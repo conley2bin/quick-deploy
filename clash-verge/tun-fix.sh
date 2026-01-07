@@ -327,36 +327,15 @@ configure_ssh() {
         cp "$ssh_config" "$ssh_config.backup.$timestamp"
         echo "✓ 已备份原配置到: $ssh_config.backup.$timestamp"
 
-        # 移除旧的 GitHub 配置
-        sed -i '/^Host github\.com/,/^Host\|^$/d' "$ssh_config"
+        # 移除旧的 GitHub 配置（包括注释）
+        # 删除从 GitHub 注释开始到 Host github.com 配置块结束的所有内容
+        sed -i '/# GitHub SSH over HTTPS port/,/ControlPersist no/d' "$ssh_config"
+        # 清理可能残留的空行
+        sed -i '/^$/N;/^\n$/d' "$ssh_config"
     fi
 
     echo ""
-    echo "将添加以下配置到 ~/.ssh/config:"
-    echo ""
-    echo "-------------------------------------------"
-    cat << 'EOF'
-# GitHub SSH over HTTPS port (443) - 最可靠的解决方案
-# 原因：
-# 1. 端口 443 比端口 22 更稳定（GitHub 官方推荐用于防火墙受限环境）
-# 2. 禁用 ControlMaster 避免连接复用导致的间歇性失败
-Host github.com
-    Hostname ssh.github.com
-    Port 443
-    User git
-    # 禁用连接复用避免间歇性问题
-    ControlMaster no
-    ControlPath none
-    ControlPersist no
-EOF
-    echo "-------------------------------------------"
-    echo ""
-    echo -n "确认添加此配置？[Y/n]: "
-    read confirm
-    if [[ "$confirm" =~ ^[Nn]$ ]]; then
-        echo "已取消 SSH 配置"
-        return
-    fi
+    echo "正在添加 SSH 配置..."
 
     # 确保 .ssh 目录存在
     mkdir -p "$HOME/.ssh"

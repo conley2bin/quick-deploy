@@ -1,129 +1,166 @@
-# Claude Code System
+# Claude Code 系统
 
-Personal Claude Code configuration collection for quick setup on new devices.
+新设备快速配置的个人 Claude Code 配置集合。
 
-Comprehensive toolkit streamlining Claude Code configuration across machines: system-level development guidelines + automated tool installation.
+综合工具包：官方 Claude Code CLI 安装 + 系统级开发准则 + 自动化工具集成。
 
-## Features
+## 功能特性
 
-- System-level CLAUDE.md: Standardized development principles
-- Tool integration: Claude Code ecosystem installation
-- Interactive setup: Select tools during installation
-- Backup protection: Optional configuration backup
-- Quick deploy: One-command installation
+- **两步设置**：官方 CLI 安装 + 个人配置
+- **系统级 CLAUDE.md**：标准化开发原则
+- **工具集成**：Claude Code 生态系统安装
+- **交互式设置**：安装过程中选择工具
+- **备份保护**：可选配置备份
+- **快速部署**：一键安装
 
-## Quick Start
+## 快速开始
+
+### 步骤1：安装 Claude Code（官方 CLI）
 
 ```bash
-git clone <repository-url>
-cd claude-code-system
-chmod +x install.sh
+cd claude-code
 ./install.sh
 ```
 
-Installer actions:
-1. Installs system-level CLAUDE.md to ~/.claude/CLAUDE.md
-2. Prompts for optional components:
-   - Custom Slash Commands
-   - Claude Code Templates (100+ templates)
+**脚本功能：**
+- 自动安装 Homebrew（如果未安装）
+- 通过 Homebrew 安装官方 Claude Code CLI
+- 使用 `claude doctor` 验证安装
+- 显示使用指南和常用命令
+
+### 步骤2：配置增强功能（可选）
+
+```bash
+./setup.sh
+```
+
+**安装内容：**
+1. 系统级 CLAUDE.md 到 ~/.claude/CLAUDE.md（必需）
+2. 提示安装可选组件：
+   - 自定义 Slash Commands
+   - Claude Code Templates（100+ 模板）
    - SuperClaude Framework
    - Claude Config Editor
 
-## Project Structure
+## 安装脚本
+
+| 脚本 | 用途 | 必需 |
+|------|------|------|
+| `install.sh` | 安装官方 Claude Code CLI | 是 |
+| `setup.sh` | 安装个人配置和工具 | 否 |
+
+**用法：**
+```bash
+# 完整设置（推荐）
+./install.sh    # 安装 Claude Code
+./setup.sh      # 添加增强功能
+
+# 最小安装
+./install.sh    # 仅安装 Claude Code
+```
+
+## 项目结构
 
 ```
-claude-code-system/
+claude-code/
+├── install.sh                 # Claude Code CLI 安装器
+├── setup.sh                   # 配置设置脚本
 ├── config/
-│   └── CLAUDE.md              # System-level guidelines
-├── commands/                  # Slash commands
+│   └── CLAUDE.md              # 系统级开发准则
+├── commands/                  # 自定义斜杠命令
 │   ├── audit-compliance.md
 │   ├── commit.md
-│   └── remind.md
-├── tools/                     # Installation scripts
+│   ├── remind.md
+│   └── work-report.md
+├── tools/                     # 增强工具
 │   ├── claude-code-templates/
 │   ├── claude-config-editor/
 │   └── superclaude-framework/
-└── install.sh                 # Main installer
+└── README.md
 ```
 
-## Included Components
+## 包含的组件
 
-| Component | Type | Purpose | Token Cost |
-|-----------|------|---------|------------|
-| System CLAUDE.md | Required | Development guidelines | 0 |
-| Custom Slash Commands | Optional | Workflow automation | 0 |
-| Claude Code Templates | Optional | 100+ templates | 0 |
-| SuperClaude Framework | Optional | Meta-programming | 30-40K/task |
-| Claude Config Editor | Optional | Config cleanup | 0 |
+| 组件 | 类型 | 用途 | Token 成本 |
+|------|------|------|-----------|
+| 系统 CLAUDE.md | 必需 | 开发准则 | 0 |
+| 自定义 Slash Commands | 可选 | 工作流自动化 | 0 |
+| Claude Code Templates | 可选 | 100+ 模板 | 0 |
+| SuperClaude Framework | 可选 | 元编程 | 30-40K/任务 |
+| Claude Config Editor | 可选 | 配置清理 | 0 |
 
-### 1. System-Level CLAUDE.md (Required)
+### 1. 系统级 CLAUDE.md（必需）
 
-Development guidelines:
-- Fail-Fast Principle
+开发准则：
+- Fail-Fast 原则
 - Single Source of Truth
-- Minimal Code Principle
-- DRY / YAGNI Principles
-- Communication protocols
+- Minimal Code 原则
+- DRY / YAGNI 原则
+- 通信协议
 
-### 2. Custom Slash Commands (Optional)
+### 2. 自定义 Slash Commands（可选）
 
-**`/audit-compliance`** - Code compliance audit
+**`/audit-compliance`** - 代码合规性审计
 
-Dynamically extracts principles from ~/.claude/CLAUDE.md:
-- Parses markdown structure (Required/Forbidden patterns)
-- Infers severity from keywords (MUST/NEVER → critical)
-- Two modes: Auto-fix (default) or Interactive
-- Serena MCP integration for symbolic analysis
+从 ~/.claude/CLAUDE.md 动态提取原则：
+- 解析 markdown 结构（必需/禁止模式）
+- 从关键词推断严重性（MUST/NEVER → 关键）
+- 两种模式：自动修复（默认）或交互式
+- Serena MCP 集成进行符号分析
 
-Usage:
+用法：
 ```bash
-/audit-compliance                         # Auto-fix violations
-/audit-compliance --interactive           # Review each change
-/audit-compliance --focus naming          # Specific domain
-/audit-compliance --baseline              # Track progress
+/audit-compliance                         # 自动修复违规
+/audit-compliance --interactive           # 审查每个更改
+/audit-compliance --focus naming          # 特定领域
+/audit-compliance --baseline              # 跟踪进度
 ```
 
-**`/commit`** - Conventional commit formatting
+**`/commit`** - 规范化提交格式
 
-Creates well-formatted commits using conventional commit format.
+使用 conventional commit 格式创建格式良好的提交。
 
-**`/remind`** - Load CLAUDE.md guidelines
+**`/remind`** - 加载 CLAUDE.md 准则
 
-Loads system-level development guidelines into session context.
+将系统级开发准则加载到会话上下文。
 
-### 3. Claude Code Templates (Optional)
+**`/work-report`** - 生成工作报告
 
-100+ ready-to-use templates:
-- 48+ specialized agents
+生成简洁的工作贡献摘要并保存为 markdown。
+
+### 3. Claude Code Templates（可选）
+
+100+ 即用型模板：
+- 48+ 专业 agents
 - 21+ slash commands
-- MCP integrations
-- Settings/hooks
+- MCP 集成
+- 设置/钩子
 
-Details: tools/claude-code-templates/README.md
+详情：tools/claude-code-templates/README.md
 
-### 4. SuperClaude Framework (Optional)
+### 4. SuperClaude Framework（可选）
 
-Meta-programming framework:
-- 3 core plugins (PM Agent, Research, Index)
-- 16 intelligent agents
-- 7 operation modes
-- 8 MCP server integrations
+元编程框架：
+- 3 个核心插件（PM Agent、Research、Index）
+- 16 个智能 agents
+- 7 种操作模式
+- 8 个 MCP 服务器集成
 
-Details: tools/superclaude-framework/README.md
+详情：tools/superclaude-framework/README.md
 
-### 5. Claude Config Editor (Optional)
+### 5. Claude Config Editor（可选）
 
-Web-based configuration management:
-- Visual interface for config cleanup
-- Bulk project deletion (17 MB → 732 KB reduction)
-- MCP server management
-- Auto-backup support
+基于 Web 的配置管理：
+- 可视化界面进行配置清理
+- 批量项目删除（17 MB → 732 KB）
+- MCP 服务器管理
+- 自动备份支持
 
-Details: tools/claude-config-editor/README.md
+详情：tools/claude-config-editor/README.md
 
-## Manual Tool Installation
+## 手动安装工具
 
-Install skipped tools manually:
+如果在 `setup.sh` 中跳过了工具，可手动安装：
 
 ```bash
 ./tools/claude-code-templates/install.sh
@@ -131,24 +168,54 @@ Install skipped tools manually:
 ./tools/superclaude-framework/install.sh
 ```
 
-## Configuration
+## 安装后操作
 
-**Priority hierarchy:**
-- System-level: ~/.claude/CLAUDE.md (all projects)
-- Project-level: <project>/CLAUDE.md (overrides system)
+**验证 Claude Code 安装：**
+```bash
+claude --version
+claude doctor
+```
 
-**Backup:**
+**检查配置：**
+```bash
+ls -la ~/.claude/CLAUDE.md
+ls -la ~/.claude/commands/
+```
+
+**开始使用 Claude Code：**
+```bash
+cd /path/to/your/project
+claude
+```
+
+**首次设置：**
+- 在 Claude Code 中运行 `/login` 进行身份验证
+- 或设置 `ANTHROPIC_API_KEY` 环境变量
+
+## 配置
+
+**优先级层次：**
+- 系统级：~/.claude/CLAUDE.md（所有项目）
+- 项目级：<project>/CLAUDE.md（覆盖系统级）
+
+**备份：**
 ```bash
 cp ~/.claude/CLAUDE.md ~/.claude/CLAUDE.md.backup.$(date +%Y%m%d)
 ```
 
-**Verification:**
+**更新 Claude Code：**
 ```bash
-ls -la ~/.claude/CLAUDE.md
+brew upgrade claude-code
 ```
 
-Restart Claude Code after installation to apply changes.
+**卸载：**
+```bash
+brew uninstall --cask claude-code
+rm -rf ~/.claude  # 删除所有配置
+```
 
-## Resources
+## 资源
 
-Claude Code Documentation: https://docs.claude.com/claude-code
+- **官方文档**：https://docs.anthropic.com/en/docs/claude-code
+- **Claude Code 设置**：https://code.claude.com/docs/en/setup
+- **工具详情**：查看 tools/*/README.md 了解各工具文档
