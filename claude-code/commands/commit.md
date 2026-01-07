@@ -41,7 +41,7 @@ Create well-formatted commit: $ARGUMENTS
 
 **Example:**
 - `/commit mano_assets` → commit changes IN mano_assets submodule
-- `/commit` (no args) → commit changes in current/main repository
+- `/commit` (no args) → commit changes in current working directory
 
 ## Current Repository State
 
