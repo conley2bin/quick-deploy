@@ -30,7 +30,7 @@ Generate concise work contribution summary by analyzing git commit history for s
    - **EXCLUDE**: Documentation (docs:, README, comments), pure config changes
    - **INCLUDE**: Features (feat:), refactoring with functional impact, fixes (fix:)
 4. **Apply translation rules**: Convert implementation details → functional descriptions
-5. Generate summary with 2-5 themes, 1-3 bullet points each
+5. Generate summary with 1-3 themes, 1-2 bullet points each
 6. Save to `work-report-MMDD-MMDD.md`
 
 **KEY PRINCIPLE: Never copy commit messages directly. Translate implementation details (parameters, classes, files, numbers) into functional behavior.**
@@ -68,6 +68,11 @@ Generate concise work contribution summary by analyzing git commit history for s
 
 ## Output Format
 
+**Formatting rules:**
+- No blank lines between theme sections
+- 1-3 themes total
+- 1-2 bullet points per theme
+
 ```markdown
 # 工作汇报 (YYYY.MM.DD - YYYY.MM.DD)
 
@@ -76,7 +81,6 @@ Generate concise work contribution summary by analyzing git commit history for s
 ### [主题一]
 - [核心要点1：问题+解决方案]
 - [核心要点2：影响和效果]
-
 ### [主题二]
 - [核心要点1]
 ```
@@ -156,19 +160,18 @@ Before writing each bullet point:
 - 新增enable_retry参数控制失败后是否重试
 - 简化算法参数，从11个配置项减少到4个，代码从240行精简至160行
 ```
-**Violations:** Included documentation, mentioned parameter name, included code statistics.
+**Violations:** Included documentation, mentioned parameter name, included code statistics, blank lines between sections.
 
 **CORRECT Output:**
 ```markdown
 ### 任务重试控制功能
 - 实现任务级别重试控制机制，支持失败时选择立即终止或继续重试
 - 失败时根据配置决定是否进入重试流程或直接抛出异常终止任务
-
 ### 脚本环境可移植性改进
 - 移除所有硬编码conda环境路径，使脚本兼容任意Python环境管理工具
 - 改用当前激活环境的解释器，依赖缺失时快速失败并提供明确错误提示
 ```
-**Correct:** Documentation excluded, functional language, no numbers/parameters.
+**Correct:** Documentation excluded, functional language, no numbers/parameters, no blank lines between sections.
 
 ## Configuration
 
@@ -177,5 +180,5 @@ Before writing each bullet point:
 - Time range: Auto-detect last Sunday-Saturday if not provided
 - Year detection: Automatic for cross-year ranges
 - Output: `work-report-MMDD-MMDD.md` in project root
-- Format: 2-5 themes, 1-3 bullet points each
+- Format: 1-3 themes, 1-2 bullet points each
 - Focus: Functional changes only, no documentation/config/statistics
