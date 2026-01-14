@@ -7,7 +7,7 @@ description: Create well-formatted commits with conventional commit format
 # Smart Git Commit
 
 CRITICAL: NEVER create commits automatically.
-CRITICAL: NEVER commit untracked files (新文件/未追踪文件).
+CRITICAL: NEVER commit untracked files (git status显示为 ?? 的文件).
 CRITICAL: NEVER modify file contents without explicit user permission.
 
 ONLY commit when:
@@ -16,11 +16,17 @@ ONLY commit when:
 
 Default behavior: Do not commit. If uncertain, do not commit.
 
-**Commit logic:**
-- **Tracked files (已追踪)**: Automatically `git add -u` and commit
-- **Untracked files (未追踪)**: DO NOT touch, DO NOT `git add`
+**Git Status Codes (git status --porcelain):**
+- `??` = untracked files (从未git add的文件) - DO NOT commit
+- `A ` = staged new files (已git add的新文件) - SHOULD commit
+- `M ` = staged modifications (已暂存的修改) - SHOULD commit
+- ` M` = unstaged modifications (未暂存的修改) - will be staged by git add -u
 
-Simple rule: Only commit files that are already in the repository (tracked files).
+**Commit logic:**
+- Use `git add -u` to stage modifications of tracked files (excludes ?? files)
+- If files with `A ` status already exist (user manually added), commit them together
+- NEVER `git add` files with `??` status
+- Commit all staged changes (`A ` and `M ` status)
 
 ---
 
@@ -58,11 +64,11 @@ Create well-formatted commit: $ARGUMENTS
 - Otherwise → work in current directory (main repository)
 
 **STEP 1-5: Git operations**
-1. Stage all tracked modified files: `git add -u` (excludes untracked files)
-2. Check what will be committed: `git diff --cached`
+1. Stage tracked file modifications: `git add -u` (excludes ?? files)
+2. Check staged changes including any `A ` status files: `git diff --cached` and `git status --porcelain`
 3. Analyze the diff to determine if multiple logical changes are present
 4. If multiple distinct changes detected, suggest splitting into multiple commits
-5. Create commit message using conventional commit format and commit
+5. Create commit message using conventional commit format and commit all staged changes
 
 **PROHIBITED OPERATIONS:**
 - DO NOT modify file contents without asking user first
@@ -147,12 +153,17 @@ Example of splitting commits:
 
 ## Important Notes
 
-- **Tracked files**: Automatically staged with `git add -u` and committed
-- **Untracked files**: Completely ignored, NOT added to commit
+- **Git status codes**:
+  - `??` = untracked files (DO NOT commit)
+  - `A ` = staged new files (COMMIT if already staged by user)
+  - `M ` = staged modifications (COMMIT)
+  - ` M` = unstaged modifications (will be staged by git add -u)
+- **Workflow**: `git add -u` stages tracked modifications, then commit all staged changes
 - Commit message constructed based on detected changes
 - Reviews diff to identify if multiple commits would be more appropriate
 - Suggests splitting into multiple commits if needed
 
 **Summary:**
-- Tracked (modified) → `git add -u` → commit
-- Untracked (new files) → ignored
+- Files with `??` status → never touch, never commit
+- Files with `A ` status (already staged) → commit together with modifications
+- Files with `M ` or ` M` status → stage with `git add -u` and commit
