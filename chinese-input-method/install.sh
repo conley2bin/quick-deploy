@@ -237,7 +237,7 @@ echo "  3. 删除多余的 Group (如果有 Group 2):"
 echo "     - 在 Group 下拉菜单中选择要删除的 Group"
 echo "     - 点击下拉菜单右侧的 '-' 按钮"
 echo "     - 点击 'Apply' 保存"
-echo "  4. 快捷键:"
+echo "  4. fcitx5 默认快捷键:"
 echo "     - Ctrl+Space: 按列表顺序循环切换输入法"
 echo "     - Left Shift: 临时切换到第一个输入法"
 echo
