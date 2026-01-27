@@ -3,35 +3,18 @@
 # Claude Config Editor 安装脚本
 # ============================================================================
 #
-# 【项目简介】
-#   Claude Config Editor - Web GUI for Claude configuration management
-#   解决 Claude 配置文件膨胀问题,提供可视化管理界面
+# Web 界面管理 Claude 配置文件，解决配置膨胀问题
 #
-# 【核心功能】
-#   • 可视化查看项目占用空间(按大小排序)
-#   • 批量删除旧项目(删除前 10 个最大项目 = 释放 90% 空间)
-#   • 导出重要对话记录(保留有价值的内容)
-#   • MCP 服务器管理(无需手动编辑 JSON)
-#   • 自动备份(所有操作前自动备份,支持撤销)
+# 核心功能：
+#   • 可视化项目空间占用（按大小排序）
+#   • 批量删除旧项目（释放 90%+ 空间）
+#   • 导出对话记录和 MCP 服务器管理
+#   • 自动备份（支持撤销）
 #
-# 【典型效果】
-#   • 配置文件从 17 MB 减少到 732 KB (减少 95.7%)
-#   • Claude 启动速度显著提升
-#   • 零外部依赖,仅需 Python 3.7+
-#
-# 【安装位置】
-#   项目根目录: claude-config-editor/
-#
-# 【使用方法】
-#   安装后运行:
-#     python3 claude-config-editor/server.py
-#   然后浏览器打开:
-#     http://localhost:8080
-#
-# 【详细文档】
-#   GitHub: https://github.com/gagarinyury/claude-config-editor
-#   Stars: 400+
-#   License: MIT
+# 典型效果：17 MB → 732 KB（减少 95.7%），启动速度显著提升
+# 依赖：Python 3.7+（零外部依赖）
+# 使用：python3 claude-config-editor/server.py，浏览器打开 http://localhost:8080
+# 文档：https://github.com/gagarinyury/claude-config-editor
 # ============================================================================
 
 set -e

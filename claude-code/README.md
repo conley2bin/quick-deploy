@@ -81,13 +81,13 @@ claude-code/
 
 ## 包含的组件
 
-| 组件 | 类型 | 用途 | Token 成本 |
-|------|------|------|-----------|
-| 系统 CLAUDE.md | 必需 | 开发准则 | 0 |
-| 自定义 Slash Commands | 可选 | 工作流自动化 | 0 |
-| Claude Code Templates | 可选 | 100+ 模板 | 0 |
-| SuperClaude Framework | 可选 | 元编程 | 30-40K/任务 |
-| Claude Config Editor | 可选 | 配置清理 | 0 |
+| 组件 | 类型 | 用途 |
+|------|------|------|
+| 系统 CLAUDE.md | 必需 | 开发准则 |
+| 自定义 Slash Commands | 可选 | 工作流自动化 |
+| Claude Code Templates | 可选 | 48+ Agents、21+ Commands、MCP 集成 |
+| SuperClaude Framework | 可选 | 元编程框架，Token 减少 94% |
+| Claude Config Editor | 可选 | 配置清理，减少 95%+ 空间 |
 
 ### 1. 系统级 CLAUDE.md（必需）
 
@@ -130,32 +130,38 @@ claude-code/
 
 ### 3. Claude Code Templates（可选）
 
-100+ 即用型模板：
-- 48+ 专业 agents
-- 21+ slash commands
-- MCP 集成
-- 设置/钩子
+即用型配置集合：
+- 48+ Agents（安全审计、性能优化、架构设计）
+- 21+ Commands（/generate-tests、/optimize-bundle）
+- MCP 集成（GitHub、PostgreSQL、Stripe、AWS、OpenAI）
+- 开发工具（Analytics、Conversation Monitor、Health Check）
 
+安装：`npx claude-code-templates@latest`
 详情：tools/claude-code-templates/README.md
 
 ### 4. SuperClaude Framework（可选）
 
-元编程框架：
-- 3 个核心插件（PM Agent、Research、Index）
-- 16 个智能 agents
-- 7 种操作模式
-- 8 个 MCP 服务器集成
+元编程框架，将 Claude Code 转变为结构化开发平台：
+- 3 个插件（PM Agent、Research、Index）
+- 16 个智能 Agents（领域专家型 AI）
+- 7 种运行模式（Quick/Standard/Deep/Exhaustive）
+- 8 个 MCP 服务器（Tavily、Serena、Mindbase）
 
+性能：Token 减少 94%（58K → 3K），速度提升 2-3 倍
+安装：`pipx install superclaude && superclaude install`
 详情：tools/superclaude-framework/README.md
 
 ### 5. Claude Config Editor（可选）
 
-基于 Web 的配置管理：
-- 可视化界面进行配置清理
-- 批量项目删除（17 MB → 732 KB）
-- MCP 服务器管理
-- 自动备份支持
+Web 界面管理 Claude 配置文件：
+- 可视化项目空间占用（按大小排序）
+- 批量删除旧项目（释放 90%+ 空间）
+- 导出对话记录和 MCP 服务器管理
+- 自动备份（支持撤销）
 
+效果：17 MB → 732 KB（减少 95.7%），启动速度显著提升
+依赖：Python 3.7+（零外部依赖）
+使用：`python3 claude-config-editor/server.py`，浏览器打开 http://localhost:8080
 详情：tools/claude-config-editor/README.md
 
 ## 手动安装工具

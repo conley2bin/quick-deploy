@@ -3,45 +3,16 @@
 # Claude Code Templates 安装脚本
 # ============================================================================
 #
-# 【项目简介】
-#   Claude Code Templates - 即用型配置模板库
-#   为 Claude Code 提供 100+ 预构建配置，快速增强 AI 开发工作流
+# 即用型配置集合：AI agents、自定义命令、MCP 集成和项目模板
 #
-# 【核心组件】
-#   • 🤖 Agents：领域专家代理（安全审计、性能优化、数据库架构...）
-#   • ⚡ Commands：斜杠命令（/generate-tests、/optimize-bundle...）
-#   • 🔌 MCPs：外部服务集成（GitHub、PostgreSQL、Stripe、AWS、OpenAI...）
-#   • ⚙️ Settings：配置选项（超时、内存分配、输出格式...）
-#   • 🪝 Hooks：自动化触发器（pre-commit 验证、post-completion 动作...）
+# 核心组件：
+#   • 48+ Agents（安全审计、性能优化、架构设计）
+#   • 21+ Commands（/generate-tests、/optimize-bundle）
+#   • MCP 集成（GitHub、PostgreSQL、Stripe、AWS、OpenAI）
+#   • 开发工具（Analytics、Conversation Monitor、Health Check）
 #
-# 【核心优势】
-#   • 100+ 即用型模板
-#   • MIT 兼容许可
-#   • 交互式浏览和安装
-#   • 完整技术栈支持
-#
-# 【典型场景】
-#   • 安全审计工作流
-#   • React 性能优化
-#   • 数据库架构设计
-#   • 自动化测试生成
-#   • 包体积优化
-#   • Pre-commit 自动验证
-#
-# 【额外工具】
-#   • Analytics：实时会话监控
-#   • Health Check：安装诊断
-#   • Plugin Dashboard：统一插件管理
-#   • Conversation Monitor：移动端响应查看（支持 Cloudflare Tunnel）
-#
-# 【快速安装】
-#   交互式：npx claude-code-templates@latest
-#   指定组件：npx claude-code-templates@latest --agent=<name> --yes
-#
-# 【详细文档】
-#   GitHub: https://github.com/davila7/claude-code-templates
-#   官网: https://aitmpl.com
-#   文档: https://docs.aitmpl.com
+# 安装：npx claude-code-templates@latest
+# 文档：https://github.com/davila7/claude-code-templates
 # ============================================================================
 
 # ============================================================================
