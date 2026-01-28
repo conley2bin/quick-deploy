@@ -43,7 +43,7 @@ echo ""
 # 检查 Homebrew
 echo -e "${YELLOW}[1/3] 检查 Homebrew...${NC}"
 if ! command -v brew &> /dev/null; then
-    echo -e "${YELLOW}未检测到 Homebrew，正在自动安装...${NC}"
+    echo -e "${YELLOW}未检测到 Homebrew，开始安装...${NC}"
     echo ""
 
     # 自动安装 Homebrew
@@ -71,42 +71,36 @@ if ! command -v brew &> /dev/null; then
     fi
 
     echo ""
-    echo -e "${GREEN}✓ Homebrew 安装完成${NC}"
+    echo -e "${GREEN}Homebrew 安装完成${NC}"
+else
+    echo -e "${GREEN}检测到 Homebrew 已安装${NC}"
+    brew --version | head -n 1
 fi
-
-BREW_VERSION=$(brew --version | head -n 1)
-echo -e "${GREEN}✓ Homebrew 已安装: $BREW_VERSION${NC}"
 echo ""
 
-# 检查是否已安装 Claude Code
+# 安装/更新 Claude Code
+echo -e "${YELLOW}[2/2] 安装/更新 Claude Code...${NC}"
+echo ""
+
+# 检查 Claude Code 是否已安装
 if command -v claude &> /dev/null; then
     CURRENT_VERSION=$(claude --version 2>/dev/null || echo "未知版本")
-    echo -e "${YELLOW}检测到已安装 Claude Code: $CURRENT_VERSION${NC}"
-    echo ""
-    echo -n "是否重新安装/更新？[y/N]: "
-    read -r reinstall
-    if [[ ! "$reinstall" =~ ^[Yy]$ ]]; then
-        echo -e "${YELLOW}跳过安装${NC}"
-        exit 0
-    fi
-    echo ""
+    echo -e "${GREEN}检测到 Claude Code 已安装: $CURRENT_VERSION${NC}"
+    echo "更新到最新版..."
+    brew upgrade claude-code
+else
+    echo "首次安装 Claude Code..."
+    brew install claude-code
 fi
-
-# 安装 Claude Code
-echo -e "${YELLOW}[2/3] 安装 Claude Code...${NC}"
-echo ""
-
-brew install --cask claude-code
 
 echo ""
 echo -e "${GREEN}✓ Claude Code 安装完成${NC}"
-echo ""
 
 # 验证安装
-echo -e "${YELLOW}[3/3] 验证安装...${NC}"
+echo ""
+echo -e "${GREEN}当前版本:${NC}"
 if command -v claude &> /dev/null; then
-    INSTALLED_VERSION=$(claude --version)
-    echo -e "${GREEN}✓ 安装成功: $INSTALLED_VERSION${NC}"
+    claude --version
 
     # 检查安装类型
     echo ""
@@ -120,7 +114,7 @@ fi
 # 输出使用提示
 echo ""
 echo -e "${BLUE}============================================================================${NC}"
-echo -e "${GREEN}  安装完成！${NC}"
+echo -e "${GREEN}  完成！${NC}"
 echo -e "${BLUE}============================================================================${NC}"
 echo ""
 
