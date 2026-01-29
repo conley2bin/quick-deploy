@@ -40,58 +40,23 @@ fi
 echo -e "${GREEN}检测到系统: $OS${NC}"
 echo ""
 
-# 检查 Homebrew
-echo -e "${YELLOW}[1/3] 检查 Homebrew...${NC}"
-if ! command -v brew &> /dev/null; then
-    echo -e "${YELLOW}未检测到 Homebrew，开始安装...${NC}"
-    echo ""
-
-    # 自动安装 Homebrew
-    /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
-
-    # Linux 需要额外配置 PATH
-    if [[ "$OS" == "Linux" ]]; then
-        echo ""
-        echo -e "${YELLOW}配置 Homebrew 环境变量...${NC}"
-
-        # 检测 shell 类型并添加到配置文件
-        if [ -n "$BASH_VERSION" ]; then
-            SHELL_RC="$HOME/.bashrc"
-        elif [ -n "$ZSH_VERSION" ]; then
-            SHELL_RC="$HOME/.zshrc"
-        else
-            SHELL_RC="$HOME/.profile"
-        fi
-
-        # 添加 Homebrew 到 PATH
-        echo 'eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"' >> "$SHELL_RC"
-
-        # 立即生效
-        eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"
-    fi
-
-    echo ""
-    echo -e "${GREEN}Homebrew 安装完成${NC}"
-else
-    echo -e "${GREEN}检测到 Homebrew 已安装${NC}"
-    brew --version | head -n 1
-fi
-echo ""
-
 # 安装/更新 Claude Code
-echo -e "${YELLOW}[2/2] 安装/更新 Claude Code...${NC}"
+echo -e "${YELLOW}[1/1] 安装/更新 Claude Code...${NC}"
 echo ""
 
 # 检查 Claude Code 是否已安装
 if command -v claude &> /dev/null; then
     CURRENT_VERSION=$(claude --version 2>/dev/null || echo "未知版本")
     echo -e "${GREEN}检测到 Claude Code 已安装: $CURRENT_VERSION${NC}"
-    echo "更新到最新版..."
-    brew upgrade claude-code
+    echo "使用官方安装脚本更新到最新版..."
+    echo ""
 else
-    echo "首次安装 Claude Code..."
-    brew install claude-code
+    echo "使用官方安装脚本安装 Claude Code..."
+    echo ""
 fi
+
+# 使用官方安装脚本
+curl -fsSL https://claude.ai/install.sh | bash
 
 echo ""
 echo -e "${GREEN}✓ Claude Code 安装完成${NC}"
