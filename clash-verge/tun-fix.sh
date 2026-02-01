@@ -276,6 +276,35 @@ update_direct_rules() {
     cat >> "$file" << 'EOF'
 
 prepend-rules:
+  # 中国大陆 IP 直连（GeoIP 规则）
+  - GEOIP,CN,DIRECT,no-resolve
+  # 中国大陆域名直连
+  - DOMAIN-SUFFIX,cn,DIRECT
+  - DOMAIN-SUFFIX,com.cn,DIRECT
+  - DOMAIN-SUFFIX,gov.cn,DIRECT
+  - DOMAIN-SUFFIX,edu.cn,DIRECT
+  # 常见中国网站直连
+  - DOMAIN-SUFFIX,bilibili.com,DIRECT
+  - DOMAIN-SUFFIX,zhihu.com,DIRECT
+  - DOMAIN-SUFFIX,huya.com,DIRECT
+  - DOMAIN-SUFFIX,douyin.com,DIRECT
+  - DOMAIN-SUFFIX,taobao.com,DIRECT
+  - DOMAIN-SUFFIX,tmall.com,DIRECT
+  - DOMAIN-SUFFIX,jd.com,DIRECT
+  - DOMAIN-SUFFIX,qq.com,DIRECT
+  - DOMAIN-SUFFIX,weixin.qq.com,DIRECT
+  - DOMAIN-SUFFIX,baidu.com,DIRECT
+  - DOMAIN-SUFFIX,163.com,DIRECT
+  - DOMAIN-SUFFIX,sina.com.cn,DIRECT
+  - DOMAIN-SUFFIX,sohu.com,DIRECT
+  - DOMAIN-SUFFIX,youku.com,DIRECT
+  - DOMAIN-SUFFIX,iqiyi.com,DIRECT
+  - DOMAIN-SUFFIX,aliyun.com,DIRECT
+  - DOMAIN-SUFFIX,alipay.com,DIRECT
+  - DOMAIN-SUFFIX,tencent.com,DIRECT
+  - DOMAIN-SUFFIX,bytedance.com,DIRECT
+  # Bing 中国
+  - DOMAIN-SUFFIX,cn.bing.com,DIRECT
   # GitHub SSH 直连（不走代理）
   - DOMAIN-SUFFIX,github.com,DIRECT
   - DOMAIN-SUFFIX,githubusercontent.com,DIRECT
@@ -288,7 +317,7 @@ prepend-rules:
   - DOMAIN-SUFFIX,local,DIRECT
 EOF
 
-    echo "✓ GitHub 直连规则已添加"
+    echo "✓ 直连规则已添加 (中国大陆 + GitHub)"
 }
 
 # 配置 SSH (可选但推荐)
@@ -407,7 +436,11 @@ optimize_all() {
     echo ""
     echo "✓ TUN 模式: 已配置 (排除本地网络)"
     echo ""
-    echo "✓ 直连规则: 已配置 (GitHub 不走代理)"
+    echo "✓ 直连规则: 已配置"
+    echo "  - 中国大陆 IP (GEOIP,CN)"
+    echo "  - 中国域名 (.cn, .com.cn)"
+    echo "  - 常见中国网站 (B站、知乎、抖音、淘宝等)"
+    echo "  - GitHub (不走代理)"
     echo ""
     echo "下一步:"
     echo "  1. 重启 Clash Verge 使配置生效"
@@ -419,9 +452,10 @@ optimize_all() {
     echo ""
     echo "注意:"
     echo "  - 配置针对当前订阅有效"
+    echo "  - 中国大陆网站已配置直连 (不走代理，节省流量)"
     echo "  - GitHub SSH 已配置直连 (不走代理)"
     echo "  - DNS 层: 主域名和通配符都已添加"
-    echo "  - 路由层: GitHub 流量直连规则已添加"
+    echo "  - 路由层: 中国 IP + GitHub 流量直连规则已添加"
     echo "  - 切换订阅需要重新运行脚本"
     echo ""
 }
