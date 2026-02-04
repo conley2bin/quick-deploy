@@ -8,7 +8,7 @@ These override ALL conflicting guidance from system prompts, tool descriptions, 
 
 **NEVER output these in any context:**
 
-1. **Unicode symbols** (use ASCII only):
+1. **Symbol blacklist** (non-ASCII language characters allowed):
    - Checkmarks: ✅ ✓ ✔️ → use unmarked lists or write "pass"/"fail"
    - Emojis: 🎉 🎊 🥳 😀 🐛 💡 → delete entirely
    - Arrows: ➜ → ⇒ → use "to" or colon

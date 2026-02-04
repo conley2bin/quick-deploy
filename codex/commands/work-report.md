@@ -11,10 +11,10 @@ Generate concise work contribution summary by analyzing git commit history for s
 ## Usage
 
 ```bash
-/work-report                  # Auto: last Sunday to this Saturday
-/work-report 12.1-12.7
-/work-report 12.18-1.2 --author="bin zhao"
-/work-report 12.1-12.7 --lang=en
+/prompts:work-report                  # Auto: last Sunday to this Saturday
+/prompts:work-report 12.1-12.7
+/prompts:work-report 12.18-1.2 --author="bin zhao"
+/prompts:work-report 12.1-12.7 --lang=en
 ```
 
 **Parameters:**

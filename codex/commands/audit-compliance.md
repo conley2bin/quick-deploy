@@ -9,7 +9,7 @@ mcp-servers: [serena, sequential]
 personas: [architect, quality]
 ---
 
-# /audit-compliance - Code Compliance Audit
+# /prompts:audit-compliance - Code Compliance Audit
 
 ## Triggers
 - Code compliance verification against CLAUDE.md development principles
@@ -19,12 +19,12 @@ personas: [architect, quality]
 
 ## Usage
 ```
-/audit-compliance [scope] [--focus <domain>] [--severity critical|warning|all] [--interactive] [--baseline] [--report] [--compare]
+/prompts:audit-compliance [scope] [--focus <domain>] [--severity critical|warning|all] [--interactive] [--baseline] [--report] [--compare]
 ```
 
 ### Execution Modes
 
-#### **Default: Auto-Fix** `/audit-compliance`
+#### **Default: Auto-Fix** `/prompts:audit-compliance`
 - Analyzes code against all CLAUDE.md principles
 - **Automatically fixes all safe violations**
 - Still requires Claude Code Edit permission per file
@@ -109,7 +109,7 @@ Key behaviors:
 
 **Default: Auto-Fix Everything**
 ```bash
-/audit-compliance
+/prompts:audit-compliance
 ```
 Automatically fixes all safe violations. Shows summary:
 - Fixed 12 naming violations
@@ -119,7 +119,7 @@ Automatically fixes all safe violations. Shows summary:
 
 **Interactive: Review Each Change**
 ```bash
-/audit-compliance --interactive
+/prompts:audit-compliance --interactive
 ```
 Shows each violation with before/after diff. User approves/rejects each fix:
 ```
@@ -135,37 +135,37 @@ Fixed
 
 **Focus on Specific Domain**
 ```bash
-/audit-compliance --focus naming                    # Auto-fix naming only
-/audit-compliance --focus naming --interactive      # Interactive naming fixes
+/prompts:audit-compliance --focus naming                    # Auto-fix naming only
+/prompts:audit-compliance --focus naming --interactive      # Interactive naming fixes
 ```
 
 **Specific Directory or File**
 ```bash
-/audit-compliance src/                              # Directory scope
-/audit-compliance src/config/manager.ts --interactive  # Single file
+/prompts:audit-compliance src/                              # Directory scope
+/prompts:audit-compliance src/config/manager.ts --interactive  # Single file
 ```
 
 **Critical Issues Only**
 ```bash
-/audit-compliance --severity critical               # Auto-fix critical only
-/audit-compliance --severity critical --interactive # Interactive critical
+/prompts:audit-compliance --severity critical               # Auto-fix critical only
+/prompts:audit-compliance --severity critical --interactive # Interactive critical
 ```
 
 **Baseline and Progress Tracking**
 ```bash
-/audit-compliance --baseline    # Save baseline to .claude/audit-baseline.json
-/audit-compliance --compare     # Compare with baseline (requires existing baseline)
+/prompts:audit-compliance --baseline    # Save baseline to .claude/audit-baseline.json
+/prompts:audit-compliance --compare     # Compare with baseline (requires existing baseline)
 ```
 
 **Report Generation**
 ```bash
-/audit-compliance --report              # Generate .claude/compliance-report.md
-/audit-compliance --baseline --report   # Combine: baseline + report
+/prompts:audit-compliance --report              # Generate .claude/compliance-report.md
+/prompts:audit-compliance --baseline --report   # Combine: baseline + report
 ```
 
 **Incremental Audit**
 ```bash
-/audit-compliance --since HEAD~5   # Only files changed in last 5 commits
+/prompts:audit-compliance --since HEAD~5   # Only files changed in last 5 commits
 ```
 
 ## How Principles Are Detected (Dynamic Extraction)
@@ -281,7 +281,7 @@ if (dependency == null) {
 - `src/config/manager.ts:15` - Variable `cfg`
 - `src/utils/context.ts:23` - Class `UsrMgr`
 
-**Quick Fix**: `/audit-compliance --fix --focus naming`
+**Quick Fix**: `/prompts:audit-compliance --fix --focus naming`
 
 ---
 
@@ -294,9 +294,9 @@ if (dependency == null) {
 ## Next Steps
 
 ```bash
-/audit-compliance --fix --focus naming  # Auto-fix simple issues
-/audit-compliance --baseline            # Track improvement
-/audit-compliance --compare             # See progress
+/prompts:audit-compliance --fix --focus naming  # Auto-fix simple issues
+/prompts:audit-compliance --baseline            # Track improvement
+/prompts:audit-compliance --compare             # See progress
 ```
 ```
 
@@ -308,12 +308,12 @@ if (dependency == null) {
 
 Both modes require Claude Code Edit permission when modifying files:
 
-1. **Default (Auto-Fix)**: `/audit-compliance`
+1. **Default (Auto-Fix)**: `/prompts:audit-compliance`
    - Agent applies all safe fixes automatically
    - Claude Code asks for Edit permission per file
    - User can approve/reject at file level
 
-2. **Interactive Mode (`--interactive`)**: `/audit-compliance --interactive`
+2. **Interactive Mode (`--interactive`)**: `/prompts:audit-compliance --interactive`
    - Agent shows each violation with before/after diff
    - User decides: "Fix this? (y/n/skip-all)"
    - After user approves, Claude Code asks for Edit permission per file

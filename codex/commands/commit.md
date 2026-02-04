@@ -11,7 +11,7 @@ CRITICAL: NEVER commit untracked files (git status显示为 ?? 的文件).
 CRITICAL: NEVER modify file contents without explicit user permission.
 
 ONLY commit when:
-1. User explicitly runs /commit command
+1. User explicitly runs /prompts:commit command
 2. User explicitly requests "commit" or "create a commit"
 
 Default behavior: Do not commit. If uncertain, do not commit.
@@ -33,9 +33,9 @@ Default behavior: Do not commit. If uncertain, do not commit.
 Create well-formatted commit: $ARGUMENTS
 
 **Parameter usage:**
-- `/commit` → Auto-generate commit message in conventional format
-- `/commit "message"` → Use provided message directly as commit message
-- `/commit subdir/` → Commit changes in specified directory/submodule
+- `/prompts:commit` → Auto-generate commit message in conventional format
+- `/prompts:commit "message"` → Use provided message directly as commit message
+- `/prompts:commit subdir/` → Commit changes in specified directory/submodule
 
 ## CRITICAL: Handle Directory/Submodule Arguments
 
@@ -46,8 +46,8 @@ Create well-formatted commit: $ARGUMENTS
 4. This is for committing changes INSIDE submodules or subdirectories
 
 **Example:**
-- `/commit mano_assets` → commit changes IN mano_assets submodule
-- `/commit` (no args) → commit changes in current working directory
+- `/prompts:commit mano_assets` → commit changes IN mano_assets submodule
+- `/prompts:commit` (no args) → commit changes in current working directory
 
 ## Current Repository State
 

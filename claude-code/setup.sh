@@ -61,11 +61,11 @@ if [ -f ~/.claude/CLAUDE.md ]; then
 fi
 
 # Copy new CLAUDE.md
-if [ -f "$SCRIPT_DIR/config/CLAUDE.md" ]; then
-    cp "$SCRIPT_DIR/config/CLAUDE.md" ~/.claude/CLAUDE.md
+if [ -f "$SCRIPT_DIR/CLAUDE.md" ]; then
+    cp "$SCRIPT_DIR/CLAUDE.md" ~/.claude/CLAUDE.md
     echo -e "${GREEN}  CLAUDE.md installed successfully${NC}"
 else
-    echo -e "${RED}  Error: Cannot find config/CLAUDE.md${NC}"
+    echo -e "${RED}  Error: Cannot find CLAUDE.md${NC}"
     exit 1
 fi
 

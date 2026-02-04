@@ -3,7 +3,7 @@ description: Load system-level CLAUDE.md development guidelines from ~/.claude/C
 allowed-tools: Read
 ---
 
-# /remind - Load CLAUDE.md Guidelines
+# /prompts:remind - Load CLAUDE.md Guidelines
 
 Load and apply system-level development guidelines from ~/.claude/CLAUDE.md.
 
@@ -64,7 +64,7 @@ Reads ~/.claude/CLAUDE.md and loads comprehensive development principles into se
 ## Usage
 
 ```bash
-/remind
+/prompts:remind
 ```
 
 Loads guidelines and confirms understanding for current session.
