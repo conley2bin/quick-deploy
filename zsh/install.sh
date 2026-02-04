@@ -95,34 +95,6 @@ EOF
         echo -e "${YELLOW}键绑定配置已存在，跳过${NC}"
     fi
 
-    # 10. 添加 tavily API 配置
-    if ! grep -q "tavily" "$ZSHRC"; then
-        echo -e "${YELLOW}添加 tavily API 配置...${NC}"
-        cat >> "$ZSHRC" << 'EOF'
-
-# >>> tavily >>>
-export TAVILY_API_KEY="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"
-# <<< tavily <<<
-EOF
-        echo -e "${GREEN}✓ tavily API 配置已添加${NC}"
-    else
-        echo -e "${YELLOW}tavily API 配置已存在，跳过${NC}"
-    fi
-
-    # 11. 添加 morphllm-fast-apply API 配置
-    if ! grep -q "morphllm-fast-apply" "$ZSHRC"; then
-        echo -e "${YELLOW}添加 morphllm-fast-apply API 配置...${NC}"
-        cat >> "$ZSHRC" << 'EOF'
-
-# >>> morphllm-fast-apply >>>
-export MORPH_API_KEY="sk-C1Uss84_TS9vXLCc1geANKSYssHgpZgv21FI9D90hTL-MRKZ"
-# <<< morphllm-fast-apply <<<
-EOF
-        echo -e "${GREEN}✓ morphllm-fast-apply API 配置已添加${NC}"
-    else
-        echo -e "${YELLOW}morphllm-fast-apply API 配置已存在，跳过${NC}"
-    fi
-
     echo -e "${GREEN}✓ .zshrc 配置完成${NC}"
 else
     echo -e "${RED}错误: .zshrc 文件不存在${NC}"
