@@ -1,0 +1,6 @@
+[submodule "codex/PiloTY"]
+	path = codex/MCP/PiloTY
+	url = git@github.com:conley2bin/PiloTY.git
+[submodule "codex/mu-mcp"]
+	path = codex/MCP/mu-mcp
+	url = git@github.com:conley2bin/mu-mcp.git
