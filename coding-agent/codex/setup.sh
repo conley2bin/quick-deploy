@@ -415,9 +415,12 @@ def upsert_mcp_stdio(
     text += "\n# MCP servers\n" + block
     return text
 
-def upsert_mcp_http_url(text: str, name: str, url: str) -> str:
+def upsert_mcp_http_url(text: str, name: str, url: str, startup_timeout_sec: int | None = None) -> str:
     header = f"[mcp_servers.{name}]"
-    block = f'{header}\nurl = "{url}"\n'
+    block_lines = [header, f'url = "{url}"']
+    if startup_timeout_sec is not None:
+        block_lines.append(f"startup_timeout_sec = {startup_timeout_sec}")
+    block = "\n".join(block_lines) + "\n"
 
     pat = re.compile(rf"(?ms)^\[mcp_servers\.{re.escape(name)}\]\n.*?(?=^\[|\Z)")
     if pat.search(text):
@@ -458,7 +461,7 @@ if selected(3):
 
 if selected(4) and tavily_key.strip():
     url = f"https://mcp.tavily.com/mcp/?tavilyApiKey={tavily_key.strip()}"
-    text = upsert_mcp_http_url(text, name="tavily", url=url)
+    text = upsert_mcp_http_url(text, name="tavily", url=url, startup_timeout_sec=60)
 
 if selected(5):
     text = upsert_mcp_stdio(

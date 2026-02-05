@@ -365,10 +365,11 @@ if "mcpServers" not in config:
 
 modified = False
 
-# 使用 shell 包装器指定工作目录
+# 使用 shell 包装器指定工作目录，并添加启动超时配置
 if 1 in want and "piloty" in config["mcpServers"]:
     config["mcpServers"]["piloty"]["command"] = "bash"
     config["mcpServers"]["piloty"]["args"] = ["-c", f"cd {piloty_dir} && uv run piloty"]
+    config["mcpServers"]["piloty"]["startup_timeout_sec"] = 60
     modified = True
     print(f"已配置 piloty 工作目录: {piloty_dir}")
 
@@ -376,6 +377,7 @@ if 2 in want and "mu_mcp" in config["mcpServers"]:
     config["mcpServers"]["mu_mcp"]["command"] = "bash"
     config["mcpServers"]["mu_mcp"]["args"] = ["-c", f"cd {mu_dir} && uv run python server.py"]
     config["mcpServers"]["mu_mcp"]["env"] = {"OPENROUTER_API_KEY": "${OPENROUTER_API_KEY}"}
+    config["mcpServers"]["mu_mcp"]["startup_timeout_sec"] = 60
     modified = True
     print(f"已配置 mu_mcp 工作目录: {mu_dir}")
     print("已添加 mu_mcp 环境变量配置")
