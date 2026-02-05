@@ -21,9 +21,9 @@ set -e
 
 # 配置
 REPO_URL="https://github.com/gagarinyury/claude-config-editor.git"
-# 获取项目根目录（脚本在 tools/claude-config-editor/，向上两级到根目录）
+# 获取项目根目录（脚本在 tools/claude-config-editor/，向上四级到 quick-deploy 根目录）
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/../../../.." && pwd)"
 INSTALL_DIR="$PROJECT_ROOT/claude-config-editor"
 
 # 颜色定义

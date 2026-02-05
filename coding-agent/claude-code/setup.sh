@@ -1,26 +1,26 @@
 #!/usr/bin/env bash
 #
-# Codex 快速部署脚本
+# Claude Code 快速部署脚本
 #
 # 作用：
 # - 交互式选择要启用的 MCP servers
-# - 自动写入/更新 ~/.codex/config.toml 里的 mcp_servers 配置（只写入你选择的项）
-# - 安装全局 AGENTS.md（系统级）
-# - 同步自定义 commands（以 /prompts:<name> 方式调用）
+# - 自动写入/更新 ~/.claude/settings.local.json 里的 mcpServers 配置（只写入你选择的项）
+# - 安装全局 CLAUDE.md（系统级）
+# - 同步自定义 commands（以 /command-name 方式调用）
 #
 # 注意：
-# - mu-mcp/tavily/morph 需要对应 API key 才能正常启动（脚本可选写入 ~/.zshrc，不会回显 key 内容）
-# - 改完配置后，需要重启 codex 才会生效
+# - mu-mcp 需要 OPENROUTER_API_KEY 才能正常启动（脚本可选写入 ~/.zshrc，不会回显 key 内容）
+# - 改完配置后，需要重启 claude 才会生效
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
+REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"
 
-CODEX_HOME="${CODEX_HOME:-${HOME}/.codex}"
-CODEX_CLI_CONFIG="${CODEX_CLI_CONFIG:-${CODEX_HOME}/config.toml}"
+CLAUDE_HOME="${CLAUDE_HOME:-${HOME}/.claude}"
+CLAUDE_SETTINGS="${CLAUDE_SETTINGS:-${CLAUDE_HOME}/settings.local.json}"
 
-PILOTY_DIR="${REPO_ROOT}/codex/MCP/PiloTY"
-MU_MCP_DIR="${REPO_ROOT}/codex/MCP/mu-mcp"
+PILOTY_DIR="${REPO_ROOT}/coding-agent/shared/MCP/PiloTY"
+MU_MCP_DIR="${REPO_ROOT}/coding-agent/shared/MCP/mu-mcp"
 
 ZSHRC_PATH="${ZSHRC_PATH:-${HOME}/.zshrc}"
 
@@ -33,9 +33,9 @@ need_cmd() {
   command -v "$1" >/dev/null 2>&1 || die "缺少命令：$1"
 }
 
-mkdir -p "${CODEX_HOME}"
+mkdir -p "${CLAUDE_HOME}"
 
-need_cmd codex
+need_cmd claude
 need_cmd python3
 need_cmd zsh
 
@@ -50,31 +50,26 @@ backup_file_if_exists() {
   fi
 }
 
-install_global_agents() {
-  local src="${REPO_ROOT}/codex/AGENTS.md"
-  local dst="${CODEX_HOME}/AGENTS.md"
-  local override="${CODEX_HOME}/AGENTS.override.md"
+install_global_claude_md() {
+  local src="${SCRIPT_DIR}/CLAUDE.md"
+  local dst="${CLAUDE_HOME}/CLAUDE.md"
 
   [[ -f "${src}" ]] || die "找不到 ${src}"
-  mkdir -p "${CODEX_HOME}"
-
-  if [[ -f "${override}" ]]; then
-    echo "note: 检测到 ${override}，Codex 将优先使用它而不是 ${dst}"
-  fi
+  mkdir -p "${CLAUDE_HOME}"
 
   if [[ -f "${dst}" ]] && cmp -s "${src}" "${dst}"; then
-    echo "Global AGENTS.md: 未变化"
+    echo "Global CLAUDE.md: 未变化"
     return 0
   fi
 
   backup_file_if_exists "${dst}"
   cp -f "${src}" "${dst}"
-  echo "Global AGENTS.md: 已更新到 ${dst}"
+  echo "Global CLAUDE.md: 已更新到 ${dst}"
 }
 
-install_custom_prompts() {
-  local src_dir="${REPO_ROOT}/codex/commands"
-  local dst_dir="${CODEX_HOME}/prompts"
+install_custom_commands() {
+  local src_dir="${SCRIPT_DIR}/commands"
+  local dst_dir="${CLAUDE_HOME}/commands"
 
   [[ -d "${src_dir}" ]] || die "找不到目录 ${src_dir}"
   mkdir -p "${dst_dir}"
@@ -84,7 +79,7 @@ install_custom_prompts() {
   shopt -u nullglob
 
   if ((${#files[@]} == 0)); then
-    echo "Custom prompts: 未找到 ${src_dir}/*.md"
+    echo "Custom commands: 未找到 ${src_dir}/*.md"
     return 0
   fi
 
@@ -101,38 +96,33 @@ install_custom_prompts() {
     copied=$((copied + 1))
   done
 
-  echo "Custom prompts: 已安装到 ${dst_dir}（更新/覆盖 ${copied} 个文件）"
+  echo "Custom commands: 已安装到 ${dst_dir}（更新/覆盖 ${copied} 个文件）"
   if ((${#names[@]} > 0)); then
     echo "自定义 commands 使用方式："
     for n in "${names[@]}"; do
-      echo "  - /prompts:${n}"
+      echo "  - /${n}"
     done
   fi
 }
 
 # 固定顺序：
-# 1) 安装系统级 AGENTS.md
+# 1) 安装系统级 CLAUDE.md
 # 2) 同步自定义 commands
 # 3) 再做 MCP 配置
-echo "[1/3] install system AGENTS.md"
-install_global_agents
+echo "[1/3] install system CLAUDE.md"
+install_global_claude_md
 echo ""
 echo "[2/3] sync custom commands"
-install_custom_prompts
+install_custom_commands
 echo ""
 echo "[3/3] configure MCP servers"
 
-echo "请选择要配置到 Codex 的 MCP servers："
+echo "请选择要配置到 Claude Code 的 MCP servers："
 echo ""
 echo "  1) piloty               (本地，PTY 终端控制)"
 echo "  2) mu_mcp               (本地，OpenRouter 聊天；需要 OPENROUTER_API_KEY)"
-echo "  3) sequential-thinking  (STDIO，npx @modelcontextprotocol/server-sequential-thinking)"
-echo "  4) tavily               (HTTP，Tavily 搜索 MCP；需要 Tavily API key)"
-echo "  5) morphllm-fast-apply  (STDIO，需要 MORPH_API_KEY)"
-echo "  6) context7             (STDIO，最新文档检索)"
-echo "  7) serena               (STDIO，代码语义工具；需要 uvx)"
 echo ""
-echo "输入：1,3,5    或 all    或 n"
+echo "输入：1,2    或 all    或 n"
 printf "> "
 read -r selection_raw || true
 selection_raw="$(echo "${selection_raw:-}" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')"
@@ -144,16 +134,16 @@ fi
 
 selected_csv=""
 if [[ "${selection_raw}" == "all" ]]; then
-  selected_csv="1,2,3,4,5,6,7"
+  selected_csv="1,2"
 else
   if [[ ! "${selection_raw}" =~ ^[0-9,]+$ ]]; then
-    die "输入格式错误：${selection_raw}（应为 1,3,5 / all / n）"
+    die "输入格式错误：${selection_raw}（应为 1,2 / all / n）"
   fi
   selected_csv="${selection_raw}"
 fi
 
 has_choice() {
-  # usage: has_choice 3
+  # usage: has_choice 2
   local n="$1"
   IFS=',' read -r -a arr <<<"${selected_csv}"
   for x in "${arr[@]}"; do
@@ -165,7 +155,7 @@ has_choice() {
 zshrc_value() {
   local var="$1"
   [[ "${var}" =~ ^[A-Z0-9_]+$ ]] || die "非法 env var 名称：${var}"
-  # 注意：这里只做“读取”，不向当前 shell 注入环境变量
+  # 注意：这里只做"读取"，不向当前 shell 注入环境变量
   zsh -lc "source \"${ZSHRC_PATH}\" >/dev/null 2>&1 || true; print -r -- \"\${${var}:-}\"" 2>/dev/null || true
 }
 
@@ -199,8 +189,8 @@ from pathlib import Path
 zshrc_path = Path(sys.argv[1]).expanduser()
 pair_args = sys.argv[2:]
 
-marker_begin = "# >>> codex mcp api keys >>>"
-marker_end = "# <<< codex mcp api keys <<<"
+marker_begin = "# >>> claude mcp api keys >>>"
+marker_end = "# <<< claude mcp api keys <<<"
 
 def escape_for_double_quotes(value: str) -> str:
     value = value.replace("\\", "\\\\")
@@ -260,28 +250,14 @@ PY
 echo ""
 echo "API key 检查结果（只检查你本机环境/~/.zshrc；不会输出 key 内容）："
 show_key_status "mu_mcp" "OPENROUTER_API_KEY"
-show_key_status "tavily" "TAVILY_API_KEY"
-show_key_status "morph" "MORPH_API_KEY"
 
-# 只针对“你选择的项”检查是否缺 key，并提供补全
+# 只针对"你选择的项"检查是否缺 key，并提供补全
 missing_pairs=()
 missing_hints=()
 if has_choice 2; then
   if [[ -z "${OPENROUTER_API_KEY-}" && -z "$(zshrc_value OPENROUTER_API_KEY)" ]]; then
     missing_pairs+=("OPENROUTER_API_KEY")
     missing_hints+=("mu_mcp:OPENROUTER_API_KEY")
-  fi
-fi
-if has_choice 4; then
-  if [[ -z "${TAVILY_API_KEY-}" && -z "$(zshrc_value TAVILY_API_KEY)" ]]; then
-    missing_pairs+=("TAVILY_API_KEY")
-    missing_hints+=("tavily:TAVILY_API_KEY")
-  fi
-fi
-if has_choice 5; then
-  if [[ -z "${MORPH_API_KEY-}" && -z "$(zshrc_value MORPH_API_KEY)" ]]; then
-    missing_pairs+=("MORPH_API_KEY")
-    missing_hints+=("morph:MORPH_API_KEY")
   fi
 fi
 
@@ -335,20 +311,12 @@ if [[ "${did_write_keys:-0}" == "1" ]]; then
   echo ""
   echo "API key 检查结果（更新后）："
   show_key_status "mu_mcp" "OPENROUTER_API_KEY"
-  show_key_status "tavily" "TAVILY_API_KEY"
-  show_key_status "morph" "MORPH_API_KEY"
 fi
 
 # 依赖检查（只检查你选择的项）
 if has_choice 1 || has_choice 2; then
   need_cmd uv
   need_cmd git
-fi
-if has_choice 3 || has_choice 5 || has_choice 6; then
-  need_cmd npx
-fi
-if has_choice 7; then
-  need_cmd uvx
 fi
 
 if has_choice 1 || has_choice 2; then
@@ -359,138 +327,61 @@ if has_choice 1 || has_choice 2; then
   [[ -f "${MU_MCP_DIR}/server.py" ]] || die "找不到 ${MU_MCP_DIR}/server.py（子模块未检出？）"
 fi
 
-tavily_key="${TAVILY_API_KEY:-}"
-if [[ -z "${tavily_key}" ]]; then
-  tavily_key="$(zshrc_value TAVILY_API_KEY)"
+# 使用 claude mcp add 命令注册 MCP 服务器
+if has_choice 1; then
+  echo "注册 piloty MCP 服务器..."
+  # 如果已存在则先删除
+  claude mcp remove piloty -s user 2>/dev/null || true
+  (cd "${PILOTY_DIR}" && claude mcp add --scope user piloty -- uv run piloty) || die "piloty 注册失败"
 fi
 
-python3 - "${CODEX_CLI_CONFIG}" "${PILOTY_DIR}" "${MU_MCP_DIR}" "${selected_csv}" "${tavily_key}" <<'PY'
-import re
+if has_choice 2; then
+  echo "注册 mu_mcp MCP 服务器..."
+  # 如果已存在则先删除
+  claude mcp remove mu_mcp -s user 2>/dev/null || true
+  (cd "${MU_MCP_DIR}" && claude mcp add --scope user mu_mcp -- uv run python server.py) || die "mu_mcp 注册失败"
+fi
+
+# 手动添加 working_directory 和环境变量配置到 ~/.claude.json
+# 注意：Claude Code 不支持 working_directory 字段，需要使用 shell 包装器
+python3 - "${PILOTY_DIR}" "${MU_MCP_DIR}" "${selected_csv}" <<'PY'
+import json
 import sys
 from pathlib import Path
 
-config_path = Path(sys.argv[1])
-piloty_dir = sys.argv[2]
-mu_dir = sys.argv[3]
-selected_csv = sys.argv[4]
-tavily_key = sys.argv[5]
-
-config_path.parent.mkdir(parents=True, exist_ok=True)
-text = config_path.read_text(encoding="utf-8") if config_path.exists() else ""
+piloty_dir = sys.argv[1]
+mu_dir = sys.argv[2]
+selected_csv = sys.argv[3]
 
 want = {int(x) for x in selected_csv.split(",") if x}
 
-def selected(n: int) -> bool:
-    return n in want
+claude_json = Path.home() / ".claude.json"
+if not claude_json.exists():
+    sys.exit(0)
 
-def upsert_mcp_stdio(
-    text: str,
-    name: str,
-    command: str,
-    args_toml: str,
-    cwd: str | None = None,
-    env_vars_toml: str | None = None,
-    startup_timeout_sec: int | None = None,
-) -> str:
-    header = f"[mcp_servers.{name}]"
-    block_lines: list[str] = [
-        header,
-        f'command = "{command}"',
-        f"args = {args_toml}",
-    ]
-    if cwd:
-        block_lines.append(f'cwd = "{cwd}"')
-    if env_vars_toml:
-        block_lines.append(f"env_vars = {env_vars_toml}")
-    if startup_timeout_sec is not None:
-        block_lines.append(f"startup_timeout_sec = {startup_timeout_sec}")
-    block = "\n".join(block_lines) + "\n"
+config = json.loads(claude_json.read_text(encoding="utf-8"))
+if "mcpServers" not in config:
+    sys.exit(0)
 
-    pat = re.compile(rf"(?ms)^\[mcp_servers\.{re.escape(name)}\]\n.*?(?=^\[|\Z)")
-    if pat.search(text):
-        return pat.sub(block + "\n", text, count=1)
+modified = False
 
-    if text and not text.endswith("\n"):
-        text += "\n"
-    text += "\n# MCP servers\n" + block
-    return text
+# 使用 shell 包装器指定工作目录
+if 1 in want and "piloty" in config["mcpServers"]:
+    config["mcpServers"]["piloty"]["command"] = "bash"
+    config["mcpServers"]["piloty"]["args"] = ["-c", f"cd {piloty_dir} && uv run piloty"]
+    modified = True
+    print(f"已配置 piloty 工作目录: {piloty_dir}")
 
-def upsert_mcp_http_url(text: str, name: str, url: str) -> str:
-    header = f"[mcp_servers.{name}]"
-    block = f'{header}\nurl = "{url}"\n'
+if 2 in want and "mu_mcp" in config["mcpServers"]:
+    config["mcpServers"]["mu_mcp"]["command"] = "bash"
+    config["mcpServers"]["mu_mcp"]["args"] = ["-c", f"cd {mu_dir} && uv run python server.py"]
+    config["mcpServers"]["mu_mcp"]["env"] = {"OPENROUTER_API_KEY": "${OPENROUTER_API_KEY}"}
+    modified = True
+    print(f"已配置 mu_mcp 工作目录: {mu_dir}")
+    print("已添加 mu_mcp 环境变量配置")
 
-    pat = re.compile(rf"(?ms)^\[mcp_servers\.{re.escape(name)}\]\n.*?(?=^\[|\Z)")
-    if pat.search(text):
-        return pat.sub(block + "\n", text, count=1)
-
-    if text and not text.endswith("\n"):
-        text += "\n"
-    text += "\n# MCP servers\n" + block
-    return text
-
-if selected(1):
-    text = upsert_mcp_stdio(
-        text,
-        name="piloty",
-        command="uv",
-        args_toml='["run","python","-m","piloty.mcp_server"]',
-        cwd=piloty_dir,
-    )
-
-if selected(2):
-    text = upsert_mcp_stdio(
-        text,
-        name="mu_mcp",
-        command="uv",
-        args_toml='["run","python","server.py"]',
-        cwd=mu_dir,
-        env_vars_toml='["OPENROUTER_API_KEY"]',
-    )
-
-if selected(3):
-    text = upsert_mcp_stdio(
-        text,
-        name="sequentialthinking",
-        command="npx",
-        args_toml='["-y","@modelcontextprotocol/server-sequential-thinking"]',
-        startup_timeout_sec=60,
-    )
-
-if selected(4) and tavily_key.strip():
-    url = f"https://mcp.tavily.com/mcp/?tavilyApiKey={tavily_key.strip()}"
-    text = upsert_mcp_http_url(text, name="tavily", url=url)
-
-if selected(5):
-    text = upsert_mcp_stdio(
-        text,
-        name="morph",
-        command="npx",
-        args_toml='["-y","@morphllm/morphmcp"]',
-        env_vars_toml='["MORPH_API_KEY"]',
-        # npx 首次启动可能需要较长时间下载/安装依赖（例如 ripgrep 预构建包）
-        startup_timeout_sec=300,
-    )
-
-if selected(6):
-    text = upsert_mcp_stdio(
-        text,
-        name="context7",
-        command="npx",
-        args_toml='["-y","@upstash/context7-mcp"]',
-        startup_timeout_sec=60,
-    )
-
-if selected(7):
-    text = upsert_mcp_stdio(
-        text,
-        name="serena",
-        command="uvx",
-        args_toml='["--from","git+https://github.com/oraios/serena","serena","start-mcp-server","--context","codex"]',
-        startup_timeout_sec=180,
-    )
-
-config_path.write_text(text, encoding="utf-8")
-print(f"Wrote {config_path}")
+if modified:
+    claude_json.write_text(json.dumps(config, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 PY
 
 is_key_set() {
@@ -501,31 +392,11 @@ is_key_set() {
 }
 
 echo ""
-echo "wrote Codex config: ${CODEX_CLI_CONFIG}"
-echo "wrote MCP config sections for selected servers"
-
-skipped=()
-if has_choice 4 && [[ -z "${tavily_key}" ]]; then
-  skipped+=("tavily")
-fi
+echo "已注册 MCP 服务器到 ~/.claude.json"
 
 missing_selected=()
 if has_choice 2 && ! is_key_set "OPENROUTER_API_KEY"; then
   missing_selected+=("mu_mcp(OPENROUTER_API_KEY)")
-fi
-if has_choice 4 && ! is_key_set "TAVILY_API_KEY"; then
-  missing_selected+=("tavily(TAVILY_API_KEY)")
-fi
-if has_choice 5 && ! is_key_set "MORPH_API_KEY"; then
-  missing_selected+=("morph(MORPH_API_KEY)")
-fi
-
-if ((${#skipped[@]} > 0)); then
-  echo ""
-  echo "warning: 本次有部分 MCP 配置未写入（因为缺少必需的 API key）："
-  for name in "${skipped[@]}"; do
-    echo "  - ${name}"
-  done
 fi
 
 if ((${#missing_selected[@]} > 0)); then
@@ -534,10 +405,12 @@ if ((${#missing_selected[@]} > 0)); then
   for item in "${missing_selected[@]}"; do
     echo "  - ${item}"
   done
-  echo "  建议：在 ${ZSHRC_PATH} 补全后，执行：source ${ZSHRC_PATH}（或新开终端）再重启 codex。"
+  echo "  建议：在 ${ZSHRC_PATH} 补全后，执行：source ${ZSHRC_PATH}（或新开终端）再重启 claude。"
 fi
 
 echo ""
 echo "下一步："
-echo "  1) 重启 codex"
-echo "  2) 验证：codex mcp list"
+echo "  1) 重启 claude"
+echo "  2) 验证：claude mcp list"
+echo ""
+echo "Note: Claude Code Tools 可以单独运行 tools.sh 安装"

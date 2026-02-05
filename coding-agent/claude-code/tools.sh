@@ -1,21 +1,21 @@
 #!/bin/bash
 # ============================================================================
-# Claude Code System - Main Installation Script
+# Claude Code Tools - Installation Script
 # ============================================================================
 #
-# Project: Personal Claude Code Configuration Collection
-# Purpose: Quick setup of complete Claude Code development environment
+# Purpose: Install optional Claude Code tools from tools/ directory
 #
-# Installation Includes:
-#   1. System-level CLAUDE.md configuration (required)
-#   2. Custom Slash Commands (optional, project-specific commands)
-#   3. Claude Code Templates (optional, 100+ templates)
-#   4. SuperClaude Framework (optional, meta-programming framework)
-#   5. Claude Config Editor (optional, config file cleanup tool)
+# Tools Included:
+#   1. Claude Code Templates (100+ template library)
+#   2. SuperClaude Framework (meta-programming framework)
+#   3. Claude Config Editor (config file cleanup tool)
 #
 # Usage:
-#   chmod +x install.sh
-#   ./install.sh
+#   bash claude-tools.sh [SCRIPT_DIR]
+#
+# Parameters:
+#   SCRIPT_DIR: Optional. Directory containing tools/ subdirectory.
+#               If not provided, uses current script's directory.
 #
 # ============================================================================
 
@@ -28,91 +28,33 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
-# Get script directory
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-
-echo -e "${BLUE}============================================================================${NC}"
-echo -e "${BLUE}  Claude Code System - Main Installation Script${NC}"
-echo -e "${BLUE}============================================================================${NC}"
-echo ""
-
-# ============================================================================
-# Step 1: Install system-level CLAUDE.md
-# ============================================================================
-echo -e "${GREEN}[1/4]${NC} Installing system-level CLAUDE.md..."
-echo ""
-
-# Create ~/.claude directory
-mkdir -p ~/.claude
-
-# Check if existing CLAUDE.md exists
-if [ -f ~/.claude/CLAUDE.md ]; then
-    echo -e "${YELLOW}  Existing CLAUDE.md detected at ~/.claude/CLAUDE.md${NC}"
-    echo -e "${YELLOW}  Do you want to backup the existing file? (y/n)${NC}"
-    read -r backup_choice
-
-    if [[ "$backup_choice" =~ ^[Yy]$ ]]; then
-        BACKUP_FILE=~/.claude/CLAUDE.md.backup.$(date +%Y%m%d_%H%M%S)
-        cp ~/.claude/CLAUDE.md "$BACKUP_FILE"
-        echo -e "${GREEN}  Backed up to: $BACKUP_FILE${NC}"
-    else
-        echo -e "${YELLOW}  Skipping backup...${NC}"
-    fi
+# Get script directory from parameter or auto-detect
+if [ -n "$1" ]; then
+    SCRIPT_DIR="$1"
+else
+    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 fi
 
-# Copy new CLAUDE.md
-if [ -f "$SCRIPT_DIR/CLAUDE.md" ]; then
-    cp "$SCRIPT_DIR/CLAUDE.md" ~/.claude/CLAUDE.md
-    echo -e "${GREEN}  CLAUDE.md installed successfully${NC}"
-else
-    echo -e "${RED}  Error: Cannot find CLAUDE.md${NC}"
+echo -e "${BLUE}============================================================================${NC}"
+echo -e "${BLUE}  Claude Code Tools - Installation Script${NC}"
+echo -e "${BLUE}============================================================================${NC}"
+echo ""
+
+# Verify tools directory exists
+if [ ! -d "$SCRIPT_DIR/tools" ]; then
+    echo -e "${RED}Error: tools/ directory not found at $SCRIPT_DIR/tools${NC}"
     exit 1
 fi
 
-echo ""
+# Track installation status
+install_templates=""
+install_superclaude=""
+install_config_editor=""
 
 # ============================================================================
-# Step 2: Install Custom Slash Commands
+# Step 1: Install Claude Code Templates
 # ============================================================================
-echo -e "${GREEN}[2/5]${NC} Custom Slash Commands..."
-echo ""
-
-if [ -d "$SCRIPT_DIR/commands" ] && [ "$(ls -A $SCRIPT_DIR/commands/*.md 2>/dev/null)" ]; then
-    echo -e "${BLUE}  Found custom slash commands in commands/ directory${NC}"
-    echo -e "${YELLOW}  Do you want to install custom slash commands? (y/n)${NC}"
-    read -r install_commands
-
-    if [[ "$install_commands" =~ ^[Yy]$ ]]; then
-        # Create ~/.claude/commands directory if it doesn't exist
-        mkdir -p ~/.claude/commands
-
-        # Count .md files (excluding README.md)
-        command_count=$(find "$SCRIPT_DIR/commands" -maxdepth 1 -name "*.md" ! -name "README.md" | wc -l)
-
-        if [ "$command_count" -gt 0 ]; then
-            echo -e "${BLUE}  Installing $command_count custom slash command(s)...${NC}"
-
-            # Copy all .md files except README.md, overwriting if exists
-            find "$SCRIPT_DIR/commands" -maxdepth 1 -name "*.md" ! -name "README.md" -exec cp {} ~/.claude/commands/ \;
-
-            echo -e "${GREEN}  Custom slash commands installed successfully${NC}"
-            echo -e "${BLUE}  Installed to: ~/.claude/commands/${NC}"
-        else
-            echo -e "${YELLOW}  No custom slash commands found (excluding README.md)${NC}"
-        fi
-    else
-        echo -e "${YELLOW}  Skipping custom slash commands installation...${NC}"
-    fi
-else
-    echo -e "${YELLOW}  No custom slash commands directory found, skipping...${NC}"
-fi
-
-echo ""
-
-# ============================================================================
-# Step 3: Install Claude Code Templates
-# ============================================================================
-echo -e "${GREEN}[3/5]${NC} Claude Code Templates..."
+echo -e "${GREEN}[1/3]${NC} Claude Code Templates..."
 echo ""
 echo -e "${YELLOW}  Do you want to install Claude Code Templates? (y/n)${NC}"
 read -r install_templates
@@ -153,9 +95,9 @@ fi
 echo ""
 
 # ============================================================================
-# Step 4: Install SuperClaude Framework
+# Step 2: Install SuperClaude Framework
 # ============================================================================
-echo -e "${GREEN}[4/5]${NC} SuperClaude Framework..."
+echo -e "${GREEN}[2/3]${NC} SuperClaude Framework..."
 echo ""
 echo -e "${YELLOW}  Do you want to install SuperClaude Framework? (y/n)${NC}"
 read -r install_superclaude
@@ -183,9 +125,9 @@ fi
 echo ""
 
 # ============================================================================
-# Step 5: Install Claude Config Editor
+# Step 3: Install Claude Config Editor
 # ============================================================================
-echo -e "${GREEN}[5/5]${NC} Claude Config Editor..."
+echo -e "${GREEN}[3/3]${NC} Claude Config Editor..."
 echo ""
 echo -e "${YELLOW}  Do you want to install Claude Config Editor? (y/n)${NC}"
 read -r install_config_editor
@@ -212,46 +154,33 @@ fi
 
 echo ""
 
-
 # ============================================================================
-# Installation Complete
+# Installation Summary
 # ============================================================================
 echo -e "${BLUE}============================================================================${NC}"
-echo -e "${GREEN}  All components installed successfully!${NC}"
+echo -e "${GREEN}  Tools installation complete!${NC}"
 echo -e "${BLUE}============================================================================${NC}"
 echo ""
 
-echo "Installed components:"
-echo "  - System-level CLAUDE.md (~/.claude/CLAUDE.md)"
-
-# Show what was installed based on user choices
-if [[ "$install_commands" =~ ^[Yy]$ ]]; then
-    echo "  - Custom Slash Commands (project-specific commands)"
-fi
+echo "Installed tools:"
 
 if [[ "$install_templates" =~ ^[Yy]$ ]]; then
     echo "  - Claude Code Templates (100+ template library)"
-fi
-
-if [[ "$install_config_editor" =~ ^[Yy]$ ]]; then
-    echo "  - Claude Config Editor (config file cleanup tool)"
 fi
 
 if [[ "$install_superclaude" =~ ^[Yy]$ ]]; then
     echo "  - SuperClaude Framework (meta-programming framework)"
 fi
 
-echo ""
+if [[ "$install_config_editor" =~ ^[Yy]$ ]]; then
+    echo "  - Claude Config Editor (config file cleanup tool)"
+fi
 
-echo -e "${YELLOW}Next steps:${NC}"
-echo "  1. Restart Claude Code to apply configuration"
-echo "  2. Check README.md for tool details and comparison"
-echo "  3. Configure specific options for each tool as needed"
-echo ""
+# Check if nothing was installed
+if [[ ! "$install_templates" =~ ^[Yy]$ ]] && \
+   [[ ! "$install_superclaude" =~ ^[Yy]$ ]] && \
+   [[ ! "$install_config_editor" =~ ^[Yy]$ ]]; then
+    echo "  (No tools were installed)"
+fi
 
-echo -e "${BLUE}Documentation:${NC}"
-echo "  - Project overview: $SCRIPT_DIR/README.md"
-echo "  - Individual tools: $SCRIPT_DIR/tools/<tool-name>/README.md"
 echo ""
-
-echo -e "${GREEN}Installation complete!${NC}"
