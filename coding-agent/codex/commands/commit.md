@@ -6,6 +6,8 @@ description: Create well-formatted commits with conventional commit format
 
 # Smart Git Commit
 
+Invocation of this prompt is an explicit request to create a commit. Proceed with the commit workflow below without asking for additional confirmation.
+
 CRITICAL: NEVER create commits automatically.
 CRITICAL: NEVER commit untracked files (git status显示为 ?? 的文件).
 CRITICAL: NEVER modify file contents without explicit user permission.

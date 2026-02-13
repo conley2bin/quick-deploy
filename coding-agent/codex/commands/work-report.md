@@ -6,6 +6,8 @@ description: Generate concise work contribution summary and save to markdown (de
 
 # Work Report Generator
 
+Invocation of this prompt is an explicit request to generate a work report using the workflow below. Proceed without additional confirmation.
+
 Generate concise work contribution summary by analyzing git commit history for specified time period.
 
 ## Usage

@@ -5,6 +5,8 @@ allowed-tools: Read
 
 # /prompts:remind - Load CLAUDE.md Guidelines
 
+Invocation of this prompt is an explicit request to load and apply ~/.claude/CLAUDE.md guidelines. Proceed without additional confirmation.
+
 Load and apply system-level development guidelines from ~/.claude/CLAUDE.md.
 
 ## What This Command Does

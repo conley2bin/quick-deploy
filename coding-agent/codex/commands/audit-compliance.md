@@ -11,6 +11,8 @@ personas: [architect, quality]
 
 # /prompts:audit-compliance - Code Compliance Audit
 
+Invocation of this prompt is an explicit request to run the audit-compliance workflow. Proceed without additional confirmation.
+
 ## Triggers
 - Code compliance verification against CLAUDE.md development principles
 - Architecture and code quality assessment based on established standards
