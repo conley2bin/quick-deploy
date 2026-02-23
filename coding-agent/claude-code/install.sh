@@ -4,7 +4,6 @@
 # ============================================================================
 #
 # Purpose: Install Anthropic's official Claude Code CLI
-# Method: Homebrew (recommended for best performance)
 #
 # Usage:
 #   chmod +x install.sh
