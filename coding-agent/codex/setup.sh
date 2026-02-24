@@ -438,6 +438,7 @@ if selected(1):
         command="uv",
         args_toml='["run","python","-m","piloty.mcp_server"]',
         cwd=piloty_dir,
+        startup_timeout_sec=60,
     )
 
 if selected(2):
