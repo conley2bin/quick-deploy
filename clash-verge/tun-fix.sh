@@ -265,16 +265,55 @@ EOF
 # 更新或创建直连规则
 update_direct_rules() {
     local file="$1"
+    local rules=(
+        "GEOIP,CN,DIRECT,no-resolve"
+        "DOMAIN-SUFFIX,cn,DIRECT"
+        "DOMAIN-SUFFIX,com.cn,DIRECT"
+        "DOMAIN-SUFFIX,gov.cn,DIRECT"
+        "DOMAIN-SUFFIX,edu.cn,DIRECT"
+        "DOMAIN-SUFFIX,bilibili.com,DIRECT"
+        "DOMAIN-SUFFIX,zhihu.com,DIRECT"
+        "DOMAIN-SUFFIX,huya.com,DIRECT"
+        "DOMAIN-SUFFIX,douyin.com,DIRECT"
+        "DOMAIN-SUFFIX,taobao.com,DIRECT"
+        "DOMAIN-SUFFIX,tmall.com,DIRECT"
+        "DOMAIN-SUFFIX,jd.com,DIRECT"
+        "DOMAIN-SUFFIX,qq.com,DIRECT"
+        "DOMAIN-SUFFIX,weixin.qq.com,DIRECT"
+        "DOMAIN-SUFFIX,baidu.com,DIRECT"
+        "DOMAIN-SUFFIX,so.com,DIRECT"
+        "DOMAIN-SUFFIX,sogou.com,DIRECT"
+        "DOMAIN-SUFFIX,360.cn,DIRECT"
+        "DOMAIN-SUFFIX,hao123.com,DIRECT"
+        "DOMAIN-SUFFIX,2345.com,DIRECT"
+        "DOMAIN-SUFFIX,163.com,DIRECT"
+        "DOMAIN-SUFFIX,sina.com.cn,DIRECT"
+        "DOMAIN-SUFFIX,weibo.com,DIRECT"
+        "DOMAIN-SUFFIX,ifeng.com,DIRECT"
+        "DOMAIN-SUFFIX,eastday.com,DIRECT"
+        "DOMAIN-SUFFIX,sohu.com,DIRECT"
+        "DOMAIN-SUFFIX,youku.com,DIRECT"
+        "DOMAIN-SUFFIX,iqiyi.com,DIRECT"
+        "DOMAIN-SUFFIX,mgtv.com,DIRECT"
+        "DOMAIN-SUFFIX,aliyun.com,DIRECT"
+        "DOMAIN-SUFFIX,alipay.com,DIRECT"
+        "DOMAIN-SUFFIX,tencent.com,DIRECT"
+        "DOMAIN-SUFFIX,bytedance.com,DIRECT"
+        "DOMAIN,cc.yiwen.lu,DIRECT"
+        "DOMAIN-SUFFIX,cn.bing.com,DIRECT"
+        "DOMAIN-SUFFIX,bing.com,DIRECT"
+        "DOMAIN-SUFFIX,github.com,DIRECT"
+        "DOMAIN-SUFFIX,githubusercontent.com,DIRECT"
+        "DOMAIN-SUFFIX,githubassets.com,DIRECT"
+        "DOMAIN-SUFFIX,github.io,DIRECT"
+        "IP-CIDR,192.168.0.0/16,DIRECT,no-resolve"
+        "IP-CIDR,10.0.0.0/8,DIRECT,no-resolve"
+        "IP-CIDR,172.16.0.0/12,DIRECT,no-resolve"
+        "DOMAIN-SUFFIX,local,DIRECT"
+    )
 
-    # 检查是否已存在 GitHub 直连规则
-    if grep -q "DOMAIN-SUFFIX,github.com,DIRECT" "$file"; then
-        echo "✓ GitHub 直连规则已存在"
-        return
-    fi
-
-    # 添加直连规则
-    cat >> "$file" << 'EOF'
-
+    local template
+    template=$(cat << 'EOF'
 prepend-rules:
   # 中国大陆 IP 直连（GeoIP 规则）
   - GEOIP,CN,DIRECT,no-resolve
@@ -327,8 +366,54 @@ prepend-rules:
   - IP-CIDR,172.16.0.0/12,DIRECT,no-resolve
   - DOMAIN-SUFFIX,local,DIRECT
 EOF
+)
 
-    echo "✓ 直连规则已添加 (中国大陆 + GitHub)"
+    if ! grep -q "^prepend-rules:" "$file"; then
+        printf "\\n%s\\n" "$template" >> "$file"
+        echo "直连规则已添加 (中国大陆 + GitHub)"
+        return
+    fi
+
+    local existing
+    existing=$(awk '
+        $0 ~ /^prepend-rules:/ {in_block=1; next}
+        in_block && $0 ~ /^[^[:space:]]/ {in_block=0}
+        in_block && $0 ~ /^[[:space:]]*-[[:space:]]*/ {
+            sub(/^[[:space:]]*-[[:space:]]*/, "", $0)
+            sub(/[[:space:]]+#.*/, "", $0)
+            sub(/[[:space:]]+$/, "", $0)
+            if ($0 != "") print $0
+        }
+    ' "$file")
+
+    declare -A rule_set
+    local rule
+    for rule in "${rules[@]}"; do
+        rule_set["$rule"]=1
+    done
+
+    local extras=()
+    while IFS= read -r rule; do
+        [ -z "$rule" ] && continue
+        if [ -z "${rule_set[$rule]+x}" ]; then
+            extras+=("$rule")
+        fi
+    done <<< "$existing"
+
+    local block="$template"
+    if [ ${#extras[@]} -gt 0 ]; then
+        block+=$'\\n'
+        block+=$(printf '  - %s\\n' "${extras[@]}")
+    fi
+
+    awk -v block="$block" '
+        BEGIN {in_block=0}
+        /^prepend-rules:/ {print block; in_block=1; next}
+        in_block && /^[^[:space:]]/ {in_block=0}
+        !in_block {print}
+    ' "$file" > "${file}.tmp" && mv "${file}.tmp" "$file"
+
+    echo "直连规则已更新 (中国大陆 + GitHub)"
 }
 
 # 配置 SSH (可选但推荐)
