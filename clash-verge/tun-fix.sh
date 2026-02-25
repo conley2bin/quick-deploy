@@ -294,17 +294,28 @@ prepend-rules:
   - DOMAIN-SUFFIX,qq.com,DIRECT
   - DOMAIN-SUFFIX,weixin.qq.com,DIRECT
   - DOMAIN-SUFFIX,baidu.com,DIRECT
+  - DOMAIN-SUFFIX,so.com,DIRECT
+  - DOMAIN-SUFFIX,sogou.com,DIRECT
+  - DOMAIN-SUFFIX,360.cn,DIRECT
+  - DOMAIN-SUFFIX,hao123.com,DIRECT
+  - DOMAIN-SUFFIX,2345.com,DIRECT
   - DOMAIN-SUFFIX,163.com,DIRECT
   - DOMAIN-SUFFIX,sina.com.cn,DIRECT
+  - DOMAIN-SUFFIX,weibo.com,DIRECT
+  - DOMAIN-SUFFIX,ifeng.com,DIRECT
+  - DOMAIN-SUFFIX,eastday.com,DIRECT
   - DOMAIN-SUFFIX,sohu.com,DIRECT
   - DOMAIN-SUFFIX,youku.com,DIRECT
   - DOMAIN-SUFFIX,iqiyi.com,DIRECT
+  - DOMAIN-SUFFIX,mgtv.com,DIRECT
   - DOMAIN-SUFFIX,aliyun.com,DIRECT
   - DOMAIN-SUFFIX,alipay.com,DIRECT
   - DOMAIN-SUFFIX,tencent.com,DIRECT
   - DOMAIN-SUFFIX,bytedance.com,DIRECT
+  - DOMAIN,cc.yiwen.lu,DIRECT
   # Bing 中国
   - DOMAIN-SUFFIX,cn.bing.com,DIRECT
+  - DOMAIN-SUFFIX,bing.com,DIRECT
   # GitHub SSH 直连（不走代理）
   - DOMAIN-SUFFIX,github.com,DIRECT
   - DOMAIN-SUFFIX,githubusercontent.com,DIRECT
