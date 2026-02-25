@@ -8,21 +8,31 @@ set -e
 CLASH_DIR="$HOME/.local/share/io.github.clash-verge-rev.clash-verge-rev"
 PROFILES_YAML="$CLASH_DIR/profiles.yaml"
 
-# 获取当前订阅使用的 Merge 配置文件
+# 获取全局 Merge 配置文件
 get_merge_config() {
-    local uid=$(grep "^current:" "$PROFILES_YAML" | awk '{print $2}')
-
-    # 从 profiles.yaml 中提取当前订阅关联的 merge 配置 UID
-    local merge_uid=$(awk -v uid="$uid" '
-        $0 ~ "uid: " uid {found=1}
-        found && /merge:/ {print $2; exit}
+    local merge_file=$(awk '
+        $0 ~ /^- uid: Merge$/ {found=1; next}
+        found && /file:/ {print $2; exit}
     ' "$PROFILES_YAML")
 
-    if [ -n "$merge_uid" ]; then
-        echo "$CLASH_DIR/profiles/${merge_uid}.yaml"
+    if [ -n "$merge_file" ]; then
+        echo "$CLASH_DIR/profiles/$merge_file"
     else
-        # 如果没有关联 merge 配置，使用全局 Merge.yaml
         echo "$CLASH_DIR/profiles/Merge.yaml"
+    fi
+}
+
+# 获取全局 Script 配置文件
+get_script_config() {
+    local script_file=$(awk '
+        $0 ~ /^- uid: Script$/ {found=1; next}
+        found && /file:/ {print $2; exit}
+    ' "$PROFILES_YAML")
+
+    if [ -n "$script_file" ]; then
+        echo "$CLASH_DIR/profiles/$script_file"
+    else
+        echo "$CLASH_DIR/profiles/Script.js"
     fi
 }
 
@@ -262,158 +272,109 @@ EOF
     echo "✓ TUN 配置已添加"
 }
 
-# 更新或创建直连规则
-update_direct_rules() {
+# 移除 prepend-rules（已改用全局脚本写入 rules）
+remove_prepend_rules() {
     local file="$1"
-    local rules=(
-        "GEOIP,CN,DIRECT,no-resolve"
-        "DOMAIN-SUFFIX,cn,DIRECT"
-        "DOMAIN-SUFFIX,com.cn,DIRECT"
-        "DOMAIN-SUFFIX,gov.cn,DIRECT"
-        "DOMAIN-SUFFIX,edu.cn,DIRECT"
-        "DOMAIN-SUFFIX,bilibili.com,DIRECT"
-        "DOMAIN-SUFFIX,zhihu.com,DIRECT"
-        "DOMAIN-SUFFIX,huya.com,DIRECT"
-        "DOMAIN-SUFFIX,douyin.com,DIRECT"
-        "DOMAIN-SUFFIX,taobao.com,DIRECT"
-        "DOMAIN-SUFFIX,tmall.com,DIRECT"
-        "DOMAIN-SUFFIX,jd.com,DIRECT"
-        "DOMAIN-SUFFIX,qq.com,DIRECT"
-        "DOMAIN-SUFFIX,weixin.qq.com,DIRECT"
-        "DOMAIN-SUFFIX,baidu.com,DIRECT"
-        "DOMAIN-SUFFIX,so.com,DIRECT"
-        "DOMAIN-SUFFIX,sogou.com,DIRECT"
-        "DOMAIN-SUFFIX,360.cn,DIRECT"
-        "DOMAIN-SUFFIX,hao123.com,DIRECT"
-        "DOMAIN-SUFFIX,2345.com,DIRECT"
-        "DOMAIN-SUFFIX,163.com,DIRECT"
-        "DOMAIN-SUFFIX,sina.com.cn,DIRECT"
-        "DOMAIN-SUFFIX,weibo.com,DIRECT"
-        "DOMAIN-SUFFIX,ifeng.com,DIRECT"
-        "DOMAIN-SUFFIX,eastday.com,DIRECT"
-        "DOMAIN-SUFFIX,sohu.com,DIRECT"
-        "DOMAIN-SUFFIX,youku.com,DIRECT"
-        "DOMAIN-SUFFIX,iqiyi.com,DIRECT"
-        "DOMAIN-SUFFIX,mgtv.com,DIRECT"
-        "DOMAIN-SUFFIX,aliyun.com,DIRECT"
-        "DOMAIN-SUFFIX,alipay.com,DIRECT"
-        "DOMAIN-SUFFIX,tencent.com,DIRECT"
-        "DOMAIN-SUFFIX,bytedance.com,DIRECT"
-        "DOMAIN,cc.yiwen.lu,DIRECT"
-        "DOMAIN-SUFFIX,cn.bing.com,DIRECT"
-        "DOMAIN-SUFFIX,bing.com,DIRECT"
-        "DOMAIN-SUFFIX,github.com,DIRECT"
-        "DOMAIN-SUFFIX,githubusercontent.com,DIRECT"
-        "DOMAIN-SUFFIX,githubassets.com,DIRECT"
-        "DOMAIN-SUFFIX,github.io,DIRECT"
-        "IP-CIDR,192.168.0.0/16,DIRECT,no-resolve"
-        "IP-CIDR,10.0.0.0/8,DIRECT,no-resolve"
-        "IP-CIDR,172.16.0.0/12,DIRECT,no-resolve"
-        "DOMAIN-SUFFIX,local,DIRECT"
-    )
-
-    local template
-    template=$(cat << 'EOF'
-prepend-rules:
-  # 中国大陆 IP 直连（GeoIP 规则）
-  - GEOIP,CN,DIRECT,no-resolve
-  # 中国大陆域名直连
-  - DOMAIN-SUFFIX,cn,DIRECT
-  - DOMAIN-SUFFIX,com.cn,DIRECT
-  - DOMAIN-SUFFIX,gov.cn,DIRECT
-  - DOMAIN-SUFFIX,edu.cn,DIRECT
-  # 常见中国网站直连
-  - DOMAIN-SUFFIX,bilibili.com,DIRECT
-  - DOMAIN-SUFFIX,zhihu.com,DIRECT
-  - DOMAIN-SUFFIX,huya.com,DIRECT
-  - DOMAIN-SUFFIX,douyin.com,DIRECT
-  - DOMAIN-SUFFIX,taobao.com,DIRECT
-  - DOMAIN-SUFFIX,tmall.com,DIRECT
-  - DOMAIN-SUFFIX,jd.com,DIRECT
-  - DOMAIN-SUFFIX,qq.com,DIRECT
-  - DOMAIN-SUFFIX,weixin.qq.com,DIRECT
-  - DOMAIN-SUFFIX,baidu.com,DIRECT
-  - DOMAIN-SUFFIX,so.com,DIRECT
-  - DOMAIN-SUFFIX,sogou.com,DIRECT
-  - DOMAIN-SUFFIX,360.cn,DIRECT
-  - DOMAIN-SUFFIX,hao123.com,DIRECT
-  - DOMAIN-SUFFIX,2345.com,DIRECT
-  - DOMAIN-SUFFIX,163.com,DIRECT
-  - DOMAIN-SUFFIX,sina.com.cn,DIRECT
-  - DOMAIN-SUFFIX,weibo.com,DIRECT
-  - DOMAIN-SUFFIX,ifeng.com,DIRECT
-  - DOMAIN-SUFFIX,eastday.com,DIRECT
-  - DOMAIN-SUFFIX,sohu.com,DIRECT
-  - DOMAIN-SUFFIX,youku.com,DIRECT
-  - DOMAIN-SUFFIX,iqiyi.com,DIRECT
-  - DOMAIN-SUFFIX,mgtv.com,DIRECT
-  - DOMAIN-SUFFIX,aliyun.com,DIRECT
-  - DOMAIN-SUFFIX,alipay.com,DIRECT
-  - DOMAIN-SUFFIX,tencent.com,DIRECT
-  - DOMAIN-SUFFIX,bytedance.com,DIRECT
-  - DOMAIN,cc.yiwen.lu,DIRECT
-  # Bing 中国
-  - DOMAIN-SUFFIX,cn.bing.com,DIRECT
-  - DOMAIN-SUFFIX,bing.com,DIRECT
-  # GitHub SSH 直连（不走代理）
-  - DOMAIN-SUFFIX,github.com,DIRECT
-  - DOMAIN-SUFFIX,githubusercontent.com,DIRECT
-  - DOMAIN-SUFFIX,githubassets.com,DIRECT
-  - DOMAIN-SUFFIX,github.io,DIRECT
-  # 本地网络直连
-  - IP-CIDR,192.168.0.0/16,DIRECT,no-resolve
-  - IP-CIDR,10.0.0.0/8,DIRECT,no-resolve
-  - IP-CIDR,172.16.0.0/12,DIRECT,no-resolve
-  - DOMAIN-SUFFIX,local,DIRECT
-EOF
-)
 
     if ! grep -q "^prepend-rules:" "$file"; then
-        printf "\\n%s\\n" "$template" >> "$file"
-        echo "直连规则已添加 (中国大陆 + GitHub)"
         return
     fi
 
-    local existing
-    existing=$(awk '
-        $0 ~ /^prepend-rules:/ {in_block=1; next}
-        in_block && $0 ~ /^[^[:space:]]/ {in_block=0}
-        in_block && $0 ~ /^[[:space:]]*-[[:space:]]*/ {
-            sub(/^[[:space:]]*-[[:space:]]*/, "", $0)
-            sub(/[[:space:]]+#.*/, "", $0)
-            sub(/[[:space:]]+$/, "", $0)
-            if ($0 != "") print $0
-        }
-    ' "$file")
-
-    declare -A rule_set
-    local rule
-    for rule in "${rules[@]}"; do
-        rule_set["$rule"]=1
-    done
-
-    local extras=()
-    while IFS= read -r rule; do
-        [ -z "$rule" ] && continue
-        if [ -z "${rule_set[$rule]+x}" ]; then
-            extras+=("$rule")
-        fi
-    done <<< "$existing"
-
-    local block="$template"
-    if [ ${#extras[@]} -gt 0 ]; then
-        block+=$'\\n'
-        block+=$(printf '  - %s\\n' "${extras[@]}")
-    fi
-
-    awk -v block="$block" '
-        BEGIN {in_block=0}
-        /^prepend-rules:/ {print block; in_block=1; next}
-        in_block && /^[^[:space:]]/ {in_block=0}
-        !in_block {print}
+    awk '
+        BEGIN {skip=0}
+        /^prepend-rules:/ {skip=1; next}
+        skip && /^[^[:space:]]/ {skip=0}
+        !skip {print}
     ' "$file" > "${file}.tmp" && mv "${file}.tmp" "$file"
 
-    echo "直连规则已更新 (中国大陆 + GitHub)"
+    echo "已移除 prepend-rules"
+}
+
+# 更新或创建直连规则
+update_direct_rules() {
+    local script_file
+    local timestamp
+
+    script_file=$(get_script_config)
+    timestamp=$(date +%Y%m%d_%H%M%S)
+
+    mkdir -p "$CLASH_DIR/profiles"
+
+    local backed_up=0
+    if [ -f "$script_file" ]; then
+        cp "$script_file" "$script_file.backup.$timestamp"
+        backed_up=1
+    fi
+
+    cat > "$script_file" << 'EOF'
+// Generated by tun-fix.sh
+
+function main(config) {
+  const prependRules = [
+    "GEOIP,CN,DIRECT,no-resolve",
+    "DOMAIN-SUFFIX,cn,DIRECT",
+    "DOMAIN-SUFFIX,com.cn,DIRECT",
+    "DOMAIN-SUFFIX,gov.cn,DIRECT",
+    "DOMAIN-SUFFIX,edu.cn,DIRECT",
+    "DOMAIN-SUFFIX,bilibili.com,DIRECT",
+    "DOMAIN-SUFFIX,zhihu.com,DIRECT",
+    "DOMAIN-SUFFIX,huya.com,DIRECT",
+    "DOMAIN-SUFFIX,douyin.com,DIRECT",
+    "DOMAIN-SUFFIX,taobao.com,DIRECT",
+    "DOMAIN-SUFFIX,tmall.com,DIRECT",
+    "DOMAIN-SUFFIX,jd.com,DIRECT",
+    "DOMAIN-SUFFIX,qq.com,DIRECT",
+    "DOMAIN-SUFFIX,weixin.qq.com,DIRECT",
+    "DOMAIN-SUFFIX,baidu.com,DIRECT",
+    "DOMAIN-SUFFIX,so.com,DIRECT",
+    "DOMAIN-SUFFIX,sogou.com,DIRECT",
+    "DOMAIN-SUFFIX,360.cn,DIRECT",
+    "DOMAIN-SUFFIX,hao123.com,DIRECT",
+    "DOMAIN-SUFFIX,2345.com,DIRECT",
+    "DOMAIN-SUFFIX,163.com,DIRECT",
+    "DOMAIN-SUFFIX,sina.com.cn,DIRECT",
+    "DOMAIN-SUFFIX,weibo.com,DIRECT",
+    "DOMAIN-SUFFIX,ifeng.com,DIRECT",
+    "DOMAIN-SUFFIX,eastday.com,DIRECT",
+    "DOMAIN-SUFFIX,sohu.com,DIRECT",
+    "DOMAIN-SUFFIX,youku.com,DIRECT",
+    "DOMAIN-SUFFIX,iqiyi.com,DIRECT",
+    "DOMAIN-SUFFIX,mgtv.com,DIRECT",
+    "DOMAIN-SUFFIX,aliyun.com,DIRECT",
+    "DOMAIN-SUFFIX,alipay.com,DIRECT",
+    "DOMAIN-SUFFIX,tencent.com,DIRECT",
+    "DOMAIN-SUFFIX,bytedance.com,DIRECT",
+    "DOMAIN,cc.yiwen.lu,DIRECT",
+    "DOMAIN-SUFFIX,cn.bing.com,DIRECT",
+    "DOMAIN-SUFFIX,bing.com,DIRECT",
+    "DOMAIN-SUFFIX,github.com,DIRECT",
+    "DOMAIN-SUFFIX,githubusercontent.com,DIRECT",
+    "DOMAIN-SUFFIX,githubassets.com,DIRECT",
+    "DOMAIN-SUFFIX,github.io,DIRECT",
+    "IP-CIDR,192.168.0.0/16,DIRECT,no-resolve",
+    "IP-CIDR,10.0.0.0/8,DIRECT,no-resolve",
+    "IP-CIDR,172.16.0.0/12,DIRECT,no-resolve",
+    "DOMAIN-SUFFIX,local,DIRECT"
+  ];
+
+  if (!Array.isArray(config.rules)) {
+    config.rules = [];
+  }
+
+  const existing = new Set(config.rules);
+  const toAdd = prependRules.filter(r => !existing.has(r));
+  if (toAdd.length > 0) {
+    config.rules = [...toAdd, ...config.rules];
+  }
+
+  return config;
+}
+EOF
+
+    echo "直连规则已写入全局脚本: $script_file"
+    if [ "$backed_up" -eq 1 ]; then
+        echo "脚本备份: $script_file.backup.$timestamp"
+    fi
 }
 
 # 配置 SSH (可选但推荐)
@@ -513,9 +474,11 @@ optimize_all() {
     echo "=========================================="
     echo ""
     echo "配置文件: $file"
-    echo "作用范围: 当前订阅 ($(get_profile_name))"
+    echo "作用范围: 全局 (所有订阅)"
     echo ""
 
+    clear_subscription_merge
+    remove_prepend_rules "$file"
     update_fake_ip_filter "$file"
     update_tun_config "$file"
     update_direct_rules "$file"
@@ -532,14 +495,14 @@ optimize_all() {
     echo ""
     echo "✓ TUN 模式: 已配置 (排除本地网络)"
     echo ""
-    echo "✓ 直连规则: 已配置"
+    echo "✓ 直连规则: 已写入全局脚本"
     echo "  - 中国大陆 IP (GEOIP,CN)"
     echo "  - 中国域名 (.cn, .com.cn)"
     echo "  - 常见中国网站 (B站、知乎、抖音、淘宝等)"
     echo "  - GitHub (不走代理)"
     echo ""
     echo "下一步:"
-    echo "  1. 重启 Clash Verge 使配置生效"
+    echo "  1. 重启或重新启用 Clash Verge 使配置生效"
     echo "  2. [推荐] 配置 SSH (选择菜单选项 2)"
     echo "     - 使用端口 443 提高稳定性"
     echo "     - 避免间歇性连接失败"
@@ -547,12 +510,11 @@ optimize_all() {
     echo "  4. 测试 Git: git fetch 或 git push"
     echo ""
     echo "注意:"
-    echo "  - 配置针对当前订阅有效"
+    echo "  - 配置对所有订阅有效"
     echo "  - 中国大陆网站已配置直连 (不走代理，节省流量)"
     echo "  - GitHub SSH 已配置直连 (不走代理)"
     echo "  - DNS 层: 主域名和通配符都已添加"
-    echo "  - 路由层: 中国 IP + GitHub 流量直连规则已添加"
-    echo "  - 切换订阅需要重新运行脚本"
+    echo "  - 规则层: 直连规则已写入全局脚本"
     echo ""
 }
 
@@ -566,10 +528,210 @@ show_menu() {
     echo "  1. 一键优化 Clash 配置 (推荐)"
     echo "  2. 配置 SSH for GitHub (可选但推荐)"
     echo "  3. 查看 Merge 配置文件路径"
+    echo "  4. 备份管理"
     echo "  0. 退出"
     echo ""
     echo "=========================================="
-    echo -n "请选择 [0-3]: "
+    echo -n "请选择 [0-4]: "
+}
+
+# 清空订阅级 Merge（保留备份）
+clear_subscription_merge() {
+    local timestamp=$(date +%Y%m%d_%H%M%S)
+    local merge_list
+    local sub_merge_uids
+    local uid
+    local file
+    local path
+
+    merge_list=$(awk '
+        $0 ~ /^- uid: / {uid=$3; type=""; file=""}
+        $0 ~ /^  type: / {type=$2}
+        $0 ~ /^  file: / {file=$2; if (type=="merge" && file!="") print uid, file}
+    ' "$PROFILES_YAML")
+
+    declare -A merge_files
+    while IFS= read -r uid file; do
+        [ -z "$uid" ] && continue
+        merge_files["$uid"]="$file"
+    done <<< "$merge_list"
+
+    sub_merge_uids=$(awk '
+        $0 ~ /^- uid: / {type=""; in_option=0}
+        $0 ~ /^  type: / {type=$2}
+        $0 ~ /^  option:$/ {in_option=1; next}
+        in_option && /^  [^[:space:]]/ {in_option=0}
+        in_option && /merge:/ {
+            if (type=="remote") print $2
+        }
+    ' "$PROFILES_YAML" | sort -u)
+
+    if [ -z "$sub_merge_uids" ]; then
+        echo "未找到订阅级 merge 记录"
+        return
+    fi
+
+    for uid in $sub_merge_uids; do
+        if [ "$uid" = "Merge" ]; then
+            continue
+        fi
+        file="${merge_files[$uid]}"
+        if [ -z "$file" ]; then
+            echo "未找到 merge 文件: $uid"
+            continue
+        fi
+        path="$CLASH_DIR/profiles/$file"
+        if [ ! -f "$path" ]; then
+            echo "文件不存在: $path"
+            continue
+        fi
+        cp "$path" "$path.backup.$timestamp"
+        printf "# 订阅级 Merge 为空\n" > "$path"
+        echo "已清空: $path (备份: ${path}.backup.${timestamp})"
+    done
+}
+
+# 备份管理
+get_backup_files() {
+    local dir="$CLASH_DIR/profiles"
+    find "$dir" -maxdepth 1 -type f -name "*.backup.*" -printf "%f\n" \
+        | awk -F'.backup.' 'NF>1{print $2 "|" $0}' \
+        | sort \
+        | awk -F'|' '{print $2}'
+}
+
+list_backups() {
+    local dir="$CLASH_DIR/profiles"
+    mapfile -t files < <(get_backup_files)
+
+    if [ ${#files[@]} -eq 0 ]; then
+        echo "未找到备份文件"
+        return
+    fi
+
+    printf "%-4s %-28s %-19s %s\n" "序号" "原文件" "备份时间" "大小(bytes)"
+    local i=1
+    local f
+    for f in "${files[@]}"; do
+        local orig="${f%%.backup.*}"
+        local ts="${f##*.backup.}"
+        local ts_date="${ts%%_*}"
+        local ts_time="${ts##*_}"
+        local ts_fmt="${ts_date:0:4}-${ts_date:4:2}-${ts_date:6:2} ${ts_time:0:2}:${ts_time:2:2}:${ts_time:4:2}"
+        local size
+        size=$(stat -c %s "$dir/$f" 2>/dev/null || echo "0")
+        printf "%-4s %-28s %-19s %s\n" "$i" "$orig" "$ts_fmt" "$size"
+        i=$((i+1))
+    done
+}
+
+restore_backup() {
+    local dir="$CLASH_DIR/profiles"
+    mapfile -t files < <(get_backup_files)
+
+    if [ ${#files[@]} -eq 0 ]; then
+        echo "未找到备份文件"
+        return
+    fi
+
+    list_backups
+    echo -n "选择序号以恢复: "
+    read idx
+
+    if ! [[ "$idx" =~ ^[0-9]+$ ]] || [ "$idx" -lt 1 ] || [ "$idx" -gt ${#files[@]} ]; then
+        echo "无效选择"
+        return
+    fi
+
+    local file="${files[$((idx-1))]}"
+    local orig="${file%%.backup.*}"
+    cp -f "$dir/$file" "$dir/$orig"
+    echo "已恢复: $orig"
+}
+
+cleanup_backups() {
+    local dir="$CLASH_DIR/profiles"
+    mapfile -t files < <(get_backup_files)
+
+    if [ ${#files[@]} -eq 0 ]; then
+        echo "没有符合条件的备份"
+        return
+    fi
+
+    echo -n "输入序号(空格分隔)或 all: "
+    read selection
+
+    if [ -z "$selection" ]; then
+        echo "无效选择"
+        return
+    fi
+
+    local to_delete=()
+    if [ "$selection" = "all" ]; then
+        to_delete=("${files[@]}")
+    else
+        local idx
+        for idx in $selection; do
+            if ! [[ "$idx" =~ ^[0-9]+$ ]] || [ "$idx" -lt 1 ] || [ "$idx" -gt ${#files[@]} ]; then
+                echo "无效序号: $idx"
+                return
+            fi
+            to_delete+=("${files[$((idx-1))]}")
+        done
+    fi
+
+    echo "以下备份将被删除:"
+    local f
+    for f in "${to_delete[@]}"; do
+        echo "  $f"
+    done
+    echo -n "确认删除? [y/N]: "
+    read confirm
+    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+        echo "已取消"
+        return
+    fi
+
+    local count=0
+    for f in "${to_delete[@]}"; do
+        rm -f "$dir/$f"
+        count=$((count+1))
+    done
+    echo "已删除 $count 个备份"
+}
+
+backup_menu() {
+    while true; do
+        echo ""
+        echo "=========================================="
+        echo "  备份管理"
+        echo "=========================================="
+        echo ""
+        list_backups
+        echo ""
+        echo "  1. 恢复备份"
+        echo "  2. 清理备份"
+        echo "  0. 返回"
+        echo ""
+        echo "=========================================="
+        echo -n "请选择 [0-2]: "
+        read choice
+
+        case $choice in
+            1)
+                restore_backup
+                ;;
+            2)
+                cleanup_backups
+                ;;
+            0)
+                return
+                ;;
+            *)
+                echo "无效选择"
+                ;;
+        esac
+    done
 }
 
 # 主程序
@@ -602,29 +764,30 @@ main() {
                 echo "  $MERGE_CONFIG"
                 echo ""
                 echo "核心作用:"
-                echo "  这是当前订阅的 Merge 增强配置"
+                echo "  这是全局 Merge 增强配置"
                 echo "  与订阅配置合并后生效"
                 echo ""
                 echo "包含内容:"
                 echo "  - dns.fake-ip-filter: DNS 过滤规则"
                 echo "  - tun: TUN 模式配置"
-                echo "  - prepend-rules: 分流规则（GitHub 直连）"
                 echo ""
                 echo "脚本修改内容:"
                 echo "  ✓ DNS 层: 添加 fake-ip-filter (包含主域名和通配符)"
                 echo "  ✓ 路由层: 添加 TUN + exclude-routes"
-                echo "  ✓ 规则层: 添加 GitHub 直连规则（不走代理）"
+                echo "  ✓ 规则层: 写入全局脚本插入直连规则"
                 echo ""
                 echo "优势:"
                 echo "  - 订阅更新不会影响此配置"
                 echo "  - 配置持久化，无需重复设置"
                 echo ""
                 echo "注意:"
-                echo "  - 此配置仅对当前订阅有效"
-                echo "  - 切换到其他订阅需要重新运行脚本"
+                echo "  - 此配置对所有订阅有效"
                 echo ""
                 echo "=========================================="
                 echo ""
+                ;;
+            4)
+                backup_menu
                 ;;
             0)
                 exit 0
