@@ -67,7 +67,7 @@ dns:
     - '*.bytedance.com'
     - 'dingtalk.com'
     - '*.dingtalk.com'
-    # GitHub SSH 支持（主域名 + 通配符）
+    # GitHub 支持（主域名 + 通配符）
     - 'github.com'
     - '*.github.com'
     - 'githubusercontent.com'
@@ -143,7 +143,7 @@ EOF
     - '*.bytedance.com'
     - 'dingtalk.com'
     - '*.dingtalk.com'
-    # GitHub SSH 支持（主域名 + 通配符）
+    # GitHub 支持（主域名 + 通配符）
     - 'github.com'
     - '*.github.com'
     - 'githubusercontent.com'
@@ -202,7 +202,7 @@ dns:
     - '*.bytedance.com'
     - 'dingtalk.com'
     - '*.dingtalk.com'
-    # GitHub SSH 支持（主域名 + 通配符）
+    # GitHub 支持（主域名 + 通配符）
     - 'github.com'
     - '*.github.com'
     - 'githubusercontent.com'
@@ -242,7 +242,7 @@ dns:
 EOF
     fi
 
-    echo "pass Fake-IP Filter 已更新 (GitHub SSH 支持主域名和通配符)"
+    echo "pass Fake-IP Filter 已更新 (GitHub 主域名和通配符)"
 }
 
 # 更新或创建 TUN 配置
@@ -373,93 +373,6 @@ EOF
     fi
 }
 
-# 配置 SSH (可选但推荐)
-configure_ssh() {
-    local ssh_config="$HOME/.ssh/config"
-    local timestamp=$(date +%Y%m%d_%H%M%S)
-
-    echo ""
-    echo "==========================================="
-    echo "  配置 SSH for GitHub (可选但推荐)"
-    echo "==========================================="
-    echo ""
-    echo "此配置将优化 GitHub SSH 连接的稳定性："
-    echo "  1. 使用端口 443 (HTTPS端口) 替代默认的 22"
-    echo "     - 更稳定，避免防火墙限制"
-    echo "     - GitHub 官方推荐方案"
-    echo "  2. 禁用连接复用 (ControlMaster)"
-    echo "     - 避免间歇性连接失败"
-    echo "     - 解决 GitHub 2% SSH 失败率问题"
-    echo ""
-
-    # 检查是否已配置
-    if [ -f "$ssh_config" ] && grep -q "^Host github.com" "$ssh_config"; then
-        echo "warning  检测到 ~/.ssh/config 中已存在 GitHub 配置"
-        echo ""
-        grep -A 10 "^Host github.com" "$ssh_config"
-        echo ""
-        echo -n "是否覆盖现有配置？[y/N]: "
-        read overwrite
-        if [[ ! "$overwrite" =~ ^[Yy]$ ]]; then
-            echo "已取消 SSH 配置"
-            return
-        fi
-
-        # 备份并移除旧配置
-        cp "$ssh_config" "$ssh_config.backup.$timestamp"
-        echo "pass 已备份原配置到: $ssh_config.backup.$timestamp"
-
-        # 移除旧的 GitHub 配置（包括注释）
-        # 删除从 GitHub 注释开始到 Host github.com 配置块结束的所有内容
-        sed -i '/# GitHub SSH over HTTPS port/,/ControlPersist no/d' "$ssh_config"
-        # 清理可能残留的空行
-        sed -i '/^$/N;/^\n$/d' "$ssh_config"
-    fi
-
-    echo ""
-    echo "正在添加 SSH 配置..."
-
-    # 确保 .ssh 目录存在
-    mkdir -p "$HOME/.ssh"
-    chmod 700 "$HOME/.ssh"
-
-    # 备份现有配置（如果存在且未备份）
-    if [ -f "$ssh_config" ] && [ ! -f "$ssh_config.backup.$timestamp" ]; then
-        cp "$ssh_config" "$ssh_config.backup.$timestamp"
-        echo "pass 已备份原配置到: $ssh_config.backup.$timestamp"
-    fi
-
-    # 添加配置
-    cat >> "$ssh_config" << 'EOF'
-
-# GitHub SSH over HTTPS port (443) - 最可靠的解决方案
-# 原因：
-# 1. 端口 443 比端口 22 更稳定（GitHub 官方推荐用于防火墙受限环境）
-# 2. 禁用 ControlMaster 避免连接复用导致的间歇性失败
-Host github.com
-    Hostname ssh.github.com
-    Port 443
-    User git
-    # 禁用连接复用避免间歇性问题
-    ControlMaster no
-    ControlPath none
-    ControlPersist no
-EOF
-
-    # 设置权限
-    chmod 600 "$ssh_config"
-
-    echo ""
-    echo "pass SSH 配置已添加到 ~/.ssh/config"
-    echo ""
-    echo "测试连接:"
-    echo "  ssh -T git@github.com"
-    echo ""
-    echo "预期输出:"
-    echo "  Hi <your-username>! You've successfully authenticated, but GitHub does not provide shell access."
-    echo ""
-}
-
 # 一键优化
 optimize_all() {
     local file="$1"
@@ -498,11 +411,7 @@ optimize_all() {
     echo ""
     echo "下一步:"
     echo "  1. 重启或重新启用 Clash Verge 使配置生效"
-    echo "  2. [推荐] 配置 SSH (选择菜单选项 2)"
-    echo "     - 使用端口 443 提高稳定性"
-    echo "     - 避免间歇性连接失败"
-    echo "  3. 测试 SSH: ssh -T git@github.com"
-    echo "  4. 测试 Git: git fetch 或 git push"
+    echo "  2. 测试 Git: git fetch 或 git push"
     echo ""
     echo "注意:"
     echo "  - 配置对所有订阅有效"
@@ -520,13 +429,12 @@ show_menu() {
     echo "=========================================="
     echo ""
     echo "  1. 一键优化 Clash 配置 (推荐)"
-    echo "  2. 配置 SSH for GitHub (可选但推荐)"
-    echo "  3. 查看 Merge 配置文件路径"
-    echo "  4. 备份管理"
+    echo "  2. 查看 Merge 配置文件路径"
+    echo "  3. 备份管理"
     echo "  0. 退出"
     echo ""
     echo "=========================================="
-    echo -n "请选择 [0-4]: "
+    echo -n "请选择 [0-3]: "
 }
 
 # 清空订阅级 Merge（保留备份）
@@ -746,9 +654,6 @@ main() {
                 optimize_all "$MERGE_CONFIG"
                 ;;
             2)
-                configure_ssh
-                ;;
-            3)
                 echo ""
                 echo "=========================================="
                 echo "Merge 配置文件"
@@ -780,7 +685,7 @@ main() {
                 echo "=========================================="
                 echo ""
                 ;;
-            4)
+            3)
                 backup_menu
                 ;;
             0)
