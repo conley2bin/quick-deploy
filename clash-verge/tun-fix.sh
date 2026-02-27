@@ -116,7 +116,7 @@ tun:
     - 172.16.0.0/12
     - 127.0.0.0/8
 EOF
-        echo "✓ Merge 配置已创建"
+        echo "pass Merge 配置已创建"
         return
     fi
 
@@ -242,7 +242,7 @@ dns:
 EOF
     fi
 
-    echo "✓ Fake-IP Filter 已更新 (GitHub SSH 支持主域名和通配符)"
+    echo "pass Fake-IP Filter 已更新 (GitHub SSH 支持主域名和通配符)"
 }
 
 # 更新或创建 TUN 配置
@@ -250,7 +250,7 @@ update_tun_config() {
     local file="$1"
 
     if grep -q "^tun:" "$file"; then
-        echo "✓ TUN 配置已存在"
+        echo "pass TUN 配置已存在"
         return
     fi
 
@@ -269,7 +269,7 @@ tun:
     - 127.0.0.0/8
 EOF
 
-    echo "✓ TUN 配置已添加"
+    echo "pass TUN 配置已添加"
 }
 
 # 移除 prepend-rules（已改用全局脚本写入 rules）
@@ -347,10 +347,6 @@ function main(config) {
     "DOMAIN,cc.yiwen.lu,DIRECT",
     "DOMAIN-SUFFIX,cn.bing.com,DIRECT",
     "DOMAIN-SUFFIX,bing.com,DIRECT",
-    "DOMAIN-SUFFIX,github.com,DIRECT",
-    "DOMAIN-SUFFIX,githubusercontent.com,DIRECT",
-    "DOMAIN-SUFFIX,githubassets.com,DIRECT",
-    "DOMAIN-SUFFIX,github.io,DIRECT",
     "IP-CIDR,192.168.0.0/16,DIRECT,no-resolve",
     "IP-CIDR,10.0.0.0/8,DIRECT,no-resolve",
     "IP-CIDR,172.16.0.0/12,DIRECT,no-resolve",
@@ -398,7 +394,7 @@ configure_ssh() {
 
     # 检查是否已配置
     if [ -f "$ssh_config" ] && grep -q "^Host github.com" "$ssh_config"; then
-        echo "⚠️  检测到 ~/.ssh/config 中已存在 GitHub 配置"
+        echo "warning  检测到 ~/.ssh/config 中已存在 GitHub 配置"
         echo ""
         grep -A 10 "^Host github.com" "$ssh_config"
         echo ""
@@ -411,7 +407,7 @@ configure_ssh() {
 
         # 备份并移除旧配置
         cp "$ssh_config" "$ssh_config.backup.$timestamp"
-        echo "✓ 已备份原配置到: $ssh_config.backup.$timestamp"
+        echo "pass 已备份原配置到: $ssh_config.backup.$timestamp"
 
         # 移除旧的 GitHub 配置（包括注释）
         # 删除从 GitHub 注释开始到 Host github.com 配置块结束的所有内容
@@ -430,7 +426,7 @@ configure_ssh() {
     # 备份现有配置（如果存在且未备份）
     if [ -f "$ssh_config" ] && [ ! -f "$ssh_config.backup.$timestamp" ]; then
         cp "$ssh_config" "$ssh_config.backup.$timestamp"
-        echo "✓ 已备份原配置到: $ssh_config.backup.$timestamp"
+        echo "pass 已备份原配置到: $ssh_config.backup.$timestamp"
     fi
 
     # 添加配置
@@ -454,7 +450,7 @@ EOF
     chmod 600 "$ssh_config"
 
     echo ""
-    echo "✓ SSH 配置已添加到 ~/.ssh/config"
+    echo "pass SSH 配置已添加到 ~/.ssh/config"
     echo ""
     echo "测试连接:"
     echo "  ssh -T git@github.com"
@@ -488,18 +484,17 @@ optimize_all() {
     echo "  配置完成！"
     echo "=========================================="
     echo ""
-    echo "✓ Fake-IP Filter: 已配置 (主域名 + 通配符)"
+    echo "pass Fake-IP Filter: 已配置 (主域名 + 通配符)"
     echo "  - 本地网络 (*.local, *.lan)"
     echo "  - 企业应用 (飞书、钉钉、字节跳动)"
     echo "  - GitHub (github.com, *.github.com, 等)"
     echo ""
-    echo "✓ TUN 模式: 已配置 (排除本地网络)"
+    echo "pass TUN 模式: 已配置 (排除本地网络)"
     echo ""
-    echo "✓ 直连规则: 已写入全局脚本"
+    echo "pass 直连规则: 已写入全局脚本"
     echo "  - 中国大陆 IP (GEOIP,CN)"
     echo "  - 中国域名 (.cn, .com.cn)"
     echo "  - 常见中国网站 (B站、知乎、抖音、淘宝等)"
-    echo "  - GitHub (不走代理)"
     echo ""
     echo "下一步:"
     echo "  1. 重启或重新启用 Clash Verge 使配置生效"
@@ -512,7 +507,6 @@ optimize_all() {
     echo "注意:"
     echo "  - 配置对所有订阅有效"
     echo "  - 中国大陆网站已配置直连 (不走代理，节省流量)"
-    echo "  - GitHub SSH 已配置直连 (不走代理)"
     echo "  - DNS 层: 主域名和通配符都已添加"
     echo "  - 规则层: 直连规则已写入全局脚本"
     echo ""
@@ -772,9 +766,9 @@ main() {
                 echo "  - tun: TUN 模式配置"
                 echo ""
                 echo "脚本修改内容:"
-                echo "  ✓ DNS 层: 添加 fake-ip-filter (包含主域名和通配符)"
-                echo "  ✓ 路由层: 添加 TUN + exclude-routes"
-                echo "  ✓ 规则层: 写入全局脚本插入直连规则"
+                echo "  pass DNS 层: 添加 fake-ip-filter (包含主域名和通配符)"
+                echo "  pass 路由层: 添加 TUN + exclude-routes"
+                echo "  pass 规则层: 写入全局脚本插入直连规则"
                 echo ""
                 echo "优势:"
                 echo "  - 订阅更新不会影响此配置"
