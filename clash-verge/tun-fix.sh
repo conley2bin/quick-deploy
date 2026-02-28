@@ -373,6 +373,84 @@ EOF
     fi
 }
 
+# 配置 SSH (可选)
+configure_ssh() {
+    local ssh_config="$HOME/.ssh/config"
+    local timestamp=$(date +%Y%m%d_%H%M%S)
+
+    echo ""
+    echo "==========================================="
+    echo "  配置 SSH for GitHub (可选)"
+    echo "==========================================="
+    echo ""
+    echo "此配置将修改 GitHub SSH 连接方式:"
+    echo "  1. 使用端口 443 连接 ssh.github.com"
+    echo "     - 规避部分网络对 22 端口的阻断"
+    echo "  2. 禁用连接复用 (ControlMaster)"
+    echo "     - 避免复用连接引发的握手失败"
+    echo ""
+
+    # 检查是否已配置
+    if [ -f "$ssh_config" ] && grep -q "^Host github.com" "$ssh_config"; then
+        echo "warning  检测到 ~/.ssh/config 中已存在 GitHub 配置"
+        echo ""
+        grep -A 10 "^Host github.com" "$ssh_config"
+        echo ""
+        echo -n "是否覆盖现有配置？[y/N]: "
+        read overwrite
+        if [[ ! "$overwrite" =~ ^[Yy]$ ]]; then
+            echo "已取消 SSH 配置"
+            return
+        fi
+
+        # 备份并移除旧配置
+        cp "$ssh_config" "$ssh_config.backup.$timestamp"
+        echo "pass 已备份原配置到: $ssh_config.backup.$timestamp"
+
+        # 移除旧的 GitHub 配置（包括注释）
+        sed -i '/# GitHub SSH over HTTPS port/,/ControlPersist no/d' "$ssh_config"
+        sed -i '/^$/N;/^\n$/d' "$ssh_config"
+    fi
+
+    echo ""
+    echo "正在添加 SSH 配置..."
+
+    # 确保 .ssh 目录存在
+    mkdir -p "$HOME/.ssh"
+    chmod 700 "$HOME/.ssh"
+
+    # 备份现有配置（如果存在且未备份）
+    if [ -f "$ssh_config" ] && [ ! -f "$ssh_config.backup.$timestamp" ]; then
+        cp "$ssh_config" "$ssh_config.backup.$timestamp"
+        echo "pass 已备份原配置到: $ssh_config.backup.$timestamp"
+    fi
+
+    # 添加配置
+    cat >> "$ssh_config" << 'EOF'
+
+# GitHub SSH over HTTPS port (443)
+# 原因：
+# 1. 443 端口通常可用，22 端口在部分网络被阻断
+# 2. 禁用 ControlMaster 规避连接复用引发的握手失败
+Host github.com
+    Hostname ssh.github.com
+    Port 443
+    User git
+    ControlMaster no
+    ControlPath none
+    ControlPersist no
+EOF
+
+    chmod 600 "$ssh_config"
+
+    echo ""
+    echo "pass SSH 配置已添加到 ~/.ssh/config"
+    echo ""
+    echo "测试连接:"
+    echo "  ssh -T git@github.com"
+    echo ""
+}
+
 # 一键优化
 optimize_all() {
     local file="$1"
@@ -429,12 +507,13 @@ show_menu() {
     echo "=========================================="
     echo ""
     echo "  1. 一键优化 Clash 配置 (推荐)"
-    echo "  2. 查看 Merge 配置文件路径"
-    echo "  3. 备份管理"
+    echo "  2. 配置 SSH for GitHub (可选)"
+    echo "  3. 查看 Merge 配置文件路径"
+    echo "  4. 备份管理"
     echo "  0. 退出"
     echo ""
     echo "=========================================="
-    echo -n "请选择 [0-3]: "
+    echo -n "请选择 [0-4]: "
 }
 
 # 清空订阅级 Merge（保留备份）
@@ -654,6 +733,9 @@ main() {
                 optimize_all "$MERGE_CONFIG"
                 ;;
             2)
+                configure_ssh
+                ;;
+            3)
                 echo ""
                 echo "=========================================="
                 echo "Merge 配置文件"
@@ -685,7 +767,7 @@ main() {
                 echo "=========================================="
                 echo ""
                 ;;
-            3)
+            4)
                 backup_menu
                 ;;
             0)
