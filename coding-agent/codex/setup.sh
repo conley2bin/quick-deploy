@@ -38,11 +38,6 @@ mkdir -p "${CODEX_HOME}"
 
 need_cmd codex
 need_cmd python3
-need_cmd zsh
-
-if [[ ! -f "${ZSHRC_PATH}" ]]; then
-  echo "warning: 未找到 ${ZSHRC_PATH}（将无法从 ~/.zshrc 检查/读取 API key）"
-fi
 
 backup_file_if_exists() {
   local path="$1"
@@ -258,93 +253,111 @@ print(str(zshrc_path))
 PY
 }
 
-# 运行后输出：需要 key 的 MCP 及当前是否已设置（不回显 key 内容）
-echo ""
-echo "API key 检查结果（只检查你本机环境/~/.zshrc；不会输出 key 内容）："
-show_key_status "mu_mcp" "OPENROUTER_API_KEY"
-show_key_status "tavily" "TAVILY_API_KEY"
-show_key_status "morph" "MORPH_API_KEY"
+if has_choice 2 || has_choice 4 || has_choice 5; then
+  need_cmd zsh
+  if [[ ! -f "${ZSHRC_PATH}" ]]; then
+    echo "warning: 未找到 ${ZSHRC_PATH}（将无法从 ~/.zshrc 检查/读取 API key）"
+  fi
 
-# 只针对“你选择的项”检查是否缺 key，并提供补全
-missing_pairs=()
-missing_hints=()
-if has_choice 2; then
-  if [[ -z "${OPENROUTER_API_KEY-}" && -z "$(zshrc_value OPENROUTER_API_KEY)" ]]; then
-    missing_pairs+=("OPENROUTER_API_KEY")
-    missing_hints+=("mu_mcp:OPENROUTER_API_KEY")
-  fi
-fi
-if has_choice 4; then
-  if [[ -z "${TAVILY_API_KEY-}" && -z "$(zshrc_value TAVILY_API_KEY)" ]]; then
-    missing_pairs+=("TAVILY_API_KEY")
-    missing_hints+=("tavily:TAVILY_API_KEY")
-  fi
-fi
-if has_choice 5; then
-  if [[ -z "${MORPH_API_KEY-}" && -z "$(zshrc_value MORPH_API_KEY)" ]]; then
-    missing_pairs+=("MORPH_API_KEY")
-    missing_hints+=("morph:MORPH_API_KEY")
-  fi
-fi
-
-if ((${#missing_pairs[@]} > 0)); then
+  # 运行后输出：需要 key 的 MCP 及当前是否已设置（不回显 key 内容）
   echo ""
-  echo "检测到你选择的 MCP 缺少 API key："
-  for item in "${missing_hints[@]}"; do
-    mcp="${item%%:*}"
-    var="${item##*:}"
-    echo "  - ${mcp} 需要 ${var}"
-  done
-  echo ""
-  printf "是否现在填写并写入 %s ？[y/N] " "${ZSHRC_PATH}"
-  read -r fill_now || true
-  fill_now="$(echo "${fill_now:-}" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')"
+  echo "API key 检查结果（只检查你本机环境/~/.zshrc；不会输出 key 内容）："
+  if has_choice 2; then
+    show_key_status "mu_mcp" "OPENROUTER_API_KEY"
+  fi
+  if has_choice 4; then
+    show_key_status "tavily" "TAVILY_API_KEY"
+  fi
+  if has_choice 5; then
+    show_key_status "morph" "MORPH_API_KEY"
+  fi
 
-  if [[ "${fill_now}" == "y" || "${fill_now}" == "yes" ]]; then
-    [[ -f "${ZSHRC_PATH}" ]] || die "找不到 ${ZSHRC_PATH}（请先创建或使用 ZSHRC_PATH 指定路径）"
+  # 只针对“你选择的项”检查是否缺 key，并提供补全
+  missing_pairs=()
+  missing_hints=()
+  if has_choice 2; then
+    if [[ -z "${OPENROUTER_API_KEY-}" && -z "$(zshrc_value OPENROUTER_API_KEY)" ]]; then
+      missing_pairs+=("OPENROUTER_API_KEY")
+      missing_hints+=("mu_mcp:OPENROUTER_API_KEY")
+    fi
+  fi
+  if has_choice 4; then
+    if [[ -z "${TAVILY_API_KEY-}" && -z "$(zshrc_value TAVILY_API_KEY)" ]]; then
+      missing_pairs+=("TAVILY_API_KEY")
+      missing_hints+=("tavily:TAVILY_API_KEY")
+    fi
+  fi
+  if has_choice 5; then
+    if [[ -z "${MORPH_API_KEY-}" && -z "$(zshrc_value MORPH_API_KEY)" ]]; then
+      missing_pairs+=("MORPH_API_KEY")
+      missing_hints+=("morph:MORPH_API_KEY")
+    fi
+  fi
 
-    to_write_args=()
-    did_write_keys="0"
+  if ((${#missing_pairs[@]} > 0)); then
+    echo ""
+    echo "检测到你选择的 MCP 缺少 API key："
     for item in "${missing_hints[@]}"; do
       mcp="${item%%:*}"
       var="${item##*:}"
-      echo ""
-      echo "请粘贴 ${mcp} 的 ${var}："
-      printf "> "
-      read -r val || true
-      val="${val:-}"
-      if [[ -z "${val}" ]]; then
-        echo "跳过：${var} 为空"
-        continue
-      fi
-      to_write_args+=("${var}=${val}")
+      echo "  - ${mcp} 需要 ${var}"
     done
+    echo ""
+    printf "是否现在填写并写入 %s ？[y/N] " "${ZSHRC_PATH}"
+    read -r fill_now || true
+    fill_now="$(echo "${fill_now:-}" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')"
 
-    if ((${#to_write_args[@]} > 0)); then
-      echo ""
-      echo "正在写入 ${ZSHRC_PATH}（会自动备份为 *.backup.TIMESTAMP）..."
-      _written_path="$(upsert_keys_to_zshrc "${ZSHRC_PATH}" "${to_write_args[@]}")"
-      did_write_keys="1"
-      echo "已写入：${_written_path}"
-      echo "提示：新开终端或执行：source ${ZSHRC_PATH}"
+    if [[ "${fill_now}" == "y" || "${fill_now}" == "yes" ]]; then
+      [[ -f "${ZSHRC_PATH}" ]] || die "找不到 ${ZSHRC_PATH}（请先创建或使用 ZSHRC_PATH 指定路径）"
+
+      to_write_args=()
+      did_write_keys="0"
+      for item in "${missing_hints[@]}"; do
+        mcp="${item%%:*}"
+        var="${item##*:}"
+        echo ""
+        echo "请粘贴 ${mcp} 的 ${var}："
+        printf "> "
+        read -r val || true
+        val="${val:-}"
+        if [[ -z "${val}" ]]; then
+          echo "跳过：${var} 为空"
+          continue
+        fi
+        to_write_args+=("${var}=${val}")
+      done
+
+      if ((${#to_write_args[@]} > 0)); then
+        echo ""
+        echo "正在写入 ${ZSHRC_PATH}（会自动备份为 *.backup.TIMESTAMP）..."
+        _written_path="$(upsert_keys_to_zshrc "${ZSHRC_PATH}" "${to_write_args[@]}")"
+        did_write_keys="1"
+        echo "已写入：${_written_path}"
+        echo "提示：新开终端或执行：source ${ZSHRC_PATH}"
+      fi
+    else
+      echo "已选择不填写 key：将继续配置 MCP（缺 key 的 MCP 可能无法握手启动）。"
     fi
-  else
-    echo "已选择不填写 key：将继续配置 MCP（缺 key 的 MCP 可能无法握手启动）。"
   fi
-fi
 
-if [[ "${did_write_keys:-0}" == "1" ]]; then
-  echo ""
-  echo "API key 检查结果（更新后）："
-  show_key_status "mu_mcp" "OPENROUTER_API_KEY"
-  show_key_status "tavily" "TAVILY_API_KEY"
-  show_key_status "morph" "MORPH_API_KEY"
+  if [[ "${did_write_keys:-0}" == "1" ]]; then
+    echo ""
+    echo "API key 检查结果（更新后）："
+    if has_choice 2; then
+      show_key_status "mu_mcp" "OPENROUTER_API_KEY"
+    fi
+    if has_choice 4; then
+      show_key_status "tavily" "TAVILY_API_KEY"
+    fi
+    if has_choice 5; then
+      show_key_status "morph" "MORPH_API_KEY"
+    fi
+  fi
 fi
 
 # 依赖检查（只检查你选择的项）
 if has_choice 1 || has_choice 2; then
   need_cmd uv
-  need_cmd git
 fi
 if has_choice 8; then
   need_cmd uv
@@ -360,12 +373,16 @@ if has_choice 1 || has_choice 2 || has_choice 8; then
   if [[ -d "${REPO_ROOT}/.git" ]]; then
     git -C "${REPO_ROOT}" submodule update --init --recursive >/dev/null
   fi
+fi
+if has_choice 1; then
   [[ -f "${PILOTY_DIR}/pyproject.toml" ]] || die "找不到 ${PILOTY_DIR}/pyproject.toml（子模块未检出？）"
+fi
+if has_choice 2; then
   [[ -f "${MU_MCP_DIR}/server.py" ]] || die "找不到 ${MU_MCP_DIR}/server.py（子模块未检出？）"
 fi
 
 tavily_key="${TAVILY_API_KEY:-}"
-if [[ -z "${tavily_key}" ]]; then
+if has_choice 4 && [[ -z "${tavily_key}" ]]; then
   tavily_key="$(zshrc_value TAVILY_API_KEY)"
 fi
 
@@ -418,7 +435,7 @@ def upsert_mcp_stdio(
 
     if text and not text.endswith("\n"):
         text += "\n"
-    text += "\n# MCP servers\n" + block
+    text += "\n" + block
     return text
 
 def upsert_mcp_http_url(text: str, name: str, url: str, startup_timeout_sec: int | None = None) -> str:
@@ -434,7 +451,7 @@ def upsert_mcp_http_url(text: str, name: str, url: str, startup_timeout_sec: int
 
     if text and not text.endswith("\n"):
         text += "\n"
-    text += "\n# MCP servers\n" + block
+    text += "\n" + block
     return text
 
 if selected(1):
