@@ -21,6 +21,7 @@ CODEX_CLI_CONFIG="${CODEX_CLI_CONFIG:-${CODEX_HOME}/config.toml}"
 
 PILOTY_DIR="${REPO_ROOT}/coding-agent/shared/MCP/PiloTY"
 MU_MCP_DIR="${REPO_ROOT}/coding-agent/shared/MCP/mu-mcp"
+DEEP_RESEARCH_DIR="${REPO_ROOT}/coding-agent/shared/MCP/mcp-server-deep-research"
 
 ZSHRC_PATH="${ZSHRC_PATH:-${HOME}/.zshrc}"
 
@@ -131,6 +132,7 @@ echo "  4) tavily               (HTTP，Tavily 搜索 MCP；需要 Tavily API ke
 echo "  5) morphllm-fast-apply  (STDIO，需要 MORPH_API_KEY)"
 echo "  6) context7             (STDIO，最新文档检索)"
 echo "  7) serena               (STDIO，代码语义工具；需要 uvx)"
+echo "  8) deep-research        (STDIO，本地深度研究流程；需要 uv)"
 echo ""
 echo "输入：1,3,5    或 all    或 n"
 printf "> "
@@ -144,7 +146,7 @@ fi
 
 selected_csv=""
 if [[ "${selection_raw}" == "all" ]]; then
-  selected_csv="1,2,3,4,5,6,7"
+  selected_csv="1,2,3,4,5,6,7,8"
 else
   if [[ ! "${selection_raw}" =~ ^[0-9,]+$ ]]; then
     die "输入格式错误：${selection_raw}（应为 1,3,5 / all / n）"
@@ -344,6 +346,9 @@ if has_choice 1 || has_choice 2; then
   need_cmd uv
   need_cmd git
 fi
+if has_choice 8; then
+  need_cmd uv
+fi
 if has_choice 3 || has_choice 5 || has_choice 6; then
   need_cmd npx
 fi
@@ -351,7 +356,7 @@ if has_choice 7; then
   need_cmd uvx
 fi
 
-if has_choice 1 || has_choice 2; then
+if has_choice 1 || has_choice 2 || has_choice 8; then
   if [[ -d "${REPO_ROOT}/.git" ]]; then
     git -C "${REPO_ROOT}" submodule update --init --recursive >/dev/null
   fi
@@ -364,7 +369,7 @@ if [[ -z "${tavily_key}" ]]; then
   tavily_key="$(zshrc_value TAVILY_API_KEY)"
 fi
 
-python3 - "${CODEX_CLI_CONFIG}" "${PILOTY_DIR}" "${MU_MCP_DIR}" "${selected_csv}" "${tavily_key}" <<'PY'
+python3 - "${CODEX_CLI_CONFIG}" "${PILOTY_DIR}" "${MU_MCP_DIR}" "${DEEP_RESEARCH_DIR}" "${selected_csv}" "${tavily_key}" <<'PY'
 import re
 import sys
 from pathlib import Path
@@ -372,8 +377,9 @@ from pathlib import Path
 config_path = Path(sys.argv[1])
 piloty_dir = sys.argv[2]
 mu_dir = sys.argv[3]
-selected_csv = sys.argv[4]
-tavily_key = sys.argv[5]
+deep_research_dir = sys.argv[4]
+selected_csv = sys.argv[5]
+tavily_key = sys.argv[6]
 
 config_path.parent.mkdir(parents=True, exist_ok=True)
 text = config_path.read_text(encoding="utf-8") if config_path.exists() else ""
@@ -491,6 +497,16 @@ if selected(7):
         command="uvx",
         args_toml='["--from","git+https://github.com/oraios/serena","serena","start-mcp-server","--context","codex"]',
         startup_timeout_sec=180,
+    )
+
+if selected(8):
+    text = upsert_mcp_stdio(
+        text,
+        name="deep_research",
+        command="uv",
+        args_toml='["run","mcp-server-deep-research"]',
+        cwd=deep_research_dir,
+        startup_timeout_sec=60,
     )
 
 config_path.write_text(text, encoding="utf-8")
