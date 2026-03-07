@@ -29,7 +29,6 @@
 #   • 代码审查：security-engineer 审查安全漏洞
 #   • 性能优化：performance-engineer 分析性能瓶颈
 #   • 架构设计：system-architect 设计系统架构
-#   • 深度研究：deep-research-agent 进行技术调研
 #
 # 【与 Slash Command 的区别】
 #   Agent：独立会话，Claude 主动调用，黑盒执行，适合复杂任务
@@ -292,5 +291,4 @@ npx claude-code-templates@latest --command=project-management/todo --directory ~
 #   3. 是否是 MCP 提供的工具？
 # ============================================================================
 # npx claude-code-templates@latest --skill=development/skill-creator --directory ~ --yes
-
 

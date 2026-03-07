@@ -4,6 +4,3 @@
 [submodule "coding-agent/shared/MCP/PiloTY"]
 	path = coding-agent/shared/MCP/PiloTY
 	url = git@github.com:yiwenlu66/PiloTY.git
-[submodule "coding-agent/shared/MCP/mcp-server-deep-research"]
-	path = coding-agent/shared/MCP/mcp-server-deep-research
-	url = git@github.com:yiwenlu66/mcp-server-deep-research.git
