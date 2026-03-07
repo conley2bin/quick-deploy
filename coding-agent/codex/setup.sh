@@ -146,6 +146,19 @@ else
   selected_csv="${selection_raw}"
 fi
 
+validate_choices() {
+  local x
+  IFS=',' read -r -a arr <<<"${selected_csv}"
+  for x in "${arr[@]}"; do
+    case "${x}" in
+      1|2|3|4|5|6|7) ;;
+      *) die "输入包含无效选项：${x}（有效范围：1-7）" ;;
+    esac
+  done
+}
+
+validate_choices
+
 has_choice() {
   # usage: has_choice 3
   local n="$1"
@@ -447,6 +460,10 @@ def upsert_mcp_http_url(text: str, name: str, url: str, startup_timeout_sec: int
     text += "\n" + block
     return text
 
+def remove_mcp_block(text: str, name: str) -> str:
+    pat = re.compile(rf"(?ms)^\[mcp_servers\.{re.escape(name)}\]\n.*?(?=^\[|\Z)")
+    return pat.sub("", text, count=1)
+
 if selected(1):
     text = upsert_mcp_stdio(
         text,
@@ -479,6 +496,8 @@ if selected(3):
 if selected(4) and tavily_key.strip():
     url = f"https://mcp.tavily.com/mcp/?tavilyApiKey={tavily_key.strip()}"
     text = upsert_mcp_http_url(text, name="tavily", url=url, startup_timeout_sec=60)
+elif selected(4):
+    text = remove_mcp_block(text, name="tavily")
 
 if selected(5):
     text = upsert_mcp_stdio(
