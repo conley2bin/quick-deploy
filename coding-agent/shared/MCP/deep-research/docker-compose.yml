@@ -1,0 +1,9 @@
+services:
+  deep-research:
+    image: xiangfa/deep-research:latest
+    container_name: deep-research
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "${DEEP_RESEARCH_PORT:-3000}:3000"

@@ -6,17 +6,12 @@ description: Create well-formatted commits with conventional commit format
 
 # Smart Git Commit
 
-Invocation of this prompt is an explicit request to create a commit. Proceed with the commit workflow below without asking for additional confirmation.
+Invocation of this prompt is an explicit request to create a commit.
+Treat the expanded prompt text itself as explicit authorization to run the commit workflow.
+Do not ask for additional confirmation.
 
-CRITICAL: NEVER create commits automatically.
 CRITICAL: NEVER commit untracked files (git status显示为 ?? 的文件).
 CRITICAL: NEVER modify file contents without explicit user permission.
-
-ONLY commit when:
-1. User explicitly runs /prompts:commit command
-2. User explicitly requests "commit" or "create a commit"
-
-Default behavior: Do not commit. If uncertain, do not commit.
 
 **Git Status Codes (git status --porcelain):**
 - `??` = untracked files (从未git add的文件) - DO NOT commit

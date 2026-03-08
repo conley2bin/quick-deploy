@@ -1,0 +1,78 @@
+{
+  "mcp_servers": [
+    {
+      "name": "context7",
+      "description": "STDIO，最新文档检索",
+      "type": "stdio",
+      "command": "npx",
+      "args": ["-y", "@upstash/context7-mcp"],
+      "startup_timeout_sec": 60
+    },
+    {
+      "name": "deep-research",
+      "description": "HTTP，深度研究报告生成（需先部署服务）",
+      "type": "http",
+      "http": {
+        "transportType": "streamable-http",
+        "timeout": 600
+      },
+      "headers": {
+        "Authorization": "Bearer {access_password}"
+      }
+    },
+    {
+      "name": "morphllm-fast-apply",
+      "description": "STDIO，需要 MORPH_API_KEY",
+      "type": "stdio",
+      "command": "npx",
+      "args": ["-y", "@morphllm/morphmcp"],
+      "env_vars": ["MORPH_API_KEY"],
+      "startup_timeout_sec": 300
+    },
+    {
+      "name": "mu-mcp",
+      "description": "本地，OpenRouter 聊天；需要 OPENROUTER_API_KEY",
+      "type": "stdio",
+      "command": "uv",
+      "args": ["run", "python", "server.py"],
+      "cwd": "${REPO_ROOT}/coding-agent/shared/MCP/mu-mcp",
+      "env_vars": ["OPENROUTER_API_KEY"]
+    },
+    {
+      "name": "piloty",
+      "description": "本地，PTY 终端控制",
+      "type": "stdio",
+      "command": "uv",
+      "args": ["run", "piloty"],
+      "cwd": "${REPO_ROOT}/coding-agent/shared/MCP/PiloTY",
+      "startup_timeout_sec": 60
+    },
+    {
+      "name": "sequential-thinking",
+      "description": "STDIO，npx @modelcontextprotocol/server-sequential-thinking",
+      "type": "stdio",
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-sequential-thinking"],
+      "startup_timeout_sec": 60
+    },
+    {
+      "name": "serena",
+      "description": "STDIO，代码语义工具；需要 uvx",
+      "type": "stdio",
+      "command": "uvx",
+      "args": ["--from", "git+https://github.com/oraios/serena", "serena", "start-mcp-server", "--context", "codex"],
+      "startup_timeout_sec": 180
+    },
+    {
+      "name": "tavily",
+      "description": "HTTP，Tavily 搜索 MCP；需要 TAVILY_API_KEY",
+      "type": "http",
+      "env_vars": ["TAVILY_API_KEY"],
+      "http": {
+        "transportType": "streamable-http",
+        "timeout": 60,
+        "url_template": "https://mcp.tavily.com/mcp/?tavilyApiKey={TAVILY_API_KEY}"
+      }
+    }
+  ]
+}
