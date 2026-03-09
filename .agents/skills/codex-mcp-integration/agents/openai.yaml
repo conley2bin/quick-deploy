@@ -1,0 +1,4 @@
+interface:
+  display_name: "Codex MCP Integration"
+  short_description: "Integrate new MCP servers into this codex repository"
+  default_prompt: "Design and integrate a new MCP server in coding-agent/shared/MCP and coding-agent/codex setup.py, with transport-specific config choices."

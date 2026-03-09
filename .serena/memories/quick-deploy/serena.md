@@ -1,1 +1,0 @@
-Repo state: `coding-agent/codex/setup.sh` configures MCPs sequentialthinking/context7/morph via `npx -y <package>`; serena via `uvx --from git+https://github.com/oraios/serena ...`; tavily via HTTP URL. Local directories `coding-agent/shared/MCP/{context7,morph,sequentialthinking,serena,tavily}` removed; setup no longer references them.

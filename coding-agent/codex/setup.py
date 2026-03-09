@@ -24,9 +24,12 @@ MCP_ROOT = REPO_ROOT / "coding-agent/shared/MCP"
 MCP_CONFIG = MCP_ROOT / "mcp.json"
 GITMODULES_PATH = REPO_ROOT / ".gitmodules"
 DEEP_RESEARCH_ENV_PATH = MCP_ROOT / "deep-research/.env"
+DEVELOPER_INSTRUCTIONS_PATH = REPO_ROOT / "coding-agent/codex/developer_instructions.md"
 
 MARKER_BEGIN = "# >>> codex mcp api keys >>>"
 MARKER_END = "# <<< codex mcp api keys <<<"
+DEV_INST_MARKER_BEGIN = "# >>> codex managed developer_instructions >>>"
+DEV_INST_MARKER_END = "# <<< codex managed developer_instructions <<<"
 
 
 def die(msg: str) -> None:
@@ -391,6 +394,71 @@ def render_block(name: str, lines: list[str]) -> str:
     return "\n".join([f"[mcp_servers.{name}]"] + lines) + "\n"
 
 
+def remove_managed_developer_instructions_block(text: str) -> str:
+    pat = re.compile(
+        rf"(?ms)^{re.escape(DEV_INST_MARKER_BEGIN)}\n.*?^{re.escape(DEV_INST_MARKER_END)}\n?"
+    )
+    return pat.sub("", text, count=1)
+
+
+def remove_plain_developer_instructions(text: str) -> str:
+    pat = re.compile(
+        r'(?ms)^developer_instructions\s*=\s*(?:"""[\s\S]*?"""|\'\'\'[\s\S]*?\'\'\'|"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\')\s*(?:\n|$)'
+    )
+    while True:
+        updated = pat.sub("", text, count=1)
+        if updated == text:
+            return text
+        text = updated
+
+
+def render_developer_instructions_block(instructions: str) -> str:
+    if "'''" in instructions:
+        die(
+            f"developer_instructions.md 包含连续三个单引号（'''），无法写入 TOML literal string：{DEVELOPER_INSTRUCTIONS_PATH}"
+        )
+
+    body = instructions.rstrip("\n")
+    return "\n".join(
+        [
+            DEV_INST_MARKER_BEGIN,
+            "developer_instructions = '''",
+            body,
+            "'''",
+            DEV_INST_MARKER_END,
+        ]
+    ) + "\n"
+
+
+def sync_developer_instructions() -> None:
+    if not DEVELOPER_INSTRUCTIONS_PATH.is_file():
+        die(f"找不到 {DEVELOPER_INSTRUCTIONS_PATH}")
+
+    instructions = read_text(DEVELOPER_INSTRUCTIONS_PATH)
+    if not instructions.strip():
+        die(f"developer_instructions.md 为空：{DEVELOPER_INSTRUCTIONS_PATH}")
+
+    block = render_developer_instructions_block(instructions)
+    config_text = read_text(CODEX_CLI_CONFIG) if CODEX_CLI_CONFIG.exists() else ""
+
+    updated = remove_managed_developer_instructions_block(config_text)
+    updated = remove_plain_developer_instructions(updated)
+
+    if updated and not updated.endswith("\n"):
+        updated += "\n"
+    if updated and not updated.endswith("\n\n"):
+        updated += "\n"
+    updated += block
+
+    if updated == config_text:
+        print("developer_instructions: 未变化")
+        return
+
+    CODEX_CLI_CONFIG.parent.mkdir(parents=True, exist_ok=True)
+    write_text(CODEX_CLI_CONFIG, updated)
+    print(f"developer_instructions: 已同步到 {CODEX_CLI_CONFIG}")
+
+
 def substitute_template(template: str, values: dict[str, str]) -> tuple[str, list[str]]:
     missing = []
 
@@ -613,11 +681,15 @@ def sync_agents_and_commands() -> None:
 def main() -> None:
     CODEX_HOME.mkdir(parents=True, exist_ok=True)
 
-    print("[1/2] sync AGENTS.md and commands")
+    print("[1/3] sync AGENTS.md and commands")
     sync_agents_and_commands()
     print("")
 
-    print("[2/2] configure MCP servers")
+    print("[2/3] sync developer_instructions")
+    sync_developer_instructions()
+    print("")
+
+    print("[3/3] configure MCP servers")
     mcp_defs = load_mcp_defs()
     if not mcp_defs:
         die(f"未找到任何 MCP 定义：{MCP_CONFIG}")

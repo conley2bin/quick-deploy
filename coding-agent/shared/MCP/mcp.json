@@ -71,6 +71,7 @@
       "http": {
         "transportType": "streamable-http",
         "timeout": 60,
+        "startup_timeout_sec": 60,
         "url_template": "https://mcp.tavily.com/mcp/?tavilyApiKey={TAVILY_API_KEY}"
       }
     }
