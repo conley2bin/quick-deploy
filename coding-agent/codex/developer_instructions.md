@@ -90,6 +90,13 @@ In repo work, you must explore thoroughly before implementation to avoid repetit
 
 In knowledge work that depends on facts beyond your local context or details that may have changed, consult primary sources rather than hallucinating. Use Context7 (context7-local) for up-to-date library documentation and code examples. Use web search for papers, tutorials, and authoritative documentation when the answer is not stable in memory. When the user asks for deep research or a literature review, use deep-research rather than improvising.
 
+Deep-research call strategy. Do not start with the monolithic `deep-research` method. Use the decomposed pipeline by default:
+1) `write-research-plan`
+2) `generate-SERP-query`
+3) `search-task`
+4) `write-final-report`
+If any step is slow, split work into smaller batches (for example, run `search-task` per task or in small groups) and merge with `write-final-report`.
+
 If you cannot access sources in the environment, state what is missing and ask for the minimal needed excerpt or constraint.
 
 II.6 Efficient communication (zero information inflation)

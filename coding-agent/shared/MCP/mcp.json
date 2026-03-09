@@ -12,6 +12,7 @@
       "name": "deep-research",
       "description": "HTTP，深度研究报告生成（需先部署服务）",
       "type": "http",
+      "tool_timeout_sec": 600,
       "http": {
         "transportType": "streamable-http",
         "timeout": 600

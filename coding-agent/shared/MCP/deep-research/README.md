@@ -45,6 +45,16 @@ http://127.0.0.1:3000/api/mcp
 headers = { Authorization = "Bearer <ACCESS_PASSWORD>" }
 ```
 
+`deep-research` 单次调用链较长，建议同时配置：
+
+```toml
+timeout = 600
+tool_timeout_sec = 600
+```
+
+- `timeout`：HTTP 传输超时
+- `tool_timeout_sec`：Codex 对单次 MCP 工具调用的超时
+
 ## 3. 运维命令
 
 ```bash

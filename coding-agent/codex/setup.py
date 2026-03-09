@@ -598,6 +598,8 @@ def configure_http(mcp: dict, values: dict):
         lines.append(f"headers = {toml_inline_table(headers)}")
     if http_cfg.get("startup_timeout_sec") is not None:
         lines.append(f"startup_timeout_sec = {int(http_cfg.get('startup_timeout_sec'))}")
+    if mcp.get("tool_timeout_sec") is not None:
+        lines.append(f"tool_timeout_sec = {int(mcp.get('tool_timeout_sec'))}")
 
     return lines, missing
 
@@ -626,6 +628,8 @@ def configure_stdio(mcp: dict, values: dict):
 
     if mcp.get("startup_timeout_sec") is not None:
         lines.append(f"startup_timeout_sec = {int(mcp.get('startup_timeout_sec'))}")
+    if mcp.get("tool_timeout_sec") is not None:
+        lines.append(f"tool_timeout_sec = {int(mcp.get('tool_timeout_sec'))}")
 
     return lines, missing
 
