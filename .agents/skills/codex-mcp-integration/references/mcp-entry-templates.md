@@ -31,12 +31,31 @@
 }
 ```
 
-## 3) http: 固定 URL + Bearer header
+## 3) http: 固定 URL + bearer_token_env_var（优先）
+
+```json
+{
+  "name": "example-http-bearer-env",
+  "description": "HTTP，Bearer 鉴权（token 来自环境变量）",
+  "type": "http",
+  "env_vars": ["EXAMPLE_ACCESS_TOKEN"],
+  "http": {
+    "transportType": "streamable-http",
+    "timeout": 120,
+    "url": "https://mcp.example.com/api/mcp",
+    "bearer_token_env_var": "EXAMPLE_ACCESS_TOKEN"
+  }
+}
+```
+
+## 4) http: 固定 URL + Bearer header（仅兼容场景）
+
+当目标服务不支持 `bearer_token_env_var`，且必须通过自定义 header 传 token 时使用。
 
 ```json
 {
   "name": "example-http-auth-header",
-  "description": "HTTP，Bearer 鉴权 MCP",
+  "description": "HTTP，Bearer 鉴权 MCP（header 方案）",
   "type": "http",
   "http": {
     "transportType": "streamable-http",
@@ -57,7 +76,7 @@
 }
 ```
 
-## 4) http: 本地部署服务（由 setup.py 派生 URL）
+## 5) http: 本地部署服务（由 setup.py 派生 URL）
 
 `mcp.json`:
 
@@ -97,4 +116,42 @@ def load_example_local_http_values() -> dict[str, str]:
 ```python
 if name == "example-local-http":
     values.update(load_example_local_http_values())
+```
+
+## 6) http: 同一服务的读写与只读双入口（通用）
+
+读写 endpoint：
+
+```json
+{
+  "name": "example-http-write",
+  "description": "HTTP，远端 MCP（读写入口）",
+  "type": "http",
+  "env_vars": ["EXAMPLE_ACCESS_TOKEN"],
+  "http": {
+    "url": "https://mcp.example.com/mcp/",
+    "transportType": "streamable-http",
+    "timeout": 60,
+    "startup_timeout_sec": 60,
+    "bearer_token_env_var": "EXAMPLE_ACCESS_TOKEN"
+  }
+}
+```
+
+只读 endpoint：
+
+```json
+{
+  "name": "example-http-readonly",
+  "description": "HTTP，远端 MCP（只读入口）",
+  "type": "http",
+  "env_vars": ["EXAMPLE_ACCESS_TOKEN"],
+  "http": {
+    "url": "https://mcp.example.com/mcp/readonly",
+    "transportType": "streamable-http",
+    "timeout": 60,
+    "startup_timeout_sec": 60,
+    "bearer_token_env_var": "EXAMPLE_ACCESS_TOKEN"
+  }
+}
 ```

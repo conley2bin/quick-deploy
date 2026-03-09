@@ -21,6 +21,19 @@
       }
     },
     {
+      "name": "github",
+      "description": "HTTP，GitHub MCP（remote）；需要 GITHUB_PERSONAL_ACCESS_TOKEN",
+      "type": "http",
+      "env_vars": ["GITHUB_PERSONAL_ACCESS_TOKEN"],
+      "http": {
+        "url": "https://api.githubcopilot.com/mcp/",
+        "transportType": "streamable-http",
+        "timeout": 60,
+        "startup_timeout_sec": 60,
+        "bearer_token_env_var": "GITHUB_PERSONAL_ACCESS_TOKEN"
+      }
+    },
+    {
       "name": "morphllm-fast-apply",
       "description": "STDIO，需要 MORPH_API_KEY",
       "type": "stdio",

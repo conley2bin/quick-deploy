@@ -53,10 +53,12 @@ description: 为 coding-agent 仓库新增或改造 MCP 接入策略。用于新
 - 在 `http` 中写 `transportType`（当前仓库使用 `streamable-http`）和 `timeout`。
 - endpoint 固定时用 `http.url`。
 - endpoint 依赖 key 时用 `http.url_template` + `env_vars`。
-- 需要鉴权头时用 `headers`，模板变量由 `setup.py` 替换。
+- Bearer token 场景优先用 `http.bearer_token_env_var`（值是环境变量名）。
+- 只有服务端不支持 `bearer_token_env_var` 时，才用 `headers` 注入鉴权头。
+- 只读场景优先使用服务端提供的 readonly endpoint（例如 `/readonly`）。
 
 约束来源：
-- `setup.py` 通过 `configure_http()` 渲染 `url/transportType/timeout/headers`。
+- `setup.py` 通过 `configure_http()` 渲染 `url/transportType/bearer_token_env_var/timeout/headers`。
 - `headers` 模板变量缺失时该 header 被跳过。
 
 ### 3) 本地自部署 HTTP MCP
@@ -91,8 +93,9 @@ description: 为 coding-agent 仓库新增或改造 MCP 接入策略。用于新
 1. 运行 `python coding-agent/codex/setup.py`，仅选择新增 MCP。
 2. 观察输出中的 key 状态和 warning，确认没有“缺 key 被移除”。
 3. 检查 `~/.codex/config.toml` 是否出现 `[mcp_servers.<name>]` 且字段完整。
-4. 本地服务型 MCP 先手动启动，再验证 endpoint 可达。
-5. 失败时先定位是配置渲染问题、服务启动问题，还是鉴权问题，不加兜底默认值。
+4. Bearer token 场景确认配置中有 `bearer_token_env_var`，且不存在明文 token 形式的 `Authorization` 值。
+5. 本地服务型 MCP 先手动启动，再验证 endpoint 可达。
+6. 失败时先定位是配置渲染问题、服务启动问题，还是鉴权问题，不加兜底默认值。
 
 ## 参考模板
 

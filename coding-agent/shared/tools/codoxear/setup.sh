@@ -6,7 +6,6 @@ HELPER_DIR="${SCRIPT_DIR}"
 UPSTREAM_DIR="${HELPER_DIR}/upstream/codoxear"
 UPSTREAM_REPO_URL="${CODOXEAR_REPO_URL:-https://github.com/yiwenlu66/codoxear}"
 ENV_FILE="${HELPER_DIR}/.env"
-ENV_EXAMPLE_FILE="${HELPER_DIR}/.env.example"
 RUN_SCRIPT="${HELPER_DIR}/run_server.sh"
 
 WRAPPER_MARKER_BEGIN="# >>> codoxear codex wrapper >>>"
@@ -18,6 +17,21 @@ need_cmd() {
     echo "error: 缺少命令 ${cmd}"
     exit 1
   fi
+}
+
+normalize_home_path() {
+  local raw="$1"
+  local out="${raw//\$\{HOME\}/${HOME}}"
+  out="${out//\$HOME/${HOME}}"
+  case "${out}" in
+    "~")
+      out="${HOME}"
+      ;;
+    "~/"*)
+      out="${HOME}/${out#\~/}"
+      ;;
+  esac
+  printf '%s' "${out}"
 }
 
 read_env_value() {
@@ -37,31 +51,6 @@ read_env_value() {
     line="${line:1:${#line}-2}"
   fi
   echo "${line}"
-}
-
-upsert_env_key() {
-  local key="$1"
-  local value="$2"
-  python3 - "${ENV_FILE}" "${key}" "${value}" <<'PY'
-from pathlib import Path
-import re
-import sys
-
-path = Path(sys.argv[1])
-key = sys.argv[2]
-value = sys.argv[3]
-
-pat = re.compile(rf"^\s*{re.escape(key)}\s*=")
-lines = path.read_text(encoding="utf-8").splitlines()
-for i, line in enumerate(lines):
-    if pat.match(line):
-        lines[i] = f"{key}={value}"
-        break
-else:
-    lines.append(f"{key}={value}")
-
-path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-PY
 }
 
 default_branch() {
@@ -126,7 +115,9 @@ create_env_template() {
   local password="${CODEX_WEB_PASSWORD:-}"
   local host="${CODEX_WEB_HOST:-::}"
   local port="${CODEX_WEB_PORT:-8743}"
-  local codex_home="${CODEX_HOME:-$HOME/.codex}"
+  local codex_home_raw="${CODEX_HOME:-$HOME/.codex}"
+  local codex_home
+  codex_home="$(normalize_home_path "${codex_home_raw}")"
   local codex_bin="${CODEX_BIN:-codex}"
 
   cat >"${ENV_FILE}" <<EOF
@@ -143,28 +134,61 @@ EOF
 
 ensure_env_file() {
   if [[ ! -f "${ENV_FILE}" ]]; then
-    if [[ -f "${ENV_EXAMPLE_FILE}" ]]; then
-      cp "${ENV_EXAMPLE_FILE}" "${ENV_FILE}"
-      # Overlay from current shell if provided.
-      if [[ -n "${CODEX_WEB_PASSWORD:-}" ]]; then
-        upsert_env_key "CODEX_WEB_PASSWORD" "${CODEX_WEB_PASSWORD}"
-      fi
-      if [[ -n "${CODEX_WEB_HOST:-}" ]]; then
-        upsert_env_key "CODEX_WEB_HOST" "${CODEX_WEB_HOST}"
-      fi
-      if [[ -n "${CODEX_WEB_PORT:-}" ]]; then
-        upsert_env_key "CODEX_WEB_PORT" "${CODEX_WEB_PORT}"
-      fi
-      if [[ -n "${CODEX_HOME:-}" ]]; then
-        upsert_env_key "CODEX_HOME" "${CODEX_HOME}"
-      fi
-      if [[ -n "${CODEX_BIN:-}" ]]; then
-        upsert_env_key "CODEX_BIN" "${CODEX_BIN}"
-      fi
-    else
-      create_env_template
-    fi
+    create_env_template
   fi
+}
+
+normalize_env_file() {
+  python3 - "${ENV_FILE}" "${HOME}" <<'PY'
+from pathlib import Path
+import re
+import sys
+
+path = Path(sys.argv[1])
+home = sys.argv[2]
+
+if not path.exists():
+    raise SystemExit(0)
+
+raw = path.read_text(encoding="utf-8")
+lines = raw.splitlines()
+out = []
+changed = False
+seen = False
+
+def normalize(v: str) -> str:
+    s = str(v).strip()
+    if s.startswith('"') and s.endswith('"') and len(s) >= 2:
+        s = s[1:-1]
+    elif s.startswith("'") and s.endswith("'") and len(s) >= 2:
+        s = s[1:-1]
+    s = s.replace("${HOME}", home).replace("$HOME", home)
+    if s == "~":
+        s = home
+    elif s.startswith("~/"):
+        s = home + "/" + s[2:]
+    return s
+
+pat = re.compile(r"^\s*CODEX_HOME\s*=(.*)$")
+for line in lines:
+    m = pat.match(line)
+    if not m:
+        out.append(line)
+        continue
+    seen = True
+    v0 = m.group(1).strip()
+    v1 = normalize(v0)
+    if v1 != v0:
+        changed = True
+    out.append(f"CODEX_HOME={v1}")
+
+if not seen:
+    out.append(f"CODEX_HOME={home}/.codex")
+    changed = True
+
+if changed:
+    path.write_text("\n".join(out) + "\n", encoding="utf-8")
+PY
 }
 
 validate_env() {
@@ -215,6 +239,15 @@ venv_broker = (repo_root / ".venv" / "bin" / "codoxear-broker").resolve()
 block = (
     f"{begin}\n"
     "codex() {\n"
+    "  if [ -n \"${CODEX_HOME:-}\" ]; then\n"
+    "    local _cxh=\"${CODEX_HOME//\\$\\{HOME\\}/${HOME}}\"\n"
+    "    _cxh=\"${_cxh//\\$HOME/${HOME}}\"\n"
+    "    case \"${_cxh}\" in\n"
+    "      \"~\") _cxh=\"${HOME}\" ;;\n"
+    "      \"~/\"*) _cxh=\"${HOME}/${_cxh#\\~/}\" ;;\n"
+    "    esac\n"
+    "    export CODEX_HOME=\"${_cxh}\"\n"
+    "  fi\n"
     "  if command -v codoxear-broker >/dev/null 2>&1; then\n"
     "    codoxear-broker -- \"$@\"\n"
     "    return\n"
@@ -262,22 +295,42 @@ PY
 }
 
 write_run_script() {
-  local repo_root
-  repo_root="$(cd "${HELPER_DIR}/../../../.." && pwd)"
-
-  cat >"${RUN_SCRIPT}" <<EOF
+  cat >"${RUN_SCRIPT}" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "${SCRIPT_DIR}"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../../../.." && pwd)"
+
+if [[ -z "${CODEX_HOME:-}" && -f "${SCRIPT_DIR}/.env" ]]; then
+  _cxh_line="$(grep -E '^[[:space:]]*CODEX_HOME[[:space:]]*=' "${SCRIPT_DIR}/.env" | tail -n 1 || true)"
+  if [[ -n "${_cxh_line}" ]]; then
+    CODEX_HOME="${_cxh_line#*=}"
+    CODEX_HOME="${CODEX_HOME#\"}"
+    CODEX_HOME="${CODEX_HOME%\"}"
+    CODEX_HOME="${CODEX_HOME#\'}"
+    CODEX_HOME="${CODEX_HOME%\'}"
+    export CODEX_HOME
+  fi
+fi
+
+if [[ -n "${CODEX_HOME:-}" ]]; then
+  CODEX_HOME="${CODEX_HOME//\$\{HOME\}/${HOME}}"
+  CODEX_HOME="${CODEX_HOME//\$HOME/${HOME}}"
+  case "${CODEX_HOME}" in
+    "~") CODEX_HOME="${HOME}" ;;
+    "~/"*) CODEX_HOME="${HOME}/${CODEX_HOME#\~/}" ;;
+  esac
+  export CODEX_HOME
+fi
 
 if command -v codoxear-server >/dev/null 2>&1; then
   exec codoxear-server
 fi
 
-if [[ -x "${repo_root}/.venv/bin/codoxear-server" ]]; then
-  exec "${repo_root}/.venv/bin/codoxear-server"
+if [[ -x "${REPO_ROOT}/.venv/bin/codoxear-server" ]]; then
+  exec "${REPO_ROOT}/.venv/bin/codoxear-server"
 fi
 
 echo "error: codoxear-server 未找到。请先运行 ./coding-agent/shared/tools/codoxear/setup.sh"
@@ -293,6 +346,7 @@ main() {
   sync_upstream
   install_codoxear
   ensure_env_file
+  normalize_env_file
   validate_env
 
   local rc_file

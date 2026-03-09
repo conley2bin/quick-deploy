@@ -587,6 +587,11 @@ def configure_http(mcp: dict, values: dict):
     transport = http_cfg.get("transportType")
     if transport:
         lines.append(f'transportType = "{toml_escape(transport)}"')
+
+    bearer_token_env_var = http_cfg.get("bearer_token_env_var")
+    if bearer_token_env_var:
+        lines.append(f'bearer_token_env_var = "{toml_escape(str(bearer_token_env_var))}"')
+
     if timeout_val is not None and str(timeout_val).strip():
         lines.append(f"timeout = {int(timeout_val)}")
     if headers:
