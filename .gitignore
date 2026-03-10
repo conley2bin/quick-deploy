@@ -1,4 +1,10 @@
-!.claude/
 .serena/
 .venv/
 .vscode/
+coding-agent/codex/__pycache__/
+coding-agent/shared/MCP/deep-research/.env
+coding-agent/shared/tools/codoxear/.env
+coding-agent/shared/tools/codoxear/upstream/
+
+!.claude/
+!.agents/
