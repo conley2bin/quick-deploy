@@ -3,6 +3,9 @@
     {
       "name": "context7",
       "description": "STDIO，最新文档检索",
+      "summary": "最新库与框架文档检索。",
+      "repo_url": "https://github.com/upstash/context7",
+      "prerequisites": [],
       "type": "stdio",
       "command": "npx",
       "args": ["-y", "@upstash/context7-mcp"],
@@ -11,6 +14,9 @@
     {
       "name": "deep-research",
       "description": "HTTP，深度研究报告生成（需先部署服务）",
+      "summary": "通过已部署的 HTTP 服务生成深度研究报告。",
+      "repo_url": "https://github.com/u14app/deep-research",
+      "prerequisites": ["需先部署 deep-research 服务"],
       "type": "http",
       "tool_timeout_sec": 600,
       "http": {
@@ -24,6 +30,9 @@
     {
       "name": "firecrawl",
       "description": "HTTP，Firecrawl 抓取/爬取 MCP；需要 FIRECRAWL_API_KEY",
+      "summary": "面向指定站点或 URL 的提取、爬取与站点地图能力。",
+      "docs_url": "https://docs.firecrawl.dev/mcp-server",
+      "prerequisites": ["需要 FIRECRAWL_API_KEY"],
       "type": "http",
       "env_vars": ["FIRECRAWL_API_KEY"],
       "http": {
@@ -35,8 +44,30 @@
       }
     },
     {
+      "name": "browser-use",
+      "description": "HTTP，Browser Use MCP（official hosted）；需要 BROWSER_USE_API_KEY",
+      "summary": "面向交互站点、表单和登录流程的浏览器自动化。",
+      "docs_url": "https://docs.browser-use.com/open-source/customize/integrations/mcp-server",
+      "prerequisites": ["需要 BROWSER_USE_API_KEY"],
+      "type": "http",
+      "env_vars": ["BROWSER_USE_API_KEY"],
+      "tool_timeout_sec": 600,
+      "http": {
+        "url": "https://api.browser-use.com/mcp",
+        "transportType": "streamable-http",
+        "timeout": 300,
+        "startup_timeout_sec": 60
+      },
+      "headers": {
+        "X-Browser-Use-API-Key": "{BROWSER_USE_API_KEY}"
+      }
+    },
+    {
       "name": "github",
       "description": "HTTP，GitHub MCP（remote）；需要 GITHUB_PERSONAL_ACCESS_TOKEN",
+      "summary": "GitHub 仓库、Issue、Pull Request 与代码搜索操作。",
+      "repo_url": "https://github.com/github/github-mcp-server",
+      "prerequisites": ["需要 GITHUB_PERSONAL_ACCESS_TOKEN"],
       "type": "http",
       "env_vars": ["GITHUB_PERSONAL_ACCESS_TOKEN"],
       "http": {
@@ -50,6 +81,9 @@
     {
       "name": "morphllm-fast-apply",
       "description": "STDIO，需要 MORPH_API_KEY",
+      "summary": "通过 Morph 实现快速代码编辑与代码库搜索。",
+      "docs_url": "https://morphllm.com",
+      "prerequisites": ["需要 MORPH_API_KEY"],
       "type": "stdio",
       "command": "npx",
       "args": ["-y", "@morphllm/morphmcp"],
@@ -59,6 +93,9 @@
     {
       "name": "mu-mcp",
       "description": "本地，OpenRouter 聊天；需要 OPENROUTER_API_KEY",
+      "summary": "基于 OpenRouter 的外部模型聊天桥接。",
+      "repo_url": "https://github.com/yiwenlu66/mu-mcp",
+      "prerequisites": ["需要 OPENROUTER_API_KEY"],
       "type": "stdio",
       "command": "uv",
       "args": ["run", "python", "server.py"],
@@ -68,6 +105,9 @@
     {
       "name": "piloty",
       "description": "本地，PTY 终端控制",
+      "summary": "面向交互式 shell 工作流的有状态 PTY 终端控制。",
+      "repo_url": "https://github.com/yiwenlu66/PiloTY",
+      "prerequisites": [],
       "type": "stdio",
       "command": "uv",
       "args": ["run", "piloty"],
@@ -77,6 +117,9 @@
     {
       "name": "sequential-thinking",
       "description": "STDIO，npx @modelcontextprotocol/server-sequential-thinking",
+      "summary": "显式多步分析的顺序推理工具。",
+      "repo_url": "https://github.com/modelcontextprotocol/servers",
+      "prerequisites": [],
       "type": "stdio",
       "command": "npx",
       "args": ["-y", "@modelcontextprotocol/server-sequential-thinking"],
@@ -85,6 +128,9 @@
     {
       "name": "serena",
       "description": "STDIO，代码语义工具；需要 uvx",
+      "summary": "基于项目符号的语义代码导航与编辑。",
+      "repo_url": "https://github.com/oraios/serena",
+      "prerequisites": ["需要 uvx"],
       "type": "stdio",
       "command": "uvx",
       "args": ["--from", "git+https://github.com/oraios/serena", "serena", "start-mcp-server", "--context", "codex"],
@@ -93,6 +139,9 @@
     {
       "name": "tavily",
       "description": "HTTP，Tavily 搜索 MCP；需要 TAVILY_API_KEY",
+      "summary": "面向当前公开网络来源的搜索与研究检索。",
+      "docs_url": "https://www.tavily.com/",
+      "prerequisites": ["需要 TAVILY_API_KEY"],
       "type": "http",
       "env_vars": ["TAVILY_API_KEY"],
       "http": {

@@ -8,7 +8,7 @@ Tooling priority. Symbol navigation (definitions, references, callsites, renames
 
 Reading discipline. If the task requires judging language (docs, instructions, UX copy, error messages, prompts, specs), read the artifact end-to-end in the terminal before proposing changes. Use rg/awk only after comprehension, for navigation or consistency checks; do not try to infer quality from partial extracts.
 
-Browser work. When the task involves websites or web UIs (navigation, scraping, authentication, or UI verification), prefer browser automation via the agent-browser skill. Do not claim you cannot test or verify something because you lack a browser; use the browser and report what it constrains.
+Browser work. When the task involves websites or web UIs with navigation, authentication, form filling, or interaction, prefer browser automation via Browser Use MCP when available. Use retrieval tools only when the task is extracting or searching for information rather than interacting with the site. Do not claim you cannot test or verify something because you lack a browser; use the browser and report what it constrains.
 
 Web retrieval routing. Use Tavily to discover sources, compare current information across the web, or answer "search/look up/latest/news" questions. Use Firecrawl to extract, crawl, or map content from a site or URL the task already targets. Do not use Firecrawl for broad web search. Do not use Tavily as the primary tool for deep site crawling or structured extraction when Firecrawl is available. When both tools could apply, use Tavily first to find candidates and switch to Firecrawl only after the target site or URL is known.
 

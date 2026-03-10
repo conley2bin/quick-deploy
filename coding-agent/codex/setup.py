@@ -10,6 +10,7 @@ import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import urlparse
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = (SCRIPT_DIR / "../..").resolve()
@@ -359,6 +360,58 @@ def load_mcp_defs():
     return items
 
 
+def get_mcp_display_link(mcp: dict) -> str:
+    for key in ("docs_url", "repo_url"):
+        value = str(mcp.get(key, "")).strip()
+        if value:
+            return value
+    return ""
+
+
+def compact_display_link(url: str) -> str:
+    raw = str(url).strip()
+    if not raw:
+        return ""
+
+    parsed = urlparse(raw)
+    if not parsed.scheme or not parsed.netloc:
+        return raw.rstrip("/")
+
+    path = parsed.path.rstrip("/")
+    return f"{parsed.netloc}{path}"
+
+
+def get_mcp_prerequisites_text(mcp: dict) -> str:
+    raw = mcp.get("prerequisites", [])
+    if isinstance(raw, str):
+        return raw.strip()
+    if not isinstance(raw, list):
+        return ""
+
+    items = []
+    for item in raw:
+        text = str(item).strip()
+        if text:
+            items.append(text)
+    return ", ".join(items)
+
+
+def render_mcp_choice_line(index: int, mcp: dict) -> str:
+    name = str(mcp.get("name", "")).strip()
+    if not name:
+        die(f"mcp.json 缺少 name: {MCP_CONFIG}")
+
+    protocol = str(mcp.get("type", "")).strip().upper() or "-"
+    about = str(mcp.get("summary") or mcp.get("description") or "").strip() or "-"
+    link = compact_display_link(get_mcp_display_link(mcp)) or "-"
+    requires = get_mcp_prerequisites_text(mcp)
+
+    details = [protocol, about, link]
+    if requires:
+        details.append(requires)
+    return f"  {index}) {name:<20} ({'; '.join(details)})"
+
+
 def toml_escape(value: str) -> str:
     return value.replace("\\", "\\\\").replace('"', '\\"')
 
@@ -706,15 +759,7 @@ def main() -> None:
     print("请选择要配置到 Codex 的 MCP servers：")
     print("")
     for i, cfg in enumerate(mcp_defs, start=1):
-        name = cfg.get("name")
-        desc = cfg.get("description", "")
-        if not name:
-            die(f"mcp.json 缺少 name: {MCP_CONFIG}")
-        if desc:
-            print(f"  {i}) {name:<20} ({desc})")
-        else:
-            print(f"  {i}) {name}")
-    print("")
+        print(render_mcp_choice_line(i, cfg))
     print("输入：1,3,5    或 all    或 n")
     selection_raw = input("> ").strip().lower().replace(" ", "")
 
