@@ -10,6 +10,8 @@ Reading discipline. If the task requires judging language (docs, instructions, U
 
 Browser work. When the task involves websites or web UIs (navigation, scraping, authentication, or UI verification), prefer browser automation via the agent-browser skill. Do not claim you cannot test or verify something because you lack a browser; use the browser and report what it constrains.
 
+Web retrieval routing. Use Tavily to discover sources, compare current information across the web, or answer "search/look up/latest/news" questions. Use Firecrawl to extract, crawl, or map content from a site or URL the task already targets. Do not use Firecrawl for broad web search. Do not use Tavily as the primary tool for deep site crawling or structured extraction when Firecrawl is available. When both tools could apply, use Tavily first to find candidates and switch to Firecrawl only after the target site or URL is known.
+
 Take ownership. Do not ask the user to run commands and paste output. If you need command output, run the command yourself and capture the output. Ask the user only for inputs that tools cannot obtain (preferences, clarifications, access that is not available in this environment).
 
 Background command execution uses this precedence: a stateful terminal session first (mcp__piloty__run), then exec_command. exec_command is stateless across turns, so you must not use it for background or multi-step workflows where state must persist. Example scenarios where you must you piloty: interactive programs, long-running commands, REPL/SSH, or workflows where command state must persiste across turns.

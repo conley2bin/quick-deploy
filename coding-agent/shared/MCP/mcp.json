@@ -22,6 +22,19 @@
       }
     },
     {
+      "name": "firecrawl",
+      "description": "HTTP，Firecrawl 抓取/爬取 MCP；需要 FIRECRAWL_API_KEY",
+      "type": "http",
+      "env_vars": ["FIRECRAWL_API_KEY"],
+      "http": {
+        "url": "https://mcp.firecrawl.dev/v2/mcp",
+        "transportType": "streamable-http",
+        "timeout": 120,
+        "startup_timeout_sec": 60,
+        "bearer_token_env_var": "FIRECRAWL_API_KEY"
+      }
+    },
+    {
       "name": "github",
       "description": "HTTP，GitHub MCP（remote）；需要 GITHUB_PERSONAL_ACCESS_TOKEN",
       "type": "http",
