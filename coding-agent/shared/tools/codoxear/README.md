@@ -16,7 +16,9 @@ cd coding-agent/shared/tools/codoxear
 
 `setup.sh` 会执行：
 
-- 克隆/更新上游仓库到 `upstream/codoxear`
+- 克隆/更新上游仓库到 `codoxear`
+- 每次运行都执行 `fetch + reset --hard + clean`，对齐远端最新提交
+- 如果设置了 `CODOXEAR_REPO_URL`，已有 checkout 的 `origin` 也会被改成这个地址
 - 用 `python3 -m pip -e` 安装 `codoxear-server` 和 `codoxear-broker`
   - 未激活虚拟环境时：`--user`
   - 已激活虚拟环境时：不加 `--user`
@@ -31,6 +33,9 @@ cd coding-agent/shared/tools/codoxear
 cd coding-agent/shared/tools/codoxear
 ./run_server.sh
 ```
+
+`run_server.sh` 启动前也会先同步到远端最新提交；如果本地 editable install 对应的提交或路径已经过期，会先重新执行一次安装。
+如果当前 shell 没有导出 `CODEX_WEB_PASSWORD`、`CODEX_WEB_HOST`、`CODEX_WEB_PORT`、`CODEX_HOME`、`CODEX_BIN`，`run_server.sh` 会从本目录 `.env` 补全这些变量。
 
 默认访问地址：
 

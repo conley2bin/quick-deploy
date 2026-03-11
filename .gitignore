@@ -4,7 +4,8 @@
 coding-agent/codex/__pycache__/
 coding-agent/shared/MCP/deep-research/.env
 coding-agent/shared/tools/codoxear/.env
-coding-agent/shared/tools/codoxear/upstream/
+coding-agent/shared/tools/codoxear/codoxear/
+coding-agent/shared/tools/codoxear/.internal/install-state
 
 !.claude/
 !.agents/

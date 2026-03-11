@@ -2,114 +2,10 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-HELPER_DIR="${SCRIPT_DIR}"
-UPSTREAM_DIR="${HELPER_DIR}/upstream/codoxear"
-UPSTREAM_REPO_URL="${CODOXEAR_REPO_URL:-https://github.com/yiwenlu66/codoxear}"
-ENV_FILE="${HELPER_DIR}/.env"
-RUN_SCRIPT="${HELPER_DIR}/run_server.sh"
+source "${SCRIPT_DIR}/.internal/common.sh"
 
 WRAPPER_MARKER_BEGIN="# >>> codoxear codex wrapper >>>"
 WRAPPER_MARKER_END="# <<< codoxear codex wrapper <<<"
-
-need_cmd() {
-  local cmd="$1"
-  if ! command -v "${cmd}" >/dev/null 2>&1; then
-    echo "error: 缺少命令 ${cmd}"
-    exit 1
-  fi
-}
-
-normalize_home_path() {
-  local raw="$1"
-  local out="${raw//\$\{HOME\}/${HOME}}"
-  out="${out//\$HOME/${HOME}}"
-  case "${out}" in
-    "~")
-      out="${HOME}"
-      ;;
-    "~/"*)
-      out="${HOME}/${out#\~/}"
-      ;;
-  esac
-  printf '%s' "${out}"
-}
-
-read_env_value() {
-  local key="$1"
-  local file="$2"
-  local line
-  line="$(grep -E "^[[:space:]]*${key}[[:space:]]*=" "${file}" | tail -n 1 || true)"
-  if [[ -z "${line}" ]]; then
-    echo ""
-    return
-  fi
-  line="${line#*=}"
-  line="$(printf '%s' "${line}" | sed -E 's/^[[:space:]]+//;s/[[:space:]]+$//')"
-  if [[ "${line}" =~ ^\".*\"$ ]]; then
-    line="${line:1:${#line}-2}"
-  elif [[ "${line}" =~ ^\'.*\'$ ]]; then
-    line="${line:1:${#line}-2}"
-  fi
-  echo "${line}"
-}
-
-default_branch() {
-  local repo_dir="$1"
-  local out
-  out="$(git -C "${repo_dir}" symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null || true)"
-  if [[ "${out}" == origin/* ]]; then
-    echo "${out#origin/}"
-    return
-  fi
-  echo "main"
-}
-
-sync_upstream() {
-  if [[ -e "${UPSTREAM_DIR}" && ! -d "${UPSTREAM_DIR}/.git" ]]; then
-    echo "error: 路径存在但不是 git 仓库: ${UPSTREAM_DIR}"
-    exit 1
-  fi
-
-  if [[ ! -d "${UPSTREAM_DIR}" ]]; then
-    mkdir -p "$(dirname "${UPSTREAM_DIR}")"
-    git clone "${UPSTREAM_REPO_URL}" "${UPSTREAM_DIR}"
-  fi
-
-  git -C "${UPSTREAM_DIR}" fetch --prune origin
-
-  local branch
-  branch="$(default_branch "${UPSTREAM_DIR}")"
-
-  local status
-  status="$(git -C "${UPSTREAM_DIR}" status --porcelain)"
-  if [[ -n "${status}" ]]; then
-    echo "error: 上游仓库有未提交修改，停止自动更新: ${UPSTREAM_DIR}"
-    exit 1
-  fi
-
-  git -C "${UPSTREAM_DIR}" checkout --detach "origin/${branch}"
-
-  local rev
-  rev="$(git -C "${UPSTREAM_DIR}" rev-parse --short HEAD)"
-  echo "codoxear repo: branch=${branch}, commit=${rev}"
-}
-
-install_codoxear() {
-  if python3 -m pip --version >/dev/null 2>&1; then
-    if [[ -n "${VIRTUAL_ENV:-}" ]]; then
-      python3 -m pip install -e "${UPSTREAM_DIR}"
-      echo "installer: python3 -m pip -e (venv)"
-    else
-      python3 -m pip install --user -e "${UPSTREAM_DIR}"
-      echo "installer: python3 -m pip --user -e"
-    fi
-    return
-  fi
-
-  echo "error: python3 -m pip 不可用"
-  echo "note: 请先配置主仓库 uv 环境并激活，再重试"
-  exit 1
-}
 
 create_env_template() {
   local password="${CODEX_WEB_PASSWORD:-}"
@@ -221,8 +117,7 @@ target_rc_file() {
 
 install_wrapper() {
   local rc_file="$1"
-  local upstream_dir="$2"
-  python3 - "${rc_file}" "${WRAPPER_MARKER_BEGIN}" "${WRAPPER_MARKER_END}" "${upstream_dir}" "${HELPER_DIR}" <<'PY'
+  python3 - "${rc_file}" "${WRAPPER_MARKER_BEGIN}" "${WRAPPER_MARKER_END}" "${HELPER_DIR}" <<'PY'
 from pathlib import Path
 from datetime import datetime
 import re
@@ -231,8 +126,7 @@ import sys
 rc_file = Path(sys.argv[1]).expanduser()
 begin = sys.argv[2]
 end = sys.argv[3]
-upstream_dir = Path(sys.argv[4]).expanduser().resolve()
-helper_dir = Path(sys.argv[5]).expanduser().resolve()
+helper_dir = Path(sys.argv[4]).expanduser().resolve()
 repo_root = helper_dir.parents[3]
 venv_broker = (repo_root / ".venv" / "bin" / "codoxear-broker").resolve()
 
@@ -294,51 +188,6 @@ print(f"wrapper rc: updated ({rc_file})")
 PY
 }
 
-write_run_script() {
-  cat >"${RUN_SCRIPT}" <<'EOF'
-#!/usr/bin/env bash
-set -euo pipefail
-
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cd "${SCRIPT_DIR}"
-REPO_ROOT="$(cd "${SCRIPT_DIR}/../../../.." && pwd)"
-
-if [[ -z "${CODEX_HOME:-}" && -f "${SCRIPT_DIR}/.env" ]]; then
-  _cxh_line="$(grep -E '^[[:space:]]*CODEX_HOME[[:space:]]*=' "${SCRIPT_DIR}/.env" | tail -n 1 || true)"
-  if [[ -n "${_cxh_line}" ]]; then
-    CODEX_HOME="${_cxh_line#*=}"
-    CODEX_HOME="${CODEX_HOME#\"}"
-    CODEX_HOME="${CODEX_HOME%\"}"
-    CODEX_HOME="${CODEX_HOME#\'}"
-    CODEX_HOME="${CODEX_HOME%\'}"
-    export CODEX_HOME
-  fi
-fi
-
-if [[ -n "${CODEX_HOME:-}" ]]; then
-  CODEX_HOME="${CODEX_HOME//\$\{HOME\}/${HOME}}"
-  CODEX_HOME="${CODEX_HOME//\$HOME/${HOME}}"
-  case "${CODEX_HOME}" in
-    "~") CODEX_HOME="${HOME}" ;;
-    "~/"*) CODEX_HOME="${HOME}/${CODEX_HOME#\~/}" ;;
-  esac
-  export CODEX_HOME
-fi
-
-if command -v codoxear-server >/dev/null 2>&1; then
-  exec codoxear-server
-fi
-
-if [[ -x "${REPO_ROOT}/.venv/bin/codoxear-server" ]]; then
-  exec "${REPO_ROOT}/.venv/bin/codoxear-server"
-fi
-
-echo "error: codoxear-server 未找到。请先运行 ./coding-agent/shared/tools/codoxear/setup.sh"
-exit 127
-EOF
-  chmod +x "${RUN_SCRIPT}"
-}
-
 main() {
   need_cmd git
   need_cmd python3
@@ -351,8 +200,7 @@ main() {
 
   local rc_file
   rc_file="$(target_rc_file)"
-  install_wrapper "${rc_file}" "${UPSTREAM_DIR}"
-  write_run_script
+  install_wrapper "${rc_file}"
 
   local host
   local port
