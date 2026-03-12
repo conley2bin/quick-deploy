@@ -91,18 +91,6 @@
       "startup_timeout_sec": 300
     },
     {
-      "name": "mu-mcp",
-      "description": "本地，OpenRouter 聊天；需要 OPENROUTER_API_KEY",
-      "summary": "基于 OpenRouter 的外部模型聊天桥接。",
-      "repo_url": "https://github.com/yiwenlu66/mu-mcp",
-      "prerequisites": ["需要 OPENROUTER_API_KEY"],
-      "type": "stdio",
-      "command": "uv",
-      "args": ["run", "python", "server.py"],
-      "cwd": "${REPO_ROOT}/coding-agent/shared/MCP/mu-mcp",
-      "env_vars": ["OPENROUTER_API_KEY"]
-    },
-    {
       "name": "pal",
       "description": "STDIO，PAL MCP Server；通过 uvx 启动并走 CRS OpenAI 兼容网关",
       "summary": "多模型协作、代码分析与讨论工具，默认使用 CRS 的 GPT-5.4。",
