@@ -51,6 +51,16 @@ http://127.0.0.1:8743
 
 ```sh
 codex() {
+  if [ "${CODEX_WEB_OWNER:-}" = "web" ]; then
+    local _real_codex
+    _real_codex="$(whence -p codex 2>/dev/null)"
+    if [ -n "${_real_codex}" ]; then
+      "${_real_codex}" "$@"
+      return $?
+    fi
+    echo "error: 未找到真实 codex 可执行文件" >&2
+    return 127
+  fi
   if command -v codoxear-broker >/dev/null 2>&1; then
     codoxear-broker -- "$@"
     return

@@ -127,33 +127,17 @@ rc_file = Path(sys.argv[1]).expanduser()
 begin = sys.argv[2]
 end = sys.argv[3]
 helper_dir = Path(sys.argv[4]).expanduser().resolve()
+sys.path.insert(0, str(helper_dir / ".internal"))
+
+from render_wrapper import render_wrapper_block
+
 repo_root = helper_dir.parents[3]
 venv_broker = (repo_root / ".venv" / "bin" / "codoxear-broker").resolve()
 
-block = (
-    f"{begin}\n"
-    "codex() {\n"
-    "  if [ -n \"${CODEX_HOME:-}\" ]; then\n"
-    "    local _cxh=\"${CODEX_HOME//\\$\\{HOME\\}/${HOME}}\"\n"
-    "    _cxh=\"${_cxh//\\$HOME/${HOME}}\"\n"
-    "    case \"${_cxh}\" in\n"
-    "      \"~\") _cxh=\"${HOME}\" ;;\n"
-    "      \"~/\"*) _cxh=\"${HOME}/${_cxh#\\~/}\" ;;\n"
-    "    esac\n"
-    "    export CODEX_HOME=\"${_cxh}\"\n"
-    "  fi\n"
-    "  if command -v codoxear-broker >/dev/null 2>&1; then\n"
-    "    codoxear-broker -- \"$@\"\n"
-    "    return\n"
-    "  fi\n"
-    f"  if [ -x {str(venv_broker)!r} ]; then\n"
-    f"    {str(venv_broker)!r} -- \"$@\"\n"
-    "    return\n"
-    "  fi\n"
-    "  echo \"error: codoxear-broker 未找到。请先运行 ./coding-agent/shared/tools/codoxear/setup.sh\" >&2\n"
-    "  return 127\n"
-    "}\n"
-    f"{end}\n"
+block = render_wrapper_block(
+    begin=begin,
+    end=end,
+    venv_broker=str(venv_broker),
 )
 
 if rc_file.exists():

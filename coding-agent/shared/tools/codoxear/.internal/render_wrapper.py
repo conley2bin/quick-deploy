@@ -1,0 +1,40 @@
+from __future__ import annotations
+
+
+def render_wrapper_block(*, begin: str, end: str, venv_broker: str) -> str:
+    lines = [
+        begin,
+        "codex() {",
+        '  if [ -n "${CODEX_HOME:-}" ]; then',
+        '    local _cxh="${CODEX_HOME//\\$\\{HOME\\}/${HOME}}"',
+        '    _cxh="${_cxh//\\$HOME/${HOME}}"',
+        '    case "${_cxh}" in',
+        '      "~") _cxh="${HOME}" ;;',
+        '      "~/"*) _cxh="${HOME}/${_cxh#\\~/}" ;;',
+        "    esac",
+        '    export CODEX_HOME="${_cxh}"',
+        "  fi",
+        '  if [ "${CODEX_WEB_OWNER:-}" = "web" ]; then',
+        "    local _real_codex",
+        '    _real_codex="$(whence -p codex 2>/dev/null)"',
+        '    if [ -n "${_real_codex}" ]; then',
+        '      "${_real_codex}" "$@"',
+        "      return $?",
+        "    fi",
+        '    echo "error: 未找到真实 codex 可执行文件" >&2',
+        "    return 127",
+        "  fi",
+        '  if command -v codoxear-broker >/dev/null 2>&1; then',
+        '    codoxear-broker -- "$@"',
+        "    return",
+        "  fi",
+        f"  if [ -x {venv_broker!r} ]; then",
+        f"    {venv_broker!r} -- \"$@\"",
+        "    return",
+        "  fi",
+        '  echo "error: codoxear-broker 未找到。请先运行 ./coding-agent/shared/tools/codoxear/setup.sh" >&2',
+        "  return 127",
+        "}",
+        end,
+    ]
+    return "\n".join(lines) + "\n"
