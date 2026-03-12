@@ -465,6 +465,28 @@ def remove_plain_developer_instructions(text: str) -> str:
         text = updated
 
 
+def insert_before_first_toml_section(text: str, block: str) -> str:
+    match = re.search(r"(?m)^\[", text)
+    if not match:
+        updated = text
+        if updated and not updated.endswith("\n"):
+            updated += "\n"
+        if updated and not updated.endswith("\n\n"):
+            updated += "\n"
+        return updated + block
+
+    head = text[: match.start()].rstrip("\n")
+    tail = text[match.start() :].lstrip("\n")
+
+    parts = []
+    if head:
+        parts.append(head)
+    parts.append(block.rstrip("\n"))
+    if tail:
+        parts.append(tail)
+    return "\n\n".join(parts) + "\n"
+
+
 def render_developer_instructions_block(instructions: str) -> str:
     if "'''" in instructions:
         die(
@@ -496,12 +518,7 @@ def sync_developer_instructions() -> None:
 
     updated = remove_managed_developer_instructions_block(config_text)
     updated = remove_plain_developer_instructions(updated)
-
-    if updated and not updated.endswith("\n"):
-        updated += "\n"
-    if updated and not updated.endswith("\n\n"):
-        updated += "\n"
-    updated += block
+    updated = insert_before_first_toml_section(updated, block)
 
     if updated == config_text:
         print("developer_instructions: 未变化")
