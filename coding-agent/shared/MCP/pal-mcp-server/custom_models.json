@@ -1,0 +1,29 @@
+{
+  "_README": {
+    "description": "Model metadata for CRS-backed PAL custom endpoint.",
+    "field_notes": "These entries map PAL's Custom provider to https://cc.yiwen.lu/openai/v1."
+  },
+  "models": [
+    {
+      "model_name": "gpt-5.4",
+      "friendly_name": "CRS (GPT-5.4)",
+      "aliases": ["gpt5.4", "gpt-5.4", "5.4"],
+      "intelligence_score": 19,
+      "description": "CRS-routed GPT-5.4 via OpenAI-compatible Responses API.",
+      "context_window": 400000,
+      "max_output_tokens": 128000,
+      "supports_extended_thinking": true,
+      "supports_system_prompts": true,
+      "supports_streaming": true,
+      "supports_function_calling": true,
+      "supports_json_mode": true,
+      "supports_images": true,
+      "supports_temperature": true,
+      "max_image_size_mb": 20.0,
+      "use_openai_response_api": true,
+      "default_reasoning_effort": "high",
+      "allow_code_generation": true,
+      "temperature_constraint": "fixed"
+    }
+  ]
+}

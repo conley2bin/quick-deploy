@@ -103,6 +103,23 @@
       "env_vars": ["OPENROUTER_API_KEY"]
     },
     {
+      "name": "pal",
+      "description": "STDIO，PAL MCP Server；通过 uvx 启动并走 CRS OpenAI 兼容网关",
+      "summary": "多模型协作、代码分析与讨论工具，默认使用 CRS 的 GPT-5.4。",
+      "repo_url": "https://github.com/BeehiveInnovations/pal-mcp-server",
+      "prerequisites": ["需要 uvx", "需要 CRS_OAI_KEY"],
+      "type": "stdio",
+      "command": "bash",
+      "args": [
+        "-lc",
+        "export CUSTOM_API_URL='https://cc.yiwen.lu/openai/v1'; export CUSTOM_API_KEY=\"$CRS_OAI_KEY\"; export DEFAULT_MODEL='gpt-5.4'; export CUSTOM_MODELS_CONFIG_PATH=\"$PWD/coding-agent/shared/MCP/pal-mcp-server/custom_models.json\"; uvx_cmd=\"$(command -v uvx 2>/dev/null || true)\"; for p in \"$uvx_cmd\" \"$HOME/.local/bin/uvx\" /opt/homebrew/bin/uvx /usr/local/bin/uvx; do [ -n \"$p\" ] && [ -x \"$p\" ] && exec \"$p\" --from git+https://github.com/BeehiveInnovations/pal-mcp-server.git pal-mcp-server; done; command -v uvx >/dev/null 2>&1 && exec uvx --from git+https://github.com/BeehiveInnovations/pal-mcp-server.git pal-mcp-server; echo 'uvx not found' >&2; exit 1"
+      ],
+      "cwd": "${REPO_ROOT}",
+      "env_vars": ["CRS_OAI_KEY"],
+      "startup_timeout_sec": 120,
+      "tool_timeout_sec": 1200
+    },
+    {
       "name": "piloty",
       "description": "本地，PTY 终端控制",
       "summary": "面向交互式 shell 工作流的有状态 PTY 终端控制。",
