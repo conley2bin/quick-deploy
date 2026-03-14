@@ -42,6 +42,55 @@ get_profile_name() {
     grep -A 3 "uid: $uid" "$PROFILES_YAML" | grep "name:" | sed 's/.*name: *//' | sed 's/^[[:space:]]*//'
 }
 
+# 获取当前订阅 UID
+get_current_profile_uid() {
+    awk '/^current:/ {print $2; exit}' "$PROFILES_YAML"
+}
+
+# 根据 UID 获取配置文件名
+get_profile_item_file() {
+    local target_uid="$1"
+
+    awk -v uid="$target_uid" '
+        $0 ~ /^- uid: / {found=($3==uid); next}
+        found && /^  file: / {print $2; exit}
+    ' "$PROFILES_YAML"
+}
+
+# 根据 UID 获取配置文件路径
+get_profile_item_path() {
+    local target_uid="$1"
+    local file
+
+    file=$(get_profile_item_file "$target_uid")
+    [ -n "$file" ] && echo "$CLASH_DIR/profiles/$file"
+}
+
+# 获取当前订阅 option 绑定的配置 UID
+get_current_profile_option_uid() {
+    local key="$1"
+    local current_uid
+
+    current_uid=$(get_current_profile_uid)
+    [ -z "$current_uid" ] && return
+
+    awk -v uid="$current_uid" -v key="$key" '
+        $0 ~ /^- uid: / {in_item=($3==uid); in_option=0; next}
+        in_item && /^  option:$/ {in_option=1; next}
+        in_item && in_option && $1==(key ":") {print $2; exit}
+        in_item && in_option && /^  [^[:space:]]/ {in_option=0}
+    ' "$PROFILES_YAML"
+}
+
+# 获取当前订阅 option 绑定的配置路径
+get_current_profile_option_path() {
+    local key="$1"
+    local uid
+
+    uid=$(get_current_profile_option_uid "$key")
+    [ -n "$uid" ] && get_profile_item_path "$uid"
+}
+
 # 更新或创建 Merge 配置中的 Fake-IP Filter
 update_fake_ip_filter() {
     local file="$1"
@@ -316,10 +365,11 @@ function main(config) {
     "DOMAIN-SUFFIX,com.cn,DIRECT",
     "DOMAIN-SUFFIX,gov.cn,DIRECT",
     "DOMAIN-SUFFIX,edu.cn,DIRECT",
-    "DOMAIN-SUFFIX,bilibili.com,DIRECT",
-    "DOMAIN-SUFFIX,zhihu.com,DIRECT",
-    "DOMAIN-SUFFIX,huya.com,DIRECT",
-    "DOMAIN-SUFFIX,douyin.com,DIRECT",
+    "DOMAIN-KEYWORD,bili,DIRECT",
+    "DOMAIN-KEYWORD,zhihu,DIRECT",
+    "DOMAIN-KEYWORD,huya,DIRECT",
+    "DOMAIN-KEYWORD,douyin,DIRECT",
+    "DOMAIN-KEYWORD,bing,DIRECT",
     "DOMAIN-SUFFIX,taobao.com,DIRECT",
     "DOMAIN-SUFFIX,tmall.com,DIRECT",
     "DOMAIN-SUFFIX,jd.com,DIRECT",
@@ -345,8 +395,6 @@ function main(config) {
     "DOMAIN-SUFFIX,tencent.com,DIRECT",
     "DOMAIN-SUFFIX,bytedance.com,DIRECT",
     "DOMAIN,cc.yiwen.lu,DIRECT",
-    "DOMAIN-SUFFIX,cn.bing.com,DIRECT",
-    "DOMAIN-SUFFIX,bing.com,DIRECT",
     "IP-CIDR,192.168.0.0/16,DIRECT,no-resolve",
     "IP-CIDR,10.0.0.0/8,DIRECT,no-resolve",
     "IP-CIDR,172.16.0.0/12,DIRECT,no-resolve",
@@ -508,7 +556,7 @@ show_menu() {
     echo ""
     echo "  1. 一键优化 Clash 配置 (推荐)"
     echo "  2. 配置 SSH for GitHub (可选)"
-    echo "  3. 查看 Merge 配置文件路径"
+    echo "  3. 查看会读取/修改的配置文件"
     echo "  4. 备份管理"
     echo "  0. 退出"
     echo ""
@@ -516,26 +564,62 @@ show_menu() {
     echo -n "请选择 [0-4]: "
 }
 
+show_config_paths() {
+    local current_uid
+    local current_profile_path
+    local global_merge
+    local global_script
+    local sub_merge
+    local sub_script
+    local sub_rules
+    local sub_proxies
+    local sub_groups
+
+    current_uid=$(get_current_profile_uid)
+    current_profile_path=$(get_profile_item_path "$current_uid")
+    global_merge=$(get_merge_config)
+    global_script=$(get_script_config)
+    sub_merge=$(get_current_profile_option_path "merge")
+    sub_script=$(get_current_profile_option_path "script")
+    sub_rules=$(get_current_profile_option_path "rules")
+    sub_proxies=$(get_current_profile_option_path "proxies")
+    sub_groups=$(get_current_profile_option_path "groups")
+
+    echo ""
+    echo "=========================================="
+    echo "配置文件路径"
+    echo "=========================================="
+    echo ""
+    echo "直接修改:"
+    echo "  $global_merge"
+    echo "  $global_script"
+    [ -n "$sub_merge" ] && echo "  $sub_merge"
+    echo ""
+    echo "读取定位:"
+    echo "  $PROFILES_YAML"
+    [ -n "$current_profile_path" ] && echo "  $current_profile_path"
+    [ -n "$sub_script" ] && echo "  $sub_script"
+    [ -n "$sub_rules" ] && echo "  $sub_rules"
+    [ -n "$sub_proxies" ] && echo "  $sub_proxies"
+    [ -n "$sub_groups" ] && echo "  $sub_groups"
+    echo ""
+    echo "说明:"
+    echo "  - 全局 Merge: Fake-IP Filter 与 TUN 配置"
+    echo "  - 全局 Script: 直连规则 prepend 到生成配置顶部"
+    echo "  - 订阅级 Merge: 一键优化时会清空，避免覆盖全局 Merge"
+    echo "  - 其余订阅绑定文件当前只读取，不直接改写"
+    echo ""
+    echo "=========================================="
+    echo ""
+}
+
 # 清空订阅级 Merge（保留备份）
 clear_subscription_merge() {
     local timestamp=$(date +%Y%m%d_%H%M%S)
-    local merge_list
     local sub_merge_uids
     local uid
     local file
     local path
-
-    merge_list=$(awk '
-        $0 ~ /^- uid: / {uid=$3; type=""; file=""}
-        $0 ~ /^  type: / {type=$2}
-        $0 ~ /^  file: / {file=$2; if (type=="merge" && file!="") print uid, file}
-    ' "$PROFILES_YAML")
-
-    declare -A merge_files
-    while IFS= read -r uid file; do
-        [ -z "$uid" ] && continue
-        merge_files["$uid"]="$file"
-    done <<< "$merge_list"
 
     sub_merge_uids=$(awk '
         $0 ~ /^- uid: / {type=""; in_option=0}
@@ -556,7 +640,7 @@ clear_subscription_merge() {
         if [ "$uid" = "Merge" ]; then
             continue
         fi
-        file="${merge_files[$uid]}"
+        file=$(get_profile_item_file "$uid")
         if [ -z "$file" ]; then
             echo "未找到 merge 文件: $uid"
             continue
@@ -736,36 +820,7 @@ main() {
                 configure_ssh
                 ;;
             3)
-                echo ""
-                echo "=========================================="
-                echo "Merge 配置文件"
-                echo "=========================================="
-                echo ""
-                echo "文件路径:"
-                echo "  $MERGE_CONFIG"
-                echo ""
-                echo "核心作用:"
-                echo "  这是全局 Merge 增强配置"
-                echo "  与订阅配置合并后生效"
-                echo ""
-                echo "包含内容:"
-                echo "  - dns.fake-ip-filter: DNS 过滤规则"
-                echo "  - tun: TUN 模式配置"
-                echo ""
-                echo "脚本修改内容:"
-                echo "  pass DNS 层: 添加 fake-ip-filter (包含主域名和通配符)"
-                echo "  pass 路由层: 添加 TUN + exclude-routes"
-                echo "  pass 规则层: 写入全局脚本插入直连规则"
-                echo ""
-                echo "优势:"
-                echo "  - 订阅更新不会影响此配置"
-                echo "  - 配置持久化，无需重复设置"
-                echo ""
-                echo "注意:"
-                echo "  - 此配置对所有订阅有效"
-                echo ""
-                echo "=========================================="
-                echo ""
+                show_config_paths
                 ;;
             4)
                 backup_menu
