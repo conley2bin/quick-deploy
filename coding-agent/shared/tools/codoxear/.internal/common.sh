@@ -5,7 +5,6 @@ HELPER_DIR="$(cd "${COMMON_DIR}/.." && pwd)"
 REPO_ROOT="$(cd "${HELPER_DIR}/../../../.." && pwd)"
 UPSTREAM_DIR="${HELPER_DIR}/codoxear"
 LEGACY_UPSTREAM_DIR="${HELPER_DIR}/upstream/codoxear"
-PATCH_DIR="${HELPER_DIR}/patches"
 UPSTREAM_REPO_URL="${CODOXEAR_REPO_URL:-https://github.com/yiwenlu66/codoxear}"
 ENV_FILE="${HELPER_DIR}/.env"
 RUN_SCRIPT="${HELPER_DIR}/run_server.sh"
@@ -113,39 +112,6 @@ codoxear_python_cmd() {
   printf '%s\n' "python3"
 }
 
-local_overlay_rev() {
-  python3 - "${PATCH_DIR}" <<'PY'
-from pathlib import Path
-import hashlib
-import sys
-
-patch_dir = Path(sys.argv[1])
-h = hashlib.sha256()
-
-if patch_dir.exists():
-    for path in sorted(patch_dir.glob("*.patch")):
-        if not path.is_file():
-            continue
-        h.update(path.name.encode("utf-8"))
-        h.update(b"\0")
-        h.update(path.read_bytes())
-        h.update(b"\0")
-
-print(h.hexdigest())
-PY
-}
-
-apply_local_patches() {
-  if [[ ! -d "${PATCH_DIR}" ]]; then
-    return
-  fi
-
-  local patch
-  while IFS= read -r patch; do
-    git -C "${UPSTREAM_DIR}" apply --whitespace=nowarn "${patch}"
-  done < <(find "${PATCH_DIR}" -maxdepth 1 -type f -name '*.patch' | sort)
-}
-
 ensure_origin_remote() {
   if git -C "${UPSTREAM_DIR}" remote get-url origin >/dev/null 2>&1; then
     git -C "${UPSTREAM_DIR}" remote set-url origin "${UPSTREAM_REPO_URL}"
@@ -193,7 +159,6 @@ sync_upstream() {
   git -C "${UPSTREAM_DIR}" checkout --detach "origin/${branch}"
   git -C "${UPSTREAM_DIR}" reset --hard "origin/${branch}"
   git -C "${UPSTREAM_DIR}" clean -fd
-  apply_local_patches
 
   local rev
   rev="$(current_repo_rev)"
@@ -207,7 +172,6 @@ write_install_state() {
   cat > "${INSTALL_STATE_FILE}" <<EOF
 REPO_DIR=${UPSTREAM_DIR}
 REPO_REV=${rev}
-OVERLAY_REV=$(local_overlay_rev)
 EOF
 }
 
@@ -225,14 +189,11 @@ install_state_matches() {
 
   local repo_dir
   local repo_rev
-  local overlay_rev
   repo_dir="$(read_env_value REPO_DIR "${INSTALL_STATE_FILE}")"
   repo_rev="$(read_env_value REPO_REV "${INSTALL_STATE_FILE}")"
-  overlay_rev="$(read_env_value OVERLAY_REV "${INSTALL_STATE_FILE}")"
 
   [[ "${repo_dir}" == "${UPSTREAM_DIR}" ]] || return 1
-  [[ "${repo_rev}" == "$(current_repo_rev)" ]] || return 1
-  [[ "${overlay_rev}" == "$(local_overlay_rev)" ]]
+  [[ "${repo_rev}" == "$(current_repo_rev)" ]]
 }
 
 install_codoxear() {
