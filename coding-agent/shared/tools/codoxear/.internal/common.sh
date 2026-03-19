@@ -5,6 +5,7 @@ HELPER_DIR="$(cd "${COMMON_DIR}/.." && pwd)"
 REPO_ROOT="$(cd "${HELPER_DIR}/../../../.." && pwd)"
 UPSTREAM_DIR="${HELPER_DIR}/codoxear"
 LEGACY_UPSTREAM_DIR="${HELPER_DIR}/upstream/codoxear"
+PATCH_DIR="${HELPER_DIR}/patches"
 UPSTREAM_REPO_URL="${CODOXEAR_REPO_URL:-https://github.com/yiwenlu66/codoxear}"
 ENV_FILE="${HELPER_DIR}/.env"
 RUN_SCRIPT="${HELPER_DIR}/run_server.sh"
@@ -104,6 +105,47 @@ current_repo_rev() {
   git -C "${UPSTREAM_DIR}" rev-parse HEAD
 }
 
+codoxear_python_cmd() {
+  if [[ -x "${REPO_ROOT}/.venv/bin/python" ]]; then
+    printf '%s\n' "${REPO_ROOT}/.venv/bin/python"
+    return
+  fi
+  printf '%s\n' "python3"
+}
+
+local_overlay_rev() {
+  python3 - "${PATCH_DIR}" <<'PY'
+from pathlib import Path
+import hashlib
+import sys
+
+patch_dir = Path(sys.argv[1])
+h = hashlib.sha256()
+
+if patch_dir.exists():
+    for path in sorted(patch_dir.glob("*.patch")):
+        if not path.is_file():
+            continue
+        h.update(path.name.encode("utf-8"))
+        h.update(b"\0")
+        h.update(path.read_bytes())
+        h.update(b"\0")
+
+print(h.hexdigest())
+PY
+}
+
+apply_local_patches() {
+  if [[ ! -d "${PATCH_DIR}" ]]; then
+    return
+  fi
+
+  local patch
+  while IFS= read -r patch; do
+    git -C "${UPSTREAM_DIR}" apply --whitespace=nowarn "${patch}"
+  done < <(find "${PATCH_DIR}" -maxdepth 1 -type f -name '*.patch' | sort)
+}
+
 ensure_origin_remote() {
   if git -C "${UPSTREAM_DIR}" remote get-url origin >/dev/null 2>&1; then
     git -C "${UPSTREAM_DIR}" remote set-url origin "${UPSTREAM_REPO_URL}"
@@ -151,6 +193,7 @@ sync_upstream() {
   git -C "${UPSTREAM_DIR}" checkout --detach "origin/${branch}"
   git -C "${UPSTREAM_DIR}" reset --hard "origin/${branch}"
   git -C "${UPSTREAM_DIR}" clean -fd
+  apply_local_patches
 
   local rev
   rev="$(current_repo_rev)"
@@ -164,6 +207,7 @@ write_install_state() {
   cat > "${INSTALL_STATE_FILE}" <<EOF
 REPO_DIR=${UPSTREAM_DIR}
 REPO_REV=${rev}
+OVERLAY_REV=$(local_overlay_rev)
 EOF
 }
 
@@ -181,36 +225,57 @@ install_state_matches() {
 
   local repo_dir
   local repo_rev
+  local overlay_rev
   repo_dir="$(read_env_value REPO_DIR "${INSTALL_STATE_FILE}")"
   repo_rev="$(read_env_value REPO_REV "${INSTALL_STATE_FILE}")"
+  overlay_rev="$(read_env_value OVERLAY_REV "${INSTALL_STATE_FILE}")"
 
   [[ "${repo_dir}" == "${UPSTREAM_DIR}" ]] || return 1
-  [[ "${repo_rev}" == "$(current_repo_rev)" ]]
+  [[ "${repo_rev}" == "$(current_repo_rev)" ]] || return 1
+  [[ "${overlay_rev}" == "$(local_overlay_rev)" ]]
 }
 
 install_codoxear() {
-  if python3 -m pip --version >/dev/null 2>&1; then
-    if [[ -n "${VIRTUAL_ENV:-}" ]]; then
-      python3 -m pip install -e "${UPSTREAM_DIR}"
-      echo "installer: python3 -m pip -e (venv)"
+  local py
+  py="$(codoxear_python_cmd)"
+
+  if "${py}" -m pip --version >/dev/null 2>&1; then
+    if [[ "${py}" == "${REPO_ROOT}/.venv/bin/python" ]]; then
+      "${py}" -m pip install -e "${UPSTREAM_DIR}"
+      echo "installer: ${py} -m pip -e (.venv)"
+    elif [[ -n "${VIRTUAL_ENV:-}" ]]; then
+      "${py}" -m pip install -e "${UPSTREAM_DIR}"
+      echo "installer: ${py} -m pip -e (venv)"
     else
-      python3 -m pip install --user -e "${UPSTREAM_DIR}"
-      echo "installer: python3 -m pip --user -e"
+      "${py}" -m pip install --user -e "${UPSTREAM_DIR}"
+      echo "installer: ${py} -m pip --user -e"
     fi
     write_install_state
     return
   fi
 
-  echo "error: python3 -m pip 不可用"
+  echo "error: ${py} -m pip 不可用"
   echo "note: 请先配置主仓库 uv 环境并激活，再重试"
   exit 1
 }
 
+codoxear_imports_cleanly() {
+  local py
+  py="$(codoxear_python_cmd)"
+  "${py}" - <<'PY' >/dev/null 2>&1
+import codoxear.server
+PY
+}
+
 ensure_codoxear_install() {
-  if install_state_matches && has_codoxear_server; then
+  if install_state_matches && has_codoxear_server && codoxear_imports_cleanly; then
     return
   fi
   install_codoxear
+  if ! codoxear_imports_cleanly; then
+    echo "error: codoxear Python import failed after install"
+    exit 1
+  fi
 }
 
 load_runtime_env_from_env() {
