@@ -135,6 +135,21 @@ maybe_migrate_legacy_checkout() {
   rmdir "$(dirname "${LEGACY_UPSTREAM_DIR}")" 2>/dev/null || true
 }
 
+require_local_upstream_checkout() {
+  maybe_migrate_legacy_checkout
+
+  if [[ -e "${UPSTREAM_DIR}" && ! -d "${UPSTREAM_DIR}/.git" ]]; then
+    echo "error: 路径存在但不是 git 仓库: ${UPSTREAM_DIR}"
+    exit 1
+  fi
+
+  if [[ ! -d "${UPSTREAM_DIR}" ]]; then
+    echo "error: 本地 codoxear 仓库不存在: ${UPSTREAM_DIR}"
+    echo "note: 首次运行请先执行 ./run_server.sh 或 ./setup.sh 以拉取远端仓库"
+    exit 1
+  fi
+}
+
 sync_upstream() {
   maybe_migrate_legacy_checkout
 

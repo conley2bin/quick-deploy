@@ -34,8 +34,14 @@ cd coding-agent/shared/tools/codoxear
 ./run_server.sh
 ```
 
-`run_server.sh` 启动前也会先同步到远端最新提交；如果本地 editable install 对应的提交或路径已经过期，会先重新执行一次安装。
+默认情况下，`run_server.sh` 启动前会先同步到远端最新提交；如果本地 editable install 对应的提交或路径已经过期，会先重新执行一次安装。
 如果当前 shell 没有导出 `CODEX_WEB_PASSWORD`、`CODEX_WEB_HOST`、`CODEX_WEB_PORT`、`CODEX_HOME`、`CODEX_BIN`，`run_server.sh` 会从本目录 `.env` 补全这些变量。
+
+如果你只想复用本地已有 checkout，不访问远端：
+
+```bash
+./run_server.sh --skip-sync
+```
 
 默认访问地址：
 
