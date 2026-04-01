@@ -645,10 +645,24 @@ def configure_http(mcp: dict, values: dict):
     elif http_cfg.get("timeout") is not None:
         timeout_val = http_cfg.get("timeout")
 
+    env_backed = {
+        key.strip()
+        for key in mcp.get("env_vars", [])
+        if isinstance(key, str) and values.get(key.strip(), "")
+    }
+
     headers = {}
+    env_http_headers = {}
     for k, tmpl in mcp.get("headers", {}).items():
-        rendered, miss = substitute_template(tmpl, values)
+        raw = str(tmpl).strip()
+        exact_env = re.fullmatch(r"\{([A-Za-z0-9_]+)\}", raw)
+        if exact_env and exact_env.group(1) in env_backed:
+            env_http_headers[k] = exact_env.group(1)
+            continue
+
+        rendered, miss = substitute_template(raw, values)
         if miss:
+            missing.extend(miss)
             continue
         headers[k] = rendered
 
@@ -666,6 +680,8 @@ def configure_http(mcp: dict, values: dict):
         lines.append(f"timeout = {int(timeout_val)}")
     if headers:
         lines.append(f"headers = {toml_inline_table(headers)}")
+    if env_http_headers:
+        lines.append(f"env_http_headers = {toml_inline_table(env_http_headers)}")
     if http_cfg.get("startup_timeout_sec") is not None:
         lines.append(f"startup_timeout_sec = {int(http_cfg.get('startup_timeout_sec'))}")
     if mcp.get("tool_timeout_sec") is not None:
