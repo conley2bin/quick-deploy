@@ -16,8 +16,9 @@ printf "Package: *\nPin: origin apt.syncthing.net\nPin-Priority: 990\n" | sudo t
 
 # 安装
 echo "Installing Syncthing..."
-sudo apt update
-sudo apt install -y syncthing
+sudo rm -f /var/lib/apt/lists/apt.syncthing.net_*
+sudo apt-get update
+sudo apt-get install -y syncthing
 
 # 验证版本
 echo "Verifying installation..."
