@@ -1,16 +1,16 @@
 {
   "_README": {
-    "description": "Model metadata for CRS-backed PAL custom endpoint.",
-    "field_notes": "These entries map PAL's Custom provider to https://cc.yiwen.lu/openai/v1."
+    "description": "Template copied by setup.py to a local PAL custom models config.",
+    "field_notes": "Edit the copied local file to set model_name, aliases, context_window, max_output_tokens, and other PAL model metadata."
   },
   "models": [
     {
-      "model_name": "gpt-5.4",
-      "friendly_name": "CRS (GPT-5.4)",
-      "aliases": ["gpt5.4", "gpt-5.4", "5.4"],
+      "model_name": "codex-current",
+      "friendly_name": "Codex current model",
+      "aliases": ["codex-current"],
       "intelligence_score": 19,
-      "description": "CRS-routed GPT-5.4 via OpenAI-compatible Responses API.",
-      "context_window": 400000,
+      "description": "Template entry for a manually configured PAL model.",
+      "context_window": 1,
       "max_output_tokens": 128000,
       "supports_extended_thinking": true,
       "supports_system_prompts": true,

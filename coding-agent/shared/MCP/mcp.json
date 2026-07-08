@@ -32,6 +32,7 @@
       "description": "HTTP，Firecrawl 抓取/爬取 MCP；需要 FIRECRAWL_API_KEY",
       "summary": "面向指定站点或 URL 的提取、爬取与站点地图能力。",
       "docs_url": "https://docs.firecrawl.dev/mcp-server",
+      "credential_url": "https://www.firecrawl.dev/app/api-keys",
       "prerequisites": ["需要 FIRECRAWL_API_KEY"],
       "type": "http",
       "env_vars": ["FIRECRAWL_API_KEY"],
@@ -48,6 +49,7 @@
       "description": "HTTP，Browser Use MCP（official hosted）；需要 BROWSER_USE_API_KEY",
       "summary": "面向交互站点、表单和登录流程的浏览器自动化。",
       "docs_url": "https://docs.browser-use.com/open-source/customize/integrations/mcp-server",
+      "credential_url": "https://cloud.browser-use.com/settings",
       "prerequisites": ["需要 BROWSER_USE_API_KEY"],
       "type": "http",
       "env_vars": ["BROWSER_USE_API_KEY"],
@@ -67,6 +69,7 @@
       "description": "HTTP，GitHub MCP（remote）；需要 GITHUB_PERSONAL_ACCESS_TOKEN",
       "summary": "GitHub 仓库、Issue、Pull Request 与代码搜索操作。",
       "repo_url": "https://github.com/github/github-mcp-server",
+      "credential_url": "https://github.com/settings/tokens",
       "prerequisites": ["需要 GITHUB_PERSONAL_ACCESS_TOKEN"],
       "type": "http",
       "env_vars": ["GITHUB_PERSONAL_ACCESS_TOKEN"],
@@ -83,6 +86,7 @@
       "description": "STDIO，需要 MORPH_API_KEY",
       "summary": "通过 Morph 实现快速代码编辑与代码库搜索。",
       "docs_url": "https://morphllm.com",
+      "credential_url": "https://morphllm.com",
       "prerequisites": ["需要 MORPH_API_KEY"],
       "type": "stdio",
       "command": "npx",
@@ -92,18 +96,26 @@
     },
     {
       "name": "pal",
-      "description": "STDIO，PAL MCP Server；通过 uvx 启动并走 CRS OpenAI 兼容网关",
-      "summary": "多模型协作、代码分析与讨论工具，默认使用 CRS 的 GPT-5.4。",
+      "description": "STDIO，PAL MCP Server；通过 uvx 启动并走 OpenAI 兼容网关，模型信息读取本地 PAL 配置文件",
+      "summary": "多模型协作、代码分析与讨论工具，模型信息读取本地 PAL 配置文件。",
       "repo_url": "https://github.com/BeehiveInnovations/pal-mcp-server",
-      "prerequisites": ["需要 uvx", "需要 CRS_OAI_KEY"],
+      "credential_url": "PAL_API_KEY 可使用公司 sub2api 下发的 Codex API key",
+      "prerequisites": ["需要 uvx", "需要 PAL_API_KEY", "需要 PAL_API_BASE_URL"],
       "type": "stdio",
       "command": "bash",
       "args": [
         "-lc",
-        "export CUSTOM_API_URL='https://cc.yiwen.lu/openai/v1'; export CUSTOM_API_KEY=\"$CRS_OAI_KEY\"; export DEFAULT_MODEL='gpt-5.4'; export CUSTOM_MODELS_CONFIG_PATH=\"$PWD/coding-agent/shared/MCP/pal-mcp-server/custom_models.json\"; uvx_cmd=\"$(command -v uvx 2>/dev/null || true)\"; for p in \"$uvx_cmd\" \"$HOME/.local/bin/uvx\" /opt/homebrew/bin/uvx /usr/local/bin/uvx; do [ -n \"$p\" ] && [ -x \"$p\" ] && exec \"$p\" --from git+https://github.com/BeehiveInnovations/pal-mcp-server.git pal-mcp-server; done; command -v uvx >/dev/null 2>&1 && exec uvx --from git+https://github.com/BeehiveInnovations/pal-mcp-server.git pal-mcp-server; echo 'uvx not found' >&2; exit 1"
+        "export CUSTOM_API_URL={PAL_API_BASE_URL_shell}; export CUSTOM_API_KEY=\"$PAL_API_KEY\"; export DEFAULT_MODEL={pal_default_model_shell}; export CUSTOM_MODELS_CONFIG_PATH={pal_custom_models_config_path_shell}; uvx_cmd=\"$(command -v uvx 2>/dev/null || true)\"; for p in \"$uvx_cmd\" \"$HOME/.local/bin/uvx\" /opt/homebrew/bin/uvx /usr/local/bin/uvx; do [ -n \"$p\" ] && [ -x \"$p\" ] && exec \"$p\" --from git+https://github.com/BeehiveInnovations/pal-mcp-server.git pal-mcp-server; done; command -v uvx >/dev/null 2>&1 && exec uvx --from git+https://github.com/BeehiveInnovations/pal-mcp-server.git pal-mcp-server; echo 'uvx not found' >&2; exit 1"
       ],
       "cwd": "${REPO_ROOT}",
-      "env_vars": ["CRS_OAI_KEY"],
+      "env_vars": ["PAL_API_KEY"],
+      "prompts": [
+        {
+          "key": "PAL_API_BASE_URL",
+          "label": "PAL OpenAI-compatible base URL",
+          "default": "http://192.168.10.120:28080"
+        }
+      ],
       "startup_timeout_sec": 120,
       "tool_timeout_sec": 1200
     },
@@ -146,6 +158,7 @@
       "description": "HTTP，Tavily 搜索 MCP；需要 TAVILY_API_KEY",
       "summary": "面向当前公开网络来源的搜索与研究检索。",
       "docs_url": "https://www.tavily.com/",
+      "credential_url": "https://app.tavily.com/",
       "prerequisites": ["需要 TAVILY_API_KEY"],
       "type": "http",
       "env_vars": ["TAVILY_API_KEY"],

@@ -5,12 +5,12 @@ import getpass
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
-from urllib.parse import urlparse
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = (SCRIPT_DIR / "../..").resolve()
@@ -19,13 +19,16 @@ CODEX_HOME = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")).expandus
 CODEX_CLI_CONFIG = Path(
     os.environ.get("CODEX_CLI_CONFIG", CODEX_HOME / "config.toml")
 ).expanduser()
-ZSHRC_PATH = Path.home() / ".zshrc"
+ZSHRC_PATH = Path(os.environ.get("CODEX_ZSHRC", Path.home() / ".zshrc")).expanduser()
 
 MCP_ROOT = REPO_ROOT / "coding-agent/shared/MCP"
 MCP_CONFIG = MCP_ROOT / "mcp.json"
 GITMODULES_PATH = REPO_ROOT / ".gitmodules"
 DEEP_RESEARCH_ENV_PATH = MCP_ROOT / "deep-research/.env"
 DEVELOPER_INSTRUCTIONS_PATH = REPO_ROOT / "coding-agent/codex/developer_instructions.md"
+SKILLS_ROOT = REPO_ROOT / "coding-agent/shared/skills"
+PAL_CUSTOM_MODELS_TEMPLATE_PATH = MCP_ROOT / "pal-mcp-server/custom_models.json"
+PAL_CUSTOM_MODELS_OUTPUT_PATH = CODEX_HOME / "pal-custom-models.json"
 
 MARKER_BEGIN = "# >>> codex mcp api keys >>>"
 MARKER_END = "# <<< codex mcp api keys <<<"
@@ -46,7 +49,12 @@ def write_text(path: Path, text: str) -> None:
     path.write_text(text, encoding="utf-8")
 
 
-def run_cmd(cmd: list[str], cwd: Path | None = None, check: bool = True) -> subprocess.CompletedProcess[str]:
+def run_cmd(
+    cmd: list[str],
+    cwd: Path | None = None,
+    check: bool = True,
+    timeout: int = 120,
+) -> subprocess.CompletedProcess[str]:
     try:
         env = os.environ.copy()
         env.setdefault("GIT_TERMINAL_PROMPT", "0")
@@ -55,7 +63,7 @@ def run_cmd(cmd: list[str], cwd: Path | None = None, check: bool = True) -> subp
             cwd=str(cwd) if cwd else None,
             capture_output=True,
             text=True,
-            timeout=120,
+            timeout=timeout,
             env=env,
             check=False,
         )
@@ -68,6 +76,13 @@ def run_cmd(cmd: list[str], cwd: Path | None = None, check: bool = True) -> subp
         err = (cp.stderr or cp.stdout or "").strip()
         die(f"命令失败：{' '.join(cmd)}\n{err}")
     return cp
+
+
+def print_cmd_output(cp: subprocess.CompletedProcess[str]) -> None:
+    for stream in (cp.stdout, cp.stderr):
+        text = stream.strip()
+        if text:
+            print(text)
 
 
 def parse_dotenv(path: Path) -> dict[str, str]:
@@ -140,12 +155,31 @@ def load_submodule_defs() -> dict[str, dict[str, object]]:
     return defs
 
 
-def load_deep_research_values() -> dict[str, str]:
+def load_deep_research_values() -> tuple[dict[str, str], str | None]:
+    if not DEEP_RESEARCH_ENV_PATH.is_file():
+        return (
+            {},
+            "\n".join(
+                [
+                    f"找不到 env 文件：{DEEP_RESEARCH_ENV_PATH}",
+                    "请先运行：",
+                    f"  cd {DEEP_RESEARCH_ENV_PATH.parent}",
+                    "  ./start_service.sh",
+                    (
+                        f"首次运行会创建 {DEEP_RESEARCH_ENV_PATH} 模板；"
+                        "填写 OPENAI_COMPATIBLE_API_BASE_URL、OPENAI_COMPATIBLE_API_KEY "
+                        "等信息后，再运行 ./start_service.sh 启动服务。"
+                    ),
+                    "服务启动后，重新运行 coding-agent/codex/setup.py 并选择 deep-research。",
+                ]
+            ),
+        )
+
     envs = parse_dotenv(DEEP_RESEARCH_ENV_PATH)
 
     port = envs.get("DEEP_RESEARCH_PORT", "").strip() or "3000"
     if not re.fullmatch(r"[0-9]+", port):
-        die(f"DEEP_RESEARCH_PORT 必须是整数：{port}")
+        return {}, f"DEEP_RESEARCH_PORT 必须是整数：{port}"
 
     values: dict[str, str] = {
         "url": f"http://127.0.0.1:{port}/api/mcp",
@@ -155,7 +189,96 @@ def load_deep_research_values() -> dict[str, str]:
     if access_password:
         values["access_password"] = access_password
 
-    return values
+    return values, None
+
+
+def print_deep_research_setup_note() -> None:
+    print("")
+    print("deep-research 准备步骤：")
+    print(f"  1. cd {DEEP_RESEARCH_ENV_PATH.parent}")
+    print("  2. ./start_service.sh")
+    print(f"  3. 填写 {DEEP_RESEARCH_ENV_PATH} 后再次运行 ./start_service.sh")
+    print("setup.py 只写入 Codex MCP 连接配置；deep-research 服务需要先在本地启动。")
+
+
+def load_pal_template() -> dict:
+    if not PAL_CUSTOM_MODELS_TEMPLATE_PATH.is_file():
+        die(f"找不到 PAL 模型模板：{PAL_CUSTOM_MODELS_TEMPLATE_PATH}")
+    try:
+        data = json.loads(read_text(PAL_CUSTOM_MODELS_TEMPLATE_PATH))
+    except json.JSONDecodeError as e:
+        die(f"PAL 模型模板 JSON 格式错误：{PAL_CUSTOM_MODELS_TEMPLATE_PATH}\n{e}")
+    models = data.get("models")
+    if not isinstance(models, list) or not models or not isinstance(models[0], dict):
+        die(f"PAL 模型模板必须包含 models[0]：{PAL_CUSTOM_MODELS_TEMPLATE_PATH}")
+    return data
+
+
+def expand_user_path(raw: str) -> Path:
+    value = raw.replace("${CODEX_HOME}", str(CODEX_HOME))
+    value = value.replace("${HOME}", str(Path.home()))
+    return Path(value).expanduser()
+
+
+def get_pal_model_names(config: dict) -> list[str]:
+    names = []
+    models = config.get("models", [])
+    if not isinstance(models, list):
+        die("PAL 模型配置中的 models 必须是数组")
+    for item in models:
+        if not isinstance(item, dict):
+            continue
+        name = item.get("model_name")
+        if isinstance(name, str) and name.strip():
+            names.append(name.strip())
+    return names
+
+
+def ensure_pal_custom_models_config(path: Path) -> list[str]:
+    if path.exists():
+        try:
+            data = json.loads(read_text(path))
+        except json.JSONDecodeError as e:
+            die(f"PAL 模型配置 JSON 格式错误：{path}\n{e}")
+        names = get_pal_model_names(data)
+        if not names:
+            die(f"PAL 模型配置缺少 models[].model_name：{path}")
+        print(f"pal custom models: 使用已有文件 {path}")
+        return names
+
+    data = load_pal_template()
+    names = get_pal_model_names(data)
+    if not names:
+        die(f"PAL 模型模板缺少 models[].model_name：{PAL_CUSTOM_MODELS_TEMPLATE_PATH}")
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    write_text(path, json.dumps(data, ensure_ascii=False, indent=2) + "\n")
+    print(f"pal custom models: 已从模板创建 {path}")
+    print("note: 后续可直接编辑该文件中的 model_name/context_window 等 PAL 模型信息。")
+    return names
+
+
+def load_pal_values() -> dict[str, str]:
+    config_path_raw = prompt_input(
+        "PAL custom models config path",
+        str(PAL_CUSTOM_MODELS_OUTPUT_PATH),
+    )
+    custom_models_path = expand_user_path(config_path_raw)
+    model_names = ensure_pal_custom_models_config(custom_models_path)
+
+    default_model = prompt_input("PAL default model", model_names[0])
+    if not default_model:
+        die("PAL default model 不能为空")
+    if default_model not in model_names:
+        print(
+            f"warning: PAL default model 不在当前模型配置中：{default_model}；"
+            f"请在 {custom_models_path} 中补齐后再使用 pal。"
+        )
+
+    return {
+        "pal_default_model_shell": shlex.quote(default_model),
+        "pal_custom_models_config_path_shell": shlex.quote(str(custom_models_path)),
+    }
 
 
 def get_git_default_branch(repo_dir: Path) -> str:
@@ -360,8 +483,29 @@ def load_mcp_defs():
     return items
 
 
+def parse_selection(selection_raw: str, total: int, label: str) -> list[int]:
+    raw = selection_raw.strip().lower().replace(" ", "")
+    if raw in ("", "n"):
+        return []
+    if raw == "all":
+        return list(range(1, total + 1))
+    if not re.fullmatch(r"[0-9,]+", raw):
+        die(f"{label} 输入格式错误：{selection_raw}（应为 1,3,5 / all / n）")
+
+    selected: list[int] = []
+    for x in raw.split(","):
+        if not x:
+            continue
+        n = int(x)
+        if n < 1 or n > total:
+            die(f"{label} 输入包含无效选项：{x}（有效范围：1-{total}）")
+        if n not in selected:
+            selected.append(n)
+    return selected
+
+
 def get_mcp_display_link(mcp: dict) -> str:
-    for key in ("docs_url", "repo_url"):
+    for key in ("credential_url", "docs_url", "repo_url"):
         value = str(mcp.get(key, "")).strip()
         if value:
             return value
@@ -372,13 +516,7 @@ def compact_display_link(url: str) -> str:
     raw = str(url).strip()
     if not raw:
         return ""
-
-    parsed = urlparse(raw)
-    if not parsed.scheme or not parsed.netloc:
-        return raw.rstrip("/")
-
-    path = parsed.path.rstrip("/")
-    return f"{parsed.netloc}{path}"
+    return raw.rstrip("/")
 
 
 def get_mcp_prerequisites_text(mcp: dict) -> str:
@@ -409,7 +547,7 @@ def render_mcp_choice_line(index: int, mcp: dict) -> str:
     details = [protocol, about, link]
     if requires:
         details.append(requires)
-    return f"  {index}) {name:<20} ({'; '.join(details)})"
+    return f"  {index}) {name:<20} ({' '.join(details)})"
 
 
 def toml_escape(value: str) -> str:
@@ -662,7 +800,6 @@ def configure_http(mcp: dict, values: dict):
 
         rendered, miss = substitute_template(raw, values)
         if miss:
-            missing.extend(miss)
             continue
         headers[k] = rendered
 
@@ -702,7 +839,13 @@ def configure_stdio(mcp: dict, values: dict):
     if command:
         lines.append(f'command = "{toml_escape(command)}"')
     if args:
-        lines.append(f"args = {toml_array(args)}")
+        rendered_args = []
+        for arg in args:
+            rendered, miss = substitute_template(str(arg), values)
+            if miss:
+                missing.extend(miss)
+            rendered_args.append(rendered)
+        lines.append(f"args = {toml_array(rendered_args)}")
 
     cwd = resolve_cwd(mcp.get("cwd"))
     if cwd:
@@ -720,7 +863,7 @@ def configure_stdio(mcp: dict, values: dict):
     return lines, missing
 
 
-def sync_agents_and_commands() -> None:
+def sync_agents() -> None:
     src = REPO_ROOT / "coding-agent/codex/AGENTS.md"
     dst = CODEX_HOME / "AGENTS.md"
     override = CODEX_HOME / "AGENTS.override.md"
@@ -742,49 +885,69 @@ def sync_agents_and_commands() -> None:
         shutil.copy2(src, dst)
         print(f"Global AGENTS.md: 已更新到 {dst}")
 
-    src_dir = REPO_ROOT / "coding-agent/codex/commands"
-    dst_dir = CODEX_HOME / "prompts"
+def load_skill_installers() -> list[dict[str, object]]:
+    if not SKILLS_ROOT.is_dir():
+        return []
+    installers = []
+    for path in sorted(SKILLS_ROOT.glob("*-setup.sh")):
+        name = path.name[: -len("-setup.sh")]
+        if name:
+            installers.append({"name": name, "path": path})
+    return installers
 
-    if not src_dir.is_dir():
-        die(f"找不到目录 {src_dir}")
 
-    dst_dir.mkdir(parents=True, exist_ok=True)
+def render_skill_choice_line(index: int, installer: dict[str, object]) -> str:
+    name = str(installer.get("name", "")).strip()
+    path = installer.get("path")
+    if not name or not isinstance(path, Path):
+        die(f"shared skill installer 格式错误：{installer}")
+    rel = path.relative_to(REPO_ROOT)
+    return f"  {index}) {name:<20} ({rel})"
 
-    files = sorted(src_dir.glob("*.md"))
-    if not files:
-        print(f"Custom prompts: 未找到 {src_dir}/*.md")
+
+def install_shared_skills() -> None:
+    installers = load_skill_installers()
+    if not installers:
+        print(f"Shared skills: 未找到 {SKILLS_ROOT}/*-setup.sh")
         return
 
-    copied = 0
-    names = []
-    for f in files:
-        base = f.name
-        names.append(base[:-3])
-        target = dst_dir / base
-        if target.exists() and target.read_bytes() == f.read_bytes():
-            continue
-        shutil.copy2(f, target)
-        copied += 1
+    print("请选择要安装到 Codex/Agents 的 shared skills：")
+    print("")
+    for i, installer in enumerate(installers, start=1):
+        print(render_skill_choice_line(i, installer))
+    print("输入：1,3,5    或 all    或 n")
+    selected_idx = parse_selection(input("> "), len(installers), "shared skills")
 
-    print(f"Custom prompts: 已安装到 {dst_dir}（更新/覆盖 {copied} 个文件）")
-    if names:
-        print("自定义 commands 使用方式：")
-        for n in names:
-            print(f"  - /prompts:{n}")
+    if not selected_idx:
+        print("未选择任何 shared skill（跳过 skills 安装）。")
+        return
 
+    for i in selected_idx:
+        installer = installers[i - 1]
+        name = str(installer["name"])
+        path = installer["path"]
+        if not isinstance(path, Path):
+            die(f"shared skill installer 路径格式错误：{installer}")
+        print(f"install shared skill: {name}")
+        cp = run_cmd(["bash", str(path)], cwd=REPO_ROOT, timeout=600)
+        print_cmd_output(cp)
 
 def main() -> None:
     CODEX_HOME.mkdir(parents=True, exist_ok=True)
 
-    print("[1/3] sync AGENTS.md and commands")
-    sync_agents_and_commands()
+    print("[1/4] sync AGENTS.md")
+    sync_agents()
     print("")
 
-    print("[2/3] sync developer_instructions")
+    print("[2/4] sync developer_instructions")
     sync_developer_instructions()
     print("")
 
-    print("[3/3] configure MCP servers")
+    print("[3/4] install shared skills")
+    install_shared_skills()
+    print("")
+
+    print("[4/4] configure MCP servers")
     mcp_defs = load_mcp_defs()
     if not mcp_defs:
         die(f"未找到任何 MCP 定义：{MCP_CONFIG}")
@@ -794,25 +957,11 @@ def main() -> None:
     for i, cfg in enumerate(mcp_defs, start=1):
         print(render_mcp_choice_line(i, cfg))
     print("输入：1,3,5    或 all    或 n")
-    selection_raw = input("> ").strip().lower().replace(" ", "")
+    selected_idx = parse_selection(input("> "), len(mcp_defs), "MCP servers")
 
-    if selection_raw in ("", "n"):
+    if not selected_idx:
         print("未选择任何 MCP（跳过 MCP 配置）。")
         return
-
-    if selection_raw == "all":
-        selected_idx = list(range(1, len(mcp_defs) + 1))
-    else:
-        if not re.fullmatch(r"[0-9,]+", selection_raw):
-            die(f"输入格式错误：{selection_raw}（应为 1,3,5 / all / n）")
-        selected_idx = []
-        for x in selection_raw.split(","):
-            if not x:
-                continue
-            n = int(x)
-            if n < 1 or n > len(mcp_defs):
-                die(f"输入包含无效选项：{x}（有效范围：1-{len(mcp_defs)}）")
-            selected_idx.append(n)
 
     selected = [mcp_defs[i - 1] for i in selected_idx]
     selected_names = {str(cfg.get("name", "")) for cfg in selected}
@@ -865,12 +1014,20 @@ def main() -> None:
                 continue
             resolved_env_values[key] = val
             key_sources[key] = "交互输入"
-            if key not in zshrc_envs:
-                envs_to_write[key] = val
 
         unresolved_keys = [k for k in sorted(required_env_vars.keys()) if not resolved_env_values.get(k)]
         if unresolved_keys:
             print(f"warning: 以下 key 仍缺失，相关 MCP 配置会被移除：{', '.join(unresolved_keys)}")
+
+        for key, val in resolved_env_values.items():
+            if val and key not in zshrc_envs:
+                envs_to_write[key] = val
+
+        if envs_to_write:
+            update_zshrc(envs_to_write)
+            zshrc_envs.update(envs_to_write)
+            envs_to_write = {}
+            print(f"wrote zshrc keys: {ZSHRC_PATH}")
 
     if CODEX_CLI_CONFIG.exists():
         config_text = read_text(CODEX_CLI_CONFIG)
@@ -897,11 +1054,6 @@ def main() -> None:
                     missing.append(key)
                     continue
                 values[key] = val
-                if key_sources.get(key) == "当前终端环境变量" and key not in zshrc_envs and key not in envs_to_write:
-                    envs_to_write[key] = val
-
-        if name == "deep-research":
-            values.update(load_deep_research_values())
 
         prompts = mcp.get("prompts", [])
         if name != "deep-research":
@@ -914,12 +1066,14 @@ def main() -> None:
                     if not val and not p.get("optional", False):
                         missing.append(key)
                     values[key] = val
+                    values[f"{key}_shell"] = shlex.quote(val)
                     continue
                 if p.get("type") == "int":
                     val = prompt_int(p.get("label", key), p.get("default"))
                     if val is None and not p.get("optional", False):
                         missing.append(key)
                     values[key] = "" if val is None else str(val)
+                    values[f"{key}_shell"] = shlex.quote(values[key])
                     continue
                 default = p.get("default")
                 if p.get("default_from"):
@@ -932,11 +1086,24 @@ def main() -> None:
                 if not val and not p.get("optional", False):
                     missing.append(key)
                 values[key] = val
+                values[f"{key}_shell"] = shlex.quote(val)
 
         if missing:
             print(f"warning: {name} 缺少必填参数，移除配置：{', '.join(sorted(set(missing)))}")
             config_text = remove_mcp_block(config_text, name)
             continue
+
+        if name == "deep-research":
+            print_deep_research_setup_note()
+            deep_values, err = load_deep_research_values()
+            if err:
+                print(f"warning: {name} 本地配置不可用，移除配置。")
+                print(err)
+                config_text = remove_mcp_block(config_text, name)
+                continue
+            values.update(deep_values)
+        elif name == "pal":
+            values.update(load_pal_values())
 
         if mcp.get("type") == "http":
             lines, miss = configure_http(mcp, values)

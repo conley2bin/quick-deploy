@@ -66,7 +66,7 @@ PY
 }
 
 create_env_template() {
-  local default_model="gpt-5.3-codex"
+  local default_model="gpt-5.5"
   local codex_model
   local openai_base_url="${OPENAI_COMPATIBLE_API_BASE_URL:-}"
   local openai_key="${OPENAI_COMPATIBLE_API_KEY:-}"
@@ -88,9 +88,26 @@ ACCESS_PASSWORD=
 DEEP_RESEARCH_PORT=3000
 
 # Deep Research MCP 配置
+# MCP_AI_PROVIDER: AI 后端提供方。当前模板使用 OpenAI 兼容网关，
+# 因此固定为 openaicompatible；实际网关地址和 key 来自上面的
+# OPENAI_COMPATIBLE_API_BASE_URL / OPENAI_COMPATIBLE_API_KEY。
 MCP_AI_PROVIDER=openaicompatible
+
+# MCP_SEARCH_PROVIDER: 研究过程使用的搜索来源。
+# 默认 tavily；可选 model, tavily, firecrawl, exa, bocha, searxng。
+# 如果当前终端没有 TAVILY_API_KEY，start_service.sh 会在启动前自动
+# 将 tavily 改为 model，避免服务因缺少 Tavily key 启动失败。
 MCP_SEARCH_PROVIDER=tavily
+
+# MCP_THINKING_MODEL: deep-research 用于规划、推理和拆解研究任务的模型。
+# 来源：start_service.sh 首次创建 .env 时读取 Codex 配置文件顶层 model；
+# 已有 .env 时，sync_model_from_codex.py 会继续从同一位置同步该字段。
+# 当前读取的 Codex 配置文件：${CODEX_CONFIG_FILE}
 MCP_THINKING_MODEL=${default_model}
+
+# MCP_TASK_MODEL: deep-research 用于执行子任务、整理和生成报告的模型。
+# 来源同 MCP_THINKING_MODEL，默认与 Codex 当前模型保持一致；如需让
+# deep-research 使用不同模型，可手动修改此值。
 MCP_TASK_MODEL=${default_model}
 EOF
 }
