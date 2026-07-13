@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+API_KEY_MARKER_BEGIN="# >>> pi skill api keys >>>"
+API_KEY_MARKER_END="# <<< pi skill api keys <<<"
+
 usage() {
   cat <<'EOF'
 Install this repository's Pi skills into the local Pi agent skill directory.
@@ -11,6 +14,7 @@ Usage:
 Defaults:
   source: directory containing this script (project pi-agent/skills)
   target: $PI_AGENT_SKILLS_DIR, or ~/.pi/agent/skills when unset
+  API key config: $PI_AGENT_SKILLS_ZSHRC, or ~/.zshrc when unset
 
 Examples:
   pi-agent/skills/install-skills.sh
@@ -19,15 +23,20 @@ Examples:
 
 Behavior:
   - Installs only subdirectories that contain SKILL.md.
+  - Reads selected skills' metadata.api-key-env declarations.
+  - Reuses nonempty environment variables and securely prompts for missing keys.
+  - Persists interactively entered keys in a managed block for later Pi sessions.
   - Copies files into target/<skill-name>/, overwriting same-named files.
   - Does not delete extra files already present in the target directory.
   - Does not copy this installer script.
+  - In --dry-run mode, reports key status but neither prompts nor writes files.
 EOF
 }
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source_dir="$script_dir"
 target_dir="${PI_AGENT_SKILLS_DIR:-$HOME/.pi/agent/skills}"
+zshrc_path="${PI_AGENT_SKILLS_ZSHRC:-$HOME/.zshrc}"
 dry_run=0
 selected=()
 
@@ -75,28 +84,129 @@ is_selected() {
   return 1
 }
 
-installed=0
-missing=()
+read_api_key_envs() {
+  local skill_file="$1"
+  awk '
+    NR == 1 && $0 == "---" { frontmatter = 1; next }
+    frontmatter && $0 == "---" { exit }
+    frontmatter && /^metadata:[[:space:]]*$/ { metadata = 1; next }
+    frontmatter && metadata && /^[^[:space:]]/ { metadata = 0 }
+    frontmatter && metadata && /^[[:space:]]+api-key-env:[[:space:]]*/ {
+      line = $0
+      sub(/^[[:space:]]+api-key-env:[[:space:]]*/, "", line)
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", line)
+      if ((substr(line, 1, 1) == "\"" && substr(line, length(line), 1) == "\"") ||
+          (substr(line, 1, 1) == "\047" && substr(line, length(line), 1) == "\047")) {
+        line = substr(line, 2, length(line) - 2)
+      }
+      gsub(/,/, " ", line)
+      print line
+    }
+  ' "$skill_file"
+}
 
-if [[ $dry_run -eq 0 ]]; then
-  mkdir -p "$target_dir"
-fi
+shell_single_quote() {
+  local value="$1"
+  value=${value//\'/\'\\\'\'}
+  printf "'%s'" "$value"
+}
+
+# Inspect only our managed block. Never source the user's shell configuration.
+declare -A managed_exports=()
+declare -A managed_configured=()
+load_managed_api_keys() {
+  [[ -f "$zshrc_path" ]] || return 0
+
+  local state="outside" begin_count=0 end_count=0 line key rhs
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    if [[ "$line" == "$API_KEY_MARKER_BEGIN" ]]; then
+      [[ "$state" == "outside" ]] || {
+        echo "error: malformed API key block in $zshrc_path (nested begin marker)" >&2
+        return 1
+      }
+      state="inside"
+      begin_count=$((begin_count + 1))
+      continue
+    fi
+    if [[ "$line" == "$API_KEY_MARKER_END" ]]; then
+      [[ "$state" == "inside" ]] || {
+        echo "error: malformed API key block in $zshrc_path (end marker without begin marker)" >&2
+        return 1
+      }
+      state="outside"
+      end_count=$((end_count + 1))
+      continue
+    fi
+    [[ "$state" == "inside" ]] || continue
+    if [[ "$line" =~ ^export[[:space:]]+([A-Z_][A-Z0-9_]*)=(.*)$ ]]; then
+      key="${BASH_REMATCH[1]}"
+      rhs="${BASH_REMATCH[2]}"
+      managed_exports["$key"]="$line"
+      if [[ -n "$rhs" && "$rhs" != "''" && "$rhs" != '""' ]]; then
+        managed_configured["$key"]=1
+      fi
+    fi
+  done < "$zshrc_path"
+
+  if [[ "$state" != "outside" || $begin_count -ne $end_count || $begin_count -gt 1 ]]; then
+    echo "error: malformed API key block in $zshrc_path" >&2
+    return 1
+  fi
+}
+
+write_managed_api_keys() {
+  local config_dir tmp key
+  config_dir="$(dirname "$zshrc_path")"
+  mkdir -p "$config_dir"
+  tmp="$(mktemp "$config_dir/.pi-skill-keys.XXXXXX")"
+
+  if [[ -f "$zshrc_path" ]]; then
+    awk -v begin="$API_KEY_MARKER_BEGIN" -v end="$API_KEY_MARKER_END" '
+      $0 == begin { managed = 1; next }
+      $0 == end { managed = 0; next }
+      !managed { outside[++count] = $0 }
+      END {
+        while (count > 0 && outside[count] == "") {
+          count--
+        }
+        for (i = 1; i <= count; i++) {
+          print outside[i]
+        }
+      }
+    ' "$zshrc_path" > "$tmp"
+    chmod --reference="$zshrc_path" "$tmp"
+  else
+    chmod 600 "$tmp"
+  fi
+
+  if [[ -s "$tmp" ]]; then
+    printf '\n' >> "$tmp"
+  fi
+  printf '%s\n' "$API_KEY_MARKER_BEGIN" >> "$tmp"
+  while IFS= read -r key; do
+    [[ -n "$key" ]] || continue
+    printf '%s\n' "${managed_exports[$key]}" >> "$tmp"
+  done < <(printf '%s\n' "${!managed_exports[@]}" | LC_ALL=C sort)
+  printf '%s\n' "$API_KEY_MARKER_END" >> "$tmp"
+  if [[ -L "$zshrc_path" ]]; then
+    cat "$tmp" > "$zshrc_path"
+    rm -f "$tmp"
+  else
+    mv "$tmp" "$zshrc_path"
+  fi
+}
+
+skill_dirs=()
+skill_names=()
+missing=()
 
 for skill_dir in "$source_dir"/*; do
   [[ -d "$skill_dir" ]] || continue
   [[ -f "$skill_dir/SKILL.md" ]] || continue
   name="$(basename "$skill_dir")"
   is_selected "$name" || continue
-
-  dest="$target_dir/$name"
-  if [[ $dry_run -eq 1 ]]; then
-    echo "would install $name -> $dest"
-  else
-    mkdir -p "$dest"
-    cp -a "$skill_dir/." "$dest/"
-    echo "installed $name -> $dest"
-  fi
-  installed=$((installed + 1))
+  skill_dirs+=("$skill_dir")
+  skill_names+=("$name")
 done
 
 if [[ ${#selected[@]} -gt 0 ]]; then
@@ -110,11 +220,120 @@ if [[ ${#missing[@]} -gt 0 ]]; then
   exit 1
 fi
 
+if [[ ${#skill_dirs[@]} -eq 0 ]]; then
+  echo "no skills installed from $source_dir" >&2
+  exit 1
+fi
+
+declare -A required_by=()
+for i in "${!skill_dirs[@]}"; do
+  skill_dir="${skill_dirs[$i]}"
+  name="${skill_names[$i]}"
+  while IFS= read -r declaration; do
+    declaration="${declaration//,/ }"
+    read -r -a keys <<< "$declaration"
+    for key in "${keys[@]}"; do
+      [[ -n "$key" ]] || continue
+      if [[ ! "$key" =~ ^[A-Z_][A-Z0-9_]*$ ]]; then
+        printf 'error: invalid metadata.api-key-env value in %s: %s\n' "$skill_dir/SKILL.md" "$key" >&2
+        exit 1
+      fi
+      if [[ -n "${required_by[$key]:-}" ]]; then
+        case ",${required_by[$key]}," in
+          *",$name,"*) ;;
+          *) required_by["$key"]+=",$name" ;;
+        esac
+      else
+        required_by["$key"]="$name"
+      fi
+    done
+  done < <(read_api_key_envs "$skill_dir/SKILL.md")
+done
+
+if [[ ${#required_by[@]} -gt 0 ]]; then
+  load_managed_api_keys
+  config_changed=0
+  echo "API key status for selected skills:"
+  missing_keys=()
+  while IFS= read -r key; do
+    [[ -n "$key" ]] || continue
+    if [[ -n "${!key:-}" ]]; then
+      current_value="${!key}"
+      if [[ "$current_value" == *$'\n'* || "$current_value" == *$'\r'* ]]; then
+        printf 'error: API key %s from the current environment must be a single line\n' "$key" >&2
+        exit 1
+      fi
+      printf '  - %s: configured (current environment; used by: %s)\n' "$key" "${required_by[$key]}"
+      unset current_value
+    elif [[ -n "${managed_configured[$key]:-}" ]]; then
+      printf '  - %s: configured (managed %s; used by: %s)\n' "$key" "$zshrc_path" "${required_by[$key]}"
+    else
+      printf '  - %s: missing (used by: %s)\n' "$key" "${required_by[$key]}"
+      missing_keys+=("$key")
+    fi
+  done < <(printf '%s\n' "${!required_by[@]}" | LC_ALL=C sort)
+
+  if [[ $dry_run -eq 1 ]]; then
+    for key in "${missing_keys[@]}"; do
+      printf 'would securely prompt for %s\n' "$key"
+    done
+  else
+    for key in "${missing_keys[@]}"; do
+      value=""
+      if ! IFS= read -r -s -p "$key: " value; then
+        printf '\nerror: unable to read required API key %s\n' "$key" >&2
+        exit 1
+      fi
+      printf '\n' >&2
+      if [[ -z "$value" ]]; then
+        printf 'error: required API key %s cannot be empty\n' "$key" >&2
+        exit 1
+      fi
+      if [[ "$value" == *$'\n'* || "$value" == *$'\r'* ]]; then
+        printf 'error: required API key %s must be a single line\n' "$key" >&2
+        exit 1
+      fi
+      managed_exports["$key"]="export $key=$(shell_single_quote "$value")"
+      managed_configured["$key"]=1
+      config_changed=1
+      printf -v "$key" '%s' "$value"
+      export "$key"
+      unset value
+    done
+
+    if [[ $config_changed -eq 1 ]]; then
+      write_managed_api_keys
+      printf 'configured selected skills API keys in %s\n' "$zshrc_path"
+    else
+      printf 'selected skills API keys are already configured\n'
+    fi
+  fi
+fi
+
+installed=0
+if [[ $dry_run -eq 0 ]]; then
+  mkdir -p "$target_dir"
+fi
+
+for i in "${!skill_dirs[@]}"; do
+  skill_dir="${skill_dirs[$i]}"
+  name="${skill_names[$i]}"
+  dest="$target_dir/$name"
+  if [[ $dry_run -eq 1 ]]; then
+    echo "would install $name -> $dest"
+  else
+    mkdir -p "$dest"
+    cp -a "$skill_dir/." "$dest/"
+    echo "installed $name -> $dest"
+  fi
+  installed=$((installed + 1))
+done
+
 if [[ $installed -eq 0 ]]; then
   echo "no skills installed from $source_dir" >&2
   exit 1
 fi
 
 if [[ $dry_run -eq 0 ]]; then
-  echo "done. Run /reload in Pi to load updated skills."
+  echo "done. Start a new shell (or source $zshrc_path), then run /reload in Pi."
 fi

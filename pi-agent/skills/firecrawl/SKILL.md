@@ -1,6 +1,8 @@
 ---
 name: firecrawl
 description: "Use Firecrawl HTTP API for webpage scraping, site mapping, and small crawls when the task needs structured extraction from specific URLs or sites. Requires FIRECRAWL_API_KEY."
+metadata:
+  api-key-env: FIRECRAWL_API_KEY
 ---
 
 # Firecrawl
