@@ -10,7 +10,6 @@ Use Tavily for current public web discovery: recent topics, market/competitor sc
 Prefer:
 - Context7 for library/framework/API documentation.
 - Firecrawl for extracting known URLs or mapping/crawling a specific site.
-- Deep Research service for full long-form outsourced reports.
 
 ## Prerequisite
 
