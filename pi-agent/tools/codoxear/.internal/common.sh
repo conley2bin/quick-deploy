@@ -121,28 +121,86 @@ installed_revision() {
   sed -n 's/^revision=//p' "${INSTALL_STATE_FILE}" | tail -n 1
 }
 
+installed_static_dir() {
+  "${VENV_DIR}/bin/python" -c '
+import sysconfig
+from pathlib import Path
+print(Path(sysconfig.get_path("purelib")) / "codoxear" / "static")
+'
+}
+
+assert_static_dir_in_venv() {
+  local static_dir="$1" resolved_static resolved_venv
+  need_cmd realpath || return 1
+  resolved_static="$(realpath -m "${static_dir}")" || return 1
+  resolved_venv="$(realpath -m "${VENV_DIR}")" || return 1
+  [[ "${resolved_static}" == "${resolved_venv}"/* ]] || {
+    echo "error: 拒绝修改 venv 外的 Codoxear static assets: ${resolved_static}" >&2
+    return 1
+  }
+}
+
+static_assets_match() {
+  local source_static="$1" installed_static
+  [[ -d "${source_static}" ]] || {
+    echo "error: upstream snapshot 缺少 codoxear/static" >&2
+    return 1
+  }
+  need_cmd diff || return 1
+  installed_static="$(installed_static_dir)" || return 1
+  assert_static_dir_in_venv "${installed_static}" || return 1
+  [[ -d "${installed_static}" ]] && diff -qr "${source_static}" "${installed_static}" >/dev/null
+}
+
+sync_static_assets() {
+  local source_static="$1" installed_static
+  [[ -d "${source_static}" ]] || {
+    echo "error: upstream snapshot 缺少 codoxear/static" >&2
+    return 1
+  }
+  need_cmd diff || return 1
+  installed_static="$(installed_static_dir)" || return 1
+  assert_static_dir_in_venv "${installed_static}" || return 1
+  rm -rf "${installed_static}" || return 1
+  mkdir -p "${installed_static}" || return 1
+  cp -a "${source_static}/." "${installed_static}/" || return 1
+  diff -qr "${source_static}" "${installed_static}" >/dev/null || {
+    echo "error: 无法同步 Codoxear static assets" >&2
+    return 1
+  }
+}
+
 install_remote_main_if_needed() {
   local revision="$1"
   ensure_venv || return 1
-  if [[ "$(installed_revision)" == "${revision}" ]] \
-    && [[ -x "${VENV_DIR}/bin/codoxear-server" ]] \
-    && [[ -x "${VENV_DIR}/bin/codoxear-broker" ]]; then
-    echo "codoxear install: unchanged (${revision})"
-    return 0
-  fi
-
   need_cmd tar || return 1
-  local source_snapshot state_tmp
+
+  local source_snapshot source_static state_tmp
   source_snapshot="$(mktemp -d "${RUNTIME_DIR}/install-source.XXXXXX")"
-  state_tmp="${INSTALL_STATE_FILE}.tmp.$$"
+  source_static="${source_snapshot}/codoxear/static"
   if ! git -C "${UPSTREAM_DIR}" archive "${revision}" | tar -x -C "${source_snapshot}"; then
     rm -rf "${source_snapshot}"
     return 1
   fi
+
+  if [[ "$(installed_revision)" == "${revision}" ]] \
+    && [[ -x "${VENV_DIR}/bin/codoxear-server" ]] \
+    && [[ -x "${VENV_DIR}/bin/codoxear-broker" ]] \
+    && static_assets_match "${source_static}"; then
+    rm -rf "${source_snapshot}"
+    echo "codoxear install: unchanged (${revision})"
+    return 0
+  fi
+
   if ! "${VENV_DIR}/bin/python" -m pip install "${source_snapshot}"; then
     rm -rf "${source_snapshot}"
     return 1
   fi
+  if ! sync_static_assets "${source_static}"; then
+    rm -rf "${source_snapshot}"
+    return 1
+  fi
+  state_tmp="${INSTALL_STATE_FILE}.tmp.$$"
   printf 'revision=%s\n' "${revision}" > "${state_tmp}"
   mv "${state_tmp}" "${INSTALL_STATE_FILE}"
   rm -rf "${source_snapshot}"
