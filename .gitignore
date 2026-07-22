@@ -6,9 +6,8 @@ PROMPT.md
 __pycache__/
 .pi-subagents/*
 coding-agent/shared/MCP/deep-research/.env
-coding-agent/shared/tools/codoxear/.env
-coding-agent/shared/tools/codoxear/codoxear/
-coding-agent/shared/tools/codoxear/.internal/install-state
+pi-agent/tools/codoxear/.env
+pi-agent/tools/codoxear/.runtime/
 
 !.claude/
 !.agents/
