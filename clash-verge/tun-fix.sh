@@ -533,6 +533,60 @@ remove_managed_ssh_block() {
     rm -f "$squeezed"
 }
 
+# ~/.ssh/config 中本脚本管理的段落 —— 全脚本唯一副本，输出到 stdout
+github_ssh_block() {
+    cat << 'EOF'
+# >>> tun-fix.sh github ssh >>>
+# GitHub SSH 走 443 端口。
+# 实测机制：流量已正确走代理，是机场封禁出站 TCP/22——不是某个节点的问题。
+# 逐节点探测（portquiz.net:22 走 /proxies/<node>/delay，443 作存活对照）：
+# 84 个节点里 0 个放行 22，81 个 443 正常。换节点无解。
+# 症状：connect 成功后一个 RTT 内返回 0 字节即断开（github/gitlab/bitbucket/
+# kernel.org 一致），同节点 :443 与 :9418 正常。443 端口不受影响。
+Host github.com ssh.github.com
+    Hostname ssh.github.com
+    Port 443
+    User git
+
+# 机场对所有境外 :22 都封，如需 GitLab / Bitbucket 取消下方注释即可
+#Host gitlab.com altssh.gitlab.com
+#    Hostname altssh.gitlab.com
+#    Port 443
+#    User git
+#
+#Host bitbucket.org altssh.bitbucket.org
+#    Hostname altssh.bitbucket.org
+#    Port 443
+#    User git
+# <<< tun-fix.sh github ssh <<<
+EOF
+}
+
+# 用 ssh 自己的解析结果确认块真的生效，而不是被更靠前的块遮蔽了。
+# 写入成功 ≠ 生效：SSH 取首个匹配到的值，且会需要考虑 Include 与 /etc/ssh/ssh_config。
+verify_github_ssh_config() {
+    local out h p
+
+    if ! command -v ssh >/dev/null 2>&1; then
+        echo "未找到 ssh 命令，跳过生效检查"
+        return 0
+    fi
+
+    out=$(ssh -G github.com 2>/dev/null || true)
+    h=$(printf '%s\n' "$out" | awk '$1=="hostname"{print $2; exit}')
+    p=$(printf '%s\n' "$out" | awk '$1=="port"{print $2; exit}')
+
+    if [ "$h" = "ssh.github.com" ] && [ "$p" = "443" ]; then
+        echo "pass ssh -G github.com 解析为 $h:$p，块已真正生效"
+        return 0
+    fi
+
+    echo "fail ssh -G github.com 解析为 ${h:-?}:${p:-?}，本脚本写入的块没有生效"
+    echo "     SSH 取首个匹配到的值，说明还有更靠前的 Host / Match / Include 在覆盖它："
+    grep -nE '^[[:space:]]*(Host|Match|Include)[[:space:]]' "$HOME/.ssh/config" 2>/dev/null | head -20
+    return 1
+}
+
 # 配置 SSH (可选)
 configure_ssh() {
     local ssh_config="$HOME/.ssh/config"
@@ -585,41 +639,47 @@ configure_ssh() {
         echo "pass 已备份原配置到: $ssh_config.backup.$timestamp"
     fi
 
-    # 添加配置
-    cat >> "$ssh_config" << 'EOF'
-
-# >>> tun-fix.sh github ssh >>>
-# GitHub SSH 走 443 端口。
-# 实测机制：流量已正确走代理，是机场封禁出站 TCP/22——不是某个节点的问题。
-# 逐节点探测（portquiz.net:22 走 /proxies/<node>/delay，443 作存活对照）：
-# 84 个节点里 0 个放行 22，81 个 443 正常。换节点无解。
-# 症状：connect 成功后一个 RTT 内返回 0 字节即断开（github/gitlab/bitbucket/
-# kernel.org 一致），同节点 :443 与 :9418 正常。443 端口不受影响。
-Host github.com ssh.github.com
-    Hostname ssh.github.com
-    Port 443
-    User git
-
-# 机场对所有境外 :22 都封，如需 GitLab / Bitbucket 取消下方注释即可
-#Host gitlab.com altssh.gitlab.com
-#    Hostname altssh.gitlab.com
-#    Port 443
-#    User git
-#
-#Host bitbucket.org altssh.bitbucket.org
-#    Hostname altssh.bitbucket.org
-#    Port 443
-#    User git
-# <<< tun-fix.sh github ssh <<<
-EOF
+    # 写到文件最前面，不是追加。
+    # SSH 配置是「首个匹配到的值生效」：追加到末尾时，任何更靠前的
+    # Host github.com / Host * 块都会盖掉本块，而旧实现仍然打印成功。
+    # 实测：手写 Host github.com 在前时，ssh -G 解析出 github.com:22，本块彻底无效。
+    # OpenSSH 的惯例本来就是特例在前、Host * 在末尾。
+    local tmp
+    tmp=$(mktemp "${ssh_config}.tmp.XXXXXX")
+    {
+        github_ssh_block
+        echo ""
+        if [ -f "$ssh_config" ]; then
+            cat "$ssh_config"
+        fi
+    } > "$tmp"
+    cat "$tmp" > "$ssh_config"
+    rm -f "$tmp"
 
     chmod 600 "$ssh_config"
 
     echo ""
-    echo "pass SSH 配置已添加到 ~/.ssh/config"
+    echo "pass SSH 配置已写入 ~/.ssh/config 顶部"
+
+    # 本脚本之外的 github.com 块不删（那是用户的东西），但必须告知已被遮蔽
+    local shadowed
+    shadowed=$(awk '
+        /^# >>> tun-fix\.sh github ssh >>>$/ {inblk=1}
+        /^# <<< tun-fix\.sh github ssh <<<$/ {inblk=0; next}
+        !inblk && /^[[:space:]]*Host[[:space:]].*github\.com/ {print "       " NR ": " $0}
+    ' "$ssh_config")
+    if [ -n "$shadowed" ]; then
+        echo ""
+        echo "note 文件里还有本脚本之外的 github.com 块，已被前置块遮蔽（未删除）："
+        printf '%s\n' "$shadowed"
+    fi
+
     echo ""
-    echo "测试连接:"
-    echo "  ssh -T git@github.com"
+    if verify_github_ssh_config; then
+        echo ""
+        echo "测试连接:"
+        echo "  ssh -T git@github.com"
+    fi
     echo ""
 }
 
