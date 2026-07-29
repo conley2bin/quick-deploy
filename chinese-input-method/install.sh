@@ -373,7 +373,7 @@ echo "重要: 注销并重新登录以使环境变量生效"
 echo "     手动操作或者使用命令: gnome-session-quit --logout --no-prompt"
 echo
 echo "首次配置 (必须):"
-echo "  1. 运行: fcitx5-configtool", 如果命令不存在，运行: fcitx5-config-qt
+echo "  1. 运行: fcitx5-configtool (若该命令不存在，运行: fcitx5-config-qt)"
 echo "  2. 在 Input Method 标签页中:"
 echo "     - 右侧 Available Input Method 找到 'Pinyin'"
 echo "     - 双击 'Pinyin' 添加拼音输入法"
