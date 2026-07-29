@@ -20,7 +20,7 @@ fi
 echo -e "\n${YELLOW}[2/8] 删除 snap 包...${NC}"
 if command -v snap &> /dev/null; then
     # 获取已安装的 snap 包列表（排除表头）
-    SNAPS=$(snap list | awk 'NR>1 {print $1}')
+    SNAPS=$(LC_ALL=C snap list 2>/dev/null | awk 'NR>1 {print $1}')
 
     if [ -z "$SNAPS" ]; then
         echo -e "${YELLOW}没有安装的 snap 包${NC}"
@@ -111,7 +111,7 @@ else
 fi
 
 # 检查 snapd 包是否还存在
-if dpkg -l | grep -q snapd; then
+if [ "$(dpkg-query -W -f='${db:Status-Status}' snapd 2>/dev/null)" = "installed" ]; then
     echo -e "  snapd 包: ${RED}仍存在${NC}"
 else
     echo -e "  snapd 包: ${GREEN}已删除${NC}"
