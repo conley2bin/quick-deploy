@@ -23,6 +23,13 @@ REQUIRED_PACKAGES=(
 
 SUDO_CMD="${SUDO_CMD:-sudo}"
 
+# 快捷键目标值 —— 写入与校验共用这一份，两者不会各自漂移
+HOTKEY_ENUMERATE_FORWARD='Shift+Shift_L'   # 左 Shift: 按列表顺序循环切换输入法
+HOTKEY_ALT_TRIGGER=''                      # 「临时切换到第一个输入法」: 不设快捷键
+
+FCITX5_CONFIG="$FCITX5_CONFIG_DIR/config"
+FCITX5_WAS_RUNNING=false
+
 section() {
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     echo "$1"
@@ -167,6 +174,170 @@ show_current_state() {
         | awk '$1 ~ /^(ii|rc)/ {print}' \
         || true
     echo
+}
+
+# 让运行中的 fcitx5 干净退出，之后才能安全写配置。
+#
+# fcitx5 退出时会用内存里的配置回写 ~/.config/fcitx5/，所以顺序必须是
+# 「先让它退出（此时它保存当前配置）→ 再写我们的文件 → 再启动」。
+# 反过来做（先写再重启）会被它退出时的保存动作覆盖掉，而脚本照样报成功。
+# profile 写入（步骤 5）同样受此影响，只是全新安装时 fcitx5 还未启动，未暴露。
+stop_fcitx5_before_write() {
+    FCITX5_WAS_RUNNING=false
+
+    if ! pgrep -x fcitx5 >/dev/null 2>&1; then
+        return 0
+    fi
+
+    FCITX5_WAS_RUNNING=true
+    echo "检测到 Fcitx5 正在运行，先让它退出再写配置"
+    echo "（它退出时会回写配置目录，不先停会覆盖掉本脚本的写入）"
+
+    if command -v gdbus >/dev/null 2>&1; then
+        gdbus call --session --dest org.fcitx.Fcitx5 --object-path /controller \
+            --method org.fcitx.Fcitx.Controller1.Exit >/dev/null 2>&1 || true
+    fi
+
+    local waited=0
+    while [ "$waited" -lt 10 ]; do
+        if ! pgrep -x fcitx5 >/dev/null 2>&1; then
+            echo "Fcitx5 已退出"
+            return 0
+        fi
+        sleep 0.5
+        waited=$((waited + 1))
+    done
+
+    echo "警告: Fcitx5 未能退出，写入的配置可能被它覆盖。"
+    echo "      本步骤结束后会回读文件校验，若不一致会明确报错。"
+}
+
+start_fcitx5_if_it_was_running() {
+    if [ "$FCITX5_WAS_RUNNING" != true ]; then
+        return 0
+    fi
+
+    if pgrep -x fcitx5 >/dev/null 2>&1; then
+        return 0
+    fi
+
+    if fcitx5 -d >/dev/null 2>&1; then
+        sleep 1
+        if pgrep -x fcitx5 >/dev/null 2>&1; then
+            echo "Fcitx5 已重新启动"
+            return 0
+        fi
+    fi
+
+    echo "提示: 未能自动重启 Fcitx5，注销重新登录后会自动启动。"
+}
+
+# 只改这两个键，不整文件覆盖 —— config 里还有 DefaultPageSize、ActiveByDefault
+# 等用户可能调过的值，整写会连坐。
+write_hotkey_config() {
+    local tmp
+
+    mkdir -p "$FCITX5_CONFIG_DIR"
+    [ -f "$FCITX5_CONFIG" ] || : > "$FCITX5_CONFIG"
+
+    tmp="$(mktemp "$FCITX5_CONFIG.tmp.XXXXXX")"
+
+    # 逐节处理：在 [Hotkey] 内替换 AltTriggerKeys，在
+    # [Hotkey/EnumerateForwardKeys] 内把整个按键列表换成单条目标值。
+    # 离开某节而目标键未出现过时补写；整个文件都没有该节时在末尾补节。
+    awk -v fwd="$HOTKEY_ENUMERATE_FORWARD" -v alt="$HOTKEY_ALT_TRIGGER" '
+        function flush_pending() {
+            if (cur == "hotkey" && !alt_done) { print "AltTriggerKeys=" alt; alt_done=1 }
+            if (cur == "fwd"    && !fwd_done) { print "0=" fwd;             fwd_done=1 }
+        }
+        /^\[.*\]$/ {
+            flush_pending()
+            if      ($0 == "[Hotkey]")                     { cur="hotkey"; saw_hotkey=1 }
+            else if ($0 == "[Hotkey/EnumerateForwardKeys]") { cur="fwd";    saw_fwd=1 }
+            else                                           { cur="other" }
+            print
+            next
+        }
+        cur == "hotkey" && /^[[:space:]]*AltTriggerKeys[[:space:]]*=/ {
+            print "AltTriggerKeys=" alt
+            alt_done=1
+            next
+        }
+        cur == "fwd" && /^[[:space:]]*[0-9]+[[:space:]]*=/ {
+            if (!fwd_done) { print "0=" fwd; fwd_done=1 }
+            next
+        }
+        { print }
+        END {
+            flush_pending()
+            if (!saw_hotkey) { print ""; print "[Hotkey]";                     print "AltTriggerKeys=" alt }
+            if (!saw_fwd)    { print ""; print "[Hotkey/EnumerateForwardKeys]"; print "0=" fwd }
+        }
+    ' "$FCITX5_CONFIG" > "$tmp"
+
+    if [ ! -s "$tmp" ] && [ -s "$FCITX5_CONFIG" ]; then
+        rm -f "$tmp"
+        echo "错误: 生成快捷键配置失败，原文件未改动"
+        exit 1
+    fi
+
+    # 内容无变化就不写也不备份，否则每跑一次就多一个同内容备份。
+    if cmp -s "$tmp" "$FCITX5_CONFIG"; then
+        rm -f "$tmp"
+        return 0
+    fi
+
+    backup_file "$FCITX5_CONFIG"
+    chmod --reference="$FCITX5_CONFIG" "$tmp" 2>/dev/null || true
+    mv -f "$tmp" "$FCITX5_CONFIG"
+}
+
+# 回读磁盘上的实际值。写入成功 ≠ 生效：fcitx5 若在写入后回写配置，
+# 这里会看到自己的值被换掉，从而抓住“报了成功其实没改上”。
+read_hotkey_value() {
+    local section="$1" key="$2"
+
+    [ -f "$FCITX5_CONFIG" ] || return 0
+
+    awk -v want_section="$section" -v want_key="$key" '
+        /^\[.*\]$/ { in_section = ($0 == want_section); next }
+        in_section {
+            line = $0
+            sub(/^[[:space:]]+/, "", line)
+            if (index(line, want_key "=") == 1) {
+                print substr(line, length(want_key) + 2)
+                exit
+            }
+        }
+    ' "$FCITX5_CONFIG"
+}
+
+verify_hotkey_config() {
+    local actual_fwd actual_alt failed=false
+
+    actual_fwd="$(read_hotkey_value '[Hotkey/EnumerateForwardKeys]' '0')"
+    actual_alt="$(read_hotkey_value '[Hotkey]' 'AltTriggerKeys')"
+
+    if [ "$actual_fwd" = "$HOTKEY_ENUMERATE_FORWARD" ]; then
+        echo "OK: 左 Shift 循环切换输入法 (EnumerateForwardKeys=$actual_fwd)"
+    else
+        echo "错误: EnumerateForwardKeys 期望 $HOTKEY_ENUMERATE_FORWARD，实际 ${actual_fwd:-(空)}"
+        failed=true
+    fi
+
+    if [ -z "$actual_alt" ]; then
+        echo "OK: 「临时切换到第一个输入法」已无快捷键 (AltTriggerKeys 为空)"
+    else
+        echo "错误: AltTriggerKeys 期望为空，实际 $actual_alt"
+        failed=true
+    fi
+
+    if [ "$failed" = true ]; then
+        echo
+        echo "快捷键未写入成功。若 Fcitx5 在写入期间仍在运行，它退出时会用内存中的"
+        echo "配置覆盖磁盘文件。请完全退出 Fcitx5 后重新运行本脚本。"
+        exit 1
+    fi
 }
 
 verify_installation() {
@@ -410,13 +581,13 @@ fi
 echo
 
 # ============================================
-# 步骤 5: 配置输入法列表
+# 步骤 5: 配置输入法列表与快捷键
 # ============================================
-# 说明: 创建 fcitx5 配置文件，添加拼音输入法。
-#       配置文件: ~/.config/fcitx5/profile
-#       包含: 键盘 (US) + 拼音输入法。
+# 说明: 写 ~/.config/fcitx5/profile（键盘 US + 拼音）与
+#       ~/.config/fcitx5/config（快捷键）。
+#       两个文件都必须在 fcitx5 退出后写，否则会被它回写覆盖。
 # ============================================
-section "[5/5] 配置输入法列表"
+section "[5/5] 配置输入法列表与快捷键"
 
 mkdir -p "$FCITX5_CONFIG_DIR"
 
@@ -426,6 +597,8 @@ if [ -f "$FCITX5_PROFILE" ] && [ "$FORCE_OVERWRITE" != true ]; then
     echo "确认要覆盖时请重新运行: ./install.sh --force"
     exit 1
 fi
+
+stop_fcitx5_before_write
 
 backup_file "$FCITX5_PROFILE"
 
@@ -448,12 +621,36 @@ Layout=
 EOF
 
 echo "已添加拼音输入法到配置"
+
+# 快捷键：fcitx5 自带的是 Ctrl+Space 循环切换、左 Shift 临时切到第一个输入法。
+# 本脚本把左 Shift 改为循环切换，并取消“临时切换”的快捷键（置空）。
+# Ctrl+Space 不变，EnumerateWithTriggerKeys 保持默认，仍然按列表顺序轮换。
+write_hotkey_config
+echo "已写入快捷键配置（左 Shift 循环切换；临时切换无快捷键）"
+
+start_fcitx5_if_it_was_running
+echo
+
+verify_hotkey_config
 echo
 
 verify_installation
 
 # ============================================
 # 完成提示
+# ============================================
+#
+# 下方提示文本保持原样。其中第 4 条描述的是 fcitx5 的出厂默认快捷键：
+#     Ctrl+Space  按列表顺序循环切换输入法
+#     Left Shift  临时切换到第一个输入法
+#
+# 本脚本的步骤 5 会把它们改成：
+#     Ctrl+Space  不变，仍为按列表顺序循环切换
+#     Left Shift  改为按列表顺序循环切换（EnumerateForwardKeys=Shift+Shift_L）
+#     「临时切换到第一个输入法」取消快捷键（AltTriggerKeys 置空）
+#
+# 即安装完成后左 Shift 与 Ctrl+Space 等效，都是循环切换。
+# 实际写入值由 verify_hotkey_config 回读磁盘校验，不一致会报错。
 # ============================================
 echo "========================================"
 echo "  安装完成"
