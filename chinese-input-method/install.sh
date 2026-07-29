@@ -150,6 +150,7 @@ show_current_state() {
 
 verify_installation() {
     local failed=false
+    local gnome_sources
 
     section "安装后检查"
 
@@ -183,6 +184,17 @@ verify_installation() {
     else
         echo "错误: Fcitx5 profile 未正确写入 pinyin"
         failed=true
+    fi
+
+    # GNOME 的输入源里若仍有 IBus 引擎，重新登录后会与 Fcitx5 抢占
+    # Ctrl+Space，表现为"装了但切不出中文"。这里只提示，不自动修改
+    # 用户现有输入法配置。
+    gnome_sources="$(gsettings get org.gnome.desktop.input-sources sources 2>/dev/null || true)"
+    if printf '%s' "$gnome_sources" | grep -q "'ibus'"; then
+        echo
+        echo "警告: GNOME 输入源仍包含 IBus 引擎: $gnome_sources"
+        echo "      它会和 Fcitx5 争抢快捷键。确认要把中文输入交给 Fcitx5 时，可执行:"
+        echo "        gsettings set org.gnome.desktop.input-sources sources \"[('xkb', 'us')]\""
     fi
 
     if [ "$failed" = true ]; then
