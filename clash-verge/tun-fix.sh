@@ -355,7 +355,20 @@ update_tun_config() {
     echo "这只说明文本已写入；是否真的生效需 Clash Verge 重载后用 verify_tun_routes 看内核"
 }
 
-# 验证排除网段是否真的落到了内核路由
+# 验证排除网段是否真的生效
+#
+# 旧实现是错的：它去 ip rule / table 2022 里 grep 那四个前缀，但 mihomo 不是
+# “先全部纳入、再加四条例外”，而是把「全部减去这四段」算成 36 条互不重叠的
+# CIDR 写进 table 2022。排除段是以「不存在」的形式体现的，grep 一个洞永远 grep 不到，
+# 所以旧版在配置完全正常的机器上也会报 0/4 fail。
+#
+# 实测对照（同一台机器，只改 tun 键名后重载）：
+#   exclude-routes（无效）      table 2022: default via 198.18.0.2 dev Meta
+#   route-exclude-address（有效） table 2022: 0.0.0.0/5, 8.0.0.0/7, 11.0.0.0/8, ...
+#                                  —— 36 条，恰好跳过 10/8、127/8、172.16/12、192.168/16
+#
+# 正确的判据：拿每段里的一个代表地址问内核“这包从哪个网卡出去”，
+# 不是 TUN 网卡就说明该段确实没被吸进去。
 verify_tun_routes() {
     echo ""
     echo "=========================================="
@@ -368,33 +381,53 @@ verify_tun_routes() {
         return
     fi
 
-    local rules routes p
-    local hit=0
-    rules=$(ip rule show 2>/dev/null || true)
+    local routes tun_dev route_count has_default
     routes=$(ip route show table 2022 2>/dev/null || true)
 
-    echo "--- ip rule show ---"
-    echo "${rules:-(空)}"
-    echo ""
-    echo "--- ip route show table 2022 ---"
-    echo "${routes:-(空)}"
+    if [ -z "$routes" ]; then
+        echo "table 2022 为空 —— TUN 未启用，或 auto-route 没有装路由。无法判断排除是否生效。"
+        return
+    fi
+
+    tun_dev=$(printf '%s\n' "$routes" | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')
+    route_count=$(printf '%s\n' "$routes" | grep -c .)
+    has_default=$(printf '%s\n' "$routes" | grep -c '^default ' || true)
+
+    echo "TUN 网卡: ${tun_dev:-未知}    table 2022 路由数: $route_count"
+    if [ "$has_default" -gt 0 ]; then
+        echo "table 2022 里是一条 default —— 全部流量无差别地进 TUN，排除没有生效。"
+    else
+        echo "table 2022 是拆分后的网段列表（不是 default）—— 符合排除已生效的形状。"
+    fi
     echo ""
 
-    for p in "${TUN_EXCLUDED_PREFIXES[@]}"; do
-        if printf '%s\n%s\n' "$rules" "$routes" | grep -qF "$p"; then
-            echo "pass 内核中已出现: $p"
-            hit=$((hit+1))
+    # 每段取一个代表地址。127.0.0.1 总是被优先级 0 的 local 表接走，
+    # 对它的检查恒为真，保留只为列表完整。
+    local prefixes=(192.168.0.0/16 10.0.0.0/8 172.16.0.0/12 127.0.0.0/8)
+    local probes=(192.168.1.1     10.0.0.1   172.16.0.1     127.0.0.1)
+    local i dev hit=0 total=${#prefixes[@]}
+
+    for i in "${!prefixes[@]}"; do
+        dev=$(ip route get "${probes[$i]}" 2>/dev/null \
+              | awk '{for(j=1;j<=NF;j++) if($j=="dev"){print $(j+1); exit}}')
+        if [ -z "$dev" ]; then
+            echo "fail ${prefixes[$i]}  (ip route get ${probes[$i]} 无结果)"
+        elif [ "$dev" = "$tun_dev" ]; then
+            echo "fail ${prefixes[$i]}  → dev $dev（这是 TUN 网卡，该段仍被代理接管）"
         else
-            echo "fail 内核中未出现: $p"
+            echo "pass ${prefixes[$i]}  → dev $dev（绕过 TUN）"
+            hit=$((hit+1))
         fi
     done
 
     echo ""
-    if [ "$hit" -eq "${#TUN_EXCLUDED_PREFIXES[@]}" ]; then
-        echo "全部排除前缀已落到内核路由，配置真实生效"
+    if [ "$hit" -eq "$total" ]; then
+        echo "$hit/$total 段均绕过 TUN，排除真实生效。"
     else
-        echo "已生效 $hit/${#TUN_EXCLUDED_PREFIXES[@]}。本结果只在 Clash Verge 重载配置、重建 TUN 之后才有意义。"
-        echo "重载后仍为 0，说明该键没被采纳；不要再把\"配置无解析错误\"当作生效证据。"
+        echo "已生效 $hit/$total。本结果只在 Clash Verge 重载配置、重建 TUN 之后才有意义。"
+        echo "重载后仍有 fail，看一下 /configs 返回的 tun 对象里有没有 route-exclude-address 字段："
+        echo "  curl -s --unix-socket /tmp/verge/verge-mihomo.sock http://localhost/configs | grep -o 'route-exclude-address'"
+        echo "没有该字段就是键名没被采纳，不要再把“配置无解析错误”当作生效证据。"
     fi
     echo ""
 }
