@@ -438,6 +438,16 @@ update_direct_rules() {
 
 function main(config) {
   const prependRules = [
+    // 出站 TCP/22 必须直连。
+    // 实测（mihomo /proxies/<node>/delay 打 http://portquiz.net:22/，443 作存活对照）：
+    // 该订阅 84 个节点中 81 个 443 通、22 全部不通，另 3 个节点连 443 对照都不通。
+    // 0/84 放行出站 22 —— 这是机场服务级策略，不是某个节点的问题，换节点无用。
+    // 症状是 connect 成功后 0 字节 EOF，看起来像对端拒绝，实际是出口丢弃。
+    // 因此把 22 端口交给代理是确定性失败；直连至少可用（本地实测 github /
+    // gitlab / salsa.debian.org / sourceware.org 的 :22 直连均返回 SSH banner）。
+    // GitHub 若已由 ~/.ssh/config 改走 ssh.github.com:443，则不受此规则影响，
+    // 仍走代理 —— 那是更稳的路径，两者互补而非互斥。
+    "DST-PORT,22,DIRECT",
     "GEOIP,CN,DIRECT,no-resolve",
     "DOMAIN-SUFFIX,cn,DIRECT",
     "DOMAIN-SUFFIX,com.cn,DIRECT",
@@ -535,8 +545,12 @@ configure_ssh() {
     echo "==========================================="
     echo ""
     echo "此配置让 GitHub SSH 走 ssh.github.com:443。"
-    echo "实测原因：流量已正确路由到代理，但机场出口节点封禁出站 TCP/22；"
-    echo "443 端口不受影响，已验证可用。"
+    echo "实测原因：流量已正确路由到代理，是机场封禁出站 TCP/22（订阅内 84 个节点"
+    echo "逐一探测，0 个放行 22；换节点无用）。443 不受影响，已验证可用。"
+    echo ""
+    echo "与选项 1 的分工：选项 1 写入的 DST-PORT,22,DIRECT 让所有 22 端口直连，"
+    echo "覆盖你自己的境外主机；本选项让 GitHub 改用 443，继续走代理，路径更稳。"
+    echo "两者不冲突：GitHub 从此不再使用 22，DIRECT 规则自然不会命中它。"
     echo ""
 
     # 检查是否已配置
@@ -576,15 +590,17 @@ configure_ssh() {
 
 # >>> tun-fix.sh github ssh >>>
 # GitHub SSH 走 443 端口。
-# 实测机制：流量已正确走代理，是代理机场的出口节点封禁出站 TCP/22
-# （github/gitlab/bitbucket/kernel.org 的 :22 均在一个 RTT 内返回 0 字节后断开，
-#   同节点的 :443 与 :9418 正常；直连的 :22 也正常）。443 端口不受影响。
+# 实测机制：流量已正确走代理，是机场封禁出站 TCP/22——不是某个节点的问题。
+# 逐节点探测（portquiz.net:22 走 /proxies/<node>/delay，443 作存活对照）：
+# 84 个节点里 0 个放行 22，81 个 443 正常。换节点无解。
+# 症状：connect 成功后一个 RTT 内返回 0 字节即断开（github/gitlab/bitbucket/
+# kernel.org 一致），同节点 :443 与 :9418 正常。443 端口不受影响。
 Host github.com ssh.github.com
     Hostname ssh.github.com
     Port 443
     User git
 
-# 同一出口节点对所有境外 :22 都封，如需 GitLab / Bitbucket 取消下方注释即可
+# 机场对所有境外 :22 都封，如需 GitLab / Bitbucket 取消下方注释即可
 #Host gitlab.com altssh.gitlab.com
 #    Hostname altssh.gitlab.com
 #    Port 443
@@ -640,6 +656,8 @@ optimize_all() {
     echo "  尚未验证生效：需重载 Clash Verge 后，由 verify_tun_routes 看内核路由确认"
     echo ""
     echo "pass 直连规则: 已写入全局脚本"
+    echo "  - 出站 TCP/22 直连 (DST-PORT,22) —— 机场 84 个节点全部封禁出站 22，"
+    echo "    走代理必然是 connect 后 0 字节断开；直连是唯一可用路径"
     echo "  - 中国大陆 IP (GEOIP,CN)"
     echo "  - 中国域名 (.cn, .com.cn)"
     echo "  - 常见中国网站 (B站、知乎、抖音、淘宝等)"
