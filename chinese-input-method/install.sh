@@ -7,6 +7,10 @@ set -euo pipefail
 CHECK_ONLY=false
 FORCE_OVERWRITE=false
 
+# 定义在顶部：覆盖预检必须在任何修改发生之前就能做（见 precheck_existing_profile）
+FCITX5_CONFIG_DIR="$HOME/.config/fcitx5"
+FCITX5_PROFILE="$FCITX5_CONFIG_DIR/profile"
+
 REQUIRED_PACKAGES=(
     fcitx5
     fcitx5-chinese-addons
@@ -82,6 +86,16 @@ ensure_not_root() {
     fi
 }
 
+# 在任何修改发生之前判定是否会覆盖用户现有配置
+precheck_existing_profile() {
+    if [ -f "$FCITX5_PROFILE" ] && [ "$FORCE_OVERWRITE" != true ]; then
+        echo "错误: 已存在 Fcitx5 配置文件: $FCITX5_PROFILE"
+        echo "为避免覆盖现有输入法设置，脚本已停止——尚未做任何修改。"
+        echo "确认要覆盖时请重新运行: ./install.sh --force"
+        exit 1
+    fi
+}
+
 check_supported_system() {
     if [ ! -r /etc/os-release ]; then
         echo "错误: 无法读取 /etc/os-release，无法确认系统版本。"
@@ -107,15 +121,22 @@ check_supported_system() {
 }
 
 check_package_candidates() {
-    local package candidate
+    local package candidate policy
     local missing=()
 
     for package in "${REQUIRED_PACKAGES[@]}"; do
         # LC_ALL=C 不可省略: apt-cache policy 的输出是本地化的。
         # 中文 locale 下它输出 "候选：" 而不是 "Candidate:"，
         # 匹配 /Candidate:/ 会永远失配，把所有软件包误判为"没有候选版本"。
-        candidate="$(LC_ALL=C apt-cache policy "$package" 2>/dev/null \
-            | awk '/^ *Candidate:/ {print $2; exit}')"
+        #
+        # 不能把 apt-cache 的错误丢进 /dev/null 再接管道：pipefail 下命令替换
+        # 会返回非 0，set -e 直接终止脚本，用户看到的只是“预检查”标题后沉默退出。
+        if ! policy="$(LC_ALL=C apt-cache policy "$package" 2>&1)"; then
+            echo "错误: apt-cache policy $package 执行失败:"
+            printf '%s\n' "$policy" | sed 's/^/  /'
+            exit 1
+        fi
+        candidate="$(printf '%s\n' "$policy" | awk '/^ *Candidate:/ {print $2; exit}')"
         if [ -z "$candidate" ] || [ "$candidate" = "(none)" ]; then
             missing+=("$package")
         fi
@@ -233,10 +254,17 @@ check_supported_system
 echo "当前显示服务器: ${XDG_SESSION_TYPE:-unknown}"
 echo
 
+# 覆盖预检必须在此处，不能拖到步骤 5。
+# 旧顺序下，脚本会先 apt install、改 ~/.xinputrc、删 ~/.config/fcitx、
+# 清理 ~/.profile，然后才在最后一步说“为避免覆盖现有设置，脚本已停止”——
+# 那时候系统已经被改了一大圈，与这句话给用户的预期不符。
+precheck_existing_profile
+
 section "预检查"
 
 check_package_candidates
 show_current_state
+
 
 if [ "$CHECK_ONLY" = true ]; then
     echo "检查完成。--check 模式不会安装或修改任何内容。"
@@ -261,9 +289,13 @@ echo
 section "[1/5] 检查冲突的 Fcitx4"
 
 # 查询已安装的 fcitx4 包。只匹配包名，不扫描述文本。
+# 用 ${db:Status-Status} 而不是 Status-Abbrev 的 ^ii：被 apt-mark hold 的包状态
+# 缩写是 "hi"，依然是已安装，匹配 ^ii 会漏掉它，导致后面 apt 才报冲突。
+# 2>/dev/null || true 是必要的：glob 无匹配时 dpkg-query 本就返回非 0，
+# 而"未安装任何 fcitx4"正是最常见的情形。
 mapfile -t FCITX4_PACKAGES < <(
-    dpkg-query -W -f='${db:Status-Abbrev} ${binary:Package}\n' 'fcitx*' 2>/dev/null \
-        | awk '$1 ~ /^ii/ && $2 ~ /^fcitx(:|$|-)/ && $2 !~ /^fcitx5(:|$|-)/ {print $2}' \
+    dpkg-query -W -f='${db:Status-Status} ${binary:Package}\n' 'fcitx*' 2>/dev/null \
+        | awk '$1 == "installed" && $2 ~ /^fcitx(:|$|-)/ && $2 !~ /^fcitx5(:|$|-)/ {print $2}' \
         || true
 )
 
@@ -278,9 +310,13 @@ else
     echo "未检测到已安装的 Fcitx4 包"
 fi
 
+# 改名而不是 rm -rf：里面可能有用户多年的自造词库和配置，
+# Fcitx5 配不成时还需要回退。永久删除交给用户自己决定。
 if [ -d "$HOME/.config/fcitx" ]; then
-    rm -rf "$HOME/.config/fcitx"
-    echo "已删除旧 Fcitx4 用户配置: $HOME/.config/fcitx"
+    FCITX4_BACKUP="$HOME/.config/fcitx.bak.$(date +%Y%m%d%H%M%S)"
+    mv "$HOME/.config/fcitx" "$FCITX4_BACKUP"
+    echo "已备份旧 Fcitx4 用户配置: $FCITX4_BACKUP"
+    echo "（确认无需回退后可自行删除）"
 fi
 
 echo
@@ -327,22 +363,36 @@ section "[4/5] 清理旧版脚本重复配置"
 PROFILE_BEGIN='# Fcitx5 输入法环境变量'
 PROFILE_END='export SDL_IM_MODULE=fcitx'
 
+# 不能用 sed '/起始/,/结束/d'，也不能靠两个独立的 grep 做守卫。
+# 范围删除在找不到结束行时会一路删到文件末尾；而两个 grep 只能证明
+# 两个标记都"存在"，不能证明它们"按顺序配对"。实测反例：
+#     before
+#     export SDL_IM_MODULE=fcitx     ← 结束标记在前
+#     manual-setting
+#     # Fcitx5 输入法环境变量   ← 起始标记在后，之后再无结束行
+#     EDITOR=vim
+# 两个 grep 都通过，awk 进了 skip 就出不来，EDITOR=vim 被删。
+# 现在把配对判定交给同一遍解析：awk 退出码 0 才代表找到了完整闭合的块。
 if [ -f "$HOME/.profile" ] && grep -qF -x "$PROFILE_BEGIN" "$HOME/.profile"; then
-    if grep -qF -x "$PROFILE_END" "$HOME/.profile"; then
-        backup_file "$HOME/.profile"
-        PROFILE_TMP="$(mktemp "$HOME/.profile.tmp.XXXXXX")"
-        awk -v b="$PROFILE_BEGIN" -v e="$PROFILE_END" '
-            !skip && $0 == b {skip=1; next}
-            skip && $0 == e {skip=0; next}
-            !skip {print}
+    PROFILE_TMP="$(mktemp "$HOME/.profile.tmp.XXXXXX")"
+    if awk -v b="$PROFILE_BEGIN" -v e="$PROFILE_END" '
+            $0 == b        { if (skip) exit 1; skip=1; removed=1; next }
+            skip && $0 == e { skip=0; next }
+            !skip          { print }
+            END            { if (skip || !removed) exit 1 }
         ' "$HOME/.profile" > "$PROFILE_TMP"
-        # 用 cat 而不是 mv，保留 ~/.profile 原有的 inode 与权限
-        cat "$PROFILE_TMP" > "$HOME/.profile"
-        rm -f "$PROFILE_TMP"
+    then
+        backup_file "$HOME/.profile"
+        # 同目录 mktemp + mv：重定向写入会先截断目标文件，磁盘满或写失败时
+        # ~/.profile 会被截成空。mv 是同一文件系统内的原子替换，失败则原文件完好。
+        chmod --reference="$HOME/.profile" "$PROFILE_TMP" 2>/dev/null || true
+        mv -f "$PROFILE_TMP" "$HOME/.profile"
         echo "已移除 ~/.profile 中旧版脚本写入的 Fcitx5 环境变量块"
     else
-        echo "警告: ~/.profile 里有旧版起始标记，但找不到结束行：$PROFILE_END"
-        echo "      无法确定块的边界，为避免误删你自己的配置，已跳过。"
+        rm -f "$PROFILE_TMP"
+        echo "警告: ~/.profile 里有旧版起始标记，但找不到与之配对的结束行："
+        echo "        $PROFILE_END"
+        echo "      无法确定块的边界，为避免误删你自己的配置，已跳过，文件未动。"
         echo "      请手动检查并删除该块。"
     fi
 else
@@ -368,14 +418,11 @@ echo
 # ============================================
 section "[5/5] 配置输入法列表"
 
-FCITX5_CONFIG_DIR="$HOME/.config/fcitx5"
-FCITX5_PROFILE="$FCITX5_CONFIG_DIR/profile"
-
 mkdir -p "$FCITX5_CONFIG_DIR"
 
+# 开头已经做过 precheck_existing_profile；这里再拦一次，防止以后改动把预检弄丢。
 if [ -f "$FCITX5_PROFILE" ] && [ "$FORCE_OVERWRITE" != true ]; then
     echo "错误: 已存在 Fcitx5 配置文件: $FCITX5_PROFILE"
-    echo "为避免覆盖现有输入法设置，脚本已停止。"
     echo "确认要覆盖时请重新运行: ./install.sh --force"
     exit 1
 fi
