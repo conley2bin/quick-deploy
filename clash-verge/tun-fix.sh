@@ -8,6 +8,10 @@ set -e
 CLASH_DIR="$HOME/.local/share/io.github.clash-verge-rev.clash-verge-rev"
 PROFILES_YAML="$CLASH_DIR/profiles.yaml"
 
+# 启动守卫: 本脚本所有配置解析都以 profiles.yaml 为唯一入口。缺失时 awk/grep 退出码
+# 非 0，在 set -e 下会让脚本从函数中途静默终止，用户看不到任何原因。此处显式拦截。
+[ -f "$PROFILES_YAML" ] || { echo "未找到 $PROFILES_YAML，请先启动 Clash Verge 生成配置" >&2; exit 1; }
+
 # 获取全局 Merge 配置文件
 get_merge_config() {
     local merge_file=$(awk '
