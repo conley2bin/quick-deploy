@@ -111,11 +111,13 @@ else
 fi
 
 # 检查 snapd 包是否还存在
-if [ "$(dpkg-query -W -f='${db:Status-Status}' snapd 2>/dev/null)" = "installed" ]; then
-    echo -e "  snapd 包: ${RED}仍存在${NC}"
-else
-    echo -e "  snapd 包: ${GREEN}已删除${NC}"
-fi
+# dpkg 的 Status-Status 三态: installed / config-files(已卸载但 conffiles 残留) / not-installed
+snapd_state="$(dpkg-query -W -f='${db:Status-Status}' snapd 2>/dev/null || true)"
+case "${snapd_state:-not-installed}" in
+    not-installed) echo -e "  snapd 包: ${GREEN}已删除${NC}" ;;
+    config-files)  echo -e "  snapd 包: ${YELLOW}已卸载但残留配置文件${NC}" ;;
+    *)             echo -e "  snapd 包: ${RED}仍存在 ($snapd_state)${NC}" ;;
+esac
 
 echo -e "\n${YELLOW}注意事项：${NC}"
 echo -e "  1. 某些系统更新可能尝试重新安装 snapd，已通过 apt-mark hold 防止"
