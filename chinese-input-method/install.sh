@@ -5,10 +5,7 @@
 set -euo pipefail
 
 CHECK_ONLY=false
-FORCE_OVERWRITE=false
-HOTKEYS_ONLY=false
 
-# 定义在顶部：覆盖预检必须在任何修改发生之前就能做（见 precheck_existing_profile）
 FCITX5_CONFIG_DIR="$HOME/.config/fcitx5"
 FCITX5_PROFILE="$FCITX5_CONFIG_DIR/profile"
 
@@ -51,21 +48,18 @@ backup_file() {
 usage() {
     cat << 'EOF'
 用法:
-  ./install.sh [--check] [--force] [--hotkeys-only] [--help]
+  ./install.sh [--check] [--help]
 
 选项:
-  --check          只检查系统、软件源和当前配置，不安装、不修改
-  --force          覆盖已有 ~/.config/fcitx5/profile；未指定时会在已有配置时退出
-  --hotkeys-only   只写快捷键与行为配置 (~/.config/fcitx5/config)，
-                   不装包、不动 profile。适用于已装好只想改快捷键
-  --help           显示帮助
+  --check   只检查系统、软件源和当前配置，不安装、不修改
+  --help    显示帮助
 
 注意:
   不要用 sudo 运行本脚本。直接运行 ./install.sh 即可，脚本会在需要时调用 sudo。
 
-  profile 与快捷键是两个独立文件:
-    profile  输入法列表与顺序，已存在时需 --force 才会覆盖
-    config   快捷键与行为，可用 --hotkeys-only 单独更新
+  本脚本是幂等的重置工具: 重跑会把输入法列表与快捷键重新写回基准状态，
+  旧文件先备份为 <文件名>.bak.<时间戳>。
+  只想调快捷键而不重置时，用 fcitx5-configtool 图形界面改。
 EOF
 }
 
@@ -74,12 +68,6 @@ parse_args() {
         case "$1" in
             --check)
                 CHECK_ONLY=true
-                ;;
-            --force)
-                FORCE_OVERWRITE=true
-                ;;
-            --hotkeys-only)
-                HOTKEYS_ONLY=true
                 ;;
             --help|-h)
                 usage
@@ -100,21 +88,6 @@ ensure_not_root() {
         echo "错误: 请不要用 sudo 运行本脚本。"
         echo "请直接运行: ./install.sh"
         echo "脚本会在需要安装软件包时调用 ${SUDO_CMD}。"
-        exit 1
-    fi
-}
-
-# 在任何修改发生之前判定是否会覆盖用户现有配置
-precheck_existing_profile() {
-    if [ -f "$FCITX5_PROFILE" ] && [ "$FORCE_OVERWRITE" != true ]; then
-        echo "错误: 已存在 Fcitx5 配置文件: $FCITX5_PROFILE"
-        echo "为避免覆盖现有输入法设置，脚本已停止——尚未做任何修改。"
-        echo ""
-        echo "如果你只是想更新快捷键，用这个（不会动 profile）:"
-        echo "  ./install.sh --hotkeys-only"
-        echo ""
-        echo "确认要连输入法列表一起覆盖时:"
-        echo "  ./install.sh --force"
         exit 1
     fi
 }
@@ -373,33 +346,6 @@ verify_hotkey_config() {
     fi
 }
 
-# --hotkeys-only 的短路径：只动 config，不装包、不碰 profile。
-#
-# 存在理由：precheck_existing_profile 在一切动作之前就拦住脚本，所以已装好的
-# 机器上直接跑 ./install.sh 什么都不会发生，想单独更新快捷键就只能 --force
-# 连 profile 一起覆盖 —— 两件事本来不相关，不应该绑在一起。
-run_hotkeys_only() {
-    section "只更新快捷键与行为配置"
-
-    echo "目标配置: $FCITX5_CONFIG"
-    echo "  左 Shift 循环切换输入法      (EnumerateForwardKeys=$HOTKEY_ENUMERATE_FORWARD)"
-    echo "  「临时切换到第一个输入法」无快捷键 (AltTriggerKeys 置空)"
-    echo "  起手即拼音直通              (ActiveByDefault=$BEHAVIOR_ACTIVE_BY_DEFAULT)"
-    echo "不会安装软件包，不会改动 profile。"
-    echo
-
-    stop_fcitx5_before_write
-    write_hotkey_config
-    echo "已写入: $FCITX5_CONFIG"
-    start_fcitx5_if_it_was_running
-    echo
-
-    verify_hotkey_config
-    echo
-    echo "完成。快捷键已生效；ActiveByDefault 对新开的窗口生效。"
-    echo
-}
-
 verify_installation() {
     local failed=false
     local gnome_sources
@@ -484,28 +430,6 @@ check_supported_system
 
 echo "当前显示服务器: ${XDG_SESSION_TYPE:-unknown}"
 echo
-
-# --hotkeys-only 在任何包操作与 profile 预检之前就走完退出，
-# 否则会被下方的 precheck_existing_profile 拦掉。
-if [ "$HOTKEYS_ONLY" = true ]; then
-    if [ "$CHECK_ONLY" = true ]; then
-        echo "错误: --hotkeys-only 与 --check 不能同时使用"
-        exit 1
-    fi
-    if ! command -v fcitx5 >/dev/null 2>&1; then
-        echo "错误: 未找到 fcitx5。--hotkeys-only 只改配置，不安装软件包。"
-        echo "请先运行不带该选项的 ./install.sh 完成安装。"
-        exit 1
-    fi
-    run_hotkeys_only
-    exit 0
-fi
-
-# 覆盖预检必须在此处，不能拖到步骤 5。
-# 旧顺序下，脚本会先 apt install、改 ~/.xinputrc、删 ~/.config/fcitx、
-# 清理 ~/.profile，然后才在最后一步说“为避免覆盖现有设置，脚本已停止”——
-# 那时候系统已经被改了一大圈，与这句话给用户的预期不符。
-precheck_existing_profile
 
 section "预检查"
 
@@ -667,13 +591,9 @@ section "[5/5] 配置输入法列表与快捷键"
 
 mkdir -p "$FCITX5_CONFIG_DIR"
 
-# 开头已经做过 precheck_existing_profile；这里再拦一次，防止以后改动把预检弄丢。
-if [ -f "$FCITX5_PROFILE" ] && [ "$FORCE_OVERWRITE" != true ]; then
-    echo "错误: 已存在 Fcitx5 配置文件: $FCITX5_PROFILE"
-    echo "确认要覆盖时请重新运行: ./install.sh --force"
-    exit 1
-fi
-
+# 无条件重写。本脚本的定位是幂等的重置工具：第一次运行是安装，
+# 之后重跑就是“把输入法改回基准状态”。旧文件由 backup_file 存成
+# <文件名>.bak.<时间戳>，回退靠它，不靠拒绝执行。
 stop_fcitx5_before_write
 
 backup_file "$FCITX5_PROFILE"
@@ -781,11 +701,10 @@ echo "上面第 4 条里“Left Shift: 临时切换到第一个输入法”已�
 echo "实际写入值已由上方安装后检查回读磁盘校验。"
 echo
 echo "配置文件: $FCITX5_CONFIG"
-echo "如需恢复默认: fcitx5-configtool 的 Global Options → Hotkey"
+echo "如需微调或恢复默认: fcitx5-configtool 的 Global Options → Hotkey"
 echo
 
-# 输入法列表的两个状态很容易被误解，而且重跑脚本时 profile 与快捷键
-# 的行为不一致（快捷键每次都写，profile 不带 --force 则根本不写），必须说明。
+# 输入法列表的两个状态很容易被误解，且重跑即重置的语义必须说清楚。
 echo "========================================"
 echo "  输入法列表说明"
 echo "========================================"
@@ -801,8 +720,6 @@ echo "  fcitx5-remote      输出 0=关闭 1=未激活 2=已激活"
 echo "  fcitx5-remote -n   输出该状态下实际使用的输入法"
 echo "若 fcitx5-remote 返回 1 而 -n 返回 pinyin，说明两个状态被调反了。"
 echo
-echo "重跑本脚本时的行为:"
-echo "  profile 已存在 → 脚本在开头就退出，包、profile、快捷键都不会动"
-echo "  只想改快捷键   → ./install.sh --hotkeys-only"
-echo "  连输入法列表一起覆盖 → ./install.sh --force"
+echo "重跑本脚本 = 重置输入法。profile 与快捷键都会被无条件写回上述基准状态，"
+echo "旧文件先备份为 <文件名>.bak.<时间戳>。只想微调而不重置时用 fcitx5-configtool。"
 echo
