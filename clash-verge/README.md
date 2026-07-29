@@ -12,9 +12,12 @@
 
 ## 解决方案
 
-通过配置 `fake-ip-filter` 让特定域名使用真实 DNS 解析，同时保持其他域名使用 Fake-IP 的高性能。
+两层配合解决 SSH 连接问题：
 
-**工作原理**: TUN 模式下，Clash 会拦截所有 DNS 查询。fake-ip-filter 中的域名会被路由到真实 DNS 服务器，获取真实 IP 地址，从而解决 SSH 连接问题。
+1. **DNS 层**: `fake-ip-filter` 让 GitHub 等域名返回真实 IP（否则 SSH 拿到 198.18.x.x 无法握手）
+2. **路由层**: `DST-PORT,22,DIRECT` 让所有出站 22 端口走直连（机场全部 84 个节点封禁出站 TCP/22，走代理必然失败）
+
+fake-ip-filter 是必要条件（给 SSH 真实 IP），但不充分——流量仍需绕过代理才能到达目标。
 
 ## 安装 Clash Verge Rev
 
@@ -129,45 +132,49 @@ Clash Verge 使用配置合并系统：
 
 ### 3. 直连规则 (路由层)
 
-让 GitHub 流量直连，不走代理（解决 SSH 连接问题）：
+通过全局 Script.js prepend 规则，让特定流量绕过代理：
 
-- GitHub 相关域名: `github.com`, `githubusercontent.com`, `githubassets.com`, `github.io`
+- `DST-PORT,22,DIRECT` — 所有出站 TCP/22 直连
+- 中国大陆 IP/域名直连（GEOIP,CN 及常见国内站点）
 - 本地网络: `192.168.0.0/16`, `10.0.0.0/8`, `172.16.0.0/12`, `*.local`
 
-**为什么需要直连**: 即使 DNS 解析正常，SSH 流量仍可能被路由到代理节点，而代理节点通常不支持 SSH 协议
+**为什么端口 22 必须直连**: 实测当前机场订阅全部 84 个节点封禁出站 TCP/22（逐节点用 portquiz.net:22 探测，0/84 放行；443 作为对照 81/84 正常）。症状是 TCP connect 成功后 0 字节即断开。走代理必然失败，DIRECT 是唯一可用路径。
+
+**注意**: 当本地网络也封 22（少数情况）时，直连同样会超时。此时唯一方案是让目标服务监听非 22 端口。
 
 ### SSH 配置（选项 2 - 可选但推荐）
 
-自动配置 `~/.ssh/config`，进一步提高 SSH 连接稳定性：
+自动配置 `~/.ssh/config`，让 GitHub SSH 改走 443 端口：
 
 #### 配置内容
 
 ```bash
-Host github.com
+Host github.com ssh.github.com
     Hostname ssh.github.com
-    Port 443                  # 使用 HTTPS 端口，更稳定
+    Port 443
     User git
-    ControlMaster no          # 禁用连接复用
-    ControlPath none
-    ControlPersist no
 ```
 
 #### 为什么需要 SSH 配置？
 
-1. **端口 443 更稳定**:
-   - GitHub 端口 22 有约 2% 的间歇性失败率
-   - 端口 443 (HTTPS) 是 GitHub 官方推荐的替代方案
-   - 绕过某些网络对端口 22 的限制
+机场封禁出站 TCP/22 是全局性的（84 节点 0 放行），选项 1 的 `DST-PORT,22,DIRECT` 让 :22 走直连。但 GitHub 位于境外，直连 :22 依赖本地网络放行——大部分情况可行，少数网络环境仍有限制。
 
-2. **禁用 ControlMaster 避免间歇性问题**:
-   - SSH ControlMaster（连接复用）会导致"第一次成功，后续失败"
-   - 禁用后每次连接独立，互不影响
+选项 2 将 GitHub SSH 改为 `ssh.github.com:443`，这条路径：
+- 通过代理正常工作（代理只封 22，443 畅通）
+- GitHub 从此不再使用端口 22，`DST-PORT,22,DIRECT` 规则不会命中它
+- 两个选项组合使用不冲突
+
+**结论**: 选项 1 覆盖所有 SSH 目标的通用情况；选项 2 专门让 GitHub 走代理上的 443，不依赖直连 :22 是否可达。
+
+#### 对其他境外 SSH 主机的影响
+
+你自己的境外服务器如果只监听 22，通过机场无解。修复方法：让 sshd 额外监听一个非 22 端口（443、2222 等），任何非 22 端口经代理正常转发。
 
 #### 脚本功能
 
 - 自动检测现有 SSH 配置
 - 备份原配置（带时间戳）
-- 安全添加 GitHub SSH 优化配置
+- 安全添加 GitHub SSH 配置
 - 设置正确的文件权限（600）
 
 ## 常见问题
@@ -182,10 +189,7 @@ A: **不会自动生效**。Merge 配置是订阅级别的，切换订阅后需�
 A: 运行脚本，选择菜单选项 3 查看文件路径。
 
 **Q: SSH 配置（选项 2）是必需的吗？**
-A: **可选但推荐**。Clash 配置（选项 1）已经支持 SSH，但选项 2 能进一步提高稳定性，避免间歇性失败。
-
-**Q: 为什么有时 SSH 第一次成功，后续失败？**
-A: 这是 SSH ControlMaster（连接复用）导致的。运行脚本选项 2 配置 SSH，禁用 ControlMaster 即可解决。
+A: **可选但推荐**。选项 1 让 :22 直连，对大部分网络环境已够用。选项 2 让 GitHub 走代理的 443 端口，不依赖本地 :22 是否可达，路径更稳定。两者组合使用不冲突。
 
 **Q: 想了解技术原理？**
 A: 查看 [CLASH-VERGE-GUIDE.md](CLASH-VERGE-GUIDE.md)，包含完整的技术架构和原理说明。
@@ -226,11 +230,11 @@ A: 查看 [CLASH-VERGE-GUIDE.md](CLASH-VERGE-GUIDE.md)，包含完整的技术�
 
 3. **检查直连规则是否生效** (重要):
    ```bash
-   grep "github.com,DIRECT" ~/.local/share/io.github.clash-verge-rev.clash-verge-rev/clash-verge.yaml
-   # 应该有: - DOMAIN-SUFFIX,github.com,DIRECT
+   # 检查全局脚本中是否包含 DST-PORT,22,DIRECT
+   grep "DST-PORT,22" ~/.local/share/io.github.clash-verge-rev.clash-verge-rev/profiles/*.js
    ```
 
-   如果没有直连规则，即使 DNS 正常，SSH 流量仍会走代理导致失败。
+   如果没有该规则，SSH 流量会走代理，而机场封禁出站 22 导致失败。
 
 4. **重启 Clash Verge**: 确保配置已重新加载
 
@@ -249,8 +253,8 @@ A: 查看 [CLASH-VERGE-GUIDE.md](CLASH-VERGE-GUIDE.md)，包含完整的技术�
 
 **常见错误诊断**:
 - `Connection closed by 198.18.x.x` → DNS 层问题，fake-ip-filter 未生效
-- `Connection closed by 20.26.156.215` → 路由层问题，缺少直连规则或代理不支持 SSH
-- 间歇性失败（时好时坏）→ SSH 层问题，需要配置 SSH（脚本选项 2）
+- `Connection closed by 20.26.156.215` → 路由层问题，流量走了代理而机场封禁出站 22；需确认 DST-PORT,22,DIRECT 规则已生效
+- connect 成功但 0 字节立即断开 → 典型的机场封 22 症状，确认选项 1 已应用或改用选项 2 走 443
 
 ### 企业应用无法访问
 

@@ -30,7 +30,7 @@
 │  [Fake-IP 模式]              [redir-host 模式]        │
 │   返回虚拟 IP (198.18.x.x)     返回真实 IP            │
 │   DNS 查询 ~1ms                DNS 查询 ~50ms         │
-│   SSH 不兼容 ❌                 SSH 兼容 ✅            │
+│   SSH 需配合 filter ✅           SSH 兼容 ✅            │
 │        │                            │                 │
 │        └────────────┬───────────────┘                 │
 │                     ↓                                 │
@@ -150,6 +150,8 @@ SSH 客户端 → 解析 github.com → 198.18.0.26 (虚拟 IP)
        "Connection closed by 198.18.0.26"
 ```
 
+这只是问题的第一层。即使通过 fake-ip-filter 解决了 DNS 层问题，流量仍可能走代理——而机场封禁出站 TCP/22（详见下文 Q4/Q5）。
+
 ### redir-host 模式（真实 IP）
 
 ```
@@ -157,9 +159,9 @@ github.com → 查询上游 DNS → 140.82.114.4 (真实 IP)
            ↓
 应用连接到真实 IP
            ↓
-Clash 尝试 sniffing 识别域名
+Clash 通过 sniffing 识别域名
   ├─ HTTPS: 读取 SNI → github.com ✅
-  └─ SSH: 无域名信息 → 只知道 IP ❌
+  └─ SSH: 无 SNI，但若域名在 fake-ip-filter 中，DNS 反向映射可恢复域名 ✅
 ```
 
 **优点:**
@@ -168,7 +170,7 @@ Clash 尝试 sniffing 识别域名
 
 **缺点:**
 - ❌ DNS 慢 (~50ms)
-- ❌ 规则匹配可能不准（SSH/纯 TCP 无法识别域名）
+- ❌ 规则匹配可能不准（纯 TCP 无 SNI 时需依赖 DNS 反向映射）
 
 ### Fake-IP Filter（混合方案）⭐
 
@@ -285,11 +287,14 @@ SSH 失败 (虚拟 IP 无法握手)
 
 **解决:**
 ```
-TUN + Fake-IP + filter + 规则模式
+TUN + Fake-IP + filter + DST-PORT,22,DIRECT
   ↓
-github.com 用真实 IP → SSH 成功 ✅
+github.com 用真实 IP → DNS 层解决 ✅
+:22 流量直连 → 路由层解决 ✅
 其他域名用 Fake-IP → 性能保持 ✅
 ```
+
+fake-ip-filter 是必要条件（让 SSH 拿到真实 IP），但不充分——还需要路由层绕过代理（机场封 22）。
 
 ### Q2: filter 后规则还能匹配吗？
 
@@ -321,23 +326,15 @@ Clash 记录: 140.82.114.4 来自 github.com
 
 ### Q4: 配置了 fake-ip-filter，SSH 仍然失败？
 
-**可能的原因:**
+**根因**: fake-ip-filter 解决的是 DNS 层（让 SSH 拿到真实 IP），但流量路由是另一层问题。
 
-1. **只配置了 DNS 层，忘记配置路由层**
+实测发现：机场订阅全部 84 个节点封禁出站 TCP/22（通过 mihomo `/proxies/<node>/delay` 接口逐节点探测 portquiz.net:22，0/84 放行；443 对照 81/84 正常）。症状是 connect 成功后 0 字节即断开。这不是某个节点的问题，换节点无效。
 
-```
-问题: fake-ip-filter 返回真实 IP，但流量仍走代理
-原因: 规则中 GitHub 配置为 Proxy 而非 DIRECT
-解决: 添加 prepend-rules，配置 GitHub 为 DIRECT
-```
+**解决方案**:
 
-2. **SSH 端口 22 不稳定**
+1. **路由层**: 添加 `DST-PORT,22,DIRECT` 规则，让所有 :22 流量直连（脚本选项 1）
 
-```
-问题: 有时成功，有时失败（间歇性）
-原因: GitHub 端口 22 有约 2% 失败率 + ControlMaster 连接复用问题
-解决: 配置 ~/.ssh/config，使用端口 443 + 禁用 ControlMaster
-```
+2. **SSH 层**: 配置 GitHub 走 ssh.github.com:443（脚本选项 2），这条路径通过代理正常工作
 
 **完整检查清单:**
 ```bash
@@ -345,7 +342,7 @@ Clash 记录: 140.82.114.4 来自 github.com
 dig github.com  # 应返回真实 IP（20.x.x.x），而非 198.18.x.x
 
 # 2. 路由层检查
-grep "github.com,DIRECT" ~/.local/share/.../profiles/[merge-uid].yaml
+grep "DST-PORT,22" ~/.local/share/io.github.clash-verge-rev.clash-verge-rev/profiles/*.js
 
 # 3. SSH 层检查（可选但推荐）
 grep "Host github.com" ~/.ssh/config
@@ -354,26 +351,28 @@ grep "Host github.com" ~/.ssh/config
 ssh -T git@github.com  # 应稳定成功
 ```
 
-### Q5: 为什么 GitHub 需要 DIRECT 而不是 Proxy？
+### Q5: 为什么需要 DST-PORT,22,DIRECT 而不是 GitHub 域名直连？
 
-**SSH 协议特性:**
-- SSH 需要端到端的直接连接
-- 大多数代理节点（HTTP/SOCKS5）不支持 SSH 协议转发
-- 即使 DNS 返回真实 IP，走代理仍会失败
+**核心原因: 机场封禁出站 TCP/22 是全局性的**
 
-**技术原因:**
+实测结果：84 个节点无一放行出站 22，不是“某些节点不支持”而是全部封禁。SSH 走代理的表现是 connect 成功后立即 0 字节断开。
+
+mihomo 日志证实流量已正确路由：
 ```
-SSH 握手过程:
-  客户端 → SSH KEX (密钥交换) → 服务器
-  ↓
-  需要直接 TCP 连接，不能经过 HTTP/SOCKS5 代理层
+[TCP] 198.18.0.1:40260 --> ssh.github.com:22 match DomainKeyword(github) using TaiShan Net[HK07]
 ```
+流量到达了代理节点，是出口端丢弃了 TCP/22。同一节点 :443 和 :9418 正常。
 
-**其他协议对比:**
-- HTTPS: 可以走 HTTP/SOCKS5 代理 ✅
-- SSH: 不能走 HTTP/SOCKS5 代理 ❌
-- Git over HTTPS: 可以走代理 ✅
-- Git over SSH: 必须直连 ⚠️
+**SSH 协议本身通过代理没有问题**——它是普通 TCP，代理节点可以正常转发。问题专属于端口 22，不是协议。
+
+**域名匹配在 TUN 下对 SSH 仍然有效**——因为 github.com 在 fake-ip-filter 中，DNS 返回真实 IP，mihomo 的 DNS 反向映射恢复了域名，所以 DOMAIN-KEYWORD 规则能匹配 port-22 连接。
+
+**为什么用 DST-PORT 而不是域名规则**:
+- 机场封 22 是全局的，不只影哓 GitHub
+- DST-PORT,22,DIRECT 一条规则覆盖所有 :22 目标
+- Clash 规则只能选择出站，无法改写目标地址或端口（没有 REWRITE/DNAT 规则类型）
+
+**直连 :22 在本地网络上是否可行**: 实测将 socket 绑定物理网卡 192.168.11.76，ssh.github.com:22、github.com:22、gitlab.com:22 等均正常返回 SSH banner（0.5-0.8s）。因此 DIRECT 路径在当前网络可用。
 
 ---
 
@@ -442,14 +441,15 @@ dns:
     - '+._tcp'
     - '+._udp'
 
-# 代理模式（使用 prepend-rules 在订阅规则前添加）
+# 代理模式（使用全局 Script.js prepend 规则）
 prepend-rules:
-  # GitHub SSH 直连（不走代理）
-  # 原因：SSH 协议需要端到端连接，大多数代理节点不支持 SSH 协议转发
-  - DOMAIN-SUFFIX,github.com,DIRECT
-  - DOMAIN-SUFFIX,githubusercontent.com,DIRECT
-  - DOMAIN-SUFFIX,githubassets.com,DIRECT
-  - DOMAIN-SUFFIX,github.io,DIRECT
+  # 出站 TCP/22 直连
+  # 原因：机场全部 84 个节点封禁出站 TCP/22，走代理必然失败
+  - DST-PORT,22,DIRECT
+  # 中国大陆直连
+  - GEOIP,CN,DIRECT,no-resolve
+  - DOMAIN-SUFFIX,cn,DIRECT
+  - DOMAIN-SUFFIX,com.cn,DIRECT
   # 本地网络直连
   - IP-CIDR,192.168.0.0/16,DIRECT,no-resolve
   - IP-CIDR,10.0.0.0/8,DIRECT,no-resolve
@@ -460,62 +460,54 @@ prepend-rules:
 
 **配置说明:**
 
-1. **TUN 配置**: 完整的 exclude-routes，排除本地网络
+1. **TUN 配置**: 完整的 route-exclude-address，排除本地网络
 2. **Fake-IP Filter**: 完整列表，包含：
    - 本地网络
    - 企业应用（飞书、钉钉等）
    - GitHub（主域名 + 通配符）
    - 中国镜像源（16个教育网 + 7个企业镜像站）
    - 协议过滤
-3. **Prepend-Rules**: GitHub 直连（DIRECT）+ 本地网络直连
-   - 使用 `prepend-rules` 在订阅规则前添加
-   - GitHub 流量不走代理（SSH 协议需要端到端直连）
+3. **Prepend-Rules**: DST-PORT,22,DIRECT + 中国大陆直连 + 本地网络直连
+   - 使用全局 Script.js 写入 prepend 规则
+   - 所有出站 TCP/22 直连（机场封禁出站 22，走代理必失败）
    - 本地网络流量直连
 
 **Clash 层面配置效果:**
 - ✅ 全局透明代理（TUN）
 - ✅ 高性能 DNS（Fake-IP）
-- ✅ SSH 可用（GitHub 在 filter 中返回真实 IP）
+- ✅ SSH 可用（GitHub 在 filter 中返回真实 IP + :22 直连）
 - ✅ 精细分流（规则模式）
 - ✅ 本地网络正常访问
 - ✅ 企业应用正常工作
-- ✅ GitHub 流量直连（不经过代理节点）
 - ✅ 中国镜像源正常访问（apt/yum 等包管理器）
 
 ---
 
 ## 七、SSH 配置优化（可选但推荐）
 
-虽然 Clash 配置已经支持 SSH（DNS 返回真实 IP + 流量直连），但为了进一步提高连接稳定性，推荐配置 SSH。
+Clash 配置（选项 1）的 `DST-PORT,22,DIRECT` 让 :22 流量直连，对大部分网络环境已够用。SSH 配置（选项 2）让 GitHub 改走 ssh.github.com:443，这条路径通过代理正常工作，不依赖直连 :22 是否可达。
 
 ### 为什么需要 SSH 配置？
 
 **问题背景:**
-- GitHub SSH 在端口 22 上有约 2% 的间歇性失败率
-- SSH ControlMaster（连接复用）可能导致"第一次成功，第二次失败"的问题
-- 某些网络环境对端口 22 有限制
+- 机场封禁出站 TCP/22（84 节点 0 放行），走代理必失败
+- 选项 1 让 :22 直连，当本地网络也封 22 时仍会失败
+- GitHub 提供 ssh.github.com:443 作为替代入口
 
 **解决方案:**
-- 使用端口 443（HTTPS 端口）替代默认的 22
-- 禁用 ControlMaster 避免连接复用问题
+- 使用端口 443 连接 GitHub SSH，该端口通过代理正常转发
 
 ### SSH 配置内容
 
 在 `~/.ssh/config` 中添加：
 
 ```bash
-# GitHub SSH over HTTPS port (443) - 最可靠的解决方案
-# 原因：
-# 1. 端口 443 比端口 22 更稳定（GitHub 官方推荐用于防火墙受限环境）
-# 2. 禁用 ControlMaster 避免连接复用导致的间歇性失败
-Host github.com
+# GitHub SSH 走 443 端口
+# 原因：机场封禁出站 TCP/22，443 通过代理正常转发
+Host github.com ssh.github.com
     Hostname ssh.github.com
     Port 443
     User git
-    # 禁用连接复用避免间歇性问题
-    ControlMaster no
-    ControlPath none
-    ControlPersist no
 ```
 
 ### 配置方式
@@ -563,24 +555,24 @@ Hi <your-username>! You've successfully authenticated, but GitHub does not provi
 ### 配置效果
 
 **端口 443 的优势:**
-- ✅ 更稳定（GitHub 服务器针对此端口优化）
-- ✅ 绕过防火墙限制（大多数网络允许 443 端口）
-- ✅ 官方推荐方案
+- ✅ 通过代理正常工作（机场只封 22，443 畅通）
+- ✅ 不依赖直连 :22 是否可达
+- ✅ GitHub 官方支持的替代入口
 
-**禁用 ControlMaster 的效果:**
-- ✅ 避免连接复用导致的"第一次成功，后续失败"问题
-- ✅ 每次连接独立，互不影响
-- ⚠️ 轻微性能损失（每次都建立新连接）
+**与选项 1 的分工:**
+- 选项 1 的 `DST-PORT,22,DIRECT` 覆盖所有 :22 目标（自己的服务器等）
+- 选项 2 让 GitHub 改用 443，从此不走 :22，DIRECT 规则不会命中它
+- 两者不冲突，组合使用效果最佳
 
 ### 完整解决方案总结
 
 **Clash 配置（必需）:**
 1. DNS 层: fake-ip-filter 让 GitHub 返回真实 IP
-2. 网络层: TUN exclude-routes 排除本地网络
-3. 路由层: prepend-rules 让 GitHub 流量直连（不走代理）
+2. 网络层: TUN route-exclude-address 排除本地网络
+3. 路由层: DST-PORT,22,DIRECT 让所有 :22 流量直连（机场封禁出站 22）
 
 **SSH 配置（推荐）:**
-4. SSH 层: 端口 443 + 禁用 ControlMaster
+4. SSH 层: GitHub 走 ssh.github.com:443，通过代理正常工作
 
 四层配置共同作用，实现最稳定的 GitHub SSH 连接。
 
