@@ -368,7 +368,7 @@ mihomo 日志证实流量已正确路由：
 **域名匹配在 TUN 下对 SSH 仍然有效**——因为 github.com 在 fake-ip-filter 中，DNS 返回真实 IP，mihomo 的 DNS 反向映射恢复了域名，所以 DOMAIN-KEYWORD 规则能匹配 port-22 连接。
 
 **为什么用 DST-PORT 而不是域名规则**:
-- 机场封 22 是全局的，不只影哓 GitHub
+- 机场封 22 是全局的，不只影响 GitHub
 - DST-PORT,22,DIRECT 一条规则覆盖所有 :22 目标
 - Clash 规则只能选择出站，无法改写目标地址或端口（没有 REWRITE/DNAT 规则类型）
 
