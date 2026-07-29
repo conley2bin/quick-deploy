@@ -635,7 +635,7 @@ clear_subscription_merge() {
         in_option && /merge:/ {
             if (type=="remote") print $2
         }
-    ' "$PROFILES_YAML" | sort -u)
+    ' "$PROFILES_YAML" | LC_ALL=C sort -u)
 
     if [ -z "$sub_merge_uids" ]; then
         echo "未找到订阅级 merge 记录"
@@ -667,7 +667,7 @@ get_backup_files() {
     local dir="$CLASH_DIR/profiles"
     find "$dir" -maxdepth 1 -type f -name "*.backup.*" -printf "%f\n" \
         | awk -F'.backup.' 'NF>1{print $2 "|" $0}' \
-        | sort \
+        | LC_ALL=C sort \
         | awk -F'|' '{print $2}'
 }
 
