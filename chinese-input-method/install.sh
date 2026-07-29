@@ -684,3 +684,46 @@ echo "清理提示:"
 echo "  本脚本不会自动执行 apt autoremove。确认系统无异常后，可手动运行:"
 echo "  sudo apt autoremove"
 echo
+
+# 上方提示文本保持原样，其中第 4 条描述的是 fcitx5 的出厂默认值。
+# 本脚本已经把它改掉了，所以必须在后面说清楚 —— 否则用户会按上面
+# 那句去理解左 Shift，而实际行为已经不同。
+echo "========================================"
+echo "  快捷键已被本脚本修改"
+echo "========================================"
+echo
+echo "上方第 4 条列的是 fcitx5 出厂默认值，本脚本已将其改为:"
+echo
+echo "  Ctrl+Space  不变，仍为按列表顺序循环切换输入法"
+echo "  Left Shift  已改为按列表顺序循环切换输入法"
+echo "              (EnumerateForwardKeys=$HOTKEY_ENUMERATE_FORWARD)"
+echo "  「临时切换到第一个输入法」已取消快捷键 (AltTriggerKeys 置空)"
+echo
+echo "即左 Shift 与 Ctrl+Space 现在等效，都是循环切换。"
+echo "上面第 4 条里“Left Shift: 临时切换到第一个输入法”已不再适用。"
+echo "实际写入值已由上方安装后检查回读磁盘校验。"
+echo
+echo "配置文件: $FCITX5_CONFIG"
+echo "如需恢复默认: fcitx5-configtool 的 Global Options → Hotkey"
+echo
+
+# 输入法列表的两个状态很容易被误解，而且重跑脚本时 profile 与快捷键
+# 的行为不一致（快捷键每次都写，profile 不带 --force 则根本不写），必须说明。
+echo "========================================"
+echo "  输入法列表说明"
+echo "========================================"
+echo
+echo "fcitx5 有两个状态，各自用哪个输入法由 profile 决定:"
+echo "  未激活 (托盘显示关) → 列表第一项 Items/0，应为英文直通"
+echo "  已激活 (托盘显示开) → DefaultIM，应为拼音"
+echo
+echo "本脚本写入的是: Items/0=keyboard-us、Items/1=pinyin、DefaultIM=pinyin"
+echo "即未激活时英文、激活后拼音。用 fcitx5-remote 可查当前状态:"
+echo "  fcitx5-remote      输出 0=关闭 1=未激活 2=已激活"
+echo "  fcitx5-remote -n   输出该状态下实际使用的输入法"
+echo "若 fcitx5-remote 返回 1 而 -n 返回 pinyin，说明两个状态被调反了。"
+echo
+echo "注意: profile 已存在时本脚本不会改写它，会在开头直接退出。"
+echo "      要让上述顺序生效需运行: ./install.sh --force"
+echo "      （快捷键不同，每次运行都会写入）"
+echo
