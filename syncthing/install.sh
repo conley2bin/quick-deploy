@@ -27,8 +27,8 @@ syncthing --version
 # 启用用户级服务
 CURRENT_USER="${SUDO_USER:-$USER}"
 echo "Enabling systemd service for user: $CURRENT_USER"
-sudo systemctl enable syncthing@$CURRENT_USER.service
-sudo systemctl start syncthing@$CURRENT_USER.service
+sudo systemctl enable "syncthing@$CURRENT_USER.service"
+sudo systemctl start "syncthing@$CURRENT_USER.service"
 
 # 检查服务状态
 echo "Service status:"

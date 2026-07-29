@@ -103,7 +103,7 @@ fi
 
 # 10. 设置 zsh 为默认 shell
 echo -e "\n${YELLOW}[9/9] 设置 zsh 为默认 shell...${NC}"
-CURRENT_SHELL=$(echo $SHELL)
+CURRENT_SHELL="$SHELL"
 ZSH_PATH=$(which zsh)
 
 if [ "$CURRENT_SHELL" != "$ZSH_PATH" ]; then

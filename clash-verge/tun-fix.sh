@@ -451,7 +451,7 @@ configure_ssh() {
         grep -A 10 "^Host github.com" "$ssh_config"
         echo ""
         echo -n "是否覆盖现有配置？[y/N]: "
-        read overwrite
+        read -r overwrite
         if [[ ! "$overwrite" =~ ^[Yy]$ ]]; then
             echo "已取消 SSH 配置"
             return
@@ -707,7 +707,7 @@ restore_backup() {
 
     list_backups
     echo -n "选择序号以恢复: "
-    read idx
+    read -r idx
 
     if ! [[ "$idx" =~ ^[0-9]+$ ]] || [ "$idx" -lt 1 ] || [ "$idx" -gt ${#files[@]} ]; then
         echo "无效选择"
@@ -730,7 +730,7 @@ cleanup_backups() {
     fi
 
     echo -n "输入序号(空格分隔)或 all: "
-    read selection
+    read -r selection
 
     if [ -z "$selection" ]; then
         echo "无效选择"
@@ -757,7 +757,7 @@ cleanup_backups() {
         echo "  $f"
     done
     echo -n "确认删除? [y/N]: "
-    read confirm
+    read -r confirm
     if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
         echo "已取消"
         return
@@ -786,7 +786,7 @@ backup_menu() {
         echo ""
         echo "=========================================="
         echo -n "请选择 [0-2]: "
-        read choice
+        read -r choice
 
         case $choice in
             1)
@@ -812,11 +812,11 @@ main() {
 
     echo ""
     echo "当前订阅: $PROFILE_NAME"
-    echo "Merge 配置: $(basename $MERGE_CONFIG)"
+    echo "Merge 配置: $(basename "$MERGE_CONFIG")"
 
     while true; do
         show_menu
-        read choice
+        read -r choice
 
         case $choice in
             1)
