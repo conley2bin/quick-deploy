@@ -12,6 +12,29 @@ PROFILES_YAML="$CLASH_DIR/profiles.yaml"
 # 非 0，在 set -e 下会让脚本从函数中途静默终止，用户看不到任何原因。此处显式拦截。
 [ -f "$PROFILES_YAML" ] || { echo "未找到 $PROFILES_YAML，请先启动 Clash Verge 生成配置" >&2; exit 1; }
 
+# TUN 排除的本地网段 —— 唯一来源：tun_block 写入的和 verify_tun_routes 校验的
+# 是同一份数组，两者不会各自漂移（否则验证会去查一组从未写入的网段）。
+TUN_EXCLUDED_PREFIXES=(192.168.0.0/16 10.0.0.0/8 172.16.0.0/12 127.0.0.0/8)
+
+# 规范 TUN 配置块 —— 全脚本唯一副本，输出到 stdout
+#
+# 键名说明：排除网段的键是 route-exclude-address（mihomo RawTun 字段，需要
+# auto-route: true 才有意义）。此前使用的 exclude-routes 是 sing-box 的
+# route_exclude_address，mihomo 的配置结构里根本没有这个字段，解析时被静默丢弃：
+# 不报错、不告警，/configs 返回的 tun 对象里没有任何排除字段，内核 ip rule /
+# table 2022 里也没有对应例外。因此"没有解析错误"不能当作键生效的证据。
+tun_block() {
+    cat << 'EOF'
+tun:
+  enable: true
+  stack: system
+  auto-route: true
+  auto-detect-interface: true
+  route-exclude-address:
+EOF
+    printf '    - %s\n' "${TUN_EXCLUDED_PREFIXES[@]}"
+}
+
 # 获取全局 Merge 配置文件
 get_merge_config() {
     local merge_file=$(awk '
@@ -159,18 +182,10 @@ dns:
     # 协议过滤
     - '+._tcp'
     - '+._udp'
-
-tun:
-  enable: true
-  stack: system
-  auto-route: true
-  auto-detect-interface: true
-  exclude-routes:
-    - 192.168.0.0/16
-    - 10.0.0.0/8
-    - 172.16.0.0/12
-    - 127.0.0.0/8
 EOF
+        # TUN 块只有一处定义，见 tun_block()
+        echo "" >> "$file"
+        tun_block >> "$file"
         echo "pass Merge 配置已创建"
         return
     fi
@@ -300,31 +315,88 @@ EOF
     echo "pass Fake-IP Filter 已更新 (GitHub 主域名和通配符)"
 }
 
-# 更新或创建 TUN 配置
+# 写入规范 TUN 配置（可重复执行）
+#
+# 旧实现在 grep -q '^tun:' 时直接 return，导致任何跑过旧版本的机器会永久保留
+# 带 exclude-routes 的无效块。现在改为：有旧块就整块删除，然后追加规范块。
 update_tun_config() {
     local file="$1"
 
-    if grep -q "^tun:" "$file"; then
-        echo "pass TUN 配置已存在"
+    if [ ! -f "$file" ]; then
+        tun_block > "$file"
+        echo "已创建并写入 TUN 配置块: $file"
         return
     fi
 
-    # 添加 TUN 配置
-    cat >> "$file" << 'EOF'
+    cp "$file" "$file.backup.$(date +%Y%m%d_%H%M%S)"
 
-tun:
-  enable: true
-  stack: system
-  auto-route: true
-  auto-detect-interface: true
-  exclude-routes:
-    - 192.168.0.0/16
-    - 10.0.0.0/8
-    - 172.16.0.0/12
-    - 127.0.0.0/8
-EOF
+    local had_block=0
+    grep -q '^tun:' "$file" && had_block=1
 
-    echo "pass TUN 配置已添加"
+    # 删除已有 tun: 块（从 ^tun: 到下一个顶层键），并去掉尾部空行，
+    # 使重复执行产生字节级相同的结果。
+    awk '
+        BEGIN {skip=0; pending=0}
+        /^tun:/ {skip=1; next}
+        skip && /^[^[:space:]]/ {skip=0}
+        skip {next}
+        /^[[:space:]]*$/ {pending++; next}
+        {while (pending-- > 0) print ""; pending=0; print}
+    ' "$file" > "${file}.tmp" && mv "${file}.tmp" "$file"
+
+    echo "" >> "$file"
+    tun_block >> "$file"
+
+    if [ "$had_block" -eq 1 ]; then
+        echo "已替换原有 tun: 块为规范块 (route-exclude-address)"
+    else
+        echo "已追加 TUN 配置块 (route-exclude-address)"
+    fi
+    echo "这只说明文本已写入；是否真的生效需 Clash Verge 重载后用 verify_tun_routes 看内核"
+}
+
+# 验证排除网段是否真的落到了内核路由
+verify_tun_routes() {
+    echo ""
+    echo "=========================================="
+    echo "  TUN 排除网段内核态检查"
+    echo "=========================================="
+    echo ""
+
+    if ! command -v ip >/dev/null 2>&1; then
+        echo "未找到 ip 命令，无法检查"
+        return
+    fi
+
+    local rules routes p
+    local hit=0
+    rules=$(ip rule show 2>/dev/null || true)
+    routes=$(ip route show table 2022 2>/dev/null || true)
+
+    echo "--- ip rule show ---"
+    echo "${rules:-(空)}"
+    echo ""
+    echo "--- ip route show table 2022 ---"
+    echo "${routes:-(空)}"
+    echo ""
+
+    for p in "${TUN_EXCLUDED_PREFIXES[@]}"; do
+        if printf '%s\n%s\n' "$rules" "$routes" | grep -qF "$p"; then
+            echo "pass 内核中已出现: $p"
+            hit=$((hit+1))
+        else
+            echo "fail 内核中未出现: $p"
+        fi
+    done
+
+    echo ""
+    if [ "$hit" -eq "${#TUN_EXCLUDED_PREFIXES[@]}" ]; then
+        echo "全部排除前缀已落到内核路由，配置真实生效"
+    else
+        echo "已生效 $hit/${#TUN_EXCLUDED_PREFIXES[@]}。本结果只在 Clash Verge 重载配置、重建 TUN 之后才有意义。"
+        echo "重载后仍为 0，说明该键没被采纳；不要再把\"配置无解析错误\"当作生效证据。"
+    fi
+    echo ""
 }
 
 # 移除 prepend-rules（已改用全局脚本写入 rules）
@@ -427,28 +499,51 @@ EOF
     fi
 }
 
+# 删除本脚本之前生成的 GitHub SSH 块（新标记块 + 旧版本的无标记块）
+remove_managed_ssh_block() {
+    local ssh_config="$1"
+
+    [ -f "$ssh_config" ] || return 0
+
+    # 当前格式：成对标记之间全删
+    sed -i '/^# >>> tun-fix\.sh github ssh >>>$/,/^# <<< tun-fix\.sh github ssh <<<$/d' "$ssh_config"
+    # 旧格式：旧版本写的块以注释头开始、以 ControlPersist no 结尾
+    sed -i '/^# GitHub SSH over HTTPS port/,/^[[:space:]]*ControlPersist no[[:space:]]*$/d' "$ssh_config"
+    # 规范空行：连续空行压成一行，并去掉首尾空行。
+    # 不能用 sed '/^$/N;/^\n$/d'（旧实现）：那是成对删除，删完块后剩下的两个
+    # 空行会被整体删掉，用户原有条目被粘到上一段末尾。
+    # 去尾空行是幂等性的关键：追加的块自带一个前置空行，不去尾就会每跑一次多一行。
+    local squeezed
+    squeezed=$(mktemp "${ssh_config}.tmp.XXXXXX")
+    awk '
+        BEGIN {pending=0; started=0}
+        /^[[:space:]]*$/ {pending=1; next}
+        {if (pending && started) print ""; pending=0; started=1; print}
+    ' "$ssh_config" > "$squeezed" && cat "$squeezed" > "$ssh_config"
+    rm -f "$squeezed"
+}
+
 # 配置 SSH (可选)
 configure_ssh() {
     local ssh_config="$HOME/.ssh/config"
-    local timestamp=$(date +%Y%m%d_%H%M%S)
+    local timestamp
+    timestamp=$(date +%Y%m%d_%H%M%S)
 
     echo ""
     echo "==========================================="
     echo "  配置 SSH for GitHub (可选)"
     echo "==========================================="
     echo ""
-    echo "此配置将修改 GitHub SSH 连接方式:"
-    echo "  1. 使用端口 443 连接 ssh.github.com"
-    echo "     - 规避部分网络对 22 端口的阻断"
-    echo "  2. 禁用连接复用 (ControlMaster)"
-    echo "     - 避免复用连接引发的握手失败"
+    echo "此配置让 GitHub SSH 走 ssh.github.com:443。"
+    echo "实测原因：流量已正确路由到代理，但机场出口节点封禁出站 TCP/22；"
+    echo "443 端口不受影响，已验证可用。"
     echo ""
 
     # 检查是否已配置
-    if [ -f "$ssh_config" ] && grep -q "^Host github.com" "$ssh_config"; then
+    if [ -f "$ssh_config" ] && grep -qE '^# >>> tun-fix\.sh github ssh >>>|^Host github\.com' "$ssh_config"; then
         echo "warning  检测到 ~/.ssh/config 中已存在 GitHub 配置"
         echo ""
-        grep -A 10 "^Host github.com" "$ssh_config"
+        grep -A 10 "^Host github.com" "$ssh_config" || true
         echo ""
         echo -n "是否覆盖现有配置？[y/N]: "
         read -r overwrite
@@ -457,13 +552,10 @@ configure_ssh() {
             return
         fi
 
-        # 备份并移除旧配置
         cp "$ssh_config" "$ssh_config.backup.$timestamp"
         echo "pass 已备份原配置到: $ssh_config.backup.$timestamp"
 
-        # 移除旧的 GitHub 配置（包括注释）
-        sed -i '/# GitHub SSH over HTTPS port/,/ControlPersist no/d' "$ssh_config"
-        sed -i '/^$/N;/^\n$/d' "$ssh_config"
+        remove_managed_ssh_block "$ssh_config"
     fi
 
     echo ""
@@ -482,17 +574,27 @@ configure_ssh() {
     # 添加配置
     cat >> "$ssh_config" << 'EOF'
 
-# GitHub SSH over HTTPS port (443)
-# 原因：
-# 1. 443 端口通常可用，22 端口在部分网络被阻断
-# 2. 禁用 ControlMaster 规避连接复用引发的握手失败
-Host github.com
+# >>> tun-fix.sh github ssh >>>
+# GitHub SSH 走 443 端口。
+# 实测机制：流量已正确走代理，是代理机场的出口节点封禁出站 TCP/22
+# （github/gitlab/bitbucket/kernel.org 的 :22 均在一个 RTT 内返回 0 字节后断开，
+#   同节点的 :443 与 :9418 正常；直连的 :22 也正常）。443 端口不受影响。
+Host github.com ssh.github.com
     Hostname ssh.github.com
     Port 443
     User git
-    ControlMaster no
-    ControlPath none
-    ControlPersist no
+
+# 同一出口节点对所有境外 :22 都封，如需 GitLab / Bitbucket 取消下方注释即可
+#Host gitlab.com altssh.gitlab.com
+#    Hostname altssh.gitlab.com
+#    Port 443
+#    User git
+#
+#Host bitbucket.org altssh.bitbucket.org
+#    Hostname altssh.bitbucket.org
+#    Port 443
+#    User git
+# <<< tun-fix.sh github ssh <<<
 EOF
 
     chmod 600 "$ssh_config"
@@ -534,7 +636,8 @@ optimize_all() {
     echo "  - 企业应用 (飞书、钉钉、字节跳动)"
     echo "  - GitHub (github.com, *.github.com, 等)"
     echo ""
-    echo "pass TUN 模式: 已配置 (排除本地网络)"
+    echo "TUN 模式: 已写入 tun: 块（route-exclude-address 排除 192.168.0.0/16、10.0.0.0/8、172.16.0.0/12、127.0.0.0/8）"
+    echo "  尚未验证生效：需重载 Clash Verge 后，由 verify_tun_routes 看内核路由确认"
     echo ""
     echo "pass 直连规则: 已写入全局脚本"
     echo "  - 中国大陆 IP (GEOIP,CN)"
@@ -551,6 +654,10 @@ optimize_all() {
     echo "  - DNS 层: 主域名和通配符都已添加"
     echo "  - 规则层: 直连规则已写入全局脚本"
     echo ""
+
+    # 写文本 ≠ 内核生效。下面的结果反映的是重载前的内核状态，
+    # 只有在 Clash Verge 重载配置、重建 TUN 之后重跑才能当作结论。
+    verify_tun_routes
 }
 
 # 显示菜单
