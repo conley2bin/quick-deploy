@@ -77,7 +77,7 @@ ensure_not_root() {
     if [ "${EUID:-$(id -u)}" -eq 0 ]; then
         echo "错误: 请不要用 sudo 运行本脚本。"
         echo "请直接运行: ./install.sh"
-    echo "脚本会在需要安装软件包时调用 ${SUDO_CMD}。"
+        echo "脚本会在需要安装软件包时调用 ${SUDO_CMD}。"
         exit 1
     fi
 }
@@ -186,6 +186,18 @@ verify_installation() {
         failed=true
     fi
 
+    # 上面那条只是回读本脚本自己刚写的文件，证明不了 pinyin 能用。
+    # fcitx5 在加载时会把找不到对应 inputmethod 注册文件的条目直接从组里删掉，
+    # 不报错、不告警——表现就是“profile 看着对，但输入法列表里没有拼音”。
+    # 所以这里校验引擎本身是否存在，这是独立于本脚本写入动作的事实。
+    if [ -f /usr/share/fcitx5/inputmethod/pinyin.conf ]; then
+        echo "OK: pinyin 输入法引擎已注册"
+    else
+        echo "错误: 找不到 /usr/share/fcitx5/inputmethod/pinyin.conf，pinyin 引擎缺失"
+        echo "      profile 里写了 pinyin 也会被 fcitx5 在加载时静默丢弃。"
+        failed=true
+    fi
+
     # GNOME 的输入源里若仍有 IBus 引擎，重新登录后会与 Fcitx5 抢占
     # Ctrl+Space，表现为"装了但切不出中文"。这里只提示，不自动修改
     # 用户现有输入法配置。
@@ -218,9 +230,7 @@ echo
 
 check_supported_system
 
-# 检测当前显示服务器
-CURRENT_SESSION="${XDG_SESSION_TYPE:-unknown}"
-echo "当前显示服务器: $CURRENT_SESSION"
+echo "当前显示服务器: ${XDG_SESSION_TYPE:-unknown}"
 echo
 
 section "预检查"
@@ -310,10 +320,31 @@ echo
 # ============================================
 section "[4/5] 清理旧版脚本重复配置"
 
-if [ -f "$HOME/.profile" ] && grep -q "^# Fcitx5 输入法环境变量$" "$HOME/.profile"; then
-    backup_file "$HOME/.profile"
-    sed -i '/^# Fcitx5 输入法环境变量$/,/^export SDL_IM_MODULE=fcitx$/d' "$HOME/.profile"
-    echo "已移除 ~/.profile 中旧版脚本写入的 Fcitx5 环境变量块"
+# 不能用 sed '/起始/,/结束/d'：范围删除在找不到结束行时会一路删到文件末尾。
+# 旧实现只 grep 了起始标记就执行删除，实测：用户若把 SDL 那行改掉或删掉，
+# 12 行的 ~/.profile 会被删到只剩 3 行，连后面的 EDITOR、cargo env 一起没，
+# 而脚本打印的是“已移除环境变量块”。现在要求两个标记都在才动手。
+PROFILE_BEGIN='# Fcitx5 输入法环境变量'
+PROFILE_END='export SDL_IM_MODULE=fcitx'
+
+if [ -f "$HOME/.profile" ] && grep -qF -x "$PROFILE_BEGIN" "$HOME/.profile"; then
+    if grep -qF -x "$PROFILE_END" "$HOME/.profile"; then
+        backup_file "$HOME/.profile"
+        PROFILE_TMP="$(mktemp "$HOME/.profile.tmp.XXXXXX")"
+        awk -v b="$PROFILE_BEGIN" -v e="$PROFILE_END" '
+            !skip && $0 == b {skip=1; next}
+            skip && $0 == e {skip=0; next}
+            !skip {print}
+        ' "$HOME/.profile" > "$PROFILE_TMP"
+        # 用 cat 而不是 mv，保留 ~/.profile 原有的 inode 与权限
+        cat "$PROFILE_TMP" > "$HOME/.profile"
+        rm -f "$PROFILE_TMP"
+        echo "已移除 ~/.profile 中旧版脚本写入的 Fcitx5 环境变量块"
+    else
+        echo "警告: ~/.profile 里有旧版起始标记，但找不到结束行：$PROFILE_END"
+        echo "      无法确定块的边界，为避免误删你自己的配置，已跳过。"
+        echo "      请手动检查并删除该块。"
+    fi
 else
     echo "未发现旧版 ~/.profile 环境变量块"
 fi

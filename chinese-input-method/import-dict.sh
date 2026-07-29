@@ -77,7 +77,6 @@ check_requirements
 
 mkdir -p "$DICT_DIR"
 WORK_DIR="$(mktemp -d "$DICT_DIR/.zhwiki-import.XXXXXX")"
-mkdir -p "$WORK_DIR"
 
 echo "正在下载中文维基百科词库..."
 echo "来源: $REPO_URL"
