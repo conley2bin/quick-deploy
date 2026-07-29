@@ -32,7 +32,7 @@ sudo systemctl start syncthing@$CURRENT_USER.service
 
 # 检查服务状态
 echo "Service status:"
-sudo systemctl status syncthing@$CURRENT_USER.service --no-pager
+sudo systemctl status "syncthing@$CURRENT_USER.service" --no-pager || true
 
 echo ""
 echo "Installation complete."
