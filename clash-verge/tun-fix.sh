@@ -67,7 +67,8 @@ get_profile_item_path() {
     local file
 
     file=$(get_profile_item_file "$target_uid")
-    [ -n "$file" ] && echo "$CLASH_DIR/profiles/$file"
+    [ -n "$file" ] || return 0
+    echo "$CLASH_DIR/profiles/$file"
 }
 
 # 获取当前订阅 option 绑定的配置 UID
@@ -92,7 +93,8 @@ get_current_profile_option_path() {
     local uid
 
     uid=$(get_current_profile_option_uid "$key")
-    [ -n "$uid" ] && get_profile_item_path "$uid"
+    [ -n "$uid" ] || return 0
+    get_profile_item_path "$uid"
 }
 
 # 更新或创建 Merge 配置中的 Fake-IP Filter
@@ -595,17 +597,17 @@ show_config_paths() {
     echo "=========================================="
     echo ""
     echo "直接修改:"
-    echo "  $global_merge"
-    echo "  $global_script"
-    [ -n "$sub_merge" ] && echo "  $sub_merge"
+    echo "  全局 Merge: $global_merge"
+    echo "  全局 Script: $global_script"
+    echo "  订阅级 Merge: ${sub_merge:-(未绑定)}"
     echo ""
     echo "读取定位:"
-    echo "  $PROFILES_YAML"
-    [ -n "$current_profile_path" ] && echo "  $current_profile_path"
-    [ -n "$sub_script" ] && echo "  $sub_script"
-    [ -n "$sub_rules" ] && echo "  $sub_rules"
-    [ -n "$sub_proxies" ] && echo "  $sub_proxies"
-    [ -n "$sub_groups" ] && echo "  $sub_groups"
+    echo "  profiles.yaml: $PROFILES_YAML"
+    echo "  当前订阅: ${current_profile_path:-(路径缺失)}"
+    echo "  订阅级 Script: ${sub_script:-(未绑定)}"
+    echo "  订阅级 Rules: ${sub_rules:-(未绑定)}"
+    echo "  订阅级 Proxies: ${sub_proxies:-(未绑定)}"
+    echo "  订阅级 Groups: ${sub_groups:-(未绑定)}"
     echo ""
     echo "说明:"
     echo "  - 全局 Merge: Fake-IP Filter 与 TUN 配置"
