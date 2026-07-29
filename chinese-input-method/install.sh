@@ -6,6 +6,7 @@ set -euo pipefail
 
 CHECK_ONLY=false
 FORCE_OVERWRITE=false
+HOTKEYS_ONLY=false
 
 # 定义在顶部：覆盖预检必须在任何修改发生之前就能做（见 precheck_existing_profile）
 FCITX5_CONFIG_DIR="$HOME/.config/fcitx5"
@@ -23,9 +24,10 @@ REQUIRED_PACKAGES=(
 
 SUDO_CMD="${SUDO_CMD:-sudo}"
 
-# 快捷键目标值 —— 写入与校验共用这一份，两者不会各自漂移
+# 快捷键与行为目标值 —— 写入与校验共用这一份，两者不会各自漂移
 HOTKEY_ENUMERATE_FORWARD='Shift+Shift_L'   # 左 Shift: 按列表顺序循环切换输入法
 HOTKEY_ALT_TRIGGER=''                      # 「临时切换到第一个输入法」: 不设快捷键
+BEHAVIOR_ACTIVE_BY_DEFAULT='True'          # 起手即为激活态，即拼音直通
 
 FCITX5_CONFIG="$FCITX5_CONFIG_DIR/config"
 FCITX5_WAS_RUNNING=false
@@ -49,15 +51,21 @@ backup_file() {
 usage() {
     cat << 'EOF'
 用法:
-  ./install.sh [--check] [--force] [--help]
+  ./install.sh [--check] [--force] [--hotkeys-only] [--help]
 
 选项:
-  --check   只检查系统、软件源和当前配置，不安装、不修改
-  --force   覆盖已有 ~/.config/fcitx5/profile；未指定时会在已有配置时退出
-  --help    显示帮助
+  --check          只检查系统、软件源和当前配置，不安装、不修改
+  --force          覆盖已有 ~/.config/fcitx5/profile；未指定时会在已有配置时退出
+  --hotkeys-only   只写快捷键与行为配置 (~/.config/fcitx5/config)，
+                   不装包、不动 profile。适用于已装好只想改快捷键
+  --help           显示帮助
 
 注意:
   不要用 sudo 运行本脚本。直接运行 ./install.sh 即可，脚本会在需要时调用 sudo。
+
+  profile 与快捷键是两个独立文件:
+    profile  输入法列表与顺序，已存在时需 --force 才会覆盖
+    config   快捷键与行为，可用 --hotkeys-only 单独更新
 EOF
 }
 
@@ -69,6 +77,9 @@ parse_args() {
                 ;;
             --force)
                 FORCE_OVERWRITE=true
+                ;;
+            --hotkeys-only)
+                HOTKEYS_ONLY=true
                 ;;
             --help|-h)
                 usage
@@ -98,7 +109,12 @@ precheck_existing_profile() {
     if [ -f "$FCITX5_PROFILE" ] && [ "$FORCE_OVERWRITE" != true ]; then
         echo "错误: 已存在 Fcitx5 配置文件: $FCITX5_PROFILE"
         echo "为避免覆盖现有输入法设置，脚本已停止——尚未做任何修改。"
-        echo "确认要覆盖时请重新运行: ./install.sh --force"
+        echo ""
+        echo "如果你只是想更新快捷键，用这个（不会动 profile）:"
+        echo "  ./install.sh --hotkeys-only"
+        echo ""
+        echo "确认要连输入法列表一起覆盖时:"
+        echo "  ./install.sh --force"
         exit 1
     fi
 }
@@ -242,18 +258,21 @@ write_hotkey_config() {
 
     tmp="$(mktemp "$FCITX5_CONFIG.tmp.XXXXXX")"
 
-    # 逐节处理：在 [Hotkey] 内替换 AltTriggerKeys，在
-    # [Hotkey/EnumerateForwardKeys] 内把整个按键列表换成单条目标值。
+    # 逐节处理：[Hotkey] 内替换 AltTriggerKeys，[Hotkey/EnumerateForwardKeys] 内
+    # 把整个按键列表换成单条目标值，[Behavior] 内替换 ActiveByDefault。
     # 离开某节而目标键未出现过时补写；整个文件都没有该节时在末尾补节。
-    awk -v fwd="$HOTKEY_ENUMERATE_FORWARD" -v alt="$HOTKEY_ALT_TRIGGER" '
+    awk -v fwd="$HOTKEY_ENUMERATE_FORWARD" -v alt="$HOTKEY_ALT_TRIGGER" \
+        -v act="$BEHAVIOR_ACTIVE_BY_DEFAULT" '
         function flush_pending() {
-            if (cur == "hotkey" && !alt_done) { print "AltTriggerKeys=" alt; alt_done=1 }
-            if (cur == "fwd"    && !fwd_done) { print "0=" fwd;             fwd_done=1 }
+            if (cur == "hotkey"   && !alt_done) { print "AltTriggerKeys=" alt;  alt_done=1 }
+            if (cur == "fwd"      && !fwd_done) { print "0=" fwd;               fwd_done=1 }
+            if (cur == "behavior" && !act_done) { print "ActiveByDefault=" act; act_done=1 }
         }
         /^\[.*\]$/ {
             flush_pending()
-            if      ($0 == "[Hotkey]")                     { cur="hotkey"; saw_hotkey=1 }
-            else if ($0 == "[Hotkey/EnumerateForwardKeys]") { cur="fwd";    saw_fwd=1 }
+            if      ($0 == "[Hotkey]")                     { cur="hotkey";   saw_hotkey=1 }
+            else if ($0 == "[Hotkey/EnumerateForwardKeys]") { cur="fwd";      saw_fwd=1 }
+            else if ($0 == "[Behavior]")                   { cur="behavior"; saw_behavior=1 }
             else                                           { cur="other" }
             print
             next
@@ -267,11 +286,17 @@ write_hotkey_config() {
             if (!fwd_done) { print "0=" fwd; fwd_done=1 }
             next
         }
+        cur == "behavior" && /^[[:space:]]*ActiveByDefault[[:space:]]*=/ {
+            print "ActiveByDefault=" act
+            act_done=1
+            next
+        }
         { print }
         END {
             flush_pending()
-            if (!saw_hotkey) { print ""; print "[Hotkey]";                     print "AltTriggerKeys=" alt }
-            if (!saw_fwd)    { print ""; print "[Hotkey/EnumerateForwardKeys]"; print "0=" fwd }
+            if (!saw_hotkey)   { print ""; print "[Hotkey]";                     print "AltTriggerKeys=" alt }
+            if (!saw_fwd)      { print ""; print "[Hotkey/EnumerateForwardKeys]"; print "0=" fwd }
+            if (!saw_behavior) { print ""; print "[Behavior]";                   print "ActiveByDefault=" act }
         }
     ' "$FCITX5_CONFIG" > "$tmp"
 
@@ -313,10 +338,11 @@ read_hotkey_value() {
 }
 
 verify_hotkey_config() {
-    local actual_fwd actual_alt failed=false
+    local actual_fwd actual_alt actual_act failed=false
 
     actual_fwd="$(read_hotkey_value '[Hotkey/EnumerateForwardKeys]' '0')"
     actual_alt="$(read_hotkey_value '[Hotkey]' 'AltTriggerKeys')"
+    actual_act="$(read_hotkey_value '[Behavior]' 'ActiveByDefault')"
 
     if [ "$actual_fwd" = "$HOTKEY_ENUMERATE_FORWARD" ]; then
         echo "OK: 左 Shift 循环切换输入法 (EnumerateForwardKeys=$actual_fwd)"
@@ -332,12 +358,46 @@ verify_hotkey_config() {
         failed=true
     fi
 
+    if [ "$actual_act" = "$BEHAVIOR_ACTIVE_BY_DEFAULT" ]; then
+        echo "OK: 起手即拼音直通 (ActiveByDefault=$actual_act)"
+    else
+        echo "错误: ActiveByDefault 期望 $BEHAVIOR_ACTIVE_BY_DEFAULT，实际 ${actual_act:-(空)}"
+        failed=true
+    fi
+
     if [ "$failed" = true ]; then
         echo
         echo "快捷键未写入成功。若 Fcitx5 在写入期间仍在运行，它退出时会用内存中的"
         echo "配置覆盖磁盘文件。请完全退出 Fcitx5 后重新运行本脚本。"
         exit 1
     fi
+}
+
+# --hotkeys-only 的短路径：只动 config，不装包、不碰 profile。
+#
+# 存在理由：precheck_existing_profile 在一切动作之前就拦住脚本，所以已装好的
+# 机器上直接跑 ./install.sh 什么都不会发生，想单独更新快捷键就只能 --force
+# 连 profile 一起覆盖 —— 两件事本来不相关，不应该绑在一起。
+run_hotkeys_only() {
+    section "只更新快捷键与行为配置"
+
+    echo "目标配置: $FCITX5_CONFIG"
+    echo "  左 Shift 循环切换输入法      (EnumerateForwardKeys=$HOTKEY_ENUMERATE_FORWARD)"
+    echo "  「临时切换到第一个输入法」无快捷键 (AltTriggerKeys 置空)"
+    echo "  起手即拼音直通              (ActiveByDefault=$BEHAVIOR_ACTIVE_BY_DEFAULT)"
+    echo "不会安装软件包，不会改动 profile。"
+    echo
+
+    stop_fcitx5_before_write
+    write_hotkey_config
+    echo "已写入: $FCITX5_CONFIG"
+    start_fcitx5_if_it_was_running
+    echo
+
+    verify_hotkey_config
+    echo
+    echo "完成。快捷键已生效；ActiveByDefault 对新开的窗口生效。"
+    echo
 }
 
 verify_installation() {
@@ -424,6 +484,22 @@ check_supported_system
 
 echo "当前显示服务器: ${XDG_SESSION_TYPE:-unknown}"
 echo
+
+# --hotkeys-only 在任何包操作与 profile 预检之前就走完退出，
+# 否则会被下方的 precheck_existing_profile 拦掉。
+if [ "$HOTKEYS_ONLY" = true ]; then
+    if [ "$CHECK_ONLY" = true ]; then
+        echo "错误: --hotkeys-only 与 --check 不能同时使用"
+        exit 1
+    fi
+    if ! command -v fcitx5 >/dev/null 2>&1; then
+        echo "错误: 未找到 fcitx5。--hotkeys-only 只改配置，不安装软件包。"
+        echo "请先运行不带该选项的 ./install.sh 完成安装。"
+        exit 1
+    fi
+    run_hotkeys_only
+    exit 0
+fi
 
 # 覆盖预检必须在此处，不能拖到步骤 5。
 # 旧顺序下，脚本会先 apt install、改 ~/.xinputrc、删 ~/.config/fcitx、
@@ -698,6 +774,7 @@ echo "  Ctrl+Space  不变，仍为按列表顺序循环切换输入法"
 echo "  Left Shift  已改为按列表顺序循环切换输入法"
 echo "              (EnumerateForwardKeys=$HOTKEY_ENUMERATE_FORWARD)"
 echo "  「临时切换到第一个输入法」已取消快捷键 (AltTriggerKeys 置空)"
+echo "  起手即拼音直通，无需先按切换键 (ActiveByDefault=$BEHAVIOR_ACTIVE_BY_DEFAULT)"
 echo
 echo "即左 Shift 与 Ctrl+Space 现在等效，都是循环切换。"
 echo "上面第 4 条里“Left Shift: 临时切换到第一个输入法”已不再适用。"
@@ -718,12 +795,14 @@ echo "  未激活 (托盘显示关) → 列表第一项 Items/0，应为英文�
 echo "  已激活 (托盘显示开) → DefaultIM，应为拼音"
 echo
 echo "本脚本写入的是: Items/0=keyboard-us、Items/1=pinyin、DefaultIM=pinyin"
-echo "即未激活时英文、激活后拼音。用 fcitx5-remote 可查当前状态:"
+echo "配上 ActiveByDefault=$BEHAVIOR_ACTIVE_BY_DEFAULT，新窗口起手就是激活态的拼音；"
+echo "按切换键转到未激活态时是英文。用 fcitx5-remote 可查当前状态:"
 echo "  fcitx5-remote      输出 0=关闭 1=未激活 2=已激活"
 echo "  fcitx5-remote -n   输出该状态下实际使用的输入法"
 echo "若 fcitx5-remote 返回 1 而 -n 返回 pinyin，说明两个状态被调反了。"
 echo
-echo "注意: profile 已存在时本脚本不会改写它，会在开头直接退出。"
-echo "      要让上述顺序生效需运行: ./install.sh --force"
-echo "      （快捷键不同，每次运行都会写入）"
+echo "重跑本脚本时的行为:"
+echo "  profile 已存在 → 脚本在开头就退出，包、profile、快捷键都不会动"
+echo "  只想改快捷键   → ./install.sh --hotkeys-only"
+echo "  连输入法列表一起覆盖 → ./install.sh --force"
 echo
