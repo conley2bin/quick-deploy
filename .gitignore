@@ -5,6 +5,7 @@ LOG.md
 PROMPT.md
 __pycache__/
 .pi-subagents/*
+.memory/
 coding-agent/shared/MCP/deep-research/.env
 pi-agent/tools/codoxear/.env
 pi-agent/tools/codoxear/.runtime/
