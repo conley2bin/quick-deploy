@@ -167,7 +167,11 @@ echo
 section "安装完成"
 
 echo "已安装的词库:"
-ls -lh "$DICT_DIR"/*.dict 2>/dev/null | awk '{print "  " $9 " (" $5 ")"}'
+# 不解析 ls -l 的输出: 它的列位置随 LC_TIME 变化，且遭遇带空格的文件名会错位。
+for dict in "$DICT_DIR"/*.dict; do
+    [ -e "$dict" ] || continue
+    printf '  %s (%s)\n' "${dict##*/}" "$(LC_ALL=C du -h --apparent-size "$dict" | cut -f1)"
+done
 echo
 echo "如果当前会话未立即生效，请注销并重新登录。"
 echo

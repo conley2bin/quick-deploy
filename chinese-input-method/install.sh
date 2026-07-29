@@ -111,7 +111,11 @@ check_package_candidates() {
     local missing=()
 
     for package in "${REQUIRED_PACKAGES[@]}"; do
-        candidate="$(apt-cache policy "$package" | awk '/Candidate:/ {print $2; exit}')"
+        # LC_ALL=C 不可省略: apt-cache policy 的输出是本地化的。
+        # 中文 locale 下它输出 "候选：" 而不是 "Candidate:"，
+        # 匹配 /Candidate:/ 会永远失配，把所有软件包误判为"没有候选版本"。
+        candidate="$(LC_ALL=C apt-cache policy "$package" 2>/dev/null \
+            | awk '/^ *Candidate:/ {print $2; exit}')"
         if [ -z "$candidate" ] || [ "$candidate" = "(none)" ]; then
             missing+=("$package")
         fi
