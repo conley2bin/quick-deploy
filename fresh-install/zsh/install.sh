@@ -103,11 +103,16 @@ fi
 
 # 9. 设置 zsh 为默认 shell
 echo -e "\n${YELLOW}[9/10] 设置 zsh 为默认 shell...${NC}"
-CURRENT_SHELL="$SHELL"
+# 读 /etc/passwd 里的持久状态（而不是 $SHELL 环境变量），
+# 这样 chsh 之后、重新登录之前的重跑也能正确识别“已是 zsh”
+CURRENT_SHELL=$(getent passwd "$USER" | cut -d: -f7)
 ZSH_PATH=$(which zsh)
 
 if [ "$CURRENT_SHELL" != "$ZSH_PATH" ]; then
-    chsh -s "$ZSH_PATH"
+    # sudo 下 chsh 不会再询问密码（PAM rootok 短路），消除交互停顿；
+    # 但 root 会绕过 /etc/shells 校验，先手动等价校验一次
+    grep -qxF "$ZSH_PATH" /etc/shells || { echo -e "${RED}错误: $ZSH_PATH 不在 /etc/shells 中${NC}"; exit 1; }
+    sudo chsh -s "$ZSH_PATH" "$USER"
     echo -e "${GREEN}✓ 默认 shell 已设置为 zsh${NC}"
 else
     echo -e "${YELLOW}zsh 已是默认 shell${NC}"
