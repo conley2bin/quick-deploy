@@ -4,11 +4,14 @@
 # 顺序有依赖关系，不要随意调整：
 #   1. 清华镜像 —— 后面几步都要用 apt，先换源给全程加速
 #   2. 卸载 Snap —— 先清垃圾再装东西
-#   3. zsh —— 需要 apt 安装
-#   4. 中文输入法 —— 需要 apt 安装，跑完本就要求注销，正好收尾
-#   5. 维基百科词库（可选）—— 从 GitHub 下载约 39MiB。
-#      全新机器此刻还没有代理，下载很可能失败，故标记为可选：
-#      失败只警告不中止，之后可随时单独重跑 import-dict.sh
+#   3. Clash Verge —— 离线 .deb 不依赖网络，但依赖包走 apt 吃镜像加速。
+#      注意：这里只装应用本体，代理要手动启动、导入订阅、开 TUN 后才可用，
+#      所以本流程无法利用它给后续步骤加速
+#   4. zsh —— 需要 apt 安装
+#   5. 中文输入法 —— 需要 apt 安装，跑完本就要求注销，正好收尾
+#   6. 维基百科词库（可选）—— 从 GitHub 下载约 39MiB。
+#      全新机器此刻很可能还没配好代理，下载可能失败，故标记为可选：
+#      失败只警告不中止；配好 Clash Verge 后补跑 import-dict.sh 成功率更高
 # 必需步骤任何一步失败即中止；修复后重跑本脚本即可，
 # 每个子脚本都幂等（会自动跳过或重做，无副作用）。
 
@@ -26,6 +29,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 STEPS=(
     "tsinghua-mirror/install.sh|切换 APT 源为清华镜像|required"
     "purge-snap/purge.sh|彻底卸载 Snap|required"
+    "clash-verge/install.sh|安装 Clash Verge（离线包）|required"
     "zsh/install.sh|安装 zsh 与 oh-my-zsh|required"
     "chinese-input-method/install.sh|安装配置中文输入法|required"
     "chinese-input-method/import-dict.sh|导入维基百科拼音词库|optional"
@@ -79,6 +83,7 @@ if [ "${#OPTIONAL_FAILED[@]}" -gt 0 ]; then
     done
 fi
 
-echo -e "\n${YELLOW}最后一步：注销并重新登录${NC}，以下改动才会生效："
-echo -e "  • 默认 shell 切换为 zsh"
-echo -e "  • 中文输入法环境变量"
+echo -e "\n${YELLOW}收尾两件手动事项：${NC}"
+echo -e "  1. ${YELLOW}注销并重新登录${NC}——默认 shell（zsh）与输入法环境变量才会生效"
+echo -e "  2. 启动 Clash Verge 导入订阅并启用 TUN，然后运行:"
+echo -e "     ${GREEN}$SCRIPT_DIR/clash-verge/tun-fix.sh${NC}（选 1）解决 TUN 模式下 SSH/局域网问题"
