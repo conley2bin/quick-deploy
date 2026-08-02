@@ -10,11 +10,11 @@ NC='\033[0m' # No Color
 echo -e "${GREEN}=== 安装 zsh 与 oh-my-zsh ===${NC}\n"
 
 # 1. 更新包列表
-echo -e "${YELLOW}[1/9] 更新包列表...${NC}"
+echo -e "${YELLOW}[1/10] 更新包列表...${NC}"
 sudo apt update
 
 # 2. 安装 zsh
-echo -e "\n${YELLOW}[2/9] 安装 zsh...${NC}"
+echo -e "\n${YELLOW}[2/10] 安装 zsh...${NC}"
 sudo apt install -y zsh
 
 # 验证安装
@@ -22,7 +22,7 @@ ZSH_VERSION=$(zsh --version)
 echo -e "${GREEN}✓ Zsh 安装完成: $ZSH_VERSION${NC}"
 
 # 3. 安装 oh-my-zsh
-echo -e "\n${YELLOW}[3/9] 安装 oh-my-zsh...${NC}"
+echo -e "\n${YELLOW}[3/10] 安装 oh-my-zsh...${NC}"
 if [ -d "$HOME/.oh-my-zsh" ]; then
     echo -e "${YELLOW}oh-my-zsh 已存在，跳过安装${NC}"
 else
@@ -44,7 +44,7 @@ else
 fi
 
 # 4. 安装 zsh-autosuggestions 插件
-echo -e "\n${YELLOW}[4/9] 安装 zsh-autosuggestions 插件...${NC}"
+echo -e "\n${YELLOW}[4/10] 安装 zsh-autosuggestions 插件...${NC}"
 PLUGIN_DIR="${ZSH_CUSTOM:-$HOME/.oh-my-zsh/custom}/plugins/zsh-autosuggestions"
 if [ -d "$PLUGIN_DIR" ]; then
     echo -e "${YELLOW}插件已存在，跳过安装${NC}"
@@ -54,7 +54,7 @@ else
 fi
 
 # 5. 安装 zsh-syntax-highlighting 插件
-echo -e "\n${YELLOW}[5/9] 安装 zsh-syntax-highlighting 插件...${NC}"
+echo -e "\n${YELLOW}[5/10] 安装 zsh-syntax-highlighting 插件...${NC}"
 PLUGIN_DIR="${ZSH_CUSTOM:-$HOME/.oh-my-zsh/custom}/plugins/zsh-syntax-highlighting"
 if [ -d "$PLUGIN_DIR" ]; then
     echo -e "${YELLOW}插件已存在，跳过安装${NC}"
@@ -64,7 +64,7 @@ else
 fi
 
 # 6-8. 配置 .zshrc
-echo -e "\n${YELLOW}[6/9] 配置 .zshrc 文件...${NC}"
+echo -e "\n${YELLOW}[6/10] 配置 .zshrc 文件...${NC}"
 ZSHRC="$HOME/.zshrc"
 
 if [ -f "$ZSHRC" ]; then
@@ -73,14 +73,14 @@ if [ -f "$ZSHRC" ]; then
     echo -e "${GREEN}✓ 已备份原配置文件${NC}"
 
     # 7. 修改主题
-    echo -e "${YELLOW}[7/9] 设置主题为 af-magic...${NC}"
+    echo -e "${YELLOW}[7/10] 设置主题为 af-magic...${NC}"
     sed -i 's/^ZSH_THEME=.*/ZSH_THEME="af-magic"/' "$ZSHRC"
 
     # 8. 修改插件配置
-    echo -e "${YELLOW}[8/9] 配置插件...${NC}"
+    echo -e "${YELLOW}[8/10] 配置插件...${NC}"
     sed -i 's/^plugins=.*/plugins=(git zsh-autosuggestions zsh-syntax-highlighting extract web-search)/' "$ZSHRC"
 
-    # 9. 添加键绑定配置
+    # 顺带添加键绑定配置
     if ! grep -q "bindkey '\^U' backward-kill-line" "$ZSHRC"; then
         echo -e "${YELLOW}添加键绑定配置...${NC}"
         cat >> "$ZSHRC" << 'EOF'
@@ -101,8 +101,8 @@ else
     exit 1
 fi
 
-# 10. 设置 zsh 为默认 shell
-echo -e "\n${YELLOW}[9/9] 设置 zsh 为默认 shell...${NC}"
+# 9. 设置 zsh 为默认 shell
+echo -e "\n${YELLOW}[9/10] 设置 zsh 为默认 shell...${NC}"
 CURRENT_SHELL="$SHELL"
 ZSH_PATH=$(which zsh)
 
@@ -111,6 +111,81 @@ if [ "$CURRENT_SHELL" != "$ZSH_PATH" ]; then
     echo -e "${GREEN}✓ 默认 shell 已设置为 zsh${NC}"
 else
     echo -e "${YELLOW}zsh 已是默认 shell${NC}"
+fi
+
+# 10. 配置 VSCode 默认终端为 zsh（等价于手动 Ctrl+Shift+P → Terminal: Select Default Profile）
+# 机制：该选择的持久化形式就是 settings.json 里的 terminal.integrated.defaultProfile.linux 字段
+echo -e "\n${YELLOW}[10/10] 配置 VSCode 默认终端...${NC}"
+VSCODE_SETTINGS="$HOME/.config/Code/User/settings.json"
+
+if ! command -v code &> /dev/null && [ ! -d "$HOME/.config/Code" ]; then
+    echo -e "${YELLOW}未检测到 VSCode，跳过（以后安装 VSCode 后重跑本脚本即可自动配置）${NC}"
+    VSCODE_SUMMARY="未配置（未检测到 VSCode，补装后重跑本脚本即可）"
+else
+    mkdir -p "$(dirname "$VSCODE_SETTINGS")"
+    VSCODE_RC=0
+    VSCODE_RESULT=$(python3 - "$VSCODE_SETTINGS" << 'PYEOF'
+import json, os, sys, tempfile
+
+path = sys.argv[1]
+key = "terminal.integrated.defaultProfile.linux"
+
+if os.path.islink(path):
+    # stow/chezmoi 类工具管理的符号链接：os.replace 会把链接本身换成普通文件，
+    # 静默切断同步——拒绝硬改
+    print("PARSE_ERROR")
+    sys.exit(2)
+
+settings = {}
+if os.path.exists(path) and os.path.getsize(path) > 0:
+    try:
+        with open(path, encoding="utf-8") as f:
+            settings = json.load(f)
+    except json.JSONDecodeError:
+        # settings.json 允许注释和尾逗号（JSONC），严格解析失败说明用户手改过。
+        # 不猜测、不硬改——搞坏用户的 settings 比没配上 terminal 严重得多
+        print("PARSE_ERROR")
+        sys.exit(2)
+
+if not isinstance(settings, dict):
+    print("PARSE_ERROR")
+    sys.exit(2)
+
+if settings.get(key) == "zsh":
+    print("ALREADY_SET")
+    sys.exit(0)
+
+settings[key] = "zsh"
+fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), suffix=".tmp")
+try:
+    os.fchmod(fd, 0o644)  # mkstemp 默认权限 600，settings.json 惯例是 644
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(settings, f, indent=4, ensure_ascii=False)
+        f.write("\n")
+    os.replace(tmp, path)  # 同目录 rename，原子替换
+except OSError:
+    os.unlink(tmp)
+    raise
+print("CONFIGURED")
+PYEOF
+) || VSCODE_RC=$?
+
+    case "$VSCODE_RESULT" in
+        CONFIGURED)
+            echo -e "${GREEN}✓ VSCode 默认终端已设置为 zsh${NC}"
+            VSCODE_SUMMARY="已自动配置为 zsh" ;;
+        ALREADY_SET)
+            echo -e "${YELLOW}VSCode 默认终端已是 zsh，跳过${NC}"
+            VSCODE_SUMMARY="已是 zsh（无需改动）" ;;
+        PARSE_ERROR)
+            echo -e "${YELLOW}settings.json 含注释或是符号链接，未自动修改（为避免破坏你的配置）${NC}"
+            echo -e "  手动设置: Ctrl+Shift+P → Terminal: Select Default Profile → zsh"
+            VSCODE_SUMMARY="未自动配置，需手动设置（见上方提示）" ;;
+        *)
+            echo -e "${YELLOW}VSCode 配置失败 (退出码 $VSCODE_RC)，不影响 zsh 本身${NC}"
+            echo -e "  手动设置: Ctrl+Shift+P → Terminal: Select Default Profile → zsh"
+            VSCODE_SUMMARY="未自动配置，需手动设置（见上方提示）" ;;
+    esac
 fi
 
 # 显示系统信息
@@ -136,5 +211,5 @@ echo -e "      自动打开浏览器搜索"
 echo -e "\n${YELLOW}重要提示：${NC}"
 echo -e "  1. 请${RED}注销并重新登录${NC}以使默认 shell 更改生效"
 echo -e "  2. 无需重启电脑，关闭所有终端窗口并重新打开即可"
-echo -e "  3. 在 VSCode 中使用 ${YELLOW}Ctrl+Shift+P${NC} → ${YELLOW}Terminal: Select Default Profile${NC} 选择 zsh"
+echo -e "  3. VSCode 默认终端: ${VSCODE_SUMMARY}"
 echo -e "\n  配置文件备份: $ZSHRC.backup.*"
