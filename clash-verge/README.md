@@ -21,19 +21,17 @@ fake-ip-filter 是必要条件（给 SSH 真实 IP），但不充分——流量
 
 ## 安装 Clash Verge Rev
 
-如果尚未安装，使用自动化安装脚本（国内无需科学上网）：
+仓库内置 2.5.2 安装包（ amd64 ），全新机器无需翻墙——这解决一个死锁：
+没有代理时下载不了代理工具，而 git clone 不需要科学上网。
 
 ```bash
-./install-clash-verge.sh
+./install.sh
 ```
 
 **功能特性**：
-- 自动检测系统和架构（Ubuntu/Debian/Fedora/CentOS/Arch）
-- 自动安装必需工具（curl/wget/aria2）
-- 测试多个 GitHub 镜像，选择最快
-- 三级下载回退机制（curl → aria2 → wget）
-- 自动文件完整性验证（大小 + 类型检查）
-- 安装成功后显示配置指引
+- 离线安装仓库内置的 .deb，无需访问 GitHub Releases
+- 安装前校验架构与包完整性，安装后以 dpkg 数据库验证结果
+- 其他架构请到官方 Releases 下载
 
 ## 使用方法
 
