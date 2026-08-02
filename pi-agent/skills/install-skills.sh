@@ -9,7 +9,7 @@ usage() {
 Install this repository's Pi skills into the local Pi agent skill directory.
 
 Usage:
-  pi-agent/skills/install-skills.sh [--dry-run] [--no-sync] [--target DIR] [skill-name ...]
+  pi-agent/skills/install-skills.sh [--dry-run] [--target DIR] [skill-name ...]
 
 Defaults:
   source: directory containing this script (project pi-agent/skills)
@@ -31,12 +31,10 @@ Upstream sync:
   - Sync covers all registered files even when only some skills are selected.
   - Synced changes are left uncommitted; they are listed at the end for
     manual review and commit.
-  - --no-sync skips syncing (offline, or to install exactly what is committed).
 
 Examples:
   pi-agent/skills/install-skills.sh
   pi-agent/skills/install-skills.sh --dry-run
-  pi-agent/skills/install-skills.sh --no-sync grilling
   pi-agent/skills/install-skills.sh --target ~/.pi/agent/skills firecrawl tavily
 
 Behavior:
@@ -56,17 +54,12 @@ source_dir="$script_dir"
 target_dir="${PI_AGENT_SKILLS_DIR:-$HOME/.pi/agent/skills}"
 zshrc_path="${PI_AGENT_SKILLS_ZSHRC:-$HOME/.zshrc}"
 dry_run=0
-no_sync=0
 selected=()
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --dry-run|-n)
       dry_run=1
-      shift
-      ;;
-    --no-sync)
-      no_sync=1
       shift
       ;;
     --target)
@@ -153,10 +146,6 @@ sync_manifest() {
 }
 
 sync_upstream() {
-  if [[ $no_sync -eq 1 ]]; then
-    echo "skipping upstream sync (--no-sync)"
-    return 0
-  fi
   local manifest
   for manifest in "$source_dir"/UPSTREAM.txt "$source_dir"/*/UPSTREAM.txt; do
     [[ -f "$manifest" ]] || continue
