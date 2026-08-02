@@ -6,10 +6,10 @@
 #   2. 卸载 Snap —— 先清垃圾再装东西
 #   3. zsh —— 需要 apt 安装
 #   4. 中文输入法 —— 需要 apt 安装，跑完本就要求注销，正好收尾
-#   5. 维基百科词库（可选）—— 从 GitHub 下载约 39MiB。
-#      全新机器此刻还没有代理，下载很可能失败，故标记为可选：
-#      失败只警告不中止，之后可随时单独重跑 import-dict.sh
-# 必需步骤任何一步失败即中止；修复后重跑本脚本即可，
+#   5. 维基百科词库 —— 默认执行。从 GitHub 下载约 39MiB，
+#      全新机器此刻很可能还没有代理，下载可能失败：
+#      失败只提示一句不中止，网络就绪后随时可单独重跑 import-dict.sh
+# 前 4 步任何一步失败即中止；修复后重跑本脚本即可，
 # 每个子脚本都幂等（会自动跳过或重做，无副作用）。
 
 set -uo pipefail
@@ -22,13 +22,13 @@ NC='\033[0m' # No Color
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# 格式: 脚本路径|步骤名称|required或optional
+# 格式: 脚本路径|步骤名称|required（失败中止）或 tolerate（失败仅提示）
 STEPS=(
     "tsinghua-mirror/install.sh|切换 APT 源为清华镜像|required"
     "purge-snap/purge.sh|彻底卸载 Snap|required"
     "zsh/install.sh|安装 zsh 与 oh-my-zsh|required"
     "chinese-input-method/install.sh|安装配置中文输入法|required"
-    "chinese-input-method/import-dict.sh|导入维基百科拼音词库|optional"
+    "chinese-input-method/import-dict.sh|导入维基百科拼音词库|tolerate"
 )
 
 echo -e "${GREEN}========================================${NC}"
@@ -46,7 +46,7 @@ trap 'kill $SUDO_KEEPALIVE 2>/dev/null' EXIT
 
 TOTAL=${#STEPS[@]}
 INDEX=0
-OPTIONAL_FAILED=()
+TOLERATE_FAILED=()
 for ENTRY in "${STEPS[@]}"; do
     INDEX=$((INDEX + 1))
     IFS='|' read -r SCRIPT NAME LEVEL <<< "$ENTRY"
@@ -57,9 +57,9 @@ for ENTRY in "${STEPS[@]}"; do
     bash "$SCRIPT_DIR/$SCRIPT" || RC=$?
     if [ "$RC" -eq 0 ]; then
         echo -e "\n${GREEN}✓ [${INDEX}/${TOTAL}] ${NAME} —— 完成${NC}"
-    elif [ "$LEVEL" = "optional" ]; then
-        echo -e "\n${YELLOW}△ [${INDEX}/${TOTAL}] ${NAME} —— 失败（可选步骤，继续）${NC}"
-        OPTIONAL_FAILED+=("$SCRIPT")
+    elif [ "$LEVEL" = "tolerate" ]; then
+        echo -e "\n${YELLOW}△ [${INDEX}/${TOTAL}] ${NAME} —— 未安装成功（多为当时无代理访问 GitHub）${NC}"
+        TOLERATE_FAILED+=("$SCRIPT")
     else
         echo -e "\n${RED}✗ [${INDEX}/${TOTAL}] ${NAME} —— 失败 (退出码 ${RC})${NC}"
         echo -e "${YELLOW}已中止后续步骤。修复问题后重跑本脚本即可："
@@ -72,10 +72,10 @@ echo -e "\n${GREEN}========================================${NC}"
 echo -e "${GREEN}   全部 ${TOTAL} 步完成   ${NC}"
 echo -e "${GREEN}========================================${NC}"
 
-if [ "${#OPTIONAL_FAILED[@]}" -gt 0 ]; then
-    echo -e "\n${YELLOW}以下可选步骤失败了（不影响系统使用，多为当时无代理导致 GitHub 不可达）：${NC}"
-    for SCRIPT in "${OPTIONAL_FAILED[@]}"; do
-        echo -e "  网络就绪后补跑: ${GREEN}$SCRIPT_DIR/$SCRIPT${NC}"
+if [ "${#TOLERATE_FAILED[@]}" -gt 0 ]; then
+    echo -e "\n${YELLOW}提示：以下步骤未安装成功，网络就绪（如配好 Clash Verge 代理）后补跑：${NC}"
+    for SCRIPT in "${TOLERATE_FAILED[@]}"; do
+        echo -e "  ${GREEN}$SCRIPT_DIR/$SCRIPT${NC}"
     done
 fi
 
