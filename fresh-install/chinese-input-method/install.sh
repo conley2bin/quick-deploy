@@ -674,7 +674,7 @@ echo "     - Ctrl+Space: 按列表顺序循环切换输入法"
 echo "     - Left Shift: 临时切换到第一个输入法"
 echo
 echo "导入词库 (可选):"
-echo "  运行: ./chinese-input-method/import-dict.sh"
+echo "  运行: $(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/import-dict.sh"
 echo
 echo "清理提示:"
 echo "  本脚本不会自动执行 apt autoremove。确认系统无异常后，可手动运行:"
