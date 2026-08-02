@@ -1,0 +1,21 @@
+# Vendored from: https://github.com/mattpocock/skills (branch: main)
+# Fetched: 2026-08-02, upstream commit 2ab958093e83e0ec752e6c1c5932da465bf23e0c
+#
+# Format: one file per line —
+#   <upstream raw URL> <local path relative to this manifest's directory>
+# Blank lines and lines starting with # are ignored.
+#
+# install-skills.sh fetches every registered file before installing and
+# overwrites the local copy when upstream differs; fetch failures keep the
+# local copy. Synced changes are left uncommitted for manual review.
+#
+# To vendor another skill from this repo: add its lines below.
+# To vendor from a new repo: create pi-agent/skills/<source>/UPSTREAM.txt
+# with the same format and put the files under that directory.
+
+https://raw.githubusercontent.com/mattpocock/skills/main/skills/productivity/grilling/SKILL.md grilling/SKILL.md
+https://raw.githubusercontent.com/mattpocock/skills/main/skills/productivity/grill-me/SKILL.md grill-me/SKILL.md
+https://raw.githubusercontent.com/mattpocock/skills/main/skills/engineering/grill-with-docs/SKILL.md grill-with-docs/SKILL.md
+https://raw.githubusercontent.com/mattpocock/skills/main/skills/engineering/domain-modeling/SKILL.md domain-modeling/SKILL.md
+https://raw.githubusercontent.com/mattpocock/skills/main/skills/engineering/domain-modeling/ADR-FORMAT.md domain-modeling/ADR-FORMAT.md
+https://raw.githubusercontent.com/mattpocock/skills/main/skills/engineering/domain-modeling/CONTEXT-FORMAT.md domain-modeling/CONTEXT-FORMAT.md

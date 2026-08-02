@@ -9,27 +9,45 @@ usage() {
 Install this repository's Pi skills into the local Pi agent skill directory.
 
 Usage:
-  pi-agent/skills/install-skills.sh [--dry-run] [--target DIR] [skill-name ...]
+  pi-agent/skills/install-skills.sh [--dry-run] [--no-sync] [--target DIR] [skill-name ...]
 
 Defaults:
   source: directory containing this script (project pi-agent/skills)
   target: $PI_AGENT_SKILLS_DIR, or ~/.pi/agent/skills when unset
   API key config: $PI_AGENT_SKILLS_ZSHRC, or ~/.zshrc when unset
 
+Layout:
+  - Own skills live directly under pi-agent/skills/<name>/SKILL.md.
+  - Vendored skills live one level deeper, grouped by upstream source:
+    pi-agent/skills/<source>/<name>/SKILL.md (e.g. mattpocock/grilling).
+  - Skill names must be unique across both levels; duplicates are an error.
+
+Upstream sync:
+  - Any UPSTREAM.txt at pi-agent/skills/UPSTREAM.txt or
+    pi-agent/skills/<source>/UPSTREAM.txt registers vendored files.
+  - Each non-comment line: <upstream raw URL> <path relative to the manifest>.
+  - Before installing, every registered file is fetched and overwritten when
+    upstream differs; fetch failures warn and keep the local copy.
+  - Sync covers all registered files even when only some skills are selected.
+  - Synced changes are left uncommitted; they are listed at the end for
+    manual review and commit.
+  - --no-sync skips syncing (offline, or to install exactly what is committed).
+
 Examples:
   pi-agent/skills/install-skills.sh
   pi-agent/skills/install-skills.sh --dry-run
+  pi-agent/skills/install-skills.sh --no-sync grilling
   pi-agent/skills/install-skills.sh --target ~/.pi/agent/skills firecrawl tavily
 
 Behavior:
-  - Installs only subdirectories that contain SKILL.md.
+  - Installs subdirectories that contain SKILL.md (one or two levels deep).
   - Reads selected skills' metadata.api-key-env declarations.
   - Reuses nonempty environment variables and securely prompts for missing keys.
   - Persists interactively entered keys in a managed block for later Pi sessions.
   - Copies files into target/<skill-name>/, overwriting same-named files.
   - Does not delete extra files already present in the target directory.
   - Does not copy this installer script.
-  - In --dry-run mode, reports key status but neither prompts nor writes files.
+  - In --dry-run mode, reports sync and key status but neither prompts nor writes files.
 EOF
 }
 
@@ -38,12 +56,17 @@ source_dir="$script_dir"
 target_dir="${PI_AGENT_SKILLS_DIR:-$HOME/.pi/agent/skills}"
 zshrc_path="${PI_AGENT_SKILLS_ZSHRC:-$HOME/.zshrc}"
 dry_run=0
+no_sync=0
 selected=()
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --dry-run|-n)
       dry_run=1
+      shift
+      ;;
+    --no-sync)
+      no_sync=1
       shift
       ;;
     --target)
@@ -83,6 +106,92 @@ is_selected() {
   done
   return 1
 }
+
+# --- Upstream sync ---------------------------------------------------------
+
+synced_updates=()
+sync_failures=()
+
+sync_manifest() {
+  local manifest="$1"
+  local manifest_dir line url path dest tmp
+  manifest_dir="$(dirname "$manifest")"
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line%$'\r'}"
+    # skip blank lines and comments (leading whitespace allowed)
+    [[ -z "${line//[[:space:]]/}" ]] && continue
+    [[ "${line#"${line%%[![:space:]]*}"}" == \#* ]] && continue
+    url="${line%%[[:space:]]*}"
+    path="${line#"$url"}"
+    path="${path#"${path%%[![:space:]]*}"}"   # ltrim
+    path="${path%"${path##*[![:space:]]}"}"   # rtrim
+    if [[ -z "$url" || -z "$path" ]]; then
+      echo "warning: malformed line in $manifest: $line" >&2
+      continue
+    fi
+    dest="$manifest_dir/$path"
+    tmp="$(mktemp)"
+    if curl -fsSL --retry 2 "$url" -o "$tmp"; then
+      if [[ -f "$dest" ]] && cmp -s "$tmp" "$dest"; then
+        : # already up to date
+      else
+        if [[ $dry_run -eq 1 ]]; then
+          echo "would sync from upstream: $dest"
+        else
+          mkdir -p "$(dirname "$dest")"
+          cp "$tmp" "$dest"
+          echo "synced from upstream: $dest"
+        fi
+        synced_updates+=("$dest")
+      fi
+    else
+      echo "warning: failed to fetch $url; keeping local copy" >&2
+      sync_failures+=("$url")
+    fi
+    rm -f "$tmp"
+  done < "$manifest"
+}
+
+sync_upstream() {
+  if [[ $no_sync -eq 1 ]]; then
+    echo "skipping upstream sync (--no-sync)"
+    return 0
+  fi
+  local manifest
+  for manifest in "$source_dir"/UPSTREAM.txt "$source_dir"/*/UPSTREAM.txt; do
+    [[ -f "$manifest" ]] || continue
+    sync_manifest "$manifest"
+  done
+}
+
+report_synced_updates() {
+  [[ $dry_run -eq 0 && ${#synced_updates[@]} -gt 0 ]] || return 0
+  local top="" rel
+  local rel_updates=()
+  if command -v git >/dev/null 2>&1; then
+    top="$(git -C "$script_dir" rev-parse --show-toplevel 2>/dev/null || true)"
+  fi
+  echo
+  echo "Upstream updates were written to the working tree and left uncommitted:"
+  local f
+  for f in "${synced_updates[@]}"; do
+    rel="$f"
+    if [[ -n "$top" ]]; then
+      rel="$(realpath --relative-to="$top" "$f" 2>/dev/null || printf '%s' "$f")"
+    fi
+    rel_updates+=("$rel")
+    printf '  %s\n' "$rel"
+  done
+  echo "Review and commit manually, e.g.:"
+  printf '  git add'
+  printf ' %q' "${rel_updates[@]}"
+  printf ' && git commit -m "Sync vendored skills from upstream"\n'
+  if [[ ${#sync_failures[@]} -gt 0 ]]; then
+    echo "note: ${#sync_failures[@]} upstream file(s) could not be fetched; local copies were kept"
+  fi
+}
+
+# --- API key handling ------------------------------------------------------
 
 read_api_key_envs() {
   local skill_file="$1"
@@ -196,14 +305,25 @@ write_managed_api_keys() {
   fi
 }
 
+# --- Skill discovery (one or two levels deep) ------------------------------
+
+sync_upstream
+
+declare -A skill_location=()
 skill_dirs=()
 skill_names=()
 missing=()
 
-for skill_dir in "$source_dir"/*; do
-  [[ -d "$skill_dir" ]] || continue
-  [[ -f "$skill_dir/SKILL.md" ]] || continue
+for skill_file in "$source_dir"/*/SKILL.md "$source_dir"/*/*/SKILL.md; do
+  [[ -f "$skill_file" ]] || continue
+  skill_dir="$(dirname "$skill_file")"
   name="$(basename "$skill_dir")"
+  if [[ -n "${skill_location[$name]:-}" ]]; then
+    printf 'error: duplicate skill name "%s" found at:\n  %s\n  %s\nskill names must be unique; rename one of them\n' \
+      "$name" "${skill_location[$name]}" "$skill_dir" >&2
+    exit 1
+  fi
+  skill_location[$name]="$skill_dir"
   is_selected "$name" || continue
   skill_dirs+=("$skill_dir")
   skill_names+=("$name")
@@ -211,12 +331,12 @@ done
 
 if [[ ${#selected[@]} -gt 0 ]]; then
   for name in "${selected[@]}"; do
-    [[ -f "$source_dir/$name/SKILL.md" ]] || missing+=("$name")
+    [[ -n "${skill_location[$name]:-}" ]] || missing+=("$name")
   done
 fi
 
 if [[ ${#missing[@]} -gt 0 ]]; then
-  printf 'error: requested skill(s) not found under %s: %s\n' "$source_dir" "${missing[*]}" >&2
+  printf 'error: requested skill(s) not found under %s (searched one and two levels deep): %s\n' "$source_dir" "${missing[*]}" >&2
   exit 1
 fi
 
@@ -333,6 +453,8 @@ if [[ $installed -eq 0 ]]; then
   echo "no skills installed from $source_dir" >&2
   exit 1
 fi
+
+report_synced_updates
 
 if [[ $dry_run -eq 0 ]]; then
   echo "done. Start a new shell (or source $zshrc_path), then run /reload in Pi."
