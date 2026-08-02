@@ -45,6 +45,9 @@ get_merge_config() {
     if [ -n "$merge_file" ]; then
         echo "$CLASH_DIR/profiles/$merge_file"
     else
+        # 未登记就写出 Merge.yaml 是一个 Verge 永远不加载的孤儿文件——必须让人知道
+        echo "warning: profiles.yaml 未登记全局 Merge；写出的 Merge.yaml 可能不会被加载。" >&2
+        echo "         请先在 Clash Verge 的「全局扩展配置」中启用 Merge。" >&2
         echo "$CLASH_DIR/profiles/Merge.yaml"
     fi
 }
@@ -59,14 +62,24 @@ get_script_config() {
     if [ -n "$script_file" ]; then
         echo "$CLASH_DIR/profiles/$script_file"
     else
+        echo "warning: profiles.yaml 未登记全局 Script；写出的 Script.js 可能不会被加载。" >&2
+        echo "         请先在 Clash Verge 的「全局扩展配置」中启用 Script。" >&2
         echo "$CLASH_DIR/profiles/Script.js"
     fi
 }
 
 # 获取订阅名称
 get_profile_name() {
-    local uid=$(grep "^current:" "$PROFILES_YAML" | awk '{print $2}')
-    grep -A 3 "uid: $uid" "$PROFILES_YAML" | grep "name:" | sed 's/.*name: *//' | sed 's/^[[:space:]]*//'
+    local uid
+    uid=$(get_current_profile_uid)
+    [ -n "$uid" ] || { echo "(profiles.yaml 中没有 current)"; return; }
+    # 整行精确匹配：grep "uid: $uid" 是子串匹配，uid 前缀碰撞（R1 撞 R1abc）
+    # 或空 uid（匹配一切）时会返回多行垃圾名字
+    awk -v uid="$uid" '
+        $0 == "- uid: " uid {found=1; next}
+        found && /^  name: / {sub(/^  name: /, ""); print; exit}
+        found && /^- uid: / {exit}
+    ' "$PROFILES_YAML"
 }
 
 # 获取当前订阅 UID
@@ -120,6 +133,65 @@ get_current_profile_option_path() {
     get_profile_item_path "$uid"
 }
 
+# 规范 fake-ip-filter 块 —— 全脚本唯一副本（2 空格键、4 空格条目）
+# 三条写入路径（新建文件 / 插入现有 dns 块 / 追加整个 dns 块）都从这里取，
+# 增删域名只改这一处。旧版三条路径各持一份拷贝，漂移后不同历史的机器
+# 会拿到不同过滤列表。
+fake_ip_filter_block() {
+    cat << 'EOF'
+  fake-ip-filter:
+    # 本地网络
+    - '*.local'
+    - '*.lan'
+    # 企业应用（主域名 + 通配符）
+    - 'feishu.cn'
+    - '*.feishu.cn'
+    - 'larkoffice.com'
+    - '*.larkoffice.com'
+    - 'bytedance.com'
+    - '*.bytedance.com'
+    - 'dingtalk.com'
+    - '*.dingtalk.com'
+    # GitHub 支持（主域名 + 通配符）
+    - 'github.com'
+    - '*.github.com'
+    - 'githubusercontent.com'
+    - '*.githubusercontent.com'
+    - 'githubassets.com'
+    - '*.githubassets.com'
+    - 'github.io'
+    - '*.github.io'
+    # 中国镜像源（教育网）
+    - '*.tsinghua.edu.cn'
+    - '*.tuna.tsinghua.edu.cn'
+    - '*.ustc.edu.cn'
+    - '*.zju.edu.cn'
+    - '*.bit.edu.cn'
+    - '*.bjtu.edu.cn'
+    - '*.hust.edu.cn'
+    - '*.sjtu.edu.cn'
+    - '*.lzu.edu.cn'
+    - '*.neusoft.edu.cn'
+    - '*.cqu.edu.cn'
+    - '*.nju.edu.cn'
+    - '*.hit.edu.cn'
+    - '*.iscas.ac.cn'
+    - '*.njupt.edu.cn'
+    - '*.xjtu.edu.cn'
+    # 中国镜像源（企业）
+    - '*.aliyun.com'
+    - '*.aliyuncs.com'
+    - '*.huaweicloud.com'
+    - '*.cloud.tencent.com'
+    - '*.163.com'
+    - '*.sohu.com'
+    - '*.yun-idc.com'
+    # 协议过滤
+    - '+._tcp'
+    - '+._udp'
+EOF
+}
+
 # 更新或创建 Merge 配置中的 Fake-IP Filter
 update_fake_ip_filter() {
     local file="$1"
@@ -127,189 +199,50 @@ update_fake_ip_filter() {
     # 检查文件是否存在
     if [ ! -f "$file" ]; then
         echo "创建新的 Merge 配置文件: $file"
-        cat > "$file" << 'EOF'
-# Clash Verge Merge 配置
-# 此文件会与订阅配置合并，提供全局增强
-
-dns:
-  fake-ip-filter:
-    # 本地网络
-    - '*.local'
-    - '*.lan'
-    # 企业应用（主域名 + 通配符）
-    - 'feishu.cn'
-    - '*.feishu.cn'
-    - 'larkoffice.com'
-    - '*.larkoffice.com'
-    - 'bytedance.com'
-    - '*.bytedance.com'
-    - 'dingtalk.com'
-    - '*.dingtalk.com'
-    # GitHub 支持（主域名 + 通配符）
-    - 'github.com'
-    - '*.github.com'
-    - 'githubusercontent.com'
-    - '*.githubusercontent.com'
-    - 'githubassets.com'
-    - '*.githubassets.com'
-    - 'github.io'
-    - '*.github.io'
-    # 中国镜像源（教育网）
-    - '*.tsinghua.edu.cn'
-    - '*.tuna.tsinghua.edu.cn'
-    - '*.ustc.edu.cn'
-    - '*.zju.edu.cn'
-    - '*.bit.edu.cn'
-    - '*.bjtu.edu.cn'
-    - '*.hust.edu.cn'
-    - '*.sjtu.edu.cn'
-    - '*.lzu.edu.cn'
-    - '*.neusoft.edu.cn'
-    - '*.cqu.edu.cn'
-    - '*.nju.edu.cn'
-    - '*.hit.edu.cn'
-    - '*.iscas.ac.cn'
-    - '*.njupt.edu.cn'
-    - '*.xjtu.edu.cn'
-    # 中国镜像源（企业）
-    - '*.aliyun.com'
-    - '*.aliyuncs.com'
-    - '*.huaweicloud.com'
-    - '*.cloud.tencent.com'
-    - '*.163.com'
-    - '*.sohu.com'
-    - '*.yun-idc.com'
-    # 协议过滤
-    - '+._tcp'
-    - '+._udp'
-EOF
-        # TUN 块只有一处定义，见 tun_block()
-        echo "" >> "$file"
-        tun_block >> "$file"
+        {
+            printf '# Clash Verge Merge 配置\n# 此文件会与订阅配置合并，提供全局增强\n\n'
+            printf 'dns:\n'
+            fake_ip_filter_block
+            echo ""
+            # TUN 块只有一处定义，见 tun_block()
+            tun_block
+        } > "$file"
         echo "pass Merge 配置已创建"
         return
     fi
 
-    # 文件存在，更新 fake-ip-filter
-    if grep -q "fake-ip-filter:" "$file"; then
-        # 删除旧的 fake-ip-filter 配置
-        sed -i '/fake-ip-filter:/,/^[[:space:]]*[a-z-].*:/{ /^[[:space:]]*[a-z-].*:/!d; }; /fake-ip-filter:/d' "$file" 2>/dev/null || true
+    # 删除旧 fake-ip-filter 块：按缩进整块删除（从键行起，删到下一个缩进
+    # 不超过键缩进的行）。不能用 sed 范围正则——列表项含冒号（rule-set:、
+    # geosite: 是 mihomo 真实语法）会提前终结范围，残留条目被 YAML 吸收成
+    # 前一个键的标量续行，布尔键类型静默损坏。
+    if grep -qE '^[[:space:]]*fake-ip-filter:' "$file"; then
+        awk '
+            /^[[:space:]]*fake-ip-filter:[[:space:]]*$/ {
+                match($0, /^[[:space:]]*/); ind=RLENGTH; skip=1; next
+            }
+            skip {
+                if ($0 ~ /^[[:space:]]*$/) next
+                match($0, /^[[:space:]]*/)
+                if (RLENGTH <= ind) skip=0
+                else next
+            }
+            {print}
+        ' "$file" > "${file}.tmp" && mv "${file}.tmp" "$file"
     fi
 
     # 查找 dns: 区块的位置
     if grep -q "^dns:" "$file"; then
-        # 在 dns: 后面插入 fake-ip-filter（使用临时文件方式，避免 sed 命令过长）
-        local filter_content=$(cat << 'FILTER_EOF'
-  fake-ip-filter:
-    # 本地网络
-    - '*.local'
-    - '*.lan'
-    # 企业应用（主域名 + 通配符）
-    - 'feishu.cn'
-    - '*.feishu.cn'
-    - 'larkoffice.com'
-    - '*.larkoffice.com'
-    - 'bytedance.com'
-    - '*.bytedance.com'
-    - 'dingtalk.com'
-    - '*.dingtalk.com'
-    # GitHub 支持（主域名 + 通配符）
-    - 'github.com'
-    - '*.github.com'
-    - 'githubusercontent.com'
-    - '*.githubusercontent.com'
-    - 'githubassets.com'
-    - '*.githubassets.com'
-    - 'github.io'
-    - '*.github.io'
-    # 中国镜像源（教育网）
-    - '*.tsinghua.edu.cn'
-    - '*.tuna.tsinghua.edu.cn'
-    - '*.ustc.edu.cn'
-    - '*.zju.edu.cn'
-    - '*.bit.edu.cn'
-    - '*.bjtu.edu.cn'
-    - '*.hust.edu.cn'
-    - '*.sjtu.edu.cn'
-    - '*.lzu.edu.cn'
-    - '*.neusoft.edu.cn'
-    - '*.cqu.edu.cn'
-    - '*.nju.edu.cn'
-    - '*.hit.edu.cn'
-    - '*.iscas.ac.cn'
-    - '*.njupt.edu.cn'
-    - '*.xjtu.edu.cn'
-    # 中国镜像源（企业）
-    - '*.aliyun.com'
-    - '*.aliyuncs.com'
-    - '*.huaweicloud.com'
-    - '*.cloud.tencent.com'
-    - '*.163.com'
-    - '*.sohu.com'
-    - '*.yun-idc.com'
-    # 协议过滤
-    - '+._tcp'
-    - '+._udp'
-FILTER_EOF
-)
-        # 使用 awk 插入配置
+        # 在 dns: 后面插入规范块（awk -v 传值，避免 sed 命令过长）
+        local filter_content
+        filter_content=$(fake_ip_filter_block)
         awk -v filter="$filter_content" '/^dns:/ {print; print filter; next} 1' "$file" > "${file}.tmp" && mv "${file}.tmp" "$file"
     else
         # 文件中没有 dns: 区块，添加整个区块
-        cat >> "$file" << 'EOF'
-
-dns:
-  fake-ip-filter:
-    # 本地网络
-    - '*.local'
-    - '*.lan'
-    # 企业应用（主域名 + 通配符）
-    - 'feishu.cn'
-    - '*.feishu.cn'
-    - 'larkoffice.com'
-    - '*.larkoffice.com'
-    - 'bytedance.com'
-    - '*.bytedance.com'
-    - 'dingtalk.com'
-    - '*.dingtalk.com'
-    # GitHub 支持（主域名 + 通配符）
-    - 'github.com'
-    - '*.github.com'
-    - 'githubusercontent.com'
-    - '*.githubusercontent.com'
-    - 'githubassets.com'
-    - '*.githubassets.com'
-    - 'github.io'
-    - '*.github.io'
-    # 中国镜像源（教育网）
-    - '*.tsinghua.edu.cn'
-    - '*.tuna.tsinghua.edu.cn'
-    - '*.ustc.edu.cn'
-    - '*.zju.edu.cn'
-    - '*.bit.edu.cn'
-    - '*.bjtu.edu.cn'
-    - '*.hust.edu.cn'
-    - '*.sjtu.edu.cn'
-    - '*.lzu.edu.cn'
-    - '*.neusoft.edu.cn'
-    - '*.cqu.edu.cn'
-    - '*.nju.edu.cn'
-    - '*.hit.edu.cn'
-    - '*.iscas.ac.cn'
-    - '*.njupt.edu.cn'
-    - '*.xjtu.edu.cn'
-    # 中国镜像源（企业）
-    - '*.aliyun.com'
-    - '*.aliyuncs.com'
-    - '*.huaweicloud.com'
-    - '*.cloud.tencent.com'
-    - '*.163.com'
-    - '*.sohu.com'
-    - '*.yun-idc.com'
-    # 协议过滤
-    - '+._tcp'
-    - '+._udp'
-EOF
+        {
+            echo ""
+            printf 'dns:\n'
+            fake_ip_filter_block
+        } >> "$file"
     fi
 
     echo "pass Fake-IP Filter 已更新 (GitHub 主域名和通配符)"
@@ -328,8 +261,7 @@ update_tun_config() {
         return
     fi
 
-    cp "$file" "$file.backup.$(date +%Y%m%d_%H%M%S)"
-
+    # 备份由 optimize_all 的前置备份统一负责（它先于一切修改）
     local had_block=0
     grep -q '^tun:' "$file" && had_block=1
 
@@ -401,21 +333,24 @@ verify_tun_routes() {
     fi
     echo ""
 
-    # 每段取一个代表地址。127.0.0.1 总是被优先级 0 的 local 表接走，
-    # 对它的检查恒为真，保留只为列表完整。
-    local prefixes=(192.168.0.0/16 10.0.0.0/8 172.16.0.0/12 127.0.0.0/8)
-    local probes=(192.168.1.1     10.0.0.1   172.16.0.1     127.0.0.1)
-    local i dev hit=0 total=${#prefixes[@]}
+    # 与 tun_block 共用顶部 TUN_EXCLUDED_PREFIXES 同一份数组（顶部注释的承诺：
+    # 写入的和校验的是同一份，不各自漂移——旧版这里硬编码了第二份，注释在撒谎）。
+    # 代表地址从基地址推导（最后一段 0 换成 1），无需第二个按下标耦合的数组。
+    # 127.0.0.1 总是被优先级 0 的 local 表接走，对它的检查恒为真，保留只为列表完整。
+    local i dev prefix base probe hit=0 total=${#TUN_EXCLUDED_PREFIXES[@]}
 
-    for i in "${!prefixes[@]}"; do
-        dev=$(ip route get "${probes[$i]}" 2>/dev/null \
+    for i in "${!TUN_EXCLUDED_PREFIXES[@]}"; do
+        prefix="${TUN_EXCLUDED_PREFIXES[$i]}"
+        base="${prefix%%/*}"
+        probe="${base%.*}.1"
+        dev=$(ip route get "$probe" 2>/dev/null \
               | awk '{for(j=1;j<=NF;j++) if($j=="dev"){print $(j+1); exit}}')
         if [ -z "$dev" ]; then
-            echo "fail ${prefixes[$i]}  (ip route get ${probes[$i]} 无结果)"
+            echo "fail $prefix  (ip route get $probe 无结果)"
         elif [ "$dev" = "$tun_dev" ]; then
-            echo "fail ${prefixes[$i]}  → dev $dev（这是 TUN 网卡，该段仍被代理接管）"
+            echo "fail $prefix  → dev $dev（这是 TUN 网卡，该段仍被代理接管）"
         else
-            echo "pass ${prefixes[$i]}  → dev $dev（绕过 TUN）"
+            echo "pass $prefix  → dev $dev（绕过 TUN）"
             hit=$((hit+1))
         fi
     done
@@ -459,6 +394,18 @@ update_direct_rules() {
     timestamp=$(date +%Y%m%d_%H%M%S)
 
     mkdir -p "$CLASH_DIR/profiles"
+
+    # 整体覆盖前检测：全局 Script.js 是用户自定义 JS 的唯一入口，
+    # 非本脚本生成的文件被无痕替换时用户无从察觉（备份在，但没人告诉TA）
+    if [ -f "$script_file" ] && ! head -n 1 "$script_file" | grep -qF "// Generated by tun-fix.sh"; then
+        echo "warning: $script_file 不是本脚本生成的（可能含你的自定义规则）"
+        echo -n "覆盖它？原文件会带时间戳备份。[y/N]: "
+        read -r overwrite_js
+        if [[ ! "$overwrite_js" =~ ^[Yy]$ ]]; then
+            echo "已跳过全局脚本写入（直连规则未更新）"
+            return
+        fi
+    fi
 
     local backed_up=0
     if [ -f "$script_file" ]; then
@@ -548,10 +495,23 @@ remove_managed_ssh_block() {
 
     [ -f "$ssh_config" ] || return 0
 
-    # 当前格式：成对标记之间全删
-    sed -i '/^# >>> tun-fix\.sh github ssh >>>$/,/^# <<< tun-fix\.sh github ssh <<<$/d' "$ssh_config"
+    # 范围删除前先确认终点标记在场：sed 范围终点缺失时会一路删到 EOF，
+    # 无关的 Host 块会被整文件清空（备份可回，但 verify 只查 github 解析，照样 pass）
+    if grep -q '^# >>> tun-fix\.sh github ssh >>>$' "$ssh_config"; then
+        if grep -q '^# <<< tun-fix\.sh github ssh <<<$' "$ssh_config"; then
+            sed -i '/^# >>> tun-fix\.sh github ssh >>>$/,/^# <<< tun-fix\.sh github ssh <<<$/d' "$ssh_config"
+        else
+            echo "warning 发现未配对的 tun-fix SSH 块起始标记，为避免误删未做清理（请手动检查 ~/.ssh/config）"
+        fi
+    fi
     # 旧格式：旧版本写的块以注释头开始、以 ControlPersist no 结尾
-    sed -i '/^# GitHub SSH over HTTPS port/,/^[[:space:]]*ControlPersist no[[:space:]]*$/d' "$ssh_config"
+    if grep -q '^# GitHub SSH over HTTPS port' "$ssh_config"; then
+        if grep -qE '^[[:space:]]*ControlPersist no[[:space:]]*$' "$ssh_config"; then
+            sed -i '/^# GitHub SSH over HTTPS port/,/^[[:space:]]*ControlPersist no[[:space:]]*$/d' "$ssh_config"
+        else
+            echo "warning 旧格式 SSH 块缺少结束标记（ControlPersist no），为避免误删未做清理"
+        fi
+    fi
     # 规范空行：连续空行压成一行，并去掉首尾空行。
     # 不能用 sed '/^$/N;/^\n$/d'（旧实现）：那是成对删除，删完块后剩下的两个
     # 空行会被整体删掉，用户原有条目被粘到上一段末尾。
@@ -716,6 +676,79 @@ configure_ssh() {
     echo ""
 }
 
+# 写后结构校验：sed/awk 文本手术的成功输出不等于文件结构正确。
+# 只读目录、含冒号的列表项、重复插入……这一类失败的共同特征是
+# "写入零字节或结构损坏，照样打印 pass"，必须有一个验证器兜底。
+verify_merge_yaml() {
+    local file="$1"
+    local fail=0
+
+    echo ""
+    echo "=========================================="
+    echo "  Merge 配置结构校验"
+    echo "=========================================="
+
+    if [ ! -f "$file" ]; then
+        echo "fail 文件不存在: $file"
+        return 1
+    fi
+
+    # grep -c 计数为 0 时退出码是 1，赋值必须带 || true 防 set -e 误杀
+    local n_filter n_tun
+    n_filter=$(grep -cE '^[[:space:]]*fake-ip-filter:' "$file" || true)
+    n_tun=$(grep -c '^tun:' "$file" || true)
+
+    if [ "$n_filter" -eq 1 ]; then
+        echo "pass fake-ip-filter 恰好 1 处"
+    else
+        echo "fail fake-ip-filter 出现 $n_filter 处（应为 1）"
+        fail=1
+    fi
+
+    if [ "$n_tun" -eq 1 ]; then
+        echo "pass tun 块恰好 1 处"
+    else
+        echo "fail tun: 出现 $n_tun 处（应为 1）"
+        fail=1
+    fi
+
+    # 规范条目抽查（与 fake_ip_filter_block / tun_block 单源内容对应的代表项）
+    local entry
+    for entry in "- 'github.com'" "- '*.github.com'" "- '*.tsinghua.edu.cn'" "- '+._tcp'"; do
+        if grep -qF -- "$entry" "$file"; then
+            echo "pass 条目在场: $entry"
+        else
+            echo "fail 条目缺失: $entry"
+            fail=1
+        fi
+    done
+
+    if grep -q 'route-exclude-address' "$file"; then
+        echo "pass route-exclude-address 在场"
+    else
+        echo "fail route-exclude-address 缺失"
+        fail=1
+    fi
+
+    # 有 PyYAML 就做真解析（Ubuntu 默认不带 python3-yaml，没有就跳过而不是安装）
+    if python3 -c 'import yaml' 2>/dev/null; then
+        if python3 -c 'import yaml,sys; yaml.safe_load(open(sys.argv[1]))' "$file" 2>/dev/null; then
+            echo "pass YAML 可解析"
+        else
+            echo "fail YAML 解析失败——文件结构已损坏，请从备份恢复"
+            fail=1
+        fi
+    else
+        echo "note 未安装 PyYAML，跳过解析级检查（以上均为文本级断言）"
+    fi
+
+    if [ "$fail" -eq 1 ]; then
+        echo ""
+        echo "结构校验未通过。备份在同目录 *.backup.*，可用菜单 4 恢复。"
+        return 1
+    fi
+}
+
 # 一键优化
 optimize_all() {
     local file="$1"
@@ -729,11 +762,23 @@ optimize_all() {
     echo "作用范围: 全局 (所有订阅)"
     echo ""
 
+    # 前置备份：先于一切修改。旧流程唯一的备份在第三步 update_tun_config 里，
+    # 前两步（清空订阅级 merge、改写 fake-ip-filter）的改动无备份可回
+    if [ -f "$file" ]; then
+        local pre_backup="$file.backup.$(date +%Y%m%d_%H%M%S)"
+        cp "$file" "$pre_backup"
+        echo "已备份原 Merge 配置: $pre_backup"
+        echo ""
+    fi
+
     clear_subscription_merge
     remove_prepend_rules "$file"
     update_fake_ip_filter "$file"
     update_tun_config "$file"
     update_direct_rules "$file"
+
+    # 文本手术的成功输出 ≠ 文件结构正确，写后校验未通过就以非零退出
+    verify_merge_yaml "$file"
 
     echo ""
     echo "=========================================="
