@@ -1,5 +1,7 @@
 #!/bin/bash
 
+set -euo pipefail
+
 # 颜色定义
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -11,7 +13,8 @@ echo -e "${GREEN}=== 彻底删除 Snap 和 snapd ===${NC}\n"
 # 1. 列出已安装的 snap 包
 echo -e "\n${YELLOW}[1/8] 列出已安装的 snap 包...${NC}"
 if command -v snap &> /dev/null; then
-    snap list
+    # 信息展示步骤，snapd 服务异常时不能因为这里失败而中断整个卸载
+    snap list || echo -e "${YELLOW}snap list 执行失败（snapd 服务可能异常），继续卸载流程${NC}"
 else
     echo -e "${YELLOW}snap 命令不存在，可能已卸载${NC}"
 fi
@@ -20,7 +23,7 @@ fi
 echo -e "\n${YELLOW}[2/8] 删除 snap 包...${NC}"
 if command -v snap &> /dev/null; then
     # 获取已安装的 snap 包列表（排除表头）
-    SNAPS=$(LC_ALL=C snap list 2>/dev/null | awk 'NR>1 {print $1}')
+    SNAPS=$(LC_ALL=C snap list 2>/dev/null | awk 'NR>1 {print $1}' || true)
 
     if [ -z "$SNAPS" ]; then
         echo -e "${YELLOW}没有安装的 snap 包${NC}"
@@ -63,8 +66,13 @@ echo -e "${GREEN}✓ snapd 包已移除${NC}"
 
 # 5. 防止 snapd 重新安装
 echo -e "\n${YELLOW}[5/8] 防止 snapd 重新安装...${NC}"
-sudo apt-mark hold snapd
-echo -e "${GREEN}✓ snapd 已标记为 hold${NC}"
+# hold 只是双保险，真正的防线是第 6 步的 nosnap.pref（Pin-Priority: -10）。
+# snapd 被彻底 purge 后 apt-mark 在个别环境会报错，非致命，警告即可
+if sudo apt-mark hold snapd; then
+    echo -e "${GREEN}✓ snapd 已标记为 hold${NC}"
+else
+    echo -e "${YELLOW}apt-mark hold 失败（非致命：nosnap.pref 仍会阻止 snapd 被安装）${NC}"
+fi
 
 # 6. 创建 APT 偏好设置文件
 # Pin-Priority: -10 表示永不安装此包（负数优先级阻止安装）
@@ -80,17 +88,21 @@ echo -e "${GREEN}✓ APT 偏好设置已创建 (Pin-Priority: -10 阻止 snapd �
 
 # 7. 清理残留目录
 echo -e "\n${YELLOW}[7/8] 清理残留目录...${NC}"
-sudo rm -rf /var/cache/snapd/
-sudo rm -rf "$HOME/snap"
-sudo rm -rf /snap
-sudo rm -rf /var/snap
-sudo rm -rf /var/lib/snapd
+for dir in /var/cache/snapd/ "$HOME/snap" /snap /var/snap /var/lib/snapd; do
+    # 残留挂载的 squashfs 会导致 rm 失败，非致命（卸载本身已完成），明确告知即可
+    sudo rm -rf "$dir" || echo -e "${YELLOW}  未能完全清理 $dir（可能仍被挂载，重启后可手动删除）${NC}"
+done
 echo -e "${GREEN}✓ 残留目录已清理${NC}"
 
 # 8. 刷新软件包信息
 echo -e "\n${YELLOW}[8/8] 刷新软件包信息...${NC}"
-sudo apt update
-echo -e "${GREEN}✓ 软件包信息已更新${NC}"
+# apt update 可能因本机其他第三方源（如 vscode/chrome）失败，
+# 与 snap 卸载结果无关，警告而不判死
+if sudo apt update; then
+    echo -e "${GREEN}✓ 软件包信息已更新${NC}"
+else
+    echo -e "${YELLOW}apt update 失败（请检查报错涉及哪个源，可能是第三方源自身问题；不影响 snap 卸载结果）${NC}"
+fi
 
 # 验证删除结果
 echo -e "\n${GREEN}=== 删除完成 ===${NC}"
