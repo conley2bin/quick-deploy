@@ -37,7 +37,7 @@ fake-ip-filter 是必要条件（给 SSH 真实 IP），但不充分——流量
 
 ```bash
 # 1. 运行配置脚本
-./clash-verge-tun-fix.sh
+./tun-fix.sh
 
 # 2. 选择菜单选项
 #    选项 1: 一键优化 Clash 配置 (必需)
@@ -189,9 +189,6 @@ A: 运行脚本，选择菜单选项 3 查看文件路径。
 **Q: SSH 配置（选项 2）是必需的吗？**
 A: **可选但推荐**。选项 1 让 :22 直连，对大部分网络环境已够用。选项 2 让 GitHub 走代理的 443 端口，不依赖本地 :22 是否可达，路径更稳定。两者组合使用不冲突。
 
-**Q: 想了解技术原理？**
-A: 查看 [CLASH-VERGE-GUIDE.md](CLASH-VERGE-GUIDE.md)，包含完整的技术架构和原理说明。
-
 ## 配置文件位置
 
 ```
@@ -245,7 +242,7 @@ A: 查看 [CLASH-VERGE-GUIDE.md](CLASH-VERGE-GUIDE.md)，包含完整的技术�
 6. **配置 SSH（可选但推荐）**:
    ```bash
    # 运行脚本选择选项 2
-   ./clash-verge-tun-fix.sh
+   ./tun-fix.sh
    # 选择: 2. 配置 SSH for GitHub
    ```
 
