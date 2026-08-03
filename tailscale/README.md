@@ -41,7 +41,7 @@ ping <设备-A 的 MagicDNS 名称或 100.x 地址>
 
 ## Clash Verge TUN / Fake-IP 兼容
 
-Clash Verge 的 TUN + Fake-IP 在某些主机会让 `tailscaled` 无法直接连接控制面。`install.sh` 会在包与服务就绪后、**首次登录之前**调用自动检测：它只在以下条件同时满足时提出配置建议：
+Clash Verge 的 TUN + Fake-IP 在某些主机会让 `tailscaled` 无法直接连接控制面。`install.sh` 会在包与服务就绪后、**首次登录之前**执行内置自动检测：它只在以下条件同时满足时提出配置建议：
 
 1. Clash Verge 最终配置 `~/.local/share/io.github.clash-verge-rev.clash-verge-rev/clash-verge.yaml` 的 `tun.enable` 为真；
 2. Clash/Mihomo 进程和 TUN 路由表正在活动；
@@ -53,16 +53,16 @@ Clash Verge 的 TUN + Fake-IP 在某些主机会让 `tailscaled` 无法直接连
 
 ```bash
 # 只读查看检测结果、受管文件与当前有效 proxy
-./configure-clash-proxy.sh --status
+./install.sh --clash-status
 
 # 从活动 Clash 最终配置读取 mixed-port 后应用
-./configure-clash-proxy.sh --apply
+./install.sh --clash-apply
 
 # 适配其他本地 HTTP proxy
-./configure-clash-proxy.sh --apply --proxy http://127.0.0.1:7897
+./install.sh --clash-apply --proxy http://127.0.0.1:7897
 
 # 只删除 quick-deploy 自己带 marker 的 drop-in
-./configure-clash-proxy.sh --remove
+./install.sh --clash-remove
 ```
 
 受管文件是：
