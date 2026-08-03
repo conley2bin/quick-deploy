@@ -3,6 +3,7 @@ name: browser-use
 description: "Use Browser Use Cloud API v3 for managed browser automation on interactive websites, login flows, forms, and tasks requiring human-like browser actions. Requires BROWSER_USE_API_KEY."
 metadata:
   api-key-env: BROWSER_USE_API_KEY
+  api-key-url: https://cloud.browser-use.com/settings?tab=api-keys
 ---
 
 # Browser Use Cloud

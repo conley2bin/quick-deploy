@@ -3,6 +3,7 @@ name: tavily
 description: "Use Tavily Search HTTP API for current public web search and retrieval when Pi's built-in search is insufficient or the user requests Tavily. Requires TAVILY_API_KEY."
 metadata:
   api-key-env: TAVILY_API_KEY
+  api-key-url: https://app.tavily.com/home
 ---
 
 # Tavily

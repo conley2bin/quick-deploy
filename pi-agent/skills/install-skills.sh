@@ -9,7 +9,7 @@ usage() {
 Install this repository's Pi skills into the local Pi agent skill directory.
 
 Usage:
-  pi-agent/skills/install-skills.sh [--dry-run] [--target DIR] [skill-name ...]
+  pi-agent/skills/install-skills.sh [--dry-run] [--target DIR]
 
 Defaults:
   source: directory containing this script (project pi-agent/skills)
@@ -35,17 +35,26 @@ Upstream sync:
 Examples:
   pi-agent/skills/install-skills.sh
   pi-agent/skills/install-skills.sh --dry-run
-  pi-agent/skills/install-skills.sh --target ~/.pi/agent/skills firecrawl tavily
+  pi-agent/skills/install-skills.sh --target ~/.pi/agent/skills
 
 Behavior:
-  - Installs subdirectories that contain SKILL.md (one or two levels deep).
+  - Discovers subdirectories that contain SKILL.md (one or two levels deep).
+  - Every invocation displays a numbered logical-skill menu and accepts sequence
+    numbers separated by spaces and/or commas (for example, `1, 3 5`). Empty
+    input cancels without installing skills.
+  - The `grill` menu item expands to its discovered physical skills:
+    domain-modeling, grilling, grill-me, and grill-with-docs. Pi continues to
+    invoke their separate physical directories.
+  - Menu entries include any API-key acquisition guidance declared in skill
+    metadata.
   - Reads selected skills' metadata.api-key-env declarations.
   - Reuses nonempty environment variables and securely prompts for missing keys.
   - Persists interactively entered keys in a managed block for later Pi sessions.
   - Copies files into target/<skill-name>/, overwriting same-named files.
   - Does not delete extra files already present in the target directory.
   - Does not copy this installer script.
-  - In --dry-run mode, reports sync and key status but neither prompts nor writes files.
+  - In --dry-run mode, prompts for the same menu choices but neither requests
+    secret values nor writes files.
 EOF
 }
 
@@ -54,7 +63,6 @@ source_dir="$script_dir"
 target_dir="${PI_AGENT_SKILLS_DIR:-$HOME/.pi/agent/skills}"
 zshrc_path="${PI_AGENT_SKILLS_ZSHRC:-$HOME/.zshrc}"
 dry_run=0
-selected=()
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -71,34 +79,18 @@ while [[ $# -gt 0 ]]; do
       usage
       exit 0
       ;;
-    --)
-      shift
-      selected+=("$@")
-      break
-      ;;
     -*)
-      echo "error: unknown option: $1" >&2
+      printf 'error: unknown option: %s\n' "$1" >&2
       usage >&2
       exit 2
       ;;
     *)
-      selected+=("$1")
-      shift
+      printf 'error: unexpected positional operand: %s\n' "$1" >&2
+      usage >&2
+      exit 2
       ;;
   esac
 done
-
-is_selected() {
-  local name="$1"
-  if [[ ${#selected[@]} -eq 0 ]]; then
-    return 0
-  fi
-  local item
-  for item in "${selected[@]}"; do
-    [[ "$item" == "$name" ]] && return 0
-  done
-  return 1
-}
 
 # --- Upstream sync ---------------------------------------------------------
 
@@ -182,25 +174,97 @@ report_synced_updates() {
 
 # --- API key handling ------------------------------------------------------
 
-read_api_key_envs() {
+read_skill_metadata() {
   local skill_file="$1"
   awk '
     NR == 1 && $0 == "---" { frontmatter = 1; next }
     frontmatter && $0 == "---" { exit }
     frontmatter && /^metadata:[[:space:]]*$/ { metadata = 1; next }
     frontmatter && metadata && /^[^[:space:]]/ { metadata = 0 }
-    frontmatter && metadata && /^[[:space:]]+api-key-env:[[:space:]]*/ {
+    frontmatter && metadata && /^[[:space:]]+(api-key-env|api-key-url):[[:space:]]*/ {
       line = $0
-      sub(/^[[:space:]]+api-key-env:[[:space:]]*/, "", line)
+      sub(/^[[:space:]]+/, "", line)
+      field = line
+      sub(/:.*/, "", field)
+      sub(/^[^:]+:[[:space:]]*/, "", line)
       gsub(/^[[:space:]]+|[[:space:]]+$/, "", line)
       if ((substr(line, 1, 1) == "\"" && substr(line, length(line), 1) == "\"") ||
           (substr(line, 1, 1) == "\047" && substr(line, length(line), 1) == "\047")) {
         line = substr(line, 2, length(line) - 2)
       }
-      gsub(/,/, " ", line)
-      print line
+      print field "\t" line
     }
   ' "$skill_file"
+}
+
+read_api_key_envs() {
+  local skill_file="$1" field value
+  while IFS=$'\t' read -r field value; do
+    [[ "$field" == "api-key-env" ]] || continue
+    printf '%s\n' "$value"
+  done < <(read_skill_metadata "$skill_file")
+}
+
+read_skill_api_key_pairs() {
+  local skill_file="$1" field value env url index existing_url
+  local -a env_values url_values metadata_values
+  declare -A url_by_env=()
+
+  while IFS=$'\t' read -r field value; do
+    metadata_values=()
+    value="${value//,/ }"
+    read -r -a metadata_values <<< "$value"
+    case "$field" in
+      api-key-env)
+        if [[ ${#metadata_values[@]} -eq 0 ]]; then
+          printf 'error: metadata.api-key-env in %s must not be empty\n' "$skill_file" >&2
+          return 1
+        fi
+        env_values+=("${metadata_values[@]}")
+        ;;
+      api-key-url)
+        if [[ ${#metadata_values[@]} -eq 0 ]]; then
+          printf 'error: metadata.api-key-url in %s must not be empty\n' "$skill_file" >&2
+          return 1
+        fi
+        url_values+=("${metadata_values[@]}")
+        ;;
+    esac
+  done < <(read_skill_metadata "$skill_file")
+
+  if [[ ${#url_values[@]} -gt 0 && ${#env_values[@]} -eq 0 ]]; then
+    printf 'error: metadata.api-key-url in %s requires metadata.api-key-env\n' "$skill_file" >&2
+    return 1
+  fi
+  if [[ ${#url_values[@]} -gt 0 && ${#url_values[@]} -ne ${#env_values[@]} ]]; then
+    printf 'error: metadata.api-key-env and metadata.api-key-url in %s must declare matching counts\n' "$skill_file" >&2
+    return 1
+  fi
+
+  for index in "${!env_values[@]}"; do
+    env="${env_values[$index]}"
+    if [[ ! "$env" =~ ^[A-Z_][A-Z0-9_]*$ ]]; then
+      printf 'error: invalid metadata.api-key-env value in %s: %s\n' "$skill_file" "$env" >&2
+      return 1
+    fi
+    [[ ${#url_values[@]} -gt 0 ]] || continue
+    url="${url_values[$index]}"
+    if [[ ! "$url" =~ ^https?://[^[:space:],]+$ ]]; then
+      printf 'error: invalid metadata.api-key-url value in %s: %s\n' "$skill_file" "$url" >&2
+      return 1
+    fi
+    existing_url="${url_by_env[$env]:-}"
+    if [[ -n "$existing_url" && "$existing_url" != "$url" ]]; then
+      printf 'error: conflicting metadata.api-key-url values for %s in %s\n' "$env" "$skill_file" >&2
+      return 1
+    fi
+    url_by_env["$env"]="$url"
+  done
+
+  while IFS= read -r env; do
+    [[ -n "$env" ]] || continue
+    printf '%s\t%s\n' "$env" "${url_by_env[$env]}"
+  done < <(printf '%s\n' "${!url_by_env[@]}" | LC_ALL=C sort)
 }
 
 shell_single_quote() {
@@ -299,9 +363,7 @@ write_managed_api_keys() {
 sync_upstream
 
 declare -A skill_location=()
-skill_dirs=()
-skill_names=()
-missing=()
+all_skill_names=()
 
 for skill_file in "$source_dir"/*/SKILL.md "$source_dir"/*/*/SKILL.md; do
   [[ -f "$skill_file" ]] || continue
@@ -313,21 +375,176 @@ for skill_file in "$source_dir"/*/SKILL.md "$source_dir"/*/*/SKILL.md; do
     exit 1
   fi
   skill_location[$name]="$skill_dir"
-  is_selected "$name" || continue
-  skill_dirs+=("$skill_dir")
-  skill_names+=("$name")
+  all_skill_names+=("$name")
 done
 
-if [[ ${#selected[@]} -gt 0 ]]; then
-  for name in "${selected[@]}"; do
-    [[ -n "${skill_location[$name]:-}" ]] || missing+=("$name")
-  done
-fi
-
-if [[ ${#missing[@]} -gt 0 ]]; then
-  printf 'error: requested skill(s) not found under %s (searched one and two levels deep): %s\n' "$source_dir" "${missing[*]}" >&2
+if [[ ${#all_skill_names[@]} -eq 0 ]]; then
+  echo "no skills installed from $source_dir" >&2
   exit 1
 fi
+
+physical_skill_names=()
+while IFS= read -r name; do
+  physical_skill_names+=("$name")
+done < <(printf '%s\n' "${all_skill_names[@]}" | LC_ALL=C sort)
+
+logical_name_for_skill() {
+  case "$1" in
+    domain-modeling|grilling|grill-me|grill-with-docs)
+      printf '%s\n' "grill"
+      ;;
+    *)
+      printf '%s\n' "$1"
+      ;;
+  esac
+}
+
+declare -A logical_members=()
+declare -A api_key_url_by_env=()
+declare -A logical_unit_key_urls=()
+declare -A logical_unit_key_envs=()
+declare -A logical_unit_guidance=()
+logical_unit_names_unsorted=()
+for name in "${physical_skill_names[@]}"; do
+  logical_name="$(logical_name_for_skill "$name")"
+  if [[ -n "${logical_members[$logical_name]:-}" ]]; then
+    logical_members["$logical_name"]+=",$name"
+  else
+    logical_members["$logical_name"]="$name"
+    logical_unit_names_unsorted+=("$logical_name")
+  fi
+
+  if ! api_key_pairs="$(read_skill_api_key_pairs "${skill_location[$name]}/SKILL.md")"; then
+    exit 1
+  fi
+  [[ -n "$api_key_pairs" ]] || continue
+  while IFS=$'\t' read -r key url; do
+    known_url="${api_key_url_by_env[$key]:-}"
+    if [[ -n "$known_url" && "$known_url" != "$url" ]]; then
+      printf 'error: conflicting metadata.api-key-url values for %s across discovered skills\n' "$key" >&2
+      exit 1
+    fi
+    api_key_url_by_env["$key"]="$url"
+
+    aggregate_key="$logical_name:$key"
+    existing_url="${logical_unit_key_urls[$aggregate_key]:-}"
+    if [[ -n "$existing_url" && "$existing_url" != "$url" ]]; then
+      printf 'error: conflicting metadata.api-key-url values for %s in logical skill %s\n' "$key" "$logical_name" >&2
+      exit 1
+    fi
+    logical_unit_key_urls["$aggregate_key"]="$url"
+    case ",${logical_unit_key_envs[$logical_name]:-}," in
+      *",$key,"*) ;;
+      *)
+        if [[ -n "${logical_unit_key_envs[$logical_name]:-}" ]]; then
+          logical_unit_key_envs["$logical_name"]+=",$key"
+        else
+          logical_unit_key_envs["$logical_name"]="$key"
+        fi
+        ;;
+    esac
+  done <<< "$api_key_pairs"
+done
+
+logical_unit_names=()
+while IFS= read -r logical_name; do
+  logical_unit_names+=("$logical_name")
+done < <(printf '%s\n' "${logical_unit_names_unsorted[@]}" | LC_ALL=C sort)
+
+for logical_name in "${logical_unit_names[@]}"; do
+  guidance=""
+  while IFS= read -r key; do
+    [[ -n "$key" ]] || continue
+    if [[ -n "$guidance" ]]; then
+      guidance+="; "
+    fi
+    guidance+="$key: ${logical_unit_key_urls[$logical_name:$key]}"
+  done < <(printf '%s\n' "${logical_unit_key_envs[$logical_name]:-}" | tr ',' '\n' | LC_ALL=C sort)
+  logical_unit_guidance["$logical_name"]="$guidance"
+done
+
+echo "Available skills:"
+for logical_index in "${!logical_unit_names[@]}"; do
+  logical_name="${logical_unit_names[$logical_index]}"
+  if [[ -n "${logical_unit_guidance[$logical_name]:-}" ]]; then
+    printf '  %d. %s — %s\n' "$((logical_index + 1))" "$logical_name" "${logical_unit_guidance[$logical_name]}"
+  else
+    printf '  %d. %s\n' "$((logical_index + 1))" "$logical_name"
+  fi
+done
+
+declare -A selected_seen=()
+skill_dirs=()
+skill_names=()
+
+add_selected_physical_skill() {
+  local physical_name="$1"
+  [[ -n "${selected_seen[$physical_name]:-}" ]] && return
+  selected_seen["$physical_name"]=1
+  skill_dirs+=("${skill_location[$physical_name]}")
+  skill_names+=("$physical_name")
+}
+
+add_selected_logical_unit() {
+  local logical_name="$1" physical_name
+  local -a physical_names
+  IFS=, read -r -a physical_names <<< "${logical_members[$logical_name]}"
+  for physical_name in "${physical_names[@]}"; do
+    add_selected_physical_skill "$physical_name"
+  done
+}
+
+choose_logical_units() {
+  local selection_input normalized_input token logical_name choice_index valid_choice
+  local -a selection_tokens chosen_logical_units
+
+  while true; do
+    printf 'Select skill numbers (spaces or commas; Enter cancels): '
+    if ! IFS= read -r selection_input; then
+      echo "error: unable to read skill selection" >&2
+      exit 1
+    fi
+    if [[ -z "${selection_input//[[:space:]]/}" ]]; then
+      report_synced_updates
+      echo "No skills selected; installation cancelled."
+      exit 0
+    fi
+
+    normalized_input="${selection_input//,/ }"
+    read -r -a selection_tokens <<< "$normalized_input"
+    if [[ ${#selection_tokens[@]} -eq 0 ]]; then
+      echo "error: enter one or more sequence numbers" >&2
+      continue
+    fi
+
+    valid_choice=1
+    chosen_logical_units=()
+    for token in "${selection_tokens[@]}"; do
+      if [[ ! "$token" =~ ^[0-9]+$ ]]; then
+        printf 'error: "%s" is not a sequence number; enter numbers from 1 to %d\n' \
+          "$token" "${#logical_unit_names[@]}" >&2
+        valid_choice=0
+        continue
+      fi
+      choice_index=$((10#$token))
+      if ((choice_index < 1 || choice_index > ${#logical_unit_names[@]})); then
+        printf 'error: selection %s is out of range; enter numbers from 1 to %d\n' \
+          "$token" "${#logical_unit_names[@]}" >&2
+        valid_choice=0
+        continue
+      fi
+      chosen_logical_units+=("${logical_unit_names[$((choice_index - 1))]}")
+    done
+    [[ $valid_choice -eq 1 ]] || continue
+
+    for logical_name in "${chosen_logical_units[@]}"; do
+      add_selected_logical_unit "$logical_name"
+    done
+    return
+  done
+}
+
+choose_logical_units
 
 if [[ ${#skill_dirs[@]} -eq 0 ]]; then
   echo "no skills installed from $source_dir" >&2
@@ -335,6 +552,7 @@ if [[ ${#skill_dirs[@]} -eq 0 ]]; then
 fi
 
 declare -A required_by=()
+declare -A skipped_skills=()
 for i in "${!skill_dirs[@]}"; do
   skill_dir="${skill_dirs[$i]}"
   name="${skill_names[$i]}"
@@ -358,6 +576,16 @@ for i in "${!skill_dirs[@]}"; do
     done
   done < <(read_api_key_envs "$skill_dir/SKILL.md")
 done
+
+key_has_unskipped_dependents() {
+  local key="$1" dependent
+  local -a dependents
+  IFS=, read -r -a dependents <<< "${required_by[$key]}"
+  for dependent in "${dependents[@]}"; do
+    [[ -z "${skipped_skills[$dependent]:-}" ]] && return 0
+  done
+  return 1
+}
 
 if [[ ${#required_by[@]} -gt 0 ]]; then
   load_managed_api_keys
@@ -388,6 +616,7 @@ if [[ ${#required_by[@]} -gt 0 ]]; then
     done
   else
     for key in "${missing_keys[@]}"; do
+      key_has_unskipped_dependents "$key" || continue
       value=""
       if ! IFS= read -r -s -p "$key: " value; then
         printf '\nerror: unable to read required API key %s\n' "$key" >&2
@@ -395,8 +624,12 @@ if [[ ${#required_by[@]} -gt 0 ]]; then
       fi
       printf '\n' >&2
       if [[ -z "$value" ]]; then
-        printf 'error: required API key %s cannot be empty\n' "$key" >&2
-        exit 1
+        printf 'skipping selected skills because %s was declined:\n' "$key"
+        while IFS= read -r name; do
+          skipped_skills["$name"]="$key"
+          printf '  - %s\n' "$name"
+        done < <(printf '%s\n' "${required_by[$key]//,/$'\n'}" | LC_ALL=C sort)
+        continue
       fi
       if [[ "$value" == *$'\n'* || "$value" == *$'\r'* ]]; then
         printf 'error: required API key %s must be a single line\n' "$key" >&2
@@ -413,6 +646,8 @@ if [[ ${#required_by[@]} -gt 0 ]]; then
     if [[ $config_changed -eq 1 ]]; then
       write_managed_api_keys
       printf 'configured selected skills API keys in %s\n' "$zshrc_path"
+    elif [[ ${#skipped_skills[@]} -gt 0 ]]; then
+      printf 'API key prompts complete; skills needing declined keys will be skipped\n'
     else
       printf 'selected skills API keys are already configured\n'
     fi
@@ -427,6 +662,10 @@ fi
 for i in "${!skill_dirs[@]}"; do
   skill_dir="${skill_dirs[$i]}"
   name="${skill_names[$i]}"
+  if [[ -n "${skipped_skills[$name]:-}" ]]; then
+    printf 'skipped %s (requires declined API key %s)\n' "$name" "${skipped_skills[$name]}"
+    continue
+  fi
   dest="$target_dir/$name"
   if [[ $dry_run -eq 1 ]]; then
     echo "would install $name -> $dest"
@@ -439,6 +678,11 @@ for i in "${!skill_dirs[@]}"; do
 done
 
 if [[ $installed -eq 0 ]]; then
+  if [[ $dry_run -eq 0 && ${#skipped_skills[@]} -gt 0 ]]; then
+    report_synced_updates
+    echo "done. No selected skills were installed; every selected skill was skipped after its required API key was declined."
+    exit 0
+  fi
   echo "no skills installed from $source_dir" >&2
   exit 1
 fi
