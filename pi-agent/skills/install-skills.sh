@@ -207,7 +207,7 @@ read_api_key_envs() {
 
 read_skill_api_key_pairs() {
   local skill_file="$1" field value env url index existing_url
-  local -a env_values url_values metadata_values
+  local -a env_values=() url_values=() metadata_values=()
   declare -A url_by_env=()
 
   while IFS=$'\t' read -r field value; do
