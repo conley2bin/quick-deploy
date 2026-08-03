@@ -1,5 +1,6 @@
 #!/bin/bash
-# Install or update Tailscale and adapt tailscaled to an active Clash Verge TUN proxy.
+# Install or update Tailscale and converge tailscaled's HTTP proxy with the
+# current Clash Verge TUN state.
 set -euo pipefail
 
 OS_RELEASE_FILE="${OS_RELEASE_FILE:-/etc/os-release}"
@@ -30,22 +31,15 @@ new_temp() {
 
 usage() {
     cat <<'USAGE'
-用法:
-  ./install.sh [--no-clash-check]
-  ./install.sh --clash-status
-  ./install.sh --clash-apply [--proxy http://HOST:PORT]
-  ./install.sh --clash-remove
+用法: ./install.sh [--no-clash-check]
 
-默认安装或更新 Ubuntu 24.04+ 的 Tailscale stable 包，只请求 tailscale 目标包。
-包和 tailscaled.service 就绪后，先检测/处理 Clash Verge TUN 代理，再判断首次登录。
-已登录节点不会重新认证；未登录时交互终端会询问是否前台执行一次 sudo tailscale up。
+安装或更新 Ubuntu 24.04+ 的 Tailscale stable 包，只请求 tailscale 目标包。
+包和 tailscaled.service 就绪后，先让 Clash Verge TUN 代理配置随当前网络状态收敛，
+再判断首次登录。已登录节点不会重新认证；未登录时交互终端会询问是否前台执行一次
+sudo tailscale up。
 
---no-clash-check  跳过登录前的 Clash Verge TUN 自动检测
---clash-status    只读显示 Clash 检测与服务代理是否已设置（代理地址会隐藏）
---clash-apply     应用本脚本带 marker 的 systemd drop-in；未指定 --proxy 时读取 mixed-port
---proxy URL        显式 HTTP proxy，只能与 --clash-apply 一起使用，格式为 http://HOST:PORT
---clash-remove     只删除本脚本管理的 drop-in，不触碰其他 drop-in
--h, --help         显示帮助
+--no-clash-check  跳过登录前的 Clash Verge TUN 检测与代理收敛
+-h, --help        显示帮助
 USAGE
 }
 
@@ -335,22 +329,6 @@ require_active_service() {
     fi
 }
 
-clash_show_status() {
-    local port='未找到' proxy='无有效 mixed-port' active='no' state effective='未设置'
-    clash_tun_is_active && active='yes'
-    port="$(read_mixed_port 2>/dev/null || printf '未找到')"
-    proxy="$(detected_clash_proxy 2>/dev/null || printf '无有效 mixed-port')"
-    state="$(managed_dropin_state)"
-    [ -n "$(effective_proxy_url 2>/dev/null || true)" ] && effective='已设置（地址已隐藏）'
-
-    echo "Clash 最终配置: $CLASH_CONFIG"
-    echo "Clash TUN 活动: $active"
-    echo "mixed-port: $port"
-    echo "检测到的 HTTP proxy: $proxy"
-    echo "受管 drop-in: $state ($DROPIN_FILE)"
-    echo "tailscaled 当前 HTTP_PROXY: $effective"
-}
-
 clash_apply_proxy() {
     local proxy="$1" tmp state
     valid_proxy_url "$proxy" || die '--proxy 只能是无认证、无路径的 http://HOST:PORT，端口必须为 1..65535'
@@ -385,7 +363,7 @@ EOF_DROPIN
     run_root systemctl restart "$SERVICE"
     require_active_service
     if ! effective_proxy_matches "$proxy"; then
-        die '服务已重启，但 tailscaled 的有效代理环境不符合预期；请运行 --clash-status 检查'
+        die '服务已重启，但 tailscaled 的有效代理环境不符合预期；请检查: systemctl show tailscaled.service -p Environment --value'
     fi
     echo "已应用并验证 tailscaled 代理: $proxy"
 }
@@ -417,8 +395,23 @@ clash_remove_proxy() {
 clash_auto_configure() {
     local proxy answer='' external state
     if ! clash_tun_is_active; then
-        echo '未检测到活动的 Clash Verge TUN；不配置 daemon proxy。'
-        echo '这不影响普通网络下的 Tailscale 安装。'
+        state="$(managed_dropin_state)"
+        if [ "$state" != managed ]; then
+            echo '未检测到活动的 Clash Verge TUN；不配置 daemon proxy。'
+            echo '这不影响普通网络下的 Tailscale 安装。'
+            return 0
+        fi
+        # A managed drop-in pins tailscaled to a local proxy. Without an active
+        # TUN that proxy is unnecessary, and a dead one cuts tailscaled off the
+        # control plane. Converge by evidence: keep it only while it still
+        # reaches the control plane; remove it once the probe provably fails.
+        external="$(effective_proxy_url 2>/dev/null || true)"
+        if [ -n "$external" ] && probe_external_proxy "$external"; then
+            echo '未检测到活动的 Clash Verge TUN；受管代理仍可连通控制面，保留配置。'
+            return 0
+        fi
+        echo '未检测到活动的 Clash Verge TUN，且受管代理已无法连通控制面；自动移除受管 drop-in。'
+        clash_remove_proxy
         return 0
     fi
     if ! proxy="$(detected_clash_proxy)"; then
@@ -453,58 +446,32 @@ clash_auto_configure() {
     echo "检测到活动的 Clash Verge TUN（mixed-port: ${proxy##*:}）。"
     echo 'Fake-IP/TUN 可能让 tailscaled 不能直接访问控制面，需要 daemon 显式经本地 HTTP proxy。'
     if [ ! -t 0 ]; then
-        echo "非交互 stdin：未应用。需要时执行: ./install.sh --clash-apply --proxy $proxy"
+        echo '非交互 stdin：未应用。需要时请在交互终端重跑 ./install.sh。'
         return 0
     fi
     read -r -p '现在为 tailscaled 应用该代理？[Y/n] ' answer || answer=''
     case "$answer" in
         ''|Y|y|yes|YES|Yes) clash_apply_proxy "$proxy" ;;
-        *) echo "未应用。需要时执行: ./install.sh --clash-apply --proxy $proxy" ;;
+        *) echo '未应用。需要时请重跑 ./install.sh。' ;;
     esac
 }
 
 run_clash_check=true
-mode=''
-proxy=''
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --no-clash-check) run_clash_check=false ;;
-        --clash-status|--clash-apply|--clash-remove)
-            [ -z "$mode" ] || die '一次只能使用一个 Clash 管理选项'
-            mode="$1"
-            ;;
-        --proxy)
-            shift
-            [ "$#" -gt 0 ] || die '--proxy 需要 URL 参数'
-            proxy="$1"
-            ;;
         -h|--help) usage; exit 0 ;;
         *) die "未知参数: $1" ;;
     esac
     shift
 done
 
-[ -z "$proxy" ] || [ "$mode" = --clash-apply ] || die '--proxy 只能与 --clash-apply 一起使用'
-[ -z "$mode" ] || [ "$run_clash_check" = true ] || die '--no-clash-check 不能与 Clash 管理选项一起使用'
-
-case "$mode" in
-    --clash-status) clash_show_status ;;
-    --clash-apply)
-        if [ -z "$proxy" ]; then
-            proxy="$(detected_clash_proxy)" || die "无法从 $CLASH_CONFIG 读取有效 mixed-port；请使用 --proxy http://HOST:PORT"
-        fi
-        clash_apply_proxy "$proxy"
-        ;;
-    --clash-remove) clash_remove_proxy ;;
-    '')
-        check_ubuntu
-        install_repository
-        install_or_update_package
-        ensure_service
-        # A first login needs the control plane, so apply/prove the Clash proxy first.
-        if [ "$run_clash_check" = true ]; then
-            clash_auto_configure
-        fi
-        handle_login
-        ;;
-esac
+check_ubuntu
+install_repository
+install_or_update_package
+ensure_service
+# A first login needs the control plane, so converge the Clash proxy first.
+if [ "$run_clash_check" = true ]; then
+    clash_auto_configure
+fi
+handle_login

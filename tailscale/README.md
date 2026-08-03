@@ -49,21 +49,7 @@ Clash Verge 的 TUN + Fake-IP 在某些主机会让 `tailscaled` 无法直接连
 
 检测到后，脚本默认询问是否为 `tailscaled` 写入 HTTP(S) proxy。端口从最终配置读取，不会把 `7897` 当作通用默认值。**应用前会通过候选 proxy 以 HTTP CONNECT 实际探测 `https://controlplane.tailscale.com/key?v=138`**；端口能监听但控制面不可达时不会写 systemd 配置。普通网络、Clash 未安装/未运行、TUN 未启用或 `mixed-port` 无效时，Tailscale 安装照常完成，且不会写 proxy。
 
-也可直接管理该适配：
-
-```bash
-# 只读查看检测结果、受管文件与当前有效 proxy
-./install.sh --clash-status
-
-# 从活动 Clash 最终配置读取 mixed-port 后应用
-./install.sh --clash-apply
-
-# 适配其他本地 HTTP proxy
-./install.sh --clash-apply --proxy http://127.0.0.1:7897
-
-# 只删除 quick-deploy 自己带 marker 的 drop-in
-./install.sh --clash-remove
-```
+反向同样自动收敛：未检测到活动的 TUN、但存在本脚本写入的受管 drop-in 时，脚本会先探测该代理是否仍能连通控制面——能连通则保留（可能只是 Clash 暂时关了 TUN），**已失效则自动移除受管 drop-in 并重启 tailscaled**。这避免了 Clash 关闭或卸载后，残留的 `127.0.0.1` 代理把 tailscaled 的控制面连接拖断、节点掉线。撤销只删带 marker 的文件，外部 drop-in 不受影响。
 
 受管文件是：
 
@@ -71,7 +57,13 @@ Clash Verge 的 TUN + Fake-IP 在某些主机会让 `tailscaled` 无法直接连
 /etc/systemd/system/tailscaled.service.d/quick-deploy-clash-proxy.conf
 ```
 
-应用和撤销都是**收敛操作**：它们都会 `daemon-reload`、重启 `tailscaled`，并验证服务仍为 active 及实际的 systemd `Environment`。即使执行 `--remove` 时受管文件已经不存在，脚本仍会 reload/restart，以恢复一次中断操作留下的 manager/process 不一致状态。只有“受管文件不存在或是外部文件，且已有等价外部 proxy”时，`--apply` 才会保留外部配置、不接管且不重启。若外部 proxy 与检测值不同，自动模式会先探测它能否抵达控制面，成功则保留，失败则阻止首次登录而不是静默继续。撤销只删除带 marker 的文件，外部 drop-in 的有效环境会保留。
+应用和撤销都是**收敛操作**：都会 `daemon-reload`、重启 `tailscaled`，并验证服务仍为 active 及实际的 systemd `Environment`。即使受管文件已经不存在，移除路径仍会 reload/restart，以恢复一次中断操作留下的 manager/process 不一致状态。外部 proxy（非本脚本写入的 drop-in）永远不被接管或删除：与检测值一致时直接保留；不一致时先探测它能否抵达控制面，成功则保留，失败则阻止首次登录而不是静默继续。
+
+手工查看 tailscaled 当前有效代理：
+
+```bash
+systemctl show tailscaled.service -p Environment --value
+```
 
 ## 服务与状态
 
