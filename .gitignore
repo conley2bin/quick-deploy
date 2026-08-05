@@ -7,8 +7,8 @@ __pycache__/
 .pi-subagents/*
 .memory/
 coding-agent/shared/MCP/deep-research/.env
-pi-agent/tools/codoxear/.env
-pi-agent/tools/codoxear/.runtime/
+codoxear/.env
+codoxear/.runtime/
 
 !.claude/
 !.agents/

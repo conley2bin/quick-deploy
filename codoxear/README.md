@@ -26,7 +26,7 @@ run_server.sh
 ## 首次配置
 
 ```bash
-cd /path/to/quick-deploy/pi-agent/tools/codoxear
+cd /path/to/quick-deploy/codoxear
 ./setup.sh
 ```
 
@@ -39,7 +39,7 @@ cd /path/to/quick-deploy/pi-agent/tools/codoxear
 setup 不要求设置 Web 密码；未设置密码时，terminal-owned 的 `codox`/`piox` 仍可使用。准备启动 Web server 时再编辑：
 
 ```text
-pi-agent/tools/codoxear/.env
+codoxear/.env
 ```
 
 至少设置：
