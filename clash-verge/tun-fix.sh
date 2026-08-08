@@ -189,6 +189,10 @@ fake_ip_filter_block() {
     # 协议过滤
     - '+._tcp'
     - '+._udp'
+    # 注意：dex-gem.ai 有意不在此列表。保留 fake-ip 才能保住域名上下文，
+    # 让全局脚本的 DOMAIN-SUFFIX,dex-gem.ai,DIRECT 规则确定性命中；
+    # 若在此过滤，应用拿到真实 IP 后连接没有域名信息，在订阅未启用
+    # sniffer 的机器上会绕过域名规则、一路掉到最后的 MATCH（通常是代理）。
 EOF
 }
 
@@ -428,6 +432,15 @@ function main(config) {
     // GitHub 若已由 ~/.ssh/config 改走 ssh.github.com:443，则不受此规则影响，
     // 仍走代理 —— 那是更稳的路径，两者互补而非互斥。
     "DST-PORT,22,DIRECT",
+    // LiteLLM 模型网关（pi CLI 的默认 provider）直连，不走任何代理节点。
+    // 事故记录（2026-08-09, conley-company）：Proxy 组选中节点失联后，
+    // litellm.dex-gem.ai 被 fake-ip 吸入 TUN，mihomo 本地 accept 后上游 EOF，
+    // TLS 握手被掐，pi 全程报 "Error: Connection error."——模型入口的可用性
+    // 被机场节点存亡绑架。dex-gem.ai 在 Cloudflare 后面，而本机直连境外
+    // 443 实测可用（mihomo 拨代理节点本身就是直连境外 IP:443 成功的），
+    // 直连把这一整类故障从 pi 的关键路径上移除。
+    // 注意配套约束：dex-gem.ai 不要加进 fake-ip-filter（见该块的注释）。
+    "DOMAIN-SUFFIX,dex-gem.ai,DIRECT",
     "GEOIP,CN,DIRECT,no-resolve",
     "DOMAIN-SUFFIX,cn,DIRECT",
     "DOMAIN-SUFFIX,com.cn,DIRECT",
@@ -799,6 +812,8 @@ optimize_all() {
     echo "  尚未验证生效：需重载 Clash Verge 后，由 verify_tun_routes 看内核路由确认"
     echo ""
     echo "pass 直连规则: 已写入全局脚本"
+    echo "  - LiteLLM 网关 (dex-gem.ai) 直连 —— pi CLI 的模型入口；走代理时"
+    echo "    节点失联曾导致 pi 全程 Connection error（2026-08-09 实测），直连后免疫"
     echo "  - 出站 TCP/22 直连 (DST-PORT,22) —— 机场 84 个节点全部封禁出站 22，"
     echo "    走代理必然是 connect 后 0 字节断开；直连是唯一可用路径"
     echo "  - 中国大陆 IP (GEOIP,CN)"
