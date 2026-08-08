@@ -540,6 +540,11 @@ Host github.com ssh.github.com
     Hostname ssh.github.com
     Port 443
     User git
+    # 显式指定密钥：SSH 远程会话/脚本里没有 ssh-agent 可用，不指定则
+    # 握手无钥可提供，报 Permission denied (publickey)。两台机器统一把
+    # 钥匙放在 ~/.ssh/conley，本脚本因此可以不加修改地在任一台上运行。
+    IdentityFile ~/.ssh/conley
+    IdentitiesOnly yes
 
 # 机场对所有境外 :22 都封，如需 GitLab / Bitbucket 取消下方注释即可
 #Host gitlab.com altssh.gitlab.com
