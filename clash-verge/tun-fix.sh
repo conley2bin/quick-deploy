@@ -144,10 +144,16 @@ fake_ip_filter_block() {
     - '*.local'
     - '*.lan'
     # 企业应用（主域名 + 通配符）
-    - 'feishu.cn'
-    - '*.feishu.cn'
-    - 'larkoffice.com'
-    - '*.larkoffice.com'
+    #
+    # 飞书 / Lark（feishu.cn、larkoffice.com）有意不在此列表，理由同下方 dex-gem.ai：
+    # 进了 fake-ip-filter 就等于放弃域名上下文，DOMAIN-SUFFIX,feishu.cn,DIRECT 永远
+    # 不可能命中。本订阅（Rbyu8mvt8Jk7.yaml）实测 enhanced-mode: fake-ip，且订阅与
+    # 本文件都没有 sniffer 段、没有 dns.respect-rules —— 域名丢了就没有任何恢复途径。
+    # 改动前的活跃连接可以直接看到这一点：
+    #   host='' dst=223.111.26.66 -> rule: GeoIP cn -> DIRECT
+    # host 为空，飞书直连完全靠 GEOIP,CN 接住真实 IP，是运气不是保证。
+    # 移出后飞书拿到 198.18.0.0/16 的 fake IP，因规则判定 DIRECT，由 mihomo 自行解析
+    # 真实 IP 并直连，fake IP 不会离开本机。局域网发现不受影响（*.local / *.lan 仍在）。
     - 'bytedance.com'
     - '*.bytedance.com'
     - 'dingtalk.com'
@@ -191,8 +197,15 @@ fake_ip_filter_block() {
     - '+._udp'
     # 注意：dex-gem.ai 有意不在此列表。保留 fake-ip 才能保住域名上下文，
     # 让全局脚本的 DOMAIN-SUFFIX,dex-gem.ai,DIRECT 规则确定性命中；
-    # 若在此过滤，应用拿到真实 IP 后连接没有域名信息，在订阅未启用
-    # sniffer 的机器上会绕过域名规则、一路掉到最后的 MATCH（通常是代理）。
+    # 若在此过滤，应用拿到真实 IP 后连接没有域名信息，会绕过域名规则、
+    # 一路掉到最后的 MATCH（通常是代理）。
+    # 本订阅实测既无 sniffer 段也无 dns.respect-rules，所以域名一旦丢失
+    # 没有任何恢复途径 —— 不要指望嗅探兼得两边。
+    #
+    # 同样的陷阱目前仍存在于 bytedance.com：它同时在本列表和全局脚本的
+    # DOMAIN-SUFFIX,bytedance.com,DIRECT 里，后者因此永远不会命中（实测活跃位次 22，
+    # 但连接的 host 为空），bytedance 直连实际靠 GEOIP,CN 接住。本次不改动它，
+    # 但别把"规则列表里有这条"当作"这条在生效"。
 EOF
 }
 
@@ -289,6 +302,121 @@ update_tun_config() {
         echo "已追加 TUN 配置块 (route-exclude-address)"
     fi
     echo "这只说明文本已写入；是否真的生效需 Clash Verge 重载后用 verify_tun_routes 看内核"
+}
+
+# 验证直连规则在活跃配置里的真实位次
+#
+# 为什么不能只查 Script.js 里有没有这行字：旧版生成的 main() 用
+# new Set(config.rules) 去重，订阅里已存在的同串规则会被跳过，于是它保留在
+# 订阅的原始深位而不是被提到顶部 —— 文件里白纸黑字写着，实际排在 537/541。
+# 只有问内核拿到的那份规则表才能分辨这两种情况。
+verify_direct_rules() {
+    echo ""
+    echo "=========================================="
+    echo "  直连规则位次检查（活跃配置）"
+    echo "=========================================="
+    echo ""
+
+    local sock="/tmp/verge/verge-mihomo.sock"
+
+    if ! command -v curl >/dev/null 2>&1; then
+        echo "未找到 curl，无法查询内核规则表"
+        return
+    fi
+    if ! python3 -c '' 2>/dev/null; then
+        echo "未找到 python3，跳过规则位次检查（这是跳过，不是通过）"
+        return
+    fi
+
+    local rules_json
+    rules_json=$(curl -s --max-time 5 --unix-socket "$sock" http://localhost/rules 2>/dev/null || true)
+
+    if [ -z "$rules_json" ]; then
+        echo "Clash Verge 未运行或尚未重载，无法判断规则是否生效。"
+        echo "（查不到不等于通过。重载 Clash Verge 后重跑本检查。）"
+        return
+    fi
+
+    printf '%s' "$rules_json" | python3 -c '
+import json, sys
+
+try:
+    rules = json.load(sys.stdin)["rules"]
+except Exception as e:
+    print("fail /rules 返回不是预期的 JSON：%s" % e)
+    sys.exit(1)
+
+print("规则总数: %d" % len(rules))
+print("")
+
+# 第一条会把流量引向代理的规则。REJECT 不算 —— 它不会把目标弄到境外，
+# 广告拦截排在前面是正常的。
+barrier = None
+for i, r in enumerate(rules):
+    p = r.get("proxy", "")
+    if p not in ("DIRECT", "REJECT", "REJECT-DROP", "PASS"):
+        barrier = i
+        break
+
+if barrier is None:
+    print("未找到任何代理规则（全直连配置？），位次断言无意义")
+    barrier = len(rules)
+else:
+    b = rules[barrier]
+    print("第一条代理规则在下标 %d: %s | %s -> %s"
+          % (barrier, b.get("type"), b.get("payload"), b.get("proxy")))
+print("")
+
+# 与 Script.js 的 forceTop 一一对应。mihomo /rules 的 type 是驼峰形式。
+force_top = [
+    ("DstPort",      "22"),
+    ("DomainSuffix", "dex-gem.ai"),
+    ("DomainSuffix", "feishu.cn"),
+    ("DomainSuffix", "feishucdn.com"),
+    ("DomainSuffix", "larkoffice.com"),
+]
+
+fail = 0
+for typ, payload in force_top:
+    hits = [i for i, r in enumerate(rules)
+            if r.get("type") == typ and r.get("payload") == payload]
+    label = "%s,%s" % (typ, payload)
+    if not hits:
+        print("fail %-32s 不在规则表里" % label)
+        fail = 1
+        continue
+    idx = hits[0]
+    proxy = rules[idx].get("proxy")
+    if proxy != "DIRECT":
+        print("fail %-32s 下标 %d 但目标是 %s（应为 DIRECT）" % (label, idx, proxy))
+        fail = 1
+    elif idx < barrier:
+        print("pass %-32s 下标 %d，在首条代理规则之前" % (label, idx))
+    else:
+        print("fail %-32s 下标 %d，前面挡着 %d 条代理规则——未被提到顶部"
+              % (label, idx, barrier))
+        fail = 1
+    if len(hits) > 1:
+        print("     note 该规则出现 %d 次（下标 %s），原位副本应已被移除"
+              % (len(hits), hits))
+        fail = 1
+
+print("")
+if fail:
+    print("位次检查未通过。若刚改完配置，先重载 Clash Verge 再重跑；")
+    print("重载后仍 fail 说明全局 Script.js 没被加载，或订阅级 script 覆盖了它。")
+else:
+    print("forceTop 规则均位于首条代理规则之前，前置真实生效。")
+' || true
+
+    echo ""
+    echo "注：位次正确只说明规则会被优先匹配。飞书要真命中 DOMAIN-SUFFIX，"
+    echo "还需要它不在 fake-ip-filter 里（由 verify_merge_yaml 单独断言）。"
+    echo "想看实际命中，浏览器打开飞书后跑："
+    echo "  curl -s --unix-socket $sock http://localhost/connections \\"
+    echo "    | python3 -c \"import json,sys;[print(c['metadata'].get('host'),c.get('rule'),c.get('chains')) for c in json.load(sys.stdin)['connections'] if 'feishu' in (c['metadata'].get('host') or '')]\""
+    echo "host 字段非空、rule 为 DomainSuffix 才是域名规则真的接管了。"
+    echo ""
 }
 
 # 验证排除网段是否真的生效
@@ -421,6 +549,25 @@ update_direct_rules() {
 // Generated by tun-fix.sh
 
 function main(config) {
+  // 必须无条件排在规则表最前的规则 —— 全是具体域名/端口，不存在"应该让位给更具体
+  // 例外"的情况。这类规则若在订阅里已存在于某个深位，要把它从原位摘掉再提到顶部。
+  //
+  // 为什么不是所有 prependRules 都这么干：下面的数组里混着两类语义相反的规则。
+  // 甲类（本数组）是具体例外；乙类是 DOMAIN-SUFFIX,cn / GEOIP,CN / 各中国站点后缀
+  // 这样的宽泛兜底，它们本来就该排在具体例外之后。
+  // 实测反例：本订阅共 541 条规则，把 DOMAIN-SUFFIX,cn,DIRECT 放在下标 537 是
+  // 故意的 —— 它前面有 DomainSuffix,services.googleapis.cn -> 代理、
+  // DomainKeyword,google -> 代理 这类"要走代理的 .cn 域名"。把兜底提到顶部会把这些
+  // 例外全部遮蔽，services.googleapis.cn 从代理变直连，这是实打实的回归。
+  // 所以对乙类，下面那个 existing.has(r) 跳过不是 bug，是正确行为，不要"顺手修掉"。
+  const forceTop = [
+    "DST-PORT,22,DIRECT",
+    "DOMAIN-SUFFIX,dex-gem.ai,DIRECT",
+    "DOMAIN-SUFFIX,feishu.cn,DIRECT",
+    "DOMAIN-SUFFIX,feishucdn.com,DIRECT",
+    "DOMAIN-SUFFIX,larkoffice.com,DIRECT"
+  ];
+
   const prependRules = [
     // 出站 TCP/22 必须直连。
     // 实测（mihomo /proxies/<node>/delay 打 http://portquiz.net:22/，443 作存活对照）：
@@ -441,6 +588,18 @@ function main(config) {
     // 直连把这一整类故障从 pi 的关键路径上移除。
     // 注意配套约束：dex-gem.ai 不要加进 fake-ip-filter（见该块的注释）。
     "DOMAIN-SUFFIX,dex-gem.ai,DIRECT",
+    // 飞书直连。实测（2026-08-18 本机 dig）飞书全部解析到中国大陆 IP：
+    // dexrobot.feishu.cn -> 223.111.230.73-80（中国移动），www.feishu.cn -> 221.130.195.x，
+    // feishu.cn / larkoffice.com -> 122.14.236.76 / 101.126.58.133，
+    // lf-scm-cn.feishucdn.com -> 36.156.107.x，sf3-cn.feishucdn.com -> 117.184.249.x。
+    // 走代理是绕远，且飞书会按境外来源加风控。
+    // 这三条能命中的前提，是 feishu.cn / larkoffice.com 已从 fake-ip-filter 中移除
+    // （见 fake_ip_filter_block 的注释）—— 两处改动是一体的，只加规则不改过滤列表
+    // 等于写一条永远不触发的规则。feishucdn.com 本来就不在过滤列表里。
+    // 改动前飞书直连靠的是下面那条 GEOIP,CN 接住真实 IP；现在 GEOIP 降为兜底。
+    "DOMAIN-SUFFIX,feishu.cn,DIRECT",
+    "DOMAIN-SUFFIX,feishucdn.com,DIRECT",
+    "DOMAIN-SUFFIX,larkoffice.com,DIRECT",
     "GEOIP,CN,DIRECT,no-resolve",
     "DOMAIN-SUFFIX,cn,DIRECT",
     "DOMAIN-SUFFIX,com.cn,DIRECT",
@@ -486,11 +645,27 @@ function main(config) {
     config.rules = [];
   }
 
-  const existing = new Set(config.rules);
-  const toAdd = prependRules.filter(r => !existing.has(r));
-  if (toAdd.length > 0) {
-    config.rules = [...toAdd, ...config.rules];
-  }
+  // 规范化后整串比较：去掉逗号周围空白，规则类型（第一段）大写。
+  // 必须是整串相等，不能只比"类型+载荷"前缀 —— GEOIP,CN,DIRECT 与
+  // GEOIP,CN,DIRECT,no-resolve 是两条不同规则，前者是订阅末尾的兜底（会触发解析），
+  // 误删后"只有域名、无 IP"的连接会一路掉到 MATCH 被代理。
+  const norm = (r) => {
+    const parts = String(r).split(",").map(s => s.trim());
+    if (parts.length > 0) parts[0] = parts[0].toUpperCase();
+    return parts.join(",");
+  };
+
+  const forced = new Set(forceTop.map(norm));
+
+  // 甲类：先把订阅里的同条规则从原位摘掉
+  const rest = config.rules.filter(r => !forced.has(norm(r)));
+  // 乙类：订阅里已有就不重复添加，保留它在订阅中的原位次
+  const restSeen = new Set(rest.map(norm));
+  const others = prependRules.filter(
+    r => !forced.has(norm(r)) && !restSeen.has(norm(r))
+  );
+
+  config.rules = [...forceTop, ...others, ...rest];
 
   return config;
 }
@@ -748,6 +923,17 @@ verify_merge_yaml() {
         fail=1
     fi
 
+    # 飞书/Lark 必须不在 fake-ip-filter 里，否则 DOMAIN-SUFFIX,feishu.cn,DIRECT 不可能命中。
+    # 旧版本写过这四条；update_fake_ip_filter 对已有文件是"整块删除后重写"，
+    # 残留会被自动清掉；这条断言是防回退的守卫。
+    if grep -qE "^[[:space:]]*- '\*?\.?(feishu\.cn|larkoffice\.com)'" "$file"; then
+        echo "fail fake-ip-filter 中残留飞书/Lark 条目，域名规则将无法命中："
+        grep -nE "^[[:space:]]*- '\*?\.?(feishu\.cn|larkoffice\.com)'" "$file"
+        fail=1
+    else
+        echo "pass fake-ip-filter 中无飞书/Lark 条目（域名上下文得以保留）"
+    fi
+
     # 有 PyYAML 就做真解析（Ubuntu 默认不带 python3-yaml，没有就跳过而不是安装）
     if python3 -c 'import yaml' 2>/dev/null; then
         if python3 -c 'import yaml,sys; yaml.safe_load(open(sys.argv[1]))' "$file" 2>/dev/null; then
@@ -798,6 +984,9 @@ optimize_all() {
     # 文本手术的成功输出 ≠ 文件结构正确，写后校验未通过就以非零退出
     verify_merge_yaml "$file"
 
+    # 写入 Script.js ≠ 规则真的在顶部，去问内核拿到的那份规则表
+    verify_direct_rules
+
     echo ""
     echo "=========================================="
     echo "  配置完成！"
@@ -812,6 +1001,9 @@ optimize_all() {
     echo "  尚未验证生效：需重载 Clash Verge 后，由 verify_tun_routes 看内核路由确认"
     echo ""
     echo "pass 直连规则: 已写入全局脚本"
+    echo "  - 飞书 (feishu.cn / feishucdn.com / larkoffice.com) 直连 —— 实测全部解析到"
+    echo "    中国大陆 IP；配套将飞书从 fake-ip-filter 移出，否则连接不带域名，"
+    echo "    域名规则永远不会命中（改动前飞书直连完全靠 GEOIP,CN 碰巧接住）"
     echo "  - LiteLLM 网关 (dex-gem.ai) 直连 —— pi CLI 的模型入口；走代理时"
     echo "    节点失联曾导致 pi 全程 Connection error（2026-08-09 实测），直连后免疫"
     echo "  - 出站 TCP/22 直连 (DST-PORT,22) —— 机场 84 个节点全部封禁出站 22，"
@@ -894,7 +1086,7 @@ show_config_paths() {
     echo ""
     echo "说明:"
     echo "  - 全局 Merge: Fake-IP Filter 与 TUN 配置"
-    echo "  - 全局 Script: 直连规则 prepend 到生成配置顶部"
+    echo "  - 全局 Script: 具体域名/端口规则强制置顶，宽泛兜底规则订阅已有则不重复添加"
     echo "  - 订阅级 Merge: 一键优化时会清空，避免覆盖全局 Merge"
     echo "  - 其余订阅绑定文件当前只读取，不直接改写"
     echo ""
