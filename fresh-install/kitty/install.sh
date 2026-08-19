@@ -278,10 +278,35 @@ install_kitty() {
 # 只做链接不改 shell 配置：fresh-install 的 zsh 模块已保证
 # ~/.local/bin 在 PATH 里；单独跑本脚本时若不在 PATH，只警告。
 integrate_path() {
+    local wrapper="$LOCAL_BIN_DIR/kitty" tmp
+
     mkdir -p "$LOCAL_BIN_DIR"
-    ln -sf "$KITTY_BIN_DIR/kitty" "$LOCAL_BIN_DIR/kitty"
+
+    # kitty 入口必须是包装脚本而不是符号链接：X11 下 fcitx5 中文输入
+    # 依赖 GLFW_IM_MODULE=ibus，而 GLFW 在进程初始化时读取该变量，
+    # 只能来自 exec 时的真实环境。实测 kitty.conf 的 env 指令晚于
+    # GLFW 初始化，不生效；从外部 shell/桌面/快捷键启动又各有各的
+    # 环境。所有启动路径（shell、桌面图标、Ctrl+Alt+T 包装脚本）
+    # 最终都走 $LOCAL_BIN_DIR/kitty，在这里 export 一处覆盖全部。
+    tmp="$(mktemp "$wrapper.tmp.XXXXXX")"
+    cat > "$tmp" << EOF
+#!/bin/bash
+# 由 fresh-install/kitty/install.sh 生成：设置 GLFW 输入法桥后启动 kitty
+export GLFW_IM_MODULE=ibus
+exec $KITTY_BIN_DIR/kitty "\$@"
+EOF
+    chmod 755 "$tmp"
+    if [ -f "$wrapper" ] && cmp -s "$tmp" "$wrapper"; then
+        rm -f "$tmp"
+        echo "包装脚本无变化，跳过: $wrapper"
+    else
+        backup_file "$wrapper"
+        mv -f "$tmp" "$wrapper"
+        echo "已写入: $wrapper"
+    fi
+
     ln -sf "$KITTY_BIN_DIR/kitten" "$LOCAL_BIN_DIR/kitten"
-    echo "已创建链接: $LOCAL_BIN_DIR/kitty, $LOCAL_BIN_DIR/kitten"
+    echo "已创建链接: $LOCAL_BIN_DIR/kitten"
 
     # 用当前 PATH 判断。若用户在别的 shell 里跑过本脚本而当前 shell
     # 不是 zsh 配置过的环境，这里的结论可能比实际保守，只警告不误导。
@@ -319,10 +344,9 @@ write_kitty_config() {
         if font_exists "$CJK_FONT_FAMILY"; then
             echo "symbol_map       $CJK_RANGE $CJK_FONT_FAMILY"
         fi
-        # X11 会话下让 kitty 通过 IBus 协议连接 fcitx5 的兼容层，中文输入必需。
-        # Wayland 下 GLFW 走 text-input-v3，此变量被忽略，无副作用。
-        # kitty 的 env 指令就是官方提供的"给 kitty 进程本身设环境变量"通道。
-        echo "env              GLFW_IM_MODULE=ibus"
+        # 注意：GLFW_IM_MODULE 不写在这里。kitty.conf 的 env 指令在
+        # GLFW 初始化之后才生效（实测确认），输入法桥改由
+        # $LOCAL_BIN_DIR/kitty 包装脚本在 exec 前 export（见 integrate_path）。
     } > "$tmp"
 
     if [ -f "$CONFIG_FILE" ] && cmp -s "$tmp" "$CONFIG_FILE"; then
@@ -344,13 +368,6 @@ verify_config() {
     # 两个本脚本，或用户在写入瞬间手改文件）。
     if [ ! -f "$CONFIG_FILE" ]; then
         echo -e "${RED}错误: $CONFIG_FILE 不存在${NC}"
-        return 1
-    fi
-
-    if grep -q "^env[[:space:]]*GLFW_IM_MODULE=ibus$" "$CONFIG_FILE"; then
-        echo "OK: GLFW_IM_MODULE=ibus 已写入（fcitx5 中文输入兼容）"
-    else
-        echo -e "${RED}错误: kitty.conf 中未找到 env GLFW_IM_MODULE=ibus${NC}"
         return 1
     fi
 
@@ -416,7 +433,9 @@ set_default_terminal() {
     cat > "$tmp" << EOF
 #!/bin/bash
 # 由 fresh-install/kitty/install.sh 生成：把 x-terminal-emulator 指向 kitty
-exec $KITTY_BIN_DIR/kitty "\$@"
+# 不直接 exec 二进制，而是走 kitty 包装脚本：那里的 export GLFW_IM_MODULE
+# 是中文输入的必要条件。
+exec $LOCAL_BIN_DIR/kitty "\$@"
 EOF
     chmod 755 "$tmp"
     if [ -f "$wrapper" ] && cmp -s "$tmp" "$wrapper"; then
@@ -468,21 +487,34 @@ smoke_test() {
         return 0
     fi
 
-    echo "启动 kitty 做冒烟测试（6 秒后自动关闭）..."
-    # 先接住退出码再分支：set -e 下裸调用返回非 0（124 正是 timeout
-    # 的正常输出）会直接终止脚本，rc=$? 永远执行不到。
-    rc=0
-    timeout 6 "$KITTY_BIN_DIR/kitty" --config "$CONFIG_FILE" --single-instance=n >/dev/null 2>&1 || rc=$?
+    echo "启动 kitty 做冒烟测试（3 秒后自动关闭）..."
 
-    if [ "$rc" -eq 124 ]; then
-        echo "OK: kitty 正常启动并存活至超时关闭"
-        return 0
+    # 必须走 $LOCAL_BIN_DIR/kitty 包装脚本启动：要验证的不只是"能开窗"，
+    # 还有 GLFW_IM_MODULE 是否真的进入了 kitty 的 exec 环境——那是
+    # fcitx5 中文输入的前提。包装脚本 exec 替换自身，$! 就是 kitty 进程。
+    "$LOCAL_BIN_DIR/kitty" --config "$CONFIG_FILE" --single-instance=n >/dev/null 2>&1 &
+    local kp=$!
+    sleep 3
+
+    if ! kill -0 "$kp" 2>/dev/null; then
+        echo -e "${RED}✗ 冒烟测试失败：kitty 提前退出。${NC}"
+        echo -e "${YELLOW}  可能是 GPU/驱动问题：可尝试在 kitty.conf 加${NC}"
+        echo -e "${YELLOW}  linux_display_server x11 强制 X11 渲染路径。${NC}"
+        return 1
     fi
 
-    echo -e "${RED}✗ 冒烟测试失败（退出码 $rc）${NC}"
-    echo -e "${YELLOW}  窗口未正常打开。可能是 GPU/驱动问题：可尝试在 kitty.conf 加${NC}"
-    echo -e "${YELLOW}  linux_display_server x11 强制 X11 渲染路径。${NC}"
-    return 1
+    # /proc/PID/environ 显示的是 exec 时的初始环境：能看到这个变量，
+    # 才证明 GLFW 初始化时读得到它（与此对照，kitty.conf 的 env 指令
+    # 用 setenv 修改进程环境，在这里是看不到的——那正是它无效的原因）。
+    if tr '\0' '\n' < "/proc/$kp/environ" 2>/dev/null | grep -qx 'GLFW_IM_MODULE=ibus'; then
+        echo "OK: kitty 正常启动，且 GLFW_IM_MODULE=ibus 已进入进程环境（中文输入前提）"
+    else
+        echo -e "${YELLOW}警告: kitty 进程环境中未发现 GLFW_IM_MODULE=ibus${NC}"
+        echo -e "${YELLOW}  包装脚本可能被绕过或内容有误，kitty 里中文输入会失效。${NC}"
+    fi
+
+    kill "$kp" 2>/dev/null || true
+    wait "$kp" 2>/dev/null || true
 }
 
 verify_installation() {
@@ -498,14 +530,19 @@ verify_installation() {
         failed=true
     fi
 
-    for link in kitty kitten; do
-        if [ -L "$LOCAL_BIN_DIR/$link" ]; then
-            echo "OK: $LOCAL_BIN_DIR/$link -> $(readlink "$LOCAL_BIN_DIR/$link")"
-        else
-            echo -e "${RED}错误: $LOCAL_BIN_DIR/$link 不是符号链接${NC}"
-            failed=true
-        fi
-    done
+    if [ -x "$LOCAL_BIN_DIR/kitty" ] && grep -q 'GLFW_IM_MODULE=ibus' "$LOCAL_BIN_DIR/kitty"; then
+        echo "OK: $LOCAL_BIN_DIR/kitty 包装脚本（含 GLFW_IM_MODULE=ibus）"
+    else
+        echo -e "${RED}错误: $LOCAL_BIN_DIR/kitty 包装脚本缺失或不含输入法桥${NC}"
+        failed=true
+    fi
+
+    if [ -L "$LOCAL_BIN_DIR/kitten" ]; then
+        echo "OK: $LOCAL_BIN_DIR/kitten -> $(readlink "$LOCAL_BIN_DIR/kitten")"
+    else
+        echo -e "${RED}错误: $LOCAL_BIN_DIR/kitten 不是符号链接${NC}"
+        failed=true
+    fi
 
     if [ -f "$DESKTOP_DST_DIR/kitty.desktop" ]; then
         echo "OK: 桌面入口 kitty.desktop"
@@ -598,10 +635,10 @@ echo "  2. 键盘协议: kitty 里运行 kitten show-key -m kitty，"
 echo "     按 shift+enter 应显示带 ;2 修饰位的 CSI u 序列（而非裸回车）"
 echo "     —— 这是 pi 等 CLI agent 里 shift+enter 换行生效的前提"
 echo "  3. 中文输入: kitty 里 Ctrl+Space 切到拼音输入一段中文。"
-echo "     若能正常输入即完成；若候选框不出现，说明 fcitx5 的 ibus"
-echo "     兼容层未生效，改用全局环境变量兜底:"
-echo "       echo 'GLFW_IM_MODULE=ibus' | sudo tee -a /etc/environment"
-echo "     然后注销重新登录。"
+echo "     输入法桥已由 $LOCAL_BIN_DIR/kitty 包装脚本注入"
+echo "     （启动时 export GLFW_IM_MODULE=ibus），冒烟测试已确认"
+echo "     该变量进入 kitty 进程环境。若仍无法输入，检查 fcitx5 是否"
+echo "     在运行（pgrep fcitx5），并确认没有别处覆盖该变量。"
 echo
 echo "SSH 提示: ssh 到远端建议用 kitten ssh 而不是 ssh，"
 echo "它会自动带上 kitty terminfo，避免远端报 TERM 未知。"
