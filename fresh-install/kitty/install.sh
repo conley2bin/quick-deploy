@@ -15,7 +15,8 @@
 set -euo pipefail
 
 CHECK_ONLY=false
-DEFAULT_TERMINAL=false
+# 默认接管 Ctrl+Alt+T（单用户机器直接默认开启，--no-default-terminal 可关）
+DEFAULT_TERMINAL=true
 
 SUDO_CMD="${SUDO_CMD:-sudo}"
 
@@ -62,17 +63,17 @@ backup_file() {
 usage() {
     cat << 'EOF'
 用法:
-  ./install.sh [--check] [--default-terminal] [--help]
+  ./install.sh [--check] [--no-default-terminal] [--help]
 
 选项:
-  --check              只检查系统与当前状态，不安装、不修改
-  --default-terminal   把 kitty 设为 GNOME 默认终端（接管 Ctrl+Alt+T）
-                       写入 ~/.config/xdg-terminals.list，默认不开启
-  --help               显示帮助
+  --check                 只检查系统与当前状态，不安装、不修改
+  --no-default-terminal   不接管 Ctrl+Alt+T（默认会接管为 kitty）
+  --help                  显示帮助
 
 注意:
   不要用 sudo 运行本脚本。直接运行 ./install.sh 即可。
-  安装目标在用户目录（~/.local/kitty.app），全程不需要 sudo。
+  kitty 本体安装到用户目录，不需要 sudo；仅当系统缺失 CJK 字体
+  （fonts-noto-cjk）时会调用 sudo apt 安装。
 
   本脚本是幂等的重置工具：重跑会重装最新版 kitty，
   并把 ~/.config/kitty/kitty.conf 重置为基准内容（旧文件先备份）。
@@ -85,7 +86,11 @@ parse_args() {
             --check)
                 CHECK_ONLY=true
                 ;;
+            --no-default-terminal)
+                DEFAULT_TERMINAL=false
+                ;;
             --default-terminal)
+                # 兼容旧命令行，默认已是开启状态
                 DEFAULT_TERMINAL=true
                 ;;
             --help|-h)
@@ -210,6 +215,11 @@ show_current_state() {
         echo "  默认终端: $(tr '\n' ' ' < "$XDG_TERMINALS_FILE")"
     else
         echo "  默认终端: 未设置 kitty（xdg-terminals.list 不存在）"
+    fi
+    if [ -x "$LOCAL_BIN_DIR/x-terminal-emulator" ]; then
+        echo "  Ctrl+Alt+T 接管: $LOCAL_BIN_DIR/x-terminal-emulator -> $KITTY_BIN_DIR/kitty"
+    else
+        echo "  Ctrl+Alt+T 接管: 未设置（x-terminal-emulator 包装脚本不存在）"
     fi
     echo
 
@@ -381,22 +391,64 @@ integrate_desktop() {
 }
 
 # ============================================
-# 步骤 5: 默认终端（可选，--default-terminal 才执行）
+# 步骤 5: 默认终端接管（--no-default-terminal 时不执行）
 # ============================================
-# GNOME 42+ 通过 ~/.config/xdg-terminals.list 决定"打开终端"
-# （Ctrl+Alt+T 与文件管理器右键）用哪个终端，内容是 desktop id，
-# 与 ~/.local/share/applications 下的文件名对应。
+# 目标：Ctrl+Alt+T 打开 kitty。
+#
+# 为什么不用 update-alternatives：它需要 sudo 改 /etc/alternatives，
+# 而 gsd-media-keys（GNOME 快捷键守护进程，Ctrl+Alt+T 的处理者）
+# 启动 x-terminal-emulator 时走的是 PATH 查找——已用 XTEST 注入
+# 真实按键实测验证。Ubuntu 默认的 ~/.profile 会把 ~/.local/bin
+# 放进登录会话 PATH（GDM 登录时 source，再经 pam 进入 systemd
+# 用户会话），所以用户目录里的同名包装脚本即可接管，不需要 root。
+#
+# 为什么还要写 xdg-terminals.list：它对 Ctrl+Alt+T 无效（同样实测
+# 验证过），但它影响遵守 xdg-terminal-exec 规范的程序（如文件管理器
+# 的“在终端中打开”），两者各管各的场景，都写上。
 set_default_terminal() {
-    mkdir -p "$(dirname "$XDG_TERMINALS_FILE")"
+    local wrapper="$LOCAL_BIN_DIR/x-terminal-emulator" tmp
 
-    if [ -f "$XDG_TERMINALS_FILE" ] && cmp -s <(printf 'kitty.desktop\n') "$XDG_TERMINALS_FILE"; then
-        echo "默认终端已是 kitty，跳过"
-        return 0
+    mkdir -p "$LOCAL_BIN_DIR"
+
+    # 用临时文件写而非直接重定向：写一半失败不会留下残缺脚本；
+    # mv 是同文件系统内的原子替换。
+    tmp="$(mktemp "$wrapper.tmp.XXXXXX")"
+    cat > "$tmp" << EOF
+#!/bin/bash
+# 由 fresh-install/kitty/install.sh 生成：把 x-terminal-emulator 指向 kitty
+exec $KITTY_BIN_DIR/kitty "\$@"
+EOF
+    chmod 755 "$tmp"
+    if [ -f "$wrapper" ] && cmp -s "$tmp" "$wrapper"; then
+        rm -f "$tmp"
+        echo "包装脚本无变化，跳过: $wrapper"
+    else
+        backup_file "$wrapper"
+        mv -f "$tmp" "$wrapper"
+        echo "已写入: $wrapper"
     fi
 
-    backup_file "$XDG_TERMINALS_FILE"
-    printf 'kitty.desktop\n' > "$XDG_TERMINALS_FILE"
-    echo "已写入默认终端: $XDG_TERMINALS_FILE"
+    mkdir -p "$(dirname "$XDG_TERMINALS_FILE")"
+    if [ -f "$XDG_TERMINALS_FILE" ] && cmp -s <(printf 'kitty.desktop\n') "$XDG_TERMINALS_FILE"; then
+        echo "默认终端已是 kitty，跳过"
+    else
+        backup_file "$XDG_TERMINALS_FILE"
+        printf 'kitty.desktop\n' > "$XDG_TERMINALS_FILE"
+        echo "已写入默认终端: $XDG_TERMINALS_FILE"
+    fi
+
+    # 登录会话的 gsd-media-keys 由 systemd 用户管理器启动，PATH 继承自
+    # 登录时的会话环境。标准 Ubuntu 的 ~/.profile 会加入 ~/.local/bin；
+    # 若用户的 ~/.profile 改过，重新登录后 Ctrl+Alt+T 会退回系统
+    # x-terminal-emulator（gnome-terminal）。这里提前检查并警告。
+    if ! systemctl --user show-environment 2>/dev/null | grep '^PATH=' | grep -qF "$LOCAL_BIN_DIR"; then
+        echo -e "${YELLOW}警告: systemd 用户会话 PATH 中未包含 $LOCAL_BIN_DIR。${NC}"
+        echo -e "${YELLOW}  重新登录后 Ctrl+Alt+T 可能仍启动旧终端。${NC}"
+        echo -e "${YELLOW}  请确认 ~/.profile 中保留以下配置块（Ubuntu 默认就有）:${NC}"
+        echo -e "${YELLOW}    if [ -d \"\$HOME/.local/bin\" ] ; then${NC}"
+        echo -e "${YELLOW}        PATH=\"\$HOME/.local/bin:\$PATH\"${NC}"
+        echo -e "${YELLOW}    fi${NC}"
+    fi
 }
 
 # ============================================
@@ -462,6 +514,21 @@ verify_installation() {
         failed=true
     fi
 
+    if [ "$DEFAULT_TERMINAL" = true ]; then
+        if [ -x "$LOCAL_BIN_DIR/x-terminal-emulator" ]; then
+            echo "OK: $LOCAL_BIN_DIR/x-terminal-emulator（接管 Ctrl+Alt+T）"
+        else
+            echo -e "${RED}错误: $LOCAL_BIN_DIR/x-terminal-emulator 不存在${NC}"
+            failed=true
+        fi
+        if [ -f "$XDG_TERMINALS_FILE" ] && grep -qx 'kitty.desktop' "$XDG_TERMINALS_FILE"; then
+            echo "OK: 默认终端 xdg-terminals.list = kitty.desktop"
+        else
+            echo -e "${RED}错误: $XDG_TERMINALS_FILE 未指向 kitty.desktop${NC}"
+            failed=true
+        fi
+    fi
+
     if [ "$failed" = true ]; then
         echo
         echo "安装后检查发现错误，请先处理以上问题。"
@@ -502,7 +569,7 @@ section "[$((++STEP))/$TOTAL] 写入 kitty 配置"
 write_kitty_config
 verify_config
 
-section "[$((++STEP))/$TOTAL] 桌面集成"
+section "[$((++STEP))/$TOTAL] 桌面集成与默认终端"
 integrate_desktop
 if [ "$DEFAULT_TERMINAL" = true ]; then
     set_default_terminal
@@ -518,8 +585,15 @@ echo "========================================"
 echo "  安装完成"
 echo "========================================"
 echo
+if [ "$DEFAULT_TERMINAL" = true ]; then
+    echo "Ctrl+Alt+T: 已通过 ~/.local/bin/x-terminal-emulator 包装脚本接管，"
+    echo "  立即生效（gsd-media-keys 每次按键实时解析，无需注销）"
+else
+    echo "Ctrl+Alt+T: 保持系统原样（--no-default-terminal）"
+fi
+echo
 echo "验证清单:"
-echo "  1. 终端里运行: kitty"
+echo "  1. 按 Ctrl+Alt+T —— 应打开 kitty"
 echo "  2. 键盘协议: kitty 里运行 kitten show-key -m kitty，"
 echo "     按 shift+enter 应显示带 ;2 修饰位的 CSI u 序列（而非裸回车）"
 echo "     —— 这是 pi 等 CLI agent 里 shift+enter 换行生效的前提"

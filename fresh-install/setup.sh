@@ -11,7 +11,9 @@
 #      失败只提示一句不中止，网络就绪后随时可单独重跑 import-dict.sh
 #   6. kitty 终端 —— 官方最新版，二进制同样从 GitHub 下载，
 #      与第 5 步一样失败只提示不中止；安装的是用户目录的独立版本，
-#      不需要 sudo，也随时可单独重跑 kitty/install.sh
+#      默认接管 Ctrl+Alt+T（--no-default-terminal 可关），
+#      除缺失 CJK 字体需 apt 安装外不需要 sudo，随时可单独重跑
+#      kitty/install.sh
 # 前 4 步任何一步失败即中止；修复后重跑本脚本即可，
 # 每个子脚本都幂等（会自动跳过或重做，无副作用）。
 
