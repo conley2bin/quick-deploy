@@ -35,6 +35,35 @@ EOF
     printf '    - %s\n' "${TUN_EXCLUDED_PREFIXES[@]}"
 }
 
+# 规范 sniffer 块 —— 全脚本唯一副本，输出到 stdout
+#
+# 为什么需要它：DOMAIN-SUFFIX,dex-gem.ai,DIRECT 只对「带域名」的连接生效。
+# fake-ip 路径域名在（应用连的是 fake IP，mihomo 查表还原域名再匹配规则）。
+# 但任何绕过 mihomo DNS 的解析都会让连接以真实 IP 裸进 TUN，域名上下文丢失：
+#   - 应用自带 DoH / DoT 解析
+#   - 系统 DNS 指向 10/8、192.168/16、172.16/12 段内的解析器（这些段被 TUN 排除，
+#     DNS 查询不进 TUN、不被 hijack，拿到的是真实 IP）
+#   - 应用硬编码 IP
+# 这类连接不匹配任何域名规则，实测一路掉到 MATCH 走代理。
+# 2026-08-19 conley-company 实测：openssl s_client 连 litellm.dex-gem.ai 的
+# 真实 Cloudflare IP 104.21.42.134:443，连接表里 rule=Match、chains 指向机场节点。
+# 开启 sniffer 后 mihomo 从 TLS ClientHello 的 SNI 恢复 litellm.dex-gem.ai，
+# 直连规则重新命中 —— 直连不再依赖 DNS 恰好走了 fake-ip。
+# 订阅与本 Merge 此前都没有 sniffer 段，由本块补齐（顶层键，mihomo 原生支持）。
+sniffer_block() {
+    cat << 'EOF'
+sniffer:
+  enable: true
+  sniff:
+    TLS:
+      ports: [443, 8443]
+    HTTP:
+      ports: [80, 8080-8880]
+    QUIC:
+      ports: [443]
+EOF
+}
+
 # 获取全局 Merge 配置文件
 get_merge_config() {
     local merge_file=$(awk '
@@ -199,13 +228,16 @@ fake_ip_filter_block() {
     # 让全局脚本的 DOMAIN-SUFFIX,dex-gem.ai,DIRECT 规则确定性命中；
     # 若在此过滤，应用拿到真实 IP 后连接没有域名信息，会绕过域名规则、
     # 一路掉到最后的 MATCH（通常是代理）。
-    # 本订阅实测既无 sniffer 段也无 dns.respect-rules，所以域名一旦丢失
-    # 没有任何恢复途径 —— 不要指望嗅探兼得两边。
+    # 本订阅实测既无 sniffer 段也无 dns.respect-rules —— 这是 2026-08-19 之前
+    # 的状态；此后本脚本会写入 sniffer 块，为「真实 IP 裸进 TUN」的连接从
+    # TLS SNI 恢复域名（见 sniffer_block），域名丢失不再是不可恢复的。
+    # 但这只是兑底：主路径仍是 fake-ip，本条目继续排除。
     #
     # 同样的陷阱目前仍存在于 bytedance.com：它同时在本列表和全局脚本的
     # DOMAIN-SUFFIX,bytedance.com,DIRECT 里，后者因此永远不会命中（实测活跃位次 22，
-    # 但连接的 host 为空），bytedance 直连实际靠 GEOIP,CN 接住。本次不改动它，
-    # 但别把"规则列表里有这条"当作"这条在生效"。
+    # 但连接的 host 为空），bytedance 直连实际靠 GEOIP,CN 接住。sniffer 块写入后
+    # 这类连接会从 SNI 恢复出 bytedance.com，域名规则重新有机会命中。本次不改动
+    # 该条目的归属，但别把「规则列表里有这条」当作「这条在生效」。
 EOF
 }
 
@@ -302,6 +334,44 @@ update_tun_config() {
         echo "已追加 TUN 配置块 (route-exclude-address)"
     fi
     echo "这只说明文本已写入；是否真的生效需 Clash Verge 重载后用 verify_tun_routes 看内核"
+}
+
+# 写入规范 sniffer 配置（可重复执行）
+#
+# 删除旧 sniffer: 块（从 ^sniffer: 到下一个顶层键）后，插到 tun: 块之前；
+# 没有 tun: 块就追加到文件末尾。插到 tun 之前是为了让本函数与 update_tun_config
+# 各自重复执行时文件内容字节级一致（update_tun_config 会把 tun 块挪到文件尾，
+# 两个函数都往末尾追加会让两块来回换位置）。
+update_sniffer_config() {
+    local file="$1"
+
+    if [ ! -f "$file" ]; then
+        sniffer_block > "$file"
+        echo "已创建并写入 sniffer 配置块: $file"
+        return
+    fi
+
+    # 与 update_tun_config 同一套删除 + 尾部空行规范，保证幂等
+    awk '
+        BEGIN {skip=0; pending=0}
+        /^sniffer:/ {skip=1; next}
+        skip && /^[^[:space:]]/ {skip=0}
+        skip {next}
+        /^[[:space:]]*$/ {pending++; next}
+        {while (pending-- > 0) print ""; pending=0; print}
+    ' "$file" > "${file}.tmp" && mv "${file}.tmp" "$file"
+
+    local content
+    content=$(sniffer_block)
+    if grep -q '^tun:' "$file"; then
+        awk -v block="$content" '/^tun:/ {print block; print ""; print; next} 1' "$file" > "${file}.tmp" && mv "${file}.tmp" "$file"
+        echo "已写入 sniffer 配置块（位于 tun 块之前）"
+    else
+        echo "" >> "$file"
+        printf '%s\n' "$content" >> "$file"
+        echo "已追加 sniffer 配置块（文件中没有 tun 块）"
+    fi
+    echo "这只说明文本已写入；是否真的生效需 Clash Verge 重载后用 verify_sniffer_live 实测"
 }
 
 # 验证直连规则在活跃配置里的真实位次
@@ -499,6 +569,126 @@ verify_tun_routes() {
     echo ""
 }
 
+# 裸 IP 直连实测：sniffer 是否把 TLS SNI 恢复成域名，让直连规则命中。
+#
+# 静态检查只能确认 sniffer.enable 写进了配置；真正的判据是造一条「域名上下文
+# 丢失」的连接（直连真实 Cloudflare IP，不走 fake-ip），看它命中
+# DomainSuffix,dex-gem.ai 还是掉到 MATCH 走代理。
+# 2026-08-19 实测：无 sniffer 时这条裸连命中 Match -> chains 指向机场节点。
+verify_sniffer_live() {
+    echo ""
+    echo "=========================================="
+    echo "  裸 IP 直连实测（sniffer 生效性）"
+    echo "=========================================="
+    echo ""
+
+    local sock="/tmp/verge/verge-mihomo.sock"
+
+    if ! command -v curl >/dev/null 2>&1; then
+        echo "未找到 curl，无法实测"
+        return
+    fi
+    if ! command -v openssl >/dev/null 2>&1; then
+        echo "note 未找到 openssl，无法造 TLS ClientHello，跳过实测（这是跳过，不是通过）"
+        return
+    fi
+
+    local rules_json
+    rules_json=$(curl -s --max-time 5 --unix-socket "$sock" http://localhost/rules 2>/dev/null || true)
+    if [ -z "$rules_json" ]; then
+        echo "Clash Verge 未运行，无法实测。"
+        return
+    fi
+
+    # 先看静态配置是否进了内核。mihomo 1.19 的 /configs 把嗅探段序列化为
+    # "sniffing" 键（值为 true 或对象），不是配置文件里的 sniffer 键。
+    local sniffer_on
+    sniffer_on=$(curl -s --max-time 5 --unix-socket "$sock" http://localhost/configs 2>/dev/null \
+        | python3 -c 'import json,sys
+c=json.load(sys.stdin)
+s=c.get("sniffing")
+s2=c.get("sniffer") or {}
+ok=bool(s) or bool(s2.get("enable"))
+print("True" if ok else "False")' 2>/dev/null || true)
+    if [ "$sniffer_on" = "True" ]; then
+        echo "pass /configs 中 sniffing/sniffer.enable = true"
+    else
+        echo "fail /configs 中 sniffing/sniffer.enable = ${sniffer_on:-缺字段} —— 配置没进内核"
+        echo "      刚改完 Merge 配置还没重载时，这里看到的就是旧内核状态；重载 Clash Verge 后重跑。"
+        return
+    fi
+
+    # 拿真实 IP：DoH 查询走 https，绕开 mihomo 的 :53 hijack，拿到的不是 fake IP。
+    # 这条 DoH 连接本身可能走代理，但它返回的 JSON 里是真实解析结果。
+    local realip
+    realip=$(curl -s --max-time 8 "https://1.1.1.1/dns-query?name=litellm.dex-gem.ai&type=A" \
+        -H "accept: application/dns-json" 2>/dev/null \
+        | python3 -c 'import json,sys
+try:
+    print([a["data"] for a in json.load(sys.stdin)["Answer"] if a.get("type")==1][0])
+except Exception:
+    pass' 2>/dev/null || true)
+
+    if [ -z "$realip" ]; then
+        echo "fail DoH 拿不到 litellm.dex-gem.ai 的真实 IP，无法实测"
+        return
+    fi
+    echo "litellm.dex-gem.ai 真实 IP: $realip"
+
+    # 保持一条带 SNI 的裸连接开几秒，让它在连接表里可查。
+    # openssl 发 TLS ClientHello（SNI=litellm.dex-gem.ai）后挂着不动，
+    # 模拟「域名上下文丢失、只有真实 IP」的连接。
+    (sleep 4 | timeout 6 openssl s_client -quiet -connect "$realip:443" -servername litellm.dex-gem.ai >/dev/null 2>&1) &
+    local hold=$!
+    sleep 1
+
+    local result
+    result=$(curl -s --max-time 5 --unix-socket "$sock" http://localhost/connections 2>/dev/null \
+        | python3 -c '
+import json,sys
+try:
+    conns=json.load(sys.stdin)["connections"]
+except Exception:
+    sys.exit(0)
+# 第一轮：sniffHost 非空的连接才是嗅探恢复出的裸连，优先取它。
+# 不能先按 remoteDestination 匹配 —— pi 的 fake-ip 直连（嗅探无关）也指向
+# 同一个真实 IP，先命中它会把「没嗅探也直连」误报成「嗅探生效」。
+found=None
+for c in conns:
+    if c.get("metadata",{}).get("sniffHost")=="litellm.dex-gem.ai":
+        found=c; break
+# 第二轮：嗅探失败时裸连的 destinationIP 就是真实 IP，且 host 为空 ——
+# 靠 host=="" 把它与 pi 的 fake-ip 直连（host 非空）区分开，避免误报。
+if found is None:
+    for c in conns:
+        m=c.get("metadata",{})
+        if m.get("host")=="" and (m.get("destinationIP")==sys.argv[1] or m.get("remoteDestination")==sys.argv[1]):
+            found=c; break
+if found:
+    print(found.get("rule",""), "|", found.get("rulePayload",""), "|", "|".join(found.get("chains") or []))
+' "$realip" 2>/dev/null || true)
+    # wait 会透传后台任务的退出码：timeout 掐掉 openssl 时是 124，
+    # 必须 || true，否则 set -e 会把脚本从函数中途静默终止。
+    wait "$hold" 2>/dev/null || true
+
+    if [ -z "$result" ]; then
+        echo "fail 连接表里没找到 dst=$realip 的连接（采样窗口太短），重跑本检查即可"
+        return
+    fi
+
+    case "$result" in
+        DomainSuffix*dex-gem.ai*DIRECT*)
+            echo "pass 裸 IP 连接命中: $result"
+            echo "      sniffer 从 SNI 恢复了域名，真实 IP 路径也直连，不再依赖 fake-ip"
+            ;;
+        *)
+            echo "fail 裸 IP 连接命中: $result"
+            echo "      sniffer 没有恢复域名，真实 IP 路径仍在走代理"
+            ;;
+    esac
+    echo ""
+}
+
 # 移除 prepend-rules（已改用全局脚本写入 rules）
 remove_prepend_rules() {
     local file="$1"
@@ -587,6 +777,8 @@ function main(config) {
     // 443 实测可用（mihomo 拨代理节点本身就是直连境外 IP:443 成功的），
     // 直连把这一整类故障从 pi 的关键路径上移除。
     // 注意配套约束：dex-gem.ai 不要加进 fake-ip-filter（见该块的注释）。
+    // 本规则只对带域名的连接生效；绕过 mihomo DNS 的路径（DoH、排除段内 DNS、
+    // 硬编码 IP）由 Merge 里的 sniffer 从 TLS SNI 恢复域名兑底（见 sniffer_block）。
     "DOMAIN-SUFFIX,dex-gem.ai,DIRECT",
     // 飞书直连。实测（2026-08-18 本机 dig）飞书全部解析到中国大陆 IP：
     // dexrobot.feishu.cn -> 223.111.230.73-80（中国移动），www.feishu.cn -> 221.130.195.x，
@@ -887,9 +1079,10 @@ verify_merge_yaml() {
     fi
 
     # grep -c 计数为 0 时退出码是 1，赋值必须带 || true 防 set -e 误杀
-    local n_filter n_tun
+    local n_filter n_tun n_sniffer
     n_filter=$(grep -cE '^[[:space:]]*fake-ip-filter:' "$file" || true)
     n_tun=$(grep -c '^tun:' "$file" || true)
+    n_sniffer=$(grep -c '^sniffer:' "$file" || true)
 
     if [ "$n_filter" -eq 1 ]; then
         echo "pass fake-ip-filter 恰好 1 处"
@@ -902,6 +1095,19 @@ verify_merge_yaml() {
         echo "pass tun 块恰好 1 处"
     else
         echo "fail tun: 出现 $n_tun 处（应为 1）"
+        fail=1
+    fi
+
+    if [ "$n_sniffer" -eq 1 ]; then
+        echo "pass sniffer 块恰好 1 处"
+    else
+        echo "fail sniffer: 出现 $n_sniffer 处（应为 1）"
+        fail=1
+    fi
+    if grep -A 3 '^sniffer:' "$file" | grep -q 'enable: true'; then
+        echo "pass sniffer 块含 enable: true"
+    else
+        echo "fail sniffer 块缺 enable: true"
         fail=1
     fi
 
@@ -979,6 +1185,7 @@ optimize_all() {
     remove_prepend_rules "$file"
     update_fake_ip_filter "$file"
     update_tun_config "$file"
+    update_sniffer_config "$file"
     update_direct_rules "$file"
 
     # 文本手术的成功输出 ≠ 文件结构正确，写后校验未通过就以非零退出
@@ -986,6 +1193,9 @@ optimize_all() {
 
     # 写入 Script.js ≠ 规则真的在顶部，去问内核拿到的那份规则表
     verify_direct_rules
+
+    # 规则在顶部 ≠ 裸 IP 连接也直连，造一条真实 IP 连接看 sniffer 是否救回域名
+    verify_sniffer_live
 
     echo ""
     echo "=========================================="
@@ -1006,6 +1216,10 @@ optimize_all() {
     echo "    域名规则永远不会命中（改动前飞书直连完全靠 GEOIP,CN 碰巧接住）"
     echo "  - LiteLLM 网关 (dex-gem.ai) 直连 —— pi CLI 的模型入口；走代理时"
     echo "    节点失联曾导致 pi 全程 Connection error（2026-08-09 实测），直连后免疫"
+    echo "  - sniffer: TLS/HTTP/QUIC 嗅探 —— 域名规则只对带域名的连接生效；绕过 mihomo"
+    echo "    DNS 的路径（DoH、排除段内 DNS、硬编码 IP）连接以真实 IP 裸进 TUN，此前"
+    echo "    一路掉到 MATCH 走代理（2026-08-19 实测）。sniffer 从 TLS SNI 恢复域名，"
+    echo "    litellm.dex-gem.ai 的直连不再依赖 fake-ip。由 verify_sniffer_live 实测"
     echo "  - 出站 TCP/22 直连 (DST-PORT,22) —— 机场 84 个节点全部封禁出站 22，"
     echo "    走代理必然是 connect 后 0 字节断开；直连是唯一可用路径"
     echo "  - 中国大陆 IP (GEOIP,CN)"
