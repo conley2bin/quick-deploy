@@ -409,6 +409,11 @@ THEME_EOF
         # GLFW 初始化之后才生效（实测确认），输入法桥改由
         # $LOCAL_BIN_DIR/kitty 包装脚本在 exec 前 export（见 integrate_path）。
 
+        # F11 全屏：部分环境（如某些桌面/输入法全局键冲突）下 kitty
+        # 默认不拦截裸 F11，按键会按传统编码 ESC[23~ 发给终端内程序，
+        # 表现为输入框出现 ~。显式声明映射，kitty 才会优先拦截。
+        echo "map f11 toggle_fullscreen"
+
         # 主题文件放在最后 include：theme.conf 由首次安装写入 Frappé，
         # 之后 kitten themes 切换主题会更新它，重跑本脚本只重置基准
         # 配置、不动用户主题。
