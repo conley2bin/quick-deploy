@@ -25,6 +25,7 @@ KITTY_BIN_DIR="$KITTY_APP_DIR/bin"
 LOCAL_BIN_DIR="$HOME/.local/bin"
 CONFIG_DIR="$HOME/.config/kitty"
 CONFIG_FILE="$CONFIG_DIR/kitty.conf"
+THEME_FILE="$CONFIG_DIR/theme.conf"
 DESKTOP_SRC_DIR="$KITTY_APP_DIR/share/applications"
 DESKTOP_DST_DIR="$HOME/.local/share/applications"
 XDG_TERMINALS_FILE="$HOME/.config/xdg-terminals.list"
@@ -216,6 +217,11 @@ show_current_state() {
     else
         echo "  默认终端: 未设置 kitty（xdg-terminals.list 不存在）"
     fi
+    if [ -f "$THEME_FILE" ]; then
+        echo "  主题文件: $THEME_FILE $(grep -m1 '^background' "$THEME_FILE" | awk '{print "(背景 " $2 ")"}')"
+    else
+        echo "  主题文件: 不存在（首次安装将写入 Catppuccin Frappé）"
+    fi
     if [ -x "$LOCAL_BIN_DIR/x-terminal-emulator" ]; then
         echo "  Ctrl+Alt+T 接管: $LOCAL_BIN_DIR/x-terminal-emulator -> $KITTY_BIN_DIR/kitty"
     else
@@ -330,6 +336,61 @@ write_kitty_config() {
 
     mkdir -p "$CONFIG_DIR"
 
+    # 主题文件只在不存在时写入（首次安装 = Catppuccin Frappé 基准主题）。
+    # 之后用户用 kitten themes 切换主题会更新这个文件——重跑本脚本
+    # 绝不覆盖它：主题是用户选择，不在"重置基准"范围内。
+    if [ ! -f "$THEME_FILE" ]; then
+        cat > "$THEME_FILE" << 'THEME_EOF'
+# Catppuccin Kitty Frappé
+# upstream: https://github.com/catppuccin/kitty/blob/main/themes/frappe.conf
+# 由 fresh-install/kitty/install.sh 在首次安装时写入，
+# 之后由 kitten themes 管理，重跑本脚本不会覆盖。
+foreground              #c6d0f5
+background              #303446
+selection_foreground    #303446
+selection_background    #f2d5cf
+cursor                  #f2d5cf
+cursor_text_color       #303446
+scrollbar_handle_color  #949cbb
+scrollbar_track_color   #51576d
+url_color               #f2d5cf
+active_border_color     #babbf1
+inactive_border_color   #737994
+bell_border_color       #e5c890
+active_tab_foreground   #232634
+active_tab_background   #ca9ee6
+inactive_tab_foreground #c6d0f5
+inactive_tab_background #292c3c
+tab_bar_background      #232634
+mark1_foreground #303446
+mark1_background #babbf1
+mark2_foreground #303446
+mark2_background #ca9ee6
+mark3_foreground #303446
+mark3_background #85c1dc
+color0  #51576d
+color1  #e78284
+color2  #a6d189
+color3  #e5c890
+color4  #8caaee
+color5  #f4b8e4
+color6  #81c8be
+color7  #b5bfe2
+color8  #626880
+color9  #e78284
+color10 #a6d189
+color11 #e5c890
+color12 #8caaee
+color13 #f4b8e4
+color14 #81c8be
+color15 #a5adce
+THEME_EOF
+        echo "已写入默认主题 (Catppuccin Frappé): $THEME_FILE"
+    else
+        echo "主题文件已存在，保持不动: $THEME_FILE"
+        echo "（kitten themes 的用户选择不会被重跑重置）"
+    fi
+
     # 同目录 mktemp + mv：重定向写入会先截断目标文件，磁盘满或写失败时
     # 原文件被截成空。mv 是同一文件系统内的原子替换，失败则原文件完好。
     tmp="$(mktemp "$CONFIG_FILE.tmp.XXXXXX")"
@@ -347,6 +408,11 @@ write_kitty_config() {
         # 注意：GLFW_IM_MODULE 不写在这里。kitty.conf 的 env 指令在
         # GLFW 初始化之后才生效（实测确认），输入法桥改由
         # $LOCAL_BIN_DIR/kitty 包装脚本在 exec 前 export（见 integrate_path）。
+
+        # 主题文件放在最后 include：theme.conf 由首次安装写入 Frappé，
+        # 之后 kitten themes 切换主题会更新它，重跑本脚本只重置基准
+        # 配置、不动用户主题。
+        echo "include theme.conf"
     } > "$tmp"
 
     if [ -f "$CONFIG_FILE" ] && cmp -s "$tmp" "$CONFIG_FILE"; then
@@ -377,6 +443,21 @@ verify_config() {
     else
         echo -e "${RED}错误: font_size 期望 $FONT_SIZE，实际 ${actual:-(空)}${NC}"
         return 1
+    fi
+
+    if grep -q '^include[[:space:]]*theme.conf$' "$CONFIG_FILE"; then
+        echo "OK: include theme.conf 已写入（主题文件引用）"
+    else
+        echo -e "${RED}错误: kitty.conf 中未找到 include theme.conf${NC}"
+        return 1
+    fi
+
+    if [ -f "$THEME_FILE" ] && grep -q '^background[[:space:]]*#303446$' "$THEME_FILE"; then
+        echo "OK: 主题文件存在（首次安装写入的 Frappé 或用户自选主题均满足）"
+    else
+        echo -e "${YELLOW}警告: $THEME_FILE 缺失，主题回退为 kitty 默认配色。${NC}"
+        echo -e "${YELLOW}  首次安装会写入 Frappé；若这是重跑且文件被手动删除，${NC}"
+        echo -e "${YELLOW}  重跑本脚本可恢复。${NC}"
     fi
 }
 
@@ -642,6 +723,9 @@ echo "     在运行（pgrep fcitx5），并确认没有别处覆盖该变量。
 echo
 echo "SSH 提示: ssh 到远端建议用 kitten ssh 而不是 ssh，"
 echo "它会自动带上 kitty terminfo，避免远端报 TERM 未知。"
+echo
+echo "主题: 已默认启用 Catppuccin Frappé。换主题运行 kitten themes"
+echo "（实时预览），切换后的选择写在 $THEME_FILE，重跑本脚本不会重置。"
 echo
 echo "清理提示: 重跑本脚本 = 重装最新版 + 重置配置。"
 echo "旧配置备份在 $CONFIG_FILE.bak.<时间戳>，确认无误可自行删除。"
