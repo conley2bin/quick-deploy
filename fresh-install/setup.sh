@@ -9,6 +9,9 @@
 #   5. 维基百科词库 —— 默认执行。从 GitHub 下载约 39MiB，
 #      全新机器此刻很可能还没有代理，下载可能失败：
 #      失败只提示一句不中止，网络就绪后随时可单独重跑 import-dict.sh
+#   6. kitty 终端 —— 官方最新版，二进制同样从 GitHub 下载，
+#      与第 5 步一样失败只提示不中止；安装的是用户目录的独立版本，
+#      不需要 sudo，也随时可单独重跑 kitty/install.sh
 # 前 4 步任何一步失败即中止；修复后重跑本脚本即可，
 # 每个子脚本都幂等（会自动跳过或重做，无副作用）。
 
@@ -29,6 +32,7 @@ STEPS=(
     "zsh/install.sh|安装 zsh 与 oh-my-zsh|required"
     "chinese-input-method/install.sh|安装配置中文输入法|required"
     "chinese-input-method/import-dict.sh|导入维基百科拼音词库|tolerate"
+    "kitty/install.sh|安装配置 kitty 终端|tolerate"
 )
 
 echo -e "${GREEN}========================================${NC}"
