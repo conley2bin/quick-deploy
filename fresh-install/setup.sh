@@ -12,8 +12,8 @@
 #   6. Ghostty 终端 —— 第三方社区包（上游不发布官方 Linux 二进制）。
 #      优先走 PPA（PGP 签名链），失败退回校验过 SHA-256 的 GitHub .deb；
 #      与第 5 步一样失败只提示不中止（新机器无代理时可能连不上）。
-#      系统级安装、需要 sudo；默认不接管 Ctrl+Alt+T（--default-terminal
-#      才接管），随时可单独重跑 ghostty/install.sh
+#      系统级安装、需要 sudo；默认接管 Ctrl+Alt+T（--no-default-terminal
+#      可关），随时可单独重跑 ghostty/install.sh
 # 前 4 步任何一步失败即中止；修复后重跑本脚本即可，
 # 每个子脚本都幂等（会自动跳过或重做，无副作用）。
 

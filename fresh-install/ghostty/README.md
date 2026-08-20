@@ -86,20 +86,34 @@ sudo apt install --allow-downgrades ghostty=1.3.1~ppa2-noble1
 
 本模块不会另写主题文件，也不会改写软件包提供的 desktop 文件。
 
-## 默认终端是显式选择
+## 默认接管 Ctrl+Alt+T
 
-默认运行**不会接管 Ctrl+Alt+T**，也不会改当前的 `xdg-terminals.list`。只有显式使用：
-
-```bash
-./install.sh --default-terminal
-```
-
-才会写入：
+默认运行**会接管 Ctrl+Alt+T**。写入：
 
 - `~/.local/bin/x-terminal-emulator`：执行 `/usr/bin/ghostty "$@"`，供 GNOME 的 `gsd-media-keys` 通过 PATH 启动；
 - `~/.config/xdg-terminals.list`：内容为 `com.mitchellh.ghostty.desktop`，供遵守 `xdg-terminal-exec` 的程序使用。
 
-若这些文件当前属于 kitty 或其它终端，脚本先保存 `.bak.<时间戳>` 再替换，不会删除 kitty。本模块也不会调用 `update-alternatives` 修改系统级默认终端。
+不想接管时显式关闭：
+
+```bash
+./install.sh --no-default-terminal
+```
+
+若这些文件当前属于其它终端，脚本先保存 `.bak.<时间戳>` 再替换，不会删除它们。本模块也不会调用 `update-alternatives` 修改系统级默认终端。
+
+### 与 X11 / Wayland 无关
+
+接管机制是“GSettings 值 + 进程启动”，不依赖 X11：`gsd-media-keys` 读
+`org.gnome.desktop.default-applications.terminal`（值为 `x-terminal-emulator`），
+然后按 PATH 启动。名字里的 “x-” 是 Debian alternatives 的历史命名（X terminal
+emulator），不是对 X11 API 的依赖。切到 Wayland 后，只有“按键怎么被抓到”
+变了（X11 走 XGrabKey，Wayland 由 Mutter 内部路由），启动终端那一步两者完全
+相同，本模块写的包装脚本两边都生效。
+
+> fcitx5 中文输入则是另一回事：上游 issue #12679 报告 Ghostty 在
+> **GNOME Wayland** 下 fcitx5 候选框错位、中文不上屏（工作区变通是
+> `GDK_BACKEND=x11 ghostty` 强制走 XWayland）。本机当前是 X11 会话，不受
+> 影响；若以后切到 Wayland 且中文输入异常，先试该环境变量。
 
 ## `--check` 是只读预检
 
@@ -117,7 +131,7 @@ sudo apt install --allow-downgrades ghostty=1.3.1~ppa2-noble1
 3. 确认主题为 Catppuccin Frappe，字号为 12；按 `F11` 能切换全屏。
 4. 在 Ghostty 中用 fcitx5 输入一段中文。安装脚本的 GUI 冒烟测试只证明 GTK4 的 `libim-fcitx5.so` 已载入进程；最终文本提交仍应人工确认。
 5. 运行 `infocmp xterm-ghostty`，确认本机 terminfo 可读。
-6. 仅在使用了 `--default-terminal` 时按 Ctrl+Alt+T，确认启动 Ghostty；同时从文件管理器测试“在终端中打开”。
+6. 按 Ctrl+Alt+T 确认启动 Ghostty（默认已接管；若用了 `--no-default-terminal` 则跳过此项）；同时从文件管理器测试“在终端中打开”。
 7. SSH 到尚未安装该 terminfo 的远端时，可执行：
 
    ```bash

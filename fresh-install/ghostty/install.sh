@@ -13,7 +13,11 @@
 set -euo pipefail
 
 CHECK_ONLY=false
-DEFAULT_TERMINAL=false
+# 默认接管 Ctrl+Alt+T。本模块刚引入时默认为否，是为了不和当时还在的
+# kitty 模块争抢同一个包装脚本（两个模块都写就是后跑者赢，无告警）。
+# kitty 模块已移除，Ghostty 是本仓库唯一的终端模块，该理由不再成立；
+# 不接管反而会让新机器装完 Ctrl+Alt+T 仍指向 gnome-terminal。
+DEFAULT_TERMINAL=true
 INSTALL_MODE="auto"
 SUDO_CMD="${SUDO_CMD:-sudo}"
 
@@ -61,19 +65,20 @@ warn() {
 usage() {
     cat <<'EOF'
 用法:
-  ./install.sh [--check] [--default-terminal] [--ppa-only | --deb-only] [--help]
+  ./install.sh [--check] [--no-default-terminal] [--ppa-only | --deb-only] [--help]
 
 选项:
-  --check              只读预检：报告当前状态与计划，不安装、不修改
-  --default-terminal   接管 Ctrl+Alt+T，并设置 xdg-terminal-exec 默认终端
-  --ppa-only           只使用第三方 PPA；失败时不退回 GitHub .deb
-  --deb-only           跳过 PPA，直接安装经 SHA-256 核对的 GitHub .deb
-  --help               显示帮助
+  --check                 只读预检：报告当前状态与计划，不安装、不修改
+  --no-default-terminal   不接管 Ctrl+Alt+T（默认会接管）
+  --default-terminal      兼容旧命令行，默认已是开启状态
+  --ppa-only              只使用第三方 PPA；失败时不退回 GitHub .deb
+  --deb-only              跳过 PPA，直接安装经 SHA-256 核对的 GitHub .deb
+  --help                  显示帮助
 
 注意:
   不要用 sudo 运行本脚本；直接运行 ./install.sh，脚本会在 apt 步骤调用 sudo。
-  默认不会接管 Ctrl+Alt+T。重跑会确保最新版，并把 Ghostty 配置重置为
-  本模块的基准内容；内容变化时会先保存 .bak.<时间戳> 备份。
+  默认接管 Ctrl+Alt+T（旧的包装脚本会先备份）。重跑会确保最新版，并把
+  Ghostty 配置重置为本模块的基准内容；内容变化时会先保存 .bak.<时间戳> 备份。
 EOF
 }
 
@@ -82,6 +87,7 @@ parse_args() {
         case "$1" in
             --check) CHECK_ONLY=true ;;
             --default-terminal) DEFAULT_TERMINAL=true ;;
+            --no-default-terminal) DEFAULT_TERMINAL=false ;;
             --ppa-only)
                 [ "$INSTALL_MODE" != "deb" ] || die "--ppa-only 与 --deb-only 不能同时使用"
                 INSTALL_MODE="ppa"
@@ -313,7 +319,7 @@ show_check() {
     if [ "$DEFAULT_TERMINAL" = true ]; then
         echo "默认终端计划: 将备份并写入 x-terminal-emulator 与 xdg-terminals.list"
     else
-        echo "默认终端计划: 保持原样（需要时显式加 --default-terminal）"
+        echo "默认终端计划: 保持原样（已显式传入 --no-default-terminal）"
     fi
     echo
     echo "检查完成。--check 模式没有安装、下载或修改任何内容。"
@@ -679,8 +685,15 @@ exec /usr/bin/ghostty "$@"
     terminal_list_content="$DESKTOP_ID
 "
 
-    # gsd-media-keys 按 PATH 找 x-terminal-emulator；xdg-terminals.list
-    # 另管遵守 xdg-terminal-exec 的程序。两处缺一都会留下启动入口不一致。
+    # 调用链（实测）：gsd-media-keys 读 GSettings
+    #   org.gnome.desktop.default-applications.terminal exec = 'x-terminal-emulator'
+    # 然后按 PATH 启动它。xdg-terminals.list 另管遵守 xdg-terminal-exec
+    # 的程序（如文件管理器的“在终端中打开”）。两处缺一都会留下启动入口不一致。
+    #
+    # 与 X11/Wayland 无关：名字里的 “x-” 是 Debian alternatives 的历史命名
+    # （X terminal emulator），不是对 X11 API 的依赖。抢占的是“GSettings 值
+    # + 进程启动”这条路，两种显示服务器下完全相同；不同的只是按键抓取
+    # （X11 走 XGrabKey，Wayland 由 Mutter 路由到同一个处理函数）。
     write_atomic_text "$TERMINAL_WRAPPER" "$wrapper_content" 755
     write_atomic_text "$XDG_TERMINALS_FILE" "$terminal_list_content" 644
 
