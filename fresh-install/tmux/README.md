@@ -11,25 +11,17 @@
 1. `apt install tmux git xclip wl-clipboard` —— 后两者是 gpakosz 配置“复制到系统剪贴板”功能在 Linux 下的依赖：X11 会话用 `xclip`，Wayland 会话用 `wl-copy`，两个都装以覆盖两种会话。
 2. 克隆 `https://github.com/gpakosz/.tmux` 到 `~/.tmux`（`--single-branch`）。
 3. 符号链接 `~/.tmux.conf` → `~/.tmux/.tmux.conf`。
-4. 用模块自带的 `tmux.conf.local` 基线播种 `~/.tmux.conf.local`（已存在则保留）。
+4. 符号链接 `~/.tmux.conf.local` → 模块自带的 `tmux.conf.local`（见下节）。
 
 ## 定制入口
 
-上游明确要求**不要改主配置** `~/.tmux/.tmux.conf`（改了后续 `git pull` 更新会冲突），一切定制写在 `~/.tmux.conf.local` 里。该文件本质是 tmux 配置片段，可以直接写 `set -g ...`；若某行被主配置覆盖，按上游说明在行尾加 `#!important`。
+上游明确要求**不要改主配置** `~/.tmux/.tmux.conf`（改了 `git pull` 会冲突），一切定制写在 `.tmux.conf.local` 里。本模块把这个入口**直接符号链接到仓库文件** `fresh-install/tmux/tmux.conf.local`：
 
-模块仓库里的 `tmux.conf.local` 是这套定制的**基线**：只记录相对上游默认的个人改动（目前仅鼠标模式），不复制上游模板里几百行注释。首次安装时播种为 `~/.tmux.conf.local`；之后本机文件自由演化，重跑脚本永不覆盖，只在它与基线不一致时打印 diff 提示。想给基线加新偏好：改模块里的 `tmux.conf.local` 并提交，新机器自动获得；已装机器按提示 diff 手动同步。
+- 单一事实源：改 `~/.tmux.conf.local` 就是改仓库文件（`<前缀> e` 打开的也是它），改完 `<前缀> r` 生效、`git commit` 入库。
+- 多机同步只拉不装：别的机器 `git pull` 本仓库即生效，无需重跑 install.sh。
+- 基线只记真实改动（目前仅鼠标模式）；全部可用选项查上游模板 `~/.tmux/.tmux.conf.local`。该文件本质是 tmux 配置片段，可直接写 `set -g ...`；若某行被主配置覆盖，按上游说明在行尾加 `#!important`。
 
-上游模板（克隆里的 `~/.tmux/.tmux.conf.local`）是全部可用选项的菜单，随时可查。
-
-### 本地副本与上游模板是脱钩的
-
-`~/.tmux.conf.local` 是安装时由模块基线**复制**出来的副本，从复制那一刻起就是私有文件。重跑脚本时 `git pull` 只更新仓库里的上游模板，本地副本**永不被覆盖或合并**——否则你写的定制（如 `set -g mouse on`）会被冲掉。
-
-代价：上游以后在模板里新增选项时，你不会自动获得。这不会弄坏任何东西（主配置对所有选项都有默认值），只是看不到新选项。想查看上游新增了什么，手动对比并挑想要的行抄过来：
-
-```bash
-diff ~/.tmux.conf.local ~/.tmux/.tmux.conf.local
-```
+路径依赖：符号链接记录的是安装时本仓库的绝对路径。仓库搬走后链接会悬空——此时 gpakosz 主配置照常加载（启动时会报一条 source 错误），只是定制失效；到新位置重跑一次 install.sh 即可重新链接。
 
 ## 幂等语义
 
@@ -37,8 +29,8 @@ diff ~/.tmux.conf.local ~/.tmux/.tmux.conf.local
 
 - apt 包已装则跳过；
 - `~/.tmux` 已是克隆则用 `git pull --ff-only` 更新；更新失败（离线、本地有改动）只警告不中止，保留现有版本；
-- `~/.tmux.conf.local` 已存在则**永不覆盖**；
-- 替换既有 `~/.tmux.conf` 或非仓库的 `~/.tmux` 目录前，先备份为 `*.bak.<时间戳>`。
+- `~/.tmux.conf.local` 已是指向模块基线的符号链接则跳过；若它被换成普通文件（少数编辑器写文件时会替换符号链接）或指向别处，先备份为 `*.bak.<时间戳>` 再重新链接——重跑即修复；
+- 替换既有 `~/.tmux.conf` 或非仓库的 `~/.tmux` 目录前同样先备份。
 
 在 `setup.sh` 中本步骤为 tolerate：tmux 本体走 apt 很可靠，但配置仓库要从 GitHub 克隆，全新机器还没配代理时可能失败——只提示不中止，网络就绪后重跑本脚本即可。
 

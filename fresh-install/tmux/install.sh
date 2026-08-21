@@ -7,13 +7,12 @@
 #      Wayland 用 wl-copy，两个都装以覆盖两种会话
 #   2. 克隆 https://github.com/gpakosz/.tmux 到 ~/.tmux（--single-branch）
 #   3. 符号链接 ~/.tmux.conf → ~/.tmux/.tmux.conf
-#   4. 用模块自带的 tmux.conf.local 基线播种 ~/.tmux.conf.local（个人定制
-#      入口，上游明确要求不要改主配置 .tmux.conf，一切定制写在这个副本里）
+#   4. 符号链接 ~/.tmux.conf.local → 模块自带的 tmux.conf.local 基线
+#      （上游规定定制写在 .tmux.conf.local；这里把它链到仓库文件，
+#      定制即仓库改动，别的机器 git pull 本仓库即生效）
 #
 # 幂等语义：重跑 = 确保 apt 包已装、已有克隆用 git pull --ff-only 更新到最新；
-# 已存在的 ~/.tmux.conf.local 永不覆盖（那是用户的定制文件），与模块基线
-# 不一致时打印 diff 提示；
-# 替换任何既有 ~/.tmux.conf / ~/.tmux 目录前先做时间戳备份。
+# 替换任何既有 ~/.tmux.conf / ~/.tmux.conf.local / ~/.tmux 目录前先做时间戳备份。
 #
 # 失败语义：apt 失败或首次克隆失败 → 退出非零；已有克隆上的更新失败
 # 只警告继续（离线重跑不应破坏已可用的安装）。在 setup.sh 中本步骤为
@@ -84,25 +83,24 @@ else
     echo -e "${GREEN}✓ ~/.tmux.conf → ~/.tmux/.tmux.conf${NC}"
 fi
 
-# 4. 播种 ~/.tmux.conf.local（定制入口，存在则保留）
-echo -e "\n${YELLOW}[4/4] 准备 ~/.tmux.conf.local...${NC}"
-if [ -e "$TMUX_CONF_LOCAL" ]; then
-    if cmp -s "$TMUX_CONF_LOCAL" "$LOCAL_BASELINE"; then
-        echo -e "${GREEN}✓ ~/.tmux.conf.local 与模块基线一致${NC}"
-    else
-        echo -e "${YELLOW}~/.tmux.conf.local 已存在且与模块基线不同，保留你的版本不覆盖${NC}"
-        echo -e "  查看差异: ${GREEN}diff -u $LOCAL_BASELINE $TMUX_CONF_LOCAL${NC}"
-    fi
+# 4. 链接 ~/.tmux.conf.local 到模块基线（单一事实源：改动即仓库改动）
+echo -e "\n${YELLOW}[4/4] 链接 ~/.tmux.conf.local...${NC}"
+if [ -L "$TMUX_CONF_LOCAL" ] && [ "$(readlink -f "$TMUX_CONF_LOCAL")" = "$LOCAL_BASELINE" ]; then
+    echo -e "${YELLOW}~/.tmux.conf.local 已指向模块基线，跳过${NC}"
 else
-    cp "$LOCAL_BASELINE" "$TMUX_CONF_LOCAL"
-    echo -e "${GREEN}✓ 已播种模块基线 ~/.tmux.conf.local${NC}"
+    if [ -e "$TMUX_CONF_LOCAL" ] || [ -L "$TMUX_CONF_LOCAL" ]; then
+        mv "$TMUX_CONF_LOCAL" "$TMUX_CONF_LOCAL.bak.$TIMESTAMP"
+        echo -e "${YELLOW}已备份既有 ~/.tmux.conf.local → ~/.tmux.conf.local.bak.$TIMESTAMP${NC}"
+    fi
+    ln -s "$LOCAL_BASELINE" "$TMUX_CONF_LOCAL"
+    echo -e "${GREEN}✓ ~/.tmux.conf.local → $LOCAL_BASELINE${NC}"
 fi
 
 echo -e "\n${GREEN}=== 安装完成 ===${NC}"
 echo -e "\n使用要点："
 echo -e "  • 前缀键保留默认 ${GREEN}Ctrl+b${NC}，同时新增第二前缀 ${GREEN}Ctrl+a${NC}"
-echo -e "  • 定制一律改 ${GREEN}~/.tmux.conf.local${NC}（不要改 ~/.tmux/.tmux.conf）"
-echo -e "  • 按 ${GREEN}<前缀> e${NC} 直接打开定制文件，${GREEN}<前缀> r${NC} 重载配置"
+echo -e "  • 定制改 ${GREEN}$LOCAL_BASELINE${NC}，或在 tmux 里按 ${GREEN}<前缀> e${NC} —— 经符号链接是同一个文件"
+echo -e "  • 改完按 ${GREEN}<前缀> r${NC} 重载生效；${GREEN}git commit${NC} 后别的机器 git pull 即同步"
 echo -e "  • 鼠标模式开关：${GREEN}<前缀> m${NC}"
 echo -e "  • 全部可选项见上游模板 ~/.tmux/.tmux.conf.local 和上游 README："
 echo -e "    ${GREEN}https://github.com/gpakosz/.tmux${NC}"
