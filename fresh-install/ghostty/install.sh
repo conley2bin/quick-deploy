@@ -42,6 +42,9 @@ CJK_FONT_FAMILY="Noto Sans Mono CJK SC"
 CJK_FONT_PACKAGE="fonts-noto-cjk"
 FONT_SIZE="12"
 THEME="Catppuccin Frappe"
+# 新终端的起始目录。空值 = 不写该行，沿用 Ghostty 默认（inherit）。
+# 可写绝对路径、~/ 开头的路径，或特殊值 home / inherit。
+WORKING_DIRECTORY="~/Documents"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -720,6 +723,32 @@ install_ghostty() {
     esac
 }
 
+# WORKING_DIRECTORY 可能指向一个该机器上不存在的目录（例如英文 locale 装的
+# 系统没有 ~/Documents，或 XDG 目录被改名）。Ghostty 拿到不存在的路径会
+# 开不出终端，为一个“默认起始目录”搭上可用性不值得。这里先用
+# xdg-user-dir 取真实的文档目录（它感知本地化名称），都不存在就退回 home。
+resolved_working_directory() {
+    local want="$WORKING_DIRECTORY" expanded xdg_doc
+
+    case "$want" in
+        home|inherit) printf '%s\n' "$want"; return 0 ;;
+    esac
+
+    expanded="${want/#\~/$HOME}"
+    if [ -d "$expanded" ]; then
+        printf '%s\n' "$want"
+        return 0
+    fi
+
+    xdg_doc="$(xdg-user-dir DOCUMENTS 2>/dev/null || true)"
+    if [ -n "$xdg_doc" ] && [ -d "$xdg_doc" ] && [ "$xdg_doc" != "$HOME" ]; then
+        printf '%s\n' "$xdg_doc"
+        return 0
+    fi
+
+    printf 'home\n'
+}
+
 render_config() {
     echo "# 由 fresh-install/ghostty/install.sh 生成与维护。"
     echo "# 重跑脚本会把本文件重置为基准内容；手工修改请在脚本里改。"
@@ -728,6 +757,16 @@ render_config() {
     echo "font-size = $FONT_SIZE"
     echo "theme = $THEME"
     echo "keybind = f11=toggle_fullscreen"
+
+    # 为什么必须显式写：working-directory 默认是 inherit，即继承启动进程的
+    # 当前目录。Ghostty 仅在能识别出“从桌面启动器启动”时才自动改用 home；
+    # 而 Ctrl+Alt+T 走的是 gsd-media-keys -> x-terminal-emulator 包装脚本，
+    # 不是桌面启动器路径，检测不到，于是退回 inherit。
+    # 叠上 gtk-single-instance=detect：新窗口请求会交给已在运行的实例，
+    # 于是新窗口继承的是“当初那个实例启动时的目录”——用户在哪个
+    # 目录里手动跑过 ghostty，以后所有快捷键窗口就黏在那里。
+    # 显式声明后行为不再取决于启动路径和历史实例。
+    echo "working-directory = $(resolved_working_directory)"
 }
 
 write_config() {

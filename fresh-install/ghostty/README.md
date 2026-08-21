@@ -70,6 +70,22 @@ sudo apt install --allow-downgrades ghostty=1.3.1~ppa2-noble1
   - 字号 `12`
   - 内置主题 `Catppuccin Frappe`
   - `F11` 全屏切换
+  - 新终端起始目录 `~/Documents`（不存在时回退到 XDG 文档目录，再不行就 `home`）
+
+### 为什么要显式写 `working-directory`
+
+不写的话，Ghostty 默认是 `inherit`——继承启动进程的当前目录。官方文档说
+“从桌面启动器启动时自动改用 home”，但 Ctrl+Alt+T 走的是
+`gsd-media-keys` → `x-terminal-emulator` 包装脚本，**不是桌面启动器路径**，
+Ghostty 检测不到，于是退回 `inherit`。
+
+再叠上 `gtk-single-instance = detect`：新窗口请求会交给**已在运行的实例**创建，
+所以新窗口继承的是“当初那个实例启动时所在的目录”。实际表现：在哪个目录里
+手动跑过一次 `ghostty`，以后所有快捷键窗口就全黏在那个目录。
+
+显式声明后，行为不再取决于启动路径和历史实例。改起始目录只需改脚本顶部的
+`WORKING_DIRECTORY` 变量（可写绝对路径、`~/` 开头的路径，或 `home` / `inherit`），
+然后重跑脚本。
 
 ## 字体
 
@@ -171,7 +187,7 @@ emulator），不是对 X11 API 的依赖。切到 Wayland 后，只有“按键
 
 1. 运行 `ghostty --version`，确认版本可读。
 2. 从 GNOME 应用菜单启动 Ghostty，确认图标入口能打开窗口。
-3. 确认主题为 Catppuccin Frappe，字号为 12；按 `F11` 能切换全屏。
+3. 确认主题为 Catppuccin Frappe，字号为 12；按 `F11` 能切换全屏。新窗口应落在 `~/Documents`。
 4. 在 Ghostty 中用 fcitx5 输入一段中文。安装脚本的 GUI 冒烟测试只证明 GTK4 的 `libim-fcitx5.so` 已载入进程；最终文本提交仍应人工确认。
 5. 运行 `infocmp xterm-ghostty`，确认本机 terminfo 可读。
 6. 按 Ctrl+Alt+T 确认启动 Ghostty（默认已接管；若用了 `--no-default-terminal` 则跳过此项）；同时从文件管理器测试“在终端中打开”。
