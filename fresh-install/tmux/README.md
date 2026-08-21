@@ -50,5 +50,9 @@ gpakosz/.tmux 的两个固定查找路径都以符号链接落盘，目标一个
 - 前缀键保留默认 `Ctrl+b`，同时新增第二前缀 `Ctrl+a`。
 - `<前缀> e` 打开 `.tmux.conf.local`，`<前缀> r` 重载配置。
 - `<前缀> m` 切换鼠标模式；`<前缀> -` / `<前缀> _` 分屏；`<前缀> h/j/k/l` 在窗格间移动。
+- `Ctrl+Alt+←/→` **不需要前缀**，直接切换上一个/下一个 window（底部状态栏的标签）。
+  绑定落在 root 表：`C-M-Left=previous-window`、`C-M-Right=next-window`。
+  Ghostty 模块显式 unbind 这两个键，确保按键进入 pty；gpakosz 检测到
+  `TERM_PROGRAM=ghostty` 后自动开启 extended-keys，tmux 才能识别组合键。
 - 内置 TPM 插件支持：在 `.tmux.conf.local` 里写 `set -g @plugin ...`，`<前缀> I` 安装，`<前缀> u` 更新，`<前缀> M-u` 卸载。
 - 完整键位与状态栏变量见上游模板 `~/.tmux/.tmux.conf.local` 和上游 README。

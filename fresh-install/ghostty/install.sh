@@ -774,6 +774,16 @@ render_config() {
     echo "theme = $THEME"
     echo "keybind = f11=toggle_fullscreen"
 
+    # 把 Ctrl+Alt+←/→ 明确让给终端内的 tmux。
+    # Ghostty 默认把它们绑给 goto_split:left/right；即使无 split 时当前版本
+    # 看起来会透传，也不能把隐式 fallback 当成稳定合同。显式 unbind 后，
+    # 按键一定编码后送入 pty，fresh-install/tmux/tmux.conf.local 的 root 表
+    # 再用 C-M-Left/Right 切 previous/next window。
+    # 这不是“改绑 Ghostty 标签页”：Ghostty 标签页继续用上游默认
+    # Ctrl+Tab / Ctrl+Shift+Tab；只把两个键的所有权交给 tmux。
+    echo "keybind = ctrl+alt+arrow_left=unbind"
+    echo "keybind = ctrl+alt+arrow_right=unbind"
+
     # 为什么必须显式写：working-directory 默认是 inherit，即继承启动进程的
     # 当前目录。Ghostty 仅在能识别出“从桌面启动器启动”时才自动改用 home；
     # 而 Ctrl+Alt+T 走的是 gsd-media-keys -> x-terminal-emulator 包装脚本，
@@ -883,7 +893,7 @@ exec /usr/bin/ghostty "$@"
 
 verify_system_integration() {
     [ -x "$GHOSTTY_BIN" ] || die "$GHOSTTY_BIN 不存在或不可执行"
-    echo "OK: $GHOSTTY_BIN —— $($GHOSTTY_BIN --version 2>/dev/null)"
+    echo "OK: $GHOSTTY_BIN —— $(installed_version)"
 
     [ -f "$DESKTOP_FILE" ] || die "系统桌面入口不存在: $DESKTOP_FILE"
     echo "OK: 系统桌面入口 $DESKTOP_FILE"
@@ -1011,7 +1021,7 @@ main() {
     echo -e "${GREEN}  Ghostty 安装完成${NC}"
     echo -e "${GREEN}========================================${NC}"
     echo
-    echo "版本: $($GHOSTTY_BIN --version 2>/dev/null)"
+    echo "版本: $(installed_version)"
     echo "配置: $CONFIG_FILE"
     if [ "$DEFAULT_TERMINAL" = true ]; then
         echo "Ctrl+Alt+T: 已通过 $TERMINAL_WRAPPER 接管"
@@ -1023,7 +1033,8 @@ main() {
     echo "  1. 从应用菜单启动 Ghostty，确认窗口和 Catppuccin Frappe 主题正常。"
     echo "  2. 按 F11，确认全屏切换。"
     echo "  3. 在 Ghostty 中用 fcitx5 输入一段中文。"
-    echo "  4. SSH 到不认识 xterm-ghostty 的远端时执行:"
+    echo "  4. SSH terminfo 已由 ssh-env + ssh-terminfo 自动处理；"
+    echo "     极简远端缺 infocmp/tic 时会回退 xterm-256color。手动兜底:"
     echo "     infocmp -x xterm-ghostty | ssh HOST -- tic -x -"
 }
 

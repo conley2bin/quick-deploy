@@ -70,6 +70,7 @@ sudo apt install --allow-downgrades ghostty=1.3.1~ppa2-noble1
   - 字号 `12`
   - 内置主题 `Catppuccin Frappe`
   - `F11` 全屏切换
+  - 显式解除 `Ctrl+Alt+←/→` 的 Ghostty split 绑定，把按键交给 tmux 切 window
   - 新终端起始目录 `~/Documents`（不存在时回退到 XDG 文档目录，再不行就 `home`）
 
 ### 为什么要显式写 `working-directory`
@@ -86,6 +87,23 @@ Ghostty 检测不到，于是退回 `inherit`。
 显式声明后，行为不再取决于启动路径和历史实例。改起始目录只需改脚本顶部的
 `WORKING_DIRECTORY` 变量（可写绝对路径、`~/` 开头的路径，或 `home` / `inherit`），
 然后重跑脚本。
+
+### Ctrl+Alt+←/→ 的所有权：交给 tmux window
+
+Ghostty 默认把这两个键绑给 `goto_split:left/right`。本机不用 Ghostty split，
+真正需求是进入 tmux 后切换底部状态栏的 window，因此模块显式写：
+
+```ini
+keybind = ctrl+alt+arrow_left=unbind
+keybind = ctrl+alt+arrow_right=unbind
+```
+
+`unbind` 是 Ghostty 的官方语法：移除前一个同触发器的默认动作，让按键正常编码
+进入 pty。随后 `fresh-install/tmux/tmux.conf.local` 在 tmux root 表绑定
+`C-M-Left/Right` 到 `previous-window` / `next-window`。
+
+这不是改绑 Ghostty 标签页；Ghostty 标签页继续使用上游默认的 `Ctrl+Tab` /
+`Ctrl+Shift+Tab`。代价是 Ghostty 自己的 split 不再能用这两个键切换。
 
 ## 字体
 
