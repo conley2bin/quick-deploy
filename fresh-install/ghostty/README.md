@@ -70,6 +70,7 @@ sudo apt install --allow-downgrades ghostty=1.3.1~ppa2-noble1
   - 字号 `12`
   - 内置主题 `Catppuccin Frappe`
   - `F11` 全屏切换
+  - `Ctrl+Alt+←/→` 切换标签页
   - 新终端起始目录 `~/Documents`（不存在时回退到 XDG 文档目录，再不行就 `home`）
 
 ### 为什么要显式写 `working-directory`
@@ -86,6 +87,18 @@ Ghostty 检测不到，于是退回 `inherit`。
 显式声明后，行为不再取决于启动路径和历史实例。改起始目录只需改脚本顶部的
 `WORKING_DIRECTORY` 变量（可写绝对路径、`~/` 开头的路径，或 `home` / `inherit`），
 然后重跑脚本。
+
+### 为什么改绑 Ctrl+Alt+←/→ 为标签页切换
+
+Ghostty 默认的标签页切换是 `Ctrl+Shift+←/→`（previous_tab / next_tab），
+但**这个组合在这台机器上根本到不了 Ghostty**：GNOME 窗口管理器把它全局绑给了
+`move-to-workspace-left/right`（`gsettings org.gnome.desktop.wm.keybindings`），
+在 WM 层拦截，应用收不到。按键会按字面编码 `ESC[1;6D/C` 发给 shell，
+表现为一串 `DDDD/CCCC`。
+
+而 `Ctrl+Alt+←/→` 在 GNOME 里没有被占用（被占的是 `Ctrl+Alt+↑/↓` 切工作区）。
+改绑它能绕开 GNOME 的抢占。代价是覆盖 Ghostty 默认的 `goto_split:left/right`
+（分割的方向切换）——本机用标签页不用分割，可以接受。需要分割切换时，`super+ctrl+[` / `]` 仍在。
 
 ## 字体
 

@@ -785,6 +785,20 @@ render_config() {
     echo "working-directory = $(resolved_working_directory)"
     [ -n "$SHELL_INTEGRATION_FEATURES" ] && \
         echo "shell-integration-features = $SHELL_INTEGRATION_FEATURES"
+
+    # Ctrl+Alt+←/→ 切换标签页。
+    #
+    # 为什么改绑：GNOME 全局快捷键把 Ctrl+Shift+←/→ 绑给了
+    # move-to-workspace-left/right（gsettings org.gnome.desktop.wm.keybindings），
+    # 它在窗口管理器层拦截，应用程序根本收不到——Ghostty 的默认
+    # ctrl+shift+arrow 标签页切换因此完全失效，按键会按字面编码
+    # ESC[1;6D/C 发给 shell，表现为一串 DDDD/CCCC。实测确认。
+    #
+    # 为什么选 Ctrl+Alt+←/→：这个组合在 GNOME 里没有占用（被占的是
+    # Ctrl+Alt+↑/↓ 切工作区），能到应用程序。代价是覆盖 Ghostty 默认的
+    # goto_split:left/right 分割切换——用户不用分割，用标签页，可以接受。
+    echo "keybind = ctrl+alt+arrow_left=previous_tab"
+    echo "keybind = ctrl+alt+arrow_right=next_tab"
 }
 
 write_config() {
