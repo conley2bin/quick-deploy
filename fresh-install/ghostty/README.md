@@ -191,10 +191,42 @@ emulator），不是对 X11 API 的依赖。切到 Wayland 后，只有“按键
 4. 在 Ghostty 中用 fcitx5 输入一段中文。安装脚本的 GUI 冒烟测试只证明 GTK4 的 `libim-fcitx5.so` 已载入进程；最终文本提交仍应人工确认。
 5. 运行 `infocmp xterm-ghostty`，确认本机 terminfo 可读。
 6. 按 Ctrl+Alt+T 确认启动 Ghostty（默认已接管；若用了 `--no-default-terminal` 则跳过此项）；同时从文件管理器测试“在终端中打开”。
-7. SSH 到尚未安装该 terminfo 的远端时，可执行：
+7. SSH 到不认识 `xterm-ghostty` 的远端时，本模块已开启 `ssh-terminfo` 自动处理（见下节）。若需手动处理：
 
    ```bash
    infocmp -x xterm-ghostty | ssh HOST -- tic -x -
    ```
 
 GUI 冒烟测试只在 `DISPLAY` 或 `WAYLAND_DISPLAY` 存在时运行。它不使用 xdotool、XTEST、libXtst 或任何合成键鼠事件；测试依据是进程持续存活、stderr 未出现错误，以及 `/proc/<pid>/maps` 中出现 fcitx5 GTK4 immodule。
+
+判定 stderr 时只认行首的错误级别前缀（`^(err|error)`）。不能拿整行里的
+"error" 字样判死：GTK 4.14 解析系统主题 CSS 时会打
+`warning(glib): ... Theme parser error: ...`，它前缀是 warning、与 Ghostty 无关，
+误杀它会把一次成功安装报成失败。配置解析另由 `ghostty +validate-config`
+单独把关。
+
+## SSH 与 terminfo
+
+终端与程序靠 **terminfo** 沟通：程序查 `TERM` 指向的那条记录，才知道怎么清屏、
+支持多少颜色、功能键发什么编码。Ghostty 的 `TERM` 是 `xterm-ghostty`。
+
+这条记录很新，只在 **ncurses >= 6.5-20241228** 里才有。Ubuntu 24.04 自带的是 6.4，
+本机这条是 Ghostty 的包装进 `/usr/share/terminfo` 的。远端服务器多半也没有，
+于是 `vim`/`htop`/`less` 会报 `unknown terminal type` 或花屏。
+
+把它弄到远端，**搬的是一份 3.8KB 的数据文件，不是把 Ghostty 装到远端**。
+Ghostty 是本地程序，负责画窗口、渲染字体、调 GPU；远端只跑 shell 和 vim 这些程序，
+它们需要的只是那张“能力说明书”。
+
+本模块默认写入 `shell-integration-features = ssh-env,ssh-terminfo`，Ghostty 会在 SSH 时
+自动用 `infocmp` + `tic` 把记录装到远端的 `~/.terminfo`（**不需要 sudo**，也不影响
+其它用户）。上游默认是关闭的（`no-ssh-env,no-ssh-terminfo`），这里刻意开启。
+
+安全网：官方文档声明两项同时开启时，安装失败会**自动回退到** `xterm-256color`，
+不会把人卡在花屏状态。前提是远端有 `infocmp` 与 `tic`（ncurses 自带）；
+极简容器镜像可能没有，那种情况下走回退。
+
+`shell-integration-features` 只写**与默认值的差异项**，不抄全量串。文档明确
+“省略某个特性就用它的默认值”，因此上游将来调整其它特性默认值时本模块能自动
+跟上，而不会把一份过期快照冻在用户配置里（尤其 `no-sudo` 这种安全相关项）。
+实测写入后生效值为 `cursor,no-sudo,title,ssh-env,ssh-terminfo,path`。

@@ -46,6 +46,22 @@ THEME="Catppuccin Frappe"
 # 可写绝对路径、~/ 开头的路径，或特殊值 home / inherit。
 WORKING_DIRECTORY="~/Documents"
 
+# shell 集成特性：只写与默认值的**差异项**。
+# 文档明确：省略某个特性就用它的默认值，所以不必抄全量串。
+# 不抄全量是有意的：上游将来调整其它特性的默认值时，本模块能自动跟上，
+# 而不会把一份过期的快照冻在用户配置里（特别是 no-sudo 这种安全相关项）。
+#
+#   ssh-terminfo —— SSH 到远端时自动用 infocmp|tic 安装 xterm-ghostty 记录。
+#     远端 ncurses 普遍还没收录这条记录（需 >= 6.5-20241228），不装则
+#     vim/htop 会报 unknown terminal type 或花屏。它装到远端的 ~/.terminfo，
+#     不需要 sudo，也不影响其它用户。
+#   ssh-env —— 配套项。terminfo 装不上时靠环境变量传递终端能力。
+#
+# 为什么敢默认开：官方文档声明两者同时开启时，安装失败会自动回退到
+# xterm-256color，不会把用户卡在花屏状态。前提是远端有 infocmp 与 tic
+# （ncurses 自带，绝大多数 Linux 都有）；极简容器镜像可能没有，那种情况下回退。
+SHELL_INTEGRATION_FEATURES="ssh-env,ssh-terminfo"
+
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -767,6 +783,8 @@ render_config() {
     # 目录里手动跑过 ghostty，以后所有快捷键窗口就黏在那里。
     # 显式声明后行为不再取决于启动路径和历史实例。
     echo "working-directory = $(resolved_working_directory)"
+    [ -n "$SHELL_INTEGRATION_FEATURES" ] && \
+        echo "shell-integration-features = $SHELL_INTEGRATION_FEATURES"
 }
 
 write_config() {
