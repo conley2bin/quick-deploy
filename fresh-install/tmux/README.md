@@ -10,18 +10,29 @@
 
 1. `apt install tmux git xclip wl-clipboard` —— 后两者是 gpakosz 配置“复制到系统剪贴板”功能在 Linux 下的依赖：X11 会话用 `xclip`，Wayland 会话用 `wl-copy`，两个都装以覆盖两种会话。
 2. 克隆 `https://github.com/gpakosz/.tmux` 到 `~/.tmux`（`--single-branch`）。
-3. 符号链接 `~/.tmux.conf` → `~/.tmux/.tmux.conf`。
-4. 符号链接 `~/.tmux.conf.local` → 模块自带的 `tmux.conf.local`（见下节）。
+
+## 脚本创建的链接
+
+gpakosz/.tmux 的两个固定查找路径都以符号链接落盘，目标一个指向上游克隆、一个指向本仓库：
+
+| 路径 | 指向 | 作用 |
+| --- | --- | --- |
+| `~/.tmux.conf` | `~/.tmux/.tmux.conf` | 主配置入口（tmux 固定读取位置）；随重跑时的 `git pull` 自动更新 |
+| `~/.tmux.conf.local` | `fresh-install/tmux/tmux.conf.local`（安装时本仓库的绝对路径） | 定制入口；改动即仓库改动 |
+
+约束与修复：
+
+- 替换任何既有文件前一律先改名为 `*.bak.<时间戳>`，从不删除。
+- `~/.tmux.conf.local` 记录的是仓库的绝对路径：仓库搬走后链接悬空，gpakosz 主配置照常加载（启动时报一条 source 错误），只是定制失效；到新位置重跑一次 install.sh 即可重新链接。
+- 少数编辑器写文件时会把符号链接替换成普通文件，重跑 install.sh 同样自动备份并重建链接。
 
 ## 定制入口
 
-上游明确要求**不要改主配置** `~/.tmux/.tmux.conf`（改了 `git pull` 会冲突），一切定制写在 `.tmux.conf.local` 里。本模块把这个入口**直接符号链接到仓库文件** `fresh-install/tmux/tmux.conf.local`：
+上游明确要求**不要改主配置** `~/.tmux/.tmux.conf`（改了 `git pull` 会冲突），一切定制写在 `.tmux.conf.local` 里。本模块把这个入口符号链接到仓库文件（见上节链接表），因此：
 
 - 单一事实源：改 `~/.tmux.conf.local` 就是改仓库文件（`<前缀> e` 打开的也是它），改完 `<前缀> r` 生效、`git commit` 入库。
 - 多机同步只拉不装：别的机器 `git pull` 本仓库即生效，无需重跑 install.sh。
 - 基线只记真实改动（目前仅鼠标模式）；全部可用选项查上游模板 `~/.tmux/.tmux.conf.local`。该文件本质是 tmux 配置片段，可直接写 `set -g ...`；若某行被主配置覆盖，按上游说明在行尾加 `#!important`。
-
-路径依赖：符号链接记录的是安装时本仓库的绝对路径。仓库搬走后链接会悬空——此时 gpakosz 主配置照常加载（启动时会报一条 source 错误），只是定制失效；到新位置重跑一次 install.sh 即可重新链接。
 
 ## 幂等语义
 
@@ -40,4 +51,4 @@
 - `<前缀> e` 打开 `.tmux.conf.local`，`<前缀> r` 重载配置。
 - `<前缀> m` 切换鼠标模式；`<前缀> -` / `<前缀> _` 分屏；`<前缀> h/j/k/l` 在窗格间移动。
 - 内置 TPM 插件支持：在 `.tmux.conf.local` 里写 `set -g @plugin ...`，`<前缀> I` 安装，`<前缀> u` 更新，`<前缀> M-u` 卸载。
-- 完整键位与状态栏变量见 `~/.tmux.conf.local` 注释和上游 README。
+- 完整键位与状态栏变量见上游模板 `~/.tmux/.tmux.conf.local` 和上游 README。
