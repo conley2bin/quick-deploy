@@ -82,6 +82,49 @@ sudo apt install --allow-downgrades ghostty=1.3.1~ppa2-noble1
 装不上。此时脚本会警告并在配置中省略对应的 `font-family` 行。
 安装后不信任 apt 的退出码，而是回读 fontconfig 确认字族名真的可用。
 
+## 中文 locale 下的等宽字体劫持（重要）
+
+在 `LANG=zh_CN.UTF-8` 的机器上，**配置里写的等宽字体会被静默忽略**，
+终端实际渲染的是 `DejaVu Sans Mono`。机制：
+
+```
+Ghostty src/font/discovery.zig 无条件给字体查询加 FC_SPACING=FC_MONO
+  → 命中 /etc/fonts/conf.d/69-language-selector-zh-cn.conf 的等宽规则
+  → 该规则用 binding="strong" 把 DejaVu Sans Mono prepend 到最前
+  → 应用显式请求的字体被挤到后面
+```
+
+该文件来自 Ubuntu 的 `language-selector-common` 包，影响中文环境下
+**所有**等宽字体（Liberation、Nimbus、Noto Mono、Ubuntu Mono 均实测中招），
+不是 Ghostty 的 bug，也不是某个字体特有。
+
+实测证据（同一份配置，用 `lsof` 看真实加载的字体文件）：
+
+| locale | 实际加载 |
+| --- | --- |
+| `en_US.UTF-8` | `JetBrainsMono-Regular.ttf` |
+| `zh_CN.UTF-8` | `DejaVuSansMono.ttf` |
+
+脚本的处理：检测到劫持时，写入
+`~/.config/fontconfig/conf.d/89-ghostty-zh-mono.conf`（文件名 89 > 69，
+必须排在 language-selector 之后才能盖过它）。规则内容由脚本的
+`FONT_FAMILY` / `CJK_FONT_FAMILY` 变量生成，不在两处重复维护字体名。
+
+两个刻意的设计选择：
+
+- **门控用实测症状，不是判断 locale 名**：只有 `fc-match` 确实返回了别的
+  字体才写规则。非中文机器不会被写入无用文件；将来 Ubuntu 修了那条规则，
+  本脚本也会自动不再干预。
+- **规则保守**：只在查询**已点名**该字体时才把它提前，而不是对所有
+  zh + 等宽查询无差别 prepend。实测：写入后 `monospace` 与 `Liberation Mono`
+  仍返回系统默认，其它程序不受影响。
+
+不采用用 `LANG=en_US.UTF-8` 启动 Ghostty 的做法：那会把终端里所有程序的
+locale 一并换成英文（日期、报错、man 页）。病灶在 fontconfig 层，就在
+那一层修。
+
+卸载只需删掉那个 `.conf` 文件。
+
 配置采用“幂等重置”语义：重跑会把它恢复为模块的基准内容。内容变化时，脚本先备份为 `config.ghostty.bak.<时间戳>`，再用同目录临时文件和原子 `mv` 替换；写完会回读，并通过 Ghostty 自身解析配置。
 
 本模块不会另写主题文件，也不会改写软件包提供的 desktop 文件。

@@ -31,6 +31,9 @@ GHOSTTY_BIN="/usr/bin/ghostty"
 CONFIG_DIR="$HOME/.config/ghostty"
 CONFIG_FILE="$CONFIG_DIR/config.ghostty"
 LOCAL_BIN_DIR="$HOME/.local/bin"
+FONTCONFIG_CONF_DIR="$HOME/.config/fontconfig/conf.d"
+# 89 > 69：必须排在 69-language-selector-zh-*.conf 之后才能盖过它。
+ZH_MONO_CONF="$FONTCONFIG_CONF_DIR/89-ghostty-zh-mono.conf"
 TERMINAL_WRAPPER="$LOCAL_BIN_DIR/x-terminal-emulator"
 XDG_TERMINALS_FILE="$HOME/.config/xdg-terminals.list"
 FONT_FAMILY="JetBrains Mono"
@@ -203,6 +206,98 @@ ensure_fonts() {
     ensure_font "$CJK_FONT_FAMILY" "$CJK_FONT_PACKAGE"
 }
 
+# ============================================
+# 中文 locale 下等宽字体被劫持的修复
+# ============================================
+# 病灶（实测定位）：Ubuntu 的 language-selector-common 包在
+# /etc/fonts/conf.d/69-language-selector-zh-cn.conf 里写了：
+#   <test name="family">monospace</test> + <test name="lang">zh-cn</test>
+#   -> <edit name="family" mode="prepend" binding="strong">DejaVu Sans Mono ...
+# 而 Ghostty 的 src/font/discovery.zig 无条件给查询加 FC_SPACING=FC_MONO，
+# 恰好命中这条规则；强绑定的 DejaVu 被插到最前，压过应用显式请求的
+# 字体。结果：config 里写了 font-family = JetBrains Mono，实际渲染却是
+# DejaVu Sans Mono，且完全静默。实测证据：同一份配置下
+#   LANG=en_US.UTF-8 -> lsof 显示加载 JetBrainsMono-Regular.ttf
+#   LANG=zh_CN.UTF-8 -> lsof 显示加载 DejaVuSansMono.ttf
+# 该规则影响 zh 下**所有**等宽字体（Liberation/Nimbus/Noto Mono 均中招），
+# 不是 JetBrains Mono 特有，也不是 Ghostty 的 bug。
+#
+# 为什么不用 LANG=en 启动 Ghostty 绕过：那会把终端里所有程序的 locale
+# 一并换成英文（日期、报错、man 页），对刻意设了 zh_CN 的用户是倒退。
+# 修在 fontconfig 层才是对症：病灶本身就是一条 fontconfig 规则。
+#
+# 规则写法上刻意保守：只在查询**已点名**该字体时才把它提前，
+# 而不是对所有 zh+等宽查询无差别 prepend——后者会连别的程序请求别的
+# 等宽字体时也被改成 JetBrains Mono。实测：写入后 monospace 与
+# Liberation Mono 仍保持系统默认，不受干扰。
+#
+# （试过的弯路：想写“通用地撤销 DejaVu 强绑定”的规则，
+# <edit mode="delete"> 语法不成立，结果选出楷体 ukai。通用规则难写对，
+# 显式列名虽啰嗦但可靠。）
+
+# fc-match 解析结果与请求的字族不一致 = 被劫持。
+# 用实测症状做门控，而不是判断 locale 名：非中文机器不会被写入无用规则，
+# 将来 Ubuntu 改了那条规则也能自动不再干预。
+mono_family_hijacked() {
+    local family="$1" got
+    font_exists "$family" || return 1
+    got="$(fc-match --format='%{family}' "$family:spacing=100" 2>/dev/null)"
+    got="${got%%,*}"
+    [ -n "$got" ] && [ "$got" != "$family" ]
+}
+
+any_mono_family_hijacked() {
+    local family
+    for family in "$FONT_FAMILY" "$CJK_FONT_FAMILY"; do
+        mono_family_hijacked "$family" && return 0
+    done
+    return 1
+}
+
+render_zh_mono_conf() {
+    local family
+    printf '%s\n' '<?xml version="1.0"?>'
+    printf '%s\n' '<!DOCTYPE fontconfig SYSTEM "urn:fontconfig:fonts.dtd">'
+    printf '%s\n' '<fontconfig>'
+    printf '%s\n' '  <!-- 由 fresh-install/ghostty/install.sh 生成与维护。 -->'
+    printf '%s\n' '  <!-- 中文 locale 下 Ubuntu 的 69-language-selector-zh-*.conf 会给所有 -->'
+    printf '%s\n' '  <!-- 等宽查询强绑定 prepend 「DejaVu Sans Mono」，压过应用显式请求的 -->'
+    printf '%s\n' '  <!-- 字体。下面只在查询已点名该字体时把它拉回最前，不影响其它字体请求。 -->'
+    for family in "$FONT_FAMILY" "$CJK_FONT_FAMILY"; do
+        font_exists "$family" || continue
+        printf '  <match target="pattern">\n'
+        printf '    <test name="lang" compare="contains"><string>zh</string></test>\n'
+        printf '    <test name="family" compare="contains"><string>%s</string></test>\n' "$family"
+        printf '    <edit name="family" mode="assign_replace" binding="strong"><string>%s</string></edit>\n' "$family"
+        printf '  </match>\n'
+    done
+    printf '%s\n' '</fontconfig>'
+}
+
+ensure_zh_mono_fontconfig() {
+    local family remaining=''
+
+    if ! any_mono_family_hijacked && [ ! -f "$ZH_MONO_CONF" ]; then
+        echo "等宽字体解析正常，无需写 fontconfig 规则"
+        return 0
+    fi
+
+    # 已被劫持，或规则文件已存在（后者下保持内容跟随 FONT_FAMILY 变更）。
+    write_atomic_text "$ZH_MONO_CONF" "$(render_zh_mono_conf)"$'\n' 644
+
+    # 回读校验：fc-match 每次都是新进程，会立即读到新规则（不需 fc-cache，
+    # 因为没有新增字体文件，只是改排序规则）。
+    for family in "$FONT_FAMILY" "$CJK_FONT_FAMILY"; do
+        mono_family_hijacked "$family" && remaining="$remaining $family"
+    done
+    if [ -z "$remaining" ]; then
+        echo "OK: 中文 locale 下等宽字体解析已恢复"
+    else
+        warn "写入规则后仍被劫持的字体:$remaining"
+        warn "  终端可能仍渲染 DejaVu Sans Mono。字体只是观感问题，不阻断安装。"
+    fi
+}
+
 ppa_present() {
     grep -Rqs --include='*.list' --include='*.sources' \
         "$PPA_MARKER" /etc/apt/sources.list /etc/apt/sources.list.d 2>/dev/null
@@ -294,6 +389,29 @@ show_check() {
         echo "  $CJK_FONT_FAMILY: 已安装（将作为 CJK 回退字体写入）"
     else
         echo "  $CJK_FONT_FAMILY: 未安装（正式安装将 apt 安装 $CJK_FONT_PACKAGE）"
+    fi
+
+    echo "等宽字体解析（locale=${LANG:-未设置}）:"
+    local family got
+    for family in "$FONT_FAMILY" "$CJK_FONT_FAMILY"; do
+        if ! font_exists "$family"; then
+            echo "  $family: 未安装，跳过检测"
+            continue
+        fi
+        got="$(fc-match --format='%{family}' "$family:spacing=100" 2>/dev/null)"
+        got="${got%%,*}"
+        if [ "$got" = "$family" ]; then
+            echo "  $family: 正常"
+        else
+            echo "  $family: 被劫持 -> $got（Ubuntu zh 规则强插等宽字体）"
+        fi
+    done
+    if [ -f "$ZH_MONO_CONF" ]; then
+        echo "  修复规则: 已存在 $ZH_MONO_CONF"
+    elif any_mono_family_hijacked; then
+        echo "  修复规则: 不存在，正式安装将写入 $ZH_MONO_CONF"
+    else
+        echo "  修复规则: 不需要"
     fi
     if infocmp xterm-ghostty >/dev/null 2>&1; then
         echo "terminfo: xterm-ghostty 已可用"
@@ -745,14 +863,26 @@ smoke_test() {
         die "Ghostty 在冒烟测试期间提前退出"
     fi
 
-    if grep -Eqi '(^|[^[:alpha:]])error([(:.]|$)|配置.*(错误|失败)|parse.*(error|fail)' "$log"; then
+    # 只认 Ghostty 自己标记为错误级别的行（行首 err/error 前缀），
+    # 而不是任何含 "error" 字样的文本。否则会误杀两类良性日志：
+    #   warning(glib): ... Theme parser error: ...（GTK 4.14 解析系统主题的
+    #     CSS 新语法产生的警告，本质是 warning，与 Ghostty 无关）
+    #   任何提到 "error" 的 info 行
+    # 配置解析已由第 3 步的 +validate-config 单独把关；这里的核心判据
+    # 是“进程能启动并持续存活”（与 kitty 模块的同一教训：stderr 良性
+    # 警告不参与判定）。
+    if grep -Eq '^(err|error)[[:space:](:]' "$log"; then
         cat "$log" >&2
         kill "$pid" 2>/dev/null || true
         wait "$pid" 2>/dev/null || true
         rm -f "$log"
-        die "Ghostty stderr 中出现错误，请检查上面的启动日志"
+        die "Ghostty 启动日志中出现错误级别行（err/error），请检查上面日志"
     fi
-    echo "OK: Ghostty 持续存活，stderr 未发现错误"
+    echo "OK: Ghostty 持续存活，stderr 未发现错误级别日志"
+    # 良性警告（如 GTK 主题解析）不影响成败，但提示一下，不静默吞掉。
+    if grep -Eqi 'theme parser error|hsl\(\) argument' "$log"; then
+        warn "stderr 含 GTK 主题解析警告（GTK 4.14 解析系统主题的 CSS），与 Ghostty 无关，不影响使用。"
+    fi
 
     if grep -Fq 'libim-fcitx5.so' "/proc/$pid/maps" 2>/dev/null; then
         echo "OK: fcitx5 GTK4 immodule（libim-fcitx5.so）已载入进程"
@@ -793,17 +923,21 @@ main() {
 
     # 字体必须先于写配置：render_config 用 font_exists 决定要不要写
     # font-family 行，顺序反了就会把刚装上的字体漏写。
-    section "[2/6] 确保字体可用"
+    section "[2/7] 确保字体可用"
     ensure_fonts
 
-    section "[3/6] 写入并验证基准配置"
+    # 必须在 ensure_fonts 之后：规则只为实际存在的字体生成。
+    section "[3/7] 修复中文 locale 下的等宽字体劫持"
+    ensure_zh_mono_fontconfig
+
+    section "[4/7] 写入并验证基准配置"
     write_config
     verify_config
 
-    section "[4/6] 验证桌面入口与 terminfo"
+    section "[5/7] 验证桌面入口与 terminfo"
     verify_system_integration
 
-    section "[5/6] 默认终端（显式选择才接管）"
+    section "[6/7] 默认终端（显式选择才接管）"
     if [ "$DEFAULT_TERMINAL" = true ]; then
         set_default_terminal
         verify_default_terminal
@@ -812,7 +946,7 @@ main() {
         echo "需要 Ghostty 接管时重跑: ./install.sh --default-terminal"
     fi
 
-    section "[6/6] GUI 冒烟测试"
+    section "[7/7] GUI 冒烟测试"
     smoke_test
 
     echo
