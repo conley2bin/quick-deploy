@@ -16,6 +16,11 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 NC='\033[0m' # No Color
 
+# 共享等锁助手（见 lib/apt-lock-wait.sh）。脚本被单独拷出、助手缺失时
+# 定义空操作跳过等锁，行为与引入前一致
+APT_LOCK_WAIT_LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../lib/apt-lock-wait.sh"
+if [ -f "$APT_LOCK_WAIT_LIB" ]; then . "$APT_LOCK_WAIT_LIB"; else wait_for_apt_lock() { return 0; }; fi
+
 MIRROR_BASE="https://mirrors.tuna.tsinghua.edu.cn/ubuntu"
 SOURCES_FILE="/etc/apt/sources.list.d/ubuntu.sources"
 TMP_FILE="${SOURCES_FILE}.tmp"
@@ -132,6 +137,11 @@ if ! apt-get indextargets --format '$(REPO_URI)' 2>/dev/null | grep -q "mirrors.
     $SUDO cp -a "$BACKUP_FILE" "$SOURCES_FILE"
     die "写入后的配置未被 apt 正确解析（未检测到清华镜像源），已自动还原备份。"
 fi
+
+# 等 apt 锁释放：新装系统首开机时 GNOME Software（aptd）常在后台跑全量
+# 系统更新并长时间持锁（内核升级 + DKMS 编译可达十几分钟），此时下面的
+# apt-get update 必报「无法获得锁」
+wait_for_apt_lock || die "等待 apt 锁超时。后台系统更新结束后重跑本脚本即可（已写入的镜像配置是正确的，无需还原）。"
 
 # 刷新软件包信息。--error-on=any 让下载失败（WARNING）也以非零退出：
 # 裸 apt update 对下载失败只警告、退出码仍为 0，不能当作验证

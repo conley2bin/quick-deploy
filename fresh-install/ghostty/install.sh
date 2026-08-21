@@ -21,6 +21,12 @@ DEFAULT_TERMINAL=true
 INSTALL_MODE="auto"
 SUDO_CMD="${SUDO_CMD:-sudo}"
 
+# 共享等锁助手：新装系统首开机时后台自动更新会长时间持 apt 锁，
+# 直接 add-apt-repository/apt-get 会撞锁失败，先等它结束。脚本被单独
+# 拷出、助手缺失时定义空操作跳过等锁
+APT_LOCK_WAIT_LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../lib/apt-lock-wait.sh"
+if [ -f "$APT_LOCK_WAIT_LIB" ]; then . "$APT_LOCK_WAIT_LIB"; else wait_for_apt_lock() { return 0; }; fi
+
 PPA_NAME="ppa:mkasberg/ghostty-ubuntu"
 PPA_MARKER="ppa.launchpadcontent.net/mkasberg/ghostty-ubuntu"
 PPA_FINGERPRINT="0721FDF5FECB88DC6920361657C8EF455CEAE491"
@@ -202,6 +208,10 @@ ensure_font() {
     fi
 
     echo "$family 未安装，尝试通过 apt 安装 $package ..."
+
+    # 后台 apt 活动（新系统首开机自动更新）持锁时装不上；等一等，
+    # 超时则按下方的字体缺失降级逻辑处理（只告警不中止）
+    wait_for_apt_lock 600 || { warn "apt 锁被占用且等待超时，跳过 $package 安装。"; return 0; }
 
     local rc=0
     "$SUDO_CMD" apt-get install -y "$package" || rc=$?
@@ -525,6 +535,11 @@ ppa_key_is_trusted() {
 
 install_from_ppa() {
     local rc=0
+
+    # add-apt-repository 与后续 apt-get update/install 都会与持锁的
+    # 后台 apt 活动冲突；先等它结束。本函数失败本就只降级不中止，
+    # 等锁超时也按同一语义返回失败
+    wait_for_apt_lock || { warn "等待 apt 锁超时，无法走 PPA 安装"; return 1; }
 
     echo "添加/刷新第三方 PPA: $PPA_NAME"
     "$SUDO_CMD" add-apt-repository -y "$PPA_NAME" || rc=$?

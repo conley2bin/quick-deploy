@@ -43,6 +43,10 @@ echo -e "${GREEN}=== 安装 tmux 与 gpakosz/.tmux 配置 ===${NC}\n"
 
 # 1. 安装软件包
 echo -e "${YELLOW}[1/4] 安装 tmux、git、剪贴板工具...${NC}"
+# 等后台 apt 活动结束（新装系统首开机自动更新常见持锁），否则 apt update 会撞锁失败。
+# 脚本被单独拷出、助手缺失时定义空操作跳过等锁
+if [ -f "$SCRIPT_DIR/../lib/apt-lock-wait.sh" ]; then . "$SCRIPT_DIR/../lib/apt-lock-wait.sh"; else wait_for_apt_lock() { return 0; }; fi
+wait_for_apt_lock || die "等待 apt 锁超时，请稍后重跑"
 sudo apt update
 sudo apt install -y tmux git xclip wl-clipboard
 TMUX_VERSION="$(tmux -V)"

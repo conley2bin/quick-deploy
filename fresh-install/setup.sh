@@ -19,6 +19,8 @@
 #      网络就绪后随时可单独重跑 tmux/install.sh
 # 前 4 步任何一步失败即中止；修复后重跑本脚本即可，
 # 每个子脚本都幂等（会自动跳过或重做，无副作用）。
+# 开始前会先等后台 apt 活动结束：新装系统首开机时 GNOME Software 常在
+# 后台跑全量系统更新并长时间持锁，不等的话任何一步 apt 操作都会撞锁失败
 
 set -uo pipefail
 
@@ -53,6 +55,12 @@ sudo -v || { echo -e "${RED}✗ 需要 sudo 权限${NC}" >&2; exit 1; }
 (while kill -0 "$$" 2>/dev/null; do sudo -n true 2>/dev/null; sleep 60; done) &
 SUDO_KEEPALIVE=$!
 trap 'kill $SUDO_KEEPALIVE 2>/dev/null' EXIT
+
+# 等后台 apt 活动结束再开始：新装系统首开机时 GNOME Software（aptd）常在
+# 后台跑全量系统更新并长时间持锁（内核升级 + NVIDIA DKMS 编译可达十几分钟），
+# 任何一步的 apt update/install 撞上它都会直接报「无法获得锁」失败
+. "$SCRIPT_DIR/lib/apt-lock-wait.sh"
+wait_for_apt_lock || { echo -e "${RED}✗ 等待 apt 锁超时，请确认后台系统更新结束后重跑本脚本${NC}" >&2; exit 1; }
 
 TOTAL=${#STEPS[@]}
 INDEX=0
