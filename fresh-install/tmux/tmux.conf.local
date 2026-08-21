@@ -6,3 +6,17 @@
 
 # 开启鼠标模式：点击切窗格、拖边框调大小、滚轮翻历史
 set -g mouse on
+
+# Ctrl+Alt+←/→ 直接切换 window（不需要前缀键）。
+#
+# Ghostty 侧不需要任何改动：它的默认绑定 ctrl+alt+arrow=goto_split 是
+# performable 绑定——当前方向没有分割时按键会原样透传给终端程序。
+# （用户实测：无分割时按 ctrl+alt+← 在 shell 里打出 DDDD，正是透传的
+# ESC 序列被 shell 显示出来的证据。）
+# gpakosz 主配置检测到 TERM_PROGRAM=ghostty 会自动开启 extended-keys，
+# tmux 由此能把透传过来的序列识别为 C-M-Left/C-M-Right。
+#
+# 注意：如果将来在 Ghostty 里用了它自己的 split，这个键会优先被
+# Ghostty 拿去跳 split 而不再传给 tmux——本机不用 Ghostty split，无影响。
+bind -n C-M-Left  previous-window
+bind -n C-M-Right next-window
