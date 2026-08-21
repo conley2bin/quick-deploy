@@ -975,7 +975,7 @@ main() {
         exit 0
     fi
 
-    section "[1/6] 安装最新版 Ghostty"
+    section "[1/7] 安装最新版 Ghostty"
     install_ghostty
 
     # 字体必须先于写配置：render_config 用 font_exists 决定要不要写
@@ -994,7 +994,7 @@ main() {
     section "[5/7] 验证桌面入口与 terminfo"
     verify_system_integration
 
-    section "[6/7] 默认终端（显式选择才接管）"
+    section "[6/7] 默认终端（接管 Ctrl+Alt+T）"
     if [ "$DEFAULT_TERMINAL" = true ]; then
         set_default_terminal
         verify_default_terminal
