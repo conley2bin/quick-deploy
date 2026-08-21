@@ -1,0 +1,8 @@
+# conley 的 tmux 定制基线 —— 相对 gpakosz/.tmux 默认的全部个人改动
+#
+# 本文件由 install.sh 在首次安装时播种为 ~/.tmux.conf.local（已存在则保留
+# 不动）。只记录真正的个人偏好，不复制上游模板的几百行注释；全部可用选项
+# 见上游模板 ~/.tmux/.tmux.conf.local（安装后可用 diff 对照）。
+
+# 开启鼠标模式：点击切窗格、拖边框调大小、滚轮翻历史
+set -g mouse on

@@ -11,15 +11,19 @@
 1. `apt install tmux git xclip wl-clipboard` —— 后两者是 gpakosz 配置“复制到系统剪贴板”功能在 Linux 下的依赖：X11 会话用 `xclip`，Wayland 会话用 `wl-copy`，两个都装以覆盖两种会话。
 2. 克隆 `https://github.com/gpakosz/.tmux` 到 `~/.tmux`（`--single-branch`）。
 3. 符号链接 `~/.tmux.conf` → `~/.tmux/.tmux.conf`。
-4. 复制 `~/.tmux/.tmux.conf.local` → `~/.tmux.conf.local`。
+4. 用模块自带的 `tmux.conf.local` 基线播种 `~/.tmux.conf.local`（已存在则保留）。
 
 ## 定制入口
 
-上游明确要求**不要改主配置** `~/.tmux/.tmux.conf`（改了后续 `git pull` 更新会冲突），一切定制写在 `~/.tmux.conf.local` 副本里。该文件本质是 tmux 配置片段，可以直接写 `set -g ...`；若某行被主配置覆盖，按上游说明在行尾加 `#!important`。
+上游明确要求**不要改主配置** `~/.tmux/.tmux.conf`（改了后续 `git pull` 更新会冲突），一切定制写在 `~/.tmux.conf.local` 里。该文件本质是 tmux 配置片段，可以直接写 `set -g ...`；若某行被主配置覆盖，按上游说明在行尾加 `#!important`。
+
+模块仓库里的 `tmux.conf.local` 是这套定制的**基线**：只记录相对上游默认的个人改动（目前仅鼠标模式），不复制上游模板里几百行注释。首次安装时播种为 `~/.tmux.conf.local`；之后本机文件自由演化，重跑脚本永不覆盖，只在它与基线不一致时打印 diff 提示。想给基线加新偏好：改模块里的 `tmux.conf.local` 并提交，新机器自动获得；已装机器按提示 diff 手动同步。
+
+上游模板（克隆里的 `~/.tmux/.tmux.conf.local`）是全部可用选项的菜单，随时可查。
 
 ### 本地副本与上游模板是脱钩的
 
-`~/.tmux.conf.local` 是安装时从仓库**复制**出来的副本，从复制那一刻起就是私有文件。重跑脚本时 `git pull` 只更新仓库里的模板，本地副本**永不被覆盖或合并**——否则你写的定制（如 `set -g mouse on`）会被冲掉。
+`~/.tmux.conf.local` 是安装时由模块基线**复制**出来的副本，从复制那一刻起就是私有文件。重跑脚本时 `git pull` 只更新仓库里的上游模板，本地副本**永不被覆盖或合并**——否则你写的定制（如 `set -g mouse on`）会被冲掉。
 
 代价：上游以后在模板里新增选项时，你不会自动获得。这不会弄坏任何东西（主配置对所有选项都有默认值），只是看不到新选项。想查看上游新增了什么，手动对比并挑想要的行抄过来：
 

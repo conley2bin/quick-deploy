@@ -7,11 +7,12 @@
 #      Wayland 用 wl-copy，两个都装以覆盖两种会话
 #   2. 克隆 https://github.com/gpakosz/.tmux 到 ~/.tmux（--single-branch）
 #   3. 符号链接 ~/.tmux.conf → ~/.tmux/.tmux.conf
-#   4. 复制 ~/.tmux/.tmux.conf.local → ~/.tmux.conf.local（唯一的定制入口，
-#      上游明确要求不要改主配置 .tmux.conf，一切定制写在这个副本里）
+#   4. 用模块自带的 tmux.conf.local 基线播种 ~/.tmux.conf.local（个人定制
+#      入口，上游明确要求不要改主配置 .tmux.conf，一切定制写在这个副本里）
 #
-# 幂等语义：重跑 = 确保 apt 包已装、已有克隆用 git pull --ff-only 更新；
-# 已存在的 ~/.tmux.conf.local 永不覆盖（那是用户的定制文件）；
+# 幂等语义：重跑 = 确保 apt 包已装、已有克隆用 git pull --ff-only 更新到最新；
+# 已存在的 ~/.tmux.conf.local 永不覆盖（那是用户的定制文件），与模块基线
+# 不一致时打印 diff 提示；
 # 替换任何既有 ~/.tmux.conf / ~/.tmux 目录前先做时间戳备份。
 #
 # 失败语义：apt 失败或首次克隆失败 → 退出非零；已有克隆上的更新失败
@@ -30,6 +31,8 @@ REPO_URL="https://github.com/gpakosz/.tmux.git"
 TMUX_REPO_DIR="$HOME/.tmux"
 TMUX_CONF="$HOME/.tmux.conf"
 TMUX_CONF_LOCAL="$HOME/.tmux.conf.local"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LOCAL_BASELINE="$SCRIPT_DIR/tmux.conf.local"
 TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
 
 die() {
@@ -81,13 +84,18 @@ else
     echo -e "${GREEN}✓ ~/.tmux.conf → ~/.tmux/.tmux.conf${NC}"
 fi
 
-# 4. 复制 .tmux.conf.local（定制入口，存在则保留）
+# 4. 播种 ~/.tmux.conf.local（定制入口，存在则保留）
 echo -e "\n${YELLOW}[4/4] 准备 ~/.tmux.conf.local...${NC}"
 if [ -e "$TMUX_CONF_LOCAL" ]; then
-    echo -e "${YELLOW}~/.tmux.conf.local 已存在，保留你的定制不覆盖${NC}"
+    if cmp -s "$TMUX_CONF_LOCAL" "$LOCAL_BASELINE"; then
+        echo -e "${GREEN}✓ ~/.tmux.conf.local 与模块基线一致${NC}"
+    else
+        echo -e "${YELLOW}~/.tmux.conf.local 已存在且与模块基线不同，保留你的版本不覆盖${NC}"
+        echo -e "  查看差异: ${GREEN}diff -u $LOCAL_BASELINE $TMUX_CONF_LOCAL${NC}"
+    fi
 else
-    cp "$TMUX_REPO_DIR/.tmux.conf.local" "$TMUX_CONF_LOCAL"
-    echo -e "${GREEN}✓ 已复制 .tmux.conf.local 模板${NC}"
+    cp "$LOCAL_BASELINE" "$TMUX_CONF_LOCAL"
+    echo -e "${GREEN}✓ 已播种模块基线 ~/.tmux.conf.local${NC}"
 fi
 
 echo -e "\n${GREEN}=== 安装完成 ===${NC}"
@@ -96,5 +104,5 @@ echo -e "  • 前缀键保留默认 ${GREEN}Ctrl+b${NC}，同时新增第二前
 echo -e "  • 定制一律改 ${GREEN}~/.tmux.conf.local${NC}（不要改 ~/.tmux/.tmux.conf）"
 echo -e "  • 按 ${GREEN}<前缀> e${NC} 直接打开定制文件，${GREEN}<前缀> r${NC} 重载配置"
 echo -e "  • 鼠标模式开关：${GREEN}<前缀> m${NC}"
-echo -e "  • 更多变量与键位见 ~/.tmux.conf.local 注释和上游 README："
+echo -e "  • 全部可选项见上游模板 ~/.tmux/.tmux.conf.local 和上游 README："
 echo -e "    ${GREEN}https://github.com/gpakosz/.tmux${NC}"
