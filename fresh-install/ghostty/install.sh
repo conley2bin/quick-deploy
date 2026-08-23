@@ -935,7 +935,12 @@ smoke_test() {
 
     log="$(mktemp /tmp/ghostty-smoke.XXXXXX.log)"
     echo "启动 Ghostty 做 3 秒进程存活、stderr 与 fcitx5 GTK4 immodule 检查……"
-    "$GHOSTTY_BIN" --gtk-single-instance=false > /dev/null 2>"$log" &
+    # 显式带上登录会话的 IM 环境变量：冒烟测试要验证的是「配置生效后
+    # Ghostty 能否加载 fcitx5 immodule」，不该依赖运行安装脚本的那个终端
+    # 恰好有这些变量——全新首开机跑 setup.sh 时就没有（im-config 要等下次
+    # 登录才设置），会把一次正常安装误判成冒烟失败。
+    GTK_IM_MODULE=fcitx QT_IM_MODULE=fcitx XMODIFIERS=@im=fcitx \
+        "$GHOSTTY_BIN" --gtk-single-instance=false > /dev/null 2>"$log" &
     pid=$!
     sleep 3
 
