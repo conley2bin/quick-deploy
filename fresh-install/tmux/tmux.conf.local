@@ -7,7 +7,8 @@
 # 开启鼠标模式：点击切窗格、拖边框调大小、滚轮翻历史
 set -g mouse on
 
-# Ctrl+Alt+←/→ 直接切换 window（不需要前缀键）。
+# Ctrl+Alt+←/→ 直接切换 window（不需要前缀键）。到头环绕
+# （previous/next-window 默认环绕）。
 #
 # Ghostty 默认把 ctrl+alt+arrow 绑给 goto_split；仅靠“无 split 时似乎会
 # 透传”的当前表现不够稳定。fresh-install/ghostty/install.sh 因此显式
@@ -19,3 +20,14 @@ set -g mouse on
 # Ghostty split，键的所有权明确交给 tmux window，避免两层抢同一按键。
 bind -n C-M-Left  previous-window
 bind -n C-M-Right next-window
+
+# Ctrl+Alt+= 新建 window（开在当前 pane 的目录，跟着手头的活儿走）。
+# = 与 + 同键：不按 Shift 产生 C-M-=，按住 Shift 产生 C-M-+，两个都绑。
+# Ghostty 默认键表里没有 equal/plus 组合，无需 unbind。
+#
+# 行尾的 #!important 不能删：gpakosz 的 _apply_bindings 会把所有 new-window
+# 绑定里的 -c '#{pane_current_path}' 剥掉（retain_current_path=false 的语义），
+# 以 #!important 结尾的 bind 行会在改写完成后被 _apply_important 重新 source，
+# 这是上游提供的逃生门。
+bind -n C-M-= new-window -c '#{pane_current_path}' #!important
+bind -n C-M-+ new-window -c '#{pane_current_path}' #!important
