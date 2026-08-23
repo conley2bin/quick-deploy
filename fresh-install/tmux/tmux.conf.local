@@ -7,27 +7,9 @@
 # 开启鼠标模式：点击切窗格、拖边框调大小、滚轮翻历史
 set -g mouse on
 
-# Ctrl+Alt+←/→ 直接切换 window（不需要前缀键）。到头环绕
-# （previous/next-window 默认环绕）。
-#
-# Ghostty 默认把 ctrl+alt+arrow 绑给 goto_split；仅靠“无 split 时似乎会
-# 透传”的当前表现不够稳定。fresh-install/ghostty/install.sh 因此显式
-# unbind 左右两个键，保证它们编码后送入 pty。
-# gpakosz 主配置检测到 TERM_PROGRAM=ghostty 会自动开启 extended-keys，
-# tmux 由此把序列识别为 C-M-Left/C-M-Right。
-#
-# 代价：Ghostty 自己的 split 不再能用 Ctrl+Alt+←/→ 切；本机不用
-# Ghostty split，键的所有权明确交给 tmux window，避免两层抢同一按键。
-bind -n C-M-Left  previous-window
-bind -n C-M-Right next-window
-
-# Ctrl+Alt+= 新建 window：先问名字（回车留空 = 不命名，按进程自动改名），
-# 开在当前 pane 的目录。= 与 + 同键：不按 Shift 产生 C-M-=，按住 Shift
-# 产生 C-M-+，两个都绑。Ghostty 默认键表里没有 equal/plus 组合，无需 unbind。
-#
-# 行尾的 #!important 不能删：gpakosz 的 _apply_bindings 会把所有 new-window
-# 绑定里的 -c '#{pane_current_path}' 剥掉（retain_current_path=false 的语义），
-# 以 #!important 结尾的 bind 行会在改写完成后被 _apply_important 重新 source，
-# 这是上游提供的逃生门。
-bind -n C-M-= command-prompt -p "window name:" "new-window -c '#{pane_current_path}' -n '%%'" #!important
-bind -n C-M-+ command-prompt -p "window name:" "new-window -c '#{pane_current_path}' -n '%%'" #!important
+# 键权说明：Ctrl+Alt+←/→（切标签）与 Ctrl+Alt+=（新建标签）归 Ghostty
+# 标签页——ghostty/install.sh 在终端层直接消费这组键，不编码进 pty，
+# 因此 tmux 里不再绑它们。tmux 内操作走前缀键：
+#   前缀 Ctrl-H / Ctrl-L   左右切 window（可连按）
+#   前缀 c                 新建 window
+#   前缀 数字 / 前缀 Tab   直跳第 N 个 / 回上一个 window
