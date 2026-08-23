@@ -33,7 +33,8 @@ HOTKEY_ALT_TRIGGER=''                      # 「临时切换到第一个输入�
 BEHAVIOR_ACTIVE_BY_DEFAULT='True'          # 起手即为激活态，即拼音直通
 
 FCITX5_CONFIG="$FCITX5_CONFIG_DIR/config"
-FCITX5_WAS_RUNNING=false
+FCITX5_STARTED_NOW=false
+IM_ENV_PUSHED=false
 
 section() {
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
@@ -169,6 +170,19 @@ show_current_state() {
         | awk '$1 ~ /^(ii|rc)/ {print}' \
         || true
     echo
+
+    echo "Fcitx5 运行状态:"
+    if pgrep -x fcitx5 >/dev/null 2>&1; then
+        echo "  正在运行（PID $(pgrep -x fcitx5 | head -n 1)）"
+    else
+        echo "  未运行（正常安装完成后会立即启动）"
+    fi
+    if systemctl --user show-environment 2>/dev/null | grep -q '^GTK_IM_MODULE=fcitx$'; then
+        echo "  会话激活环境: GTK_IM_MODULE=fcitx 已就位"
+    else
+        echo "  会话激活环境: 未含 GTK_IM_MODULE=fcitx（安装时将写入；登录时由 im-config 设置）"
+    fi
+    echo
 }
 
 # 让运行中的 fcitx5 干净退出，之后才能安全写配置。
@@ -178,13 +192,10 @@ show_current_state() {
 # 反过来做（先写再重启）会被它退出时的保存动作覆盖掉，而脚本照样报成功。
 # profile 写入（步骤 5）同样受此影响，只是全新安装时 fcitx5 还未启动，未暴露。
 stop_fcitx5_before_write() {
-    FCITX5_WAS_RUNNING=false
-
     if ! pgrep -x fcitx5 >/dev/null 2>&1; then
         return 0
     fi
 
-    FCITX5_WAS_RUNNING=true
     echo "检测到 Fcitx5 正在运行，先让它退出再写配置"
     echo "（它退出时会回写配置目录，不先停会覆盖掉本脚本的写入）"
 
@@ -207,24 +218,85 @@ stop_fcitx5_before_write() {
     echo "      本步骤结束后会回读文件校验，若不一致会明确报错。"
 }
 
-start_fcitx5_if_it_was_running() {
-    if [ "$FCITX5_WAS_RUNNING" != true ]; then
+# 安装完成时让输入法立即可用，而不是强制注销重登。
+# 补的是 im-config 登录钩子 /usr/share/im-config/data/23_fcitx5.rc 的两件事：
+#   它的 IM_CONFIG_PHASE=2 —— 启动 fcitx5 守护进程（fcitx5 -d）
+#   它的 IM_CONFIG_PHASE=1 —— 设置 GTK_IM_MODULE 等环境变量
+# 环境变量无法改已经在运行的进程（包括 gnome-shell 自己），但
+# dbus-update-activation-environment --systemd 能更新 systemd --user 管理器
+# 与 D-Bus 激活环境，让「之后新启动」的桌面应用带上这些变量。
+graphical_session_available() {
+    [ -n "${WAYLAND_DISPLAY:-}" ] || [ -n "${DISPLAY:-}" ]
+}
+
+ensure_fcitx5_running() {
+    if ! graphical_session_available; then
+        echo "当前不是图形会话（可能是 SSH），跳过立即启动；"
+        echo "登录桌面时 im-config 会自动启动 Fcitx5。"
         return 0
     fi
 
     if pgrep -x fcitx5 >/dev/null 2>&1; then
+        echo "Fcitx5 已在运行"
         return 0
     fi
 
     if fcitx5 -d >/dev/null 2>&1; then
         sleep 1
         if pgrep -x fcitx5 >/dev/null 2>&1; then
-            echo "Fcitx5 已重新启动"
+            FCITX5_STARTED_NOW=true
+            echo "Fcitx5 已启动（无需注销重登）"
             return 0
         fi
     fi
 
-    echo "提示: 未能自动重启 Fcitx5，注销重新登录后会自动启动。"
+    echo "警告: 未能自动启动 Fcitx5。可手动运行 fcitx5 -d，"
+    echo "      或注销重登后由 im-config 自动启动。"
+}
+
+push_im_env_to_session() {
+    if ! graphical_session_available; then
+        return 0
+    fi
+
+    # 判据是激活环境里的实际值，而不是「刚才是不是我们启动的」：
+    # 手工启动过 fcitx5 但缺变量的会话同样需要补写；已就位则幂等跳过。
+    if systemctl --user show-environment 2>/dev/null | grep -q '^GTK_IM_MODULE=fcitx$'; then
+        return 0
+    fi
+
+    # 与 23_fcitx5.rc 的 IM_CONFIG_PHASE=1 保持一致
+    local vars=(
+        "GTK_IM_MODULE=fcitx"
+        "QT_IM_MODULE=fcitx"
+        "XMODIFIERS=@im=fcitx"
+        "CLUTTER_IM_MODULE=xim"
+        "SDL_IM_MODULE=fcitx"
+    )
+
+    if command -v dbus-update-activation-environment >/dev/null 2>&1; then
+        if dbus-update-activation-environment --systemd "${vars[@]}" >/dev/null 2>&1; then
+            IM_ENV_PUSHED=true
+        fi
+    fi
+    # 兜底：dbus-update 失败时直接写 systemd --user 管理器环境
+    if [ "$IM_ENV_PUSHED" != true ] \
+        && systemctl --user set-environment "${vars[@]}" 2>/dev/null; then
+        IM_ENV_PUSHED=true
+    fi
+
+    if [ "$IM_ENV_PUSHED" = true ]; then
+        # 回读校验：写入动作返回 0 ≠ 变量真的进了管理器环境
+        if systemctl --user show-environment 2>/dev/null | grep -q '^GTK_IM_MODULE=fcitx$'; then
+            echo "已把输入法环境变量写入当前会话激活环境（之后新启动的应用直接可用）"
+        else
+            IM_ENV_PUSHED=false
+            echo "警告: 激活环境回读不到 GTK_IM_MODULE=fcitx，写入未生效；"
+            echo "      注销重登后由 im-config 统一设置。"
+        fi
+    else
+        echo "警告: 未能写入会话激活环境；注销重登后由 im-config 统一设置。"
+    fi
 }
 
 # 只改这两个键，不整文件覆盖 —— config 里还有 DefaultPageSize、ActiveByDefault
@@ -390,6 +462,22 @@ verify_installation() {
         failed=true
     fi
 
+    # 运行态：装完应当立即可用。缺进程或缺激活环境变量只告警不报错——
+    # 非图形会话（SSH）下两者都合法地缺席，由登录时的 im-config 补上。
+    if pgrep -x fcitx5 >/dev/null 2>&1; then
+        echo "OK: Fcitx5 正在运行"
+    elif graphical_session_available; then
+        echo "警告: Fcitx5 未在运行；注销重登后会由 im-config 启动"
+    else
+        echo "提示: 非图形会话，Fcitx5 将在登录桌面时由 im-config 启动"
+    fi
+
+    if systemctl --user show-environment 2>/dev/null | grep -q '^GTK_IM_MODULE=fcitx$'; then
+        echo "OK: 会话激活环境已含 GTK_IM_MODULE=fcitx"
+    elif graphical_session_available; then
+        echo "警告: 会话激活环境缺 GTK_IM_MODULE=fcitx，之后新启动的应用拿不到输入法变量"
+    fi
+
     # 上面那条只是回读本脚本自己刚写的文件，证明不了 pinyin 能用。
     # fcitx5 在加载时会把找不到对应 inputmethod 注册文件的条目直接从组里删掉，
     # 不报错、不告警——表现就是“profile 看着对，但输入法列表里没有拼音”。
@@ -521,7 +609,8 @@ echo
 # 步骤 3: 配置输入法框架
 # ============================================
 # 说明: 使用 im-config 将 fcitx5 设置为用户默认输入法框架。
-#       im-config 会在下次登录时设置环境变量并启动 fcitx5。
+#       im-config 负责「下次登录」：设置环境变量并启动 fcitx5。
+#       「本次会话」的启动与环境变量由步骤 5 之后立即补上，不必等重登。
 # ============================================
 section "[3/5] 配置输入法框架"
 
@@ -634,7 +723,9 @@ echo "已添加拼音输入法到配置"
 write_hotkey_config
 echo "已写入快捷键配置（左 Shift 循环切换；临时切换无快捷键）"
 
-start_fcitx5_if_it_was_running
+# 启动 + 写会话环境变量：让之后新开的应用立即可用输入法。
+ensure_fcitx5_running
+push_im_env_to_session
 echo
 
 verify_hotkey_config
@@ -662,8 +753,17 @@ echo "========================================"
 echo "  安装完成"
 echo "========================================"
 echo
-echo "重要: 注销并重新登录以使环境变量生效"
-echo "     手动操作或者使用命令: gnome-session-quit --logout --no-prompt"
+if [ "$FCITX5_STARTED_NOW" = true ] || [ "$IM_ENV_PUSHED" = true ]; then
+    echo "输入法已即时生效（无需等注销重登）:"
+    echo "  - Fcitx5 已启动，输入法环境变量已写入当前会话激活环境"
+    echo "  - 之后新打开的应用可直接输入中文"
+    echo "  - 已经在运行的程序环境不可改（含本终端已开的窗口），需重启该程序"
+    echo "  - 注销重登一次仍是让所有程序彻底一致的最干净路径:"
+    echo "      gnome-session-quit --logout --no-prompt"
+else
+    echo "重要: 注销并重新登录以启动输入法并设置环境变量"
+    echo "     手动操作或者使用命令: gnome-session-quit --logout --no-prompt"
+fi
 echo
 echo "首次配置 (必须):"
 echo "  1. 运行: fcitx5-configtool (若该命令不存在，运行: fcitx5-config-qt)"

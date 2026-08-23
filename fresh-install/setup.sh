@@ -97,6 +97,6 @@ if [ "${#TOLERATE_FAILED[@]}" -gt 0 ]; then
     done
 fi
 
-echo -e "\n${YELLOW}最后一步：注销并重新登录${NC}，以下改动才会生效："
-echo -e "  • 默认 shell 切换为 zsh"
-echo -e "  • 中文输入法环境变量"
+echo -e "\n${YELLOW}最后一步：注销并重新登录${NC}，让所有改动彻底一致："
+echo -e "  • 默认 shell 切换为 zsh（必须重登才生效）"
+echo -e "  • 中文输入法已即时启动（之后新开的应用可直接用）；重登让已在运行的程序也生效"
