@@ -448,6 +448,9 @@ show_check() {
         echo "terminfo: xterm-ghostty 不可用（安装的系统级 .deb 应补齐）"
     fi
     echo "Ctrl+Alt+T: $(wrapper_state)"
+    if command -v gsettings >/dev/null 2>&1; then
+        echo "GSettings terminal exec: $(gsettings get org.gnome.desktop.default-applications.terminal exec 2>/dev/null)"
+    fi
     echo "xdg-terminal-exec 默认项: $(xdg_terminal_state)"
 
     case "$INSTALL_MODE" in
@@ -886,23 +889,34 @@ exec /usr/bin/ghostty "$@"
 "
 
     # 调用链（实测）：gsd-media-keys 读 GSettings
-    #   org.gnome.desktop.default-applications.terminal exec = 'x-terminal-emulator'
-    # 然后按 PATH 启动它。xdg-terminals.list 另管遵守 xdg-terminal-exec
+    #   org.gnome.desktop.default-applications.terminal exec
+    # 按值启动终端。xdg-terminals.list 另管遵守 xdg-terminal-exec
     # 的程序（如文件管理器的“在终端中打开”）。两处缺一都会留下启动入口不一致。
     #
+    # 为什么 exec 写绝对路径而不是包装脚本名：gsd-media-keys 是 systemd 用户
+    # 服务，它的 PATH 来自 systemd 用户管理器，而 GDM 的 Wayland 会话不
+    # source ~/.profile（Xsession 不参与），profile 里的 ~/.local/bin 块到不了
+    # 图形会话。实测（Ubuntu 24.04 Wayland）：systemd 用户会话 PATH 就是
+    # /etc/environment 的原样，按名字解析会回落到 /usr/bin/x-terminal-emulator
+    # （alternatives → gnome-terminal）。绝对路径绕开 PATH 解析，立即生效。
+    #
+    # 为什么不能用 environment.d 补 PATH：systemd 把 /etc/environment 经
+    # /usr/lib/environment.d/99-environment.conf 符号链接当成 environment.d 文件
+    # 读，且该目录优先级最高、同一变量先写者赢，用户的 ~/.config/environment.d
+    # 再也改不动 PATH（实测 PATH=ZZZ:${PATH} 被完全忽略）。
+    #
     # 与 X11/Wayland 无关：名字里的 “x-” 是 Debian alternatives 的历史命名
-    # （X terminal emulator），不是对 X11 API 的依赖。抢占的是“GSettings 值
-    # + 进程启动”这条路，两种显示服务器下完全相同；不同的只是按键抓取
-    # （X11 走 XGrabKey，Wayland 由 Mutter 路由到同一个处理函数）。
+    # （X terminal emulator），不是对 X11 API 的依赖。
     write_atomic_text "$TERMINAL_WRAPPER" "$wrapper_content" 755
     write_atomic_text "$XDG_TERMINALS_FILE" "$terminal_list_content" 644
 
-    # Ubuntu 默认 ~/.profile 会把 ~/.local/bin 注入登录会话；若用户删过
-    # 这段，重新登录后 gsd-media-keys 会绕过上面的用户级包装脚本。
-    if ! systemctl --user show-environment 2>/dev/null \
-        | grep '^PATH=' | grep -qF "$LOCAL_BIN_DIR"; then
-        warn "systemd 用户会话 PATH 中没有 $LOCAL_BIN_DIR，重新登录后 Ctrl+Alt+T 可能退回旧终端"
-        echo "请确认 ~/.profile 保留 Ubuntu 默认的 ~/.local/bin PATH 配置块。"
+    if command -v gsettings >/dev/null 2>&1; then
+        # gsd-media-keys 每次按键时现读该键，写完立即生效，不用重启也不用重登。
+        # exec-arg 保持 Ubuntu 默认 '-e'：Ghostty 与 gnome-terminal 一样接受 -e。
+        gsettings set org.gnome.desktop.default-applications.terminal exec "$TERMINAL_WRAPPER"
+        echo "已设置 GSettings terminal exec -> $TERMINAL_WRAPPER（绝对路径，不依赖 PATH）"
+    else
+        warn "找不到 gsettings，无法把 Ctrl+Alt+T 指到包装脚本绝对路径"
     fi
 }
 
@@ -923,7 +937,11 @@ verify_default_terminal() {
         || die "$TERMINAL_WRAPPER 未正确指向 Ghostty"
     grep -qx "$DESKTOP_ID" "$XDG_TERMINALS_FILE" \
         || die "$XDG_TERMINALS_FILE 未正确指向 $DESKTOP_ID"
-    echo "OK: 默认终端包装脚本与 xdg-terminals.list 均已指向 Ghostty"
+    if command -v gsettings >/dev/null 2>&1; then
+        [ "$(gsettings get org.gnome.desktop.default-applications.terminal exec)" = "'$TERMINAL_WRAPPER'" ] \
+            || die "GSettings terminal exec 未指向 $TERMINAL_WRAPPER"
+    fi
+    echo "OK: 默认终端包装脚本、xdg-terminals.list 与 GSettings exec 均已指向 Ghostty"
 }
 
 smoke_test() {
