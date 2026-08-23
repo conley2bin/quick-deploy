@@ -792,20 +792,15 @@ render_config() {
     echo "theme = $THEME"
     echo "keybind = f11=toggle_fullscreen"
 
-    # Ctrl+Alt+←/→ 切换标签，Ctrl+Alt+= 新建标签。
-    # 两个上游行为差异需要知道：
-    #   - previous_tab/next_tab 不环绕（上游刻意决定，issue #999：曾经环绕，
-    #     应另一用户要求改为不环绕），到头即停；
-    #   - new_tab 没有「先问名字」的机制，要改名只能建后用 prompt_tab_title。
-    # 新标签继承当前目录（tab-inherit-working-directory 默认 true，
-    # 依赖 shell integration 的 cwd 上报）。
-    # = 与 + 同键：不按/按住 Shift 分别产生 equal/plus，两个都绑。
-    # 这组键一度被本模块 unbind 让给 tmux 切 window，现归还给标签页；
-    # tmux.conf.local 侧的对应绑定已同步移除（tmux 内改用前缀键操作）。
-    echo "keybind = ctrl+alt+arrow_left=previous_tab"
-    echo "keybind = ctrl+alt+arrow_right=next_tab"
-    echo "keybind = ctrl+alt+equal=new_tab"
-    echo "keybind = ctrl+alt+plus=new_tab"
+    # 把 Ctrl+Alt+←/→ 明确让给终端内的 tmux。
+    # Ghostty 默认把它们绑给 goto_split:left/right；即使无 split 时当前版本
+    # 看起来会透传，也不能把隐式 fallback 当成稳定合同。显式 unbind 后，
+    # 按键一定编码后送入 pty，fresh-install/tmux/tmux.conf.local 的 root 表
+    # 再用 C-M-Left/Right 切 previous/next window。
+    # 这不是“改绑 Ghostty 标签页”：Ghostty 标签页继续用上游默认
+    # Ctrl+Tab / Ctrl+Shift+Tab；只把两个键的所有权交给 tmux。
+    echo "keybind = ctrl+alt+arrow_left=unbind"
+    echo "keybind = ctrl+alt+arrow_right=unbind"
 
     # 为什么必须显式写：working-directory 默认是 inherit，即继承启动进程的
     # 当前目录。Ghostty 仅在能识别出“从桌面启动器启动”时才自动改用 home；
