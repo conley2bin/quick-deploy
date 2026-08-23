@@ -7,6 +7,14 @@
 # 开启鼠标模式：点击切窗格、拖边框调大小、滚轮翻历史
 set -g mouse on
 
+# Ghostty 需要 tmux 开 extended-keys 才能正确收到带修饰键的按键序列
+# （本配置的 Ctrl+Alt+←/→ 与 Ctrl+Alt+= 都依赖它）。gpakosz 的自动开启
+# 只在「启动 tmux 服务器那一刻 TERM_PROGRAM=ghostty」时才生效；从 VS Code
+# 终端、SSH、脚本等上下文启动的服务器会被设成 off，之后从 Ghostty 附着
+# 上去就会看到 “tmux extended-keys is off” 警告且修饰键失灵。
+# 本机只用 Ghostty，无条件开启；本行位于 gpakosz 条件判断之后，覆盖其结论。
+set -g extended-keys on
+
 # Ctrl+Alt+←/→ 直接切换 window（不需要前缀键）。到头环绕
 # （previous/next-window 默认环绕）。
 #
