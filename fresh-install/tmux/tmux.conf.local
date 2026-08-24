@@ -7,13 +7,23 @@
 # 开启鼠标模式：点击切窗格、拖边框调大小、滚轮翻历史
 set -g mouse on
 
-# Ghostty 需要 tmux 开 extended-keys 才能正确收到带修饰键的按键序列
-# （本配置的 Ctrl+Alt+←/→ 与 Ctrl+Alt+= 都依赖它）。gpakosz 的自动开启
-# 只在「启动 tmux 服务器那一刻 TERM_PROGRAM=ghostty」时才生效；从 VS Code
-# 终端、SSH、脚本等上下文启动的服务器会被设成 off，之后从 Ghostty 附着
-# 上去就会看到 “tmux extended-keys is off” 警告且修饰键失灵。
-# 本机只用 Ghostty，无条件开启；本行位于 gpakosz 条件判断之后，覆盖其结论。
-set -g extended-keys on
+# Ghostty 与 tmux 的扩展键：真正依赖 extended-keys 的是 C-M-= / C-M-+
+# （没有传统编码的按键）。tmux ≥3.5 只有在终端具备 extkeys 特性时才会
+# 真正向终端发出请求（CSI > 4 ; 2 m），Ghostty 收到请求后才会发送
+# ghostty/install.sh 里写死的 csi:61;7u / csi:43;7u。本机 xterm-ghostty 的
+# terminfo 没有 Eneks 能力，tmux 的默认表也不含 Ghostty —— 不加下一行，
+# extended-keys 设 on 还是 always 都不会发出请求，C-M-=/+ 失灵且 Ghostty
+# 一直提示 “tmux extended-keys is off”（与服务器从哪个终端启动无关）。
+set -as terminal-features ',xterm-ghostty:extkeys'
+# 无条件开启（本机只用 Ghostty）。gpakosz 只在「启动 tmux 服务器那一刻
+# TERM_PROGRAM=ghostty」时设 always，从 VS Code/SSH 等上下文启动的服务器会
+# 被设成 off；本行位于其条件判断之后（主配置在 line 164 才 source 本文件），
+# 覆盖为 always —— 与 gpakosz 现代分支取值一致，扩展键也会无条件转发给
+# pane 内应用，即使应用没有主动请求 modifyOtherKeys。
+set -g extended-keys always
+# Oh my tmux! 默认额外把 Ctrl+a 配成第二前缀；取消该绑定，只保留 Ctrl+b。
+set -gu prefix2
+unbind C-a
 
 # Ctrl+Alt+←/→ 直接切换 window（不需要前缀键）。到头环绕
 # （previous/next-window 默认环绕）。
@@ -21,17 +31,19 @@ set -g extended-keys on
 # Ghostty 默认把 ctrl+alt+arrow 绑给 goto_split；仅靠“无 split 时似乎会
 # 透传”的当前表现不够稳定。fresh-install/ghostty/install.sh 因此显式
 # unbind 左右两个键，保证它们编码后送入 pty。
-# gpakosz 主配置检测到 TERM_PROGRAM=ghostty 会自动开启 extended-keys，
-# tmux 由此把序列识别为 C-M-Left/C-M-Right。
+# unbind 后 Ghostty 按传统编码（CSI 1;7D / 1;7C）发送这两个组合键，
+# tmux 无需 extended-keys 也能识别为 C-M-Left/C-M-Right —— 与 C-M-=/+
+# 依赖 CSI-u 的路径不同。
 #
 # 代价：Ghostty 自己的 split 不再能用 Ctrl+Alt+←/→ 切；本机不用
 # Ghostty split，键的所有权明确交给 tmux window，避免两层抢同一按键。
 bind -n C-M-Left  previous-window
 bind -n C-M-Right next-window
 
-# Ctrl+Alt+= 新建 window：先问名字（回车留空 = 不命名，按进程自动改名），
-# 开在当前 pane 的目录。= 与 + 同键：不按 Shift 产生 C-M-=，按住 Shift
-# 产生 C-M-+，两个都绑。Ghostty 默认键表里没有 equal/plus 组合，无需 unbind。
+# Ctrl+Alt+= / Ctrl+Alt++ 新建 window：先问名字（回车留空 = 不命名，按进程
+# 自动改名），开在当前 pane 的目录。Ghostty 为这两个物理组合键显式发送
+# 固定 CSI-u 序列，tmux 分别识别为 C-M-= 与 C-M-+，避免依赖终端对符号键
+# 修饰符的隐式编码。
 #
 # 行尾的 #!important 不能删：gpakosz 的 _apply_bindings 会把所有 new-window
 # 绑定里的 -c '#{pane_current_path}' 剥掉（retain_current_path=false 的语义），

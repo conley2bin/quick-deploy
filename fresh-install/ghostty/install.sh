@@ -802,6 +802,12 @@ render_config() {
     echo "keybind = ctrl+alt+arrow_left=unbind"
     echo "keybind = ctrl+alt+arrow_right=unbind"
 
+    # 为 tmux 的 Ctrl+Alt+= / Ctrl+Alt++ 新建 window 绑定发送确定的 CSI-u
+    # 序列。= 是 Unicode 61，+ 是 Unicode 43；修饰参数 7 表示 Shift+Alt+Ctrl。
+    # 显式 csi 避免符号键在不同键盘布局或 Ghostty 编码路径下丢失修饰信息。
+    echo "keybind = ctrl+alt+equal=csi:61;7u"
+    echo "keybind = ctrl+alt+shift+equal=csi:43;7u"
+
     # 为什么必须显式写：working-directory 默认是 inherit，即继承启动进程的
     # 当前目录。Ghostty 仅在能识别出“从桌面启动器启动”时才自动改用 home；
     # 而 Ctrl+Alt+T 走的是 gsd-media-keys -> x-terminal-emulator 包装脚本，

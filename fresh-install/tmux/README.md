@@ -32,7 +32,7 @@ gpakosz/.tmux 的两个固定查找路径都以符号链接落盘，目标一个
 
 - 单一事实源：改 `~/.tmux.conf.local` 就是改仓库文件（`<前缀> e` 打开的也是它），改完 `<前缀> r` 生效、`git commit` 入库。
 - 多机同步只拉不装：别的机器 `git pull` 本仓库即生效，无需重跑 install.sh。
-- 基线只记真实改动（目前是鼠标模式 + `Ctrl+Alt+←/→` 无前缀切换 window）；全部可用选项查上游模板 `~/.tmux/.tmux.conf.local`。该文件本质是 tmux 配置片段，可直接写 `set -g ...`；若某行被主配置覆盖，按上游说明在行尾加 `#!important`。
+- 基线只记真实改动（目前是鼠标模式、取消 `Ctrl+a` 第二前缀、`Ctrl+Alt+←/→` 切换 window、`Ctrl+Alt+=/+` 新建 window）；全部可用选项查上游模板 `~/.tmux/.tmux.conf.local`。该文件本质是 tmux 配置片段，可直接写 `set -g ...`；若某行被主配置覆盖，按上游说明在行尾加 `#!important`。
 
 ## 幂等语义
 
@@ -47,12 +47,13 @@ gpakosz/.tmux 的两个固定查找路径都以符号链接落盘，目标一个
 
 ## 使用要点
 
-- 前缀键保留默认 `Ctrl+b`，同时新增第二前缀 `Ctrl+a`。
+- 前缀键仅保留默认 `Ctrl+b`；Oh my tmux! 默认新增的第二前缀 `Ctrl+a` 已取消。
 - `<前缀> e` 打开 `.tmux.conf.local`，`<前缀> r` 重载配置。
 - `<前缀> m` 切换鼠标模式；`<前缀> -` / `<前缀> _` 分屏；`<前缀> h/j/k/l` 在窗格间移动。
 - `Ctrl+Alt+←/→` **不需要前缀**，直接切换上一个/下一个 window（底部状态栏的标签）。
   绑定落在 root 表：`C-M-Left=previous-window`、`C-M-Right=next-window`。
   Ghostty 模块显式 unbind 这两个键，确保按键进入 pty；gpakosz 检测到
   `TERM_PROGRAM=ghostty` 后自动开启 extended-keys，tmux 才能识别组合键。
+- `Ctrl+Alt+=` / `Ctrl+Alt++` **不需要前缀**，提示输入名称后在当前 pane 的目录新建 window；直接回车则让 tmux 按运行程序自动命名。Ghostty 模块为两者显式发送 CSI-u 序列，tmux 分别绑定 `C-M-=` / `C-M-+`，避免符号键修饰信息在终端编码中丢失。
 - 内置 TPM 插件支持：在 `.tmux.conf.local` 里写 `set -g @plugin ...`，`<前缀> I` 安装，`<前缀> u` 更新，`<前缀> M-u` 卸载。
 - 完整键位与状态栏变量见上游模板 `~/.tmux/.tmux.conf.local` 和上游 README。

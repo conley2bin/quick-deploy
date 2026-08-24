@@ -71,6 +71,7 @@ sudo apt install --allow-downgrades ghostty=1.3.1~ppa2-noble1
   - 内置主题 `Catppuccin Frappe`
   - `F11` 全屏切换
   - 显式解除 `Ctrl+Alt+←/→` 的 Ghostty split 绑定，把按键交给 tmux 切 window
+  - 为 `Ctrl+Alt+=/+` 显式发送 CSI-u 序列，交给 tmux 新建 window
   - 新终端起始目录 `~/Documents`（不存在时回退到 XDG 文档目录，再不行就 `home`）
 
 ### 为什么要显式写 `working-directory`
