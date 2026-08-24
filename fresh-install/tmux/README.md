@@ -49,7 +49,7 @@ gpakosz/.tmux 的两个固定查找路径都以符号链接落盘，目标一个
 
 - 前缀键仅保留默认 `Ctrl+b`；Oh my tmux! 默认新增的第二前缀 `Ctrl+a` 已取消。
 - `<前缀> e` 打开 `.tmux.conf.local`，`<前缀> r` 重载配置。
-- `<前缀> m` 切换鼠标模式；`<前缀> -` / `<前缀> _` 分屏；`<前缀> h/j/k/l` 在窗格间移动。
+- `<前缀> m` 切换鼠标模式；普通 pane 中鼠标滚轮每格滚动 1 行；`<前缀> -` / `<前缀> _` 分屏；`<前缀> h/j/k/l` 在窗格间移动。应用主动开启 mouse reporting 时，滚轮仍交给应用自身处理。
 - `Ctrl+Alt+←/→` **不需要前缀**，直接切换上一个/下一个 window（底部状态栏的标签）。
   绑定落在 root 表：`C-M-Left=previous-window`、`C-M-Right=next-window`。
   Ghostty 模块显式 unbind 这两个键，确保按键进入 pty；gpakosz 检测到

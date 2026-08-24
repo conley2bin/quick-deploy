@@ -7,6 +7,17 @@
 # 开启鼠标模式：点击切窗格、拖边框调大小、滚轮翻历史
 set -g mouse on
 
+# 普通 pane 中滚轮每格滚动 1 行：首次向上滚时进入 copy-mode，随后由
+# copy-mode 的 WheelUp/DownPane 绑定按 history-limit 滚动。应用若主动开启
+# mouse reporting（mouse_any_flag），仍把滚轮原样交给应用处理。
+bind -T root WheelUpPane if-shell -F '#{mouse_any_flag}' \
+  'send-keys -M' \
+  'copy-mode -e; send-keys -X -N 1 scroll-up'
+bind -T copy-mode WheelUpPane   send-keys -X -N 1 scroll-up
+bind -T copy-mode WheelDownPane send-keys -X -N 1 scroll-down
+bind -T copy-mode-vi WheelUpPane   send-keys -X -N 1 scroll-up
+bind -T copy-mode-vi WheelDownPane send-keys -X -N 1 scroll-down
+
 # Oh my tmux! 默认额外把 Ctrl+a 配成第二前缀；取消该绑定，只保留 Ctrl+b。
 set -gu prefix2
 unbind C-a
