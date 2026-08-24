@@ -102,7 +102,7 @@ fi
 
 echo -e "\n${GREEN}=== 安装完成 ===${NC}"
 echo -e "\n使用要点："
-echo -e "  • 前缀键保留默认 ${GREEN}Ctrl+b${NC}，同时新增第二前缀 ${GREEN}Ctrl+a${NC}"
+echo -e "  • 前缀键仅保留默认 ${GREEN}Ctrl+b${NC}（已取消 Oh my tmux! 的 ${GREEN}Ctrl+a${NC} 第二前缀）"
 echo -e "  • 定制改 ${GREEN}$LOCAL_BASELINE${NC}，或在 tmux 里按 ${GREEN}<前缀> e${NC} —— 经符号链接是同一个文件"
 echo -e "  • 改完按 ${GREEN}<前缀> r${NC} 重载生效；${GREEN}git commit${NC} 后别的机器 git pull 即同步"
 echo -e "  • 鼠标模式开关：${GREEN}<前缀> m${NC}"
