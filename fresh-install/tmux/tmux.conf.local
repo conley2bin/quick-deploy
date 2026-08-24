@@ -25,9 +25,10 @@ unbind C-a
 bind -n C-M-Left  previous-window
 bind -n C-M-Right next-window
 
-# Ctrl+Alt+= 新建 window：先问名字（回车留空 = 不命名，按进程自动改名），
-# 开在当前 pane 的目录。= 与 + 同键：不按 Shift 产生 C-M-=，按住 Shift
-# 产生 C-M-+，两个都绑。Ghostty 默认键表里没有 equal/plus 组合，无需 unbind。
+# Ctrl+Alt+= / Ctrl+Alt++ 新建 window：先问名字（回车留空 = 不命名，按进程
+# 自动改名），开在当前 pane 的目录。Ghostty 为这两个物理组合键显式发送
+# 固定 CSI-u 序列，tmux 分别识别为 C-M-= 与 C-M-+，避免依赖终端对符号键
+# 修饰符的隐式编码。
 #
 # 行尾的 #!important 不能删：gpakosz 的 _apply_bindings 会把所有 new-window
 # 绑定里的 -c '#{pane_current_path}' 剥掉（retain_current_path=false 的语义），
