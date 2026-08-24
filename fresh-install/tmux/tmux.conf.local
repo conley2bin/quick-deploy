@@ -10,6 +10,7 @@ set -g mouse on
 # Oh my tmux! 默认额外把 Ctrl+a 配成第二前缀；取消该绑定，只保留 Ctrl+b。
 set -gu prefix2
 unbind C-a
+bind-key DC kill-window
 
 # Ctrl+Alt+←/→ 直接切换 window（不需要前缀键）。到头环绕
 # （previous/next-window 默认环绕）。
