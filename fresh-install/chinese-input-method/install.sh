@@ -8,6 +8,8 @@ CHECK_ONLY=false
 
 FCITX5_CONFIG_DIR="$HOME/.config/fcitx5"
 FCITX5_PROFILE="$FCITX5_CONFIG_DIR/profile"
+FCITX5_AUTOSTART_DIR="$HOME/.config/autostart"
+FCITX5_AUTOSTART="$FCITX5_AUTOSTART_DIR/fcitx5.desktop"
 
 REQUIRED_PACKAGES=(
     fcitx5
@@ -182,6 +184,11 @@ show_current_state() {
     else
         echo "  会话激活环境: 未含 GTK_IM_MODULE=fcitx（安装时将写入；登录时由 im-config 设置）"
     fi
+    if [ -f "$FCITX5_AUTOSTART" ]; then
+        echo "  登录自启动: 已配置 $FCITX5_AUTOSTART"
+    else
+        echo "  登录自启动: 未配置（安装时将创建）"
+    fi
     echo
 }
 
@@ -252,6 +259,100 @@ ensure_fcitx5_running() {
 
     echo "警告: 未能自动启动 Fcitx5。可手动运行 fcitx5 -d，"
     echo "      或注销重登后由 im-config 自动启动。"
+}
+
+autostart_file_matches() {
+    [ -f "$FCITX5_AUTOSTART" ] \
+        && grep -qxF 'Type=Application' "$FCITX5_AUTOSTART" \
+        && grep -qxF 'Exec=/usr/bin/fcitx5 -d' "$FCITX5_AUTOSTART" \
+        && grep -qxF 'Hidden=false' "$FCITX5_AUTOSTART" \
+        && grep -qxF 'X-GNOME-Autostart-enabled=true' "$FCITX5_AUTOSTART" \
+        && grep -qxF 'X-Quick-Deploy-Managed=true' "$FCITX5_AUTOSTART"
+}
+
+# im-config 的登录钩子负责环境变量，但启动时机取决于具体桌面会话是否执行它。
+# 用户级 XDG autostart 是桌面环境共同识别的启动入口，显式写入它保证 fcitx5
+# 在每次图形登录时调用 daemon 模式。fcitx5 是单实例守护进程，因而即便
+# im-config 同时运行，额外启动尝试也不会生成第二个实例。
+ensure_fcitx5_autostart() {
+    local tmp legacy_tmp
+
+    mkdir -p "$FCITX5_AUTOSTART_DIR"
+    tmp="$(mktemp "$FCITX5_AUTOSTART.tmp.XXXXXX")"
+    cat > "$tmp" << 'EOF'
+[Desktop Entry]
+Type=Application
+Name=Fcitx 5
+Comment=Start Fcitx 5 input method
+Exec=/usr/bin/fcitx5 -d
+Terminal=false
+Hidden=false
+X-GNOME-Autostart-enabled=true
+X-Quick-Deploy-Managed=true
+EOF
+
+    # 相同内容直接跳过：重跑不触碰 mtime，也不制造重复备份。
+    if [ -f "$FCITX5_AUTOSTART" ] && cmp -s "$tmp" "$FCITX5_AUTOSTART"; then
+        rm -f "$tmp"
+        echo "Fcitx5 登录自启动已配置"
+        return 0
+    fi
+
+    # 只迁移本脚本历史版本精确写出的文件，或此前由本脚本管理、但因
+    # 手动禁用等原因不再满足验收的版本。不能借“配置自启动”覆盖用户自己的
+    # desktop entry；遇到未知文件显式失败，让用户决定如何合并。
+    if [ -f "$FCITX5_AUTOSTART" ]; then
+        if grep -qxF 'X-Quick-Deploy-Managed=true' "$FCITX5_AUTOSTART"; then
+            :
+        else
+            legacy_tmp="$(mktemp "$FCITX5_AUTOSTART.legacy.XXXXXX")"
+            cat > "$legacy_tmp" << 'EOF'
+[Desktop Entry]
+Name=Fcitx 5
+GenericName=Input Method
+Comment=Start Input Method
+Exec=fcitx5
+Icon=fcitx
+Terminal=false
+Type=Application
+Categories=System;Utility;
+StartupNotify=false
+X-GNOME-Autostart-Phase=Applications
+X-GNOME-AutoRestart=false
+X-GNOME-Autostart-Notify=false
+X-KDE-autostart-after=panel
+EOF
+            if ! cmp -s "$legacy_tmp" "$FCITX5_AUTOSTART"; then
+                rm -f "$tmp" "$legacy_tmp"
+                echo "错误: 现有 Fcitx5 自启动文件不是本脚本管理的版本，未覆盖:"
+                echo "      $FCITX5_AUTOSTART"
+                echo "      请手动合并后重跑，或移除该文件让本脚本创建受管配置。"
+                return 1
+            fi
+            rm -f "$legacy_tmp"
+        fi
+    fi
+
+    backup_file "$FCITX5_AUTOSTART"
+    chmod --reference="$FCITX5_AUTOSTART" "$tmp" 2>/dev/null || true
+    mv -f "$tmp" "$FCITX5_AUTOSTART"
+
+    if autostart_file_matches; then
+        echo "已配置 Fcitx5 登录自启动: $FCITX5_AUTOSTART"
+    else
+        echo "错误: Fcitx5 登录自启动文件写入后校验失败: $FCITX5_AUTOSTART"
+        return 1
+    fi
+}
+
+verify_fcitx5_autostart() {
+    if autostart_file_matches; then
+        echo "OK: Fcitx5 登录自启动已启用 ($FCITX5_AUTOSTART)"
+        return 0
+    fi
+
+    echo "错误: Fcitx5 登录自启动未正确配置: $FCITX5_AUTOSTART"
+    return 1
 }
 
 push_im_env_to_session() {
@@ -455,6 +556,12 @@ verify_installation() {
         im-config -m || true
     fi
 
+    if verify_fcitx5_autostart; then
+        :
+    else
+        failed=true
+    fi
+
     if [ -s "$HOME/.config/fcitx5/profile" ] && grep -q '^Name=pinyin$' "$HOME/.config/fcitx5/profile"; then
         echo "OK: Fcitx5 profile 已包含 pinyin"
     else
@@ -619,12 +726,13 @@ echo "已设置 Fcitx5 为默认输入法框架"
 echo
 
 # ============================================
-# 步骤 4: 清理旧版脚本的手写启动配置
+# 步骤 4: 清理旧版环境变量配置
 # ============================================
-# 说明: Ubuntu 的 im-config 已经会设置环境变量并启动 fcitx5。
-#       这里仅移除旧版脚本可能写入的重复配置。
+# 说明: 输入法环境变量由 im-config 在登录时设置。
+#       旧版写入 ~/.profile 的重复块必须移除；登录启动由步骤 5 的
+#       XDG autostart 文件明确保证。
 # ============================================
-section "[4/5] 清理旧版脚本重复配置"
+section "[4/5] 清理旧版环境变量配置"
 
 # 不能用 sed '/起始/,/结束/d'：范围删除在找不到结束行时会一路删到文件末尾。
 # 旧实现只 grep 了起始标记就执行删除，实测：用户若把 SDL 那行改掉或删掉，
@@ -669,24 +777,17 @@ else
     echo "未发现旧版 ~/.profile 环境变量块"
 fi
 
-OLD_AUTOSTART="$HOME/.config/autostart/fcitx5.desktop"
-if [ -f "$OLD_AUTOSTART" ] && grep -q "^Exec=fcitx5$" "$OLD_AUTOSTART"; then
-    rm -f "$OLD_AUTOSTART"
-    echo "已删除旧版脚本创建的重复 autostart: $OLD_AUTOSTART"
-else
-    echo "未发现旧版 fcitx5 autostart 文件"
-fi
-
 echo
 
 # ============================================
-# 步骤 5: 配置输入法列表与快捷键
+# 步骤 5: 配置输入法、快捷键与登录自启动
 # ============================================
 # 说明: 写 ~/.config/fcitx5/profile（键盘 US + 拼音）与
-#       ~/.config/fcitx5/config（快捷键）。
-#       两个文件都必须在 fcitx5 退出后写，否则会被它回写覆盖。
+#       ~/.config/fcitx5/config（快捷键）。两个文件都必须在 fcitx5
+#       退出后写，否则会被它回写覆盖。随后创建用户级 XDG autostart
+#       文件，保证每次登录桌面都会启动 fcitx5。
 # ============================================
-section "[5/5] 配置输入法列表与快捷键"
+section "[5/5] 配置输入法、快捷键与登录自启动"
 
 mkdir -p "$FCITX5_CONFIG_DIR"
 
@@ -723,12 +824,18 @@ echo "已添加拼音输入法到配置"
 write_hotkey_config
 echo "已写入快捷键配置（左 Shift 循环切换；临时切换无快捷键）"
 
+# 登录自启动与当前会话是两条独立路径：im-config 的登录钩子可能随桌面
+# 会话集成变化；XDG autostart 让已完成安装的用户在下次登录时始终启动 fcitx5。
+# 内容无变化时函数不写文件、不生成备份，因此重跑不会积累副作用。
+ensure_fcitx5_autostart
+
 # 启动 + 写会话环境变量：让之后新开的应用立即可用输入法。
 ensure_fcitx5_running
 push_im_env_to_session
 echo
 
 verify_hotkey_config
+verify_fcitx5_autostart
 echo
 
 verify_installation
