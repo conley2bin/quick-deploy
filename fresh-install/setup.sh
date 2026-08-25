@@ -13,10 +13,10 @@
 #      优先走 PPA（PGP 签名链），失败退回校验过 SHA-256 的 GitHub .deb；
 #      与第 5 步一样失败只提示不中止（新机器无代理时可能连不上）。
 #      系统级安装、需要 sudo；默认接管 Ctrl+Alt+T（--no-default-terminal
-#      可关），随时可单独重跑 ghostty/install.sh
+#      可关），随时可单独重跑 modules/ghostty/install.sh
 #   7. tmux 与 gpakosz/.tmux 配置 —— tmux 本体走 apt 很可靠，但配置仓库
 #      要从 GitHub 克隆，与第 5、6 步一样失败只提示不中止，
-#      网络就绪后随时可单独重跑 tmux/install.sh
+#      网络就绪后随时可单独重跑 modules/tmux/install.sh
 # 前 4 步任何一步失败即中止；修复后重跑本脚本即可，
 # 每个子脚本都幂等（会自动跳过或重做，无副作用）。
 # 开始前会先等后台 apt 活动结束：新装系统首开机时 GNOME Software 常在
@@ -34,13 +34,13 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # 格式: 脚本路径|步骤名称|required（失败中止）或 tolerate（失败仅提示）
 STEPS=(
-    "tsinghua-mirror/install.sh|切换 APT 源为清华镜像|required"
-    "purge-snap/purge.sh|彻底卸载 Snap|required"
-    "zsh/install.sh|安装 zsh 与 oh-my-zsh|required"
-    "chinese-input-method/install.sh|安装配置中文输入法|required"
-    "chinese-input-method/import-dict.sh|导入维基百科拼音词库|tolerate"
-    "ghostty/install.sh|安装配置 Ghostty 终端|tolerate"
-    "tmux/install.sh|安装 tmux 与 gpakosz/.tmux 配置|tolerate"
+    "modules/tsinghua-mirror/install.sh|切换 APT 源为清华镜像|required"
+    "modules/purge-snap/purge.sh|彻底卸载 Snap|required"
+    "modules/zsh/install.sh|安装 zsh 与 oh-my-zsh|required"
+    "modules/chinese-input-method/install.sh|安装配置中文输入法|required"
+    "modules/chinese-input-method/import-dict.sh|导入维基百科拼音词库|tolerate"
+    "modules/ghostty/install.sh|安装配置 Ghostty 终端|tolerate"
+    "modules/tmux/install.sh|安装 tmux 与 gpakosz/.tmux 配置|tolerate"
 )
 
 echo -e "${GREEN}========================================${NC}"

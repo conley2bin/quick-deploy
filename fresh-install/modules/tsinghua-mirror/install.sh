@@ -18,7 +18,7 @@ NC='\033[0m' # No Color
 
 # 共享等锁助手（见 lib/apt-lock-wait.sh）。脚本被单独拷出、助手缺失时
 # 定义空操作跳过等锁，行为与引入前一致
-APT_LOCK_WAIT_LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../lib/apt-lock-wait.sh"
+APT_LOCK_WAIT_LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../../lib/apt-lock-wait.sh"
 if [ -f "$APT_LOCK_WAIT_LIB" ]; then . "$APT_LOCK_WAIT_LIB"; else wait_for_apt_lock() { return 0; }; fi
 
 MIRROR_BASE="https://mirrors.tuna.tsinghua.edu.cn/ubuntu"

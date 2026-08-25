@@ -30,7 +30,9 @@ REPO_URL="https://github.com/gpakosz/.tmux.git"
 TMUX_REPO_DIR="$HOME/.tmux"
 TMUX_CONF="$HOME/.tmux.conf"
 TMUX_CONF_LOCAL="$HOME/.tmux.conf.local"
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# 使用物理路径：本仓库保留 fresh-install/tmux → modules/tmux 兼容链接，
+# 旧入口经该链接执行时也必须稳定定位 canonical 模块和 ../../lib。
+SCRIPT_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LOCAL_BASELINE="$SCRIPT_DIR/tmux.conf.local"
 TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
 
@@ -45,7 +47,7 @@ echo -e "${GREEN}=== 安装 tmux 与 gpakosz/.tmux 配置 ===${NC}\n"
 echo -e "${YELLOW}[1/4] 安装 tmux、git、剪贴板工具...${NC}"
 # 等后台 apt 活动结束（新装系统首开机自动更新常见持锁），否则 apt update 会撞锁失败。
 # 脚本被单独拷出、助手缺失时定义空操作跳过等锁
-if [ -f "$SCRIPT_DIR/../lib/apt-lock-wait.sh" ]; then . "$SCRIPT_DIR/../lib/apt-lock-wait.sh"; else wait_for_apt_lock() { return 0; }; fi
+if [ -f "$SCRIPT_DIR/../../lib/apt-lock-wait.sh" ]; then . "$SCRIPT_DIR/../../lib/apt-lock-wait.sh"; else wait_for_apt_lock() { return 0; }; fi
 wait_for_apt_lock || die "等待 apt 锁超时，请稍后重跑"
 sudo apt update
 sudo apt install -y tmux git xclip wl-clipboard

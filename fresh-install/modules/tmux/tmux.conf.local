@@ -45,7 +45,7 @@ bind-key DC kill-window
 # （previous/next-window 默认环绕）。
 #
 # Ghostty 默认把 ctrl+alt+arrow 绑给 goto_split；仅靠“无 split 时似乎会
-# 透传”的当前表现不够稳定。fresh-install/ghostty/install.sh 因此显式
+# 透传”的当前表现不够稳定。fresh-install/modules/ghostty/install.sh 因此显式
 # unbind 左右两个键，保证它们编码后送入 pty。
 # gpakosz 主配置检测到 TERM_PROGRAM=ghostty 会自动开启 extended-keys，
 # tmux 由此把序列识别为 C-M-Left/C-M-Right。

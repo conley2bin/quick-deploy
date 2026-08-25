@@ -26,7 +26,7 @@ SUDO_CMD="${SUDO_CMD:-sudo}"
 # 共享等锁助手：新装系统首开机时后台自动更新会长时间持 apt 锁，
 # 直接 purge/update 会撞锁失败，先等它结束。脚本被单独拷出、
 # 助手缺失时定义空操作跳过等锁
-APT_LOCK_WAIT_LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../lib/apt-lock-wait.sh"
+APT_LOCK_WAIT_LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../../lib/apt-lock-wait.sh"
 if [ -f "$APT_LOCK_WAIT_LIB" ]; then . "$APT_LOCK_WAIT_LIB"; else wait_for_apt_lock() { return 0; }; fi
 
 # 快捷键与行为目标值 —— 写入与校验共用这一份，两者不会各自漂移
