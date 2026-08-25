@@ -30,8 +30,7 @@ REPO_URL="https://github.com/gpakosz/.tmux.git"
 TMUX_REPO_DIR="$HOME/.tmux"
 TMUX_CONF="$HOME/.tmux.conf"
 TMUX_CONF_LOCAL="$HOME/.tmux.conf.local"
-# 使用物理路径：本仓库保留 fresh-install/tmux → modules/tmux 兼容链接，
-# 旧入口经该链接执行时也必须稳定定位 canonical 模块和 ../../lib。
+# 使用物理路径，稳定定位 canonical 模块和 ../../lib。
 SCRIPT_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LOCAL_BASELINE="$SCRIPT_DIR/tmux.conf.local"
 TIMESTAMP="$(date +%Y%m%d_%H%M%S)"

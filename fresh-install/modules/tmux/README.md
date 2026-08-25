@@ -23,7 +23,6 @@ gpakosz/.tmux 的两个固定查找路径都以符号链接落盘，目标一个
 约束与修复：
 
 - 替换任何既有文件前一律先改名为 `*.bak.<时间戳>`，从不删除。
-- 仓库保留 `fresh-install/tmux → modules/tmux` 兼容链接，因此目录整理前已经安装的 `~/.tmux.conf.local` 旧绝对链接在 `git pull` 后仍然有效；新安装统一链接到 canonical 的 `modules/tmux` 路径。
 - `~/.tmux.conf.local` 记录的是仓库的绝对路径：若整个仓库搬走，链接仍会悬空；到新位置重跑一次 install.sh 即可重新链接。
 - 少数编辑器写文件时会把符号链接替换成普通文件，重跑 install.sh 同样自动备份并重建链接。
 

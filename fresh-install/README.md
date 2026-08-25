@@ -14,7 +14,6 @@ fresh-install/
 │   ├── chinese-input-method/
 │   ├── ghostty/
 │   └── tmux/
-└── tmux -> modules/tmux     # 兼容旧机器上的绝对配置链接
 ```
 
 ## 一键安装
@@ -54,7 +53,3 @@ bash fresh-install/modules/tmux/install.sh
 ## 共享实现
 
 `lib/apt-lock-wait.sh` 被一键入口和所有执行 APT 操作的模块共同加载。它只等待真实持锁进程结束，不删除锁文件、不终止系统更新。保留模块自己的加载逻辑，是为了让模块脱离 `setup.sh` 单独运行时仍具备相同的首开机可靠性。
-
-## tmux 兼容路径
-
-`tmux/install.sh` 历史上将 `~/.tmux.conf.local` 绝对链接到仓库内的 `fresh-install/tmux/tmux.conf.local`。模块移入 `modules/` 后，根目录保留 `tmux → modules/tmux` 符号链接，使旧机器仅执行 `git pull` 也不会出现悬空链接。新安装以 `fresh-install/modules/tmux/` 为 canonical 路径。
