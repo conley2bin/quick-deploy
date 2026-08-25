@@ -11,7 +11,7 @@ echo -e "${GREEN}=== 安装 zsh 与 oh-my-zsh ===${NC}\n"
 
 # 等后台 apt 活动结束（新装系统首开机自动更新常见持锁），否则下面 apt update 会撞锁失败。
 # 脚本被单独拷出、助手缺失时定义空操作跳过等锁
-APT_LOCK_WAIT_LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../lib/apt-lock-wait.sh"
+APT_LOCK_WAIT_LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../../lib/apt-lock-wait.sh"
 if [ -f "$APT_LOCK_WAIT_LIB" ]; then . "$APT_LOCK_WAIT_LIB"; else wait_for_apt_lock() { return 0; }; fi
 wait_for_apt_lock || { echo -e "${RED}✗ 等待 apt 锁超时，请稍后重跑${NC}" >&2; exit 1; }
 

@@ -100,7 +100,7 @@ keybind = ctrl+alt+arrow_right=unbind
 ```
 
 `unbind` 是 Ghostty 的官方语法：移除前一个同触发器的默认动作，让按键正常编码
-进入 pty。随后 `fresh-install/tmux/tmux.conf.local` 在 tmux root 表绑定
+进入 pty。随后 `fresh-install/modules/tmux/tmux.conf.local` 在 tmux root 表绑定
 `C-M-Left/Right` 到 `previous-window` / `next-window`。
 
 这不是改绑 Ghostty 标签页；Ghostty 标签页继续使用上游默认的 `Ctrl+Tab` /

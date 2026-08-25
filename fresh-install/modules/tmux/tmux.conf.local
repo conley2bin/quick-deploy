@@ -21,15 +21,45 @@ set -as terminal-features ',xterm-ghostty:extkeys'
 # 覆盖为 always —— 与 gpakosz 现代分支取值一致，扩展键也会无条件转发给
 # pane 内应用，即使应用没有主动请求 modifyOtherKeys。
 set -g extended-keys always
+# 精简 Oh my tmux! 状态栏：左侧只显示 session 名，移除系统 uptime；右侧
+# 移除电池/电源信息，并把用户名、主机名与时间、日期放在同一分段中，使用
+# 完全相同的前景、背景和文字属性，不再以红色色块突出主机名。
+tmux_conf_theme_status_left=" ❐ #S "
+tmux_conf_theme_status_right=" #{prefix}#{mouse}#{pairing}#{synchronized} %R · %d %b · #{username}#{root}@#{hostname} "
+tmux_conf_theme_status_right_fg="$tmux_conf_theme_colour_12"
+tmux_conf_theme_status_right_bg="$tmux_conf_theme_colour_15"
+tmux_conf_theme_status_right_attr="none"
+
+# Oh my tmux! 默认会用蓝字灰底标出上一次浏览的 window；改为与普通
+# window 完全相同，状态栏只突出当前 window。
+# 这里使用当前默认调色板的字面值，而不引用 colour_3/colour_1：本地精简
+# 配置没有重新声明整套调色板，source 阶段引用未定义 shell 变量会展开为空，
+# 随后 Oh my tmux! 反而会回退到 last-window 的蓝字灰底默认值。
+tmux_conf_theme_window_status_last_fg="#8a8a8a"
+tmux_conf_theme_window_status_last_bg="#080808"
+tmux_conf_theme_window_status_last_attr="none"
+
+# 普通 pane 中滚轮每格滚动 1 行：首次向上滚时进入 copy-mode，随后由
+# copy-mode 的 WheelUp/DownPane 绑定按 history-limit 滚动。应用若主动开启
+# mouse reporting（mouse_any_flag），仍把滚轮原样交给应用处理。
+bind -T root WheelUpPane if-shell -F '#{mouse_any_flag}' \
+  'send-keys -M' \
+  'copy-mode -e; send-keys -X -N 1 scroll-up'
+bind -T copy-mode WheelUpPane   send-keys -X -N 1 scroll-up
+bind -T copy-mode WheelDownPane send-keys -X -N 1 scroll-down
+bind -T copy-mode-vi WheelUpPane   send-keys -X -N 1 scroll-up
+bind -T copy-mode-vi WheelDownPane send-keys -X -N 1 scroll-down
+
 # Oh my tmux! 默认额外把 Ctrl+a 配成第二前缀；取消该绑定，只保留 Ctrl+b。
 set -gu prefix2
 unbind C-a
+bind-key DC kill-window
 
 # Ctrl+Alt+←/→ 直接切换 window（不需要前缀键）。到头环绕
 # （previous/next-window 默认环绕）。
 #
 # Ghostty 默认把 ctrl+alt+arrow 绑给 goto_split；仅靠“无 split 时似乎会
-# 透传”的当前表现不够稳定。fresh-install/ghostty/install.sh 因此显式
+# 透传”的当前表现不够稳定。fresh-install/modules/ghostty/install.sh 因此显式
 # unbind 左右两个键，保证它们编码后送入 pty。
 # unbind 后 Ghostty 按传统编码（CSI 1;7D / 1;7C）发送这两个组合键，
 # tmux 无需 extended-keys 也能识别为 C-M-Left/C-M-Right —— 与 C-M-=/+

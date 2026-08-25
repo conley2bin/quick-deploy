@@ -18,12 +18,13 @@ gpakosz/.tmux 的两个固定查找路径都以符号链接落盘，目标一个
 | 路径 | 指向 | 作用 |
 | --- | --- | --- |
 | `~/.tmux.conf` | `~/.tmux/.tmux.conf` | 主配置入口（tmux 固定读取位置）；随重跑时的 `git pull` 自动更新 |
-| `~/.tmux.conf.local` | `fresh-install/tmux/tmux.conf.local`（安装时本仓库的绝对路径） | 定制入口；改动即仓库改动 |
+| `~/.tmux.conf.local` | `fresh-install/modules/tmux/tmux.conf.local`（安装时本仓库的绝对路径） | 定制入口；改动即仓库改动 |
 
 约束与修复：
 
 - 替换任何既有文件前一律先改名为 `*.bak.<时间戳>`，从不删除。
-- `~/.tmux.conf.local` 记录的是仓库的绝对路径：仓库搬走后链接悬空，gpakosz 主配置照常加载（启动时报一条 source 错误），只是定制失效；到新位置重跑一次 install.sh 即可重新链接。
+- 仓库保留 `fresh-install/tmux → modules/tmux` 兼容链接，因此目录整理前已经安装的 `~/.tmux.conf.local` 旧绝对链接在 `git pull` 后仍然有效；新安装统一链接到 canonical 的 `modules/tmux` 路径。
+- `~/.tmux.conf.local` 记录的是仓库的绝对路径：若整个仓库搬走，链接仍会悬空；到新位置重跑一次 install.sh 即可重新链接。
 - 少数编辑器写文件时会把符号链接替换成普通文件，重跑 install.sh 同样自动备份并重建链接。
 
 ## 定制入口
@@ -32,7 +33,7 @@ gpakosz/.tmux 的两个固定查找路径都以符号链接落盘，目标一个
 
 - 单一事实源：改 `~/.tmux.conf.local` 就是改仓库文件（`<前缀> e` 打开的也是它），改完 `<前缀> r` 生效、`git commit` 入库。
 - 多机同步只拉不装：别的机器 `git pull` 本仓库即生效，无需重跑 install.sh。
-- 基线只记真实改动（目前是鼠标模式、取消 `Ctrl+a` 第二前缀、`Ctrl+Alt+←/→` 切换 window、`Ctrl+Alt+=/+` 新建 window）；全部可用选项查上游模板 `~/.tmux/.tmux.conf.local`。该文件本质是 tmux 配置片段，可直接写 `set -g ...`；若某行被主配置覆盖，按上游说明在行尾加 `#!important`。
+- 基线只记真实改动（目前是鼠标模式、精简状态栏、取消上次 window 高亮、取消 `Ctrl+a` 第二前缀、`Ctrl+Alt+←/→` 切换 window、`Ctrl+Alt+=/+` 新建 window）；全部可用选项查上游模板 `~/.tmux/.tmux.conf.local`。该文件本质是 tmux 配置片段，可直接写 `set -g ...`；若某行被主配置覆盖，按上游说明在行尾加 `#!important`。
 
 ## 幂等语义
 
@@ -49,7 +50,8 @@ gpakosz/.tmux 的两个固定查找路径都以符号链接落盘，目标一个
 
 - 前缀键仅保留默认 `Ctrl+b`；Oh my tmux! 默认新增的第二前缀 `Ctrl+a` 已取消。
 - `<前缀> e` 打开 `.tmux.conf.local`，`<前缀> r` 重载配置。
-- `<前缀> m` 切换鼠标模式；`<前缀> -` / `<前缀> _` 分屏；`<前缀> h/j/k/l` 在窗格间移动。
+- 状态栏左侧只显示 session 名；右侧移除电池信息，时间、日期和 `username@hostname` 使用同一普通样式；上一次浏览的 window 不再高亮，只突出当前 window。
+- `<前缀> m` 切换鼠标模式；普通 pane 中鼠标滚轮每格滚动 1 行；`<前缀> -` / `<前缀> _` 分屏；`<前缀> h/j/k/l` 在窗格间移动。应用主动开启 mouse reporting 时，滚轮仍交给应用自身处理。
 - `Ctrl+Alt+←/→` **不需要前缀**，直接切换上一个/下一个 window（底部状态栏的标签）。
   绑定落在 root 表：`C-M-Left=previous-window`、`C-M-Right=next-window`。
   Ghostty 模块显式 unbind 这两个键，确保按键进入 pty；gpakosz 检测到

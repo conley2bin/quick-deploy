@@ -24,7 +24,7 @@ SUDO_CMD="${SUDO_CMD:-sudo}"
 # 共享等锁助手：新装系统首开机时后台自动更新会长时间持 apt 锁，
 # 直接 add-apt-repository/apt-get 会撞锁失败，先等它结束。脚本被单独
 # 拷出、助手缺失时定义空操作跳过等锁
-APT_LOCK_WAIT_LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../lib/apt-lock-wait.sh"
+APT_LOCK_WAIT_LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../../lib/apt-lock-wait.sh"
 if [ -f "$APT_LOCK_WAIT_LIB" ]; then . "$APT_LOCK_WAIT_LIB"; else wait_for_apt_lock() { return 0; }; fi
 
 PPA_NAME="ppa:mkasberg/ghostty-ubuntu"
@@ -288,7 +288,7 @@ render_zh_mono_conf() {
     printf '%s\n' '<?xml version="1.0"?>'
     printf '%s\n' '<!DOCTYPE fontconfig SYSTEM "urn:fontconfig:fonts.dtd">'
     printf '%s\n' '<fontconfig>'
-    printf '%s\n' '  <!-- 由 fresh-install/ghostty/install.sh 生成与维护。 -->'
+    printf '%s\n' '  <!-- 由 fresh-install/modules/ghostty/install.sh 生成与维护。 -->'
     printf '%s\n' '  <!-- 中文 locale 下 Ubuntu 的 69-language-selector-zh-*.conf 会给所有 -->'
     printf '%s\n' '  <!-- 等宽查询强绑定 prepend 「DejaVu Sans Mono」，压过应用显式请求的 -->'
     printf '%s\n' '  <!-- 字体。下面只在查询已点名该字体时把它拉回最前，不影响其它字体请求。 -->'
@@ -784,7 +784,7 @@ resolved_working_directory() {
 }
 
 render_config() {
-    echo "# 由 fresh-install/ghostty/install.sh 生成与维护。"
+    echo "# 由 fresh-install/modules/ghostty/install.sh 生成与维护。"
     echo "# 重跑脚本会把本文件重置为基准内容；手工修改请在脚本里改。"
     font_exists "$FONT_FAMILY" && echo "font-family = $FONT_FAMILY"
     font_exists "$CJK_FONT_FAMILY" && echo "font-family = $CJK_FONT_FAMILY"
@@ -795,7 +795,7 @@ render_config() {
     # 把 Ctrl+Alt+←/→ 明确让给终端内的 tmux。
     # Ghostty 默认把它们绑给 goto_split:left/right；即使无 split 时当前版本
     # 看起来会透传，也不能把隐式 fallback 当成稳定合同。显式 unbind 后，
-    # 按键一定编码后送入 pty，fresh-install/tmux/tmux.conf.local 的 root 表
+    # 按键一定编码后送入 pty，fresh-install/modules/tmux/tmux.conf.local 的 root 表
     # 再用 C-M-Left/Right 切 previous/next window。
     # 这不是“改绑 Ghostty 标签页”：Ghostty 标签页继续用上游默认
     # Ctrl+Tab / Ctrl+Shift+Tab；只把两个键的所有权交给 tmux。
@@ -888,7 +888,7 @@ write_atomic_text() {
 set_default_terminal() {
     local wrapper_content terminal_list_content
     wrapper_content='#!/bin/bash
-# 由 fresh-install/ghostty/install.sh 生成：让 GNOME 的 Ctrl+Alt+T 启动 Ghostty
+# 由 fresh-install/modules/ghostty/install.sh 生成：让 GNOME 的 Ctrl+Alt+T 启动 Ghostty
 exec /usr/bin/ghostty "$@"
 '
     terminal_list_content="$DESKTOP_ID
