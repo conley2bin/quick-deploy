@@ -7,6 +7,24 @@
 # 开启鼠标模式：点击切窗格、拖边框调大小、滚轮翻历史
 set -g mouse on
 
+# 精简 Oh my tmux! 状态栏：左侧只显示 session 名，移除系统 uptime；右侧
+# 移除电池/电源信息，并把用户名、主机名与时间、日期放在同一分段中，使用
+# 完全相同的前景、背景和文字属性，不再以红色色块突出主机名。
+tmux_conf_theme_status_left=" ❐ #S "
+tmux_conf_theme_status_right=" #{prefix}#{mouse}#{pairing}#{synchronized} %R · %d %b · #{username}#{root}@#{hostname} "
+tmux_conf_theme_status_right_fg="$tmux_conf_theme_colour_12"
+tmux_conf_theme_status_right_bg="$tmux_conf_theme_colour_15"
+tmux_conf_theme_status_right_attr="none"
+
+# Oh my tmux! 默认会用蓝字灰底标出上一次浏览的 window；改为与普通
+# window 完全相同，状态栏只突出当前 window。
+# 这里使用当前默认调色板的字面值，而不引用 colour_3/colour_1：本地精简
+# 配置没有重新声明整套调色板，source 阶段引用未定义 shell 变量会展开为空，
+# 随后 Oh my tmux! 反而会回退到 last-window 的蓝字灰底默认值。
+tmux_conf_theme_window_status_last_fg="#8a8a8a"
+tmux_conf_theme_window_status_last_bg="#080808"
+tmux_conf_theme_window_status_last_attr="none"
+
 # 普通 pane 中滚轮每格滚动 1 行：首次向上滚时进入 copy-mode，随后由
 # copy-mode 的 WheelUp/DownPane 绑定按 history-limit 滚动。应用若主动开启
 # mouse reporting（mouse_any_flag），仍把滚轮原样交给应用处理。
