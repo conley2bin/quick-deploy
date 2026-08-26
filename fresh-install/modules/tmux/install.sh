@@ -10,9 +10,12 @@
 #   4. 符号链接 ~/.tmux.conf.local → 模块自带的 tmux.conf.local 基线
 #      （上游规定定制写在 .tmux.conf.local；这里把它链到仓库文件，
 #      定制即仓库改动，别的机器 git pull 本仓库即生效）
+#   5. 符号链接 ~/.pi/agent/extensions/quick-deploy-tmux-status → 本仓库扩展
+#      （Pi 生命周期事件驱动 tmux window breathing status）
 #
-# 幂等语义：重跑 = 确保 apt 包已装、已有克隆用 git pull --ff-only 更新到最新；
-# 替换任何既有 ~/.tmux.conf / ~/.tmux.conf.local / ~/.tmux 目录前先做时间戳备份。
+# 幂等语义：重跑 = 确保 apt 包已装、已有克隆用 git pull --ff-only 更新到最新，
+# tmux/Pi 扩展链接指向本仓库；替换任何既有 ~/.tmux.conf / ~/.tmux.conf.local /
+# ~/.tmux 目录前先做时间戳备份，未知 Pi 扩展路径则拒绝替换。
 #
 # 失败语义：apt 失败或首次克隆失败 → 退出非零；已有克隆上的更新失败
 # 只警告继续（离线重跑不应破坏已可用的安装）。在 setup.sh 中本步骤为
@@ -43,7 +46,7 @@ die() {
 echo -e "${GREEN}=== 安装 tmux 与 gpakosz/.tmux 配置 ===${NC}\n"
 
 # 1. 安装软件包
-echo -e "${YELLOW}[1/4] 安装 tmux、git、剪贴板工具...${NC}"
+echo -e "${YELLOW}[1/5] 安装 tmux、git、剪贴板工具...${NC}"
 # 等后台 apt 活动结束（新装系统首开机自动更新常见持锁），否则 apt update 会撞锁失败。
 # 脚本被单独拷出、助手缺失时定义空操作跳过等锁
 if [ -f "$SCRIPT_DIR/../../lib/apt-lock-wait.sh" ]; then . "$SCRIPT_DIR/../../lib/apt-lock-wait.sh"; else wait_for_apt_lock() { return 0; }; fi
@@ -54,7 +57,7 @@ TMUX_VERSION="$(tmux -V)"
 echo -e "${GREEN}✓ $TMUX_VERSION 安装完成${NC}"
 
 # 2. 克隆或更新 gpakosz/.tmux
-echo -e "\n${YELLOW}[2/4] 安装 Oh my tmux! 配置仓库...${NC}"
+echo -e "\n${YELLOW}[2/5] 安装 Oh my tmux! 配置仓库...${NC}"
 if [ -d "$TMUX_REPO_DIR/.git" ]; then
     echo -e "${YELLOW}~/.tmux 已存在，用 git pull --ff-only 更新...${NC}"
     if git -C "$TMUX_REPO_DIR" pull --ff-only; then
@@ -75,7 +78,7 @@ fi
     || die "~/.tmux 中找不到 .tmux.conf，该目录不是预期的 gpakosz/.tmux 仓库"
 
 # 3. 符号链接 ~/.tmux.conf
-echo -e "\n${YELLOW}[3/4] 链接 ~/.tmux.conf...${NC}"
+echo -e "\n${YELLOW}[3/5] 链接 ~/.tmux.conf...${NC}"
 # 用 readlink -f 规范化比较，兼容相对链接（上游官方命令建的就是相对链接）
 if [ -L "$TMUX_CONF" ] && [ "$(readlink -f "$TMUX_CONF")" = "$TMUX_REPO_DIR/.tmux.conf" ]; then
     echo -e "${YELLOW}~/.tmux.conf 已指向 ~/.tmux/.tmux.conf，跳过${NC}"
@@ -89,7 +92,7 @@ else
 fi
 
 # 4. 链接 ~/.tmux.conf.local 到模块基线（单一事实源：改动即仓库改动）
-echo -e "\n${YELLOW}[4/4] 链接 ~/.tmux.conf.local...${NC}"
+echo -e "\n${YELLOW}[4/5] 链接 ~/.tmux.conf.local...${NC}"
 if [ -L "$TMUX_CONF_LOCAL" ] && [ "$(readlink -f "$TMUX_CONF_LOCAL")" = "$LOCAL_BASELINE" ]; then
     echo -e "${YELLOW}~/.tmux.conf.local 已指向模块基线，跳过${NC}"
 else
@@ -100,6 +103,9 @@ else
     ln -s "$LOCAL_BASELINE" "$TMUX_CONF_LOCAL"
     echo -e "${GREEN}✓ ~/.tmux.conf.local → $LOCAL_BASELINE${NC}"
 fi
+
+echo -e "\n${YELLOW}[5/5] 安装 Pi→tmux breathing status extension...${NC}"
+"$SCRIPT_DIR/install-pi-tmux-status.sh"
 
 echo -e "\n${GREEN}=== 安装完成 ===${NC}"
 echo -e "\n使用要点："

@@ -22,22 +22,34 @@ set -as terminal-features ',xterm-ghostty:extkeys'
 # pane 内应用，即使应用没有主动请求 modifyOtherKeys。
 set -g extended-keys always
 # 精简 Oh my tmux! 状态栏：左侧只显示 session 名，移除系统 uptime；右侧
-# 移除电池/电源信息，并把用户名、主机名与时间、日期放在同一分段中，使用
-# 完全相同的前景、背景和文字属性，不再以红色色块突出主机名。
+# 移除电池/电源信息，并把用户名、主机名与时间、日期放在同一分段中。session
+# 与右侧时间同为浅灰字、深灰底、无文字属性。
 tmux_conf_theme_status_left=" ❐ #S "
+tmux_conf_theme_status_left_fg="#8a8a8a"
+tmux_conf_theme_status_left_bg="#080808"
+tmux_conf_theme_status_left_attr="none"
 tmux_conf_theme_status_right=" #{prefix}#{mouse}#{pairing}#{synchronized} %R · %d %b · #{username}#{root}@#{hostname} "
 tmux_conf_theme_status_right_fg="$tmux_conf_theme_colour_12"
 tmux_conf_theme_status_right_bg="$tmux_conf_theme_colour_15"
 tmux_conf_theme_status_right_attr="none"
 
-# Oh my tmux! 默认会用蓝字灰底标出上一次浏览的 window；改为与普通
-# window 完全相同，状态栏只突出当前 window。
-# 这里使用当前默认调色板的字面值，而不引用 colour_3/colour_1：本地精简
-# 配置没有重新声明整套调色板，source 阶段引用未定义 shell 变量会展开为空，
-# 随后 Oh my tmux! 反而会回退到 last-window 的蓝字灰底默认值。
-tmux_conf_theme_window_status_last_fg="#8a8a8a"
-tmux_conf_theme_window_status_last_bg="#080808"
-tmux_conf_theme_window_status_last_attr="none"
+# 普通未选中 window 的空闲基线是深色字、灰色块背景；选中 window 保持
+# 上游既有蓝色块。下面的 #!important 直写格式最终接管 last/activity/bell
+# 的渲染，因此不再声明这些覆盖变量：last 和 activity 不改变背景或强调；
+# bell 只保留黄色前景和 ! 标记；zoom 保留 Z 标记。
+# 这里使用当前默认调色板的字面值，而不引用 colour_*：本地精简配置没有重新
+# 声明整套调色板，source 阶段引用未定义 shell 变量会展开为空。
+tmux_conf_theme_window_status_fg="#080808"
+tmux_conf_theme_window_status_bg="#bcbcbc"
+tmux_conf_theme_window_status_attr="none"
+
+# The Pi extension writes these window-scoped options only while work is active
+# or a model/provider error is latched. The Oh My Tmux generator expands its
+# theme variables before tmux can evaluate nested formats, so this narrow
+# important override keeps the dark edge cells, fixed idle backgrounds,
+# bell/zoom markers, steady red errors, and breathing colors in one place.
+setw -g window-status-format '#[fg=#{?@quick_deploy_pi_error,#ffffff,#{?window_bell_flag,#ffff00,#080808}},bg=#{?@quick_deploy_pi_error,#d70000,#{?@quick_deploy_pi_active,#{@quick_deploy_pi_bg},#bcbcbc}},none] #{window_index} #{window_name}#{?window_bell_flag,!,}#{?window_zoomed_flag,Z,} #[fg=#080808,bg=#080808]' #!important
+setw -g window-status-current-format '#[fg=#{?@quick_deploy_pi_error,#ffffff,#{?window_bell_flag,#ffff00,#080808}},bg=#{?@quick_deploy_pi_error,#d70000,#{?@quick_deploy_pi_active,#{@quick_deploy_pi_current_bg},#00afff}},bold] #{window_index} #{window_name}#{?window_bell_flag,!,}#{?window_zoomed_flag,Z,} #[fg=#080808,bg=#080808]' #!important
 
 # 普通 pane 中滚轮每格滚动 1 行：首次向上滚时进入 copy-mode，随后由
 # copy-mode 的 WheelUp/DownPane 绑定按 history-limit 滚动。应用若主动开启
