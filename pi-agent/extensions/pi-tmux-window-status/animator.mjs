@@ -6,7 +6,7 @@ import { execFileSync } from "node:child_process";
 import { acquireAnimatorLock, readLease, releaseAnimatorLock, runtimeRoot, safeId, windowLeaseStates } from "./state.mjs";
 
 export const FRAME_COUNT = 24;
-export const FRAME_MS = 60;
+export const FRAME_MS = 42;
 export const ERROR_MS = 1_000;
 export const PERIOD_MS = FRAME_COUNT * FRAME_MS;
 export const ERROR_BG = "#d70000";

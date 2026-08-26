@@ -20,8 +20,8 @@ const real = (runId = "root", lastActivityAt = 100, state = "running", steps = [
 test("24-frame palettes start at idle baseline and hit symmetric perceptual ranges", () => {
   assert.equal(FRAMES.length, FRAME_COUNT);
   assert.equal(CURRENT_FRAMES.length, FRAME_COUNT);
-  assert.equal(FRAME_MS, 60);
-  assert.equal(PERIOD_MS, 1440);
+  assert.equal(FRAME_MS, 42);
+  assert.equal(PERIOD_MS, 1008);
   assert.equal(FRAMES[0], GRAY_RANGE.idle);
   assert.equal(FRAMES[6], GRAY_RANGE.bright);
   assert.equal(FRAMES[12], GRAY_RANGE.idle);
@@ -34,10 +34,10 @@ test("24-frame palettes start at idle baseline and hit symmetric perceptual rang
 
 test("monotonic frame phase wraps and skips delayed callbacks", () => {
   assert.equal(frameAt(0), 0);
-  assert.equal(frameAt(59), 0);
-  assert.equal(frameAt(60), 1);
-  assert.equal(frameAt(60 * 10 + 17), 10);
-  assert.equal(frameAt(PERIOD_MS + 60 * 3 + 1), 3);
+  assert.equal(frameAt(41), 0);
+  assert.equal(frameAt(42), 1);
+  assert.equal(frameAt(42 * 10 + 17), 10);
+  assert.equal(frameAt(PERIOD_MS + 42 * 3 + 1), 3);
   assert.equal(frameAt(-1), 23);
 });
 
@@ -439,6 +439,77 @@ test("animator batches active/error transitions, cadences, resets, and cached cl
   wall = 1300; a.tick();
   assert.ok(calls.some((args) => args.includes("-uw") && args.includes("@quick_deploy_pi_error")));
   assert.equal(acquireAnimatorLock(join(root, "animator.lock")).owner, true);
+});
+
+test("auto-continue classifier additions cover terminated, weekly quota, mixed and cloudflare errors", () => {
+  const assistantError = (errorMessage) => ({ role: "assistant", stopReason: "error", errorMessage });
+  for (const message of [
+    "Error: terminated",
+    "terminated",
+    "{\"error\":{\"type\":\"new_api_error\",\"message\":\"用户额度不足：模型 claude-opus-5\"}} ... {\"error\":{\"type\":\"permission_error\",\"message\":\"You've reached your weekly (7-day) usage limit. Your quota will reset when the current 7-day window ends. To continue now, purchase extra usage or upgrade your plan\"}}",
+    "OpenAI API error (403): 用户额度不足：模型 gpt-5.6-sol ... Error doing the fallback: litellm.BadRequestError: {\"error\":{\"message\":\"An assistant message with 'tool_calls' must be followed by tool messages\",\"type\":\"invalid_request_error\"}} LiteLLM Retried: 3 times",
+    "Error: 502 {\"status\":502,\"error_code\":502,\"retryable\":true,\"retry_after\":60,\"cloudflare_error\":true}",
+  ]) assert.equal(classifyModelUnavailable(assistantError(message)), true, message);
+  assert.equal(classifyModelUnavailable(assistantError("the task terminated normally")), false);
+});
+
+test("auto-continue schedules on idle model error, respects cancel/cap/throttle, and never clears red", async () => {
+  const runtime = temp(), work = temp(), socket = join(work, "server.sock");
+  const tmux = (args, options = {}) => execFileSync("tmux", args, { ...options });
+  tmux(["-S", socket, "-f", join(process.env.HOME, ".tmux.conf"), "new-session", "-d", "-s", "auto-continue"]);
+  const windowId = tmux(["-S", socket, "display-message", "-p", "#{window_id}"], { encoding: "utf8" }).trim();
+  const paneId = tmux(["-S", socket, "display-message", "-p", "#{pane_id}"], { encoding: "utf8" }).trim();
+  const handlers = {};
+  const sent = [];
+  let idle = true, pending = false;
+  const ctx = { isIdle: () => idle, hasPendingMessages: () => pending, sessionManager: { getSessionFile: () => "/home/tester/.pi/agent/sessions/sanitized/session.jsonl" } };
+  const pi = {
+    on: (name, fn) => { (handlers[name] ||= []).push(fn); },
+    events: { on: () => () => {} },
+    sendUserMessage: (content) => sent.push(content),
+  };
+  const env = { QUICK_DEPLOY_PI_TMUX_WINDOW_STATUS_RUNTIME: runtime, TMUX_PANE: paneId, TMUX: `${socket},0,0` };
+  const origEnv = { ...process.env };
+  Object.assign(process.env, env);
+  try {
+    const mod = await import("../index.ts?auto-continue-test");
+    mod.default(pi);
+    const fire = (name, ...args) => { for (const fn of handlers[name] || []) fn(...args); };
+    const errMsg = { role: "assistant", stopReason: "error", errorMessage: "Error: terminated" };
+    fire("message_end", { message: errMsg });
+    assert.deepEqual(sent, [], "no continue before settle");
+    idle = true; pending = false;
+    fire("agent_settled", {}, ctx);
+    await new Promise((r) => setTimeout(r, 350));
+    assert.deepEqual(sent, ["continue"], "debounced continue sent once on idle model error");
+    const bg = tmux(["-S", socket, "show-options", "-wqv", "@quick_deploy_pi_error"], { encoding: "utf8" }).trim();
+    assert.equal(bg, "1", "auto-continue keeps red error latch");
+    // input cancels pending continue
+    fire("message_end", { message: errMsg });
+    idle = true; pending = false;
+    fire("agent_settled", {}, ctx);
+    fire("input", { text: "user typed" });
+    await new Promise((r) => setTimeout(r, 350));
+    assert.equal(sent.length, 1, "input during debounce cancels");
+    // agent_start cancels
+    fire("message_end", { message: errMsg });
+    idle = true; pending = false;
+    fire("agent_settled", {}, ctx);
+    fire("agent_start", {}, ctx);
+    await new Promise((r) => setTimeout(r, 350));
+    assert.equal(sent.length, 1, "agent_start during debounce cancels");
+    // success resets streak and clears red
+    fire("message_end", { message: { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "ok" }] } });
+    idle = true;
+    fire("agent_settled", {}, ctx);
+    await new Promise((r) => setTimeout(r, 350));
+    assert.equal(sent.length, 1, "success does not auto-continue");
+  } finally {
+    Object.keys(process.env).forEach((k) => { if (!(k in origEnv)) delete process.env[k]; });
+    Object.assign(process.env, origEnv);
+    for (const fn of handlers["session_shutdown"] || []) fn({ type: "session_shutdown" }, ctx);
+    tmux(["-S", socket, "kill-server"]);
+  }
 });
 
 test("detached animator process remains alive for later 60ms frames and exits after lease removal", async () => {

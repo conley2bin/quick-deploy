@@ -14,12 +14,12 @@ type SessionManager = { getSessionFile?: () => string | null | undefined; getSes
 const object = (x: unknown): Record<string, unknown> | undefined => x && typeof x === "object" ? x as Record<string, unknown> : undefined;
 const NESTED_TERMINAL = new Set(["complete", "failed", "paused", "stopped", "rejected"]);
 const HARD_EXCLUDE = /(abort|aborted|cancelled|context (length|overflow|window)|maximum context|max tokens|token limit|content policy|safety|refusal|refused)/i;
-const POSITIVE_QUOTA = /(insufficient_user_quota|quota|quota exceeded|billing|balance(?!\s*transfer)|out of (balance|credit)|zero (balance|credit)|payment required|(?:余额|额度|配额|套餐).{0,12}(?:不足|耗尽|用尽|为 0|为0))/i;
+const POSITIVE_QUOTA = /(insufficient_user_quota|quota|quota exceeded|billing|balance(?!\s*transfer)|out of (balance|credit)|zero (balance|credit)|payment required|usage limit|quota will reset|weekly.{0,12}limit|purchase extra usage|upgrade your plan|(?:余额|额度|配额|套餐).{0,12}(?:不足|耗尽|用尽|为 0|为0))/i;
 const POSITIVE_AUTH = /(api[-_ ]?key|authentication|unauthorized|forbidden|\b401\b|\b403\b)/i;
 const POSITIVE_MODEL = /(invalid model|unknown model|model (id|name).*(invalid|unknown)|model not found|model does not exist|model.*(unavailable|not available))/i;
 const POSITIVE_RATE = /(no deployments? available|deployment unavailable|\b429\b|rate[- ]limit|overloaded?|capacity|too many requests)/i;
 const POSITIVE_TIMEOUT = /\b408\b|timeout|timed out/i;
-const POSITIVE_TRANSPORT = /(network failure|fetch failed|connection (refused|reset|dropped)|econn(refused|reset)|socket hang up|streaming error|streaming failed|stream ended[- ]before|stream interrupted|transport error|transport.*failed)/i;
+const POSITIVE_TRANSPORT = /(^|\bError:\s*)terminated\s*$|network failure|fetch failed|connection (refused|reset|dropped)|econn(refused|reset)|socket hang up|streaming error|streaming failed|stream ended[- ]before|stream interrupted|transport error|transport.*failed/i;
 const POSITIVE_5XX = /\b5\d\d\b|\b520\b|\b524\b|\b529\b/i;
 const POSITIVE_ADAPTER = /LiteLLMCompletionStreamingIterator|completed_response/i;
 const POSITIVE_CONCURRENCY = /(permission[_ ]?error.*concurrent|concurrent request limit)/i;
@@ -80,6 +80,8 @@ export default function piTmuxWindowStatus(pi: ExtensionAPI) {
   if (nestedPublisherDisabled()) return;
   let tmux: Identity; try { tmux = identity(); } catch (error) { console.error(error instanceof Error ? error.message : String(error)); return; }
   let mainActive = false, modelError = false, rootSessionId: string | undefined, beat: ReturnType<typeof setInterval> | undefined, animator: ReturnType<typeof spawn> | undefined, previousLeaseState: false | "active" | "error" = false;
+  let lastAssistantErrorMatched = false, continueTimer: ReturnType<typeof setTimeout> | undefined, lastContinueSentAt = 0, autoContinueCount = 0;
+  const AUTO_CONTINUE_MAX = 10, AUTO_CONTINUE_MIN_INTERVAL_MS = 30_000, AUTO_CONTINUE_DEBOUNCE_MS = 250;
   const owner = `${process.pid}:${tmux.paneId}`, children = new Map<string, Child>(), watchers = new Map<string, FSWatcher>(), routeWatchers = new Map<string, FSWatcher>(), attention = new Map<string, number>();
   const snapshots = () => new Map([...children].map(([id, c]) => { const snapshot = mergedChildSnapshot(c, readStatus(c.asyncDir)); seedAttentionWatermarksFromSnapshot(snapshot, attention); return [id, snapshot]; }));
   const logical = () => aggregateLogicalState({ mainActive, roots: new Set(children.keys()), snapshots: snapshots(), attentionWatermarks: attention });
@@ -102,12 +104,19 @@ export default function piTmuxWindowStatus(pi: ExtensionAPI) {
   const restore = () => { if (!rootSessionId) return; for (const child of restoredChildren(defaultAsyncRoot(), rootSessionId)) { children.set(child.id, child); watchChild(child.id); watchNestedRoute(child.id); } sync(); };
   const captureSession = (ctx: { sessionManager?: SessionManager }) => { rootSessionId ||= sessionIdOf(ctx.sessionManager); if (!rootSessionId) console.error("pi-tmux-window-status: root Pi session identity is unavailable"); };
   const updateModelError = (eventType: string, message?: unknown) => { const next = nextModelErrorState(modelError, eventType, message); if (next !== modelError) { modelError = next; sync(); } };
+  const cancelContinue = () => { if (continueTimer) { clearTimeout(continueTimer); continueTimer = undefined; } };
+  const sendContinue = () => { continueTimer = undefined; lastContinueSentAt = Date.now(); autoContinueCount += 1; pi.sendUserMessage("continue"); };
+  const scheduleContinue = (delay: number) => { cancelContinue(); continueTimer = setTimeout(() => { if (mainActive) { continueTimer = undefined; return; } const idle = lastCtx?.isIdle?.() ?? false; const pending = lastCtx?.hasPendingMessages?.() ?? false; if (!idle || pending) { continueTimer = undefined; return; } const elapsed = Date.now() - lastContinueSentAt; if (elapsed < AUTO_CONTINUE_MIN_INTERVAL_MS) { scheduleContinue(AUTO_CONTINUE_MIN_INTERVAL_MS - elapsed); return; } if (autoContinueCount >= AUTO_CONTINUE_MAX) { continueTimer = undefined; return; } sendContinue(); }, delay); };
+  const maybeAutoContinue = (ctx: { isIdle?: () => boolean; hasPendingMessages?: () => boolean }) => { lastCtx = ctx; if (!modelError || !lastAssistantErrorMatched || autoContinueCount >= AUTO_CONTINUE_MAX) return; if (!ctx.isIdle?.() || ctx.hasPendingMessages?.()) return; scheduleContinue(AUTO_CONTINUE_DEBOUNCE_MS); };
+  let lastCtx: { isIdle?: () => boolean; hasPendingMessages?: () => boolean } | undefined;
+  const resetFailureStreak = () => { autoContinueCount = 0; };
   const unsub = [pi.events.on(STARTED, started), pi.events.on(COMPLETE, complete), pi.events.on(CONTROL, control)];
   pi.on("session_start", (_event, ctx) => { captureSession(ctx); restore(); });
-  pi.on("agent_start", (_event, ctx) => { captureSession(ctx); mainActive = true; restore(); sync(); });
-  pi.on("agent_settled", () => { mainActive = false; sync(); });
+  pi.on("agent_start", (_event, ctx) => { captureSession(ctx); mainActive = true; cancelContinue(); restore(); sync(); });
+  pi.on("agent_settled", (_event, ctx) => { mainActive = false; sync(); maybeAutoContinue(ctx); });
+  pi.on("input", () => { cancelContinue(); });
   pi.on("message_update", (...args: unknown[]) => updateModelError("message_update", unwrapAssistantMessage(eventMessage(args)) || eventMessage(args)));
-  pi.on("message_end", (...args: unknown[]) => updateModelError("message_end", eventMessage(args)));
-  pi.on("model_select", () => updateModelError("model_select"));
-  pi.on("session_shutdown", () => { const hadError = previousLeaseState === "error" || modelError; mainActive = false; modelError = false; children.clear(); if (beat) clearInterval(beat); for (const watcher of watchers.values()) watcher.close(); watchers.clear(); for (const watcher of routeWatchers.values()) watcher.close(); routeWatchers.clear(); publishLease(tmux, owner, false); if (hadError) kick(true); for (const unsubscribe of unsub) if (typeof unsubscribe === "function") unsubscribe(); });
+  pi.on("message_end", (...args: unknown[]) => { const msg = eventMessage(args); const matched = classifyModelUnavailable(msg); lastAssistantErrorMatched = matched; updateModelError("message_end", msg); if (!matched && object(msg)?.role === "assistant" && object(msg)?.stopReason !== "error" && object(msg)?.stopReason !== "aborted") resetFailureStreak(); });
+  pi.on("model_select", () => { resetFailureStreak(); updateModelError("model_select"); });
+  pi.on("session_shutdown", () => { const hadError = previousLeaseState === "error" || modelError; mainActive = false; modelError = false; lastAssistantErrorMatched = false; cancelContinue(); children.clear(); if (beat) clearInterval(beat); for (const watcher of watchers.values()) watcher.close(); watchers.clear(); for (const watcher of routeWatchers.values()) watcher.close(); routeWatchers.clear(); publishLease(tmux, owner, false); if (hadError) kick(true); for (const unsubscribe of unsub) if (typeof unsubscribe === "function") unsubscribe(); });
 }
