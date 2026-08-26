@@ -20,7 +20,9 @@ gpakosz/.tmux 的两个固定查找路径都以符号链接落盘，目标一个
 | --- | --- | --- |
 | `~/.tmux.conf` | `~/.tmux/.tmux.conf` | 主配置入口（tmux 固定读取位置）；随重跑时的 `git pull` 自动更新 |
 | `~/.tmux.conf.local` | `fresh-install/modules/tmux/tmux.conf.local`（安装时本仓库的绝对路径） | 定制入口；改动即仓库改动 |
-| `~/.pi/agent/extensions/quick-deploy-tmux-status` | `pi-agent/extensions/quick-deploy-tmux-status`（安装时本仓库的绝对路径） | Pi 生命周期到 tmux breathing status 的受管扩展 |
+| `~/.pi/agent/extensions/pi-tmux-window-status` | `pi-agent/extensions/pi-tmux-window-status`（安装时本仓库的绝对路径） | Pi 生命周期到 tmux breathing status 的受管扩展 |
+
+历史命名：该扩展由 `quick-deploy-tmux-status` 更名而来。installer 仍识别旧名 `~/.pi/agent/extensions/quick-deploy-tmux-status` 的已知受管链接：视为 legacy，备份为 `*.bak.<时间戳>` 后创建新链接；未知旧路径（外部链接、普通文件、目录）一律不改动并失败。tmux 窗口选项 `@quick_deploy_pi_*` 与运行时私有目录 `quick-deploy/pi-tmux-status` 有意保持不变，避免已运行 Pi 进程产生重复运行时状态。
 
 约束与修复：
 
@@ -43,10 +45,14 @@ gpakosz/.tmux 的两个固定查找路径都以符号链接落盘，目标一个
 - apt 包已装则跳过；
 - `~/.tmux` 已是克隆则用 `git pull --ff-only` 更新；更新失败（离线、本地有改动）只警告不中止，保留现有版本；
 - `~/.tmux.conf.local` 已是指向模块基线的符号链接则跳过；若它被换成普通文件（少数编辑器写文件时会替换符号链接）或指向别处，先备份为 `*.bak.<时间戳>` 再重新链接——重跑即修复；
-- `install-pi-tmux-status.sh` 可独立运行，且只管理唯一的 Pi 扩展链接：精确目标跳过；仓库搬迁留下的旧受管链接先备份再修复；未知文件、目录或外部链接直接失败且不改动。它接受 `QUICK_DEPLOY_PI_TMUX_STATUS_SOURCE`、`QUICK_DEPLOY_PI_HOME`、`QUICK_DEPLOY_PI_TMUX_STATUS_TARGET` 做隔离测试。
+- `install-pi-tmux-window-status.sh` 可独立运行，且只管理唯一的 Pi 扩展链接：精确新目标跳过；新目标位置已知受管旧链接（仓库搬迁遗留）先备份再修复；旧名 `quick-deploy-tmux-status` 的已知受管链接视为 legacy 迁移；未知文件、目录或外部链接（新旧任一侧）直接失败且不改动；新旧都存在时只有两者都是已知受管链接才处理。它接受 `QUICK_DEPLOY_PI_TMUX_WINDOW_STATUS_SOURCE`、`QUICK_DEPLOY_PI_HOME`、`QUICK_DEPLOY_PI_TMUX_WINDOW_STATUS_TARGET`、`QUICK_DEPLOY_PI_TMUX_WINDOW_STATUS_LEGACY_TARGET` 做隔离测试。
 - 替换既有 `~/.tmux.conf` 或非仓库的 `~/.tmux` 目录前同样先备份。
 
 在 `setup.sh` 中本步骤为 tolerate：tmux 本体走 apt 很可靠，但配置仓库要从 GitHub 克隆，全新机器还没配代理时可能失败——只提示不中止，网络就绪后重跑本脚本即可。
+
+## Pi 扩展自动发现
+
+Pi 只在启动时扫描 `~/.pi/agent/extensions/` 下的目录，不会扫描本仓库——仓库里的 `pi-agent/extensions/pi-tmux-window-status` 必须通过上面的受管符号链接暴露到 `~/.pi/agent/extensions/` 才会被加载。安装/更新扩展后需要**重启 Pi 或执行 `/reload`** 才生效；tmux 只须 `<前缀> r` 重载样式。
 
 ## 使用要点
 

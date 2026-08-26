@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { afterEach, test } from "node:test";
-import { existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, readlinkSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -121,7 +121,7 @@ test("0.56 async-started ownership filters on root Pi session file identity", ()
 });
 
 test("animator direct-execution predicate is nonthrowing and symlink execution is recognized", () => {
-  const d = temp(), link = join(d, "animator.mjs"), missing = join(d, "missing.mjs"), target = join(ROOT, "pi-agent/extensions/quick-deploy-tmux-status/animator.mjs");
+  const d = temp(), link = join(d, "animator.mjs"), missing = join(d, "missing.mjs"), target = join(ROOT, "pi-agent/extensions/pi-tmux-window-status/animator.mjs");
   assert.equal(isDirectExecution(import.meta.url, missing), false, "nonexistent argv path is treated as import/non-direct without throwing");
   assert.equal(isDirectExecution(import.meta.url, "-"), false, "stdin argv marker is treated as import/non-direct without throwing");
   execFileSync("ln", ["-s", target, link]);
@@ -280,7 +280,7 @@ test("repair monitor condition remains while tracked attention-idle children hav
 });
 
 test("lease heartbeat diagnostics are sorted and contain no history-bearing fields", () => {
-  const runtime = temp(), i = ident(), env = { QUICK_DEPLOY_TMUX_STATUS_RUNTIME: runtime }, file = leasePath(i, "owner", env);
+  const runtime = temp(), i = ident(), env = { QUICK_DEPLOY_PI_TMUX_WINDOW_STATUS_RUNTIME: runtime }, file = leasePath(i, "owner", env);
   publishLease(i, "owner", true, 1, env, { parentSessionId: "session-z", activeRunIds: ["b", "a", "a"], activeNodeIds: ["n2", "n1"] });
   const lease = JSON.parse(readFileSync(file, "utf8"));
   assert.deepEqual(lease.activeRunIds, ["a", "b"]);
@@ -290,7 +290,7 @@ test("lease heartbeat diagnostics are sorted and contain no history-bearing fiel
 });
 
 test("invalid lease residue is removed while legacy missing-state leases stay active", () => {
-  const runtime = temp(), env = { QUICK_DEPLOY_TMUX_STATUS_RUNTIME: runtime }, i = ident(), dir = join(runtime, "quick-deploy", "pi-tmux-status", Buffer.from(i.socketPath).toString("base64url"), "leases");
+  const runtime = temp(), env = { QUICK_DEPLOY_PI_TMUX_WINDOW_STATUS_RUNTIME: runtime }, i = ident(), dir = join(runtime, "quick-deploy", "pi-tmux-status", Buffer.from(i.socketPath).toString("base64url"), "leases");
   mkdirSync(dir, { recursive: true });
   const bad = leasePath(i, "garbage", env);
   writeFileSync(bad, "not json");
@@ -306,7 +306,7 @@ test("invalid lease residue is removed while legacy missing-state leases stay ac
 });
 
 test("lease heartbeat remains fresh beyond two TTL windows then clears immediately", () => {
-  const runtime = temp(), i = ident(), env = { QUICK_DEPLOY_TMUX_STATUS_RUNTIME: runtime }, file = leasePath(i, "owner", env);
+  const runtime = temp(), i = ident(), env = { QUICK_DEPLOY_PI_TMUX_WINDOW_STATUS_RUNTIME: runtime }, file = leasePath(i, "owner", env);
   for (let t = 0; t <= LEASE_TTL_MS * 3; t += HEARTBEAT_MS) {
     publishLease(i, "owner", true, t, env);
     assert.ok(readLease(file, t + HEARTBEAT_MS - 1));
@@ -316,7 +316,7 @@ test("lease heartbeat remains fresh beyond two TTL windows then clears immediate
 });
 
 test("multiple owners aggregate active/error leases with backcompat and expiry", () => {
-  const runtime = temp(), env = { QUICK_DEPLOY_TMUX_STATUS_RUNTIME: runtime }, i = ident();
+  const runtime = temp(), env = { QUICK_DEPLOY_PI_TMUX_WINDOW_STATUS_RUNTIME: runtime }, i = ident();
   publishLease(i, "legacy-active", true, 1, env);
   const legacyPath = leasePath(i, "legacy-missing-state", env);
   writeFileSync(legacyPath, JSON.stringify({ version: 1, ownerId: "legacy-missing-state", socketPath: i.socketPath, windowId: "@10", paneId: "%11", heartbeatAt: 1 }));
@@ -407,7 +407,7 @@ test("process-owned animator lock uses atomic hard-link, cleans up temp, and rej
 });
 
 test("animator batches active/error transitions, cadences, resets, and cached clients", () => {
-  const runtime = temp(), env = { QUICK_DEPLOY_TMUX_STATUS_RUNTIME: runtime }, i = ident("/tmp/socket"), root = join(runtime, "quick-deploy", "pi-tmux-status", Buffer.from(i.socketPath).toString("base64url"));
+  const runtime = temp(), env = { QUICK_DEPLOY_PI_TMUX_WINDOW_STATUS_RUNTIME: runtime }, i = ident("/tmp/socket"), root = join(runtime, "quick-deploy", "pi-tmux-status", Buffer.from(i.socketPath).toString("base64url"));
   publishLease(i, "a", "active", 100, env);
   const calls = [], delays = [];
   let mono = 0, wall = 100, listCount = 0;
@@ -447,9 +447,9 @@ test("detached animator process remains alive for later 60ms frames and exits af
   tmux(["-S", socket, "-f", join(process.env.HOME, ".tmux.conf"), "new-session", "-d", "-s", "animator-process"]);
   const windowId = tmux(["-S", socket, "display-message", "-p", "#{window_id}"], { encoding: "utf8" }).trim();
   const paneId = tmux(["-S", socket, "display-message", "-p", "#{pane_id}"], { encoding: "utf8" }).trim();
-  const i = { socketPath: socket, windowId, paneId }, env = { QUICK_DEPLOY_TMUX_STATUS_RUNTIME: runtime };
+  const i = { socketPath: socket, windowId, paneId }, env = { QUICK_DEPLOY_PI_TMUX_WINDOW_STATUS_RUNTIME: runtime };
   publishLease(i, "process", "active", Date.now(), env);
-  const animator = spawn(process.execPath, [join(ROOT, "pi-agent/extensions/quick-deploy-tmux-status/animator.mjs"), socket], { env: { ...process.env, ...env }, stdio: "ignore" });
+  const animator = spawn(process.execPath, [join(ROOT, "pi-agent/extensions/pi-tmux-window-status/animator.mjs"), socket], { env: { ...process.env, ...env }, stdio: "ignore" });
   try {
     await new Promise((resolve) => setTimeout(resolve, FRAME_MS * 3 + 30));
     assert.equal(animator.exitCode, null, "referenced frame timer keeps the detached helper alive");
@@ -482,19 +482,117 @@ test("client listing handles zero clients and startup sweep resets stale active/
   assert.ok(args.includes("@quick_deploy_pi_error"));
 });
 
-test("installer is executable, idempotent, and preserves foreign paths", () => {
+test("installer is executable, idempotent, exact-link skip, and preserves foreign new path", () => {
   const d = temp(), source = join(d, "source"), home = join(d, "home");
   mkdirSync(source, { recursive: true });
   writeFileSync(join(source, "index.ts"), "");
-  const installer = join(ROOT, "fresh-install/modules/tmux/install-pi-tmux-status.sh"), env = { ...process.env, QUICK_DEPLOY_PI_TMUX_STATUS_SOURCE: source, QUICK_DEPLOY_PI_HOME: join(home, ".pi", "agent") };
+  const installer = join(ROOT, "fresh-install/modules/tmux/install-pi-tmux-window-status.sh"), env = { ...process.env, QUICK_DEPLOY_PI_TMUX_WINDOW_STATUS_SOURCE: source, QUICK_DEPLOY_PI_HOME: join(home, ".pi", "agent") };
   assert.equal(spawnSync("bash", [installer], { env }).status, 0);
   assert.equal(spawnSync("bash", [installer], { env }).status, 0);
-  const target = join(env.QUICK_DEPLOY_PI_HOME, "extensions", "quick-deploy-tmux-status");
+  const target = join(env.QUICK_DEPLOY_PI_HOME, "extensions", "pi-tmux-window-status");
+  assert.equal(readlinkSync(target), source, "second run leaves the exact managed link in place");
   rmSync(target);
   mkdirSync(target);
   writeFileSync(join(target, "keep"), "yes");
   assert.notEqual(spawnSync("bash", [installer], { env }).status, 0);
   assert.equal(readFileSync(join(target, "keep"), "utf8"), "yes");
+});
+
+test("installer migrates a known legacy managed old link to the new managed link", () => {
+  const d = temp(), source = join(d, "source"), home = join(d, "home");
+  mkdirSync(source, { recursive: true });
+  writeFileSync(join(source, "index.ts"), "");
+  const env = { ...process.env, QUICK_DEPLOY_PI_TMUX_WINDOW_STATUS_SOURCE: source, QUICK_DEPLOY_PI_HOME: join(home, ".pi", "agent") };
+  const installer = join(ROOT, "fresh-install/modules/tmux/install-pi-tmux-window-status.sh");
+  const extensions = join(env.QUICK_DEPLOY_PI_HOME, "extensions"), legacy = join(extensions, "quick-deploy-tmux-status"), target = join(extensions, "pi-tmux-window-status");
+  const oldCheckout = join(d, "old-checkout", "pi-agent", "extensions", "quick-deploy-tmux-status");
+  mkdirSync(oldCheckout, { recursive: true });
+  mkdirSync(extensions, { recursive: true });
+  symlinkSync(oldCheckout, legacy);
+  assert.equal(spawnSync("bash", [installer], { env }).status, 0);
+  assert.equal(readlinkSync(target), source, "new managed link points at the new source");
+  assert.equal(existsSync(legacy), false, "legacy link was removed");
+  const backups = readdirSync(extensions).filter((entry) => entry.startsWith("quick-deploy-tmux-status.bak."));
+  assert.equal(backups.length, 1, "legacy link is backed up, never deleted");
+  assert.equal(readlinkSync(join(extensions, backups[0])), oldCheckout, "backup preserves the original raw target");
+});
+
+test("installer refuses a foreign legacy path without mutation", () => {
+  const d = temp(), source = join(d, "source"), home = join(d, "home");
+  mkdirSync(source, { recursive: true });
+  writeFileSync(join(source, "index.ts"), "");
+  const env = { ...process.env, QUICK_DEPLOY_PI_TMUX_WINDOW_STATUS_SOURCE: source, QUICK_DEPLOY_PI_HOME: join(home, ".pi", "agent") };
+  const installer = join(ROOT, "fresh-install/modules/tmux/install-pi-tmux-window-status.sh");
+  const legacy = join(env.QUICK_DEPLOY_PI_HOME, "extensions", "quick-deploy-tmux-status");
+  mkdirSync(legacy, { recursive: true });
+  writeFileSync(join(legacy, "keep"), "yes");
+  assert.notEqual(spawnSync("bash", [installer], { env }).status, 0, "foreign legacy path fails");
+  assert.equal(readFileSync(join(legacy, "keep"), "utf8"), "yes", "foreign legacy content untouched");
+  assert.equal(existsSync(join(env.QUICK_DEPLOY_PI_HOME, "extensions", "pi-tmux-window-status")), false, "no new link is created on foreign conflict");
+});
+
+test("installer fails without mutation when both old and new exist and one side is foreign", () => {
+  const d = temp(), source = join(d, "source"), home = join(d, "home");
+  mkdirSync(source, { recursive: true });
+  writeFileSync(join(source, "index.ts"), "");
+  const env = { ...process.env, QUICK_DEPLOY_PI_TMUX_WINDOW_STATUS_SOURCE: source, QUICK_DEPLOY_PI_HOME: join(home, ".pi", "agent") };
+  const installer = join(ROOT, "fresh-install/modules/tmux/install-pi-tmux-window-status.sh");
+  const extensions = join(env.QUICK_DEPLOY_PI_HOME, "extensions"), legacy = join(extensions, "quick-deploy-tmux-status"), target = join(extensions, "pi-tmux-window-status");
+  mkdirSync(extensions, { recursive: true });
+  symlinkSync(source, target);
+  mkdirSync(legacy, { recursive: true });
+  writeFileSync(join(legacy, "keep"), "yes");
+  assert.notEqual(spawnSync("bash", [installer], { env }).status, 0, "both-present with a foreign side fails");
+  assert.equal(readlinkSync(target), source, "exact new link is untouched");
+  assert.equal(readFileSync(join(legacy, "keep"), "utf8"), "yes", "foreign legacy dir is untouched");
+});
+
+test("installer proceeds when both old and new are known managed links", () => {
+  const d = temp(), source = join(d, "source"), home = join(d, "home");
+  mkdirSync(source, { recursive: true });
+  writeFileSync(join(source, "index.ts"), "");
+  const env = { ...process.env, QUICK_DEPLOY_PI_TMUX_WINDOW_STATUS_SOURCE: source, QUICK_DEPLOY_PI_HOME: join(home, ".pi", "agent") };
+  const installer = join(ROOT, "fresh-install/modules/tmux/install-pi-tmux-window-status.sh");
+  const extensions = join(env.QUICK_DEPLOY_PI_HOME, "extensions"), legacy = join(extensions, "quick-deploy-tmux-status"), target = join(extensions, "pi-tmux-window-status");
+  const oldCheckout = join(d, "old-checkout", "pi-agent", "extensions", "quick-deploy-tmux-status");
+  mkdirSync(oldCheckout, { recursive: true });
+  mkdirSync(extensions, { recursive: true });
+  symlinkSync(oldCheckout, legacy);
+  const otherCheckout = join(d, "other-checkout", "pi-agent", "extensions", "pi-tmux-window-status");
+  mkdirSync(otherCheckout, { recursive: true });
+  symlinkSync(otherCheckout, target);
+  assert.equal(spawnSync("bash", [installer], { env }).status, 0, "both managed links are reconciled");
+  assert.equal(readlinkSync(target), source, "new target is reinstalled to the real source");
+  assert.equal(existsSync(legacy), false);
+  const backups = readdirSync(extensions).filter((entry) => /^(quick-deploy-tmux-status|pi-tmux-window-status)\.bak\./.test(entry));
+  assert.equal(backups.length, 2, "both managed links are backed up before replacement");
+});
+
+test("installer repairs a stale new-link target left by a checkout move", () => {
+  const d = temp(), source = join(d, "source"), home = join(d, "home");
+  mkdirSync(source, { recursive: true });
+  writeFileSync(join(source, "index.ts"), "");
+  const env = { ...process.env, QUICK_DEPLOY_PI_TMUX_WINDOW_STATUS_SOURCE: source, QUICK_DEPLOY_PI_HOME: join(home, ".pi", "agent") };
+  const installer = join(ROOT, "fresh-install/modules/tmux/install-pi-tmux-window-status.sh");
+  const extensions = join(env.QUICK_DEPLOY_PI_HOME, "extensions"), target = join(extensions, "pi-tmux-window-status");
+  const movedCheckout = join(d, "moved-checkout", "pi-agent", "extensions", "pi-tmux-window-status");
+  mkdirSync(extensions, { recursive: true });
+  symlinkSync(movedCheckout, target);
+  assert.equal(existsSync(target), false, "precondition: link is dangling because the checkout moved");
+  assert.equal(spawnSync("bash", [installer], { env }).status, 0);
+  assert.equal(readlinkSync(target), source, "dangling managed link is replaced with the real source");
+  const backups = readdirSync(extensions).filter((entry) => entry.startsWith("pi-tmux-window-status.bak."));
+  assert.equal(backups.length, 1, "dangling managed link is backed up");
+});
+
+test("installer resolves the tracked source independently of the working directory", () => {
+  const d = temp(), home = join(d, "home");
+  const env = { ...process.env, QUICK_DEPLOY_PI_HOME: join(home, ".pi", "agent") };
+  const installer = join(ROOT, "fresh-install/modules/tmux/install-pi-tmux-window-status.sh");
+  const target = join(env.QUICK_DEPLOY_PI_HOME, "extensions", "pi-tmux-window-status");
+  const repoSource = join(ROOT, "pi-agent/extensions/pi-tmux-window-status");
+  assert.equal(spawnSync("bash", [installer], { env, cwd: d }).status, 0, "default source resolution must not depend on the caller's cwd");
+  assert.equal(resolve(readlinkSync(target)), repoSource, "default source resolves to the tracked extension");
 });
 
 test("isolated gpakosz load evaluates actual deployed formats across idle and two active frames", () => {

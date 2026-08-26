@@ -19,21 +19,25 @@ This Pi 0.84.3 extension exposes **logical Pi work** and root model/provider ava
 Run the independent installer:
 
 ```bash
-bash fresh-install/modules/tmux/install-pi-tmux-status.sh
+bash fresh-install/modules/tmux/install-pi-tmux-window-status.sh
 ```
 
 It creates exactly one managed link:
 
 ```text
-~/.pi/agent/extensions/quick-deploy-tmux-status
-  → <checkout>/pi-agent/extensions/quick-deploy-tmux-status
+~/.pi/agent/extensions/pi-tmux-window-status
+  → <checkout>/pi-agent/extensions/pi-tmux-window-status
 ```
 
-An exact link is skipped. A stale symlink whose target suffix is recognizably `pi-agent/extensions/quick-deploy-tmux-status` is backed up and replaced. Other files, directories, and foreign symlinks are left untouched and cause a failure. The installer accepts `QUICK_DEPLOY_PI_TMUX_STATUS_SOURCE`, `QUICK_DEPLOY_PI_HOME`, and `QUICK_DEPLOY_PI_TMUX_STATUS_TARGET` for isolated tests.
+An exact link is skipped. A stale symlink at the new path whose target suffix is recognizably `pi-agent/extensions/pi-tmux-window-status` (for example after a checkout move) is backed up and replaced. The legacy name `~/.pi/agent/extensions/quick-deploy-tmux-status` is still recognized: when it is a known managed link to this repo's old extension path, it is treated as a legacy install and migrated — backed up with a timestamp and then replaced by the new link. Unknown files, directories, and foreign symlinks at either path are left untouched and cause a failure; if both old and new paths exist, the installer proceeds only when both are known managed links and otherwise fails without mutating anything. The installer accepts `QUICK_DEPLOY_PI_TMUX_WINDOW_STATUS_SOURCE`, `QUICK_DEPLOY_PI_HOME`, `QUICK_DEPLOY_PI_TMUX_WINDOW_STATUS_TARGET`, and `QUICK_DEPLOY_PI_TMUX_WINDOW_STATUS_LEGACY_TARGET` for isolated tests.
+
+**Runtime contract is intentionally unchanged by this rename.** tmux window options remain `@quick_deploy_pi_*` and the private lease directory remains `quick-deploy/pi-tmux-status`; only the managed symlink name changed. This keeps already-running Pi processes and outstanding leases working and creates no duplicate runtime state.
 
 On startup/reload, restoration reads only pi-subagents 0.56's active-run index under `ASYNC_DIR/.active-runs` beneath `PI_SUBAGENTS_TEMP_ROOT` (or its default scoped temp root), and adopts only status files whose `sessionId` matches the current Pi session. It does not scrape arbitrary directories.
 
-Pi discovers extension directories at startup. **Restart Pi or run `/reload`** after installing or pulling this extension. Reloading tmux only changes the visual format; it does not load the Pi extension. The current Pi process is not reloaded by the installer.
+## Pi auto-discovery
+
+Pi does **not** scan this repository. At startup Pi loads extension directories it finds under `~/.pi/agent/extensions/`, which is exactly what the managed symlink above provides; the tracked extension under `pi-agent/extensions/pi-tmux-window-status/` is inert until that link exists. After installing or updating the extension, **restart Pi or run `/reload`** so the new code is loaded. Reloading tmux only changes the visual format; it does not load the Pi extension. The current Pi process is not reloaded by the installer.
 
 The status format deliberately uses absolute styles so activity color always wins. `last` and `activity` overlays therefore retain their label semantics but do not change background; bell preserves yellow foreground and `!`, and zoom preserves `Z`, while the active/idle background remains authoritative. The dark edge cell still separates adjacent tabs.
 

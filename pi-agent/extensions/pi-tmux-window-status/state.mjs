@@ -7,8 +7,9 @@ export const LEASE_TTL_MS = 6_000;
 export const HEARTBEAT_MS = 2_000;
 const TERMINAL = new Set(["complete", "completed", "failed", "paused", "stopped", "rejected"]);
 
+/** Runtime contract: tmux window options stay @quick_deploy_pi_* and the private lease directory stays quick-deploy/pi-tmux-status (deliberately unchanged by the extension rename) so no duplicate runtime state is created. */
 export function runtimeRoot(env = process.env) {
-  const base = env.QUICK_DEPLOY_TMUX_STATUS_RUNTIME || env.XDG_RUNTIME_DIR || join(env.XDG_STATE_HOME || join(env.HOME || ".", ".local", "state"), "quick-deploy-runtime");
+  const base = env.QUICK_DEPLOY_PI_TMUX_WINDOW_STATUS_RUNTIME || env.XDG_RUNTIME_DIR || join(env.XDG_STATE_HOME || join(env.HOME || ".", ".local", "state"), "quick-deploy-runtime");
   const root = join(base, "quick-deploy", "pi-tmux-status");
   mkdirSync(root, { recursive: true, mode: 0o700 });
   try { chmodSync(root, 0o700); } catch {}
@@ -34,7 +35,7 @@ export function normalizeLeaseState(state) {
   if (state === false || state === undefined || state === null) return false;
   if (state === true || state === "active") return "active";
   if (state === "error") return "error";
-  throw new Error(`invalid quick-deploy tmux lease state: ${String(state)}`);
+  throw new Error(`invalid pi-tmux-window-status lease state: ${String(state)}`);
 }
 
 export function publishLease(identity, ownerId, state, now = Date.now(), env = process.env, diagnostic = {}) {

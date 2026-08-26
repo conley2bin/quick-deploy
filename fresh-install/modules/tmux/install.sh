@@ -10,12 +10,15 @@
 #   4. 符号链接 ~/.tmux.conf.local → 模块自带的 tmux.conf.local 基线
 #      （上游规定定制写在 .tmux.conf.local；这里把它链到仓库文件，
 #      定制即仓库改动，别的机器 git pull 本仓库即生效）
-#   5. 符号链接 ~/.pi/agent/extensions/quick-deploy-tmux-status → 本仓库扩展
+#   5. 符号链接 ~/.pi/agent/extensions/pi-tmux-window-status → 本仓库扩展
 #      （Pi 生命周期事件驱动 tmux window breathing status）
 #
 # 幂等语义：重跑 = 确保 apt 包已装、已有克隆用 git pull --ff-only 更新到最新，
 # tmux/Pi 扩展链接指向本仓库；替换任何既有 ~/.tmux.conf / ~/.tmux.conf.local /
 # ~/.tmux 目录前先做时间戳备份，未知 Pi 扩展路径则拒绝替换。
+# install-pi-tmux-window-status.sh 只管理唯一的 Pi 扩展链接：精确新目标跳过；
+# 已知旧链接 quick-deploy-tmux-status 视为 legacy 迁移（备份后重建新链接）；
+# 未知旧/新路径冲突一律不改动并失败。
 #
 # 失败语义：apt 失败或首次克隆失败 → 退出非零；已有克隆上的更新失败
 # 只警告继续（离线重跑不应破坏已可用的安装）。在 setup.sh 中本步骤为
@@ -105,7 +108,7 @@ else
 fi
 
 echo -e "\n${YELLOW}[5/5] 安装 Pi→tmux breathing status extension...${NC}"
-"$SCRIPT_DIR/install-pi-tmux-status.sh"
+"$SCRIPT_DIR/install-pi-tmux-window-status.sh"
 
 echo -e "\n${GREEN}=== 安装完成 ===${NC}"
 echo -e "\n使用要点："
