@@ -73,19 +73,25 @@ sudo apt install --allow-downgrades ghostty=1.3.1~ppa2-noble1
   - 显式解除 `Ctrl+Alt+←/→` 的 Ghostty split 绑定，把按键交给 tmux 切 window
   - 为 `Ctrl+Alt+=/+` 显式发送 CSI-u 序列，交给 tmux 新建 window
   - 新终端起始目录 `~/Documents`（不存在时回退到 XDG 文档目录，再不行就 `home`）
+  - 关闭新窗口工作目录继承；新标签页和分屏仍保留继承
 
-### 为什么要显式写 `working-directory`
+### 为什么同时写 `working-directory` 和 `window-inherit-working-directory`
 
-不写的话，Ghostty 默认是 `inherit`——继承启动进程的当前目录。官方文档说
-“从桌面启动器启动时自动改用 home”，但 Ctrl+Alt+T 走的是
-`gsd-media-keys` → `x-terminal-emulator` 包装脚本，**不是桌面启动器路径**，
-Ghostty 检测不到，于是退回 `inherit`。
+`working-directory` 只决定“没有可继承窗口时”的默认目录。Ghostty 默认开启
+`window-inherit-working-directory = true`，而且它的优先级更高；配合
+`gtk-single-instance=true`，Ctrl+Alt+T 创建的新窗口会继承现有 Ghostty 焦点窗口
+报告的工作目录。实际表现是：只要焦点窗口位于某个项目目录，以后新窗口都会
+黏在该项目目录，即使 `working-directory = ~/Documents` 已正确生效。
 
-再叠上 `gtk-single-instance = detect`：新窗口请求会交给**已在运行的实例**创建，
-所以新窗口继承的是“当初那个实例启动时所在的目录”。实际表现：在哪个目录里
-手动跑过一次 `ghostty`，以后所有快捷键窗口就全黏在那个目录。
+模块因此同时写入：
 
-显式声明后，行为不再取决于启动路径和历史实例。改起始目录只需改脚本顶部的
+```ini
+working-directory = ~/Documents
+window-inherit-working-directory = false
+```
+
+这让每个新窗口固定从 `~/Documents` 启动。新标签页和分屏仍保留 Ghostty 的默认
+继承行为，方便在当前项目中继续工作。改默认目录只需改脚本顶部的
 `WORKING_DIRECTORY` 变量（可写绝对路径、`~/` 开头的路径，或 `home` / `inherit`），
 然后重跑脚本。
 

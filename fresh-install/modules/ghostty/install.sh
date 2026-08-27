@@ -808,15 +808,14 @@ render_config() {
     echo "keybind = ctrl+alt+equal=csi:61;7u"
     echo "keybind = ctrl+alt+shift+equal=csi:43;7u"
 
-    # 为什么必须显式写：working-directory 默认是 inherit，即继承启动进程的
-    # 当前目录。Ghostty 仅在能识别出“从桌面启动器启动”时才自动改用 home；
-    # 而 Ctrl+Alt+T 走的是 gsd-media-keys -> x-terminal-emulator 包装脚本，
-    # 不是桌面启动器路径，检测不到，于是退回 inherit。
-    # 叠上 gtk-single-instance=detect：新窗口请求会交给已在运行的实例，
-    # 于是新窗口继承的是“当初那个实例启动时的目录”——用户在哪个
-    # 目录里手动跑过 ghostty，以后所有快捷键窗口就黏在那里。
-    # 显式声明后行为不再取决于启动路径和历史实例。
+    # working-directory 只决定没有可继承窗口时的默认目录。Ghostty 的
+    # window-inherit-working-directory 默认为 true，且优先级更高；配合
+    # gtk-single-instance=true，Ctrl+Alt+T 创建的新窗口会继承现有 Ghostty
+    # 焦点窗口的目录，导致所有新窗口长期黏在某个项目目录。
+    # 明确关闭“新窗口继承”，让每个新窗口都从 WORKING_DIRECTORY 启动。
+    # tab/split 仍保留上游默认继承，方便在同一项目中继续工作。
     echo "working-directory = $(resolved_working_directory)"
+    echo "window-inherit-working-directory = false"
     [ -n "$SHELL_INTEGRATION_FEATURES" ] && \
         echo "shell-integration-features = $SHELL_INTEGRATION_FEATURES"
 }
