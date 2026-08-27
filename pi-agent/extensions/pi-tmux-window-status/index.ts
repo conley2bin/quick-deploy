@@ -27,6 +27,9 @@ const POSITIVE_PROVIDER = /(service unavailable|provider (unavailable|error)|bac
 const POSITIVE_ANY = new RegExp([POSITIVE_QUOTA.source, POSITIVE_AUTH.source, POSITIVE_MODEL.source, POSITIVE_RATE.source, POSITIVE_TIMEOUT.source, POSITIVE_TRANSPORT.source, POSITIVE_5XX.source, POSITIVE_ADAPTER.source, POSITIVE_CONCURRENCY.source, POSITIVE_PROVIDER.source].join("|"), "i");
 const ORDINARY_BAD_REQUEST = /(\b400\b|bad request|invalid request|schema|validation(?! failed))/i;
 const CONFLICT_RATELIMIT = /too many concurrent requests/i;
+// Pi 自动重试耗尽后的收尾消息（retryAttempt>0）；用户主动 Esc 是 "Operation aborted"
+// （retryAttempt=0），两者必须区分：前者是被分类错误的事实尾巴，后者是用户意图。
+const RETRY_EXHAUSTED_ABORT = /^aborted after \d+ retry attempts?$/i;
 
 export function classifyModelUnavailable(message: unknown) {
   const msg = object(message);
@@ -45,6 +48,12 @@ export function classifyModelUnavailable(message: unknown) {
 function partHasSemanticOutput(part: Record<string, unknown> | undefined) { if (!part) return false; if (typeof part.text === "string" && part.text.trim()) return true; if (typeof part.thinking === "string" && (part.thinking as string).trim()) return true; const t = String(part.type || ""); return t === "toolCall" || t === "tool_call" || t === "tool_use"; }
 function assistantHasSemanticOutput(msg: Record<string, unknown> | undefined) { if (!msg || msg.role !== "assistant") return false; if (typeof msg.text === "string" && msg.text.trim()) return true; if (typeof msg.thinking === "string" && msg.thinking.trim()) return true; const content = Array.isArray(msg.content) ? msg.content : []; const delta = object(msg.delta); if (Array.isArray(delta?.content) && delta!.content.some((part) => partHasSemanticOutput(object(part)))) return true; return content.some((part) => partHasSemanticOutput(object(part))); }
 function semanticAssistantOutput(message: unknown) { const p = object(message); if (!p) return false; if (assistantHasSemanticOutput(p)) return true; const inner = object(p.message); if (inner) return assistantHasSemanticOutput(inner); return false; }
+export function isRetryExhaustedAbort(message: unknown) { const msg = object(message); return msg?.role === "assistant" && msg?.stopReason === "aborted" && RETRY_EXHAUSTED_ABORT.test(typeof msg?.errorMessage === "string" ? msg.errorMessage.trim() : ""); }
+// auto-continue 的门控标志：跟 modelError 一样要扛过 Pi 内部重试耗尽后的 aborted 尾巴
+// （pi 对 stopReason:"error" 会自动重试，放弃时把消息改成 stopReason:"aborted" +
+// "Aborted after N retry attempts"——该消息命中 HARD_EXCLUDE，若直接覆盖标志，
+// 真正 settle 时 lastAssistantErrorMatched 必为 false，continue 永远发不出去）。
+export function nextLastAssistantErrorMatched(current: boolean, message: unknown) { return classifyModelUnavailable(message) || (isRetryExhaustedAbort(message) && current); }
 export function nextModelErrorState(current: boolean, eventType: string, message?: unknown) { if (eventType === "model_select") return false; if (eventType === "message_update") { if (classifyModelUnavailable(message)) return true; return current && semanticAssistantOutput(message) ? false : current; } if (eventType === "message_end") { const msg = object(message); if (classifyModelUnavailable(message)) return true; if (msg?.role === "assistant" && msg?.stopReason !== "error" && msg?.stopReason !== "aborted") return false; return current; } return current; }
 function eventMessage(args: unknown[]) { for (const arg of args) { const p = object(arg); if (object(p?.message)) return p?.message; if (p?.role === "assistant" || p?.role === "tool") return p; } return undefined; }
 function unwrapAssistantMessage(value: unknown) { const p = object(value); if (object(p?.message)) return p?.message; if (p?.role === "assistant") return p; return undefined; }
@@ -116,7 +125,7 @@ export default function piTmuxWindowStatus(pi: ExtensionAPI) {
   pi.on("agent_settled", (_event, ctx) => { mainActive = false; sync(); maybeAutoContinue(ctx); });
   pi.on("input", () => { cancelContinue(); });
   pi.on("message_update", (...args: unknown[]) => updateModelError("message_update", unwrapAssistantMessage(eventMessage(args)) || eventMessage(args)));
-  pi.on("message_end", (...args: unknown[]) => { const msg = eventMessage(args); const matched = classifyModelUnavailable(msg); lastAssistantErrorMatched = matched; updateModelError("message_end", msg); if (!matched && object(msg)?.role === "assistant" && object(msg)?.stopReason !== "error" && object(msg)?.stopReason !== "aborted") resetFailureStreak(); });
+  pi.on("message_end", (...args: unknown[]) => { const msg = eventMessage(args); const matched = classifyModelUnavailable(msg); lastAssistantErrorMatched = nextLastAssistantErrorMatched(lastAssistantErrorMatched, msg); updateModelError("message_end", msg); if (!matched && object(msg)?.role === "assistant" && object(msg)?.stopReason !== "error" && object(msg)?.stopReason !== "aborted") resetFailureStreak(); });
   pi.on("model_select", () => { resetFailureStreak(); updateModelError("model_select"); });
   pi.on("session_shutdown", () => { const hadError = previousLeaseState === "error" || modelError; mainActive = false; modelError = false; lastAssistantErrorMatched = false; cancelContinue(); children.clear(); if (beat) clearInterval(beat); for (const watcher of watchers.values()) watcher.close(); watchers.clear(); for (const watcher of routeWatchers.values()) watcher.close(); routeWatchers.clear(); publishLease(tmux, owner, false); if (hadError) kick(true); for (const unsubscribe of unsub) if (typeof unsubscribe === "function") unsubscribe(); });
 }

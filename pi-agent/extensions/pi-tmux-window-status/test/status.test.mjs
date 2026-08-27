@@ -6,7 +6,7 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { HEARTBEAT_MS, LEASE_TTL_MS, acquireAnimatorLock, aggregateLogicalState, leasePath, projectAsyncStatus, publishLease, readLease, releaseAnimatorLock, seedAttentionWatermarksFromSnapshot, windowLeaseStates } from "../state.mjs";
-import { animatorSpawnNeeded, childFromStartedPayload, childStillRunning, classifyModelUnavailable, defaultAsyncRoot, mergedChildSnapshot, monitorNeeded, nestedProjectionFromChildren, nestedPublisherDisabled, nextModelErrorState, readNestedRegistryProjection, restoredChildren, sessionIdOf, validateNestedRoute } from "../index.ts";
+import { animatorSpawnNeeded, childFromStartedPayload, childStillRunning, classifyModelUnavailable, defaultAsyncRoot, isRetryExhaustedAbort, mergedChildSnapshot, monitorNeeded, nestedProjectionFromChildren, nestedPublisherDisabled, nextLastAssistantErrorMatched, nextModelErrorState, readNestedRegistryProjection, restoredChildren, sessionIdOf, validateNestedRoute } from "../index.ts";
 import { BLUE_RANGE, CURRENT_FRAMES, ERROR_BG, ERROR_FG, ERROR_MS, FRAME_COUNT, FRAME_MS, FRAMES, GRAY_RANGE, PERIOD_MS, activeWindows, frameAt, isDirectExecution, leaseWindowStates, listClients, runAnimator, sweepWindows, windowOptionArgs } from "../animator.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -106,6 +106,27 @@ test("model error state latches and clears only on semantic assistant/model succ
   assert.equal(nextModelErrorState(false, "message_end", { role: "assistant", stopReason: "error", errorMessage: "context length exceeded" }), false);
   assert.equal(nextModelErrorState(true, "message_end", { role: "assistant", stopReason: "error", errorMessage: "context length exceeded" }), true, "nonmatching error does not clear existing latch");
   assert.equal(nextModelErrorState(true, "message_end", { role: "assistant", stopReason: "aborted", errorMessage: "aborted" }), true);
+});
+
+test("auto-continue flag survives pi retry-exhaustion abort tail but not user abort or normal output", () => {
+  const terminated = { role: "assistant", stopReason: "error", errorMessage: "terminated" };
+  const retryAbort = (n) => ({ role: "assistant", stopReason: "aborted", errorMessage: `Aborted after ${n} retry attempt${n > 1 ? "s" : ""}` });
+  const userAbort = { role: "assistant", stopReason: "aborted", errorMessage: "Operation aborted" };
+  assert.equal(isRetryExhaustedAbort(retryAbort(1)), true);
+  assert.equal(isRetryExhaustedAbort(retryAbort(5)), true);
+  assert.equal(isRetryExhaustedAbort(userAbort), false);
+  assert.equal(isRetryExhaustedAbort(terminated), false);
+  assert.equal(isRetryExhaustedAbort({ role: "tool", stopReason: "aborted", errorMessage: "Aborted after 3 retry attempts" }), false);
+  // 重现会话日志中的失败链：terminated →（pi 内部重试）→ "Aborted after N retry attempts" → settle
+  let flag = false;
+  flag = nextLastAssistantErrorMatched(flag, terminated);
+  assert.equal(flag, true, "classified provider error arms the continue gate");
+  flag = nextLastAssistantErrorMatched(flag, retryAbort(1));
+  assert.equal(flag, true, "retry-exhaustion abort tail preserves the gate so agent_settled can send continue");
+  assert.equal(nextLastAssistantErrorMatched(false, retryAbort(3)), false, "abort tail alone does not arm without a prior classified error");
+  assert.equal(nextLastAssistantErrorMatched(true, userAbort), false, "user Esc abort clears the gate");
+  assert.equal(nextLastAssistantErrorMatched(true, { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "ok" }] }), false, "normal assistant completion clears the gate");
+  assert.equal(nextLastAssistantErrorMatched(true, { role: "assistant", stopReason: "error", errorMessage: "context length exceeded" }), false, "non-availability error clears the gate");
 });
 
 test("0.56 async-started ownership filters on root Pi session file identity", () => {
