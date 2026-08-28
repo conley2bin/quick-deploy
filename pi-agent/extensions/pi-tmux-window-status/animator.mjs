@@ -12,7 +12,7 @@ export const PERIOD_MS = FRAME_COUNT * FRAME_MS;
 export const ERROR_BG = "#d70000";
 export const ERROR_FG = "#ffffff";
 export const GRAY_RANGE = { idle: "#bcbcbc", bright: "#f5f5f5", dark: "#808080" };
-export const BLUE_RANGE = { idle: "#00afff", bright: "#7be0ff", dark: "#0087af" };
+export const FRAME_BLUE = "#0077aa"; // selection frame color; the frame never breathes
 
 const srgb = (byte) => { const value = byte / 255; return value <= 0.04045 ? value / 12.92 : ((value + 0.055) / 1.055) ** 2.4; };
 const encoded = (value) => Math.round(255 * (value <= 0.0031308 ? value * 12.92 : 1.055 * value ** (1 / 2.4) - 0.055));
@@ -20,7 +20,6 @@ const rgb = (hex) => [1, 3, 5].map((offset) => srgb(Number.parseInt(hex.slice(of
 function interpolate(from, to, amount) { const a = rgb(from), b = rgb(to); return `#${a.map((v, i) => encoded(v + (b[i] - v) * amount).toString(16).padStart(2, "0")).join("")}`; }
 export function createPalette({ idle, bright, dark }) { return Array.from({ length: FRAME_COUNT }, (_, frame) => { const wave = Math.sin((Math.PI * 2 * frame) / FRAME_COUNT); return wave >= 0 ? interpolate(idle, bright, wave) : interpolate(idle, dark, -wave); }); }
 export const FRAMES = createPalette(GRAY_RANGE);
-export const CURRENT_FRAMES = createPalette(BLUE_RANGE);
 export function frameAt(elapsedMs) { return Math.floor(((elapsedMs % PERIOD_MS) + PERIOD_MS) % PERIOD_MS / FRAME_MS); }
 
 export function activeWindows(root, now = Date.now()) { return windowLeaseStates(root, now).active; }
@@ -28,9 +27,11 @@ export function leaseWindowStates(root, now = Date.now()) { return windowLeaseSt
 
 export function windowOptionArgs(active, frame, reset = new Set(), error = new Set()) {
   const args = [];
+  // The reset branch still unsets the legacy @quick_deploy_pi_current_bg so
+  // windows painted by pre-selection-frame animator versions are cleaned up.
   for (const id of [...reset].sort()) args.push("set-option", "-uw", "-t", id, "@quick_deploy_pi_active", ";", "set-option", "-uw", "-t", id, "@quick_deploy_pi_bg", ";", "set-option", "-uw", "-t", id, "@quick_deploy_pi_current_bg", ";", "set-option", "-uw", "-t", id, "@quick_deploy_pi_error", ";");
-  for (const id of [...error].sort()) args.push("set-option", "-uw", "-t", id, "@quick_deploy_pi_active", ";", "set-option", "-uw", "-t", id, "@quick_deploy_pi_bg", ";", "set-option", "-uw", "-t", id, "@quick_deploy_pi_current_bg", ";", "set-option", "-w", "-t", id, "@quick_deploy_pi_error", "1", ";");
-  for (const id of [...active].sort()) args.push("set-option", "-uw", "-t", id, "@quick_deploy_pi_error", ";", "set-option", "-w", "-t", id, "@quick_deploy_pi_active", "1", ";", "set-option", "-w", "-t", id, "@quick_deploy_pi_bg", FRAMES[frame], ";", "set-option", "-w", "-t", id, "@quick_deploy_pi_current_bg", CURRENT_FRAMES[frame], ";");
+  for (const id of [...error].sort()) args.push("set-option", "-uw", "-t", id, "@quick_deploy_pi_active", ";", "set-option", "-uw", "-t", id, "@quick_deploy_pi_bg", ";", "set-option", "-w", "-t", id, "@quick_deploy_pi_error", "1", ";");
+  for (const id of [...active].sort()) args.push("set-option", "-uw", "-t", id, "@quick_deploy_pi_error", ";", "set-option", "-w", "-t", id, "@quick_deploy_pi_active", "1", ";", "set-option", "-w", "-t", id, "@quick_deploy_pi_bg", FRAMES[frame], ";");
   return args;
 }
 export function clientRefreshArgs(clients) { return clients.flatMap((client) => ["refresh-client", "-S", "-t", client, ";"]); }

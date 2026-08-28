@@ -7,7 +7,7 @@ import { fileURLToPath } from "node:url";
 import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { HEARTBEAT_MS, LEASE_TTL_MS, acquireAnimatorLock, aggregateLogicalState, leasePath, projectAsyncStatus, publishLease, readLease, releaseAnimatorLock, seedAttentionWatermarksFromSnapshot, windowLeaseStates } from "../state.mjs";
 import { animatorSpawnNeeded, childFromStartedPayload, childStillRunning, classifyModelUnavailable, defaultAsyncRoot, isRetryExhaustedAbort, mergedChildSnapshot, monitorNeeded, nestedProjectionFromChildren, nestedPublisherDisabled, nextLastAssistantErrorMatched, nextModelErrorState, readNestedRegistryProjection, restoredChildren, sessionIdOf, validateNestedRoute } from "../index.ts";
-import { BLUE_RANGE, CURRENT_FRAMES, ERROR_BG, ERROR_FG, ERROR_MS, FRAME_COUNT, FRAME_MS, FRAMES, GRAY_RANGE, PERIOD_MS, activeWindows, frameAt, isDirectExecution, leaseWindowStates, listClients, runAnimator, sweepWindows, windowOptionArgs } from "../animator.mjs";
+import { ERROR_BG, ERROR_FG, ERROR_MS, FRAME_BLUE, FRAME_COUNT, FRAME_MS, FRAMES, GRAY_RANGE, PERIOD_MS, activeWindows, frameAt, isDirectExecution, leaseWindowStates, listClients, runAnimator, sweepWindows, windowOptionArgs } from "../animator.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT = resolve(HERE, "../../../..");
@@ -17,19 +17,15 @@ afterEach(() => { while (trash.length) rmSync(trash.pop(), { recursive: true, fo
 const ident = (socket = "/tmp/tmux-status") => ({ socketPath: socket, windowId: "@8", paneId: "%9" });
 const real = (runId = "root", lastActivityAt = 100, state = "running", steps = []) => ({ runId, state, lastUpdate: lastActivityAt, steps });
 
-test("24-frame palettes start at idle baseline and hit symmetric perceptual ranges", () => {
+test("24-frame breathing palette starts at idle baseline and hits symmetric perceptual ranges", () => {
   assert.equal(FRAMES.length, FRAME_COUNT);
-  assert.equal(CURRENT_FRAMES.length, FRAME_COUNT);
   assert.equal(FRAME_MS, 42);
   assert.equal(PERIOD_MS, 1008);
   assert.equal(FRAMES[0], GRAY_RANGE.idle);
   assert.equal(FRAMES[6], GRAY_RANGE.bright);
   assert.equal(FRAMES[12], GRAY_RANGE.idle);
   assert.equal(FRAMES[18], GRAY_RANGE.dark);
-  assert.equal(CURRENT_FRAMES[0], BLUE_RANGE.idle);
-  assert.equal(CURRENT_FRAMES[6], BLUE_RANGE.bright);
-  assert.equal(CURRENT_FRAMES[12], BLUE_RANGE.idle);
-  assert.equal(CURRENT_FRAMES[18], BLUE_RANGE.dark);
+  assert.equal(FRAME_BLUE, "#0077aa", "selection frame color stays fixed and never breathes");
 });
 
 test("monotonic frame phase wraps and skips delayed callbacks", () => {
@@ -570,7 +566,8 @@ test("client listing handles zero clients and startup sweep resets stale active/
   assert.ok(sweep[1].includes("@2"));
   assert.ok(sweep[1].includes("@quick_deploy_pi_error"));
   const args = windowOptionArgs(new Set(["@1"]), 6, new Set(["@2"]), new Set(["@3"]));
-  assert.ok(args.includes(CURRENT_FRAMES[6]));
+  assert.ok(args.includes(FRAMES[6]), "active windows breathe through the gray palette");
+  assert.equal(args.filter((value) => value === "@quick_deploy_pi_current_bg").length, 1, "only the reset branch unsets the legacy current-bg option");
   assert.ok(args.includes("@quick_deploy_pi_error"));
 });
 
@@ -696,7 +693,9 @@ test("isolated gpakosz load evaluates actual deployed formats across idle and tw
     const current = tmux(["-S", socket, "show-options", "-gqv", "window-status-current-format"], { encoding: "utf8" });
     const evalf = (f) => tmux(["-S", socket, "display-message", "-p", f], { encoding: "utf8" });
     assert.match(evalf(idle), /#bcbcbc/);
-    assert.match(evalf(current), /#00afff/);
+    assert.match(evalf(current), /#bcbcbc/, "selected idle keeps the same gray-white background");
+    assert.match(evalf(current), new RegExp(FRAME_BLUE), "selected idle shows the deep-blue frame");
+    assert.doesNotMatch(evalf(current), /#00afff/, "selected no longer uses a blue background block");
     assert.match(evalf(idle), /#080808/);
     assert.doesNotMatch(idle + current, /#\(/);
     tmux(["-S", socket, "set-option", "-w", "@quick_deploy_pi_error", "1"]);
@@ -704,6 +703,7 @@ test("isolated gpakosz load evaluates actual deployed formats across idle and tw
     assert.match(evalf(idle), new RegExp(ERROR_FG));
     assert.match(evalf(current), new RegExp(ERROR_BG));
     assert.match(evalf(current), new RegExp(ERROR_FG));
+    assert.match(evalf(current), new RegExp(FRAME_BLUE), "selected with error keeps the blue frame on the red block");
     assert.match(idle, /window_bell_flag,#ffff00/);
     assert.match(idle, /window_bell_flag,!,/);
     assert.match(evalf(idle), new RegExp(ERROR_FG), "error foreground wins over bell yellow path while preserving bell marker conditional");
@@ -715,6 +715,8 @@ test("isolated gpakosz load evaluates actual deployed formats across idle and tw
       tmux(["-S", socket, "set-option", "-w", "@quick_deploy_pi_active", "1"]);
       tmux(["-S", socket, "set-option", "-w", "@quick_deploy_pi_bg", color]);
       assert.match(evalf(idle), new RegExp(color));
+      assert.match(evalf(current), new RegExp(color), "selected and unselected breathe the same gray palette");
+      assert.match(evalf(current), new RegExp(FRAME_BLUE), "the frame stays visible while the block breathes");
     }
     tmux(["-S", socket, "set-option", "-uw", "@quick_deploy_pi_active"]);
     tmux(["-S", socket, "set-option", "-uw", "@quick_deploy_pi_bg"]);
