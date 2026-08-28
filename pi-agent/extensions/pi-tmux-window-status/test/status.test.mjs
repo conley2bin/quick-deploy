@@ -698,7 +698,7 @@ test("isolated gpakosz load evaluates actual deployed formats across idle and tw
     assert.match(evalf(current), new RegExp(FRAME_BLUE), "selected idle shows the deep-blue side rails");
     assert.doesNotMatch(evalf(current), /#00afff/, "selected no longer uses a blue background block");
     const visible = stripStyles(evalf(current));
-    assert.match(visible, /█.*█/, "selected draws full-block blue bars at both ends");
+    assert.match(visible, /██.*██/, "selected draws two-cell full-block blue bars at both ends");
     assert.match(evalf(idle), /#080808/);
     assert.doesNotMatch(idle + current, /#\(/);
     tmux(["-S", socket, "set-option", "-w", "@quick_deploy_pi_error", "1"]);
