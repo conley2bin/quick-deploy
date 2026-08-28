@@ -695,14 +695,10 @@ test("isolated gpakosz load evaluates actual deployed formats across idle and tw
     const evalf = (f) => tmux(["-S", socket, "display-message", "-p", f], { encoding: "utf8" });
     assert.match(evalf(idle), /#bcbcbc/);
     assert.match(evalf(current), /#bcbcbc/, "selected idle keeps the same gray-white background");
-    assert.match(evalf(current), new RegExp(FRAME_BLUE), "selected idle shows the deep-blue frame");
+    assert.match(evalf(current), new RegExp(FRAME_BLUE), "selected idle shows the deep-blue side rails");
     assert.doesNotMatch(evalf(current), /#00afff/, "selected no longer uses a blue background block");
-    const visible = (f) => stripStyles(evalf(f)).split("\n").filter((line) => line.length);
-    const idleLines = visible(current);
-    assert.equal(idleLines.length, 2, "selected format spans two status lines");
-    assert.equal([...idleLines[0]].length, [...idleLines[1]].length, "top and bottom box lines stay flush for any window name length");
-    assert.match(idleLines[0], /┏━.*━┓/, "top line carries the upper box corners and bars");
-    assert.match(idleLines[1], /^┗.*┛$/, "bottom line carries the lower corners joined by dynamic ━");
+    const visible = stripStyles(evalf(current));
+    assert.match(visible, /▐.*▌/, "selected draws half-block side rails facing inward");
     assert.match(evalf(idle), /#080808/);
     assert.doesNotMatch(idle + current, /#\(/);
     tmux(["-S", socket, "set-option", "-w", "@quick_deploy_pi_error", "1"]);
