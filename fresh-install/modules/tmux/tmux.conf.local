@@ -71,6 +71,15 @@ bind -T copy-mode WheelDownPane send-keys -X -N 1 scroll-down
 bind -T copy-mode-vi WheelUpPane   send-keys -X -N 1 scroll-up
 bind -T copy-mode-vi WheelDownPane send-keys -X -N 1 scroll-down
 
+# 鼠标拖选复制后不退出 copy-mode、不跳回 pane 底部：tmux 默认（gpakosz 未
+# 覆盖）的 copy-mode MouseDragEnd1Pane = copy-pipe-and-cancel，-cancel 在
+# 复制进缓冲区后立即退出 copy-mode，视图跳回 pane 实时位置（Pi 提示符），
+# 拖选前滚上去的位置全部丢失。改为复制后仅清除选区、留在 copy-mode：
+# 复制到的内容仍进 tmux 缓冲区，视图保持当前滚动位置；看完历史按 q / Esc
+# 再回底部。copy-mode-vi 表同样覆盖（mode-keys 切到 vi 时生效）。
+bind -T copy-mode    MouseDragEnd1Pane send-keys -X copy-selection-no-clear \; send-keys -X clear-selection
+bind -T copy-mode-vi MouseDragEnd1Pane send-keys -X copy-selection-no-clear \; send-keys -X clear-selection
+
 # Oh my tmux! 默认额外把 Ctrl+a 配成第二前缀；取消该绑定，只保留 Ctrl+b。
 set -gu prefix2
 unbind C-a
