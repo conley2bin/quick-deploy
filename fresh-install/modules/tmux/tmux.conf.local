@@ -34,15 +34,16 @@ tmux_conf_theme_status_right_bg="$tmux_conf_theme_colour_15"
 tmux_conf_theme_status_right_attr="none"
 
 # 普通未选中 window 的空闲基线是深色字、灰色块背景；选中 window 不再用
-# 蓝色块，而是在色块两侧画 #0077aa 深蓝粗方框（┏━ 左侧角+横线，━┓ 右侧
-# 横线+角）——选中与 error 从此走两个正交视觉通道（边框 vs 背景），
-# error 红底不再吞掉选中标识；呼吸始终放在背景色块上，方框不呼吸。
-# 单行状态栏物理上放不下真正的下横线（tmux 状态行只有一行高），
-# ┏━…━┓ 是单行内最接近完整方框的形态。下面的 #!important 直写格式最终
-# 接管 last/activity/bell 的渲染，因此不再声明这些覆盖变量：last 和
-# activity 不改变背景或强调；bell 只保留黄色前景和 ! 标记；zoom 保留 Z。
-# 这里使用当前默认调色板的字面值，而不引用 colour_*：本地精简配置没有重新
-# 声明整套调色板，source 阶段引用未定义 shell 变量会展开为空。
+# 蓝色块，而是在色块四周画 #0077aa 深蓝粗方框：上框行（┏━ 内容 ━┓）与
+# 下框行（┗━…━┛），四角齐全。选中与 error 走正交视觉通道（边框 vs 背景），
+# error 红底不再吞掉选中标识；呼吸始终放在背景色块上（上下两行同步），
+# 方框不呼吸。tmux 状态栏单行放不下下框，因此选中窗口占两行；下框横线用
+# s/ 替换修饰符把上行内容逐字符映射为 ━（空格保留），宽度随窗口名动态变化，
+# 无需固定截断窗口名即可保证上下对齐。下面的 #!important 直写格式最终接管
+# last/activity/bell 的渲染，因此不再声明这些覆盖变量：last 和 activity 不改变
+# 背景或强调；bell 只保留黄色前景和 ! 标记；zoom 保留 Z。这里使用当前默认
+# 调色板的字面值，而不引用 colour_*：本地精简配置没有重新声明整套调色板，
+# source 阶段引用未定义 shell 变量会展开为空。
 tmux_conf_theme_window_status_fg="#080808"
 tmux_conf_theme_window_status_bg="#bcbcbc"
 tmux_conf_theme_window_status_attr="none"
@@ -52,16 +53,18 @@ tmux_conf_theme_window_status_attr="none"
 # theme variables before tmux can evaluate nested formats, so this narrow
 # important override keeps the dark edge cells, fixed idle backgrounds,
 # bell/zoom markers, steady red errors, and breathing colors in one place.
-# Selection is expressed as a bold #0077aa box frame (┏━ left corner+bar, ━┓
-# right bar+corner) drawn around the selected tab — a separate visual channel
-# from the background — so a selected tab with a latched error shows the red
-# block plus the blue frame instead of losing the selection cue. Breathing
-# only ever moves the background block, never the frame; the frame stays
-# #0077aa in every state. A true bottom bar is physically impossible in the
-# one-line tmux status bar; ┏━…━┓ is the closest complete-box approximation
-# a single line can draw.
+# Selection is a bold #0077aa box frame with all four corners: the top line
+# carries ┏━ content ━┓ and the bottom line ┗━…━┛. A single status line has
+# no room for a bottom bar, so the selected tab spans two status lines while
+# unselected tabs keep one. The bottom bar repeats the top content through
+# an s/ substitution that turns every non-space character into ━, so both
+# lines stay flush for any window name length without padding/truncation.
+# Breathing only ever moves the background block on both lines in sync,
+# never the frame; the frame stays #0077aa in every state. The double-quoted
+# string is deliberate: tmux config parsing turns \n into a real newline so
+# the option value contains two status lines.
 setw -g window-status-format '#[fg=#{?@quick_deploy_pi_error,#ffffff,#{?window_bell_flag,#ffff00,#080808}},bg=#{?@quick_deploy_pi_error,#d70000,#{?@quick_deploy_pi_active,#{@quick_deploy_pi_bg},#bcbcbc}},none] #{window_index} #{window_name}#{?window_bell_flag,!,}#{?window_zoomed_flag,Z,} #[fg=#080808,bg=#080808]' #!important
-setw -g window-status-current-format '#[fg=#0077aa,bg=#{?@quick_deploy_pi_error,#d70000,#{?@quick_deploy_pi_active,#{@quick_deploy_pi_bg},#bcbcbc}},none]┏━#[fg=#{?@quick_deploy_pi_error,#ffffff,#{?window_bell_flag,#ffff00,#080808}},bg=#{?@quick_deploy_pi_error,#d70000,#{?@quick_deploy_pi_active,#{@quick_deploy_pi_bg},#bcbcbc}},bold] #{window_index} #{window_name}#{?window_bell_flag,!,}#{?window_zoomed_flag,Z,} #[fg=#0077aa,bg=#{?@quick_deploy_pi_error,#d70000,#{?@quick_deploy_pi_active,#{@quick_deploy_pi_bg},#bcbcbc}},none]━┓#[fg=#080808,bg=#080808]' #!important
+setw -g window-status-current-format "#[fg=#0077aa,bg=#{?@quick_deploy_pi_error,#d70000,#{?@quick_deploy_pi_active,#{@quick_deploy_pi_bg},#bcbcbc}},none]┏━#[fg=#{?@quick_deploy_pi_error,#ffffff,#{?window_bell_flag,#ffff00,#080808}},bg=#{?@quick_deploy_pi_error,#d70000,#{?@quick_deploy_pi_active,#{@quick_deploy_pi_bg},#bcbcbc}},bold] #{window_index} #{window_name}#{?window_bell_flag,!, }#{?window_zoomed_flag,Z, } #[fg=#0077aa,bg=#{?@quick_deploy_pi_error,#d70000,#{?@quick_deploy_pi_active,#{@quick_deploy_pi_bg},#bcbcbc}},none]━┓#[fg=#080808,bg=#080808]\n#[fg=#0077aa,bg=#{?@quick_deploy_pi_error,#d70000,#{?@quick_deploy_pi_active,#{@quick_deploy_pi_bg},#bcbcbc}},none]┗━#{s/[^ ]/━/g: #{window_index} #{window_name}#{?window_bell_flag,!, }#{?window_zoomed_flag,Z, } }━┛#[fg=#080808,bg=#080808]" #!important
 
 # 普通 pane 中滚轮每格滚动 1 行：首次向上滚时进入 copy-mode，随后由
 # copy-mode 的 WheelUp/DownPane 绑定按 history-limit 滚动。应用若主动开启

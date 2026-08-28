@@ -687,6 +687,7 @@ test("installer resolves the tracked source independently of the working directo
 test("isolated gpakosz load evaluates actual deployed formats across idle and two active frames", () => {
   const work = temp(), socket = join(work, "server.sock");
   const tmux = (args, options = {}) => execFileSync("tmux", args, { cwd: work, ...options });
+  const stripStyles = (s) => String(s).replace(/#\[[^\]]*\]/g, "");
   tmux(["-S", socket, "-f", join(process.env.HOME, ".tmux.conf"), "new-session", "-d", "-s", "q"]);
   try {
     const idle = tmux(["-S", socket, "show-options", "-gqv", "window-status-format"], { encoding: "utf8" });
@@ -696,6 +697,12 @@ test("isolated gpakosz load evaluates actual deployed formats across idle and tw
     assert.match(evalf(current), /#bcbcbc/, "selected idle keeps the same gray-white background");
     assert.match(evalf(current), new RegExp(FRAME_BLUE), "selected idle shows the deep-blue frame");
     assert.doesNotMatch(evalf(current), /#00afff/, "selected no longer uses a blue background block");
+    const visible = (f) => stripStyles(evalf(f)).split("\n").filter((line) => line.length);
+    const idleLines = visible(current);
+    assert.equal(idleLines.length, 2, "selected format spans two status lines");
+    assert.equal([...idleLines[0]].length, [...idleLines[1]].length, "top and bottom box lines stay flush for any window name length");
+    assert.match(idleLines[0], /┏━.*━┓/, "top line carries the upper box corners and bars");
+    assert.match(idleLines[1], /^┗.*┛$/, "bottom line carries the lower corners joined by dynamic ━");
     assert.match(evalf(idle), /#080808/);
     assert.doesNotMatch(idle + current, /#\(/);
     tmux(["-S", socket, "set-option", "-w", "@quick_deploy_pi_error", "1"]);
