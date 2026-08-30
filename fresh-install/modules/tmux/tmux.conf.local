@@ -60,9 +60,11 @@ tmux_conf_theme_window_status_attr="none"
 setw -g window-status-format '#[fg=#{?@quick_deploy_pi_error,#ffffff,#{?window_bell_flag,#ffff00,#080808}},bg=#{?@quick_deploy_pi_error,#d70000,#{?@quick_deploy_pi_active,#{@quick_deploy_pi_bg},#bcbcbc}},none] #{window_index} #{window_name}#{?window_bell_flag,!,}#{?window_zoomed_flag,Z,} #[fg=#080808,bg=#080808]' #!important
 setw -g window-status-current-format '#[fg=#0077aa,bg=#0077aa,none]██#[fg=#{?@quick_deploy_pi_error,#ffffff,#{?window_bell_flag,#ffff00,#080808}},bg=#{?@quick_deploy_pi_error,#d70000,#{?@quick_deploy_pi_active,#{@quick_deploy_pi_bg},#bcbcbc}},bold] #{window_index} #{window_name}#{?window_bell_flag,!,}#{?window_zoomed_flag,Z,} #[fg=#0077aa,bg=#0077aa,none]██#[fg=#080808,bg=#080808]' #!important
 
-# 普通 pane 中滚轮每格滚动 1 行：首次向上滚时进入 copy-mode，随后由
-# copy-mode 的 WheelUp/DownPane 绑定按 history-limit 滚动。应用若主动开启
-# mouse reporting（mouse_any_flag），仍把滚轮原样交给应用处理。
+# 滚轮透明翻历史：tmux 里回看历史的唯一方式就是 copy-mode，把它关掉
+# 等于滚轮彻底失效（2026-08-30 曾改为 root 表直接 send-keys -M 转发，
+# 用户反馈「滚轮无法滑动界面」后恢复本方案，勿再改）。首次向上滚进入
+# copy-mode -e，每格 1 行；向下滚到底部（回到实时位置）时 -e 自动退出
+# copy-mode，全程无需按键。应用主动开 mouse reporting 时滚轮仍原样交给应用。
 bind -T root WheelUpPane if-shell -F '#{mouse_any_flag}' \
   'send-keys -M' \
   'copy-mode -e; send-keys -X -N 1 scroll-up'
