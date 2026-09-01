@@ -7,7 +7,8 @@
 # 无法访问 Launchpad，则退回同一维护者的 GitHub .deb，并在安装前核对
 # GitHub API 给出的 SHA-256 digest。
 #
-# 幂等语义：重跑 = 确保最新版 + 把配置重置为基准内容；旧文件先备份。
+# 幂等语义：重跑 = 确保最新版 + 把配置重置为基准内容，并把 Ghostty
+# SSH 鼠标自愈 hook 同步到用户 zsh；旧文件先备份。
 # --check 只读，不添加源、不更新 apt、不下载或写入任何文件。
 
 set -euo pipefail
@@ -21,10 +22,12 @@ DEFAULT_TERMINAL=true
 INSTALL_MODE="auto"
 SUDO_CMD="${SUDO_CMD:-sudo}"
 
+SCRIPT_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 # 共享等锁助手：新装系统首开机时后台自动更新会长时间持 apt 锁，
 # 直接 add-apt-repository/apt-get 会撞锁失败，先等它结束。脚本被单独
 # 拷出、助手缺失时定义空操作跳过等锁
-APT_LOCK_WAIT_LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../../lib/apt-lock-wait.sh"
+APT_LOCK_WAIT_LIB="$SCRIPT_DIR/../../lib/apt-lock-wait.sh"
 if [ -f "$APT_LOCK_WAIT_LIB" ]; then . "$APT_LOCK_WAIT_LIB"; else wait_for_apt_lock() { return 0; }; fi
 
 PPA_NAME="ppa:mkasberg/ghostty-ubuntu"
@@ -37,6 +40,13 @@ GHOSTTY_BIN="/usr/bin/ghostty"
 CONFIG_DIR="$HOME/.config/ghostty"
 CONFIG_FILE="$CONFIG_DIR/config.ghostty"
 LOCAL_BIN_DIR="$HOME/.local/bin"
+# SSH 异常断开后清理残留鼠标上报模式的 zsh hook。源文件跟随模块版本，
+# 安装时复制到用户目录；不直接 source 仓库路径，避免 checkout 移动后失效。
+SSH_MOUSE_HOOK_SOURCE="$SCRIPT_DIR/ssh-mouse-reset.zsh"
+SSH_MOUSE_HOOK_FILENAME="ghostty-ssh-mouse-reset.zsh"
+SSH_MOUSE_HOOK_CONFIG="$HOME/.config/ghostty/$SSH_MOUSE_HOOK_FILENAME"
+ZSHRC_BLOCK_BEGIN="# >>> fresh-install ghostty: ssh 鼠标复位 hook >>>"
+ZSHRC_BLOCK_END="# <<< fresh-install ghostty: ssh 鼠标复位 hook <<<"
 FONTCONFIG_CONF_DIR="$HOME/.config/fontconfig/conf.d"
 # 89 > 69：必须排在 69-language-selector-zh-*.conf 之后才能盖过它。
 ZH_MONO_CONF="$FONTCONFIG_CONF_DIR/89-ghostty-zh-mono.conf"
@@ -452,6 +462,9 @@ show_check() {
         echo "GSettings terminal exec: $(gsettings get org.gnome.desktop.default-applications.terminal exec 2>/dev/null)"
     fi
     echo "xdg-terminal-exec 默认项: $(xdg_terminal_state)"
+    echo "SSH 断开后的鼠标状态自愈:"
+    ssh_mouse_hook_state
+    echo "  复位键: Ctrl+Shift+R -> Ghostty reset 动作"
 
     case "$INSTALL_MODE" in
         ppa) echo "计划: 只走 PPA，更新 apt 并安装最新版 ghostty；失败即退出" ;;
@@ -808,6 +821,12 @@ render_config() {
     echo "keybind = ctrl+alt+equal=csi:61;7u"
     echo "keybind = ctrl+alt+shift+equal=csi:43;7u"
 
+    # SSH 异常断开时，远端 TUI 可能来不及关闭鼠标上报模式。Ghostty 无法
+    # 从终端协议判断 SSH 已死亡，因此由 zsh hook 在 ssh 返回后的下一个
+    # prompt 发出针对常见鼠标协议的 DECRST；Ctrl+Shift+R 是所有 shell
+    # 和非交互式 SSH 启动方式都能使用的 Ghostty 原生 reset 兜底。
+    echo "keybind = ctrl+shift+r=reset"
+
     # working-directory 只决定没有可继承窗口时的默认目录。Ghostty 的
     # window-inherit-working-directory 默认为 true，且优先级更高；配合
     # gtk-single-instance=true，Ctrl+Alt+T 创建的新窗口会继承现有 Ghostty
@@ -882,6 +901,177 @@ write_atomic_text() {
     backup_file "$target"
     mv -f "$tmp" "$target"
     echo "已写入: $target"
+}
+
+write_atomic_file_from_source() {
+    local target="$1" source="$2" mode="$3" tmp
+    mkdir -p "$(dirname "$target")"
+    tmp="$(mktemp "$target.tmp.XXXXXX")"
+    if ! cat "$source" > "$tmp" || ! chmod "$mode" "$tmp"; then
+        rm -f "$tmp"
+        return 1
+    fi
+    if [ -f "$target" ] && cmp -s "$tmp" "$target"; then
+        rm -f "$tmp"
+        echo "文件无变化，跳过: $target"
+        return 0
+    fi
+    backup_file "$target"
+    mv -f "$tmp" "$target"
+    echo "已写入: $target"
+}
+
+write_atomic_file_keep_mode() {
+    # 原子安装一个已经生成好的临时文件；用于保留用户文件的原始字节，
+    # 避免命令替换吞掉 .zshrc 末尾换行。
+    local target="$1" tmp="$2" default_mode="$3"
+    if [ -f "$target" ]; then
+        chmod --reference="$target" "$tmp" 2>/dev/null || chmod "$default_mode" "$tmp"
+    else
+        chmod "$default_mode" "$tmp"
+    fi
+    if [ -f "$target" ] && cmp -s "$tmp" "$target"; then
+        rm -f "$tmp"
+        echo "文件无变化，跳过: $target"
+        return 0
+    fi
+    backup_file "$target"
+    mv -f "$tmp" "$target"
+    echo "已写入: $target"
+}
+
+# ============================================
+# SSH 异常断开后的鼠标状态自愈
+# ============================================
+# 远端 tmux/vim/htop 等程序通过 DECSET 打开鼠标上报后，SSH 若因断网、
+# 超时或进程被杀而结束，负责发送 DECRST 的程序已经不存在。Ghostty 不
+# 能知道哪个 SSH 通道拥有当前终端状态，于是下一次点击会把 SGR 鼠标报文
+# 送进本地 zsh，显示为 0;列;行M/m。hook 只在交互式 ssh 命令回到 prompt
+# 时清理，既保留活动中的 tmux/TUI 鼠标功能，也不碰其它键盘/终端模式。
+
+render_zshrc_hook_block() {
+    cat <<EOF
+$ZSHRC_BLOCK_BEGIN
+# 由 fresh-install/modules/ghostty/install.sh 管理；其余 .zshrc 内容不动。
+if [ -f "\$HOME/.config/ghostty/$SSH_MOUSE_HOOK_FILENAME" ]; then
+    source "\$HOME/.config/ghostty/$SSH_MOUSE_HOOK_FILENAME"
+fi
+$ZSHRC_BLOCK_END
+EOF
+}
+
+zshrc_hook_markers_valid() {
+    awk -v begin="$ZSHRC_BLOCK_BEGIN" -v end="$ZSHRC_BLOCK_END" '
+        $0 == begin { if (begin_line || bad) bad = 1; begin_line = NR; next }
+        $0 == end   { if (!begin_line || end_line || bad) bad = 1; end_line = NR; next }
+        END { exit !(begin_line && end_line && begin_line < end_line && !bad) }
+    ' "$1"
+}
+
+ensure_zshrc_hook_block() {
+    local target="$HOME/.zshrc" block tmp
+
+    if [ -L "$target" ]; then
+        warn "$target 是符号链接，拒绝改写；hook 文件已写入，请在其源文件中加入："
+        warn "  [ -f \"\$HOME/.config/ghostty/$SSH_MOUSE_HOOK_FILENAME\" ] && source \"\$HOME/.config/ghostty/$SSH_MOUSE_HOOK_FILENAME\""
+        return 0
+    fi
+    if [ -e "$target" ] && [ ! -f "$target" ]; then
+        warn "$target 不是普通文件，拒绝改写；请手动 source Ghostty SSH hook"
+        return 0
+    fi
+
+    if [ -f "$target" ]; then
+        if zshrc_hook_markers_valid "$target"; then
+            echo "$target 已有 Ghostty SSH hook 托管加载块，保持原位置不动"
+            return 0
+        fi
+        if grep -Fqx "$ZSHRC_BLOCK_BEGIN" "$target" || grep -Fqx "$ZSHRC_BLOCK_END" "$target"; then
+            warn "$target 中 Ghostty hook 标记不成对、乱序或重复，拒绝改写以保护用户配置"
+            return 0
+        fi
+    fi
+
+    block="$(render_zshrc_hook_block)"
+    tmp="$(mktemp "$target.tmp.XXXXXX")"
+    if [ -f "$target" ]; then
+        # 先原样复制用户文件，再只追加本模块自己的内容；不会丢失或
+        # 重写用户原有的尾部换行、CRLF 或其它字节。
+        if ! cat "$target" > "$tmp" || ! printf '\n' >> "$tmp"; then
+            rm -f "$tmp"
+            return 1
+        fi
+    fi
+    if ! printf '%s\n' "$block" >> "$tmp"; then
+        rm -f "$tmp"
+        return 1
+    fi
+    write_atomic_file_keep_mode "$target" "$tmp" 644
+}
+
+install_ssh_mouse_hook() {
+    if ! command -v zsh >/dev/null 2>&1; then
+        warn "未找到 zsh，跳过 SSH 鼠标自愈 hook（Ctrl+Shift+R 仍可手动复位）"
+        return 0
+    fi
+    if [ ! -f "$SSH_MOUSE_HOOK_SOURCE" ]; then
+        warn "缺少 Ghostty SSH hook 源文件，跳过自动自愈（Ctrl+Shift+R 仍可手动复位）: $SSH_MOUSE_HOOK_SOURCE"
+        return 0
+    fi
+
+    if [ -L "$SSH_MOUSE_HOOK_CONFIG" ]; then
+        warn "$SSH_MOUSE_HOOK_CONFIG 是符号链接，拒绝覆盖；SSH 鼠标自愈 hook 未启用"
+        warn "  手动恢复: Ctrl+Shift+R，或运行 reset"
+        return 0
+    fi
+    if [ -e "$SSH_MOUSE_HOOK_CONFIG" ] && [ ! -f "$SSH_MOUSE_HOOK_CONFIG" ]; then
+        warn "$SSH_MOUSE_HOOK_CONFIG 不是普通文件，拒绝覆盖；SSH 鼠标自愈 hook 未启用"
+        warn "  手动恢复: Ctrl+Shift+R，或运行 reset"
+        return 0
+    fi
+    write_atomic_file_from_source "$SSH_MOUSE_HOOK_CONFIG" "$SSH_MOUSE_HOOK_SOURCE" 644
+    ensure_zshrc_hook_block
+    if [ ! -f "$SSH_MOUSE_HOOK_CONFIG" ] || ! zsh -n "$SSH_MOUSE_HOOK_CONFIG"; then
+        die "SSH 鼠标自愈 hook 写入后校验失败: $SSH_MOUSE_HOOK_CONFIG"
+    fi
+    if [ -f "$HOME/.zshrc" ] && [ ! -L "$HOME/.zshrc" ] && zshrc_hook_markers_valid "$HOME/.zshrc"; then
+        echo "OK: SSH 鼠标自愈 hook 已写入、已登记到 .zshrc，语法检查通过: $SSH_MOUSE_HOOK_CONFIG"
+    else
+        warn "SSH 鼠标自愈 hook 文件已写入，但 .zshrc 未登记；请按上方提示手动 source"
+    fi
+}
+
+ssh_mouse_hook_state() {
+    if ! command -v zsh >/dev/null 2>&1; then
+        echo "  zsh hook: 跳过（未安装 zsh）"
+        return 0
+    fi
+    if [ ! -f "$SSH_MOUSE_HOOK_SOURCE" ]; then
+        echo "  zsh hook: 跳过（源文件缺失；正式安装也会跳过）"
+        return 0
+    fi
+    if [ -L "$SSH_MOUSE_HOOK_CONFIG" ]; then
+        echo "  hook 文件: $SSH_MOUSE_HOOK_CONFIG —— 符号链接（正式安装将拒绝覆盖）"
+    elif [ -e "$SSH_MOUSE_HOOK_CONFIG" ] && [ ! -f "$SSH_MOUSE_HOOK_CONFIG" ]; then
+        echo "  hook 文件: $SSH_MOUSE_HOOK_CONFIG —— 不是普通文件（正式安装将跳过）"
+    elif [ -f "$SSH_MOUSE_HOOK_CONFIG" ] && cmp -s "$SSH_MOUSE_HOOK_SOURCE" "$SSH_MOUSE_HOOK_CONFIG"; then
+        echo "  hook 文件: $SSH_MOUSE_HOOK_CONFIG —— 已是当前基准"
+    elif [ -f "$SSH_MOUSE_HOOK_CONFIG" ]; then
+        echo "  hook 文件: $SSH_MOUSE_HOOK_CONFIG —— 已存在但内容漂移（正式安装将备份）"
+    else
+        echo "  hook 文件: $SSH_MOUSE_HOOK_CONFIG —— 不存在（正式安装将写入）"
+    fi
+    if [ -L "$HOME/.zshrc" ]; then
+        echo "  .zshrc: 符号链接（正式安装将跳过并提示手动 source）"
+    elif [ -e "$HOME/.zshrc" ] && [ ! -f "$HOME/.zshrc" ]; then
+        echo "  .zshrc: 不是普通文件（正式安装将跳过）"
+    elif [ -f "$HOME/.zshrc" ] && zshrc_hook_markers_valid "$HOME/.zshrc"; then
+        echo "  .zshrc: 已有托管加载块"
+    elif [ -f "$HOME/.zshrc" ] && { grep -Fqx "$ZSHRC_BLOCK_BEGIN" "$HOME/.zshrc" || grep -Fqx "$ZSHRC_BLOCK_END" "$HOME/.zshrc"; }; then
+        echo "  .zshrc: hook 标记异常（正式安装将拒绝改写并提示）"
+    else
+        echo "  .zshrc: 正式安装将追加托管加载块"
+    fi
 }
 
 set_default_terminal() {
@@ -1028,26 +1218,29 @@ main() {
         exit 0
     fi
 
-    section "[1/7] 安装最新版 Ghostty"
+    section "[1/8] 安装最新版 Ghostty"
     install_ghostty
 
     # 字体必须先于写配置：render_config 用 font_exists 决定要不要写
     # font-family 行，顺序反了就会把刚装上的字体漏写。
-    section "[2/7] 确保字体可用"
+    section "[2/8] 确保字体可用"
     ensure_fonts
 
     # 必须在 ensure_fonts 之后：规则只为实际存在的字体生成。
-    section "[3/7] 修复中文 locale 下的等宽字体劫持"
+    section "[3/8] 修复中文 locale 下的等宽字体劫持"
     ensure_zh_mono_fontconfig
 
-    section "[4/7] 写入并验证基准配置"
+    section "[4/8] 写入并验证基准配置"
     write_config
     verify_config
 
-    section "[5/7] 验证桌面入口与 terminfo"
+    section "[5/8] 配置 SSH 断开后的鼠标状态自愈"
+    install_ssh_mouse_hook
+
+    section "[6/8] 验证桌面入口与 terminfo"
     verify_system_integration
 
-    section "[6/7] 默认终端（接管 Ctrl+Alt+T）"
+    section "[7/8] 默认终端（接管 Ctrl+Alt+T）"
     if [ "$DEFAULT_TERMINAL" = true ]; then
         set_default_terminal
         verify_default_terminal
@@ -1056,7 +1249,7 @@ main() {
         echo "需要 Ghostty 接管时重跑: ./install.sh --default-terminal"
     fi
 
-    section "[7/7] GUI 冒烟测试"
+    section "[8/8] GUI 冒烟测试"
     smoke_test
 
     echo
@@ -1079,6 +1272,8 @@ main() {
     echo "  4. SSH terminfo 已由 ssh-env + ssh-terminfo 自动处理；"
     echo "     极简远端缺 infocmp/tic 时会回退 xterm-256color。手动兜底:"
     echo "     infocmp -x xterm-ghostty | ssh HOST -- tic -x -"
+    echo "  5. SSH 异常断开后点击若出现 0;xx;xxM 乱码，按 Ctrl+Shift+R；"
+    echo "     zsh hook 会在 ssh 返回到本地提示符时自动清理常见鼠标模式。"
 }
 
 main "$@"

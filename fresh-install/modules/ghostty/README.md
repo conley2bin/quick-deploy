@@ -67,13 +67,17 @@ sudo apt install --allow-downgrades ghostty=1.3.1~ppa2-noble1
 - `~/.config/ghostty/config.ghostty`
   - 主字体 `JetBrains Mono`
   - 等宽 CJK 回退字体 `Noto Sans Mono CJK SC`
-  - 字号 `12`
-  - 内置主题 `Catppuccin Frappe`
+  - 字号 `12`，主题 `Catppuccin Frappe`
   - `F11` 全屏切换
   - 显式解除 `Ctrl+Alt+←/→` 的 Ghostty split 绑定，把按键交给 tmux 切 window
   - 为 `Ctrl+Alt+=/+` 显式发送 CSI-u 序列，交给 tmux 新建 window
+  - `Ctrl+Shift+R` 绑定 Ghostty 原生 `reset`，用于清理异常 SSH 后残留的终端状态
   - 新终端起始目录 `~/Documents`（不存在时回退到 XDG 文档目录，再不行就 `home`）
   - 关闭新窗口工作目录继承；新标签页和分屏仍保留继承
+- `~/.config/ghostty/ghostty-ssh-mouse-reset.zsh`
+  - zsh 在 SSH 返回本地提示符前自动清理常见鼠标模式
+- `~/.zshrc`
+  - 追加一个标记包围的 hook 加载块（符号链接 `.zshrc` 不会被改写）
 
 ### 为什么同时写 `working-directory` 和 `window-inherit-working-directory`
 
@@ -206,17 +210,24 @@ emulator），不是对 X11 API 的依赖。切到 Wayland 后，只有“按键
 ./install.sh --check --deb-only --default-terminal
 ```
 
-预检报告：系统与架构、Ghostty 版本、apt 候选版本、PPA 是否已在源中、配置状态、两种字体、`xterm-ghostty` terminfo、当前默认终端所有者以及计划动作。它不会添加软件源、调用修改状态的 apt 命令、访问 GitHub、下载文件或写入用户目录。
+离线回归测试（不安装软件、不联网、不改真实 HOME）：
+
+```bash
+bash tests/run.sh
+```
+
+预检报告：系统与架构、Ghostty 版本、apt 候选版本、PPA 是否已在源中、配置状态、两种字体、`xterm-ghostty` terminfo、SSH 鼠标自愈 hook、当前默认终端所有者以及计划动作。它不会添加软件源、调用修改状态的 apt 命令、访问 GitHub、下载文件或写入用户目录。
 
 ## 安装后的用户验收清单
 
 1. 运行 `ghostty --version`，确认版本可读。
 2. 从 GNOME 应用菜单启动 Ghostty，确认图标入口能打开窗口。
 3. 确认主题为 Catppuccin Frappe，字号为 12；按 `F11` 能切换全屏。新窗口应落在 `~/Documents`。
-4. 在 Ghostty 中用 fcitx5 输入一段中文。安装脚本的 GUI 冒烟测试只证明 GTK4 的 `libim-fcitx5.so` 已载入进程；最终文本提交仍应人工确认。
-5. 运行 `infocmp xterm-ghostty`，确认本机 terminfo 可读。
-6. 按 Ctrl+Alt+T 确认启动 Ghostty（默认已接管；若用了 `--no-default-terminal` 则跳过此项）；同时从文件管理器测试“在终端中打开”。
-7. SSH 到不认识 `xterm-ghostty` 的远端时，本模块已开启 `ssh-terminfo` 自动处理（见下节）。若需手动处理：
+4. SSH 异常断开后点击若出现 `0;xx;xxM` / `0;xx;xxm` 乱码，按 `Ctrl+Shift+R` 确认 Ghostty 能复位终端；正常通过 zsh 执行的 SSH 会在返回提示符前自动清理。
+5. 在 Ghostty 中用 fcitx5 输入一段中文。安装脚本的 GUI 冒烟测试只证明 GTK4 的 `libim-fcitx5.so` 已载入进程；最终文本提交仍应人工确认。
+6. 运行 `infocmp xterm-ghostty`，确认本机 terminfo 可读。
+7. 按 Ctrl+Alt+T 确认启动 Ghostty（默认已接管；若用了 `--no-default-terminal` 则跳过此项）；同时从文件管理器测试“在终端中打开”。
+8. SSH 到不认识 `xterm-ghostty` 的远端时，本模块已开启 `ssh-terminfo` 自动处理（见下节）。若需手动处理：
 
    ```bash
    infocmp -x xterm-ghostty | ssh HOST -- tic -x -
@@ -255,3 +266,38 @@ Ghostty 是本地程序，负责画窗口、渲染字体、调 GPU；远端只�
 “省略某个特性就用它的默认值”，因此上游将来调整其它特性默认值时本模块能自动
 跟上，而不会把一份过期快照冻在用户配置里（尤其 `no-sudo` 这种安全相关项）。
 实测写入后生效值为 `cursor,no-sudo,title,ssh-env,ssh-terminfo,path`。
+
+## SSH 异常断开后的鼠标乱码
+
+`0;62;39M` / `0;42;40m` 不是字体乱码，而是 SGR 鼠标报文的一部分：完整报文形如
+`ESC[<按钮;列;行M`（按下）或末尾为 `m`（释放）。远端的 tmux、vim、htop 等程序
+打开鼠标上报后，如果 SSH 因超时、断网或进程被杀而结束，程序来不及发送关闭鼠标
+模式的序列；Ghostty 不知道哪个 SSH 进程已死，因此会按协议继续把下一次点击送进
+当前本地 shell。zsh 的行编辑器消费报文前缀后，数字尾部就会显示在提示符中。
+这与 `ssh-env` / `ssh-terminfo` 无关：那两个特性只处理环境变量和 terminfo，继续保留。
+
+本模块采用两层处理：
+
+1. `~/.config/ghostty/config.ghostty` 中绑定
+   `keybind = ctrl+shift+r=reset`。它调用 Ghostty 原生 reset 动作，会重置所有鼠标
+   上报模式；SSH 由 `exec`、脚本或其它工具启动时也能直接使用。也可以运行 `reset`，
+   或从终端右键菜单选择 **Reset**。
+2. 若安装时存在 zsh，模块会写入
+   `~/.config/ghostty/ghostty-ssh-mouse-reset.zsh`，并在 `~/.zshrc` 末尾加入标记托管
+   块。它只在 Ghostty 的交互式 zsh 中生效：识别首个命令为 `ssh`（包括常见的
+   `command`、`builtin`、`env`、`sudo` 和 `VAR=value` 修饰），待 SSH 返回提示符前
+   发送 `1000,1001,1002,1003,1005,1006,1015,1016` 的 DECRST。它不替换 `ssh`、不改变退出
+   码，也不在 SSH/TUI 运行期间干预鼠标；因此 `tmux` 的鼠标功能仍可用。若本地使用
+   GNU screen（`STY`），hook 会跳过自动复位，使用 `Ctrl+Shift+R` 手动恢复。
+
+自动 hook 的边界是 `exec ssh`（没有本地提示符可回）、非交互式脚本/GUI 工具，以及
+符号链接 `.zshrc`（为避免破坏 stow/chezmoi 等管理文件，安装器会跳过并提示手动
+source）。hook 文件内容变化时重跑会先保存 `.bak.<时间戳>` 并同步基准；已有完整标记的 `.zshrc`
+托管块保持原位置，其它 `.zshrc` 内容保持不动。该问题的上游说明见
+[Ghostty discussion #10547](https://github.com/ghostty-org/ghostty/discussions/10547)、
+[#6679](https://github.com/ghostty-org/ghostty/discussions/6679)；上游建议的恢复动作
+也是 `reset`。
+
+如果只把 `install.sh` 单独拷出而没有同目录的
+`ssh-mouse-reset.zsh`，安装器会跳过自动 hook 并保留 `Ctrl+Shift+R` / `reset` 手动
+恢复路径。
