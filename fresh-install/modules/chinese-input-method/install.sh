@@ -35,6 +35,8 @@ HOTKEY_ALT_TRIGGER=''                      # 「临时切换到第一个输入�
 BEHAVIOR_ACTIVE_BY_DEFAULT='True'          # 起手即为激活态，即拼音直通
 
 FCITX5_CONFIG="$FCITX5_CONFIG_DIR/config"
+FCITX5_CHTTRANS_CONF="$FCITX5_CONFIG_DIR/conf/chttrans.conf"
+CHTTRANS_ADDON_NAME="chttrans"
 FCITX5_STARTED_NOW=false
 IM_ENV_PUSHED=false
 
@@ -47,9 +49,19 @@ section() {
 
 backup_file() {
     local file="$1"
+    local stamp target n
 
     if [ -f "$file" ]; then
-        cp "$file" "${file}.bak.$(date +%Y%m%d%H%M%S)"
+        stamp="$(date +%Y%m%d%H%M%S)"
+        target="${file}.bak.${stamp}"
+        # 同一秒内可能多次备份同一文件（如先改快捷键再禁插件的同一轮安装），
+        # 后一次不能覆盖前一次：最早的原始备份必须留得住，碰撞时追加 .1/.2… 唯一后缀。
+        n=0
+        while [ -e "$target" ]; do
+            n=$((n + 1))
+            target="${file}.bak.${stamp}.${n}"
+        done
+        cp "$file" "$target"
         echo "已备份: $file"
     fi
 }
@@ -66,7 +78,8 @@ usage() {
 注意:
   不要用 sudo 运行本脚本。直接运行 ./install.sh 即可，脚本会在需要时调用 sudo。
 
-  本脚本是幂等的重置工具: 重跑会把输入法列表与快捷键重新写回基准状态，
+  本脚本是幂等的重置工具: 重跑会把输入法列表、快捷键与简繁转换状态重新写回
+  基准状态（简繁转换插件保持禁用，拼音固定简体），
   旧文件先备份为 <文件名>.bak.<时间戳>。
   只想调快捷键而不重置时，用 fcitx5-configtool 图形界面改。
 EOF
@@ -525,6 +538,401 @@ verify_hotkey_config() {
     fi
 }
 
+# ============================================
+# 简繁转换（chttrans）治理
+# ============================================
+#
+# 机制（fcitx5 5.1.7 源码直读证实）:
+#   - chttrans 的热键处理、状态栏「简/繁」入口、输出转换过滤器全部随插件实例
+#     构造注册；插件不加载，这些入口就全部不存在。
+#   - GUI（fcitx5-configtool）禁用插件的实际落盘动作是往 ~/.config/fcitx5/config
+#     里 GlobalConfig 的 Behavior 子配置隐藏选项 DisabledAddons 列表加一项，
+#     启动时由 Instance 把它交给 AddonManager 跳过加载。该列表挂在
+#     BehaviorConfig 下，非空时的确切持久化形态是 [Behavior/DisabledAddons]
+#     子节加 0=…、1=… 数字项；空列表则是 [Behavior] 节里的 DisabledAddons=
+#     叶子行。根级 [DisabledAddons] 节不属于任何选项路径，写了也不会被读。
+#   - ~/.config/fcitx5/addon/<name>.conf 在 5.1.7 没有读取点（插件定义只从
+#     PkgData 即 /usr/share/fcitx5/addon 与 ~/.local/share/fcitx5/addon 读），
+#     写那个路径是无效操作。
+#   - pinyin 对 chttrans 只是可选依赖，禁用 chttrans 不影响拼音。
+#
+# 只读检测: 按 fcitx5 的真实加载语义判断 chttrans 是否在 DisabledAddons 里。
+# readFromIni 会把重复的 [Behavior/DisabledAddons] 节合并到同一 RawConfig 节点，
+# 同一数字索引后写覆盖先写（get+setValue）；vector 反序列化按 0,1,2… 连续
+# 读取，遇索引缺口即止。因此不能只 grep 文本: 「某节里有 chttrans」不等于
+# 「加载结果里有 chttrans」。
+chttrans_in_disabled_addons() {
+    local file="$1"
+
+    [ -f "$file" ] || return 1
+
+    awk -v addon="$CHTTRANS_ADDON_NAME" '
+        BEGIN { maxidx = -1 }
+        {
+            t = $0
+            sub(/\r$/, "", t)
+            sub(/^[[:space:]]+/, "", t)
+            sub(/[[:space:]]+$/, "", t)
+            if (substr(t, 1, 1) == "[" && substr(t, length(t), 1) == "]") {
+                in_da = (t == "[Behavior/DisabledAddons]")
+            } else if (in_da && t ~ /^[0-9]+=/) {
+                idx = t
+                sub(/=.*/, "", idx)
+                val = t
+                sub(/^[^=]*=/, "", val)
+                eff[idx + 0] = val        # 同索引后写覆盖先写
+                if (idx + 0 > maxidx) maxidx = idx + 0
+            }
+        }
+        END {
+            for (i = 0; i <= maxidx; i++) {
+                if (!(i in eff)) break    # 遇索引缺口即止，与 vector 读取一致
+                if (eff[i] == addon) { found = 1; break }
+            }
+            exit found ? 0 : 1
+        }
+    ' "$file"
+}
+
+# 往 ~/.config/fcitx5/config 的 [Behavior/DisabledAddons] 加入 chttrans（与 GUI
+# 禁用插件产生的磁盘状态一致）。幂等: 已是规范形态时不写文件；变化时先备份
+# 再同目录原子替换。
+#
+# 必须处理重复节与重复索引: readFromIni 把重复的 [Behavior/DisabledAddons]
+# 折叠到同一节点，同索引后写覆盖先写；只往第一个节追加、或因“文本里已有
+# chttrans”而早退，都可能让后续重复节的同索引项在加载时把 chttrans 顶掉。
+# 因此这里没有早退，总是执行两遍规范化:
+#   1) 按加载语义收集所有重复节的数字项（同索引后写覆盖），按索引升序
+#      去重取值，空值丢弃，缺 chttrans 则补在末尾;
+#   2) 重写为唯一一个 [Behavior/DisabledAddons] 节（首个节的位置），
+#      条目重编号为连续的 0..n，原重复节全部删除。
+# 同时删掉 [Behavior] 里的 DisabledAddons= 叶子行（空列表的持久化形态，
+# 含值形态加载时本就被 vector 忽略），避免同一路径叶子与子节并存。
+# 保留 Behavior 其它键、注释与未知节键。目标节内的非数字未知子键随节
+# 重写一并丢弃（加载时本就忽略）。
+disable_chttrans_addon() {
+    local tmp had_content entries
+
+    mkdir -p "$FCITX5_CONFIG_DIR"
+    [ -f "$FCITX5_CONFIG" ] || : > "$FCITX5_CONFIG"
+    [ -s "$FCITX5_CONFIG" ] && had_content=true || had_content=false
+
+    # 第一遍: 计算加载语义下的目标列表（同索引后写覆盖，索引升序去重，含 chttrans）
+    entries="$(
+        awk -v addon="$CHTTRANS_ADDON_NAME" '
+            BEGIN { maxidx = -1 }
+            {
+                t = $0
+                sub(/\r$/, "", t)
+                sub(/^[[:space:]]+/, "", t)
+                sub(/[[:space:]]+$/, "", t)
+                if (substr(t, 1, 1) == "[" && substr(t, length(t), 1) == "]") {
+                    in_da = (t == "[Behavior/DisabledAddons]")
+                } else if (in_da && t ~ /^[0-9]+=/) {
+                    idx = t
+                    sub(/=.*/, "", idx)
+                    val = t
+                    sub(/^[^=]*=/, "", val)
+                    eff[idx + 0] = val
+                    if (idx + 0 > maxidx) maxidx = idx + 0
+                }
+            }
+            END {
+                n = 0
+                for (i = 0; i <= maxidx; i++) {
+                    if (i in eff) {
+                        v = eff[i]
+                        if (v != "" && !(v in seen)) {
+                            seen[v] = 1
+                            out[n++] = v
+                        }
+                    }
+                }
+                if (!(addon in seen)) {
+                    out[n++] = addon
+                }
+                for (j = 0; j < n; j++) print out[j]
+            }
+        ' "$FCITX5_CONFIG"
+    )"
+
+    tmp="$(mktemp "$FCITX5_CONFIG.tmp.XXXXXX")"
+
+    # 第二遍: 折叠重写。首个 [Behavior/DisabledAddons] 节头保留在原位，
+    # 内容换成重编号列表；后续重复节整节删除；[Behavior] 内叶子行删除。
+    awk -v entries="$entries" '
+        BEGIN { n = split(entries, item, "\n") }
+        {
+            t = $0
+            sub(/\r$/, "", t)
+            sub(/^[[:space:]]+/, "", t)
+            sub(/[[:space:]]+$/, "", t)
+            if (substr(t, 1, 1) == "[" && substr(t, length(t), 1) == "]") {
+                if (t == "[Behavior/DisabledAddons]") {
+                    if (!saw_da) {
+                        saw_da = 1
+                        print
+                        for (k = 0; k < n; k++) {
+                            printf "%d=%s\n", k, item[k + 1]
+                        }
+                    }
+                    in_da = 1
+                } else {
+                    in_da = 0
+                    print
+                }
+                in_behavior = (t == "[Behavior]")
+                next
+            }
+            if (in_da) {
+                next
+            }
+            if (in_behavior && t ~ /^DisabledAddons=/) {
+                next
+            }
+            print
+        }
+        END {
+            if (!saw_da) {
+                if (NR > 0) {
+                    print ""
+                }
+                # 不需要先建 [Behavior] 节头: ini 读取器遇到
+                # [Behavior/DisabledAddons] 会自动创建整条路径节点
+                print "[Behavior/DisabledAddons]"
+                for (k = 0; k < n; k++) {
+                    printf "%d=%s\n", k, item[k + 1]
+                }
+            }
+        }
+    ' "$FCITX5_CONFIG" > "$tmp"
+
+    if [ ! -s "$tmp" ] && [ "$had_content" = true ]; then
+        rm -f "$tmp"
+        echo "错误: 生成简繁转换插件禁用配置失败，原文件未改动" >&2
+        return 1
+    fi
+
+    if cmp -s "$tmp" "$FCITX5_CONFIG"; then
+        rm -f "$tmp"
+        return 0
+    fi
+
+    if [ "$had_content" = true ]; then
+        backup_file "$FCITX5_CONFIG"
+    fi
+    chmod --reference="$FCITX5_CONFIG" "$tmp" 2>/dev/null || true
+    mv -f "$tmp" "$FCITX5_CONFIG"
+}
+
+# conf/chttrans.conf 防御性清理: 即便将来手动重新启用 chttrans 插件，也不会
+# 带着旧繁体状态（EnabledIM）和简繁切换键（Hotkey）回来。
+#
+# 为什么不能只删条目: fcitx5 的 Configuration::load 对文件里缺失的选项一律
+# reset 到默认值，而 Hotkey 的默认值就是 Control+Shift+F。
+#
+# 空键表的目标形态必须是顶层 Hotkey= 叶子行，而不是裸 [Hotkey] 节:
+# fcitx5 的 writeAsIni 只给有子项的节点输出节头，无子节点一律输出 name=value
+# 叶子行，safeSaveAsIni 对空 KeyList 落盘的就是顶层 Hotkey=（与 live 文件里
+# 空 EnabledIM= 同一形态）。若这里规范成裸 [Hotkey] 节，将来任何一次 fcitx5
+# 自动保存都会改回叶子形态，导致每次重跑都“变更→备份”的漂移循环。两种
+# 形态加载时都得到空键表（读入器对裸节头也会建节点），但只有叶子是双方
+# 共同的稳定不动点。非空 EnabledIM/Hotkey 的持久化形态是 [节名] 下 0=… 数字列表。
+neutralize_chttrans_conf() {
+    local tmp had_content
+
+    mkdir -p "$(dirname "$FCITX5_CHTTRANS_CONF")"
+    [ -f "$FCITX5_CHTTRANS_CONF" ] || : > "$FCITX5_CHTTRANS_CONF"
+    [ -s "$FCITX5_CHTTRANS_CONF" ] && had_content=true || had_content=false
+
+    tmp="$(mktemp "$FCITX5_CHTTRANS_CONF.tmp.XXXXXX")"
+
+    # 变换规则（未列出的行原样保留，含注释/空行/未知节键与 CRLF）:
+    #   顶层第一条 EnabledIM=… / Hotkey=… 就地规范为空值叶子，重复键丢弃
+    #   [EnabledIM] / [Hotkey] 节整节删除（含节内全部条目）
+    #   缺顶层 EnabledIM= / Hotkey= 时在首个节头前（或文件末尾）补齐
+    # 目标固定形态 = 恰好一条顶层 EnabledIM= + 恰好一条顶层 Hotkey=，均为空值
+    awk '
+        {
+            t = $0
+            sub(/\r$/, "", t)
+            sub(/^[[:space:]]+/, "", t)
+            sub(/[[:space:]]+$/, "", t)
+            if (substr(t, 1, 1) == "[" && substr(t, length(t), 1) == "]") {
+                if (!top_e) {
+                    print "EnabledIM="
+                    top_e = 1
+                }
+                if (!top_h) {
+                    print "Hotkey="
+                    top_h = 1
+                }
+                if (t == "[Hotkey]" || t == "[EnabledIM]") {
+                    cur = "drop"
+                } else {
+                    cur = "other"
+                    print
+                }
+                next
+            }
+            if (cur == "drop") {
+                next
+            }
+            if (cur == "") {
+                if (t ~ /^EnabledIM=/) {
+                    if (!top_e) {
+                        print "EnabledIM="
+                        top_e = 1
+                    }
+                } else if (t ~ /^Hotkey=/) {
+                    if (!top_h) {
+                        print "Hotkey="
+                        top_h = 1
+                    }
+                } else {
+                    print
+                }
+                next
+            }
+            print
+        }
+        END {
+            if (!top_e) {
+                print "EnabledIM="
+            }
+            if (!top_h) {
+                print "Hotkey="
+            }
+        }
+    ' "$FCITX5_CHTTRANS_CONF" > "$tmp"
+
+    if [ ! -s "$tmp" ] && [ "$had_content" = true ]; then
+        rm -f "$tmp"
+        echo "错误: 生成简繁转换配置清理结果失败，原文件未改动" >&2
+        return 1
+    fi
+
+    if cmp -s "$tmp" "$FCITX5_CHTTRANS_CONF"; then
+        rm -f "$tmp"
+        return 0
+    fi
+
+    if [ "$had_content" = true ]; then
+        backup_file "$FCITX5_CHTTRANS_CONF"
+    fi
+    chmod --reference="$FCITX5_CHTTRANS_CONF" "$tmp" 2>/dev/null || true
+    mv -f "$tmp" "$FCITX5_CHTTRANS_CONF"
+}
+
+# 精确回读校验: 磁盘上的实际状态必须是「插件已禁用 + EnabledIM 空 + 无任何
+# 简繁切换键」。与写入共用同一套 ini 判定，任一项漂移都报错退出。
+# 空键表的规范形态是顶层 Hotkey= 叶子（fcitx5 safeSaveAsIni 对空 KeyList
+# 的落盘形态，与空 EnabledIM= 同源）；[EnabledIM]/[Hotkey] 节一律算残留。
+verify_chttrans_neutralized() {
+    local failed=false
+    local e_top_n e_top_v e_hdr e_res h_top_n h_top_v h_hdr h_res
+    local conf_top conf_sections
+
+    if chttrans_in_disabled_addons "$FCITX5_CONFIG"; then
+        echo "OK: 简繁转换插件 chttrans 已禁用（状态栏简繁入口与热键处理一并移除）"
+    else
+        echo "错误: 简繁转换插件未禁用: $FCITX5_CONFIG 的 [Behavior/DisabledAddons] 缺少 $CHTTRANS_ADDON_NAME"
+        echo "      （DisabledAddons 属于 GlobalConfig 的 Behavior 子配置，根级 [DisabledAddons] 节不会被读）"
+        failed=true
+    fi
+
+    if [ ! -f "$FCITX5_CHTTRANS_CONF" ]; then
+        echo "错误: 缺少 $FCITX5_CHTTRANS_CONF"
+        failed=true
+    else
+        # 顶层区（首个节头之前）: EnabledIM= 与 Hotkey= 必须各恰好一条且值为空
+        readarray -t conf_top < <(
+            awk '
+                BEGIN { en = 0; ev = "<missing>"; hn = 0; hv = "<missing>" }
+                {
+                    t = $0
+                    sub(/\r$/, "", t)
+                    sub(/^[[:space:]]+/, "", t)
+                    sub(/[[:space:]]+$/, "", t)
+                    if (substr(t, 1, 1) == "[" && substr(t, length(t), 1) == "]") {
+                        in_top = 1
+                    } else if (!in_top) {
+                        if (t ~ /^EnabledIM=/) {
+                            en++
+                            ev = substr(t, 11)
+                        } else if (t ~ /^Hotkey=/) {
+                            hn++
+                            hv = substr(t, 8)
+                        }
+                    }
+                }
+                END { print en; print ev; print hn; print hv }
+            ' "$FCITX5_CHTTRANS_CONF"
+        )
+        e_top_n="${conf_top[0]:-0}"
+        e_top_v="${conf_top[1]-<missing>}"
+        h_top_n="${conf_top[2]:-0}"
+        h_top_v="${conf_top[3]-<missing>}"
+
+        # [EnabledIM] / [Hotkey] 节必须不复存在（节头本身或节内任何非空行都算残留）
+        readarray -t conf_sections < <(
+            awk '
+                BEGIN { eh = 0; er = 0; hh = 0; hr = 0 }
+                {
+                    t = $0
+                    sub(/\r$/, "", t)
+                    sub(/^[[:space:]]+/, "", t)
+                    sub(/[[:space:]]+$/, "", t)
+                    if (substr(t, 1, 1) == "[" && substr(t, length(t), 1) == "]") {
+                        if (t == "[EnabledIM]") {
+                            cur = "e"
+                            eh++
+                        } else if (t == "[Hotkey]") {
+                            cur = "h"
+                            hh++
+                        } else {
+                            cur = ""
+                        }
+                    } else if (cur == "e" && t != "") {
+                        er++
+                    } else if (cur == "h" && t != "") {
+                        hr++
+                    }
+                }
+                END { print eh; print er; print hh; print hr }
+            ' "$FCITX5_CHTTRANS_CONF"
+        )
+        e_hdr="${conf_sections[0]:-0}"
+        e_res="${conf_sections[1]:-0}"
+        h_hdr="${conf_sections[2]:-0}"
+        h_res="${conf_sections[3]:-0}"
+
+        if [ "$e_top_n" = "1" ] && [ -z "$e_top_v" ] && [ "$e_hdr" = "0" ] && [ "$e_res" = "0" ]; then
+            echo "OK: 简繁转换状态已清空 (顶层 EnabledIM= 为空，无 [EnabledIM] 残留)"
+        else
+            echo "错误: EnabledIM 未清空: 顶层出现 ${e_top_n} 条（值: ${e_top_v}），[EnabledIM] 节头 ${e_hdr} 个、残留 ${e_res} 行"
+            failed=true
+        fi
+
+        if [ "$h_top_n" = "1" ] && [ -z "$h_top_v" ] && [ "$h_hdr" = "0" ] && [ "$h_res" = "0" ]; then
+            echo "OK: 简繁切换快捷键已清空 (顶层 Hotkey= 为空，fcitx5 空键表的规范落盘形态)"
+        else
+            echo "错误: 简繁切换快捷键未清空: 顶层 Hotkey= ${h_top_n} 条（值: ${h_top_v}），[Hotkey] 节头 ${h_hdr} 个、残留 ${h_res} 行"
+            echo "      （空键表必须用顶层 Hotkey= 叶子显式标记；标记缺失时 fcitx5 会回退默认 Control+Shift+F）"
+            failed=true
+        fi
+    fi
+
+    if [ "$failed" = true ]; then
+        echo
+        echo "简繁转换未收敛到目标状态。若 Fcitx5 在写入期间仍在运行，它退出时可能"
+        echo "用内存配置覆盖了写入，请完全退出 Fcitx5 后重新运行本脚本。"
+        exit 1
+    fi
+
+    echo "OK: 简繁转换快捷键已禁用，拼音固定简体"
+}
+
 verify_installation() {
     local failed=false
     local gnome_sources
@@ -824,6 +1232,14 @@ echo "已添加拼音输入法到配置"
 write_hotkey_config
 echo "已写入快捷键配置（左 Shift 循环切换；临时切换无快捷键）"
 
+# 简繁转换：禁用 chttrans 插件本身（状态栏简繁入口、热键处理、转换过滤器
+# 全部随插件消失），并防御性清空 conf/chttrans.conf 里已保存的 EnabledIM 与
+# Hotkey —— 将来手动重新启用插件时也不会带回旧繁体状态和 Ctrl+Shift+F。
+disable_chttrans_addon
+echo "已禁用简繁转换插件 ($CHTTRANS_ADDON_NAME)"
+neutralize_chttrans_conf
+echo "已清空简繁转换状态与快捷键 (EnabledIM 空、Hotkey 空键表)"
+
 # 登录自启动与当前会话是两条独立路径：im-config 的登录钩子可能随桌面
 # 会话集成变化；XDG autostart 让已完成安装的用户在下次登录时始终启动 fcitx5。
 # 内容无变化时函数不写文件、不生成备份，因此重跑不会积累副作用。
@@ -836,6 +1252,7 @@ echo
 
 verify_hotkey_config
 verify_fcitx5_autostart
+verify_chttrans_neutralized
 echo
 
 verify_installation
@@ -844,17 +1261,8 @@ verify_installation
 # 完成提示
 # ============================================
 #
-# 下方提示文本保持原样。其中第 4 条描述的是 fcitx5 的出厂默认快捷键：
-#     Ctrl+Space  按列表顺序循环切换输入法
-#     Left Shift  临时切换到第一个输入法
-#
-# 本脚本的步骤 5 会把它们改成：
-#     Ctrl+Space  不变，仍为按列表顺序循环切换
-#     Left Shift  改为按列表顺序循环切换（EnumerateForwardKeys=Shift+Shift_L）
-#     「临时切换到第一个输入法」取消快捷键（AltTriggerKeys 置空）
-#
-# 即安装完成后左 Shift 与 Ctrl+Space 等效，都是循环切换。
-# 实际写入值由 verify_hotkey_config 回读磁盘校验，不一致会报错。
+# 基线已由脚本自动写入并经回读校验，无需首次手动到 fcitx5-configtool
+# 里添加输入法或纠正快捷键。
 # ============================================
 echo "========================================"
 echo "  安装完成"
@@ -872,53 +1280,19 @@ else
     echo "     手动操作或者使用命令: gnome-session-quit --logout --no-prompt"
 fi
 echo
-echo "首次配置 (必须):"
-echo "  1. 运行: fcitx5-configtool (若该命令不存在，运行: fcitx5-config-qt)"
-echo "  2. 在 Input Method 标签页中:"
-echo "     - 右侧 Available Input Method 找到 'Pinyin'"
-echo "     - 双击 'Pinyin' 添加拼音输入法"
-echo "     - 添加 'Keyboard - English (US)' 英文键盘"
-echo "     - 调整顺序 (推荐):"
-echo "       * Pinyin 在第一位 (默认中文输入)"
-echo "       * English 在第二位"
-echo "     - 点击 'Apply' 保存"
-echo "  3. 删除多余的 Group (如果有 Group 2):"
-echo "     - 在 Group 下拉菜单中选择要删除的 Group"
-echo "     - 点击下拉菜单右侧的 '-' 按钮"
-echo "     - 点击 'Apply' 保存"
-echo "  4. fcitx5 默认快捷键:"
-echo "     - Ctrl+Space: 按列表顺序循环切换输入法"
-echo "     - Left Shift: 临时切换到第一个输入法"
+echo "最终基线（已自动写入，无需首次手动配置）："
+echo "  - 输入法列表: profile 已自动写为 keyboard-us + pinyin，无需手动添加"
+echo "  - 中英文切换: 左 Shift 或 Ctrl+Space（等效，均按列表顺序循环切换）"
+echo "  - 起手状态: 新窗口默认激活拼音 (ActiveByDefault=$BEHAVIOR_ACTIVE_BY_DEFAULT)"
+echo "  - 简繁转换: 插件已禁用、转换状态为空（拼音固定简体）"
+echo "  - 简繁快捷键: Ctrl+Shift+F 已清空，简繁之间无任何快捷键"
 echo
-echo "导入词库 (可选):"
+echo "导入词库 (可选）："
 echo "  运行: $(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/import-dict.sh"
 echo
 echo "清理提示:"
 echo "  本脚本不会自动执行 apt autoremove。确认系统无异常后，可手动运行:"
 echo "  sudo apt autoremove"
-echo
-
-# 上方提示文本保持原样，其中第 4 条描述的是 fcitx5 的出厂默认值。
-# 本脚本已经把它改掉了，所以必须在后面说清楚 —— 否则用户会按上面
-# 那句去理解左 Shift，而实际行为已经不同。
-echo "========================================"
-echo "  快捷键已被本脚本修改"
-echo "========================================"
-echo
-echo "上方第 4 条列的是 fcitx5 出厂默认值，本脚本已将其改为:"
-echo
-echo "  Ctrl+Space  不变，仍为按列表顺序循环切换输入法"
-echo "  Left Shift  已改为按列表顺序循环切换输入法"
-echo "              (EnumerateForwardKeys=$HOTKEY_ENUMERATE_FORWARD)"
-echo "  「临时切换到第一个输入法」已取消快捷键 (AltTriggerKeys 置空)"
-echo "  起手即拼音直通，无需先按切换键 (ActiveByDefault=$BEHAVIOR_ACTIVE_BY_DEFAULT)"
-echo
-echo "即左 Shift 与 Ctrl+Space 现在等效，都是循环切换。"
-echo "上面第 4 条里“Left Shift: 临时切换到第一个输入法”已不再适用。"
-echo "实际写入值已由上方安装后检查回读磁盘校验。"
-echo
-echo "配置文件: $FCITX5_CONFIG"
-echo "如需微调或恢复默认: fcitx5-configtool 的 Global Options → Hotkey"
 echo
 
 # 输入法列表的两个状态很容易被误解，且重跑即重置的语义必须说清楚。
@@ -937,6 +1311,7 @@ echo "  fcitx5-remote      输出 0=关闭 1=未激活 2=已激活"
 echo "  fcitx5-remote -n   输出该状态下实际使用的输入法"
 echo "若 fcitx5-remote 返回 1 而 -n 返回 pinyin，说明两个状态被调反了。"
 echo
-echo "重跑本脚本 = 重置输入法。profile 与快捷键都会被无条件写回上述基准状态，"
-echo "旧文件先备份为 <文件名>.bak.<时间戳>。只想微调而不重置时用 fcitx5-configtool。"
+echo "重跑本脚本 = 重置输入法。profile、快捷键与简繁转换状态都会被写回上述基准"
+echo "状态（简繁转换插件保持禁用），旧文件先备份为 <文件名>.bak.<时间戳>。"
+echo "只想微调而不重置时用 fcitx5-configtool。"
 echo
