@@ -7,7 +7,7 @@ import { fileURLToPath } from "node:url";
 import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { HEARTBEAT_MS, LEASE_TTL_MS, acquireAnimatorLock, aggregateLogicalState, leasePath, projectAsyncStatus, publishLease, readLease, releaseAnimatorLock, seedAttentionWatermarksFromSnapshot, windowLeaseStates } from "../state.mjs";
 import { animatorSpawnNeeded, childFromStartedPayload, childStillRunning, classifyModelUnavailable, defaultAsyncRoot, isRetryExhaustedAbort, mergedChildSnapshot, monitorNeeded, nestedProjectionFromChildren, nestedPublisherDisabled, nextLastAssistantErrorMatched, nextModelErrorState, readNestedRegistryProjection, restoredChildren, sessionIdOf, validateNestedRoute } from "../index.ts";
-import { ERROR_BG, ERROR_FG, ERROR_MS, FRAME_BLUE, FRAME_COUNT, FRAME_MS, FRAMES, GRAY_RANGE, PERIOD_MS, activeWindows, frameAt, isDirectExecution, leaseWindowStates, listClients, runAnimator, sweepWindows, windowOptionArgs } from "../animator.mjs";
+import { ERROR_BG, ERROR_FG, ERROR_MS, FRAME_BLUE, FRAME_COUNT, FRAME_MS, FRAMES, GRAY_RANGE, MAX_CONSECUTIVE_FAILURES, PERIOD_MS, activeWindows, frameAt, isDirectExecution, leaseWindowStates, listClients, runAnimator, sweepWindows, windowOptionArgs } from "../animator.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT = resolve(HERE, "../../../..");
@@ -382,11 +382,11 @@ test("nested registry projection treats rejected descendant as terminal and clea
 
 test("process-owned animator lock uses atomic hard-link, cleans up temp, and rejects concurrent claims", () => {
   const d = temp(), lock = join(d, "animator.lock");
-  const held = acquireAnimatorLock(lock, "live", 111);
+  const held = acquireAnimatorLock(lock, "live", process.pid);
   assert.ok(held.owner);
   const live = JSON.parse(readFileSync(lock));
   assert.equal(live.token, "live", "real lock file is complete JSON");
-  assert.equal(live.pid, 111);
+  assert.equal(live.pid, process.pid, "lock records the claiming pid; using the test process pid keeps the liveness check deterministic (an arbitrary pid like 111 may not exist on the host)");
   const dirEntries = readdirSync(d);
   assert.equal(dirEntries.includes("animator.lock"), true, "lock file is published");
   assert.equal(dirEntries.some((entry) => entry.endsWith(".tmp")), false, "no temp hard-link is left in the directory after successful claim");
@@ -421,6 +421,36 @@ test("process-owned animator lock uses atomic hard-link, cleans up temp, and rej
   assert.ok(winner.owner, "real subsequent claim wins after the racing EEXIST injection");
   assert.equal(readdirSync(eexDir).some((entry) => entry.endsWith(".tmp")), false, "no temp hard-link left after successful real claim");
   releaseAnimatorLock(eexLock, "winner");
+});
+
+test("animator gives up after consecutive failed frames and releases the lock", () => {
+  const runtime = temp(), env = { QUICK_DEPLOY_PI_TMUX_WINDOW_STATUS_RUNTIME: runtime }, i = ident("/tmp/socket"), root = join(runtime, "quick-deploy", "pi-tmux-status", Buffer.from(i.socketPath).toString("base64url"));
+  publishLease(i, "a", "active", 100, env);
+  const exec = () => { const e = new Error("no server running"); e.status = 1; throw e; };
+  const delays = [];
+  const a = runAnimator({ socketPath: i.socketPath, root, now: () => 0, wallNow: () => 100, intervalMs: FRAME_MS, errorIntervalMs: ERROR_MS, exec, schedule: (_fn, delay) => { delays.push(delay); return { unref() {} }; }, cancel: () => {} });
+  assert.ok(a.started);
+  assert.equal(acquireAnimatorLock(join(root, "animator.lock")).owner, false, "lock is held while retrying");
+  assert.equal(delays.at(-1), ERROR_MS, "failed frame retries at the slow reconciliation cadence");
+  for (let n = 1; n < MAX_CONSECUTIVE_FAILURES; n++) a.tick();
+  assert.equal(existsSync(join(root, "animator.lock")), false, "lock file is removed after MAX_CONSECUTIVE_FAILURES failed frames");
+  const recovered = runAnimator({ socketPath: i.socketPath, root, now: () => 0, wallNow: () => 100, intervalMs: FRAME_MS, errorIntervalMs: ERROR_MS, exec, schedule: (_fn, delay) => { delays.push(delay); return { unref() {} }; }, cancel: () => {} });
+  assert.ok(recovered.started, "a fresh animator can acquire the lock and retry right away");
+});
+
+test("animator counts only consecutive failures: one success resets the give-up counter", () => {
+  const runtime = temp(), env = { QUICK_DEPLOY_PI_TMUX_WINDOW_STATUS_RUNTIME: runtime }, i = ident("/tmp/socket"), root = join(runtime, "quick-deploy", "pi-tmux-status", Buffer.from(i.socketPath).toString("base64url"));
+  publishLease(i, "a", "active", 100, env);
+  let failing = true;
+  const exec = () => { if (failing) { const e = new Error("no server running"); e.status = 1; throw e; } return ""; };
+  const a = runAnimator({ socketPath: i.socketPath, root, now: () => 0, wallNow: () => 100, intervalMs: FRAME_MS, errorIntervalMs: ERROR_MS, exec, schedule: () => ({ unref() {} }), cancel: () => {} });
+  assert.ok(a.started);
+  failing = false; a.tick();
+  failing = true;
+  for (let n = 0; n < MAX_CONSECUTIVE_FAILURES - 1; n++) a.tick();
+  assert.equal(existsSync(join(root, "animator.lock")), true, "a success between failures resets the counter");
+  a.tick();
+  assert.equal(existsSync(join(root, "animator.lock")), false, "the give-up threshold applies to consecutive failures only");
 });
 
 test("animator batches active/error transitions, cadences, resets, and cached clients", () => {

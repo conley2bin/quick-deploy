@@ -35,6 +35,7 @@ gpakosz/.tmux 的两个固定查找路径都以符号链接落盘，目标一个
 上游明确要求**不要改主配置** `~/.tmux/.tmux.conf`（改了 `git pull` 会冲突），一切定制写在 `.tmux.conf.local` 里。本模块把这个入口符号链接到仓库文件（见上节链接表），因此：
 
 - 单一事实源：改 `~/.tmux.conf.local` 就是改仓库文件（`<前缀> e` 打开的也是它），改完 `<前缀> r` 生效、`git commit` 入库。
+- 注意：gpakosz 每次加载配置都会用 `cut -c3- "$TMUX_CONF_LOCAL" | sh -s printf probe` 探测本文件是否旧式脚本格式——注释行剥掉前两个字符（`# `）后会**被 shell 真实执行**，因此注释里不要写 `> < ; | & $() 反引号` 等元字符（历史上的 `（CSI > 4 ; 2 m）` 曾在服务器工作目录生成空文件 `4`）；需要表达时用全角 `＞ ；` 代替。
 - 多机同步只拉不装：别的机器 `git pull` 本仓库即生效，无需重跑 install.sh。
 - 基线只记真实改动（目前是鼠标模式、精简状态栏、左侧 session 与右侧时间同样式、未选中 window 使用灰色块、取消 `Ctrl+a` 第二前缀、`Ctrl+Alt+←/→` 切换 window、`Ctrl+Alt+=/+` 新建 window）；全部可用选项查上游模板 `~/.tmux/.tmux.conf.local`。该文件本质是 tmux 配置片段，可直接写 `set -g ...`；若某行被主配置覆盖，按上游说明在行尾加 `#!important`。
 
@@ -53,6 +54,10 @@ gpakosz/.tmux 的两个固定查找路径都以符号链接落盘，目标一个
 ## Pi 扩展自动发现
 
 Pi 只在启动时扫描 `~/.pi/agent/extensions/` 下的目录，不会扫描本仓库——仓库里的 `pi-agent/extensions/pi-tmux-window-status` 必须通过上面的受管符号链接暴露到 `~/.pi/agent/extensions/` 才会被加载。安装/更新扩展后需要**重启 Pi 或执行 `/reload`** 才生效；tmux 只须 `<前缀> r` 重载样式。
+
+注意：conley 的 pi-agent fork（`github.com:conley2bin/pi-agent` 分支 `conley`）自 2026-08-27 起**把 `extensions/pi-tmux-window-status` 作为符号链接纳入 git 追踪**（目标文本与本模块安装器创建的一致）。因此 `~/.pi/agent` 里 `git pull` 首次遇到该路径时会报 “untracked working tree file would be overwritten by merge”——这是追踪文件与安装器创建的未追踪链接同名所致，一次性解决：确认链接内容后 `rm ~/.pi/agent/extensions/pi-tmux-window-status`（或先备份），完成 `git pull`，再重跑本模块 `install.sh` 重建链接。此后上游追踪的链接与安装器目标文本一致，`git pull` 与重跑安装都保持干净；仓库搬迁后照旧重跑 install.sh。
+
+呼吸动画的自愈语义：animator 每帧失败会按 1s 慢速重试；若**连续 10 帧失败**（tmux 服务不可达、lease 窗口已被关闭等），animator 会打印 giving up、清理残留选项、释放 animator.lock 并退出——不再无限重试死守锁。扩展在每个心跳周期（2s）重新派生 animator，故障消除后（如 tmux 服务恢复）新 animator 自动接管并恢复呼吸，无需手动杀进程。
 
 ## 使用要点
 

@@ -9,8 +9,8 @@ set -g mouse on
 
 # Ghostty 与 tmux 的扩展键：真正依赖 extended-keys 的是 C-M-= / C-M-+
 # （没有传统编码的按键）。tmux ≥3.5 只有在终端具备 extkeys 特性时才会
-# 真正向终端发出请求（CSI > 4 ; 2 m），Ghostty 收到请求后才会发送
-# ghostty/install.sh 里写死的 csi:61;7u / csi:43;7u。本机 xterm-ghostty 的
+# 真正向终端发出请求（CSI ＞ 4 ； 2 m），Ghostty 收到请求后才会发送
+# ghostty/install.sh 里写死的 csi:61；7u / csi:43；7u。本机 xterm-ghostty 的
 # terminfo 没有 Eneks 能力，tmux 的默认表也不含 Ghostty —— 不加下一行，
 # extended-keys 设 on 还是 always 都不会发出请求，C-M-=/+ 失灵且 Ghostty
 # 一直提示 “tmux extended-keys is off”（与服务器从哪个终端启动无关）。
@@ -93,7 +93,7 @@ bind-key DC kill-window
 # Ghostty 默认把 ctrl+alt+arrow 绑给 goto_split；仅靠“无 split 时似乎会
 # 透传”的当前表现不够稳定。fresh-install/modules/ghostty/install.sh 因此显式
 # unbind 左右两个键，保证它们编码后送入 pty。
-# unbind 后 Ghostty 按传统编码（CSI 1;7D / 1;7C）发送这两个组合键，
+# unbind 后 Ghostty 按传统编码（CSI 1；7D / 1；7C）发送这两个组合键，
 # tmux 无需 extended-keys 也能识别为 C-M-Left/C-M-Right —— 与 C-M-=/+
 # 依赖 CSI-u 的路径不同。
 #
