@@ -7,6 +7,13 @@
 # 开启鼠标模式：点击切窗格、拖边框调大小、滚轮翻历史
 set -g mouse on
 
+# 状态栏 window 标签在左键释放时切换。释放事件代表一个完成的点击，并且
+# 不会像按下事件那样被二击或三击分类替换。只在释放时按鼠标目标切换，
+# 每个完整点击恰好执行一次。important 保证该语义在 Oh my tmux! 重建默认
+# 键位后仍然生效。
+unbind -T root MouseDown1Status #!important
+bind -T root MouseUp1Status select-window -t = #!important
+
 # Ghostty 与 tmux 的扩展键：真正依赖 extended-keys 的是 C-M-= / C-M-+
 # （没有传统编码的按键）。tmux ≥3.5 只有在终端具备 extkeys 特性时才会
 # 真正向终端发出请求（CSI ＞ 4 ； 2 m），Ghostty 收到请求后才会发送
@@ -77,10 +84,17 @@ bind -T copy-mode-vi WheelDownPane send-keys -X -N 1 scroll-down
 # 覆盖）的 copy-mode MouseDragEnd1Pane = copy-pipe-and-cancel，-cancel 在
 # 复制进缓冲区后立即退出 copy-mode，视图跳回 pane 实时位置（Pi 提示符），
 # 拖选前滚上去的位置全部丢失。改为复制后仅清除选区、留在 copy-mode：
-# 复制到的内容仍进 tmux 缓冲区，视图保持当前滚动位置；看完历史按 q / Esc
-# 再回底部。copy-mode-vi 表同样覆盖（mode-keys 切到 vi 时生效）。
+# 复制到的内容仍进 tmux 缓冲区，视图保持当前滚动位置；看完历史按 Esc
+# 返回底部，或直接按字母退出并把该字母送给 pane。copy-mode-vi 表同样覆盖
+# （mode-keys 切到 vi 时生效）。
 bind -T copy-mode    MouseDragEnd1Pane send-keys -X copy-selection-no-clear \; send-keys -X clear-selection
 bind -T copy-mode-vi MouseDragEnd1Pane send-keys -X copy-selection-no-clear \; send-keys -X clear-selection
+
+# 滚轮带入 copy-mode 后，直接按任意英文字母即可回到实时 pane，并把刚按下
+# 的字母原样送给 pane，不附加回车。小写与 Shift 大写分别绑定，emacs 和 vi
+# 两张 copy-mode 键表保持一致。run-shell 内的反斜杠用于让子 tmux 保存两步
+# 命令列表，不能缩减，否则第二步会在重载配置时执行。
+run-shell 'for table in copy-mode copy-mode-vi; do for key in a b c d e f g h i j k l m n o p q r s t u v w x y z A B C D E F G H I J K L M N O P Q R S T U V W X Y Z; do tmux bind-key -T "$table" "$key" send-keys -X cancel \\\; send-keys -l -- "$key"; done; done' #!important
 
 # Oh my tmux! 默认额外把 Ctrl+a 配成第二前缀；取消该绑定，只保留 Ctrl+b。
 set -gu prefix2

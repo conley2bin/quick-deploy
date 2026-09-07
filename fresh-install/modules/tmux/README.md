@@ -37,7 +37,7 @@ gpakosz/.tmux 的两个固定查找路径都以符号链接落盘，目标一个
 - 单一事实源：改 `~/.tmux.conf.local` 就是改仓库文件（`<前缀> e` 打开的也是它），改完 `<前缀> r` 生效、`git commit` 入库。
 - 注意：gpakosz 每次加载配置都会用 `cut -c3- "$TMUX_CONF_LOCAL" | sh -s printf probe` 探测本文件是否旧式脚本格式——注释行剥掉前两个字符（`# `）后会**被 shell 真实执行**，因此注释里不要写 `> < ; | & $() 反引号` 等元字符（历史上的 `（CSI > 4 ; 2 m）` 曾在服务器工作目录生成空文件 `4`）；需要表达时用全角 `＞ ；` 代替。
 - 多机同步只拉不装：别的机器 `git pull` 本仓库即生效，无需重跑 install.sh。
-- 基线只记真实改动（目前是鼠标模式、精简状态栏、左侧 session 与右侧时间同样式、未选中 window 使用灰色块、取消 `Ctrl+a` 第二前缀、`Ctrl+Alt+←/→` 切换 window、`Ctrl+Alt+=/+` 新建 window）；全部可用选项查上游模板 `~/.tmux/.tmux.conf.local`。该文件本质是 tmux 配置片段，可直接写 `set -g ...`；若某行被主配置覆盖，按上游说明在行尾加 `#!important`。
+- 基线只记真实改动（目前是鼠标模式、状态栏左键释放切换 window、copy-mode 字母键退出并原样输入、精简状态栏、左侧 session 与右侧时间同样式、未选中 window 使用灰色块、取消 `Ctrl+a` 第二前缀、`Ctrl+Alt+←/→` 切换 window、`Ctrl+Alt+=/+` 新建 window）；全部可用选项查上游模板 `~/.tmux/.tmux.conf.local`。该文件本质是 tmux 配置片段，可直接写 `set -g ...`；若某行被主配置覆盖，按上游说明在行尾加 `#!important`。
 
 ## 幂等语义
 
@@ -50,6 +50,14 @@ gpakosz/.tmux 的两个固定查找路径都以符号链接落盘，目标一个
 - 替换既有 `~/.tmux.conf` 或非仓库的 `~/.tmux` 目录前同样先备份。
 
 在 `setup.sh` 中本步骤为 tolerate：tmux 本体走 apt 很可靠，但配置仓库要从 GitHub 克隆，全新机器还没配代理时可能失败——只提示不中止，网络就绪后重跑本脚本即可。
+
+## 隔离回归测试
+
+```bash
+./tests/run.sh
+```
+
+测试使用独立 tmux socket 和临时目录，真实验证状态栏鼠标释放切换，以及 emacs、vi 两张 copy-mode 键表退出后向 pane 投递原字符；不会改动当前 tmux server。
 
 ## Pi 扩展自动发现
 
@@ -64,7 +72,7 @@ Pi 只在启动时扫描 `~/.pi/agent/extensions/` 下的目录，不会扫描�
 - 前缀键仅保留默认 `Ctrl+b`；Oh my tmux! 默认新增的第二前缀 `Ctrl+a` 已取消。
 - `<前缀> e` 打开 `.tmux.conf.local`，`<前缀> r` 重载配置。
 - 状态栏左侧只显示 session 名，并与右侧时间使用完全相同的浅灰字、深灰底样式；右侧移除电池信息。所有未选中的 window 空闲时为 `#bcbcbc` 灰白块、深色字；bell 状态保留黄色前景和 `!` 标记。last/activity 不改变背景或额外强调。选中不再用蓝色背景块，而是在色块左右末端各放两个整格实心的 `#0077aa` 蓝色竖条（`██`，各向内延伸 2 格；fg/bg 同设蓝，字体即使留缝隙也不漏底色）。选中与 error 走正交视觉通道：竖条 vs 背景，error 红底不再吞掉选中标识；两侧蓝色竖条永不呼吸、永不变色。Pi 根进程主回合或其 pi-subagents 0.56 异步子代理实际运行时，相应 window 以 24 帧、42ms/帧、约 24 FPS、1s 周期呼吸；选中与未选中呼吸同一条灰色路径 `#808080 ↔ #f5f5f5`（呼吸只发生在背景色块上），从空闲基线开始并用单调时间跳帧/回绕。等待用户或 `needs_attention` 是空闲。Pi 0.84.3 根助手出现模型/供应商不可用错误（配额/余额、认证、模型不存在、超时、传输、限流/过载、无部署、5xx 等）时优先显示稳定红底白字；abort、上下文溢出、policy/refusal、普通 400/schema 和 tool-result 错误不会触发。红色状态优先级高于呼吸，纯红窗口只用约 1s 慢速 reconciliation，不跑 42ms 动画；后续语义输出、成功 assistant 结束或切换模型会清除。模型错误且 agent 空闲时，扩展会在 250ms 防抖后自动发送 `continue`（用户输入或新一轮启动会取消），30s 至少间隔一次、单轮失败最多 10 次，正常对话后计数清零；达到上限后保持红色不再自动发送。异步 ownership 只在根 Pi 的私有 lease 中瞬态保存 parent session ID 与活动 run/node ID；错误 lease 只存 `state=error`，不记录原始 provider 文本、历史、prompt、cwd 或名称。深色边格仍分隔相邻标签。安装后需 **重启 Pi 或执行 `/reload`** 让扩展加载；tmux 只须 `<前缀> r` 重载样式。
-- `<前缀> m` 切换鼠标模式；普通 pane 中鼠标滚轮每格滚动 1 行；`<前缀> -` / `<前缀> _` 分屏；`<前缀> h/j/k/l` 在窗格间移动。应用主动开启 mouse reporting 时，滚轮仍交给应用自身处理。鼠标拖选复制后停留在 copy-mode、不跳回 pane 底部，按 `q`/`Esc` 返回实时提示符。
+- `<前缀> m` 切换鼠标模式；状态栏 window 标签在鼠标左键释放时切换，因此单击和快速连续点击都会落到释放位置对应的 window。普通 pane 中鼠标滚轮每格滚动 1 行；`<前缀> -` / `<前缀> _` 分屏；`<前缀> h/j/k/l` 在窗格间移动。应用主动开启 mouse reporting 时，滚轮仍交给应用自身处理。鼠标拖选复制后停留在 copy-mode、不跳回 pane 底部；按 `Esc` 只退出，按任意英文字母则退出并把该字母原样输入 pane，大小写保持不变且不会自动回车。
 - `Ctrl+Alt+←/→` **不需要前缀**，直接切换上一个/下一个 window（底部状态栏的标签）。
   绑定落在 root 表：`C-M-Left=previous-window`、`C-M-Right=next-window`。
   Ghostty 模块显式 unbind 这两个键，确保按键进入 pty；gpakosz 检测到
