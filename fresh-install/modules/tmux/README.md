@@ -10,7 +10,7 @@
 
 1. `apt install tmux git xclip wl-clipboard` —— 后两者是 gpakosz 配置“复制到系统剪贴板”功能在 Linux 下的依赖：X11 会话用 `xclip`，Wayland 会话用 `wl-copy`，两个都装以覆盖两种会话。
 2. 克隆 `https://github.com/gpakosz/.tmux` 到 `~/.tmux`（`--single-branch`）。
-3. 链接本仓库的 `tmux.conf.local` 和 Pi→tmux breathing status 扩展。
+3. 链接本仓库的 `tmux.conf.local`、Pi→tmux breathing status 扩展，以及 Pi suspend guard 扩展。
 
 ## 脚本创建的链接
 
@@ -21,6 +21,7 @@ gpakosz/.tmux 的两个固定查找路径都以符号链接落盘，目标一个
 | `~/.tmux.conf` | `~/.tmux/.tmux.conf` | 主配置入口（tmux 固定读取位置）；随重跑时的 `git pull` 自动更新 |
 | `~/.tmux.conf.local` | `fresh-install/modules/tmux/tmux.conf.local`（安装时本仓库的绝对路径） | 定制入口；改动即仓库改动 |
 | `~/.pi/agent/extensions/pi-tmux-window-status` | `pi-agent/extensions/pi-tmux-window-status`（安装时本仓库的绝对路径） | Pi 生命周期到 tmux breathing status 的受管扩展 |
+| `~/.pi/agent/extensions/pi-suspend-guard` | `fresh-install/modules/tmux/pi-suspend-guard`（安装时本仓库的绝对路径） | 仅在 Linux 已证实当前 process group orphaned 时拦截 Pi suspend 的受管扩展 |
 
 历史命名：该扩展由 `quick-deploy-tmux-status` 更名而来。installer 仍识别旧名 `~/.pi/agent/extensions/quick-deploy-tmux-status` 的已知受管链接：视为 legacy，备份为 `*.bak.<时间戳>` 后创建新链接；未知旧路径（外部链接、普通文件、目录）一律不改动并失败。tmux 窗口选项 `@quick_deploy_pi_*` 与运行时私有目录 `quick-deploy/pi-tmux-status` 有意保持不变，避免已运行 Pi 进程产生重复运行时状态。
 
@@ -36,8 +37,10 @@ gpakosz/.tmux 的两个固定查找路径都以符号链接落盘，目标一个
 
 - 单一事实源：改 `~/.tmux.conf.local` 就是改仓库文件（`<前缀> e` 打开的也是它），改完 `<前缀> r` 生效、`git commit` 入库。
 - 注意：gpakosz 每次加载配置都会用 `cut -c3- "$TMUX_CONF_LOCAL" | sh -s printf probe` 探测本文件是否旧式脚本格式——注释行剥掉前两个字符（`# `）后会**被 shell 真实执行**，因此注释里不要写 `> < ; | & $() 反引号` 等元字符（历史上的 `（CSI > 4 ; 2 m）` 曾在服务器工作目录生成空文件 `4`）；需要表达时用全角 `＞ ；` 代替。
-- 多机同步只拉不装：别的机器 `git pull` 本仓库即生效，无需重跑 install.sh。
+- `~/.tmux.conf.local` 是仓库内文件的符号链接，已存在该链接的机器仍可只靠 `git pull` 接收其后续内容更新。Pi suspend guard 是新增的独立受管链接：已有安装必须先运行一次 `install-pi-suspend-guard.sh`（或完整 `install.sh`），然后重启 Pi 或执行 `/reload`；该链接存在后，guard 源码的后续更新同样随 `git pull` 到达。
 - 基线只记真实改动（目前是鼠标模式、状态栏左键释放切换 window、copy-mode 字母键退出并原样输入、精简状态栏、左侧 session 与右侧时间同样式、未选中 window 使用灰色块、取消 `Ctrl+a` 第二前缀、`Ctrl+Alt+←/→` 切换 window、`Ctrl+Alt+=/+` 新建 window）；全部可用选项查上游模板 `~/.tmux/.tmux.conf.local`。该文件本质是 tmux 配置片段，可直接写 `set -g ...`；若某行被主配置覆盖，按上游说明在行尾加 `#!important`。
+
+Pi suspend guard 不改 tmux key table，也不根据 pane、session、进程名或路径判断。只有收到当前有效的 `app.suspend` 输入时，它才一次性读取 Linux `/proc` 的当前 process group：只在每个组成员的父进程都不属于“同一 session 的另一 process group”时，才把该组判为 orphaned。该条件意味着没有可接收停止作业的 shell owner。仅在这时，guard 通过 Pi 的 terminal-input listener 消费该输入并提示用户；它读取 Pi 已生效的 keybindings，因此用户将 suspend 改绑后仍拦截改后的按键。普通 shell job 的同 session 父进程是反证，guard 不消费输入，Pi 原生 `Ctrl+Z` / `fg` 完全不变。
 
 ## 幂等语义
 
@@ -46,7 +49,8 @@ gpakosz/.tmux 的两个固定查找路径都以符号链接落盘，目标一个
 - apt 包已装则跳过；
 - `~/.tmux` 已是克隆则用 `git pull --ff-only` 更新；更新失败（离线、本地有改动）只警告不中止，保留现有版本；
 - `~/.tmux.conf.local` 已是指向模块基线的符号链接则跳过；若它被换成普通文件（少数编辑器写文件时会替换符号链接）或指向别处，先备份为 `*.bak.<时间戳>` 再重新链接——重跑即修复；
-- `install-pi-tmux-window-status.sh` 可独立运行，且只管理唯一的 Pi 扩展链接：精确新目标跳过；新目标位置已知受管旧链接（仓库搬迁遗留）先备份再修复；旧名 `quick-deploy-tmux-status` 的已知受管链接视为 legacy 迁移；未知文件、目录或外部链接（新旧任一侧）直接失败且不改动；新旧都存在时只有两者都是已知受管链接才处理。它接受 `QUICK_DEPLOY_PI_TMUX_WINDOW_STATUS_SOURCE`、`QUICK_DEPLOY_PI_HOME`、`QUICK_DEPLOY_PI_TMUX_WINDOW_STATUS_TARGET`、`QUICK_DEPLOY_PI_TMUX_WINDOW_STATUS_LEGACY_TARGET` 做隔离测试。
+- `install-pi-tmux-window-status.sh` 可独立运行，且只管理唯一的 Pi status 扩展链接：精确新目标跳过；新目标位置已知受管旧链接（仓库搬迁遗留）先备份再修复；旧名 `quick-deploy-tmux-status` 的已知受管链接视为 legacy 迁移；未知文件、目录或外部链接（新旧任一侧）直接失败且不改动；新旧都存在时只有两者都是已知受管链接才处理。它接受 `QUICK_DEPLOY_PI_TMUX_WINDOW_STATUS_SOURCE`、`QUICK_DEPLOY_PI_HOME`、`QUICK_DEPLOY_PI_TMUX_WINDOW_STATUS_TARGET`、`QUICK_DEPLOY_PI_TMUX_WINDOW_STATUS_LEGACY_TARGET` 做隔离测试。
+- `install-pi-suspend-guard.sh` 可独立运行，且只管理 suspend guard 链接：精确目标跳过；指向旧 checkout 中同名 guard 的受管旧链接先备份再修复；普通文件、目录和外部链接一律拒绝覆盖。它接受 `QUICK_DEPLOY_PI_SUSPEND_GUARD_SOURCE`、`QUICK_DEPLOY_PI_HOME`、`QUICK_DEPLOY_PI_SUSPEND_GUARD_TARGET` 做隔离测试。
 - 替换既有 `~/.tmux.conf` 或非仓库的 `~/.tmux` 目录前同样先备份。
 
 在 `setup.sh` 中本步骤为 tolerate：tmux 本体走 apt 很可靠，但配置仓库要从 GitHub 克隆，全新机器还没配代理时可能失败——只提示不中止，网络就绪后重跑本脚本即可。
@@ -57,11 +61,11 @@ gpakosz/.tmux 的两个固定查找路径都以符号链接落盘，目标一个
 ./tests/run.sh
 ```
 
-测试使用独立 tmux socket 和临时目录，真实验证状态栏鼠标释放切换，以及 emacs、vi 两张 copy-mode 键表退出后向 pane 投递原字符；不会改动当前 tmux server。
+测试使用独立 tmux socket 和临时目录，真实验证状态栏鼠标释放切换，以及 emacs、vi 两张 copy-mode 键表退出后向 pane 投递原字符；同时验证 suspend guard 的 proc classifier、有效按键消费与懒重分类、shell-job/forkpty Pi 拓扑、真实 Pi TUI Ctrl-Z 消费和链接安装契约；不会改动当前 tmux server。
 
 ## Pi 扩展自动发现
 
-Pi 只在启动时扫描 `~/.pi/agent/extensions/` 下的目录，不会扫描本仓库——仓库里的 `pi-agent/extensions/pi-tmux-window-status` 必须通过上面的受管符号链接暴露到 `~/.pi/agent/extensions/` 才会被加载。安装/更新扩展后需要**重启 Pi 或执行 `/reload`** 才生效；tmux 只须 `<前缀> r` 重载样式。
+Pi 只在启动时扫描 `~/.pi/agent/extensions/` 下的目录，不会扫描本仓库——仓库里的 status extension 与本模块中的 suspend guard 都必须通过上面的受管符号链接暴露到 `~/.pi/agent/extensions/` 才会被加载。已有安装首次部署 guard 时，运行 `install-pi-suspend-guard.sh`（或完整 `install.sh`）一次；之后源码更新只需 `git pull`。每次安装或更新扩展后需要**重启 Pi 或执行 `/reload`** 才生效；tmux 只须 `<前缀> r` 重载样式。
 
 注意：conley 的 pi-agent fork（`github.com:conley2bin/pi-agent` 分支 `conley`）自 2026-08-27 起**把 `extensions/pi-tmux-window-status` 作为符号链接纳入 git 追踪**（目标文本与本模块安装器创建的一致）。因此 `~/.pi/agent` 里 `git pull` 首次遇到该路径时会报 “untracked working tree file would be overwritten by merge”——这是追踪文件与安装器创建的未追踪链接同名所致，一次性解决：确认链接内容后 `rm ~/.pi/agent/extensions/pi-tmux-window-status`（或先备份），完成 `git pull`，再重跑本模块 `install.sh` 重建链接。此后上游追踪的链接与安装器目标文本一致，`git pull` 与重跑安装都保持干净；仓库搬迁后照旧重跑 install.sh。
 

@@ -188,4 +188,8 @@ PY
 python3 "$WORK/mouse-check.py" "$SOCKET" click "$ONE_ID" "$TWO_ID" \
     || fail "状态栏左键释放切换行为失败"
 
-echo "PASS: tmux 状态栏点击切换与 copy-mode 字母原样输入"
+node --test "$MODULE_DIR/tests/pi-suspend-guard.test.mjs"
+python3 "$MODULE_DIR/tests/pi-suspend-guard-topology.py" "$MODULE_DIR/pi-suspend-guard/guard.mjs" "$MODULE_DIR/pi-suspend-guard/index.ts"
+"$MODULE_DIR/tests/test-pi-suspend-guard-install.sh"
+
+echo "PASS: tmux 输入路由与 Pi suspend guard"
