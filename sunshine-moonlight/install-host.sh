@@ -1,116 +1,94 @@
 #!/bin/bash
-# quick-deploy/sunshine-moonlight/install-host.sh
-# 在 Ubuntu 24.04+ 上安装/收敛 Sunshine 串流主机（官方 GitHub release .deb）。
-#
-# 安全设计：
-#   - 版本下限 v2026.516.143833（CVE-2026-32253，认证绕过，CVSS 9.8），
-#     低于下限一律无条件拒绝，不提供任何绕过开关。
-#   - .deb 的 SHA-256 与 GitHub API 返回的 asset digest 比对通过后才允许 apt 安装；
-#     摘要不匹配时系统在逻辑上未被触碰。
-#   - 不动锁屏/睡眠/DPMS 设置，不启用 enable-linger，不把端口暴露到公网。
-#
-# 幂等：重跑会重新校验并重放到同一状态；已有 ~/.config/sunshine 的未知键全部保留。
-
+# Install/configure the native Sunshine package for an existing Ubuntu desktop over Tailscale.
 set -euo pipefail
-
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/common.sh
 . "$SCRIPT_DIR/lib/common.sh"
 
-# ---- 常量 --------------------------------------------------------------------
-
 GITHUB_REPO='LizardByte/Sunshine'
-DEFAULT_VERSION='v2026.516.143833'
-FLOOR_VERSION='2026.516.143833'           # CVE-2026-32253 修复下限（不含前导 v）
-FLOOR_CVE='CVE-2026-32253'
-CANONICAL_UNIT='app-dev.lizardbyte.app.Sunshine.service'
-ALIAS_UNIT='sunshine.service'
-# sunshine.conf 里的 port 是“基准端口”（默认 47989）；Web UI 实际监听 base+1（默认 47990）。
-DEFAULT_BASE_PORT='47989'
-
-# 测试专用钩子（tests/run.sh 使用；真实运行不要设置）：
-#   QD_OS_RELEASE_FILE      替代 /etc/os-release（common.sh）
-#   QD_SUNSHINE_CONFIG_DIR   替代 ~/.config/sunshine
-#   QD_UINPUT_NODE/QD_UHID_NODE  替代 /dev/uinput、/dev/uhid 设备节点路径
-#   QD_SYSTEMD_USER_DIR      替代 /usr/lib/systemd/user（单元文件探测目录）
-CONFIG_DIR="${QD_SUNSHINE_CONFIG_DIR:-$HOME/.config/sunshine}"
-CONFIG_FILE="$CONFIG_DIR/sunshine.conf"
-UINPUT_NODE="${QD_UINPUT_NODE:-/dev/uinput}"
-UHID_NODE="${QD_UHID_NODE:-/dev/uhid}"
-SYSTEMD_USER_DIR="${QD_SYSTEMD_USER_DIR:-/usr/lib/systemd/user}"
-
-# 安装归属记录：uninstall.sh 据此判断 sunshine 包是否由本脚本引入。
+VERSION_TAG="v$QD_SUNSHINE_VERSION"
+CONFIG_DIR=''
+CONFIG_FILE=''
 STATE_DIR="${QD_HOST_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/quick-deploy/sunshine-moonlight}"
 STATE_FILE="$STATE_DIR/host.state"
-
-VERSION_TAG="$DEFAULT_VERSION"
-CAPTURE=''                 # 空 = 不写 capture 键（Sunshine 自行选择）；auto = 显式删除 capture 键
-BIND_ADDRESS=''            # 空 = 取当前 tailscale IPv4
-WEB_UI_PORT=''             # configure_sunshine 收敛后 = 配置基准端口 + 1
-CONFIG_CHANGED=false       # configure_sunshine 检测到内容变化时置 true
+UINPUT_NODE="${QD_UINPUT_NODE:-/dev/uinput}"
+UHID_NODE="${QD_UHID_NODE:-/dev/uhid}"
+CAPTURE=''
+BIND_ADDRESS=''
+BASE_PORT=''
+WEB_UI_PORT=''
+CONFIG_CHANGED=false
+PACKAGE_CHANGED=false
+CAPS_CHANGED=false
 
 usage() {
     cat <<USAGE
-用法: ./install-host.sh [选项]
-
-安装或收敛 Sunshine 串流主机（Ubuntu 24.04+，官方 GitHub release .deb）。
-不要用 root/sudo 运行本脚本；需要管理员权限的步骤会自行调用 sudo。
-
-选项:
-  --version TAG                  指定 release 标签（默认 $DEFAULT_VERSION）。低于 v$FLOOR_VERSION
-                                 （$FLOOR_CVE 修复版本）一律无条件拒绝，没有绕过开关。
-  --capture auto|kms|portal|x11  写入 capture 捕获后端；auto = 删除 capture 键，由 Sunshine
-                                 自动侦测（默认不写；发现旧的 xcb/auto 等无效值会警告并移除）
-  --bind-address IPV4            Web UI/服务绑定地址（默认取当前 tailscale IPv4）
-  -h, --help                     显示帮助
+用法: ./install-host.sh [--version v版本] [--capture auto|kms|portal|x11|nvfbc|wlr|kwin]
+                      [--bind-address 本机TailnetIPv4]
+默认版本 v$QD_SUNSHINE_VERSION；最低版本 v$QD_SUNSHINE_FLOOR。
+不传 --capture 保留已有设置；auto 明确删除 capture 键。
+--bind-address 只能确认本机已分配的 Tailscale IPv4，不能用来绑定 LAN/公网/通配地址。
+请在已登录图形桌面的普通用户下运行。脚本会调用 sudo 安装原生包，不修改睡眠/锁屏。
 USAGE
 }
-
 parse_args() {
     while [ "$#" -gt 0 ]; do
         case "$1" in
             --version)
-                [ "$#" -ge 2 ] || qd_die '--version 需要一个参数'
-                [[ "$2" =~ ^v[0-9]+(\.[0-9]+)*$ ]] \
-                    || qd_die "--version 标签格式非法: $2（期望形如 v2026.516.143833，仅 v+数字+点）"
-                VERSION_TAG="$2"; shift ;;
+                [ "$#" -ge 2 ] && [[ "$2" =~ ^v[0-9]+(\.[0-9]+)*$ ]] || qd_die '--version 需要 v+数字点分版本'
+                VERSION_TAG="$2"; shift;;
             --capture)
-                [ "$#" -ge 2 ] || qd_die '--capture 需要一个参数'
-                case "$2" in
-                    auto|kms|portal|x11) CAPTURE="$2" ;;
-                    *) qd_die "--capture 只接受 auto|kms|portal|x11（收到: $2）。注意 xcb 是旧名，现行值为 x11。" ;;
-                esac
-                shift ;;
+                [ "$#" -ge 2 ] || qd_die '--capture 需要参数'
+                if [ "$2" != auto ] && { [ -z "$2" ] || ! qd_valid_capture "$2"; }; then
+                    qd_die 'capture 只接受 auto|kms|portal|x11|nvfbc|wlr|kwin'
+                fi
+                CAPTURE="$2"; shift;;
             --bind-address)
-                [ "$#" -ge 2 ] || qd_die '--bind-address 需要一个参数'
-                qd_valid_ipv4 "$2" \
-                    || qd_die "--bind-address 不是合法 IPv4 点分地址: $2"
-                BIND_ADDRESS="$2"; shift ;;
-            -h|--help) usage; exit 0 ;;
-            *) qd_die "未知参数: $1（-h 查看用法）" ;;
+                [ "$#" -ge 2 ] && qd_valid_ipv4 "$2" || qd_die '--bind-address 需要标准 IPv4 地址'
+                BIND_ADDRESS="$2"; shift;;
+            -h|--help) usage; exit 0;;
+            *) qd_die "未知参数: $1";;
         esac
         shift
     done
+    qd_version_ge "$VERSION_TAG" "$QD_SUNSHINE_FLOOR" \
+        || qd_die "拒绝低于维护基线 v$QD_SUNSHINE_FLOOR 的版本；请使用包含 September 2026 上游安全修复的版本"
 }
 
-# ---- 版本下限 ------------------------------------------------------------------
-
-# 低于下限一律拒绝：远程桌面的认证绕过（CVSS 9.8）没有“可接受风险”的合理场景，
-# 因此不提供任何绕过开关（旧的 --i-accept-cve-2026-32253-risk 已移除）。
-enforce_version_floor() {
-    local num="${VERSION_TAG#v}"
-    if qd_version_ge "$num" "$FLOOR_VERSION"; then
-        qd_info "版本基线: $VERSION_TAG >= v$FLOOR_VERSION（$FLOOR_CVE 已修复）"
-        return 0
+preflight() {
+    local cmd ip session capture origin
+    for cmd in python3 curl sha256sum dpkg-deb systemctl loginctl tailscale ip ss; do qd_require_cmd "$cmd"; done
+    CONFIG_DIR="$(qd_host_config_dir)" || exit 1
+    CONFIG_FILE="$CONFIG_DIR/sunshine.conf"
+    qd_check_service_config "$CONFIG_DIR" || qd_die '用户服务配置不兼容；尚未安装或改写配置'
+    session="$(qd_graphical_session)" || qd_die '没有当前用户的活动本地图形会话；请先登录主机桌面（SSH/linger 不能创建桌面）'
+    qd_check_display_environment "$session" || exit 1
+    qd_info "图形会话: $session"
+    ip="$(qd_tailnet_ip)" || exit 1
+    [ -z "$BIND_ADDRESS" ] || [ "$BIND_ADDRESS" = "$ip" ] || qd_die "只能绑定本机 Tailnet IPv4: $ip"
+    BIND_ADDRESS="$ip"
+    [ ! -L "$CONFIG_FILE" ] || qd_die "配置文件是符号链接，请先人工核对目标: $CONFIG_FILE"
+    if [ -e "$CONFIG_FILE" ]; then
+        [ -f "$CONFIG_FILE" ] && [ -r "$CONFIG_FILE" ] || qd_die "配置不是可读普通文件: $CONFIG_FILE"
     fi
-    qd_die "拒绝安装 $VERSION_TAG：低于安全基线 v$FLOOR_VERSION（$FLOOR_CVE，认证绕过，CVSS 9.8）。
-该漏洞没有可接受的例外场景，本脚本不提供绕过开关。请使用 >= v$FLOOR_VERSION 的版本。"
+    BASE_PORT="$(qd_base_port "$CONFIG_FILE")" || exit 1
+    WEB_UI_PORT=$((BASE_PORT + 1))
+    origin="$(qd_conf_get "$CONFIG_FILE" origin_web_ui_allowed || true)"
+    case "$origin" in
+        ''|lan|wan) ;;
+        pc) qd_die 'origin_web_ui_allowed=pc 拒绝 Tailnet Web UI；若同意 Tailnet 访问，请手动改为 lan 后重跑（无需 wan）';;
+        *) qd_die "无法识别 origin_web_ui_allowed=$origin；请先修正为 lan";;
+    esac
+    capture="$(qd_conf_get "$CONFIG_FILE" capture || true)"
+    if [ -z "$CAPTURE" ] && ! qd_valid_capture "$capture"; then
+        qd_die "已有 capture=$capture 无效；显式 --capture auto 删除，或选择有效后端（X11 用 x11，不是 xcb）"
+    fi
+    case "${CAPTURE:-$capture}:$session" in
+        x11:*'(wayland)') qd_die 'capture=x11 只用于 Xorg 会话；Wayland 桌面请明确选择 kms、portal 或自动选择';;
+        wlr:*'(x11)'|kwin:*'(x11)') qd_die 'capture=wlr/kwin 需要 Wayland 会话；Xorg 桌面请选择 x11、kms 或自动选择';;
+    esac
 }
 
-# ---- 资产选择与摘要验证 -----------------------------------------------------------
-
-# 从 GitHub API release JSON 中选出当前 Ubuntu VERSION_ID/架构的 .deb，输出: 下载URL<TAB>sha256。
-# 例如 Ubuntu 24.04 只接受 sunshine-ubuntu-24.04-amd64.deb；未来系统不会静默安装旧发行版资产。
 pick_deb_asset() {
     local json_file="$1" arch="$2" ubuntu_version="$3"
     python3 - "$json_file" "$arch" "$ubuntu_version" "$VERSION_TAG" <<'PY'
@@ -178,22 +156,17 @@ download_and_verify_deb() {
     name="$(cut -f3 <<<"$picked")"
     qd_info "选定资产: $name"
 
-    qd_mktemp_file deb
+    qd_mktemp_file deb --suffix=.deb
     qd_info "下载: $url"
-    qd_curl -o "$deb" "$url" || qd_die '下载失败；未对系统做任何修改'
+    qd_curl -o "$deb" "$url" || qd_die '下载失败；未安装下载文件'
     qd_verify_sha256 "$deb" "$digest"
     DEB_FILE="$deb"
 }
 
-# ---- 包安装与状态记录 -------------------------------------------------------------
-
 sunshine_pkg_installed() {
-    dpkg-query -W -f='${db:Status-Status}' sunshine 2>/dev/null | grep -qx 'installed'
+    dpkg-query -W -f='${db:Status-Status}' sunshine 2>/dev/null | grep -qx installed
 }
-
-sunshine_pkg_version() {
-    dpkg-query -W -f='${Version}' sunshine 2>/dev/null
-}
+sunshine_pkg_version() { dpkg-query -W -f='${Version}' sunshine; }
 
 record_ownership() {
     # 只在首次运行时记录：sunshine 包是否在本脚本介入之前就已存在。
@@ -217,321 +190,164 @@ time=$(date -Iseconds)
 EOF_LAST
 }
 
+verify_deb_metadata() {
+    local arch="$1" package upstream actual_arch
+    package="$(dpkg-deb -f "$DEB_FILE" Package)" || qd_die '无法读取 deb Package'
+    actual_arch="$(dpkg-deb -f "$DEB_FILE" Architecture)" || qd_die '无法读取 deb Architecture'
+    DEB_VERSION="$(dpkg-deb -f "$DEB_FILE" Version)" || qd_die '无法读取 deb Version'
+    [ "$package" = sunshine ] || qd_die "deb Package=$package，不是 sunshine"
+    [ "$actual_arch" = "$arch" ] || qd_die "deb Architecture=$actual_arch，期望 $arch"
+    upstream="$(qd_upstream_version "$DEB_VERSION")" || qd_die "无法识别 deb 上游版本: $DEB_VERSION"
+    [ "$upstream" = "${VERSION_TAG#v}" ] || qd_die "deb 上游版本 $upstream 与请求 $VERSION_TAG 不匹配"
+    qd_version_ge "$upstream" "$QD_SUNSHINE_FLOOR" || qd_die 'deb 上游版本低于维护基线'
+}
 install_package() {
-    local arch="$1"
-    local preexisting=false installed_version='' requested_version="${VERSION_TAG#v}"
+    local arch="$1" preexisting=false installed='' upstream now_version
     if sunshine_pkg_installed; then
         preexisting=true
-        installed_version="$(sunshine_pkg_version)"
-        [ -n "$installed_version" ] || qd_die '已安装 Sunshine，但 dpkg 返回的版本为空'
-        qd_info "检测到已安装的 Sunshine: $installed_version（保留现有状态与配置）"
-        if qd_version_ge "$installed_version" "$requested_version"; then
-            qd_version_ge "$installed_version" "$FLOOR_VERSION" \
-                || qd_die "现有版本 $installed_version 低于安全基线 v$FLOOR_VERSION（$FLOOR_CVE）"
-            if [ "$installed_version" = "$requested_version" ]; then
-                qd_info '已是请求版本，跳过重复下载与 apt 重装'
+        installed="$(sunshine_pkg_version)"
+        upstream="$(qd_upstream_version "$installed")" || qd_die "无法识别已安装版本: $installed"
+        if qd_version_ge "$upstream" "${VERSION_TAG#v}"; then
+            if [ "$upstream" = "${VERSION_TAG#v}" ]; then
+                qd_info "已有请求的上游版本 ($installed)，跳过下载/重装"
             else
-                qd_warn "现有版本 $installed_version 高于请求版本 $requested_version；拒绝降级，保留现有版本"
+                qd_warn "已有更高上游版本 $upstream，保留现有包，不降级"
             fi
-            record_ownership preexisting "$installed_version"
+            record_ownership preexisting "$installed"
             return 0
         fi
     fi
-
     download_and_verify_deb "$arch"
-
-    qd_info '安装 .deb（apt 会自动补齐依赖）...'
-    if ! qd_sudo apt-get install -y "$DEB_FILE"; then
-        qd_die 'apt 安装失败；未记录任何归属状态，系统包状态由 apt 自身保证一致'
+    verify_deb_metadata "$arch"
+    local -a apt_args=(install -y)
+    if [ "$preexisting" = true ] && dpkg --compare-versions "$installed" gt "$DEB_VERSION"; then
+        # An old downstream epoch can sort above a newer official upstream release.
+        qd_info '已验证上游版本更新；允许切换到 Debian 排序较低的官方包版本'
+        apt_args+=(--allow-downgrades)
     fi
-
-    sunshine_pkg_installed || qd_die 'apt 返回后仍查询不到 sunshine 包，安装失败'
-    local now_version
+    qd_sudo apt-get "${apt_args[@]}" "$DEB_FILE" || qd_die 'apt 安装失败；请检查 apt/dpkg 状态，本次未记录包归属'
+    sunshine_pkg_installed || qd_die 'apt 返回后 sunshine 不是 installed；请检查 dpkg 状态'
     now_version="$(sunshine_pkg_version)"
-    [ -n "$now_version" ] || qd_die 'apt 返回后 Sunshine 版本为空'
-    if ! qd_version_ge "$now_version" "$FLOOR_VERSION"; then
-        qd_die "安装后版本 $now_version 低于基线 v$FLOOR_VERSION（$FLOOR_CVE）；请人工检查"
-    fi
-    qd_info "Sunshine 包已就绪: $now_version"
-
-    if [ "$preexisting" = true ]; then
-        record_ownership preexisting "$now_version"
-    else
-        record_ownership fresh "$now_version"
-    fi
+    [ "$now_version" = "$DEB_VERSION" ] || qd_die "安装后版本 $now_version 与已验证 deb $DEB_VERSION 不符；请检查包状态"
+    PACKAGE_CHANGED=true
+    if [ "$preexisting" = true ]; then record_ownership preexisting "$now_version"; else record_ownership fresh "$now_version"; fi
+    qd_info "包已安装: $now_version"
 }
 
-# ---- 捕获后端能力（cap） -----------------------------------------------------------
-
-# 官方 deb 的 postinst 已执行 setcap cap_sys_admin,cap_sys_nice+p、加载 uhid、
-# 安装 udev 规则。这里只做“验证 + 缺失时修复”，不重复安装 udev 规则。
 converge_caps() {
-    if [ "$CAPTURE" = portal ]; then
-        qd_info 'capture=portal：经桌面门户捕获，无需 cap_sys_admin，跳过 capability 收敛'
-        return 0
-    fi
-    if ! command -v getcap >/dev/null 2>&1; then
-        qd_info '安装 libcap2-bin（提供 getcap/setcap）...'
-        qd_sudo apt-get install -y libcap2-bin
-    fi
-    local bin real cur
-    bin="$(dpkg -L sunshine 2>/dev/null | grep -E '/bin/sunshine$' | head -n1)"
-    [ -n "$bin" ] || qd_die '无法在 sunshine 包内定位 bin/sunshine'
-    real="$(readlink -f "$bin")"
-    cur="$(getcap "$real" 2>/dev/null || true)"
-    if grep -q 'cap_sys_admin' <<<"$cur" && grep -q 'cap_sys_nice' <<<"$cur" && grep -q '=.*p' <<<"$cur"; then
-        qd_info "capability 已正确（官方 postinst 已设置）: $cur"
-        return 0
-    fi
-    qd_warn "capability 缺失或不完整（当前: ${cur:-无}），执行修复: setcap cap_sys_admin,cap_sys_nice+p $real"
-    qd_sudo setcap 'cap_sys_admin,cap_sys_nice+p' "$real"
-    cur="$(getcap "$real" 2>/dev/null || true)"
-    if grep -q 'cap_sys_admin' <<<"$cur" && grep -q 'cap_sys_nice' <<<"$cur" && grep -q '=.*p' <<<"$cur"; then
-        qd_info "capability 修复并验证通过: $cur"
-    else
-        qd_die "setcap 后仍读不到 cap_sys_admin,cap_sys_nice+p（当前: ${cur:-无}）"
-    fi
+    local capture bin cur
+    capture="${CAPTURE:-$(qd_conf_get "$CONFIG_FILE" capture || true)}"
+    # KMS needs these file capabilities; portal/X11 have their own privilege handling.
+    case "$capture" in ''|auto|kms) ;; *) return 0;; esac
+    if ! command -v getcap >/dev/null 2>&1; then qd_sudo apt-get install -y libcap2-bin; fi
+    bin="$(qd_sunshine_binary)"
+    [ -n "$bin" ] || qd_die '包内缺少 sunshine executable'
+    bin="$(readlink -f "$bin")"
+    cur="$(getcap "$bin")"
+    if grep -qE 'cap_sys_(admin,cap_sys_nice|nice,cap_sys_admin)=e?p($| )' <<<"$cur"; then return 0; fi
+    qd_sudo setcap 'cap_sys_admin,cap_sys_nice+p' "$bin"
+    cur="$(getcap "$bin")"
+    grep -qE 'cap_sys_(admin,cap_sys_nice|nice,cap_sys_admin)=e?p($| )' <<<"$cur" || qd_die 'setcap 后 capability 仍不完整'
+    CAPS_CHANGED=true
 }
-
-# ---- 输入设备访问 -----------------------------------------------------------------
-
-# 官方包的 udev 规则 + systemd-logind 的 uaccess 通常会让“已登录图形会话的用户”
-# 直接获得 /dev/uinput（及 /dev/uhid）的读写 ACL。只有有效访问缺失时才退回 input 组。
 converge_input_access() {
-    local need_group=false node
-    for node in "$UINPUT_NODE" "$UHID_NODE"; do
-        if [ -e "$node" ]; then
-            if [ -r "$node" ] && [ -w "$node" ]; then
-                qd_info "输入设备可读写: $node（uaccess ACL 生效，无需 input 组）"
-            else
-                qd_warn "输入设备存在但当前用户无有效读写权限: $node"
-                need_group=true
-            fi
-        else
-            qd_warn "输入设备节点不存在: $node（官方包应已加载 uhid/配置 udev；请确认 Sunshine 包安装完整且已重新登录）"
-            need_group=true
-        fi
-    done
-    [ "$need_group" = true ] || return 0
-
-    if id -nG | tr ' ' '\n' | grep -qx 'input'; then
-        qd_warn '你已在 input 组，但权限尚未生效：请注销并重新登录图形会话后重试。'
-        return 0
+    # Do not confuse absent devices with group membership. Keep repairs explicit.
+    [ -e "$UINPUT_NODE" ] || qd_die "$UINPUT_NODE 不存在，键鼠注入未就绪；请检查 uinput 模块与包内 60-sunshine.rules，再重跑"
+    if [ ! -r "$UINPUT_NODE" ] || [ ! -w "$UINPUT_NODE" ]; then
+        qd_die "$UINPUT_NODE 无读写权限；请检查活动会话 uaccess ACL/udev。只有节点属 input 组且 ACL 不适用时才考虑加入 input 组；本次未修改组"
     fi
-    qd_warn '将当前用户加入 input 组（需要 sudo）...'
-    qd_sudo usermod -aG input "$(id -un)"
-    qd_warn '!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!'
-    qd_warn '已加入 input 组。必须注销并重新登录图形会话后才会生效。'
-    qd_warn '!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!'
-}
-
-# ---- 配置合并 ---------------------------------------------------------------------
-
-resolve_bind_address() {
-    if [ -z "$BIND_ADDRESS" ]; then
-        command -v tailscale >/dev/null 2>&1 \
-            || qd_die '未找到 tailscale 命令。请先运行 ../tailscale/install.sh 加入 Tailnet，或用 --bind-address 显式指定绑定地址。'
-        BIND_ADDRESS="$(tailscale ip -4 2>/dev/null | head -n1)"
-        [ -n "$BIND_ADDRESS" ] \
-            || qd_die 'tailscale 当前没有 IPv4 地址（未登录或 tailscaled 未运行）。请先完成 tailscale 登录，或用 --bind-address 显式指定。'
-        qd_info "绑定地址（tailscale IPv4）: $BIND_ADDRESS"
-    else
-        qd_info "绑定地址（显式指定）: $BIND_ADDRESS"
+    if [ ! -e "$UHID_NODE" ] || [ ! -r "$UHID_NODE" ] || [ ! -w "$UHID_NODE" ]; then
+        qd_warn "$UHID_NODE 不存在或不可读写，部分手柄注入不可用；请检查 uhid 模块/udev，键鼠不依赖此节点"
     fi
-    # 显式与自动两种来源都过同一道校验：防配置注入（换行/特殊字符）与非法地址
-    qd_valid_ipv4 "$BIND_ADDRESS" \
-        || qd_die "绑定地址不是合法 IPv4 点分地址: $BIND_ADDRESS"
 }
-
-# 读取配置里的基准端口（port 键，Sunshine 语义：默认 47989，Web UI = base+1）。
-# 不存在 → 默认；存在但非数字/越界 → 拒绝继续（不能拿着猜出来的 URL 声称成功）。
-resolve_web_ui_port() {
-    local base
-    base="$(qd_conf_get "$CONFIG_FILE" port 2>/dev/null || true)"
-    if [ -z "$base" ]; then
-        base="$DEFAULT_BASE_PORT"
-    elif ! [[ "$base" =~ ^[0-9]+$ ]] \
-        || [ "$base" -lt 1029 ] || [ "$base" -gt 65514 ]; then
-        qd_die "配置 $CONFIG_FILE 里的 port 不是 Sunshine 合法基准端口（1029-65514）: '$base'。请手工修正后重跑。"
-    fi
-    WEB_UI_PORT=$((base + 1))
-}
-
 configure_sunshine() {
+    local staged mode origin="https://$BIND_ADDRESS:$WEB_UI_PORT"
     mkdir -p "$CONFIG_DIR"
-    if [ -e "$CONFIG_FILE" ] && [ ! -f "$CONFIG_FILE" ]; then
-        qd_die "配置路径存在但不是普通文件: $CONFIG_FILE"
-    fi
-    if [ -f "$CONFIG_FILE" ] && [ ! -r "$CONFIG_FILE" ]; then
-        qd_die "现有配置不可读，拒绝覆盖: $CONFIG_FILE"
-    fi
-    resolve_web_ui_port
-    local origin="https://$BIND_ADDRESS:$WEB_UI_PORT"
-    local before_hash='' after_hash curmode existing_capture
-    local backup="$CONFIG_FILE.bak"
-    CONF_BEFORE=''
-    if [ -f "$CONFIG_FILE" ]; then
-        before_hash="$(sha256sum "$CONFIG_FILE" | awk '{print $1}')"
-        qd_mktemp_file CONF_BEFORE
-        cp -p "$CONFIG_FILE" "$CONF_BEFORE"
-    fi
-
-    qd_conf_set "$CONFIG_FILE" upnp disabled
-    # capture 语义：自动侦测 = 配置里完全没有 capture 键。
-    #   --capture auto   → 删除所有 capture 行，交给 Sunshine 自动侦测
-    #   --capture kms/portal/x11 → 显式写入（portal 在 v2026.516 源码中仍是合法后端）
-    #   默认（不传）      → 保留合法值；发现 xcb/auto/未知等无效值时警告并移除，
-    #                        绝不留着无效值还声称收敛成功（doctor 会把这些标为失败）
+    qd_mktemp_file staged "$CONFIG_FILE.qdtmp.XXXXXX"
+    if [ -f "$CONFIG_FILE" ]; then cp -p "$CONFIG_FILE" "$staged"; fi
+    qd_conf_set "$staged" upnp disabled
+    qd_conf_set "$staged" address_family ipv4
+    qd_conf_set "$staged" bind_address "$BIND_ADDRESS"
+    qd_conf_ensure_token "$staged" csrf_allowed_origins "$origin"
     case "$CAPTURE" in
-        auto)
-            if qd_conf_get "$CONFIG_FILE" capture >/dev/null 2>&1; then
-                qd_conf_unset "$CONFIG_FILE" capture
-                qd_info 'capture=auto：已移除 capture 键，由 Sunshine 自动侦测'
-            fi ;;
-        '' )
-            existing_capture="$(qd_conf_get "$CONFIG_FILE" capture 2>/dev/null || true)"
-            case "$existing_capture" in
-                '') : ;;
-                kms|portal|x11)
-                    qd_info "保留已有 capture = $existing_capture" ;;
-                *)
-                    qd_warn "现有 capture = $existing_capture 无效（xcb 是旧名；auto 应为空键而非显式值）"
-                    qd_warn '已移除 capture 键，改由 Sunshine 自动侦测（等价于 --capture auto）'
-                    qd_conf_unset "$CONFIG_FILE" capture ;;
-            esac ;;
-        *)
-            qd_conf_set "$CONFIG_FILE" capture "$CAPTURE" ;;
+        auto) qd_conf_unset "$staged" capture;;
+        '') ;; # Preserve the user's selected backend, including its comments.
+        *) qd_conf_set "$staged" capture "$CAPTURE";;
     esac
-    qd_conf_set "$CONFIG_FILE" bind_address "$BIND_ADDRESS"
-    qd_conf_ensure_token "$CONFIG_FILE" csrf_allowed_origins "$origin"
-
-    # sunshine.conf 可能含敏感路径/设置：权限收紧到 0600；已有更严权限（如 0400）则保留
-    curmode="$(stat -c %a "$CONFIG_FILE")"
-    if [ $((8#$curmode & ~8#600)) -ne 0 ]; then
-        chmod 600 "$CONFIG_FILE"
-        qd_info '已将 sunshine.conf 权限收紧为 0600'
-    fi
-
-    # 回读验证
-    [ "$(qd_conf_get "$CONFIG_FILE" upnp)" = disabled ] || qd_die '配置回读失败: upnp'
-    [ "$(qd_conf_get "$CONFIG_FILE" bind_address)" = "$BIND_ADDRESS" ] || qd_die '配置回读失败: bind_address'
-    qd_conf_get "$CONFIG_FILE" csrf_allowed_origins | tr ',' '\n' | sed 's/^[ \t]*//;s/[ \t]*$//' \
-        | grep -qx "$origin" || qd_die '配置回读失败: csrf_allowed_origins'
-    case "$CAPTURE" in
-        auto)
-            ! qd_conf_get "$CONFIG_FILE" capture >/dev/null 2>&1 || qd_die '配置回读失败: capture 应已移除' ;;
-        '')
-            case "$existing_capture" in
-                ''|kms|portal|x11) : ;;
-                *) ! qd_conf_get "$CONFIG_FILE" capture >/dev/null 2>&1 || qd_die '配置回读失败: 无效 capture 应已移除' ;;
-            esac ;;
-        *)
-            [ "$(qd_conf_get "$CONFIG_FILE" capture)" = "$CAPTURE" ] || qd_die '配置回读失败: capture' ;;
-    esac
-
-    # 变更检测：内容没变 → 不备份、不重启服务；变了 → 滚动单份备份（.bak，避免 .bak.时间戳 无限堆积）
-    after_hash="$(sha256sum "$CONFIG_FILE" | awk '{print $1}')"
-    if [ "$before_hash" != "$after_hash" ]; then
-        CONFIG_CHANGED=true
-        if [ -n "$before_hash" ]; then
-            cp -p "$CONF_BEFORE" "$backup"
+    [ "$(qd_conf_get "$staged" upnp)" = disabled ] &&
+        [ "$(qd_conf_get "$staged" address_family)" = ipv4 ] &&
+        [ "$(qd_conf_get "$staged" bind_address)" = "$BIND_ADDRESS" ] || qd_die '候选配置回读失败'
+    qd_conf_get "$staged" csrf_allowed_origins | tr ',' '\n' | sed 's/^[ \t]*//;s/[ \t]*$//' | grep -Fxq "$origin" \
+        || qd_die '候选配置 csrf_allowed_origins 回读失败'
+    mode="$(stat -c %a "$staged")"
+    if [ $((8#$mode & ~8#600)) -ne 0 ]; then chmod 600 "$staged"; fi
+    if [ -f "$CONFIG_FILE" ] && cmp -s "$staged" "$CONFIG_FILE"; then
+        # Content-identical runs do not touch backups or restart an active stream.
+        chmod --reference="$staged" "$CONFIG_FILE"
+        qd_info '配置无变化'
+    else
+        if [ -f "$CONFIG_FILE" ]; then
+            local backup
+            qd_mktemp_file backup "$CONFIG_FILE.bak.qdtmp.XXXXXX"
+            cp "$CONFIG_FILE" "$backup"
             chmod 600 "$backup"
-            qd_info "配置有变更，修改前内容已滚动备份到: $backup"
+            mv -f "$backup" "$CONFIG_FILE.bak"
         fi
-        qd_info "配置已收敛（未知键原样保留）: $CONFIG_FILE"
-    else
-        qd_info "配置无变化（已收敛）: $CONFIG_FILE"
-    fi
-    qd_info "  upnp=disabled, bind_address=$BIND_ADDRESS, csrf_allowed_origins 含 $origin, Web UI 端口 $WEB_UI_PORT（基准端口 $((WEB_UI_PORT - 1))）"
-}
-
-# ---- 用户服务 ---------------------------------------------------------------------
-
-detect_unit() {
-    local units
-    units="$(systemctl --user list-unit-files --no-legend --no-pager 2>/dev/null || true)"
-    if grep -q "^$CANONICAL_UNIT" <<<"$units" || [ -f "$SYSTEMD_USER_DIR/$CANONICAL_UNIT" ]; then
-        printf '%s\n' "$CANONICAL_UNIT"
-    elif grep -q "^$ALIAS_UNIT" <<<"$units" || [ -f "$SYSTEMD_USER_DIR/$ALIAS_UNIT" ]; then
-        printf '%s\n' "$ALIAS_UNIT"
-    else
-        return 1
+        mv -f "$staged" "$CONFIG_FILE"
+        CONFIG_CHANGED=true
+        qd_info "配置已更新: $CONFIG_FILE（其它键与凭据保留）"
     fi
 }
 
 enable_service() {
-    local unit
-    # The package installs a user unit after the user manager may already have
-    # cached its search path. Reload before discovery/start so a first install
-    # does not depend on logging out or restarting the user manager.
-    systemctl --user daemon-reload \
-        || qd_die 'systemctl --user daemon-reload 失败；无法加载新安装的 Sunshine 用户服务'
-    unit="$(detect_unit)" || qd_die "未找到 Sunshine 用户服务单元（$CANONICAL_UNIT 或别名 $ALIAS_UNIT）；请确认 deb 安装完整"
+    local unit attempt detail='' binary_status=0
+    systemctl --user daemon-reload || qd_die '用户管理器 daemon-reload 失败'
+    qd_check_service_config "$CONFIG_DIR" || qd_die '已安装包的用户服务配置不兼容；尚未启动'
+    unit="$(qd_find_unit)" || qd_die '未找到 Sunshine 用户服务'
+    systemctl --user enable "$unit" || qd_die "无法 enable $unit"
     if systemctl --user is-active --quiet "$unit"; then
-        # 已在运行：enable --now 是 no-op，配置若变了必须 try-restart 才会生效；
-        # 配置没变则不动服务（幂等重跑不打扰正在进行的串流会话）。
-        systemctl --user enable "$unit" >/dev/null \
-            || qd_die "无法为当前用户启用 $unit"
-        systemctl --user is-enabled --quiet "$unit" \
-            || qd_die "$unit 执行 enable 后仍不是 enabled"
-        if [ "$CONFIG_CHANGED" = true ]; then
-            qd_info "$unit 已在运行且配置有变更，执行 try-restart 使新配置生效"
-            systemctl --user try-restart "$unit" \
-                || qd_die "systemctl --user try-restart $unit 失败。查看日志: journalctl --user -u $unit -e"
-            systemctl --user is-active --quiet "$unit" \
-                || qd_die "$unit 重启后不是 active。查看日志: journalctl --user -u $unit -e"
-            qd_info "$unit 已重启并保持 active，新配置已生效"
+        qd_running_binary_current "$unit" || binary_status=$?
+        if [ "$PACKAGE_CHANGED" = true ] || [ "$CAPS_CHANGED" = true ] || [ "$CONFIG_CHANGED" = true ] || [ "$binary_status" -eq 1 ]; then
+            qd_info '包、capability、配置或运行 executable 有变化，重启用户服务'
+            systemctl --user restart "$unit" || qd_die "无法 restart $unit"
         else
-            qd_info "$unit 已在运行且配置无变化，不重启"
+            qd_info '包与配置无变化，不重启活动服务'
         fi
-        return 0
+    else
+        systemctl --user start "$unit" || qd_die "无法 start $unit；查看 journalctl --user -u $unit -e"
     fi
-    qd_info "启用并启动用户服务: $unit（不使用 sudo，写入当前用户的 systemd）"
-    if ! systemctl --user enable --now "$unit"; then
-        qd_die "systemctl --user enable --now $unit 失败。
-常见原因: 当前没有活动的用户 systemd 会话（例如纯 SSH 且从未登录图形界面）。
-注意: Sunshine 需要本机存在已登录的图形用户会话才能捕获桌面；
-不要用 loginctl enable-linger 当作无人值守/预登录方案——Sunshine 不在那种模式下工作。"
-    fi
-    systemctl --user is-enabled --quiet "$unit" \
-        || qd_die "$unit 启动后不是 enabled"
-    if ! systemctl --user is-active --quiet "$unit"; then
-        qd_die "$unit 启动后不是 active。查看日志: journalctl --user -u $unit -e
-注意: Sunshine 需要已登录的图形用户会话；enable-linger 不是替代方案。"
-    fi
-    qd_info "$unit 已 enabled 且 active"
+    systemctl --user is-enabled --quiet "$unit" || qd_die "$unit 未 enabled"
+    # Type=simple does not signal application readiness. Wait for its actual control listeners.
+    for attempt in {1..30}; do
+        if systemctl --user is-active --quiet "$unit" && detail="$(qd_check_listeners "$BIND_ADDRESS" "$BASE_PORT" "$unit" 2>&1)"; then
+            qd_info "$detail"
+            return 0
+        fi
+        sleep 1
+    done
+    qd_die "服务在 30 秒内未完成 TCP 监听。$detail
+查看 journalctl --user -u $unit -e；portal 首次授权需在主机桌面确认。软件可能已安装，请修正后重跑。"
 }
-
-# ---- 主流程 ------------------------------------------------------------------------
 
 main() {
     parse_args "$@"
     qd_require_not_root
     qd_require_ubuntu
-    enforce_version_floor
-
     local arch
     arch="$(dpkg --print-architecture)"
-    case "$arch" in
-        amd64|arm64) ;;
-        *) qd_die "官方 release 仅提供 amd64/arm64 的 Ubuntu 24.04 .deb；当前架构: $arch" ;;
-    esac
-
-    resolve_bind_address   # 先解析，避免下载后才失败
+    case "$arch" in amd64|arm64) ;; *) qd_die "不支持架构 $arch";; esac
+    preflight
     install_package "$arch"
     converge_caps
     converge_input_access
     configure_sunshine
     enable_service
-
-    qd_section '完成'
     cat <<EOF_DONE
-Sunshine 主机已就绪。
-  Web UI（绑定到所选地址）: https://$BIND_ADDRESS:${WEB_UI_PORT}
-  首次使用请在 Web UI 设置用户名/密码（凭据只落本机，不进入本仓库）。
-  Moonlight 客户端添加主机地址: $BIND_ADDRESS，配对 PIN 在 Web UI 的 PIN 页面输入。
-提醒: Sunshine 需要本机保持已登录的图形会话；锁屏/睡眠/DPMS 设置本脚本未做任何改动。
+Sunshine 已部署，控制端口已监听。
+  Web UI: https://$BIND_ADDRESS:$WEB_UI_PORT
+  Moonlight 手动添加: $BIND_ADDRESS:$BASE_PORT
+首次在 Web UI 设置管理员凭据；核对待配对客户端/来源后输入 Moonlight 显示的 PIN。
+尚未验证实际 Desktop 串流：请从客户端检查画面、键鼠和断开重连。
 EOF_DONE
 }
-
 main "$@"

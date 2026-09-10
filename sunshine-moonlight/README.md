@@ -1,189 +1,117 @@
-# sunshine-moonlight — Tailscale 内网桌面串流
+# Ubuntu 桌面串流：Sunshine + Moonlight
 
-用 Sunshine（主机端）+ Moonlight（客户端）在 Tailnet 内串流 Ubuntu 桌面。
-目标：可重复安装、可诊断、可回滚，且不改锁屏/睡眠设置、不向公网暴露任何端口。
+**A 是被控主机，安装 Sunshine；B 是控制端，安装 Moonlight。** 两端通过 Tailscale 连接，接管 A 已登录的图形桌面。本目录独立使用，不接入 `fresh-install`。
 
-- 主机（被串流的一方，如 Y9000P `100.123.34.64`）：Ubuntu 24.04+，安装 Sunshine。
-- 客户端（发起串流的一方，本机 `100.125.138.103`）：Ubuntu 24.04+ x86_64，安装 Moonlight。
-- 传输层：Tailscale。两端必须先在 Tailnet 内（见 `../tailscale/`）。
+## 开始之前
 
-## 架构与角色划分
+- 两端运行 Ubuntu 24.04；B 必须是 x86_64，A 支持 amd64/arm64。
+- 两端先加入同一 Tailnet，允许 B 访问 A。需要内核网络模式的 `tailscale0`，可先使用 `../tailscale/`。
+- A 已登录本地图形桌面，有可捕获的显示输出及正常的显卡驱动。用该桌面用户运行脚本，**不要用 sudo 运行整个脚本**；包安装步骤会自行调用 sudo。
+- 需要 `curl`、`python3` 等命令；脚本发现缺失会提示。主机安装从 GitHub 下载官方 Ubuntu/架构匹配的 deb；客户端解包官方 AppImage，不依赖 FUSE，不引入 Snap/Flatpak。
 
-```
-客户端 (Moonlight)  ──Tailscale 加密隧道──>  主机 (Sunshine)
-  解码/显示/键鼠手柄输入                        捕获桌面画面 + 编码 + 注入输入
-```
-
-- **Sunshine 是 systemd 用户服务**，跑在主机上已登录的图形会话里，镜像的是"当前那个桌面"，
-  不是登录界面，也不是独立虚拟桌面。
-- **Moonlight 是客户端应用**，官方 AppImage 解包后装在用户目录，不经 Snap/Flatpak。
-- **Tailscale 只做传输**。 pairing（配对）、画面、输入全部走 Tailnet 地址。
-
-## 安装
-
-两个脚本都不要用 root/sudo 运行；需要管理员权限的步骤会自行调用 sudo。
-
-### 主机端（在 Y9000P 上执行）
+## 1. 在 A 安装 Sunshine
 
 ```bash
 cd ~/quick-deploy/sunshine-moonlight
-./install-host.sh                     # 默认 v2026.516.143833，绑定当前 tailscale IPv4
-# 可选：
-./install-host.sh --capture kms       # 显式指定捕获后端：auto|kms|portal|x11
-./install-host.sh --bind-address 100.123.34.64   # 显式绑定地址
+./install-host.sh
+tailscale ip -4
 ```
 
-行为要点：
+记下 A 的 Tailnet IPv4。安装器会输出两项：
 
-- 版本下限 `v2026.516.143833`（修复 CVE-2026-32253，CVSS 9.8）。低于下限一律拒绝，**没有绕过开关**。
-- 未安装或需要升级时，只选择与当前 Ubuntu `VERSION_ID` 和 CPU 架构完全匹配的官方 `.deb`，并与 GitHub API 返回的 SHA-256 digest 比对，通过才交给 apt；不匹配即放弃。已安装同版直接收敛配置，不重复下载/重装；已安装更高版会保留并拒绝降级。
-- 官方包的 postinst 已经做了 setcap（`cap_sys_admin,cap_sys_nice+p`）、加载 uhid、
-  安装 udev 规则；脚本只**验证并在缺失时修复**，不重复安装包所有的规则。
-- 输入设备走 systemd-logind 的 uaccess ACL（图形会话用户天然可读写 `/dev/uinput`、`/dev/uhid`）；
-  只有有效访问缺失时才退回把你加入 `input` 组（需重新登录生效）。
-- 配置只做定向收敛：`upnp = disabled`、`bind_address = <tailnet IP>`、
-  `csrf_allowed_origins` 追加本机来源、可选 `capture`。
-  `~/.config/sunshine/sunshine.conf` 里的其它键、注释、凭据全部原样保留；内容变化时把修改前版本滚动备份为 `sunshine.conf.bak`，无变化不刷新备份、不重启正在串流的服务。
-- 启用 canonical 用户服务 `app-dev.lizardbyte.app.Sunshine.service`
-  （旧别名 `sunshine.service` 也可识别）。
+- **Web UI**：`https://<A 的 Tailnet IPv4>:47990`
+- **Moonlight 手动添加地址**：`<A 的 Tailnet IPv4>:47989`
 
-### 客户端（在本机执行）
+若配置过自定义端口，以安装器输出为准。默认保留已有有效的捕获选择；需要明确选择时：
+
+```bash
+./install-host.sh --capture kms       # DRM/KMS
+./install-host.sh --capture portal    # 桌面门户
+./install-host.sh --capture x11       # Xorg 会话
+./install-host.sh --capture auto      # 删除 capture 键，恢复自动选择
+```
+
+已有有效后端设置会保留；`wlr`、`kwin` 需要 Wayland，`x11` 需要 Xorg。脚本拒绝与会话类型冲突的选择，具体 compositor/显卡是否可用仍需连接 Desktop 检查。无效值（如 `xcb` 或字面值 `auto`）会报错，由你明确选择修正方式。
+
+## 2. 在 B 安装 Moonlight 并配对
 
 ```bash
 cd ~/quick-deploy/sunshine-moonlight
-./install-client.sh                   # 默认 v6.1.0
+./install-client.sh
+~/.local/bin/moonlight
 ```
 
-行为要点：
+1. 在浏览器打开 A 的 Web UI，确认地址后接受自签名证书提示。首次设置 Sunshine 管理员用户名与密码。
+2. 在 Moonlight 手动添加安装器输出的主机地址；Tailnet 上不依赖自动发现。
+3. Moonlight 在 B 显示 PIN。到 A 的 Web UI **PIN** 页面，核对待配对客户端名称与来源地址，选择对应请求，**输入 B 显示的 PIN**。
+4. 配对完成后，在 Moonlight 选择 **Desktop**。
 
-- 官方 AppImage 用**固定 SHA-256 + 精确字节数**双重校验
-  （`0e855ffd…80b400` / 55325888 字节），全部通过才落盘。
-- 直接运行 AppImage 在 Ubuntu 24.04 会失败（只有 fuse3，缺 `libfuse.so.2`）。
-  因此用 `--appimage-extract` 解包（不依赖 FUSE），安装解包后的目录：
-  - 程序：`~/.local/opt/moonlight/6.1.0/`（含 `AppRun` 与摘要标记 `.quick-deploy-sha256`）
-  - 启动包装：`~/.local/bin/moonlight`
-  - 桌面项：`~/.local/share/applications/com.moonlight_stream.Moonlight.desktop`
-- 不安装 libfuse2，不用 Snap/Flatpak。仅支持 x86_64。
-- 重跑幂等：摘要一致则跳过下载，只修复包装/桌面项。
+Web UI 只绑定 A 的 Tailnet IPv4；远端 `localhost:47990` 不是它的监听地址。若使用 SSH 隧道，转发目标必须是 A 的 Tailnet IPv4 和实际 Web UI 端口。
 
-## 配对与首次连接
+## 3. 先连接，再调整画质
 
-1. 主机上打开 Sunshine Web UI（仅限 Tailnet 内访问）：
-   `https://100.123.34.64:47990`（首次设置管理员用户名/密码，凭据只落在主机本机）。
-   若希望通过 SSH 隧道访问，转发目标也必须是 Sunshine 实际绑定的 Tailnet 地址（它没有监听远端 localhost）：
-   ```bash
-   ssh -L 47990:100.123.34.64:47990 <主机用户>@100.123.34.64
-   # 然后访问 https://localhost:47990（首次会看到自签名证书提示）
-   ```
-   Sunshine 内置允许 localhost Web UI origin；也可以直接在 Tailnet 内访问 `https://100.123.34.64:47990`。
-2. 客户端启动 Moonlight（`~/.local/bin/moonlight` 或应用列表），手动添加主机 `100.123.34.64`。
-3. Moonlight 显示 4 位 PIN；到主机 Web UI 的 **PIN** 页面输入完成配对。
-4. 配对后即可在 Moonlight 里看到主机桌面/应用入口。
+先用 **1080p、60 FPS、20 Mbps**。在 A 打开一个空白编辑器，通过 B 检查画面持续更新、鼠标位置准确、键盘文字能输入；随后断开并重新连接，确认回到同一桌面。
 
-## 捕获后端：kms / portal / x11 怎么选
+- `Ctrl+Alt+Shift+Q`：退出串流；`Z`：切换键鼠捕获；`X`：切换全屏。
+- `Ctrl+Alt+Shift+S`：性能统计；`M`：切换鼠标模式（以上均保留相同修饰键）。
+- 卡顿时先看性能统计，再用 `tailscale ping` 检查到 A 的连接是 direct 还是 relay。延迟和可用吞吐会影响串流，不能只凭成功配对判断网络质量。
 
-`--capture` 不传时脚本不写 `capture` 键，由 Sunshine 自选（相当于 auto）。
+本流程捕获一个选定的显示输出，不保证同时映射 A/B 两块显示器。它不创建登录前桌面、不自动登录，也不提供文件传输或完整双向剪贴板；文件可走 `scp`/SFTP。
 
-| 后端 | 适用 | 代价/限制 |
-|---|---|---|
-| `kms` | 低延迟，绕过桌面门户限制 | 需要活跃的 DRM connector；**屏幕 DPMS 关闭时会报 `Couldn't find monitor`**；需要 cap_sys_admin（脚本已收敛） |
-| `portal` | Wayland/GNOME 桌面，可在部分熄屏场景存活 | 依赖 GNOME portal 授权策略，可能残留过期授权 token |
-| `x11` | X11 会话 | 传统捕获；注意现行配置值是 `x11`，**`xcb` 是旧名已失效**，写了会导致捕获初始化失败 |
+## 端口与访问范围
 
-本机当前是 X11 会话；远端按实际会话类型选择。doctor 会把 `xcb` 标为失败项。
+以基准端口 `p` 表示（默认 `47989`）：
 
-## 边界：DPMS / 锁屏 / 登录
+| 用途 | 协议与端口 |
+|---|---|
+| 配对/控制 HTTP、HTTPS | TCP `p`、`p−5` |
+| Web UI | TCP `p+1` |
+| RTSP | TCP `p+21` |
+| 视频、控制、音频 | UDP `p+9`、`p+10`、`p+11` |
 
-- **Sunshine 镜像的是已登录的图形桌面**。GDM 登录界面之前没有会话，Sunshine 不在那种模式工作；
-  `loginctl enable-linger` **不是**无人值守/预登录方案，脚本明确拒绝推荐它。
-- **锁屏**：串流看到的是锁屏画面；解锁行为取决于桌面环境，不要用串流当作绕过锁屏的手段。
-- **DPMS/睡眠**：屏幕省电关闭时 kms 捕获可能失败（无活跃 connector）。
-  本仓库**不替你改**锁屏、睡眠、DPMS 任何设置——需要主机不熄屏请自己在系统设置里调整，这是一个显式的本机取舍。
+默认 TCP 为 `47984,47989,47990,48010`，UDP 为 `47998,47999,48000`。UDP 可能只在串流时监听。
 
-## 端口与网络暴露
+如 `port = 48000`，Moonlight 添加 `<A_IP>:48000`，Web UI 为 `https://<A_IP>:48001`。基准端口须为 `1029–65514` 的十进制整数，不带前导零。
 
-- 默认端口：TCP `47984`、`47989`、`47990`（Web UI）、`48010`；UDP `47998`、`47999`、`48000`、`48002`、`48010`。若修改 `sunshine.conf` 的基准 `port`（合法范围 `1029–65514`），这一组端口会按 Sunshine 的规则整体偏移，Web UI 为 `port + 1`。
-- 安装后 Web UI 绑定在 tailnet 地址（默认 `100.123.34.64`），**不绑 0.0.0.0**；
-  `upnp = disabled` 防止路由器自动映射端口。
-- 不做任何公网/NAT 放行。防火墙保持默认即可；请确认没有对公网放行 47984-48010。
-- 绑定 tailnet 地址的固有取舍：tailscaled 不在线或 IP 变化时 Sunshine 监听会失败——这是用可用性换安全。
+脚本验证本机在线且已分配的 Tailnet IPv4，设置 `address_family=ipv4` 与 `upnp=disabled`，不修改防火墙、不添加公网/NAT 映射。已有防火墙与 Tailnet ACL 仍须允许 B→A。`--bind-address` 不能用来改绑 LAN、公网或通配地址。
 
-## Moonlight 常用快捷键（串流会话内）
-
-- `Ctrl+Alt+Shift+Q`：退出当前串流会话
-- `Ctrl+Alt+Shift+Z`：切换键鼠捕获（抓/放）
-- `Ctrl+Alt+Shift+X`：切换全屏/窗口
-- `Ctrl+Alt+Shift+S`：打开性能统计叠加层
-- `Ctrl+Alt+Shift+M`：切换鼠标模式（远程桌面/指针）
-
-## 这条链路不做什么（及替代方案）
-
-- **没有原生文件传输**：Sunshine/Moonlight 不传文件。用：
-  - `sftp <主机用户>@100.123.34.64` 或 `scp`；
-  - `tailscale file cp`（Taildrop）在两台 Tailscale 设备间互传。
-- **没有可靠的双向剪贴板**：不要依赖跨端复制粘贴作为工作流；重要内容走文件传输。
-- **终端连续性**：`ssh <主机用户>@100.123.34.64` + `tmux` 是命令行工作的主通道；
-  串流用于必须看图形界面的场景，两者互补。
-
-## 日常运维
-
-### 检查（只读，不改任何东西）
+## 检查与排障
 
 ```bash
-./doctor.sh            # 自动检测角色
-./doctor.sh --host     # 只查主机项
-./doctor.sh --client   # 只查客户端项
+./doctor.sh --host       # 在 A
+./doctor.sh --client     # 在 B
+journalctl --user -u app-dev.lizardbyte.app.Sunshine.service -e
 ```
 
-退出码 0=无失败项。检查项：系统版本、图形会话、Tailscale 状态、包版本与安全基线、
-用户服务、capability、输入设备有效 ACL、配置键（含 xcb 旧值告警）、监听端口、GPU/编码器信号。
-注意 doctor 从不执行 `sunshine --version`（它会写日志，不是只读）；版本一律从 dpkg 元数据读。
+Doctor 只读；退出 1 表示必需条件不满足。它检查包、实际服务配置路径、图形会话、输入节点及控制 TCP 监听；不会主动启动捕获。安装器显示“已监听”仍需上面的 Desktop 连接检查。
 
-### 升级
+| 现象 | 处理 |
+|---|---|
+| Web UI 不通 | 核对 A 的 `tailscale ip -4`、安装器输出端口、服务日志与 ACL。Tailscale 恢复后服务若触发启动限流，可执行 `systemctl --user reset-failed app-dev.lizardbyte.app.Sunshine.service`，再重跑安装器。 |
+| 提示配置路径/override 冲突 | 统一 shell 与用户管理器的 `XDG_CONFIG_HOME`/`CONFIGURATION_DIRECTORY`；先核对自定义 service/drop-in。脚本拒绝猜测自定义 ExecStart 使用的配置。 |
+| 提示 `origin_web_ui_allowed=pc` | 该设置只允许本机来源。若同意 Tailnet Web UI 访问，手动改为 `lan` 后重跑；不需要 `wan`。 |
+| 黑屏或 `Couldn't find monitor` | 检查输出选择、驱动和活动 scanout。KMS 在 DPMS 关闭或无头时可能丢失可捕获 framebuffer；并非所有这类错误都由熄屏引起。 |
+| GNOME 锁屏后 portal 断开 | GNOME 46 会终止门户捕获，先解锁，必要时重新授权。KMS/X11 的锁屏和熄屏表现须在目标机器确认。 |
+| 键鼠无效 | 检查 `/dev/uinput`、包内 udev 规则和活动会话 ACL；节点缺失不是组权限问题。`/dev/uhid` 主要关系到手柄。 |
 
-- 主机：`./install-host.sh --version v<新版本>`（仍受版本下限约束；release 必须提供当前 Ubuntu/架构的官方 `.deb` 和 GitHub SHA-256 digest）。
-- 客户端脚本只接受固定版本 `v6.1.0`。升级 Moonlight 时，先从官方 release 下载新 AppImage，人工核对 SHA-256 与精确大小，再更新 `install-client.sh` 顶部的版本、`PINNED_SHA256` 和 `PINNED_SIZE`；未固化校验值的新版本会被拒绝。
+脚本不改锁屏、睡眠、DPMS，不把 `loginctl enable-linger` 当作登录前远控方案。
 
-### 卸载与归属
+## 升级、卸载与维护
+
+版本、维护基线及客户端固定摘要集中在 [`lib/common.sh`](lib/common.sh)。Sunshine 基线包含上游 2026 年 9 月公布的修复；下载先校验摘要和 deb 元数据，再安装。相同上游版本跳过重装，更高版本保留；包、capability 或配置变化时会重启活动服务，中断当前串流。
+
+主机升级可用 `./install-host.sh --version v版本号`。保留原配置及凭据，配置变化前备份为同目录的 `sunshine.conf.bak`。新版本可能改变显示编号，升级后核对选中的显示器。
+
+客户端只接受固定版本；升级前核对官方新 AppImage 的 SHA-256 与精确大小，再更新共享定义。目录中的摘要标记记录下载来源，不表示已重新校验解包后的全部内容。
 
 ```bash
-./uninstall.sh --client                 # 移除 quick-deploy 安装的 Moonlight 文件
-./uninstall.sh --host-package           # apt remove sunshine（仅限本脚本引入的安装）
-./uninstall.sh --destroy-host-state     # 删除 ~/.config/sunshine（凭据/配对，不可恢复）
+./uninstall.sh --client                 # 只删本流程带标记的客户端内容
+./uninstall.sh --host-package           # 先停用当前用户服务，再移除本流程引入的包
+./uninstall.sh --destroy-host-state     # 先停止并禁用服务，再删除有效配置目录；不可恢复
 ```
 
-归属规则：
+主机包移除默认保留凭据，预先存在的包默认拒绝删除；`--help` 说明显式强制选项。状态删除会停止并禁用服务，避免下次图形登录用默认配置启动；再次使用前重跑 `./install-host.sh` 恢复 Tailnet 配置与服务。配置目录本身若为符号链接，会在停止服务前拒绝删除；普通 HOME/XDG 父目录链接不受此限制。目录外的凭据不在删除范围；其他用户或手动启动的 Sunshine 实例会报告 PID/UID，不会被终止。
 
-- 客户端只删带 `quick-deploy` 标记的文件/目录；外来内容一律保留并说明。
-- 主机的 `sunshine` 包：只有 `~/.local/state/quick-deploy/sunshine-moonlight/host.state`
-  证明它由本脚本首次引入时才允许移除；预先存在的安装默认拒绝，
-  需要显式 `--force-remove-preexisting-package`。
-- `~/.config/sunshine`（Web UI 凭据、配对状态）默认保留；删除必须是显式破坏性选择。
+维护时运行 `./tests/run.sh`：测试用临时 HOME、命令 mock 和真实 apt 模拟，不安装包或操作真实服务。
 
-### 安全基线
-
-- Sunshine 不得低于 `v2026.516.143833`（CVE-2026-32253，认证绕过，CVSS 9.8）。
-- 所有下载先校验后落盘；摘要不匹配即放弃，系统保持原状。
-- 脚本不以 root 运行；凭据、PIN、认证 URL 不进入本仓库。
-
-## 故障排查
-
-| 现象 | 先看 | 说明 |
-|---|---|---|
-| Web UI 打不开 | `./doctor.sh --host` 的"监听端口"项 | 绑定 tailnet 地址时 tailscaled 不在线会监听失败；确认 `tailscale ip -4` 与 `bind_address` 一致 |
-| 配对 PIN 页面拒绝 | 浏览器访问的 origin 与 Web UI 端口 | 默认直接用 `https://<bind_address>:47990`；自定义基准端口时 Web UI 是 `port+1`。SSH 隧道必须转发到远端的 `<bind_address>:<web-ui-port>`，不能转发到远端 localhost |
-| 串流黑屏/报 `Couldn't find monitor` | 主机屏幕是否 DPMS 关闭 | kms 捕获需要活跃 connector；唤醒屏幕或换 `--capture portal` |
-| 报 `Unable to initialize capture method` | `sunshine.conf` 里 `capture` 的值 | `xcb` 是旧名，改成 `x11`（doctor 会标红） |
-| 客户端键鼠无效 | doctor 的"输入注入"项 | 图形会话用户应经 uaccess 获得 `/dev/uinput`、`/dev/uhid` 读写；被加入 input 组后必须**重新登录**才生效 |
-| 服务起不来 | `journalctl --user -u app-dev.lizardbyte.app.Sunshine.service -e` | 纯 SSH 且无图形会话时用户服务无法正常捕获；先登录本机图形会话 |
-| Moonlight 直接运行 AppImage 报 `libfuse.so.2` | —— | 预期现象；请用安装后的 `~/.local/bin/moonlight`（解包部署，不需要 libfuse2） |
-| 升级后想确认版本 | `dpkg-query -W sunshine` | 不要跑 `sunshine --version`（非只读） |
-
-## 测试
-
-```bash
-./tests/run.sh
-```
-
-隔离测试：临时 HOME + PATH 命令 mock，不需要 root、不需要网络，
-绝不触碰真实 Sunshine/Moonlight 安装与 `~/.config/sunshine`。
+参考：[Sunshine 最新发行与安全修复](https://github.com/LizardByte/Sunshine/releases/latest) · [Sunshine 配置文档](https://docs.lizardbyte.dev/projects/sunshine/latest/md_docs_2configuration.html) · [Moonlight 使用指南](https://github.com/moonlight-stream/moonlight-docs/wiki/Setup-Guide)

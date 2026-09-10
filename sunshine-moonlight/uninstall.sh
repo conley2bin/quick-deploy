@@ -3,7 +3,7 @@
 # 只移除本目录脚本创建/拥有的内容；外来文件一律保留并说明。
 #
 # 默认保护：
-#   - ~/.config/sunshine（含 Web UI 凭据与配对状态）默认保留；
+#   - 有效 Sunshine 配置目录（默认 ~/.config/sunshine）默认保留；
 #     只有显式 --destroy-host-state 才删除。
 #   - sunshine 包：仅当 install-host.sh 的归属记录证明它由本脚本首次引入时才允许移除；
 #     预先存在的 Sunshine 一律拒绝移除，除非再加 --force-remove-preexisting-package。
@@ -20,7 +20,7 @@ WRAPPER="$HOME/.local/bin/moonlight"
 DESKTOP_FILE="$HOME/.local/share/applications/com.moonlight_stream.Moonlight.desktop"
 
 # 测试专用钩子（tests/run.sh 使用；真实运行不要设置）
-CONFIG_DIR="${QD_SUNSHINE_CONFIG_DIR:-$HOME/.config/sunshine}"
+CONFIG_DIR=''
 STATE_DIR="${QD_HOST_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/quick-deploy/sunshine-moonlight}"
 STATE_FILE="$STATE_DIR/host.state"
 
@@ -38,7 +38,7 @@ usage() {
 动作:
   --client                           移除 quick-deploy 安装的 Moonlight 客户端文件
   --host-package                     apt remove sunshine（仅限本脚本引入的安装）
-  --destroy-host-state               删除 ~/.config/sunshine（含凭据/配对，不可恢复）
+  --destroy-host-state               停止并禁用服务，删除有效 Sunshine 配置目录（不可恢复）
 
 选项:
   --force-remove-preexisting-package  确认移除「并非本脚本引入」的 sunshine 包
@@ -122,7 +122,11 @@ remove_client() {
 remove_host_package() {
     qd_section '移除 sunshine 包'
     if ! dpkg-query -W -f='${db:Status-Status}' sunshine 2>/dev/null | grep -qx installed; then
-        qd_info 'sunshine 包未安装，无需移除'
+        rm -f "$STATE_FILE" "$STATE_DIR/last-install"
+        local remaining
+        remaining="$(qd_sunshine_processes)" || qd_die '无法查询残留 Sunshine 实例'
+        [ -z "$remaining" ] || qd_die "包已不在 installed 状态，但仍有 Sunshine 实例（未终止）：$remaining"
+        qd_info 'sunshine 包未安装；已清理过期归属记录'
         return 0
     fi
 
@@ -150,21 +154,36 @@ remove_host_package() {
             fi ;;
     esac
 
+    stop_host_service
     qd_sudo apt-get remove -y sunshine
     if dpkg-query -W -f='${db:Status-Status}' sunshine 2>/dev/null | grep -qx installed; then
         qd_die 'apt remove 返回后 sunshine 仍处于 installed 状态；保留归属记录以便重试'
     fi
-    # Once the owned package is gone, its ownership proof must go too. Keeping
-    # package_preexisting=false would make a later manual reinstall look owned
-    # by quick-deploy and a subsequent uninstall could delete foreign state.
+    # Clear ownership as soon as package absence is verified, even if reload later fails.
     rm -f "$STATE_FILE" "$STATE_DIR/last-install"
     rmdir "$STATE_DIR" 2>/dev/null || true
-    qd_info 'sunshine 包已移除（apt remove，非 purge），主机归属记录已清理。配置目录 ~/.config/sunshine 保留。'
+    systemctl --user daemon-reload || qd_die '移除包后用户管理器 reload 失败'
+    qd_info "sunshine 包已移除，归属记录已清理；配置目录 $CONFIG_DIR 保留。"
+}
+
+stop_host_service() {
+    local unit remaining
+    unit="$(qd_find_unit || true)"
+    if [ -n "$unit" ]; then
+        systemctl --user disable --now "$unit" || qd_die "无法停止/禁用 $unit；未删除包或状态"
+        if systemctl --user is-active --quiet "$unit"; then qd_die "$unit 仍 active；拒绝删除"; fi
+        if systemctl --user is-enabled --quiet "$unit"; then qd_die "$unit 仍 enabled；拒绝删除"; fi
+    fi
+    remaining="$(qd_sunshine_processes)" || qd_die '无法查询残留 Sunshine 进程；拒绝删除'
+    [ -z "$remaining" ] || qd_die "仍有 Sunshine 实例运行（不会终止其他用户/手动进程）：
+$remaining
+请由进程所有者停止后重跑。"
 }
 
 destroy_host_state() {
     qd_section '删除 Sunshine 主机状态'
-    qd_warn "即将删除 $CONFIG_DIR（含 Web UI 凭据与所有配对状态，不可恢复）"
+    stop_host_service
+    qd_warn "即将删除 $CONFIG_DIR（不可恢复）；目录外的凭据不在删除范围。服务已停止并禁用，再次使用前请重跑 install-host.sh"
     if [ ! -d "$CONFIG_DIR" ]; then
         qd_info '配置目录不存在，无需删除'
         return 0
@@ -177,6 +196,16 @@ destroy_host_state() {
 main() {
     parse_args "$@"
     qd_require_not_root
+    if [ "$DO_HOST_PACKAGE" = true ] || [ "$DESTROY_HOST_STATE" = true ]; then
+        local selected_config
+        selected_config="$(qd_host_config_path)" || exit 1
+        CONFIG_DIR="$(qd_host_config_dir)" || exit 1
+        if [ "$DESTROY_HOST_STATE" = true ] && [ -L "${selected_config%/}" ]; then
+            qd_die "拒绝删除符号链接配置目录 $selected_config：它指向 $CONFIG_DIR，递归删除会移除目标内容。请先人工核对；服务未停止"
+        fi
+        qd_check_service_config "$CONFIG_DIR" || qd_die '有效服务配置路径不明确；未执行卸载'
+        [ "$CONFIG_DIR" != / ] && [ "$CONFIG_DIR" != "$HOME" ] || qd_die '拒绝删除根目录或 HOME'
+    fi
     [ "$DO_CLIENT" = true ] && remove_client
     [ "$DO_HOST_PACKAGE" = true ] && remove_host_package
     [ "$DESTROY_HOST_STATE" = true ] && destroy_host_state

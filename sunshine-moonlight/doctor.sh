@@ -1,368 +1,179 @@
 #!/bin/bash
-# quick-deploy/sunshine-moonlight/doctor.sh
-# 只读诊断：不安装、不修改、不启动任何服务。
-# 注意：绝不执行 `sunshine --version`（它会读配置并写 sunshine.log，不是只读）；
-# 版本一律从 dpkg 包元数据读取。
-
+# Read-only checks. Never execute Sunshine: even --version can write configuration/logs.
 set -euo pipefail
-
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/common.sh
 . "$SCRIPT_DIR/lib/common.sh"
 
-FLOOR_VERSION='2026.516.143833'
-FLOOR_CVE='CVE-2026-32253'
-CANONICAL_UNIT='app-dev.lizardbyte.app.Sunshine.service'
-ALIAS_UNIT='sunshine.service'
-# sunshine.conf 的 port 是基准端口（默认 47989）；Web UI 监听 base+1（默认 47990）
-DEFAULT_BASE_PORT='47989'
-MOONLIGHT_PINNED_SHA='0e855ffd22d407e18ab5fdb575fed5f01ca119a3f91993c5f0213f15ac80b400'
-
-# 测试专用钩子（tests/run.sh 使用；真实运行不要设置）
-CONFIG_DIR="${QD_SUNSHINE_CONFIG_DIR:-$HOME/.config/sunshine}"
-CONFIG_FILE="$CONFIG_DIR/sunshine.conf"
-UINPUT_NODE="${QD_UINPUT_NODE:-/dev/uinput}"
-UHID_NODE="${QD_UHID_NODE:-/dev/uhid}"
-SYSTEMD_USER_DIR="${QD_SYSTEMD_USER_DIR:-/usr/lib/systemd/user}"
-OPT_DIR="$HOME/.local/opt/moonlight"
-WRAPPER="$HOME/.local/bin/moonlight"
-DESKTOP_FILE="$HOME/.local/share/applications/com.moonlight_stream.Moonlight.desktop"
-
 CHECK_HOST=false
 CHECK_CLIENT=false
-EXPLICIT_CLIENT=false   # 显式 --client 时未安装 Moonlight 记失败；自动检测时只警告
+EXPLICIT_CLIENT=false
 FAILURES=0
 WARNINGS=0
-
-ok()   { printf '  [通过] %s\n' "$*"; }
+ok() { printf '  [通过] %s\n' "$*"; }
 warn() { printf '  [警告] %s\n' "$*"; WARNINGS=$((WARNINGS+1)); }
-bad()  { printf '  [失败] %s\n' "$*"; FAILURES=$((FAILURES+1)); }
-
+bad() { printf '  [失败] %s\n' "$*"; FAILURES=$((FAILURES+1)); }
 usage() {
-    cat <<USAGE
-用法: ./doctor.sh [--host] [--client] [-h]
-
-只读诊断。不带参数时自动检测角色（装了 Sunshine 查主机项，装了 Moonlight 查客户端项，
-两者都没有则两类都查）。退出码: 0=无失败项, 1=存在失败项。
-严重性约定：显式 --client 时「未安装 Moonlight」记失败（退出码 1）；
-自动检测模式下同一状态只记警告（可能只是不想在这台机器装客户端）。
-USAGE
-}
-
-# ---- 通用 --------------------------------------------------------------------------
-
-check_os() {
-    qd_section '系统'
-    if [ -r "$QD_OS_RELEASE_FILE" ]; then
-        # shellcheck disable=SC1090
-        . "$QD_OS_RELEASE_FILE"
-        if [ "${ID:-}" = ubuntu ] && dpkg --compare-versions "${VERSION_ID:-0}" ge 24.04; then
-            ok "系统: ${PRETTY_NAME:-Ubuntu}"
-        else
-            bad "仅支持 Ubuntu 24.04+: ${PRETTY_NAME:-未知}"
-        fi
-    else
-        bad "无法读取 $QD_OS_RELEASE_FILE"
-    fi
-    printf '  [信息] 架构: %s\n' "$(dpkg --print-architecture 2>/dev/null || uname -m)"
-    printf '  [信息] 会话类型: %s（显示服务器: %s）\n' \
-        "${XDG_SESSION_TYPE:-未知}" "${XDG_CURRENT_DESKTOP:-未知}"
-}
-
-# ---- 主机 ----------------------------------------------------------------------------
-
-check_host_session() {
-    qd_section '主机: 图形会话'
-    if [ -n "${XDG_SESSION_TYPE:-}" ]; then
-        ok "当前处于已登录会话（$XDG_SESSION_TYPE）"
-    else
-        warn '检测不到图形会话环境变量（可能正通过 SSH 诊断）。Sunshine 需要本机有已登录的图形用户会话；enable-linger 不是替代方案。'
-    fi
-}
-
-check_host_tailscale() {
-    qd_section '主机: Tailscale'
-    if ! command -v tailscale >/dev/null 2>&1; then
-        warn '未安装 tailscale（若仅局域网使用可忽略；远程串流建议先运行 ../tailscale/install.sh）'
-        return 0
-    fi
-    local ip
-    ip="$(tailscale ip -4 2>/dev/null | head -n1 || true)"
-    if [ -n "$ip" ]; then
-        ok "Tailscale IPv4: $ip"
-    else
-        warn 'tailscale 已安装但无 IPv4 地址（未登录或 tailscaled 未运行）'
-    fi
-    # bind_address 绑定 tailnet IP 的可用性权衡：tailscaled 不在线时 Sunshine 可能绑定失败
-    local bind
-    bind="$(qd_conf_get "$CONFIG_FILE" bind_address 2>/dev/null || true)"
-    if [ -n "$bind" ] && [[ "$bind" =~ ^100\. ]]; then
-        if [ -n "$ip" ] && [ "$ip" = "$bind" ]; then
-            ok "bind_address ($bind) 与当前 tailscale IPv4 一致"
-        else
-            warn "bind_address=$bind 是 Tailnet 地址，但当前 tailscale IP 为 '${ip:-无}'。tailscaled 不在线或 IP 变化时 Sunshine 监听会失败——这是绑定 tailnet 的固有取舍（安全换可用性）。"
-        fi
-    fi
-}
-
-check_host_package() {
-    qd_section '主机: Sunshine 包与安全基线'
-    local status version
-    status="$(dpkg-query -W -f='${db:Status-Status}' sunshine 2>/dev/null || true)"
-    if [ "$status" != installed ]; then
-        bad '未安装 sunshine 包（运行 ./install-host.sh）'
-        return 0
-    fi
-    version="$(dpkg-query -W -f='${Version}' sunshine 2>/dev/null)"
-    ok "已安装 Sunshine: $version"
-    if qd_version_ge "$version" "$FLOOR_VERSION"; then
-        ok "版本 >= v$FLOOR_VERSION（$FLOOR_CVE 已修复）"
-    else
-        bad "版本 $version 低于安全基线 v$FLOOR_VERSION（$FLOOR_CVE）！请立即升级: ./install-host.sh"
-    fi
-}
-
-check_host_service() {
-    qd_section '主机: systemd 用户服务'
-    local unit=''
-    if systemctl --user cat "$CANONICAL_UNIT" >/dev/null 2>&1 \
-        || [ -f "$SYSTEMD_USER_DIR/$CANONICAL_UNIT" ]; then
-        unit="$CANONICAL_UNIT"
-    elif systemctl --user cat "$ALIAS_UNIT" >/dev/null 2>&1 \
-        || [ -f "$SYSTEMD_USER_DIR/$ALIAS_UNIT" ]; then
-        unit="$ALIAS_UNIT"
-    fi
-    if [ -z "$unit" ]; then
-        bad "未找到 Sunshine 用户服务（$CANONICAL_UNIT / $ALIAS_UNIT）"
-        return 0
-    fi
-    ok "服务单元: $unit"
-    if systemctl --user is-enabled --quiet "$unit" 2>/dev/null; then
-        ok '已 enabled'
-    else
-        bad "未 enabled（运行: systemctl --user enable --now $unit）"
-    fi
-    if systemctl --user is-active --quiet "$unit" 2>/dev/null; then
-        ok '运行中 (active)'
-    else
-        bad "未在运行。查看: journalctl --user -u $unit -e（注意需要已登录图形会话）"
-    fi
-}
-
-check_host_caps() {
-    qd_section '主机: 捕获 capability'
-    local bin real cur
-    bin="$(dpkg -L sunshine 2>/dev/null | grep -E '/bin/sunshine$' | head -n1 || true)"
-    if [ -z "$bin" ]; then
-        bad '无法在 sunshine 包内定位 bin/sunshine'
-        return 0
-    fi
-    real="$(readlink -f "$bin")"
-    if ! command -v getcap >/dev/null 2>&1; then
-        warn '缺少 getcap（libcap2-bin），无法验证 capability'
-        return 0
-    fi
-    cur="$(getcap "$real" 2>/dev/null || true)"
-    if grep -q 'cap_sys_admin' <<<"$cur" && grep -q 'cap_sys_nice' <<<"$cur" && grep -q '=.*p' <<<"$cur"; then
-        ok "$cur"
-    else
-        warn "capability 缺失（当前: ${cur:-无}）。KMS 捕获需要 cap_sys_admin+p；portal 捕获可不需要。修复: ./install-host.sh 会自动收敛"
-    fi
-}
-
-check_host_input() {
-    qd_section '主机: 输入注入'
-    local node
-    for node in "$UINPUT_NODE" "$UHID_NODE"; do
-        if [ ! -e "$node" ]; then
-            warn "$node 不存在（官方包通常通过 udev/uhid 提供；若刚安装请重新登录）"
-        elif [ -r "$node" ] && [ -w "$node" ]; then
-            ok "$node 可读写（uaccess ACL 生效）"
-        else
-            warn "$node 存在但无有效读写权限；install-host.sh 会在此时把你加入 input 组（需重新登录）"
-        fi
-    done
-    if id -nG 2>/dev/null | tr ' ' '\n' | grep -qx 'input'; then
-        ok '当前用户在 input 组'
-    else
-        printf '  [信息] 当前用户不在 input 组（uaccess 生效时不需要）\n'
-    fi
-}
-
-check_host_config() {
-    qd_section '主机: 配置（仅显示受管键，不输出任何凭据）'
-    if [ ! -f "$CONFIG_FILE" ]; then
-        warn "配置文件不存在: $CONFIG_FILE（install-host.sh 会创建）"
-        return 0
-    fi
-    local key value
-    for key in upnp capture bind_address csrf_allowed_origins; do
-        value="$(qd_conf_get "$CONFIG_FILE" "$key" 2>/dev/null || true)"
-        if [ -z "$value" ]; then
-            case "$key" in
-                capture) ok 'capture 未设置（Sunshine 自动侦测，这是健康的默认状态）' ;;
-                *) warn "$key 未设置" ;;
-            esac
-            continue
-        fi
-        case "$key:$value" in
-            upnp:disabled) ok 'upnp = disabled' ;;
-            upnp:*) warn "upnp = $value（建议 disabled，避免路由器自动开端口）" ;;
-            capture:xcb) bad 'capture = xcb 是旧名，现行值为 x11；请修正（install-host.sh 重跑会自动移除）' ;;
-            capture:auto) bad 'capture = auto 是无效写法：自动侦测应为“配置里没有 capture 键”。请删除该行（./install-host.sh --capture auto 会自动移除）' ;;
-            capture:kms|capture:portal|capture:x11) ok "capture = $value" ;;
-            capture:*) bad "capture = $value 无法识别（合法: kms|portal|x11，自动侦测 = 删除该键）" ;;
-            *) printf '  [信息] %s = %s\n' "$key" "$value" ;;
-        esac
-    done
-}
-
-check_host_listeners() {
-    qd_section '主机: 监听端口'
-    command -v ss >/dev/null 2>&1 || { warn '缺少 ss（iproute2），跳过端口检查'; return 0; }
-    local base web out
-    base="$(qd_conf_get "$CONFIG_FILE" port 2>/dev/null || true)"
-    if [ -n "$base" ]; then
-        if [[ "$base" =~ ^[0-9]+$ ]] && [ "$base" -ge 1029 ] && [ "$base" -le 65514 ]; then
-            web=$((base + 1))
-        else
-            bad "配置里的 port 不是 Sunshine 合法基准端口（1029-65514）: '$base'"
-            return 0
-        fi
-    else
-        base="$DEFAULT_BASE_PORT"
-        web=$((base + 1))
-    fi
-    out="$(ss -tln 2>/dev/null || true)"
-    # Parse the first field ending in :<web-port>. This is the local listener;
-    # the peer column ends in :* and must not be mistaken for a wildcard bind.
-    local local_listener
-    local_listener="$(awk -v suffix=":$web" '
-        $1 == "LISTEN" || $2 == "LISTEN" {
-            for (i = 1; i <= NF; i++) {
-                if (length($i) >= length(suffix) && substr($i, length($i) - length(suffix) + 1) == suffix) {
-                    print $i
-                    exit
-                }
-            }
-        }
-    ' <<<"$out")"
-    if [ -n "$local_listener" ]; then
-        ok "TCP $web (Web UI，基准端口 $base + 1) 监听中: $local_listener"
-    else
-        warn "TCP $web 未监听（Sunshine 未运行或绑定失败——若绑定 tailnet 地址，确认 tailscaled 在线）"
-    fi
-    case "$local_listener" in
-        "0.0.0.0:$web"|"*:$web"|"[::]:$web"|":::$web")
-            warn "$web 绑定在通配地址。默认应只绑定 tailscale IP；确认防火墙未对公网放行 47984-48010。" ;;
-    esac
-}
-
-check_host_gpu() {
-    qd_section '主机: GPU/编码器信号（信息性）'
-    local -a render_nodes=()
-    mapfile -t render_nodes < <(find /dev/dri -maxdepth 1 -type c -name 'renderD*' -print 2>/dev/null | sort)
-    if [ "${#render_nodes[@]}" -gt 0 ]; then
-        ok "DRM 渲染节点: ${render_nodes[*]}"
-    else
-        printf '  [信息] 无 /dev/dri 渲染节点\n'
-    fi
-    if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi >/dev/null 2>&1; then
-        ok "NVIDIA: $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -n1)"
-    fi
-    if command -v vainfo >/dev/null 2>&1 && vainfo >/dev/null 2>&1; then
-        printf '  [信息] VA-API 可用\n'
-    fi
+    printf '%s\n' '用法: ./doctor.sh [--host] [--client]' \
+        '不带参数自动检测角色；退出码 1 表示必需条件不满足，0 不代表已完成双机串流测试。'
 }
 
 run_host_checks() {
-    check_host_session
-    check_host_tailscale
-    check_host_package
-    check_host_service
-    check_host_caps
-    check_host_input
-    check_host_config
-    check_host_listeners
-    check_host_gpu
-}
+    qd_section '主机'
+    local cmd dir conf unit session detail ip bind base version upstream capture family origin rc
+    for cmd in python3 systemctl loginctl tailscale ip ss; do
+        if ! command -v "$cmd" >/dev/null 2>&1; then bad "缺少 $cmd，无法检查主机"; return 0; fi
+    done
+    dir="$(qd_host_config_dir)" || { bad '无法确定配置目录'; return 0; }
+    conf="$dir/sunshine.conf"
+    if detail="$(qd_check_service_config "$dir" 2>&1)"; then
+        ok "有效配置目录: $dir"
+    else
+        bad "$detail"
+        # Do not draw config/listener conclusions from a possibly unused file.
+        return 0
+    fi
+    if session="$(qd_graphical_session)"; then ok "活动本地图形会话: $session"; else bad '没有当前用户的活动本地图形会话；SSH/tty 不是桌面'; fi
+    if ! detail="$(qd_check_display_environment "${session:-}" 2>&1)"; then bad "$detail"; fi
 
-# ---- 客户端 ----------------------------------------------------------------------------
+    if [ "$(dpkg-query -W -f='${db:Status-Status}' sunshine 2>/dev/null || true)" = installed ]; then
+        version="$(dpkg-query -W -f='${Version}' sunshine)"
+        if upstream="$(qd_upstream_version "$version")" && qd_version_ge "$upstream" "$QD_SUNSHINE_FLOOR"; then
+            ok "已安装包 $version；上游版本达到维护基线 v$QD_SUNSHINE_FLOOR"
+        else
+            bad "已安装包 $version 未达到/无法验证维护基线 v$QD_SUNSHINE_FLOOR"
+        fi
+    else
+        bad 'sunshine 包未安装'
+    fi
+    unit="$(qd_find_unit || true)"
+    if [ -z "$unit" ]; then
+        bad '未找到 Sunshine 用户服务'
+    else
+        if systemctl --user is-enabled --quiet "$unit"; then ok '用户服务已 enabled'; else bad '用户服务未 enabled'; fi
+        if systemctl --user is-active --quiet "$unit"; then
+            rc=0
+            detail="$(qd_running_binary_current "$unit" 2>&1)" || rc=$?
+            case "$rc" in
+                0) ok '用户服务运行的 executable 与已安装包一致';;
+                2) warn "$detail";;
+                *) bad "$detail";;
+            esac
+        else
+            bad "用户服务未运行；journalctl --user -u $unit -e"
+        fi
+    fi
+    if [ ! -f "$conf" ] || [ ! -r "$conf" ]; then bad "配置文件缺失/不可读: $conf"; return 0; fi
+    capture="$(qd_conf_get "$conf" capture || true)"
+    if qd_valid_capture "$capture"; then
+        ok "capture = ${capture:-自动选择}（可用性仍取决于桌面与驱动）"
+    else
+        bad "capture=$capture 无效；显式 --capture auto 删除，或选择有效后端；X11 使用 x11，不是 xcb"
+    fi
+    case "$capture:${session:-}" in
+        x11:*'(wayland)') bad 'capture=x11 与当前 Wayland 会话不符';;
+        wlr:*'(x11)'|kwin:*'(x11)') bad "capture=$capture 需要 Wayland，与当前 Xorg 会话不符";;
+    esac
+    if [ "$capture" = portal ]; then printf '  [信息] GNOME 46 锁屏会终止 portal 捕获，可能需要重新授权。\n'; fi
+    family="$(qd_conf_get "$conf" address_family || true)"
+    [ "${family:-ipv4}" = ipv4 ] || bad "address_family=$family 与本流程的 IPv4 绑定冲突"
+    origin="$(qd_conf_get "$conf" origin_web_ui_allowed || true)"
+    case "$origin" in
+        ''|lan|wan) ;;
+        pc) bad 'origin_web_ui_allowed=pc 阻止 Tailnet Web UI；同意 Tailnet 访问后改为 lan';;
+        *) bad "origin_web_ui_allowed=$origin 无法识别";;
+    esac
+    [ "$(qd_conf_get "$conf" upnp || true)" = disabled ] || bad '本流程要求 upnp=disabled'
+    ip=''
+    if detail="$(qd_tailnet_ip 2>&1)"; then ip="$detail"; ok "Tailscale 在线: $ip"; else bad "$detail"; fi
+    bind="$(qd_conf_get "$conf" bind_address || true)"
+    if [ -z "$ip" ] || [ "$bind" != "$ip" ]; then bad "bind_address=${bind:-未设置} 不等于本机在线 Tailnet IPv4"; fi
+    if base="$(qd_base_port "$conf")"; then
+        origin="https://$bind:$((base+1))"
+        if ! qd_conf_get "$conf" csrf_allowed_origins | tr ',' '\n' | sed 's/^[ \t]*//;s/[ \t]*$//' | grep -Fxq "$origin"; then
+            bad "csrf_allowed_origins 缺少 $origin，直接访问时的配对操作可能被拒绝"
+        fi
+        if [ -n "$unit" ]; then
+            if detail="$(qd_check_listeners "$bind" "$base" "$unit" 2>&1)"; then
+                ok "$detail"
+                if [[ "$detail" == *'未验证所有者'* ]]; then warn 'ss 未提供部分端口 PID；端口所有者尚未验证'; fi
+            else
+                bad "$detail"
+            fi
+        fi
+    else
+        bad '基准 port 无效'
+    fi
+    local bin caps uinput="${QD_UINPUT_NODE:-/dev/uinput}" uhid="${QD_UHID_NODE:-/dev/uhid}"
+    if [ -e "$uinput" ] && [ -r "$uinput" ] && [ -w "$uinput" ]; then
+        ok 'uinput 可读写（键鼠注入前提）'
+    else
+        bad "$uinput 缺失或无读写权限；检查 uinput 模块、包内 udev 规则、活动会话 ACL；组成员身份不能创建节点"
+    fi
+    if [ ! -e "$uhid" ] || [ ! -r "$uhid" ] || [ ! -w "$uhid" ]; then warn "$uhid 不可用，部分手柄功能受限"; fi
+    bin="$(qd_sunshine_binary 2>/dev/null || true)"
+    if [ -n "$bin" ] && command -v getcap >/dev/null 2>&1; then
+        caps="$(getcap "$bin" 2>/dev/null || true)"
+        if ! grep -qE 'cap_sys_(admin,cap_sys_nice|nice,cap_sys_admin)=e?p($| )' <<<"$caps"; then
+            if [ "$capture" = kms ]; then bad 'KMS capability 不完整；重跑主机安装器修复'; else warn '未确认 KMS capability，自动捕获可能选择其他后端'; fi
+        fi
+    elif [ "$capture" = kms ]; then
+        bad '无法检查 KMS capability（缺少 getcap 或 executable）'
+    fi
+    printf '  [信息] 实际画面、硬件编码与输入需从 Moonlight 的 Desktop 串流检查；此处不启动捕获。\n'
+}
 
 run_client_checks() {
-    qd_section '客户端: Moonlight'
-    local machine
-    machine="$(uname -m)"
-    if [ "$machine" = x86_64 ]; then
-        ok "架构 x86_64 受支持"
-    else
-        bad "架构 $machine 不受官方 AppImage 支持"
-    fi
-
-    local ver_dir="$OPT_DIR/6.1.0"
-    if [ -x "$ver_dir/AppRun" ] && [ -f "$ver_dir/.quick-deploy-sha256" ]; then
-        local recorded
-        recorded="$(cat "$ver_dir/.quick-deploy-sha256")"
-        if [ "$recorded" = "$MOONLIGHT_PINNED_SHA" ]; then
-            ok "安装目录与固定 SHA-256 一致: $ver_dir"
+    qd_section '客户端'
+    local opt="$HOME/.local/opt/moonlight" target wrapper desktop recorded
+    target="$opt/$QD_MOONLIGHT_VERSION"
+    wrapper="$HOME/.local/bin/moonlight"
+    desktop="$HOME/.local/share/applications/com.moonlight_stream.Moonlight.desktop"
+    [ "$(uname -m)" = x86_64 ] || bad '固定的 AppImage 只支持 x86_64'
+    if [ ! -d "$opt" ] && [ "$EXPLICIT_CLIENT" = false ]; then warn '未安装本流程的 Moonlight'; return 0; fi
+    if [ ! -x "$target/AppRun" ]; then bad "缺少可执行 AppRun: $target（运行 install-client.sh 修复）"; fi
+    if [ -f "$target/.quick-deploy-sha256" ]; then
+        recorded="$(cat "$target/.quick-deploy-sha256")"
+        if [ "$recorded" = "$QD_MOONLIGHT_SHA256" ]; then
+            ok "v$QD_MOONLIGHT_VERSION 的下载摘要记录符合固定值；未重新校验已解包内容"
         else
-            warn "安装记录摘要与 v6.1.0 固定值不一致（可能装的是其它版本）: $recorded"
+            bad '下载摘要记录不匹配；不能确认安装来源'
         fi
-    elif [ -d "$OPT_DIR" ]; then
-        warn "$OPT_DIR 存在但缺少完整的 6.1.0 安装标记"
-    elif [ "$EXPLICIT_CLIENT" = true ]; then
-        bad '未安装 Moonlight（运行 ./install-client.sh）'
     else
-        warn '未安装 Moonlight（运行 ./install-client.sh；自动检测模式下仅作提醒）'
+        bad '缺少 Moonlight 下载来源记录'
     fi
-
-    if [ -x "$WRAPPER" ] && grep -q 'quick-deploy/sunshine-moonlight' "$WRAPPER" 2>/dev/null; then
-        ok "启动包装: $WRAPPER"
+    if [ -x "$wrapper" ] && grep -qF 'quick-deploy/sunshine-moonlight' "$wrapper" && grep -Fxq "exec \"$target/AppRun\" \"\$@\"" "$wrapper"; then
+        ok 'CLI 包装指向固定版本'
     else
-        warn "启动包装缺失或外来: $WRAPPER"
+        bad 'CLI 包装缺失、外来或指向错误版本'
     fi
-    if [ -f "$DESKTOP_FILE" ] && grep -q 'quick-deploy/sunshine-moonlight' "$DESKTOP_FILE" 2>/dev/null; then
-        ok "桌面项: $DESKTOP_FILE"
+    if [ -f "$desktop" ] && grep -qF 'quick-deploy/sunshine-moonlight' "$desktop" && grep -Fxq "Exec=$wrapper" "$desktop"; then
+        ok '桌面入口指向 CLI 包装'
     else
-        warn "桌面项缺失或外来: $DESKTOP_FILE"
+        bad '桌面入口缺失、外来或指向错误程序'
     fi
 }
-
-# ---- 主流程 ------------------------------------------------------------------------------
 
 main() {
     while [ "$#" -gt 0 ]; do
         case "$1" in
-            --host) CHECK_HOST=true ;;
-            --client) CHECK_CLIENT=true; EXPLICIT_CLIENT=true ;;
-            -h|--help) usage; exit 0 ;;
-            *) qd_die "未知参数: $1" ;;
+            --host) CHECK_HOST=true;;
+            --client) CHECK_CLIENT=true; EXPLICIT_CLIENT=true;;
+            -h|--help) usage; exit 0;;
+            *) qd_die "未知参数: $1";;
         esac
         shift
     done
-
+    qd_require_not_root
+    qd_require_ubuntu
     if [ "$CHECK_HOST" = false ] && [ "$CHECK_CLIENT" = false ]; then
-        # 自动角色检测
-        if dpkg-query -W -f='${db:Status-Status}' sunshine 2>/dev/null | grep -qx installed \
-            || [ -f "$SYSTEMD_USER_DIR/$CANONICAL_UNIT" ]; then
-            CHECK_HOST=true
-        fi
-        if [ -d "$OPT_DIR" ] || [ -e "$WRAPPER" ]; then
-            CHECK_CLIENT=true
-        fi
-        if [ "$CHECK_HOST" = false ] && [ "$CHECK_CLIENT" = false ]; then
-            CHECK_HOST=true
-            CHECK_CLIENT=true
-        fi
+        if dpkg-query -W -f='${db:Status-Status}' sunshine 2>/dev/null | grep -qx installed; then CHECK_HOST=true; fi
+        if [ -d "$HOME/.local/opt/moonlight" ] || [ -e "$HOME/.local/bin/moonlight" ]; then CHECK_CLIENT=true; fi
+        if [ "$CHECK_HOST" = false ] && [ "$CHECK_CLIENT" = false ]; then CHECK_HOST=true; CHECK_CLIENT=true; fi
     fi
-
-    check_os
-    [ "$CHECK_HOST" = true ] && run_host_checks
-    [ "$CHECK_CLIENT" = true ] && run_client_checks
-
-    qd_section '结论'
-    printf '失败 %d 项，警告 %d 项。\n' "$FAILURES" "$WARNINGS"
+    [ "$CHECK_HOST" = false ] || run_host_checks
+    [ "$CHECK_CLIENT" = false ] || run_client_checks
+    printf '\n失败 %d 项，警告 %d 项。\n' "$FAILURES" "$WARNINGS"
     [ "$FAILURES" -eq 0 ]
 }
-
 main "$@"

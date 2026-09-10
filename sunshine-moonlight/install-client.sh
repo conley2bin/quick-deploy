@@ -1,21 +1,5 @@
 #!/bin/bash
-# quick-deploy/sunshine-moonlight/install-client.sh
-# 在 Ubuntu 24.04+ x86_64 上安装 Moonlight 客户端（官方 AppImage，解包模式）。
-#
-# 为什么解包而不是直接运行 AppImage：Ubuntu 24.04 默认只有 fuse3，
-# 直接运行 AppImage 会报 dlopen(): error loading libfuse.so.2。
-# --appimage-extract 不依赖 FUSE；解包后的 squashfs-root 直接可运行。
-# 因此本脚本不引入、也不要求安装 libfuse2。
-#
-# 不使用 Snap、不使用 Flatpak。
-# 只支持固定版本 v6.1.0：用脚本内置的 SHA-256 与精确字节数双重校验，全部通过才落盘。
-# 为什么不接受其它 --version：GitHub release v6.1 的 API asset digest 字段为 null，
-# “动态查 API 拿 digest”这条路既不可用也不如固定值安全——因此只有固定值一条信任路径。
-# 升级 = 手工把新版本的 sha256/大小固化进下方常量（见 README“升级”节）。
-#
-# 归属纪律：拒绝覆盖任何“外来”资产（无 quick-deploy 标记的启动包装、桌面项、
-# 目标版本目录、暂存目录），而不是先静默备份再让 uninstall 误删。
-
+# Install the pinned Moonlight AppImage as an extracted, user-owned application (no FUSE).
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -23,13 +7,11 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 . "$SCRIPT_DIR/lib/common.sh"
 
 GITHUB_REPO='moonlight-stream/moonlight-qt'
-DEFAULT_VERSION='v6.1.0'
+DEFAULT_VERSION="v$QD_MOONLIGHT_VERSION"
 
-# 固定校验值（v6.1.0 官方 AppImage）。升级版本时必须同步更新这两个常量。
-# 测试专用钩子（tests/run.sh 使用；真实运行不要设置）：
-#   QD_TEST_MOONLIGHT_SHA256 / QD_TEST_MOONLIGHT_SIZE —— 覆盖固定摘要与大小
-PINNED_SHA256="${QD_TEST_MOONLIGHT_SHA256:-0e855ffd22d407e18ab5fdb575fed5f01ca119a3f91993c5f0213f15ac80b400}"
-PINNED_SIZE="${QD_TEST_MOONLIGHT_SIZE:-55325888}"
+# Isolated tests substitute a small extraction fixture; production pins live in common.sh.
+PINNED_SHA256="${QD_TEST_MOONLIGHT_SHA256:-$QD_MOONLIGHT_SHA256}"
+PINNED_SIZE="${QD_TEST_MOONLIGHT_SIZE:-$QD_MOONLIGHT_SIZE}"
 
 MOONLIGHT_VERSION="$DEFAULT_VERSION"
 
@@ -49,8 +31,7 @@ usage() {
 
 选项:
   --version TAG   只接受固定版本 $DEFAULT_VERSION（内置 SHA-256+大小双重校验）。
-                  其它版本一律拒绝：API digest 不可用且强度不够；
-                  升级请手工核对后更新脚本内的 PINNED_SHA256/PINNED_SIZE。
+                  升级需核对新 AppImage 后更新 lib/common.sh 中的版本、摘要与大小。
   -h, --help      显示帮助
 USAGE
 }
@@ -61,7 +42,7 @@ parse_args() {
             --version)
                 [ "$#" -ge 2 ] || qd_die '--version 需要一个参数'
                 [[ "$2" =~ ^v[0-9]+(\.[0-9]+)*$ ]] \
-                    || qd_die "--version 标签格式非法: $2（期望形如 v6.1.0，仅 v+数字+点）"
+                    || qd_die "--version 标签格式非法: $2（期望 v+数字+点）"
                 MOONLIGHT_VERSION="$2"; shift ;;
             -h|--help) usage; exit 0 ;;
             *) qd_die "未知参数: $1（-h 查看用法）" ;;
@@ -70,8 +51,7 @@ parse_args() {
     done
     [ "$MOONLIGHT_VERSION" = "$DEFAULT_VERSION" ] \
         || qd_die "拒绝安装非固定版本 $MOONLIGHT_VERSION：本脚本只信任内置固定校验值（$DEFAULT_VERSION）。
-GitHub API 对该 release 的 asset digest 为 null，动态校验既不可用也不如固定值安全。
-升级流程：手工下载核对新版本 sha256/大小后，更新脚本顶部 PINNED_SHA256/PINNED_SIZE 常量。"
+升级流程：手工核对新版本后更新 lib/common.sh 的 Moonlight 版本、SHA-256 与大小。"
 }
 
 # ---- 下载与校验 -------------------------------------------------------------------
@@ -138,7 +118,7 @@ extract_and_install() {
         qd_die 'AppImage 解包失败；未安装任何内容'
     fi
     [ -d "$extract_tmp/squashfs-root" ] || qd_die '解包结果缺少 squashfs-root；未安装任何内容'
-    [ -e "$extract_tmp/squashfs-root/AppRun" ] || qd_die '解包结果缺少 AppRun；未安装任何内容'
+    [ -x "$extract_tmp/squashfs-root/AppRun" ] || qd_die '解包结果缺少 AppRun；未安装任何内容'
 
     mkdir -p "$OPT_DIR"
     staged="$OPT_DIR/.staging-$ver_num.$$"
@@ -174,6 +154,8 @@ already_converged() {
     ver_num="${MOONLIGHT_VERSION#v}"
     target="$OPT_DIR/$ver_num"
     [ -x "$target/AppRun" ] || return 1
+    [ -f "$target/com.moonlight_stream.Moonlight.desktop" ] || return 1
+    [ -r "$target/moonlight.svg" ] || return 1
     [ -f "$target/$MARKER_NAME" ] || return 1
     expected="$(cat "$target/$MARKER_NAME")"
     [ "$expected" = "$PINNED_SHA256" ]
@@ -197,11 +179,11 @@ EOF_WRAP
 }
 
 install_desktop_entry() {
-    [ -n "${DESKTOP_SRC:-}" ] || { qd_warn '解包内容中没有 .desktop 文件，跳过桌面项'; return 0; }
+    [ -n "${DESKTOP_SRC:-}" ] || qd_die '安装内容缺少 .desktop 文件；请修复安装后再使用桌面入口'
     mkdir -p "$APP_DIR"
     local dst="$APP_DIR/com.moonlight_stream.Moonlight.desktop" tmp icon_path=''
     refuse_foreign_file "$dst" '桌面项'
-    qd_mktemp_file tmp
+    qd_mktemp_file tmp "$dst.qdtmp.XXXXXX"
     if [ -n "${ICON_SRC:-}" ]; then
         icon_path="$TARGET_DIR/moonlight.svg"
         [ "$ICON_SRC" = "$icon_path" ] || cp "$ICON_SRC" "$icon_path"
@@ -212,7 +194,8 @@ install_desktop_entry() {
         "$DESKTOP_SRC" >"$tmp"
     grep -q '^Exec=' "$tmp" || printf 'Exec=%s/moonlight\n' "$BIN_DIR" >>"$tmp"
     printf '%s\n' "$OWNERSHIP_MARK" >>"$tmp"
-    cp "$tmp" "$dst"
+    chmod 644 "$tmp"
+    mv -f "$tmp" "$dst"
     qd_info "桌面项: $dst"
     if command -v update-desktop-database >/dev/null 2>&1; then
         update-desktop-database "$APP_DIR" >/dev/null 2>&1 || true
@@ -227,15 +210,14 @@ main() {
     local machine
     machine="$(uname -m)"
     [ "$machine" = x86_64 ] \
-        || qd_die "Moonlight 官方 AppImage 仅提供 x86_64 构建；当前架构 $machine 不受支持。
-ARM 设备请改用发行版源码构建或官方 Flatpak 以外的渠道评估（本脚本不支持）。"
+        || qd_die "本脚本固定的 Moonlight AppImage 仅适用于 x86_64；当前架构 $machine 不受支持。"
 
     qd_section "Moonlight $MOONLIGHT_VERSION (x86_64)"
 
     check_no_foreign_assets   # 在任何下载/写入之前拒止外来资产
 
     if already_converged; then
-        qd_info "已安装且摘要与固定值一致，跳过下载（幂等收敛）"
+        qd_info "安装记录的下载摘要符合固定值，跳过下载；未重新校验已解包程序的内容"
         TARGET_DIR="$OPT_DIR/${MOONLIGHT_VERSION#v}"
         # 修复可能被删掉的包装/桌面项
         DESKTOP_SRC="$(find "$TARGET_DIR" -maxdepth 1 -name 'com.moonlight_stream.Moonlight.desktop' -print -quit)"
@@ -257,8 +239,8 @@ ARM 设备请改用发行版源码构建或官方 Flatpak 以外的渠道评估�
 Moonlight 已就绪。启动方式:
   命令行:  ~/.local/bin/moonlight
   桌面:    应用列表中的 Moonlight
-添加主机: 在 Moonlight 中手动添加 Tailscale 地址（如 100.123.34.64），
-配对 PIN 到主机 Web UI（https://<主机>:47990）的 PIN 页面完成。
+添加主机: 使用 install-host.sh 输出的 <Tailnet IPv4>:<基准端口>。
+在主机 Web UI 核对待配对客户端与来源地址后，输入 Moonlight 显示的 PIN。
 EOF_DONE
 }
 

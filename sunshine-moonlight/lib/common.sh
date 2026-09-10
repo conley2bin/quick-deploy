@@ -1,245 +1,314 @@
 # shellcheck shell=bash
-# quick-deploy/sunshine-moonlight 共享函数库。
-# 只被本目录的脚本 source，不直接执行。
-#
-# 约定（与同仓库 tailscale/、fresh-install/ 模块一致）：
-#   - 幂等：重跑收敛到同一状态
-#   - 写后回读校验，不信任“写入动作完成”本身
-#   - 任何校验失败都发生在系统被修改之前（先验证、后变更）
+# Shared pins and small helpers for the standalone Sunshine/Moonlight workflow.
 
-# ---- 输出 -----------------------------------------------------------------
+QD_SUNSHINE_VERSION='2026.906.222525'
+QD_SUNSHINE_FLOOR="$QD_SUNSHINE_VERSION"  # September 2026 upstream security fixes
+QD_MOONLIGHT_VERSION='6.1.0'
+QD_MOONLIGHT_SHA256='0e855ffd22d407e18ab5fdb575fed5f01ca119a3f91993c5f0213f15ac80b400'
+QD_MOONLIGHT_SIZE='55325888'
+QD_CANONICAL_UNIT='app-dev.lizardbyte.app.Sunshine.service'
+QD_ALIAS_UNIT='sunshine.service'
+QD_BASE_PORT=47989
 
 qd_info()    { printf '%s\n' "$*"; }
 qd_warn()    { printf '警告: %s\n' "$*" >&2; }
 qd_die()     { printf '错误: %s\n' "$*" >&2; exit 1; }
 qd_section() { printf '\n========== %s ==========\n' "$*"; }
-
-# ---- 运行前提 --------------------------------------------------------------
-
-# 主脚本一律禁止 root：需要管理员权限的步骤各自显式调用 sudo，
-# 避免以 root 身份写坏用户目录的属主，也避免 systemctl --user 打到 root 的总线。
 qd_require_not_root() {
-    [ "$(id -u)" -ne 0 ] \
-        || qd_die '请不要以 root 或 sudo 运行本脚本。需要管理员权限的步骤会自行调用 sudo。'
+    [ "$(id -u)" -ne 0 ] || qd_die '请不要用 root/sudo 运行；需要管理员权限的步骤会调用 sudo。'
 }
 
-# 测试专用钩子：QD_OS_RELEASE_FILE 指向替代 os-release（tests/run.sh 使用，真实运行不要设置）。
-# 注意：source os-release 会写入 VERSION/ID/NAME 等通用变量名，
-# 调用方脚本不得使用这些名字存放自己的状态。
+# QD_* path/checksum overrides are only for isolated tests, never deployment settings.
 QD_OS_RELEASE_FILE="${QD_OS_RELEASE_FILE:-/etc/os-release}"
-
 qd_require_ubuntu() {
     [ -r "$QD_OS_RELEASE_FILE" ] || qd_die "无法读取 $QD_OS_RELEASE_FILE"
     # shellcheck disable=SC1090
     . "$QD_OS_RELEASE_FILE"
-    [ "${ID:-}" = ubuntu ] || qd_die "当前系统不是 Ubuntu: ${ID:-未知}"
-    [ -n "${VERSION_ID:-}" ] || qd_die '系统版本信息缺失'
-    dpkg --compare-versions "$VERSION_ID" ge 24.04 \
-        || qd_die "仅支持 Ubuntu 24.04 及更高版本；当前为 ${PRETTY_NAME:-$VERSION_ID}"
+    [ "${ID:-}" = ubuntu ] && dpkg --compare-versions "${VERSION_ID:-0}" ge 24.04 \
+        || qd_die '仅支持 Ubuntu 24.04 及更高版本'
     qd_info "系统: ${PRETTY_NAME:-Ubuntu $VERSION_ID}"
 }
-
 qd_require_cmd() {
-    command -v "$1" >/dev/null 2>&1 || qd_die "缺少命令 $1。请先安装: sudo apt install ${2:-$1}"
+    command -v "$1" >/dev/null 2>&1 || qd_die "缺少命令 $1；请先安装 ${2:-$1}。"
 }
-
-qd_sudo() {
-    sudo "$@"
-}
-
-# ---- 临时文件 --------------------------------------------------------------
+qd_sudo() { sudo "$@"; }
 
 QD_TEMP_FILES=()
 QD_TEMP_DIRS=()
-
 qd_cleanup() {
     local f d
-    for f in "${QD_TEMP_FILES[@]}"; do rm -f "$f"; done
-    for d in "${QD_TEMP_DIRS[@]}"; do rm -rf "$d"; done
+    for f in "${QD_TEMP_FILES[@]}"; do rm -f -- "$f"; done
+    for d in "${QD_TEMP_DIRS[@]}"; do rm -rf -- "$d"; done
 }
 trap qd_cleanup EXIT
 
-# qd_mktemp_file VAR [MKTEMP_ARGS...] / qd_mktemp_dir VAR [MKTEMP_ARGS...]
-# 通过“输出变量”把路径写回父 shell 并登记到 QD_TEMP_FILES/QD_TEMP_DIRS，
-# EXIT trap 统一清理。禁止用 command substitution 调用这两个函数——
-# $(qd_mktemp_file) 在子 shell 里执行，数组登记会随子 shell 一起被丢弃，
-# trap 永远清理不到（历史上每个临时文件都因此泄漏）。
+# Output-variable calls keep cleanup registration in the parent shell.
 qd_mktemp_file() {
-    local __qd_var="$1"; shift || true
+    local __qd_var="$1"; shift
     local f
     f="$(mktemp "$@")" || qd_die '无法创建临时文件'
     QD_TEMP_FILES+=("$f")
     printf -v "$__qd_var" '%s' "$f"
 }
-
 qd_mktemp_dir() {
-    local __qd_var="$1"; shift || true
+    local __qd_var="$1"; shift
     local d
     d="$(mktemp -d "$@")" || qd_die '无法创建临时目录'
     QD_TEMP_DIRS+=("$d")
     printf -v "$__qd_var" '%s' "$d"
 }
 
-# ---- 输入校验 ------------------------------------------------------------------
-
-# qd_valid_ipv4 IP —— 真正的 IPv4 点分四段校验：恰好 4 段、每段 1-3 位数字、0-255。
-# 正则整体先拒绝换行/空白/特殊字符（防配置注入）。
 qd_valid_ipv4() {
     local ip="$1" octet
-    [[ "$ip" =~ ^[0-9.]+$ ]] || return 1
+    [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
     local -a octets
     IFS='.' read -ra octets <<<"$ip"
-    [ "${#octets[@]}" -eq 4 ] || return 1
     for octet in "${octets[@]}"; do
-        [[ "$octet" =~ ^[0-9]{1,3}$ ]] || return 1
-        ((10#$octet <= 255)) || return 1
+        [[ "$octet" =~ ^(0|[1-9][0-9]{0,2})$ ]] && ((10#$octet <= 255)) || return 1
     done
-    return 0
 }
 
-# ---- 下载与校验 --------------------------------------------------------------
-
-qd_curl() {
-    curl -fL --retry 3 --connect-timeout 20 "$@"
+qd_tailnet_ip() {
+    local ip addresses
+    ip="$(tailscale ip -4 2>/dev/null)" || { qd_warn '无法读取 Tailscale IPv4；请先加入 Tailnet'; return 1; }
+    qd_valid_ipv4 "$ip" || { qd_warn 'Tailscale 未返回单个标准 IPv4 地址'; return 1; }
+    local first second rest
+    IFS=. read -r first second rest <<<"$ip"
+    [ "$first" = 100 ] && ((second >= 64 && second <= 127)) \
+        || { qd_warn "$ip 不在 Tailscale IPv4 地址范围 100.64.0.0/10"; return 1; }
+    # Require both a running Tailscale identity and a kernel-assigned tunnel address.
+    tailscale status --json 2>/dev/null | python3 -c 'import json,sys; sys.exit(json.load(sys.stdin).get("BackendState") != "Running")' \
+        || { qd_warn 'Tailscale 未处于 Running 状态'; return 1; }
+    addresses="$(ip -o -4 address show dev tailscale0 2>/dev/null)" || {
+        qd_warn '找不到 tailscale0；本流程要求内核网络模式下已分配的 Tailnet IPv4'; return 1;
+    }
+    awk '$3 == "inet" {split($4, a, "/"); print a[1]}' <<<"$addresses" | grep -Fxq "$ip" \
+        || { qd_warn "$ip 未分配给本机 tailscale0"; return 1; }
+    printf '%s\n' "$ip"
 }
 
-# qd_verify_sha256 FILE EXPECTED_HEX —— 不匹配即 die，调用方保证尚未做任何系统修改。
+qd_curl() { curl -fL --retry 3 --connect-timeout 20 "$@"; }
 qd_verify_sha256() {
     local file="$1" expected="$2" actual
+    [[ "$expected" =~ ^[0-9a-f]{64}$ ]] || qd_die '来源没有有效 SHA-256 摘要'
     actual="$(sha256sum "$file" | awk '{print $1}')"
-    [ "$actual" = "$expected" ] || {
-        qd_warn "期望 sha256: $expected"
-        qd_warn "实际 sha256: $actual"
-        qd_die "SHA-256 摘要不匹配，已放弃；未对系统做任何修改。"
-    }
+    [ "$actual" = "$expected" ] || qd_die "SHA-256 摘要不匹配；拒绝使用下载文件（期望 $expected，实际 $actual）"
     qd_info "SHA-256 校验通过: $actual"
 }
+qd_version_ge() { dpkg --compare-versions "${1#v}" ge "${2#v}"; }
 
-# 版本号比较：剥离前导 v 后用 dpkg --compare-versions（纯数字点分版本，如 2026.516.143833）。
-qd_version_ge() {
-    local a="${1#v}" b="${2#v}"
-    dpkg --compare-versions "$a" ge "$b"
+# Debian epoch and revision do not change which upstream fixes are present.
+qd_upstream_version() {
+    local version="$1"
+    if [[ "$version" == *:* ]]; then
+        [[ "${version%%:*}" =~ ^[0-9]+$ ]] || return 1
+        version="${version#*:}"
+    fi
+    version="${version%-*}"
+    [[ "$version" =~ ^[0-9]+(\.[0-9]+)*$ ]] || return 1
+    printf '%s\n' "$version"
+}
+qd_valid_capture() {
+    case "$1" in ''|kms|portal|x11|nvfbc|wlr|kwin) return 0;; *) return 1;; esac
 }
 
-# ---- sunshine.conf 合并（保留未知键、注释与行序） ----------------------------
-
-# 写文件一律“同目录临时文件 + mv”原子替换，保留原文件权限位；
-# 新文件的权限取 mktemp 默认的 0600（ sunshine.conf 可能含敏感路径/设置）。
-# 同目录是为了让 mv 退化为 rename(2)，避免跨文件系统拷贝窗口里留下半写文件。
-
-# _qd_conf_begin_write FILE —— 准备写入：打印临时文件路径到 __QD_CONF_TMP，原权限到 __QD_CONF_MODE
+# Sunshine scalars and comma lists strip # comments. Unknown lines are untouched.
 _qd_conf_begin_write() {
     local file="$1"
     __QD_CONF_MODE=''
-    if [ -f "$file" ]; then
-        __QD_CONF_MODE="$(stat -c %a "$file")"
-    fi
+    [ ! -f "$file" ] || __QD_CONF_MODE="$(stat -c %a "$file")"
     qd_mktemp_file __QD_CONF_TMP "$file.qdtmp.XXXXXX"
 }
-
 _qd_conf_finish_write() {
     local file="$1"
-    [ -z "$__QD_CONF_MODE" ] || chmod "$__QD_CONF_MODE" "$__QD_CONF_TMP"
-    mv -f "$__QD_CONF_TMP" "$file"
-}
-
-_qd_conf_read() { # FILE —— 存在则输出内容，不存在则输出空
-    if [ -f "$1" ]; then
-        cat -- "$1"
+    if [ -f "$file" ] && cmp -s "$file" "$__QD_CONF_TMP"; then
+        rm -f "$__QD_CONF_TMP"
+        return 0
     fi
+    [ -z "$__QD_CONF_MODE" ] || chmod "$__QD_CONF_MODE" "$__QD_CONF_TMP"
+    mv -f -- "$__QD_CONF_TMP" "$file"
 }
-
-# qd_conf_set FILE KEY VALUE
-# 幂等：键存在则原位替换（重复键只保留第一行），不存在则追加到文件末尾。
-qd_conf_set() {
-    local file="$1" key="$2" value="$3"
-    _qd_conf_begin_write "$file"
-    _qd_conf_read "$file" | awk -v key="$key" -v value="$value" '
-        {
-            line = $0
-            stripped = line
-            sub(/^[ \t]+/, "", stripped)
-            if (stripped ~ ("^" key "[ \t]*=")) {
-                if (!done) { print key " = " value; done = 1 }
-                next
-            }
-            print line
-        }
-        END { if (!done) print key " = " value }
-    ' >"$__QD_CONF_TMP"
-    _qd_conf_finish_write "$file"
-}
-
-# qd_conf_unset FILE KEY
-# 删除该键的所有行（例如 capture 自动侦测 = 配置里完全没有 capture 键）。
-# 键不存在时不触碰文件（不触发备份、不改变 mtime）。
-qd_conf_unset() {
-    local file="$1" key="$2"
-    [ -f "$file" ] || return 0
-    grep -qE "^[ \t]*${key}[ \t]*=" -- "$file" || return 0
-    _qd_conf_begin_write "$file"
-    awk -v key="$key" '
-        {
-            stripped = $0
-            sub(/^[ \t]+/, "", stripped)
-            if (stripped ~ ("^" key "[ \t]*=")) next
-            print $0
-        }
-    ' "$file" >"$__QD_CONF_TMP"
-    _qd_conf_finish_write "$file"
-}
-
-# qd_conf_ensure_token FILE KEY TOKEN
-# 键的值按逗号分隔列表处理：列表已含精确 TOKEN 则原样保留，否则追加；键不存在则新建。
-qd_conf_ensure_token() {
-    local file="$1" key="$2" token="$3"
-    _qd_conf_begin_write "$file"
-    _qd_conf_read "$file" | awk -v key="$key" -v token="$token" '
-        function trim(x) { gsub(/^[ \t]+|[ \t]+$/, "", x); return x }
-        {
-            line = $0
-            stripped = line
-            sub(/^[ \t]+/, "", stripped)
-            if (stripped ~ ("^" key "[ \t]*=")) {
-                if (done) { next }
-                val = stripped
-                sub(("^" key "[ \t]*=[ \t]*"), "", val)
-                n = split(val, parts, ",")
-                found = 0
-                for (i = 1; i <= n; i++) {
-                    if (trim(parts[i]) == token) found = 1
-                }
-                if (found) { print line } else {
-                    newval = trim(val)
-                    if (newval == "") { newval = token } else { newval = newval ", " token }
-                    print key " = " newval
-                }
-                done = 1
-                next
-            }
-            print line
-        }
-        END { if (!done) print key " = " token }
-    ' >"$__QD_CONF_TMP"
-    _qd_conf_finish_write "$file"
-}
-
-# qd_conf_get FILE KEY —— 打印首个匹配键的值（无匹配则无输出、返回 1）。只读。
+_qd_conf_read() { if [ -f "$1" ]; then cat -- "$1"; fi; }
 qd_conf_get() {
     local file="$1" key="$2"
     [ -f "$file" ] || return 1
     awk -v key="$key" '
-        {
-            stripped = $0
-            sub(/^[ \t]+/, "", stripped)
-            if (stripped ~ ("^" key "[ \t]*=")) {
-                sub(("^" key "[ \t]*=[ \t]*"), "", stripped)
-                gsub(/[ \t]+$/, "", stripped)
-                print stripped
-                found = 1
-                exit
-            }
-        }
-        END { if (!found) exit 1 }
+        { line=$0; sub(/#.*/, "", line); sub(/^[ \t]+/, "", line)
+          if (line ~ ("^" key "[ \t]*=")) {
+              sub(("^" key "[ \t]*=[ \t]*"), "", line)
+              sub(/[ \t\r]+$/, "", line); print line; found=1; exit
+          }
+        } END { if (!found) exit 1 }
     ' "$file"
+}
+qd_conf_set() {
+    local file="$1" key="$2" value="$3"
+    _qd_conf_begin_write "$file"
+    _qd_conf_read "$file" | awk -v key="$key" -v value="$value" '
+        { line=$0; stripped=line; sub(/^[ \t]+/, "", stripped)
+          if (stripped ~ ("^" key "[ \t]*=")) {
+              comment=""; p=index(line,"#"); if (p) comment=substr(line,p)
+              if (!done) { print key " = " value (comment == "" ? "" : " " comment); done=1 }
+              else if (comment != "") print comment
+              next
+          } print line
+        } END { if (!done) print key " = " value }
+    ' >"$__QD_CONF_TMP"
+    _qd_conf_finish_write "$file"
+}
+qd_conf_unset() {
+    local file="$1" key="$2"
+    [ -f "$file" ] || return 0
+    _qd_conf_begin_write "$file"
+    awk -v key="$key" '
+        { stripped=$0; sub(/^[ \t]+/, "", stripped)
+          if (stripped ~ ("^" key "[ \t]*=")) {
+              p=index($0,"#"); if (p) print substr($0,p); next
+          } print
+        }
+    ' "$file" >"$__QD_CONF_TMP"
+    _qd_conf_finish_write "$file"
+}
+qd_conf_ensure_token() {
+    local file="$1" key="$2" token="$3" value
+    value="$(qd_conf_get "$file" "$key" || true)"
+    if printf '%s\n' "$value" | tr ',' '\n' | sed 's/^[ \t]*//;s/[ \t]*$//' | grep -Fxq "$token"; then
+        return 0
+    fi
+    qd_conf_set "$file" "$key" "${value:+$value, }$token"
+}
+qd_base_port() {
+    local base
+    base="$(qd_conf_get "$1" port || true)"
+    base="${base:-$QD_BASE_PORT}"
+    [[ "$base" =~ ^[1-9][0-9]{3,4}$ ]] && ((base >= 1029 && base <= 65514)) \
+        || { qd_warn 'port 必须为 1029–65514 的十进制整数（不带前导零）'; return 1; }
+    printf '%s\n' "$base"
+}
+
+# Matches Sunshine appdata(): CONFIGURATION_DIRECTORY, then XDG_CONFIG_HOME, then HOME.
+# Keep the selected path available for destructive callers before resolving symlinks.
+qd_host_config_path() {
+    local root="${1-${CONFIGURATION_DIRECTORY:-}}" xdg="${2-${XDG_CONFIG_HOME:-}}" dir
+    [[ "$root" != *:* ]] || { qd_warn '不支持多目录 CONFIGURATION_DIRECTORY'; return 1; }
+    dir="${QD_SUNSHINE_CONFIG_DIR:-${root:-${xdg:-$HOME/.config}}/sunshine}"
+    [[ "$dir" = /* && "$dir" != *$'\n'* ]] || { qd_warn 'Sunshine 配置目录必须为绝对单行路径'; return 1; }
+    printf '%s\n' "$dir"
+}
+qd_host_config_dir() {
+    local dir
+    dir="$(qd_host_config_path "$@")" || return 1
+    realpath -m -- "$dir"
+}
+qd_unit_property() { systemctl --user show "$1" -p "$2" --value; }
+qd_find_unit() {
+    local unit
+    for unit in "$QD_CANONICAL_UNIT" "$QD_ALIAS_UNIT"; do
+        if [ "$(qd_unit_property "$unit" LoadState 2>/dev/null)" = loaded ]; then
+            printf '%s\n' "$unit"; return 0
+        fi
+    done
+    return 1
+}
+
+# Refuse overrides instead of trying to interpret arbitrary systemd execution rules.
+# This is read-only and is called before any package/config/service mutation.
+qd_check_service_config() {
+    local wanted="$1" env root xdg actual unit load fragment drops execstart settings
+    env="$(systemctl --user show-environment)" || { qd_warn '无法连接 systemd 用户管理器'; return 1; }
+    root="$(sed -n 's/^CONFIGURATION_DIRECTORY=//p' <<<"$env")"
+    xdg="$(sed -n 's/^XDG_CONFIG_HOME=//p' <<<"$env")"
+    actual="$(qd_host_config_dir "$root" "$xdg")" || return 1
+    [ "$wanted" = "$actual" ] || {
+        qd_warn "当前 shell 配置目录 $wanted 与用户服务目录 $actual 不一致；请在同一图形登录环境运行并统一 XDG_CONFIG_HOME/CONFIGURATION_DIRECTORY"; return 1;
+    }
+    for unit in "$QD_CANONICAL_UNIT" "$QD_ALIAS_UNIT"; do
+        load="$(qd_unit_property "$unit" LoadState)" || return 1
+        [ "$load" != not-found ] || continue
+        [ "$load" = loaded ] || { qd_warn "$unit 的 LoadState=$load；先处理 masked/error 状态"; return 1; }
+        fragment="$(qd_unit_property "$unit" FragmentPath)" || return 1
+        drops="$(qd_unit_property "$unit" DropInPaths)" || return 1
+        case "$fragment" in
+            /usr/lib/systemd/user/"$QD_CANONICAL_UNIT"|/lib/systemd/user/"$QD_CANONICAL_UNIT"|/usr/lib/systemd/user/"$QD_ALIAS_UNIT"|/lib/systemd/user/"$QD_ALIAS_UNIT") ;;
+            *) qd_warn "拒绝修改自定义 Sunshine 单元: $fragment；请先核对其 ExecStart/配置路径"; return 1;;
+        esac
+        [ -z "$drops" ] || { qd_warn "发现 Sunshine service override: $drops；本流程不解释自定义 drop-in，请先人工核对/移除"; return 1; }
+        execstart="$(qd_unit_property "$unit" ExecStart)" || return 1
+        [[ "$execstart" == *'argv[]=/usr/bin/sunshine ;'* ]] || {
+            qd_warn "$unit 使用非默认 ExecStart；请先核对实际配置文件，不会修改可能未使用的配置"; return 1;
+        }
+        for settings in Environment EnvironmentFiles ConfigurationDirectory; do
+            actual="$(qd_unit_property "$unit" "$settings")" || return 1
+            [ -z "$actual" ] || { qd_warn "$unit 有自定义 $settings；请先核对有效配置目录"; return 1; }
+        done
+        break
+    done
+}
+
+qd_graphical_session() {
+    local sessions sid uid rest info type
+    sessions="$(loginctl list-sessions --no-legend --no-pager)" || return 1
+    while read -r sid uid rest; do
+        [ "$uid" = "$(id -u)" ] || continue
+        info="$(loginctl show-session "$sid" -p Type -p Active -p Remote 2>/dev/null)" || continue
+        type="$(sed -n 's/^Type=//p' <<<"$info")"
+        case "$type" in x11|wayland) ;; *) continue;; esac
+        if grep -qx 'Active=yes' <<<"$info" && grep -qx 'Remote=no' <<<"$info"; then
+            printf '%s (%s)\n' "$sid" "$type"; return 0
+        fi
+    done <<<"$sessions"
+    return 1
+}
+qd_check_display_environment() {
+    local pattern='^(DISPLAY|WAYLAND_DISPLAY)=.+'
+    case "${1:-}" in
+        *'(x11)') pattern='^DISPLAY=.+';;
+        *'(wayland)') pattern='^WAYLAND_DISPLAY=.+';;
+    esac
+    systemctl --user show-environment | grep -qE "$pattern" \
+        || { qd_warn '用户服务没有匹配图形会话的 DISPLAY/WAYLAND_DISPLAY；请重新登录图形会话后运行'; return 1; }
+}
+qd_sunshine_binary() { dpkg -L sunshine | grep -E '/bin/sunshine$' | head -n1; }
+qd_running_binary_current() {
+    local unit="$1" pid bin proc
+    pid="$(qd_unit_property "$unit" MainPID)" || return 1
+    [[ "$pid" =~ ^[1-9][0-9]*$ ]] || { qd_warn "$unit 没有运行中 MainPID"; return 1; }
+    bin="$(qd_sunshine_binary)" || return 1
+    proc="${QD_PROC_ROOT:-/proc}/$pid/exe"
+    if [ ! -r "$proc" ]; then
+        qd_warn "无法读取 PID $pid 的 executable；未验证运行版本"; return 2
+    fi
+    [ "$(stat -Lc '%d:%i' "$bin")" = "$(stat -Lc '%d:%i' "$proc")" ] || {
+        qd_warn "PID $pid 仍在运行旧的/已删除的 Sunshine executable；需要重启用户服务"; return 1;
+    }
+}
+qd_sunshine_processes() { ps -eo pid=,uid=,comm= | awk '$3 == "sunshine" {print "PID=" $1 " UID=" $2}'; }
+
+# Idle control TCP ports only. UDP media sockets are created for streaming sessions.
+qd_check_listeners() {
+    local bind="$1" base="$2" unit="$3" pid out
+    pid="$(qd_unit_property "$unit" MainPID)" || return 1
+    [[ "$pid" =~ ^[1-9][0-9]*$ ]] || { qd_warn "$unit 没有 MainPID"; return 1; }
+    out="$(ss -H -ltnp)" || return 1
+    printf '%s\n' "$out" | python3 -c '
+import re, sys
+bind, base, pid = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+rows = [line.split() for line in sys.stdin if line.strip()]
+failed = False
+for port in (base - 5, base, base + 1, base + 21):
+    matches = [r for r in rows if len(r) >= 5 and r[0] == "LISTEN" and r[3].rsplit(":", 1)[-1] == str(port)]
+    if not matches:
+        print(f"TCP {port} 未监听"); failed = True; continue
+    for row in matches:
+        if row[3] != f"{bind}:{port}":
+            print(f"TCP {port} 监听地址不符: {row[3]}，期望 {bind}"); failed = True; continue
+        owners = re.findall(r"pid=(\d+)", " ".join(row[5:]))
+        if owners and pid not in owners:
+            print(f"TCP {port} 属于其他 PID {owners}，期望服务 PID {pid}"); failed = True
+        elif not owners:
+            print(f"TCP {port} 地址正确；ss 未提供 PID，未验证所有者")
+        else:
+            print(f"TCP {port} 地址/PID 正确")
+sys.exit(1 if failed else 0)
+' "$bind" "$base" "$pid"
 }
