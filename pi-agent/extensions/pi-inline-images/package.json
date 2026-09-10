@@ -1,29 +1,30 @@
 {
-  "name": "pi-inline-images-prototype",
-  "version": "0.0.1",
+  "name": "pi-inline-images",
+  "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Stage-1 proof that Kitty Unicode placeholders survive Pi's native Markdown renderer",
+  "description": "Display assistant Markdown images in source order with Kitty Unicode placements",
   "scripts": {
-    "test": "node --test --import tsx test/*.test.ts"
+    "test": "node --test --import tsx test/*.test.ts",
+    "typecheck": "tsc --noEmit",
+    "check": "npm run typecheck && npm test"
   },
   "dependencies": {
-    "marked": "18.0.5"
+    "marked": "18.0.5",
+    "sharp": "0.35.4"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",
-    "tsx": "^4.22.3"
+    "tsx": "^4.22.3",
+    "typescript": "^5.9.0"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "0.85.1",
     "@earendil-works/pi-tui": "0.85.1"
   },
   "peerDependenciesMeta": {
-    "@earendil-works/pi-coding-agent": {
-      "optional": true
-    },
-    "@earendil-works/pi-tui": {
-      "optional": true
-    }
-  }
+    "@earendil-works/pi-coding-agent": { "optional": true },
+    "@earendil-works/pi-tui": { "optional": true }
+  },
+  "engines": { "node": ">=22.19.0" }
 }

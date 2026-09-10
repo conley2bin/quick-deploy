@@ -1,53 +1,312 @@
-// Derived from pi-tmux-images 0.2.0 (MIT).
-// See LICENSE and UPSTREAM.md in this directory.
+// Derived from pi-tmux-images 0.2.0 (MIT); see LICENSE and UPSTREAM.md.
 
 const ESC = "\x1b";
 export const PLACEHOLDER_GLYPH = "\u{10eeee}";
-
-// The stage-1 prototype emits at most four columns, two rows, and uses high
-// image-ID byte 7. Keep only the marks exercised by that bounded mechanism.
-export const ROW_COLUMN_DIACRITICS = [
-  "\u{305}",
-  "\u{30d}",
-  "\u{30e}",
-  "\u{310}",
-  "\u{312}",
-  "\u{33d}",
-  "\u{33e}",
-  "\u{33f}",
+const ROW_COLUMN_DIACRITICS = [
+	"\u{305}",
+	"\u{30D}",
+	"\u{30E}",
+	"\u{310}",
+	"\u{312}",
+	"\u{33D}",
+	"\u{33E}",
+	"\u{33F}",
+	"\u{346}",
+	"\u{34A}",
+	"\u{34B}",
+	"\u{34C}",
+	"\u{350}",
+	"\u{351}",
+	"\u{352}",
+	"\u{357}",
+	"\u{35B}",
+	"\u{363}",
+	"\u{364}",
+	"\u{365}",
+	"\u{366}",
+	"\u{367}",
+	"\u{368}",
+	"\u{369}",
+	"\u{36A}",
+	"\u{36B}",
+	"\u{36C}",
+	"\u{36D}",
+	"\u{36E}",
+	"\u{36F}",
+	"\u{483}",
+	"\u{484}",
+	"\u{485}",
+	"\u{486}",
+	"\u{487}",
+	"\u{592}",
+	"\u{593}",
+	"\u{594}",
+	"\u{595}",
+	"\u{597}",
+	"\u{598}",
+	"\u{599}",
+	"\u{59C}",
+	"\u{59D}",
+	"\u{59E}",
+	"\u{59F}",
+	"\u{5A0}",
+	"\u{5A1}",
+	"\u{5A8}",
+	"\u{5A9}",
+	"\u{5AB}",
+	"\u{5AC}",
+	"\u{5AF}",
+	"\u{5C4}",
+	"\u{610}",
+	"\u{611}",
+	"\u{612}",
+	"\u{613}",
+	"\u{614}",
+	"\u{615}",
+	"\u{616}",
+	"\u{617}",
+	"\u{657}",
+	"\u{658}",
+	"\u{659}",
+	"\u{65A}",
+	"\u{65B}",
+	"\u{65D}",
+	"\u{65E}",
+	"\u{6D6}",
+	"\u{6D7}",
+	"\u{6D8}",
+	"\u{6D9}",
+	"\u{6DA}",
+	"\u{6DB}",
+	"\u{6DC}",
+	"\u{6DF}",
+	"\u{6E0}",
+	"\u{6E1}",
+	"\u{6E2}",
+	"\u{6E4}",
+	"\u{6E7}",
+	"\u{6E8}",
+	"\u{6EB}",
+	"\u{6EC}",
+	"\u{730}",
+	"\u{732}",
+	"\u{733}",
+	"\u{735}",
+	"\u{736}",
+	"\u{73A}",
+	"\u{73D}",
+	"\u{73F}",
+	"\u{740}",
+	"\u{741}",
+	"\u{743}",
+	"\u{745}",
+	"\u{747}",
+	"\u{749}",
+	"\u{74A}",
+	"\u{7EB}",
+	"\u{7EC}",
+	"\u{7ED}",
+	"\u{7EE}",
+	"\u{7EF}",
+	"\u{7F0}",
+	"\u{7F1}",
+	"\u{7F3}",
+	"\u{816}",
+	"\u{817}",
+	"\u{818}",
+	"\u{819}",
+	"\u{81B}",
+	"\u{81C}",
+	"\u{81D}",
+	"\u{81E}",
+	"\u{81F}",
+	"\u{820}",
+	"\u{821}",
+	"\u{822}",
+	"\u{823}",
+	"\u{825}",
+	"\u{826}",
+	"\u{827}",
+	"\u{829}",
+	"\u{82A}",
+	"\u{82B}",
+	"\u{82C}",
+	"\u{82D}",
+	"\u{951}",
+	"\u{953}",
+	"\u{954}",
+	"\u{F82}",
+	"\u{F83}",
+	"\u{F86}",
+	"\u{F87}",
+	"\u{135D}",
+	"\u{135E}",
+	"\u{135F}",
+	"\u{17DD}",
+	"\u{193A}",
+	"\u{1A17}",
+	"\u{1A75}",
+	"\u{1A76}",
+	"\u{1A77}",
+	"\u{1A78}",
+	"\u{1A79}",
+	"\u{1A7A}",
+	"\u{1A7B}",
+	"\u{1A7C}",
+	"\u{1B6B}",
+	"\u{1B6D}",
+	"\u{1B6E}",
+	"\u{1B6F}",
+	"\u{1B70}",
+	"\u{1B71}",
+	"\u{1B72}",
+	"\u{1B73}",
+	"\u{1CD0}",
+	"\u{1CD1}",
+	"\u{1CD2}",
+	"\u{1CDA}",
+	"\u{1CDB}",
+	"\u{1CE0}",
+	"\u{1DC0}",
+	"\u{1DC1}",
+	"\u{1DC3}",
+	"\u{1DC4}",
+	"\u{1DC5}",
+	"\u{1DC6}",
+	"\u{1DC7}",
+	"\u{1DC8}",
+	"\u{1DC9}",
+	"\u{1DCB}",
+	"\u{1DCC}",
+	"\u{1DD1}",
+	"\u{1DD2}",
+	"\u{1DD3}",
+	"\u{1DD4}",
+	"\u{1DD5}",
+	"\u{1DD6}",
+	"\u{1DD7}",
+	"\u{1DD8}",
+	"\u{1DD9}",
+	"\u{1DDA}",
+	"\u{1DDB}",
+	"\u{1DDC}",
+	"\u{1DDD}",
+	"\u{1DDE}",
+	"\u{1DDF}",
+	"\u{1DE0}",
+	"\u{1DE1}",
+	"\u{1DE2}",
+	"\u{1DE3}",
+	"\u{1DE4}",
+	"\u{1DE5}",
+	"\u{1DE6}",
+	"\u{1DFE}",
+	"\u{20D0}",
+	"\u{20D1}",
+	"\u{20D4}",
+	"\u{20D5}",
+	"\u{20D6}",
+	"\u{20D7}",
+	"\u{20DB}",
+	"\u{20DC}",
+	"\u{20E1}",
+	"\u{20E7}",
+	"\u{20E9}",
+	"\u{20F0}",
+	"\u{2CEF}",
+	"\u{2CF0}",
+	"\u{2CF1}",
+	"\u{2DE0}",
+	"\u{2DE1}",
+	"\u{2DE2}",
+	"\u{2DE3}",
+	"\u{2DE4}",
+	"\u{2DE5}",
+	"\u{2DE6}",
+	"\u{2DE7}",
+	"\u{2DE8}",
+	"\u{2DE9}",
+	"\u{2DEA}",
+	"\u{2DEB}",
+	"\u{2DEC}",
+	"\u{2DED}",
+	"\u{2DEE}",
+	"\u{2DEF}",
+	"\u{2DF0}",
+	"\u{2DF1}",
+	"\u{2DF2}",
+	"\u{2DF3}",
+	"\u{2DF4}",
+	"\u{2DF5}",
+	"\u{2DF6}",
+	"\u{2DF7}",
+	"\u{2DF8}",
+	"\u{2DF9}",
+	"\u{2DFA}",
+	"\u{2DFB}",
+	"\u{2DFC}",
+	"\u{2DFD}",
+	"\u{2DFE}",
+	"\u{2DFF}",
+	"\u{A66F}",
+	"\u{A67C}",
+	"\u{A67D}",
+	"\u{A6F0}",
+	"\u{A6F1}",
+	"\u{A8E0}",
+	"\u{A8E1}",
+	"\u{A8E2}",
+	"\u{A8E3}",
+	"\u{A8E4}",
+	"\u{A8E5}",
 ] as const;
 
+export interface Sink {
+	write(sequence: string): void;
+}
+export function tmux(sequence: string): string {
+	return `${ESC}Ptmux;${sequence.replaceAll(ESC, ESC + ESC)}${ESC}\\`;
+}
+export function kitty(command: string, inTmux: boolean): string {
+	const sequence = `${ESC}_G${command}${ESC}\\`;
+	return inTmux ? tmux(sequence) : sequence;
+}
+export function upload(base64: string, imageId: number, inTmux: boolean): string[] {
+	const chunks = base64.match(/.{1,4096}/gu) ?? [""];
+	return chunks.map((chunk, index) =>
+		kitty(`${index ? "" : `a=t,f=100,i=${imageId},q=2,`}m=${index + 1 < chunks.length ? 1 : 0};${chunk}`, inTmux),
+	);
+}
+function placementId(imageId: number): number {
+	return imageId & 0xffffff || 1;
+}
+export function placement(imageId: number, columns: number, rows: number, inTmux: boolean): string {
+	return kitty(`a=p,i=${imageId},p=${placementId(imageId)},U=1,c=${columns},r=${rows},q=2;`, inTmux);
+}
+/** Delete one virtual placement while retaining its uploaded image data. */
+export function deletePlacement(imageId: number, inTmux: boolean): string {
+	return kitty(`a=d,d=i,i=${imageId},p=${placementId(imageId)},q=2;`, inTmux);
+}
+export function deleteImage(imageId: number, inTmux: boolean): string {
+	return kitty(`a=d,d=I,i=${imageId},q=2;`, inTmux);
+}
 function mark(index: number): string {
-  const value = ROW_COLUMN_DIACRITICS[index];
-  if (!value) throw new Error(`Kitty placeholder index ${index} exceeds the prototype table`);
-  return value;
+	const value = ROW_COLUMN_DIACRITICS[index];
+	if (!value) throw new Error(`Kitty placeholder index ${index} exceeds supported diacritic table`);
+	return value;
 }
-
 function rgb(code: 38 | 58, value: number): string {
-  return `${ESC}[${code};2;${(value >>> 16) & 255};${(value >>> 8) & 255};${value & 255}m`;
+	return `${ESC}[${code};2;${(value >>> 16) & 255};${(value >>> 8) & 255};${value & 255}m`;
 }
-
 /** Kitty Unicode placeholder: foreground is image ID, underline is placement ID. */
 export function cell(column: number, row: number, imageId: number): string {
-  const high = imageId >>> 24;
-  const low = imageId & 0xffffff;
-  return `${rgb(38, low)}${rgb(58, low || 1)}${PLACEHOLDER_GLYPH}${mark(row)}${mark(column)}${
-    high ? mark(high) : ""
-  }${ESC}[39;59m`;
+	const high = imageId >>> 24;
+	return `${rgb(38, imageId & 0xffffff)}${rgb(58, imageId & 0xffffff || 1)}${PLACEHOLDER_GLYPH}${mark(row)}${mark(column)}${high ? mark(high) : ""}${ESC}[39;59m`;
 }
-
-/**
- * Produce placeholder rows that remain independent through Pi 0.85.1 wrapping.
- *
- * Pi's ANSI tracker understands 38/48 extended colors but not Kitty's 58
- * underline-color selector. Without a full row reset it mistakes the `2` in
- * `58;2;R;G;B` for SGR dim and prepends `ESC[2m` to the next Markdown line.
- * Ending each bounded row with SGR 0 prevents that synthetic style from
- * crossing the newline while leaving every cell's Kitty colors intact.
- */
+/** End every row with SGR 0: Pi 0.85.1 otherwise carries a false dim state from SGR 58;2. */
 export function grid(columns: number, rows: number, imageId: number): string[] {
-  return Array.from({ length: rows }, (_, row) => {
-    const cells = Array.from({ length: columns }, (_, column) => cell(column, row, imageId)).join("");
-    return `${cells}${ESC}[0m`;
-  });
+	return Array.from(
+		{ length: rows },
+		(_, row) => `${Array.from({ length: columns }, (_, column) => cell(column, row, imageId)).join("")}\x1b[0m`,
+	);
 }
