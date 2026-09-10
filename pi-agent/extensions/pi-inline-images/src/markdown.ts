@@ -42,7 +42,10 @@ export function parseMarkdownImages(markdown: string): ImageReference[] {
   const references: ImageReference[] = [];
 
   const collectDefinitions = (node: Node): void => {
-    if (node.type === "definition") definitions.set((node as Definition).identifier, node as Definition);
+    if (node.type === "definition") {
+      const definition = node as Definition;
+      if (!definitions.has(definition.identifier)) definitions.set(definition.identifier, definition);
+    }
     if (isParent(node)) for (const child of node.children) collectDefinitions(child);
   };
   collectDefinitions(tree);
@@ -87,11 +90,15 @@ function safeReason(error: string): string {
   return error.replace(/[\[\]\r\n]/gu, " ").slice(0, 160);
 }
 
+function tableCellText(value: string): string {
+  return value.replace(/\r\n?|\n/gu, " ").replace(/\\/gu, "\\\\").replace(/\|/gu, "\\|");
+}
+
 export function transformMarkdown(prepared: PreparedMarkdown, width: number, terminal: TerminalImages): string {
   let output = prepared.source;
   for (const reference of [...prepared.references].reverse()) {
     let replacement: string;
-    if (reference.inTable) replacement = `[image unavailable: ${reference.alt} — inline images in tables unsupported]`;
+    if (reference.inTable) replacement = `[image unavailable: ${tableCellText(reference.alt)} — inline images in tables unsupported]`;
     else if (reference.error) replacement = `[image unavailable: ${reference.alt} — ${safeReason(reference.error)}]`;
     else if (!terminal.available()) replacement = `[image unavailable: ${reference.alt} — Kitty graphics or tmux passthrough unavailable]`;
     else {

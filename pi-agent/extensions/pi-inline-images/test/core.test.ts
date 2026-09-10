@@ -53,6 +53,13 @@ test("parser-owned spans handle review code repros, unmatched ticks, escapes, re
   assert.equal(table[0]?.inTable, true);
 });
 
+test("reference definitions keep the first normalized identifier", () => {
+  const exact = "![x][id]\n\n[id]: first.png\n[id]: second.png";
+  assert.equal(parseMarkdownImages(exact)[0]?.href, "first.png");
+  const normalized = "![x][foo bar]\n\n[Foo   Bar]: normalized-first.png\n[FOO BAR]: normalized-second.png";
+  assert.equal(parseMarkdownImages(normalized)[0]?.href, "normalized-first.png");
+});
+
 test("local, file, and data resources decode to bounded PNG state", async () => {
   const local = await loadImage(FIXTURE, HERE);
   const relative = await loadImage("fixtures/color-block.png", HERE);

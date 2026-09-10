@@ -3,7 +3,7 @@ import { execFileSync } from "node:child_process";
 import { dirname, join } from "node:path";
 import { pathToFileURL } from "node:url";
 import test from "node:test";
-import { transformMarkdown } from "../src/markdown.ts";
+import { parseMarkdownImages, transformMarkdown } from "../src/markdown.ts";
 import { ImageSession } from "../src/session.ts";
 import { TerminalImages } from "../src/terminal.ts";
 import { grid, PLACEHOLDER_GLYPH } from "../vendor/pi-tmux-images/kitty-placeholder.ts";
@@ -134,6 +134,46 @@ test("native AssistantMessage preserves GFM table columns with an explicit in-ce
   const tableLines = lines.map(stripAnsi).filter((line) => line.includes("│"));
   assert.ok(tableLines.length > 0 && tableLines.every((line) => (line.match(/│/gu) || []).length >= 3), "native table keeps two bordered columns");
   assert.match(tableLines.map((line) => line.split("│")[2]?.trim() || "").join(""), /tail/, "tail remains in the second column");
+});
+
+test("native AssistantMessage uses the first normalized reference definition", async () => {
+  const root = installedPiRoot();
+  const module = await import(pathToFileURL(join(root, "dist/modes/interactive/components/assistant-message.js")).href);
+  const theme = await import(pathToFileURL(join(root, "dist/modes/interactive/theme/theme.js")).href);
+  theme.initTheme("dark", false);
+  const cases = [
+    { source: "![x][id]\n\n[id]: first.png\n[id]: second.png", expected: "first.png" },
+    { source: "![x][foo bar]\n\n[Foo   Bar]: normalized-first.png\n[FOO BAR]: normalized-second.png", expected: "normalized-first.png" },
+  ];
+  for (const { source, expected } of cases) {
+    let loaded = "";
+    const terminal = new TerminalImages(() => 0x07123456, () => ({ widthPx: 10, heightPx: 20 }), { write: () => undefined }, { TERM_PROGRAM: "ghostty" }, true);
+    const session = new ImageSession(terminal, async (href) => {
+      loaded = href;
+      return { source: href, hash: href, width: 20, height: 20, png: Buffer.from(href) };
+    });
+    const prepared = await session.prepare(source, "/fixture");
+    const transformer = (markdown: string, context: { availableWidth: number }) => transformMarkdown(prepared, context.availableWidth, terminal);
+    const lines = new module.AssistantMessageComponent(assistantMessage(source), false, undefined, "Thinking...", 1, [transformer]).render(40) as string[];
+    assert.equal(loaded, expected);
+    assert.match(lines.join("\n"), new RegExp(PLACEHOLDER_GLYPH, "u"));
+  }
+});
+
+test("native table notices escape decoded pipe, backslash, and newline alt text", async () => {
+  const cases = [
+    { source: "| image | text |\n| --- | --- |\n| ![x\\|y](a.png) | tail |", alt: "x|y" },
+    { source: "| image | text |\n| --- | --- |\n| ![x\\\\y\\|z&#10;q](a.png) | tail |", alt: "x\\y|z\nq" },
+  ];
+  const stripAnsi = (value: string) => value.replace(/\x1b(?:\][^\x07]*\x07|\[[0-?]*[ -/]*[@-~])/gu, "");
+  for (const { source, alt } of cases) {
+    assert.equal(parseMarkdownImages(source)[0]?.alt, alt);
+    const lines = (await renderAssistant(source, 80)).map(stripAnsi);
+    assert.doesNotMatch(lines.join("\n"), new RegExp(PLACEHOLDER_GLYPH, "u"));
+    const tableLines = lines.filter((line) => line.includes("│"));
+    assert.ok(tableLines.every((line) => (line.match(/│/gu) || []).length >= 3), source);
+    assert.match(tableLines.map((line) => line.split("│")[2]?.trim() || "").join(""), /tail/, "tail stays in column two");
+  }
 });
 
 test("native AssistantMessage still renders paragraph and list images in source order", async () => {
