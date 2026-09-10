@@ -84,6 +84,45 @@ test("native AssistantMessage keeps exact code repros literal and renders only t
   assert.match(unmatched, new RegExp(PLACEHOLDER_GLYPH, "u"));
 });
 
+test("native cached components retain immutable geometry across changed bytes and later failures", async () => {
+  const root = installedPiRoot();
+  const module = await import(pathToFileURL(join(root, "dist/modes/interactive/components/assistant-message.js")).href);
+  const theme = await import(pathToFileURL(join(root, "dist/modes/interactive/theme/theme.js")).href);
+  theme.initTheme("dark", false);
+  let allocated = 0x07123450;
+  const terminal = new TerminalImages(() => ++allocated, () => ({ widthPx: 10, heightPx: 20 }), { write: () => undefined }, { TERM_PROGRAM: "ghostty" }, true);
+  const versions = [
+    { source: "fixture", hash: "large", width: 100, height: 100, png: Buffer.from("large") },
+    { source: "fixture", hash: "small", width: 20, height: 20, png: Buffer.from("small") },
+  ];
+  let load = 0;
+  const session = new ImageSession(terminal, async () => {
+    const image = versions[load++];
+    if (!image) throw new Error("changed file unreadable");
+    return image;
+  });
+  const source = "Before\n\n![same](/tmp/image.png)\n\nAfter";
+  const transformer = (markdown: string, context: { messageType: string; isStreaming: boolean; availableWidth: number }) => {
+    const prepared = session.markdown.get(markdown);
+    return prepared ? transformMarkdown(prepared, context.availableWidth, terminal) : markdown;
+  };
+  const component = () => new module.AssistantMessageComponent(assistantMessage(source), false, undefined, "Thinking...", 1, [transformer]);
+
+  const firstPrepared = await session.prepare(source, "/fixture");
+  const first = component();
+  assert.equal(first.render(16).join("\n").split(PLACEHOLDER_GLYPH).length - 1, 50);
+  const secondPrepared = await session.prepare(source, "/fixture");
+  const second = component();
+  assert.equal(second.render(16).join("\n").split(PLACEHOLDER_GLYPH).length - 1, 2);
+  assert.notEqual(firstPrepared.references[0].logicalId, secondPrepared.references[0].logicalId, "changed bytes receive a distinct immutable resource ID");
+  assert.equal(first.render(16).join("\n").split(PLACEHOLDER_GLYPH).length - 1, 50, "old same-width Markdown cache remains compatible with its old resource");
+
+  await session.prepare(source, "/fixture");
+  const failed = component().render(40).join("\n").replace(/\x1b(?:\][^\x07]*\x07|\[[0-?]*[ -/]*[@-~])/gu, "");
+  assert.match(failed.replace(/\s+/gu, " "), /image unavailable: same — changed file unreadable/);
+  assert.equal(first.render(16).join("\n").split(PLACEHOLDER_GLYPH).length - 1, 50, "a later failure does not invalidate cached old grids");
+});
+
 test("native AssistantMessage preserves GFM table columns with an explicit in-cell notice", async () => {
   const source = "| image | text |\n| --- | --- |\n| ![x](a.png) | tail |";
   const lines = await renderAssistant(source, 16);

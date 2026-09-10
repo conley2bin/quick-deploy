@@ -45,14 +45,18 @@ Repeated runs are idempotent. Run `/reload` yourself afterward.
 - Failures remain visible in place. Unsupported schemes/formats, bad content,
   missing files, unavailable Kitty/tmux passthrough, and the 64-active-image cap
   are never silently dropped.
-- Current-branch assistant text is reloaded on session start and tree navigation.
-  Session switch/shutdown clears owned terminal images. Resize redraw deletes an
-  old owned placement before creating its new geometry.
-- Occurrence identity includes cwd, complete text-block Markdown, ordinal, and
-  URL, so the same path in different replies is not globally suppressed. Because
-  the public transformer has no message ID, byte-identical repeated text blocks
-  share identity; reloading a changed local file updates all such identical
-  occurrences rather than preserving historical pixels.
+- Current-branch assistant text is reloaded on committed session start and tree
+  navigation; shutdown also clears owned terminal images. A cancelled switch has
+  no cleanup side effect. Resize redraw deletes an old owned placement before
+  creating its new geometry.
+- Occurrence identity includes cwd, complete text-block Markdown, ordinal, URL,
+  and loaded content hash. Changed bytes therefore receive a distinct immutable
+  terminal image ID; bytes/geometry behind an old cached grid are never
+  overwritten. An already-rendered same-width Markdown component can retain its
+  cached historical grid until Pi redraws or invalidates it. On redraw/restore,
+  the public transformer has no message identity, so byte-identical text blocks
+  resolve to the latest prepared version. The 64-image bound counts immutable
+  content versions and reports exhaustion in place.
 
 ## Validation
 

@@ -11,6 +11,12 @@ if ! git -C "$PI_HOME" rev-parse --git-dir >/dev/null 2>&1; then
   exit 1
 fi
 
+INDEXED=$(git -C "$PI_HOME" ls-files -- "extensions/pi-inline-images" "extensions/pi-inline-images/**")
+if [[ -n "$INDEXED" ]]; then
+  echo "pi-inline-images: refusing Git-index-owned target: ${INDEXED%%$'\n'*}" >&2
+  exit 1
+fi
+
 if [[ -e "$TARGET" || -L "$TARGET" ]]; then
   if [[ ! -L "$TARGET" ]]; then
     echo "pi-inline-images: refusing to replace non-symlink: $TARGET" >&2

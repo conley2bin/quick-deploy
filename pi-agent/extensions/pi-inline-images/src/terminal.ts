@@ -41,7 +41,11 @@ export class TerminalImages {
   ) {}
 
   available(): boolean { return this.capable; }
-  set(logicalId: string, image: LoadedImage): void { this.images.set(logicalId, image); }
+  set(logicalId: string, image: LoadedImage): void {
+    const existing = this.images.get(logicalId);
+    if (existing && existing.hash !== image.hash) throw new Error(`immutable image resource '${logicalId}' cannot be overwritten`);
+    this.images.set(logicalId, image);
+  }
   has(logicalId: string): boolean { return this.images.has(logicalId); }
   count(): number { return this.images.size; }
 

@@ -25,6 +25,5 @@ export default function piInlineImages(pi: ExtensionAPI) {
   };
   pi.on("session_start", restore as never);
   pi.on("session_tree", restore as never);
-  pi.on("session_before_switch", () => session.reset());
   pi.on("session_shutdown", () => session.reset());
 }

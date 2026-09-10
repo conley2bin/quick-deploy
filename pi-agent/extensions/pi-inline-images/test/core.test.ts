@@ -128,11 +128,14 @@ test("restore follows the active branch, reset clears state, and repeated paths 
   assert.deepEqual(assistantTextBlocks({ role: "assistant", content: [{ type: "thinking", text: "no" }, { type: "text", text: "  yes\n" }] }), ["yes"], "cache keys match Pi AssistantMessage's native trim");
 });
 
-test("capacity exhaustion is visible instead of silently dropping references", async () => {
+test("immutable content versions stay bounded and capacity exhaustion remains visible", async () => {
   const { terminal } = runtime();
-  const session = new ImageSession(terminal, async () => image);
-  const source = Array.from({ length: MAX_ACTIVE_IMAGES + 1 }, (_, index) => `![${index}](${index}.png)`).join("\n\n");
-  const prepared = await session.prepare(source, "/work");
-  assert.equal(prepared.references.at(-1)?.error, `inline image capacity reached (${MAX_ACTIVE_IMAGES})`);
-  assert.match(transformMarkdown(prepared, 20, terminal), /inline image capacity reached/);
+  let version = 0;
+  const session = new ImageSession(terminal, async () => ({ ...image, hash: `version-${version++}` }));
+  const source = "![same](same.png)";
+  let prepared;
+  for (let index = 0; index <= MAX_ACTIVE_IMAGES; index++) prepared = await session.prepare(source, "/work");
+  assert.equal(terminal.count(), MAX_ACTIVE_IMAGES);
+  assert.equal(prepared!.references[0]?.error, `inline image capacity reached (${MAX_ACTIVE_IMAGES})`);
+  assert.match(transformMarkdown(prepared!, 20, terminal), /inline image capacity reached/);
 });

@@ -19,6 +19,10 @@ export function assistantTextBlocks(message: Message | undefined): string[] {
   });
 }
 
+export function versionedLogicalId(baseId: string, contentHash: string): string {
+  return `${baseId}:${contentHash}`;
+}
+
 export class ImageSession {
   readonly markdown = new Map<string, PreparedMarkdown>();
   private generation = 0;
@@ -32,13 +36,14 @@ export class ImageSession {
     const generation = this.generation;
     for (const reference of references) {
       if (reference.inTable) continue;
-      if (!this.terminal.has(reference.logicalId) && this.terminal.count() >= MAX_ACTIVE_IMAGES) {
-        reference.error = `inline image capacity reached (${MAX_ACTIVE_IMAGES})`;
-        continue;
-      }
       try {
         const image = await this.loader(reference.href, cwd);
         if (generation !== this.generation) return prepared;
+        reference.logicalId = versionedLogicalId(reference.logicalId, image.hash);
+        if (!this.terminal.has(reference.logicalId) && this.terminal.count() >= MAX_ACTIVE_IMAGES) {
+          reference.error = `inline image capacity reached (${MAX_ACTIVE_IMAGES})`;
+          continue;
+        }
         this.terminal.set(reference.logicalId, image);
       } catch (error) {
         reference.error = error instanceof Error ? error.message : String(error);
