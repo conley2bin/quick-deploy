@@ -1,0 +1,29 @@
+{
+  "name": "pi-inline-images-prototype",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "description": "Stage-1 proof that Kitty Unicode placeholders survive Pi's native Markdown renderer",
+  "scripts": {
+    "test": "node --test --import tsx test/*.test.ts"
+  },
+  "dependencies": {
+    "marked": "18.0.5"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "tsx": "^4.22.3"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "0.85.1",
+    "@earendil-works/pi-tui": "0.85.1"
+  },
+  "peerDependenciesMeta": {
+    "@earendil-works/pi-coding-agent": {
+      "optional": true
+    },
+    "@earendil-works/pi-tui": {
+      "optional": true
+    }
+  }
+}
