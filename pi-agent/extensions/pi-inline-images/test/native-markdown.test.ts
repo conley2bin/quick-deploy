@@ -3,11 +3,42 @@ import { execFileSync } from "node:child_process";
 import { dirname, join } from "node:path";
 import { pathToFileURL } from "node:url";
 import test from "node:test";
+import { transformMarkdown } from "../src/markdown.ts";
+import { ImageSession } from "../src/session.ts";
+import { TerminalImages } from "../src/terminal.ts";
 import { grid, PLACEHOLDER_GLYPH } from "../vendor/pi-tmux-images/kitty-placeholder.ts";
 
 function installedPiRoot(): string {
   const cli = execFileSync("sh", ["-lc", "realpath \"$(command -v pi)\""], { encoding: "utf8" }).trim();
   return dirname(dirname(dirname(cli)));
+}
+
+function assistantMessage(text: string) {
+  return {
+    role: "assistant",
+    content: [{ type: "text", text }],
+    api: "fixture",
+    provider: "none",
+    model: "none",
+    usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+    stopReason: "stop",
+    timestamp: 0,
+  };
+}
+
+async function renderAssistant(source: string, width: number) {
+  const root = installedPiRoot();
+  const module = await import(pathToFileURL(join(root, "dist/modes/interactive/components/assistant-message.js")).href);
+  const theme = await import(pathToFileURL(join(root, "dist/modes/interactive/theme/theme.js")).href);
+  theme.initTheme("dark", false);
+  const terminal = new TerminalImages(() => 0x07123456, () => ({ widthPx: 10, heightPx: 20 }), { write: () => undefined }, { TERM_PROGRAM: "ghostty" }, true);
+  const image = { source: "fixture", hash: "fixture", width: 100, height: 100, png: Buffer.from("fixture") };
+  const session = new ImageSession(terminal, async () => image);
+  const prepared = await session.prepare(source.trim(), "/fixture");
+  const transformer = (markdown: string, context: { messageType: string; isStreaming: boolean; availableWidth: number }) =>
+    context.messageType === "assistant" && !context.isStreaming ? transformMarkdown(prepared, context.availableWidth, terminal) : markdown;
+  const component = new module.AssistantMessageComponent(assistantMessage(source), false, undefined, "Thinking...", 1, [transformer]);
+  return component.render(width) as string[];
 }
 
 test("row-reset Kitty grid survives Pi's native Markdown render and wrapping", async () => {
@@ -34,5 +65,43 @@ test("row-reset Kitty grid survives Pi's native Markdown render and wrapping", a
       assert.match(row, /\x1b\[38;2;18;52;86m/);
       assert.match(row, /\x1b\[58;2;18;52;86m/);
     }
+  }
+});
+
+test("native AssistantMessage keeps exact code repros literal and renders only the later image", async () => {
+  const sources = [
+    "Start\n\n    ![same](a.png)\n\n![same](a.png)",
+    "> ~~~\n> ![same](a.png)\n> ~~~\n\n![same](a.png)",
+    "- ~~~\n  ![same](a.png)\n  ~~~\n\n![same](a.png)",
+  ];
+  for (const source of sources) {
+    const lines = await renderAssistant(source, 24);
+    const literal = lines.findIndex((line) => line.includes("![same](a.png)"));
+    const bitmap = lines.findIndex((line) => line.includes(PLACEHOLDER_GLYPH));
+    assert.ok(literal >= 0 && bitmap > literal, source);
+  }
+  const unmatched = (await renderAssistant("An unmatched ` marker\n\n![real](a.png)", 24)).join("\n");
+  assert.match(unmatched, new RegExp(PLACEHOLDER_GLYPH, "u"));
+});
+
+test("native AssistantMessage preserves GFM table columns with an explicit in-cell notice", async () => {
+  const source = "| image | text |\n| --- | --- |\n| ![x](a.png) | tail |";
+  const lines = await renderAssistant(source, 16);
+  const joined = lines.join("\n");
+  assert.doesNotMatch(joined, new RegExp(PLACEHOLDER_GLYPH, "u"));
+  const stripAnsi = (value: string) => value.replace(/\x1b(?:\][^\x07]*\x07|\[[0-?]*[ -/]*[@-~])/gu, "");
+  const words = stripAnsi(joined).replace(/[^A-Za-z]/gu, "");
+  assert.match(words, /imagesintablesunsupported/);
+  const tableLines = lines.map(stripAnsi).filter((line) => line.includes("│"));
+  assert.ok(tableLines.length > 0 && tableLines.every((line) => (line.match(/│/gu) || []).length >= 3), "native table keeps two bordered columns");
+  assert.match(tableLines.map((line) => line.split("│")[2]?.trim() || "").join(""), /tail/, "tail remains in the second column");
+});
+
+test("native AssistantMessage still renders paragraph and list images in source order", async () => {
+  for (const source of ["before\n\n![x](a.png)\n\nafter", "- before ![x](a.png) after"]) {
+    const joined = (await renderAssistant(source, 24)).join("\n");
+    assert.match(joined, new RegExp(PLACEHOLDER_GLYPH, "u"));
+    assert.ok(joined.indexOf("before") < joined.indexOf(PLACEHOLDER_GLYPH));
+    assert.ok(joined.indexOf(PLACEHOLDER_GLYPH) < joined.indexOf("after"));
   }
 });

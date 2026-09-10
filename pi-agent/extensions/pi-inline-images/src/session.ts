@@ -31,6 +31,7 @@ export class ImageSession {
     this.markdown.set(source, prepared);
     const generation = this.generation;
     for (const reference of references) {
+      if (reference.inTable) continue;
       if (!this.terminal.has(reference.logicalId) && this.terminal.count() >= MAX_ACTIVE_IMAGES) {
         reference.error = `inline image capacity reached (${MAX_ACTIVE_IMAGES})`;
         continue;

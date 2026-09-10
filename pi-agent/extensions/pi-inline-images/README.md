@@ -32,9 +32,11 @@ Repeated runs are idempotent. Run `/reload` yourself afterward.
 
 ## Behavior
 
-- Parses finalized assistant Markdown with Marked; fenced code and inline code are
-  excluded. Inline, reference-style, list, and quote image syntax retain source
-  order. Images embedded in a sentence become a block at that point.
+- Parses finalized assistant Markdown with a position-aware remark/mdast tree plus
+  GFM table nodes; fenced/indented code and inline code are excluded. Inline,
+  reference-style, list, and quote image syntax retain source order. Images
+  embedded in a sentence become a block at that point. Table cells retain their
+  columns and show an explicit unsupported notice instead of a bitmap grid.
 - Loads resources asynchronously at `message_end`; the synchronous display
   transformer performs no file, network, or decode work.
 - Supports absolute/relative paths, `file:` URLs (empty/localhost host), HTTP(S),

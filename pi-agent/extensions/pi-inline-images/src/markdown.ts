@@ -1,6 +1,11 @@
 import { createHash } from "node:crypto";
-import { marked } from "marked";
+import type { Definition, Image, ImageReference as MdastImageReference, Node, Parent, Root } from "mdast";
+import remarkGfm from "remark-gfm";
+import remarkParse from "remark-parse";
+import { unified } from "unified";
 import type { TerminalImages } from "./terminal.ts";
+
+const markdownParser = unified().use(remarkParse).use(remarkGfm);
 
 export interface ImageReference {
   start: number;
@@ -9,6 +14,7 @@ export interface ImageReference {
   href: string;
   alt: string;
   ordinal: number;
+  inTable: boolean;
 }
 
 export type PreparedReference = ImageReference & { logicalId: string; error?: string };
@@ -19,79 +25,47 @@ export interface PreparedMarkdown {
   references: PreparedReference[];
 }
 
-function imageTokens(markdown: string): Array<{ raw: string; href: string; alt: string }> {
-  const found: Array<{ raw: string; href: string; alt: string }> = [];
-  const tokens = marked.lexer(markdown);
-  marked.walkTokens(tokens, (token) => {
-    if (token.type === "image") found.push({ raw: token.raw, href: token.href, alt: token.text || "image" });
-  });
-  return found;
+function isParent(node: Node): node is Parent {
+  return Array.isArray((node as Parent).children);
 }
 
-function tickRunAt(source: string, offset: number): number {
-  let length = 0;
-  while (source[offset + length] === "`") length++;
-  return length;
+function sourceOffsets(node: Node): { start: number; end: number } | undefined {
+  const start = node.position?.start.offset;
+  const end = node.position?.end.offset;
+  return typeof start === "number" && typeof end === "number" ? { start, end } : undefined;
 }
 
-/** Locate only image tokens accepted by Marked, while skipping fenced and inline code. */
+/** Use the parser's own source spans and container ancestry; no second Markdown grammar is maintained here. */
 export function parseMarkdownImages(markdown: string): ImageReference[] {
-  const expected = imageTokens(markdown);
+  const tree = markdownParser.parse(markdown) as Root;
+  const definitions = new Map<string, Definition>();
   const references: ImageReference[] = [];
-  let tokenIndex = 0;
-  let inlineTicks = 0;
-  let inComment = false;
-  let fence: { character: string; length: number } | undefined;
-  let lineStart = true;
 
-  for (let offset = 0; offset < markdown.length && tokenIndex < expected.length;) {
-    if (lineStart) {
-      const newline = markdown.indexOf("\n", offset);
-      const end = newline < 0 ? markdown.length : newline;
-      const line = markdown.slice(offset, end);
-      const match = /^ {0,3}(`{3,}|~{3,})/u.exec(line);
-      if (match) {
-        const character = match[1][0];
-        if (!fence) fence = { character, length: match[1].length };
-        else if (fence.character === character && match[1].length >= fence.length) fence = undefined;
-        offset = end;
-        continue;
-      }
+  const collectDefinitions = (node: Node): void => {
+    if (node.type === "definition") definitions.set((node as Definition).identifier, node as Definition);
+    if (isParent(node)) for (const child of node.children) collectDefinitions(child);
+  };
+  collectDefinitions(tree);
+
+  const collectImages = (node: Node, inTable: boolean): void => {
+    const insideTable = inTable || node.type === "table";
+    if (node.type === "image" || node.type === "imageReference") {
+      const offsets = sourceOffsets(node);
+      const image = node as Image | MdastImageReference;
+      const definition = node.type === "imageReference" ? definitions.get((node as MdastImageReference).identifier) : undefined;
+      const href = node.type === "image" ? (node as Image).url : definition?.url;
+      if (offsets && href) references.push({
+        ...offsets,
+        raw: markdown.slice(offsets.start, offsets.end),
+        href,
+        alt: image.alt || "image",
+        ordinal: references.length,
+        inTable: insideTable,
+      });
     }
-    const character = markdown[offset];
-    if (inComment) {
-      const end = markdown.indexOf("-->", offset);
-      if (end < 0) break;
-      inComment = false;
-      offset = end + 3;
-      continue;
-    }
-    if (!inlineTicks && markdown.startsWith("<!--", offset)) {
-      inComment = true;
-      offset += 4;
-      continue;
-    }
-    if (character === "\n") { lineStart = true; offset++; continue; }
-    if (lineStart) lineStart = false;
-    if (fence) { offset++; continue; }
-    if (character === "`" && (offset === 0 || markdown[offset - 1] !== "\\")) {
-      const run = tickRunAt(markdown, offset);
-      if (!inlineTicks) inlineTicks = run;
-      else if (run === inlineTicks) inlineTicks = 0;
-      offset += run;
-      continue;
-    }
-    if (!inlineTicks && character === "!" && (offset === 0 || markdown[offset - 1] !== "\\")) {
-      const candidate = expected[tokenIndex];
-      if (markdown.startsWith(candidate.raw, offset)) {
-        references.push({ start: offset, end: offset + candidate.raw.length, ...candidate, ordinal: tokenIndex });
-        tokenIndex++;
-        offset += candidate.raw.length;
-        continue;
-      }
-    }
-    offset++;
-  }
+    if (isParent(node)) for (const child of node.children) collectImages(child, insideTable);
+  };
+  collectImages(tree, false);
   return references;
 }
 
@@ -117,7 +91,8 @@ export function transformMarkdown(prepared: PreparedMarkdown, width: number, ter
   let output = prepared.source;
   for (const reference of [...prepared.references].reverse()) {
     let replacement: string;
-    if (reference.error) replacement = `[image unavailable: ${reference.alt} — ${safeReason(reference.error)}]`;
+    if (reference.inTable) replacement = `[image unavailable: ${reference.alt} — inline images in tables unsupported]`;
+    else if (reference.error) replacement = `[image unavailable: ${reference.alt} — ${safeReason(reference.error)}]`;
     else if (!terminal.available()) replacement = `[image unavailable: ${reference.alt} — Kitty graphics or tmux passthrough unavailable]`;
     else {
       const prefix = structuralPrefix(prepared.source, reference.start);

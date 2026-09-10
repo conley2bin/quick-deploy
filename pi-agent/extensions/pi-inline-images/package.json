@@ -10,10 +10,13 @@
     "check": "npm run typecheck && npm test"
   },
   "dependencies": {
-    "marked": "18.0.5",
-    "sharp": "0.35.4"
+    "remark-gfm": "4.0.1",
+    "remark-parse": "11.0.0",
+    "sharp": "0.35.4",
+    "unified": "11.0.5"
   },
   "devDependencies": {
+    "@types/mdast": "4.0.4",
     "@types/node": "^24.0.0",
     "tsx": "^4.22.3",
     "typescript": "^5.9.0"
@@ -23,8 +26,14 @@
     "@earendil-works/pi-tui": "0.85.1"
   },
   "peerDependenciesMeta": {
-    "@earendil-works/pi-coding-agent": { "optional": true },
-    "@earendil-works/pi-tui": { "optional": true }
+    "@earendil-works/pi-coding-agent": {
+      "optional": true
+    },
+    "@earendil-works/pi-tui": {
+      "optional": true
+    }
   },
-  "engines": { "node": ">=22.19.0" }
+  "engines": {
+    "node": ">=22.19.0"
+  }
 }

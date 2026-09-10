@@ -20,7 +20,7 @@ function runtime() {
   return { terminal, writes };
 }
 
-test("Marked-backed discovery preserves source order and excludes code", () => {
+test("position-aware AST discovery preserves source order and excludes code", () => {
   const markdown = [
     "`![inline](skip.png)` then ![one](a.png)",
     "",
@@ -37,6 +37,20 @@ test("Marked-backed discovery preserves source order and excludes code", () => {
   const refs = parseMarkdownImages(markdown);
   assert.deepEqual(refs.map((ref) => [ref.alt, ref.href]), [["one", "a.png"], ["two", "b image.webp"], ["three", "c.jpg"]]);
   assert.ok(refs.every((ref, index) => index === 0 || ref.start > refs[index - 1].start));
+});
+
+test("parser-owned spans handle review code repros, unmatched ticks, escapes, references, and tables", () => {
+  const repeated = [
+    "Start\n\n    ![same](a.png)\n\n![same](a.png)",
+    "> ~~~\n> ![same](a.png)\n> ~~~\n\n![same](a.png)",
+    "- ~~~\n  ![same](a.png)\n  ~~~\n\n![same](a.png)",
+  ];
+  for (const source of repeated) assert.equal(parseMarkdownImages(source)[0]?.start, source.lastIndexOf("![same]"));
+  const unmatched = "An unmatched ` marker\n\n\\![escaped](no.png)\n\n![real][id]\n\n[id]: a.png";
+  const refs = parseMarkdownImages(unmatched);
+  assert.deepEqual(refs.map((ref) => [ref.raw, ref.href]), [["![real][id]", "a.png"]]);
+  const table = parseMarkdownImages("| image | text |\n| --- | --- |\n| ![x](a.png) | tail |");
+  assert.equal(table[0]?.inTable, true);
 });
 
 test("local, file, and data resources decode to bounded PNG state", async () => {
