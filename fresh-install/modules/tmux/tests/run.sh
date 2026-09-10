@@ -38,6 +38,11 @@ case "$up_binding" in
     *"select-window -t ="*) ;;
     *) fail "MouseUp1Status 未按鼠标目标切换 window" ;;
 esac
+for key in WheelUpStatus WheelDownStatus; do
+    if tx list-keys -T root "$key" >/dev/null 2>&1; then
+        fail "$key 仍绑定为状态栏切换 window"
+    fi
+done
 
 # 两张 copy-mode 表的 52 个大小写字母都必须保存同一条两步命令列表。
 lower='a b c d e f g h i j k l m n o p q r s t u v w x y z'
@@ -177,6 +182,17 @@ try:
     time.sleep(0.05)
     if active_id() != two_id:
         raise AssertionError("mouse up did not select the ranged window")
+
+    # Wheel events on the status row must be inert; pane wheel bindings are
+    # intentionally left untouched by this change.
+    for button in (64, 65):
+        tx("select-window", "-t", one_id)
+        time.sleep(0.05)
+        drain(fd)
+        os.write(fd, f"\x1b[<{button};{x};24M".encode())
+        time.sleep(0.05)
+        if active_id() != one_id:
+            raise AssertionError(f"status wheel button {button} unexpectedly switched window")
 finally:
     tx("detach-client", "-s", session, check=False)
     try:

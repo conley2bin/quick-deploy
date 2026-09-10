@@ -14,6 +14,10 @@ set -g mouse on
 unbind -T root MouseDown1Status #!important
 bind -T root MouseUp1Status select-window -t = #!important
 
+# 禁用状态栏区域的滚轮切换 window；pane 区域的滚轮翻历史保持不变。
+unbind -T root WheelUpStatus #!important
+unbind -T root WheelDownStatus #!important
+
 # Ghostty 与 tmux 的扩展键：真正依赖 extended-keys 的是 C-M-= / C-M-+
 # （没有传统编码的按键）。tmux ≥3.5 只有在终端具备 extkeys 特性时才会
 # 真正向终端发出请求（CSI ＞ 4 ； 2 m），Ghostty 收到请求后才会发送
