@@ -65,7 +65,7 @@ Pi suspend guard 已迁移出本模块：它是与 tmux 无关的 Pi 运行时�
 
 Pi 只在启动时扫描 `~/.pi/agent/extensions/` 下的目录，不会扫描本仓库——仓库里的 `pi-agent/extensions/pi-tmux-window-status` 必须通过上面的受管符号链接暴露到 `~/.pi/agent/extensions/` 才会被加载。安装/更新扩展后需要**重启 Pi 或执行 `/reload`** 才生效；tmux 只须 `<前缀> r` 重载样式。
 
-注意：conley 的 pi-agent fork（`github.com:conley2bin/pi-agent` 分支 `conley`）自 2026-08-27 起**把 `extensions/pi-tmux-window-status` 作为符号链接纳入 git 追踪**（目标文本与本模块安装器创建的一致）。因此 `~/.pi/agent` 里 `git pull` 首次遇到该路径时会报 “untracked working tree file would be overwritten by merge”——这是追踪文件与安装器创建的未追踪链接同名所致，一次性解决：确认链接内容后 `rm ~/.pi/agent/extensions/pi-tmux-window-status`（或先备份），完成 `git pull`，再重跑本模块 `install.sh` 重建链接。此后上游追踪的链接与安装器目标文本一致，`git pull` 与重跑安装都保持干净；仓库搬迁后照旧重跑 install.sh。
+该扩展链接不受 conley 的 pi-agent fork 追踪（fork 的 `7f8dc20` 已停止追踪并由 `.gitignore` 忽略），`git pull` 与重跑安装互不干扰；仓库搬迁后重跑 install.sh 重建链接。
 
 呼吸动画的自愈语义：animator 每帧失败会按 1s 慢速重试；若**连续 10 帧失败**（tmux 服务不可达、lease 窗口已被关闭等），animator 会打印 giving up、清理残留选项、释放 animator.lock 并退出——不再无限重试死守锁。扩展在每个心跳周期（2s）重新派生 animator，故障消除后（如 tmux 服务恢复）新 animator 自动接管并恢复呼吸，无需手动杀进程。
 
