@@ -5,7 +5,7 @@ import {
   installSuspendListener,
   parseProcStat,
   suspendGuardInput,
-} from "../pi-suspend-guard/guard.mjs";
+} from "../guard.mjs";
 
 const record = (pid, ppid, pgrp, session) => ({ pid, ppid, pgrp, session });
 const lookup = (rows) => (pid) => {
