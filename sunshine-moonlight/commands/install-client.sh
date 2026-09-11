@@ -2,8 +2,8 @@
 # Install the pinned Moonlight AppImage as an extracted, user-owned application (no FUSE).
 set -euo pipefail
 
-SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-# shellcheck source=lib/common.sh
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=../lib/common.sh
 . "$SCRIPT_DIR/lib/common.sh"
 
 GITHUB_REPO='moonlight-stream/moonlight-qt'
@@ -24,7 +24,7 @@ OWNERSHIP_GREP='quick-deploy/sunshine-moonlight'
 
 usage() {
     cat <<USAGE
-用法: ./install-client.sh [选项]
+用法: ./commands/install-client.sh [选项]
 
 安装 Moonlight 客户端（官方 AppImage 解包到 ~/.local/opt/moonlight/<版本>）。
 不要用 root/sudo 运行本脚本。不使用 Snap/Flatpak，不依赖 libfuse2。
@@ -100,7 +100,7 @@ check_no_foreign_assets() {
     for stale in "$OPT_DIR"/.staging-"$ver_num".* "$OPT_DIR"/.backup-"$ver_num".*; do
         [ -e "$stale" ] || continue
         qd_die "发现上次安装中断/回滚残留的目录: $stale。
-为避免误删，请人工检查其内容后自行移除（或运行 ./uninstall.sh --client，带标记的残留会被清掉），再重跑。"
+为避免误删，请人工检查其内容后自行移除（或运行 ./commands/uninstall.sh --client，带标记的残留会被清掉），再重跑。"
     done
 }
 
@@ -239,7 +239,7 @@ main() {
 Moonlight 已就绪。启动方式:
   命令行:  ~/.local/bin/moonlight
   桌面:    应用列表中的 Moonlight
-添加主机: 使用 install-host.sh 输出的 <Tailnet IPv4>:<基准端口>。
+添加主机: 使用 commands/install-host.sh 输出的 <Tailnet IPv4>:<基准端口>。
 在主机 Web UI 核对待配对客户端与来源地址后，输入 Moonlight 显示的 PIN。
 EOF_DONE
 }

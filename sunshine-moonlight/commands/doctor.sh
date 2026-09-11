@@ -1,8 +1,8 @@
 #!/bin/bash
 # Read-only checks. Never execute Sunshine: even --version can write configuration/logs.
 set -euo pipefail
-SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-# shellcheck source=lib/common.sh
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=../lib/common.sh
 . "$SCRIPT_DIR/lib/common.sh"
 
 CHECK_HOST=false
@@ -14,7 +14,7 @@ ok() { printf '  [通过] %s\n' "$*"; }
 warn() { printf '  [警告] %s\n' "$*"; WARNINGS=$((WARNINGS+1)); }
 bad() { printf '  [失败] %s\n' "$*"; FAILURES=$((FAILURES+1)); }
 usage() {
-    printf '%s\n' '用法: ./doctor.sh [--host] [--client]' \
+    printf '%s\n' '用法: ./commands/doctor.sh [--host] [--client]' \
         '不带参数自动检测角色；退出码 1 表示必需条件不满足，0 不代表已完成双机串流测试。'
 }
 
@@ -131,7 +131,7 @@ run_client_checks() {
     desktop="$HOME/.local/share/applications/com.moonlight_stream.Moonlight.desktop"
     [ "$(uname -m)" = x86_64 ] || bad '固定的 AppImage 只支持 x86_64'
     if [ ! -d "$opt" ] && [ "$EXPLICIT_CLIENT" = false ]; then warn '未安装本流程的 Moonlight'; return 0; fi
-    if [ ! -x "$target/AppRun" ]; then bad "缺少可执行 AppRun: $target（运行 install-client.sh 修复）"; fi
+    if [ ! -x "$target/AppRun" ]; then bad "缺少可执行 AppRun: $target（运行 commands/install-client.sh 修复）"; fi
     if [ -f "$target/.quick-deploy-sha256" ]; then
         recorded="$(cat "$target/.quick-deploy-sha256")"
         if [ "$recorded" = "$QD_MOONLIGHT_SHA256" ]; then

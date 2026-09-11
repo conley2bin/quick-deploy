@@ -27,10 +27,15 @@ run() {
     bash "$MODULE_DIR/$1" "${@:2}" >"$CASE/out" 2>"$CASE/err" || RC=$?
     cat "$CASE/err" >>"$CASE/out"
 }
+run_from() {
+    RC=0
+    (cd -- "$1" && "$2" "${@:3}") >"$CASE/out" 2>"$CASE/err" || RC=$?
+    cat "$CASE/err" >>"$CASE/out"
+}
 end_case() {
     rm -rf -- "$CASE"; CASE=''
     export PATH="$BASE_PATH" HOME="$ORIGINAL_HOME"
-    unset XDG_CONFIG_HOME CONFIGURATION_DIRECTORY
+    unset XDG_CONFIG_HOME CONFIGURATION_DIRECTORY QD_TEST_SYSTEM_PYTHON QD_TEST_YAML_AVAILABLE
     # All mutable mock controls are case-local.
     while IFS= read -r key; do unset "$key"; done < <(compgen -v | grep '^MOCK_' || true)
     unset QD_TEST_MOONLIGHT_SHA256 QD_TEST_MOONLIGHT_SIZE TMPDIR
@@ -81,6 +86,19 @@ active() {
     ln -sf "$CASE/installed/bin/sunshine" "$QD_PROC_ROOT/4242/exe"
     cp "$QD_SUNSHINE_CONFIG_DIR/sunshine.conf" "$CASE/running.conf"
 }
+system_python_fixture() {
+    cat >"$CASE/system-python" <<'MOCK'
+#!/bin/bash
+if [ "${1:-}" = -c ] && [ "${2:-}" = 'import yaml' ]; then
+    [ "${QD_TEST_YAML_AVAILABLE:-0}" = 1 ] || [ -f "$CASE/python3-yaml-installed" ]
+    exit $?
+fi
+exec /usr/bin/python3 "$@"
+MOCK
+    chmod +x "$CASE/system-python"
+    export QD_TEST_SYSTEM_PYTHON="$CASE/system-python"
+}
+
 client_fixture() {
     cat >"$CASE/fixtures/moonlight.AppImage" <<'AI'
 #!/bin/bash
@@ -118,6 +136,10 @@ printf 'apt-get %s\n' "$*" >>"$CASE/log"
 case "$1" in
  install)
     file="${@: -1}"
+    if [ "$file" = python3-yaml ]; then
+        touch "$CASE/python3-yaml-installed"
+        exit 0
+    fi
     [[ "$file" = /*.deb ]] || { echo "Unsupported file $file" >&2; exit 100; }
     /usr/bin/dpkg-deb -f "$file" Package >/dev/null || exit 100
     version="$(/usr/bin/dpkg-deb -f "$file" Version)"
@@ -314,7 +336,7 @@ check 'real apt selected only dummy package' contains "$CASE/apt-out" 'Inst qd-s
 end_case
 
 new_case
-run install-host.sh
+run commands/install-host.sh
 check 'fresh native-name install reaches listening state' test "$RC" -eq 0
 check 'apt receives .deb suffix' contains "$CASE/log" '.deb'
 check 'fresh install owns package' contains "$QD_HOST_STATE_DIR/host.state" 'package_preexisting=false'
@@ -322,12 +344,12 @@ check 'host prints Moonlight base port' contains "$CASE/out" '100.64.0.2:47989'
 check 'host distinguishes untested live stream' contains "$CASE/out" '尚未验证实际 Desktop'
 check 'new config mode is 600' test "$(stat -c %a "$QD_SUNSHINE_CONFIG_DIR/sunshine.conf")" = 600
 : >"$CASE/log"
-run install-host.sh
+run commands/install-host.sh
 check 'same Debian-revision upstream is idempotent' test "$RC" -eq 0
 check 'same upstream skips apt' absent "$CASE/log" 'apt-get install'
 check 'same upstream skips restart' absent "$CASE/log" 'systemctl --user restart'
 check 'temporary files cleaned' test -z "$(find "$TMPDIR" -mindepth 1 -print -quit)"
-run doctor.sh --host
+run commands/doctor.sh --host
 check 'healthy modeled host doctor passes' test "$RC" -eq 0
 end_case
 
@@ -340,7 +362,7 @@ for failure in package arch version digest; do
  esac
  write_api "v$QD_SUNSHINE_VERSION" 'sunshine-ubuntu-24.04-amd64.deb'
  if [ "$failure" = digest ]; then printf 'corruption' >>"$CASE/fixtures/sunshine.deb"; fi
- run install-host.sh
+ run commands/install-host.sh
  check "reject $failure before apt" test "$RC" -ne 0
  check "no privileged changes on $failure" absent "$CASE/log" 'sudo '
  check "no config on $failure" test ! -e "$QD_SUNSHINE_CONFIG_DIR/sunshine.conf"
@@ -348,13 +370,13 @@ for failure in package arch version digest; do
 done
 new_case
 export MOCK_APT_VERSION=2099.1.1
-run install-host.sh
+run commands/install-host.sh
 check 'exact installed Debian version required' test "$RC" -ne 0
 check 'wrong installed version cannot claim ownership' test ! -e "$QD_HOST_STATE_DIR/host.state"
 end_case
 new_case
 export MOCK_APT_FAIL=1
-run install-host.sh
+run commands/install-host.sh
 check 'apt failure is surfaced without false consistency claim' test "$RC" -ne 0
 check 'failed install keeps no ownership proof' test ! -e "$QD_HOST_STATE_DIR/host.state"
 end_case
@@ -362,12 +384,12 @@ new_case
 export MOCK_ARCH=arm64
 make_deb sunshine arm64 "$QD_SUNSHINE_VERSION-1+ubuntu24.04"
 write_api "v$QD_SUNSHINE_VERSION" "sunshine_$QD_SUNSHINE_VERSION-1+ubuntu24.04_arm64.deb"
-run install-host.sh
+run commands/install-host.sh
 check 'native arm64 asset accepted' test "$RC" -eq 0
 end_case
 new_case
 write_api "v$QD_SUNSHINE_VERSION" 'sunshine-ubuntu-22.04-amd64.deb'
-run install-host.sh
+run commands/install-host.sh
 check 'other Ubuntu asset refused' test "$RC" -ne 0
 check 'asset rejection before apt' absent "$CASE/log" 'apt-get'
 end_case
@@ -380,7 +402,7 @@ for change in package caps stale; do
  caps) export MOCK_CAPS_MISSING=1;;
  stale) printf 'stale\n' >"$CASE/stale"; ln -sf "$CASE/stale" "$QD_PROC_ROOT/4242/exe";;
  esac
- run install-host.sh
+ run commands/install-host.sh
  check "$change change succeeds" test "$RC" -eq 0
  check "$change change restarts active daemon" contains "$CASE/log" 'systemctl --user restart'
  if [ "$change" = package ]; then check 'old Debian epoch explicitly handled' contains "$CASE/log" '--allow-downgrades'; fi
@@ -388,12 +410,12 @@ for change in package caps stale; do
  end_case
 done
 new_case; installed 2099.1.1; write_conf; active
-run install-host.sh
+run commands/install-host.sh
 check 'newer upstream preserved' test "$RC" -eq 0
 check 'newer upstream not downloaded' absent "$CASE/log" 'curl '
 end_case
 new_case; installed '1:2026.516.143833-99'; write_conf; active
-run doctor.sh --host
+run commands/doctor.sh --host
 check 'epoch cannot satisfy upstream floor' test "$RC" -ne 0
 end_case
 
@@ -409,7 +431,7 @@ p=sys.argv[1]; d=json.load(open(p)); d['assets'][0]['digest']=None
 with open(p,'w') as f: json.dump(d,f)
 PY_TEST
  fi
- run install-host.sh
+ run commands/install-host.sh
  check "$issue fails before mutation" test "$RC" -ne 0
  check "$issue performs no sudo" absent "$CASE/log" 'sudo '
  end_case
@@ -430,14 +452,14 @@ for scenario in dropin fragment execstart unit-env xdg-mismatch configdir-mismat
  offline) export MOCK_TS_STATE=Stopped;;
  unassigned) export MOCK_ASSIGNED_IP=100.64.0.3;;
  esac
- if [ "$scenario" = foreign-address ]; then run install-host.sh --bind-address 192.168.1.2; else run install-host.sh; fi
+ if [ "$scenario" = foreign-address ]; then run commands/install-host.sh --bind-address 192.168.1.2; else run commands/install-host.sh; fi
  check "$scenario refused before mutations" test "$RC" -ne 0
  check "$scenario performs no sudo" absent "$CASE/log" 'sudo '
  check "$scenario performs no service start" absent "$CASE/log" 'systemctl --user start '
  end_case
 done
 for ip in 0.0.0.0 1.2.3.4. 010.0.0.1 999.1.1.1; do
- new_case; run install-host.sh --bind-address "$ip"
+ new_case; run commands/install-host.sh --bind-address "$ip"
  check "invalid/wildcard $ip rejected" test "$RC" -ne 0
  check "$ip rejected before sudo" absent "$CASE/log" 'sudo '
  end_case
@@ -446,13 +468,13 @@ new_case
 unset QD_SUNSHINE_CONFIG_DIR
 export XDG_CONFIG_HOME="$HOME/xdg-config" CONFIGURATION_DIRECTORY="$HOME/service-config"
 export MOCK_MANAGER_ENV="$(printf 'DISPLAY=:1\nXDG_CONFIG_HOME=%s\nCONFIGURATION_DIRECTORY=%s' "$XDG_CONFIG_HOME" "$CONFIGURATION_DIRECTORY")"
-run install-host.sh
+run commands/install-host.sh
 check 'matching service CONFIGURATION_DIRECTORY wins over XDG' test "$RC" -eq 0
 check 'actual service directory configured' test -f "$CONFIGURATION_DIRECTORY/sunshine/sunshine.conf"
 check 'unused default config not created' test ! -e "$HOME/.config/sunshine"
-run doctor.sh --host
+run commands/doctor.sh --host
 check 'doctor uses matching effective directory' test "$RC" -eq 0
-run uninstall.sh --destroy-host-state
+run commands/uninstall.sh --destroy-host-state
 check 'destroy uses matching effective directory' test ! -e "$CONFIGURATION_DIRECTORY/sunshine"
 end_case
 
@@ -460,18 +482,18 @@ new_case
 unset QD_SUNSHINE_CONFIG_DIR
 export XDG_CONFIG_HOME="$HOME/xdg-only"
 export MOCK_MANAGER_ENV="$(printf 'DISPLAY=:1\nXDG_CONFIG_HOME=%s' "$XDG_CONFIG_HOME")"
-run install-host.sh
+run commands/install-host.sh
 check 'XDG_CONFIG_HOME alone is honored' test "$RC" -eq 0
 check 'XDG config created at actual service location' test -f "$XDG_CONFIG_HOME/sunshine/sunshine.conf"
 end_case
 new_case
 export MOCK_SESSION_TYPE=wayland MOCK_MANAGER_ENV='WAYLAND_DISPLAY=wayland-0'
-run install-host.sh --capture portal
+run commands/install-host.sh --capture portal
 check 'Wayland portal configuration reaches modeled control listener' test "$RC" -eq 0
-run doctor.sh --host
+run commands/doctor.sh --host
 check 'Wayland doctor discloses portal lock limitation' contains "$CASE/out" '锁屏会终止'
 : >"$CASE/log"
-run install-host.sh --capture x11
+run commands/install-host.sh --capture x11
 check 'x11 on actual Wayland is preflight error' test "$RC" -ne 0
 check 'x11 mismatch does not mutate packages' absent "$CASE/log" 'sudo '
 end_case
@@ -481,25 +503,25 @@ for capture in kms portal x11 nvfbc wlr kwin; do
  new_case; write_conf
  case "$capture" in wlr|kwin) export MOCK_SESSION_TYPE=wayland MOCK_MANAGER_ENV='WAYLAND_DISPLAY=wayland-0';; esac
  printf 'capture = %s # intentional\n' "$capture" >>"$QD_SUNSHINE_CONFIG_DIR/sunshine.conf"
- run install-host.sh
+ run commands/install-host.sh
  check "preserve compatible $capture selection" test "$RC" -eq 0
  check "preserve $capture bytes/comment" contains "$QD_SUNSHINE_CONFIG_DIR/sunshine.conf" "capture = $capture # intentional"
- run doctor.sh --host
+ run commands/doctor.sh --host
  check "doctor accepts compatible $capture session" test "$RC" -eq 0
  end_case
 done
 for capture in wlr kwin; do
  new_case; installed; write_conf; active
- run install-host.sh --capture "$capture"
+ run commands/install-host.sh --capture "$capture"
  check "explicit $capture on X11 rejected" test "$RC" -ne 0
  check "explicit $capture conflict precedes mutation" absent "$CASE/log" 'sudo '
  check "explicit $capture conflict preserves config" absent "$QD_SUNSHINE_CONFIG_DIR/sunshine.conf" 'capture ='
  printf 'capture = %s # intentional\n' "$capture" >>"$QD_SUNSHINE_CONFIG_DIR/sunshine.conf"
- run install-host.sh
+ run commands/install-host.sh
  check "preserved $capture on X11 rejected" test "$RC" -ne 0
  check "$capture conflict does not erase selection" contains "$QD_SUNSHINE_CONFIG_DIR/sunshine.conf" "capture = $capture # intentional"
  check "$capture conflict leaves active service untouched" absent "$CASE/log" 'systemctl --user restart'
- run doctor.sh --host
+ run commands/doctor.sh --host
  check "doctor rejects $capture on X11" test "$RC" -ne 0
  check "doctor names $capture Wayland requirement" contains "$CASE/out" "capture=$capture 需要 Wayland"
  end_case
@@ -507,11 +529,11 @@ done
 for capture in xcb auto typo; do
  new_case; write_conf
  printf 'capture = %s\n' "$capture" >>"$QD_SUNSHINE_CONFIG_DIR/sunshine.conf"
- run install-host.sh
+ run commands/install-host.sh
  check "invalid existing $capture is preflight error" test "$RC" -ne 0
  check "$capture not silently deleted" contains "$QD_SUNSHINE_CONFIG_DIR/sunshine.conf" "capture = $capture"
  check "$capture fails before apt" absent "$CASE/log" 'apt-get'
- run install-host.sh --capture auto
+ run commands/install-host.sh --capture auto
  check "explicit auto clears $capture" test "$RC" -eq 0
  check 'auto leaves no selector' absent "$QD_SUNSHINE_CONFIG_DIR/sunshine.conf" 'capture ='
  end_case
@@ -526,7 +548,7 @@ capture = portal # selected
 csrf_allowed_origins = https://existing.example:47990#trusted
 CONF
 cp "$QD_SUNSHINE_CONFIG_DIR/sunshine.conf" "$CASE/before"
-run install-host.sh
+run commands/install-host.sh
 check 'commented config converges successfully' test "$RC" -eq 0
 check 'unknown scalar/comment preserved' contains "$QD_SUNSHINE_CONFIG_DIR/sunshine.conf" 'custom_key = custom value # untouched'
 check 'IPv4 setting converged as native scalar' grep -qx 'address_family = ipv4' "$QD_SUNSHINE_CONFIG_DIR/sunshine.conf"
@@ -535,19 +557,19 @@ check 'origin inserted before comment' contains "$QD_SUNSHINE_CONFIG_DIR/sunshin
 check 'custom Moonlight address uses base' contains "$CASE/out" '100.64.0.2:48000'
 check 'custom UI address uses base+1' contains "$CASE/out" 'https://100.64.0.2:48001'
 check 'backup retains original bytes' cmp -s "$CASE/before" "$QD_SUNSHINE_CONFIG_DIR/sunshine.conf.bak"
-: >"$CASE/log"; run install-host.sh
+: >"$CASE/log"; run commands/install-host.sh
 check 'unchanged rerun leaves backup intact' cmp -s "$CASE/before" "$QD_SUNSHINE_CONFIG_DIR/sunshine.conf.bak"
 check 'unchanged rerun does not restart' absent "$CASE/log" 'systemctl --user restart'
 end_case
 for port in 01029 1028 65515 999999999999999999999999999999 foo; do
  new_case; write_conf; printf 'port = %s\n' "$port" >>"$QD_SUNSHINE_CONFIG_DIR/sunshine.conf"
- run install-host.sh
+ run commands/install-host.sh
  check "invalid port $port rejected before sudo" absent "$CASE/log" 'sudo '
  check "invalid port $port fails" test "$RC" -ne 0
  end_case
 done
 new_case; write_conf; printf 'origin_web_ui_allowed = pc # local only\n' >>"$QD_SUNSHINE_CONFIG_DIR/sunshine.conf"
-run install-host.sh
+run commands/install-host.sh
 check 'local-only Web UI conflict rejected' test "$RC" -ne 0
 check 'local-only authorization not broadened' contains "$QD_SUNSHINE_CONFIG_DIR/sunshine.conf" 'origin_web_ui_allowed = pc'
 check 'local-only conflict before sudo' absent "$CASE/log" 'sudo '
@@ -559,7 +581,7 @@ printf 'upnp = enabled\n' >"$CASE/change"
 cat "$QD_SUNSHINE_CONFIG_DIR/sunshine.conf" >>"$CASE/change"
 cp "$CASE/change" "$QD_SUNSHINE_CONFIG_DIR/sunshine.conf"
 export MOCK_FAIL_CONFIG_COMMIT=1
-run install-host.sh
+run commands/install-host.sh
 check 'failed config promotion is surfaced' test "$RC" -ne 0
 check 'failed config promotion preserves original' cmp -s "$CASE/change" "$QD_SUNSHINE_CONFIG_DIR/sunshine.conf"
 check 'failed config promotion preserves original backup' cmp -s "$CASE/change" "$QD_SUNSHINE_CONFIG_DIR/sunshine.conf.bak"
@@ -567,16 +589,16 @@ check 'failed config promotion does not restart daemon' absent "$CASE/log" 'syst
 end_case
 
 # Required input and listener failures do not become readiness success.
-new_case; rm "$QD_UINPUT_NODE"; run install-host.sh
+new_case; rm "$QD_UINPUT_NODE"; run commands/install-host.sh
 check 'missing uinput blocks ready result' test "$RC" -ne 0
 check 'missing device never triggers usermod' absent "$CASE/log" 'usermod'
 check 'missing device never starts service' absent "$CASE/log" 'systemctl --user start '
 end_case
-new_case; chmod 000 "$QD_UINPUT_NODE"; run install-host.sh
+new_case; chmod 000 "$QD_UINPUT_NODE"; run commands/install-host.sh
 check 'inaccessible uinput blocks readiness' test "$RC" -ne 0
 check 'inaccessible uinput has no automatic group mutation' absent "$CASE/log" 'usermod'
 end_case
-new_case; rm "$QD_UHID_NODE"; run install-host.sh
+new_case; rm "$QD_UHID_NODE"; run commands/install-host.sh
 check 'missing uhid warns without blocking keyboard/mouse setup' test "$RC" -eq 0
 check 'uhid warning scoped to controllers' contains "$CASE/out" '手柄'
 end_case
@@ -590,25 +612,25 @@ for scenario in no-listener wrong-address wrong-pid tty stale incomplete-family;
  stale) printf 'stale' >"$CASE/stale"; ln -sf "$CASE/stale" "$QD_PROC_ROOT/4242/exe";;
  incomplete-family) sed -i 's/address_family = ipv4/address_family = both/' "$QD_SUNSHINE_CONFIG_DIR/sunshine.conf";;
  esac
- run doctor.sh --host
+ run commands/doctor.sh --host
  check "doctor fails $scenario" test "$RC" -ne 0
  check "doctor never mutates on $scenario" absent "$CASE/log" 'sudo '
  end_case
 done
-new_case; export MOCK_LISTEN=no; run install-host.sh
+new_case; export MOCK_LISTEN=no; run commands/install-host.sh
 check 'installer fails bounded listener wait' test "$RC" -ne 0
 check 'timeout does not claim ready' absent "$CASE/out" '控制端口已监听'
 end_case
-new_case; export MOCK_HIDE_OWNER=1; run install-host.sh
+new_case; export MOCK_HIDE_OWNER=1; run commands/install-host.sh
 check 'unobservable listener PID is disclosed' contains "$CASE/out" '未验证所有者'
 end_case
 
 # Uninstall protects ownership and stops the daemon before destructive actions.
 new_case; installed; write_conf; active
-run uninstall.sh --host-package
+run commands/uninstall.sh --host-package
 check 'unowned package removal refused' test "$RC" -ne 0
 check 'ownership checked before stopping service' test -f "$CASE/active"
-run uninstall.sh --host-package --force-remove-preexisting-package
+run commands/uninstall.sh --host-package --force-remove-preexisting-package
 check 'explicit preexisting package removal succeeds' test "$RC" -eq 0
 check 'package removal stops service' test ! -e "$CASE/active"
 check 'package removal disables service' test ! -e "$CASE/enabled"
@@ -620,24 +642,24 @@ end_case
 for mode in stop-failure other-process; do
  new_case; installed; write_conf; active
  if [ "$mode" = stop-failure ]; then export MOCK_STOP_FAIL=1; else export MOCK_EXTRA_PROCS='9999 2345 sunshine'; fi
- run uninstall.sh --host-package --force-remove-preexisting-package
+ run commands/uninstall.sh --host-package --force-remove-preexisting-package
  check "$mode blocks package removal" test "$RC" -ne 0
  check "$mode leaves package installed" test -s "$CASE/version"
  check "$mode never calls apt remove" absent "$CASE/log" 'apt-get remove'
  end_case
 done
 new_case; installed; write_conf; active
-run uninstall.sh --destroy-host-state
+run commands/uninstall.sh --destroy-host-state
 check 'state deletion succeeds' test "$RC" -eq 0
 check 'state deletion leaves process stopped' test ! -e "$CASE/active"
 check 'state deletion disables next-login startup' test ! -e "$CASE/enabled"
 check 'state deletion removes effective config' test ! -e "$QD_SUNSHINE_CONFIG_DIR"
 check 'state deletion does not remove package' test -s "$CASE/version"
-check 'state deletion requires configured reinstall before reuse' contains "$CASE/out" 'install-host.sh'
+check 'state deletion requires configured reinstall before reuse' contains "$CASE/out" 'commands/install-host.sh'
 end_case
 new_case; installed; write_conf; active
 export MOCK_STILL_ENABLED=1
-run uninstall.sh --destroy-host-state
+run commands/uninstall.sh --destroy-host-state
 check 'enabled unit after disable is reported as failure' test "$RC" -ne 0
 check 'still-enabled unit prevents state deletion' test -f "$QD_SUNSHINE_CONFIG_DIR/sunshine.conf"
 end_case
@@ -648,9 +670,9 @@ for action in state-only combined; do
  cp -a "$CASE/sentinel-dir" "$CASE/sentinel-before"
  ln -s "$CASE/sentinel-dir" "$QD_SUNSHINE_CONFIG_DIR"
  if [ "$action" = combined ]; then
-     run uninstall.sh --host-package --force-remove-preexisting-package --destroy-host-state
+     run commands/uninstall.sh --host-package --force-remove-preexisting-package --destroy-host-state
  else
-     run uninstall.sh --destroy-host-state
+     run commands/uninstall.sh --destroy-host-state
  fi
  check "$action final config symlink refused" test "$RC" -ne 0
  check "$action refusal explains resolved target" contains "$CASE/out" "$CASE/sentinel-dir"
@@ -671,21 +693,21 @@ for parent in home xdg; do
  fi
  printf 'keep parent content\n' >"$HOME/.config/sibling"
  unset QD_SUNSHINE_CONFIG_DIR
- run uninstall.sh --destroy-host-state
+ run commands/uninstall.sh --destroy-host-state
  check "$parent parent symlink allowed for state deletion" test "$RC" -eq 0
  check "$parent parent symlink keeps sibling contents" contains "$HOME/.config/sibling" 'keep parent content'
  check "$parent parent symlink service disabled" test ! -e "$CASE/enabled"
  check "$parent parent symlink state removed" test ! -e "$HOME/.config/sunshine"
  end_case
 done
-new_case; run install-host.sh; run uninstall.sh --host-package
+new_case; run commands/install-host.sh; run commands/uninstall.sh --host-package
 check 'owned uninstall clears stale ownership proof' test ! -e "$QD_HOST_STATE_DIR/host.state"
 end_case
 
 new_case
 mkdir -p "$QD_HOST_STATE_DIR"
 printf 'package_preexisting=false\n' >"$QD_HOST_STATE_DIR/host.state"
-run uninstall.sh --host-package
+run commands/uninstall.sh --host-package
 check 'already absent package clears stale ownership' test ! -e "$QD_HOST_STATE_DIR/host.state"
 end_case
 
@@ -695,31 +717,31 @@ check 'native binding semantics and byte-preserving rewrite' python3 "$TESTS_DIR
 check 'real prestart guard and retry time model' python3 "$TESTS_DIR/retry.py"
 
 # Client extraction, pins/provenance, ownership and interrupted replacement.
-new_case; client_fixture; run install-client.sh
+new_case; client_fixture; run commands/install-client.sh
 check 'extracted AppImage client installs' test "$RC" -eq 0
 check 'extracted AppRun resolves to executable' test -x "$HOME/.local/opt/moonlight/$QD_MOONLIGHT_VERSION/AppRun"
-: >"$CASE/log"; run install-client.sh
+: >"$CASE/log"; run commands/install-client.sh
 check 'client rerun skips download based on provenance' absent "$CASE/log" 'curl '
 check 'client provenance wording does not claim rehash' contains "$CASE/out" '未重新校验'
 rm "$HOME/.local/opt/moonlight/$QD_MOONLIGHT_VERSION/com.moonlight_stream.Moonlight.desktop"
-run install-client.sh
+run commands/install-client.sh
 check 'missing extracted desktop metadata triggers repair' test "$RC" -eq 0
 check 'extracted desktop metadata restored' test -f "$HOME/.local/opt/moonlight/$QD_MOONLIGHT_VERSION/com.moonlight_stream.Moonlight.desktop"
 # The fake payload is intentionally not the published payload; test both marker paths.
-run doctor.sh --client
+run commands/doctor.sh --client
 check 'doctor rejects wrong pinned provenance' test "$RC" -ne 0
 printf '%s\n' "$QD_MOONLIGHT_SHA256" >"$HOME/.local/opt/moonlight/$QD_MOONLIGHT_VERSION/.quick-deploy-sha256"
-run doctor.sh --client
+run commands/doctor.sh --client
 check 'modeled client with published marker passes structural checks' test "$RC" -eq 0
 rm "$HOME/.local/opt/moonlight/$QD_MOONLIGHT_VERSION/usr/bin/moonlight"
-run doctor.sh --client
+run commands/doctor.sh --client
 check 'broken AppRun symlink fails client doctor' test "$RC" -ne 0
 mkdir -p "$HOME/.local/opt/moonlight/foreign-build"
-run uninstall.sh --client
+run commands/uninstall.sh --client
 check 'client removes owned payload only' test ! -d "$HOME/.local/opt/moonlight/$QD_MOONLIGHT_VERSION"
 check 'client preserves foreign directory' test -d "$HOME/.local/opt/moonlight/foreign-build"
 end_case
-new_case; mkdir -p "$HOME/.local/opt/moonlight"; run doctor.sh --client
+new_case; mkdir -p "$HOME/.local/opt/moonlight"; run commands/doctor.sh --client
 check 'empty client directory is a failure' test "$RC" -ne 0
 end_case
 for failure in digest size extract foreign; do
@@ -730,7 +752,7 @@ for failure in digest size extract foreign; do
  extract) export MOCK_EXTRACT_FAIL=1;;
  foreign) mkdir -p "$HOME/.local/bin"; printf 'foreign\n' >"$HOME/.local/bin/moonlight";;
  esac
- run install-client.sh
+ run commands/install-client.sh
  check "client $failure fails" test "$RC" -ne 0
  check "client $failure does not install payload" test ! -e "$HOME/.local/opt/moonlight/$QD_MOONLIGHT_VERSION"
  end_case
@@ -756,7 +778,7 @@ for asset in desktop target staging backup; do
      if [ "$asset" != target ]; then printf 'recorded residue\n' >"$foreign/.quick-deploy-sha256"; fi
      cp -a "$foreign" "$CASE/before";;
  esac
- run install-client.sh
+ run commands/install-client.sh
  check "client refuses $asset ownership boundary" test "$RC" -ne 0
  check "$asset refusal occurs before download" absent "$CASE/log" 'curl '
  if [ "$asset" = desktop ]; then
@@ -778,30 +800,106 @@ done
 mkdir -p "$opt/.foreign-hidden/nested"
 printf 'keep hidden bytes\n' >"$opt/.foreign-hidden/nested/file"
 cp -a "$opt/.foreign-hidden" "$CASE/hidden-before"
-run uninstall.sh --client
+run commands/uninstall.sh --client
 check 'hidden residue uninstall succeeds' test "$RC" -eq 0
 check 'marked hidden staging removed' test ! -e "$opt/.staging-$QD_MOONLIGHT_VERSION.123"
 check 'marked hidden backup removed' test ! -e "$opt/.backup-$QD_MOONLIGHT_VERSION.123"
 check 'unmarked hidden contents preserved' diff -qr "$CASE/hidden-before" "$opt/.foreign-hidden"
 end_case
-new_case; client_fixture; run install-client.sh
+new_case; client_fixture; run commands/install-client.sh
 printf 'old marker\n' >"$HOME/.local/opt/moonlight/$QD_MOONLIGHT_VERSION/.quick-deploy-sha256"
 export MOCK_FAIL_PROMOTE=1
-run install-client.sh
+run commands/install-client.sh
 check 'failed client promotion is surfaced' test "$RC" -ne 0
 check 'failed client promotion restores old target' contains "$HOME/.local/opt/moonlight/$QD_MOONLIGHT_VERSION/.quick-deploy-sha256" 'old marker'
 end_case
-new_case; export MOCK_UID=0; run install-host.sh
-check 'root installer refused' test "$RC" -ne 0
+# Combined installer executes the moved entrypoints, not compatibility wrappers.
+new_case; client_fixture; system_python_fixture; export QD_TEST_YAML_AVAILABLE=1
+run install.sh
+check 'combined installer succeeds' test "$RC" -eq 0
+check 'combined installer invokes host before client' test "$(grep -n 'api.github.com/repos/LizardByte/Sunshine' "$CASE/log" | head -1 | cut -d: -f1)" -lt "$(grep -n 'Moonlight-6.1.0-x86_64.AppImage' "$CASE/log" | head -1 | cut -d: -f1)"
+check 'combined installer selects KMS capture' grep -Fxq 'capture = kms' "$QD_SUNSHINE_CONFIG_DIR/sunshine.conf"
+check 'combined installer creates client wrapper' test -x "$HOME/.local/bin/moonlight"
+check 'combined installer skips apt when system Python has PyYAML' absent "$CASE/log" 'apt-get install -y python3-yaml'
+check 'client ownership marker keeps historic bytes' grep -Fxq '# Managed by quick-deploy/sunshine-moonlight/install-client.sh' "$HOME/.local/bin/moonlight"
 end_case
-new_case; run install-host.sh --version v2026.516.143833
+
+new_case; system_python_fixture; export QD_TEST_YAML_AVAILABLE=1
+run install.sh --host-only
+check 'host-only installer succeeds' test "$RC" -eq 0
+check 'host-only installer skips client' test ! -e "$HOME/.local/bin/moonlight"
+end_case
+
+new_case; client_fixture; system_python_fixture; export QD_TEST_YAML_AVAILABLE=1
+run install.sh --client-only
+check 'client-only installer succeeds' test "$RC" -eq 0
+check 'client-only installer skips host' test ! -s "$CASE/version"
+end_case
+
+new_case; client_fixture; system_python_fixture
+run install.sh --client-only
+check 'missing PyYAML is installed through privileged apt' test "$RC" -eq 0
+check 'missing PyYAML apt request uses package name' contains "$CASE/log" 'apt-get install -y python3-yaml'
+check 'PyYAML installation precedes client installation' test "$(grep -n 'python3-yaml' "$CASE/log" | head -1 | cut -d: -f1)" -lt "$(grep -n 'Moonlight-6.1.0-x86_64.AppImage' "$CASE/log" | head -1 | cut -d: -f1)"
+end_case
+
+new_case; system_python_fixture; export MOCK_APT_FAIL=1
+run install.sh --client-only
+check 'PyYAML apt failure is surfaced' test "$RC" -ne 0
+check 'PyYAML apt failure starts no client install' test ! -e "$HOME/.local/bin/moonlight"
+end_case
+
+new_case; client_fixture; system_python_fixture; export QD_TEST_YAML_AVAILABLE=1 MOCK_START_FAIL=1
+run install.sh
+check 'host failure stops combined installer' test "$RC" -ne 0
+check 'host failure leaves client unstarted' test ! -e "$HOME/.local/bin/moonlight"
+check 'host failure reports partial-completion boundary' contains "$CASE/out" 'Moonlight 客户端未开始'
+end_case
+
+new_case; system_python_fixture
+run install.sh --host-only --client-only
+check 'combined installer rejects conflicting modes before mutation' test "$RC" -ne 0
+check 'conflicting modes make no apt request' test ! -s "$CASE/log"
+run install.sh --unknown
+check 'combined installer rejects unknown option before mutation' test "$RC" -ne 0
+check 'unknown option makes no apt request' test ! -s "$CASE/log"
+run install.sh --help
+check 'combined installer help succeeds without mutation' test "$RC" -eq 0
+check 'combined installer help names direct commands' contains "$CASE/out" 'commands/install-host.sh'
+end_case
+
+new_case; export MOCK_UID=0; run install.sh
+check 'combined installer refuses root' test "$RC" -ne 0
+check 'root refusal precedes PyYAML apt' test ! -s "$CASE/log"
+end_case
+
+for entry in install-host.sh install-client.sh doctor.sh uninstall.sh; do
+    check "moved entrypoint exists: $entry" test -x "$MODULE_DIR/commands/$entry"
+    check "legacy top-level entry removed: $entry" test ! -e "$MODULE_DIR/$entry"
+done
+
+new_case
+space_module="$CASE/repo with spaces/sunshine-moonlight"
+mkdir -p "$space_module" "$CASE/unrelated cwd"
+cp -a "$MODULE_DIR/commands" "$MODULE_DIR/lib" "$MODULE_DIR/service" "$space_module/"
+cp -a "$MODULE_DIR/install.sh" "$space_module/"
+for entry in install.sh commands/install-host.sh commands/install-client.sh commands/doctor.sh commands/uninstall.sh; do
+    run_from "$CASE/unrelated cwd" "$space_module/$entry" --help
+    check "moved entry help works from spaced module path: $entry" test "$RC" -eq 0
+done
+end_case
+
+new_case; export MOCK_UID=0; run commands/install-host.sh
+check 'direct host installer refuses root' test "$RC" -ne 0
+end_case
+new_case; run commands/install-host.sh --version v2026.516.143833
 check 'obsolete security baseline rejected' test "$RC" -ne 0
 check 'obsolete version fails before network' absent "$CASE/log" 'curl '
-run install-client.sh --version v9999
+run commands/install-client.sh --version v9999
 check 'unpinned client version rejected' test "$RC" -ne 0
 end_case
 
-for script in "$MODULE_DIR"/*.sh "$MODULE_DIR"/lib/common.sh "$TESTS_DIR"/*.sh; do check "syntax: ${script##*/}" bash -n "$script"; done
+for script in "$MODULE_DIR"/*.sh "$MODULE_DIR"/commands/*.sh "$MODULE_DIR"/lib/common.sh "$TESTS_DIR"/*.sh; do check "syntax: ${script##*/}" bash -n "$script"; done
 check 'scoped diff whitespace' git --no-pager -C "$MODULE_DIR" diff --check -- .
 printf '\nAssertions: passed=%d failed=%d\n' "$PASSED" "$FAILED"
 [ "$FAILED" -eq 0 ]

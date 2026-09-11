@@ -1,0 +1,9 @@
+# Copy to machines.local.yaml and replace each non-secret connection value.
+# Keep passwords, pairing PINs, private keys, and command/options out of this file.
+machines:
+  desktop:
+    ssh: user@100.64.0.10
+    tailnet_ip: 100.64.0.10
+    moonlight_port: 47989
+    # ssh_port: 22
+    note: Replace with the Sunshine host's current Tailnet IPv4 and SSH destination.

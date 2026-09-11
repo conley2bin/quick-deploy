@@ -192,7 +192,7 @@ class BindingTests(unittest.TestCase):
 new_case; installed
 mkdir -p "$QD_SUNSHINE_CONFIG_DIR"
 cp "$BINDING_INPUT" "$QD_SUNSHINE_CONFIG_DIR/sunshine.conf"
-run install-host.sh
+run commands/install-host.sh
 [ "$RC" -eq 0 ] || { cat "$CASE/out"; exit 1; }
 cp "$QD_SUNSHINE_CONFIG_DIR/sunshine.conf" "$BINDING_OUTPUT"
 python3 "$(qd_retry_dir)/check-tailnet.py" "$(qd_host_config_dir)"

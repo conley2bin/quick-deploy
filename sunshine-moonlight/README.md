@@ -9,11 +9,21 @@
 - A 已登录本地图形桌面，有可捕获的显示输出及正常的显卡驱动。用该桌面用户运行脚本，**不要用 sudo 运行整个脚本**；包安装步骤会自行调用 sudo。
 - 需要 `curl`、`python3` 等命令；脚本发现缺失会提示。主机安装从 GitHub 下载官方 Ubuntu/架构匹配的 deb；客户端解包官方 AppImage，不依赖 FUSE，不引入 Snap/Flatpak。
 
+## 本机双角色安装
+
+若这台机器既需要运行 Sunshine 又需要运行 Moonlight，可在目录根部运行：
+
+```bash
+./install.sh
+```
+
+它先以 `--capture kms` 安装本机 Sunshine，再安装 Moonlight，并只在系统 Python 无法导入 PyYAML 时通过 `sudo apt-get install python3-yaml` 安装该依赖。只安装 A 时使用 `./install.sh --host-only`，只安装 B 时使用 `./install.sh --client-only`；已在双角色安装中完成这两个角色时，不要在下面的编号步骤重复安装。高级版本、捕获或绑定选项仍直接传给 `commands/install-host.sh` 或 `commands/install-client.sh`。任一阶段失败会停止后续阶段，已成功完成的阶段不会自动回滚。
+
 ## 1. 在 A 安装 Sunshine
 
 ```bash
 cd ~/quick-deploy/sunshine-moonlight
-./install-host.sh --capture kms
+./install.sh --host-only
 tailscale ip -4
 ```
 
@@ -25,10 +35,10 @@ tailscale ip -4
 若配置过自定义端口，以安装器输出为准。默认保留已有有效的捕获选择；需要明确选择时：
 
 ```bash
-./install-host.sh --capture kms       # DRM/KMS
-./install-host.sh --capture portal    # 桌面门户
-./install-host.sh --capture x11       # Xorg 会话
-./install-host.sh --capture auto      # 删除 capture 键，恢复自动选择
+./commands/install-host.sh --capture kms       # DRM/KMS
+./commands/install-host.sh --capture portal    # 桌面门户
+./commands/install-host.sh --capture x11       # Xorg 会话
+./commands/install-host.sh --capture auto      # 删除 capture 键，恢复自动选择
 ```
 
 这两台保留普通 GNOME Wayland 桌面，使用原生 `--capture kms`，不转换为 Xorg；KMS 不走桌面门户授权。不传 `--capture` 时已有有效后端设置会保留；`wlr`、`kwin` 需要 Wayland，`x11` 需要 Xorg。脚本拒绝与会话类型冲突的选择，具体 compositor/显卡是否可用仍需连接 Desktop 检查。无效值（如 `xcb` 或字面值 `auto`）会报错，由你明确选择修正方式。
@@ -37,7 +47,7 @@ tailscale ip -4
 
 ```bash
 cd ~/quick-deploy/sunshine-moonlight
-./install-client.sh
+./install.sh --client-only
 ~/.local/bin/moonlight
 ```
 
@@ -50,7 +60,40 @@ cd ~/quick-deploy/sunshine-moonlight
 
 Web UI 只绑定 A 的 Tailnet IPv4；远端 `localhost:47990` 不是它的监听地址。若使用 SSH 隧道，转发目标必须是 A 的 Tailnet IPv4 和实际 Web UI 端口。
 
-## 3. 先连接，再调整画质
+## 3. 用本机清单连接
+
+安装完成后，先从示例建立本机清单；它包含机器名、Tailnet IPv4 与 SSH 目标，不保存密码、PIN、私钥或命令参数：
+
+```bash
+cd ~/quick-deploy/sunshine-moonlight
+[ -e machines.local.yaml ] || cp machines.example.yaml machines.local.yaml
+$EDITOR machines.local.yaml
+./run_server.sh --list
+```
+
+`machines.local.yaml` 被模块的 `.gitignore` 忽略；已有本地文件不会被安装器或连接器改写。默认清单始终是 `run_server.sh` 同目录的 `machines.local.yaml`，不会因当前目录改变。用 `--config PATH` 时，PATH 按当前工作目录解析，适合临时、明确指定的清单。
+
+每个名称需有一个 `ssh`（单个别名或 `[user@]hostname/IP`）和 `tailnet_ip`（IPv4）；`moonlight_port` 可省略并默认 `47989`，`ssh_port` 可选。字段以 [`machines.example.yaml`](machines.example.yaml) 为准；未知字段、重复键、非字符串地址、布尔值/字符串端口、无效 IP 或端口都会在启动本地程序前报错。
+
+在 **Moonlight 中独立完成配对** 后，以名称启动 Desktop 串流：
+
+```bash
+./run_server.sh desktop              # 默认 Moonlight Desktop
+./run_server.sh --moonlight desktop  # 同上
+./run_server.sh --config /path/to/inventory.yaml desktop
+```
+
+连接器实际执行固定的 Moonlight Qt 命令：`~/.local/bin/moonlight stream -- <Tailnet IPv4>:<基准端口> Desktop`。它不会自动配对、不会把 Moonlight 返回 0 解释成“已连接”，也不会远程安装、启动 Sunshine 或改写远端配置。Moonlight 仍是桌面 GUI，须从拥有正常图形会话的本机用户运行；未配对或运行时错误可能显示对话框后退出。
+
+SSH 是另一个明确动作，只打开交互式登录并沿用现有 SSH config、密钥/agent 与 known_hosts：
+
+```bash
+./run_server.sh --ssh desktop
+```
+
+它不会启动串流、传入远程命令或放宽主机密钥检查。`--list` 只列出清单名称，必须指定名称的模式不会默认选择或遍历机器。
+
+## 4. 先连接，再调整画质
 
 先用 **1080p、60 FPS、20 Mbps**。在 A 打开一个空白编辑器，通过 B 检查画面持续更新、鼠标位置准确、键盘文字能输入；随后断开并重新连接，确认回到同一桌面。
 
@@ -129,8 +172,8 @@ KMS 需要活动、可读取的 scanout/framebuffer，物理屏幕变暗时也�
 ## 检查与排障
 
 ```bash
-./doctor.sh --host       # 在 A
-./doctor.sh --client     # 在 B
+./commands/doctor.sh --host       # 在 A
+./commands/doctor.sh --client     # 在 B
 journalctl --user -u app-dev.lizardbyte.app.Sunshine.service -e
 ```
 
@@ -152,21 +195,21 @@ Doctor 只读；退出 1 表示必需条件不满足。它检查包、实际服�
 
 版本、维护基线及客户端固定摘要集中在 [`lib/common.sh`](lib/common.sh)。Sunshine 基线包含上游 2026 年 9 月公布的修复；下载先校验摘要和 deb 元数据，再安装。相同上游版本跳过重装，更高版本保留；包、capability、配置或 retry 策略变化时会重启活动服务，中断当前串流。
 
-主机升级可用 `./install-host.sh --version v版本号`。保留原配置及凭据，配置变化前备份为同目录的 `sunshine.conf.bak`。新版本可能改变显示编号，升级后核对选中的显示器。
+主机升级可用 `./commands/install-host.sh --version v版本号`。保留原配置及凭据，配置变化前备份为同目录的 `sunshine.conf.bak`。新版本可能改变显示编号，升级后核对选中的显示器。
 
 客户端只接受固定版本；升级前核对官方新 AppImage 的 SHA-256 与精确大小，再更新共享定义。目录中的摘要标记记录下载来源，不表示已重新校验解包后的全部内容。
 
 ```bash
-./uninstall.sh --client                 # 只删本流程带标记的客户端内容
-./uninstall.sh --host-package           # 先停用当前用户服务，再移除本流程引入的包
-./uninstall.sh --destroy-host-state     # 先停止并禁用服务，再删除有效配置目录；不可恢复
+./commands/uninstall.sh --client                 # 只删本流程带标记的客户端内容
+./commands/uninstall.sh --host-package           # 先停用当前用户服务，再移除本流程引入的包
+./commands/uninstall.sh --destroy-host-state     # 先停止并禁用服务，再删除有效配置目录；不可恢复
 ```
 
 受管 retry 文件位于 `${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/app-dev.lizardbyte.app.Sunshine.service.d/`，仅有 `quick-deploy-retry.conf` 和 `check-tailnet.py`。安装器不覆盖外来/改写的文件；卸载先停止并禁用服务，再移除原样的受管文件并 reload，保留无关文件。普通 HOME/XDG 父目录链接可用：加载的 drop-in 按真实路径核对，启动参数仍保留安装时的字面路径；不接受 retry 目录或两个受管文件本身的符号链接。
 
-主机包移除默认保留凭据，预先存在的包默认拒绝删除；`--help` 说明显式强制选项。状态删除会停止并禁用服务，避免下次图形登录用默认配置启动；再次使用前重跑 `./install-host.sh` 恢复 Tailnet 配置与服务。配置目录本身若为符号链接，会在停止服务前拒绝删除；普通 HOME/XDG 父目录链接不受此限制。目录外的凭据不在删除范围；其他用户或手动启动的 Sunshine 实例会报告 PID/UID，不会被终止。
+主机包移除默认保留凭据，预先存在的包默认拒绝删除；`--help` 说明显式强制选项。状态删除会停止并禁用服务，避免下次图形登录用默认配置启动；再次使用前重跑 `./commands/install-host.sh` 恢复 Tailnet 配置与服务。配置目录本身若为符号链接，会在停止服务前拒绝删除；普通 HOME/XDG 父目录链接不受此限制。目录外的凭据不在删除范围；其他用户或手动启动的 Sunshine 实例会报告 PID/UID，不会被终止。
 
-维护时运行 `./tests/run.sh`：临时 HOME/PATH 下实际执行启动检查，覆盖地址缺失、配置来源变化、归属与卸载顺序，以及 HOME/XDG 父目录链接下的安装、复装、doctor 和移除。延迟超过 500 秒及停止重试采用离散时间模型，不是真实 systemd 运行验收。有 `systemd-analyze` 时另做静态单元解析和加载路径核对；APT 仅模拟，不安装包或操作真实服务，也不验证实际画面/输入。
+维护时运行 `./tests/run.sh` 及 `python3 ./tests/run_server.py`：前者在临时 HOME/PATH 下实际执行启动检查，覆盖地址缺失、配置来源变化、归属与卸载顺序，以及 HOME/XDG 父目录链接下的安装、复装、doctor 和移除；后者在带空格的临时模块副本中实际执行 `run_server.sh`→Python→假 Moonlight/SSH，核对参数、stdin、退出码和无副作用拒绝。延迟超过 500 秒及停止重试采用离散时间模型，不是真实 systemd 运行验收。有 `systemd-analyze` 时另做静态单元解析和加载路径核对；APT 仅模拟，不安装包或操作真实服务，也不验证实际画面/输入。
 
 绑定解析测试使用已核对的原生解析结果。若本地有对应标签源码和 C++ 编译器，可额外运行 `python3 tests/binding.py --native-source /path/to/Sunshine-2026.906.222525/src/config.cpp`，离线编译该文件的原始解析函数，对照输入、重写结果和隔离安装器输出；不会构建或运行 Sunshine。
 

@@ -10,8 +10,8 @@
 
 set -euo pipefail
 
-SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-# shellcheck source=lib/common.sh
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=../lib/common.sh
 . "$SCRIPT_DIR/lib/common.sh"
 
 OWNERSHIP_MARK='quick-deploy/sunshine-moonlight'
@@ -31,7 +31,7 @@ FORCE_PREEXISTING=false
 
 usage() {
     cat <<USAGE
-用法: ./uninstall.sh <动作> [选项]
+用法: ./commands/uninstall.sh <动作> [选项]
 
 不带参数不执行任何操作。
 
@@ -187,7 +187,7 @@ destroy_host_state() {
     qd_section '删除 Sunshine 主机状态'
     stop_host_service
     qd_remove_retry "$CONFIG_DIR"
-    qd_warn "即将删除 $CONFIG_DIR（不可恢复）；目录外的凭据不在删除范围。服务已停止并禁用，再次使用前请重跑 install-host.sh"
+    qd_warn "即将删除 $CONFIG_DIR（不可恢复）；目录外的凭据不在删除范围。服务已停止并禁用，再次使用前请重跑 commands/install-host.sh"
     if [ ! -d "$CONFIG_DIR" ]; then
         qd_info '配置目录不存在，无需删除'
         return 0

@@ -1,8 +1,8 @@
 #!/bin/bash
 # Install/configure the native Sunshine package for an existing Ubuntu desktop over Tailscale.
 set -euo pipefail
-SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-# shellcheck source=lib/common.sh
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=../lib/common.sh
 . "$SCRIPT_DIR/lib/common.sh"
 
 GITHUB_REPO='LizardByte/Sunshine'
@@ -24,7 +24,7 @@ SERVICE_CHANGED=false
 
 usage() {
     cat <<USAGE
-用法: ./install-host.sh [--version v版本] [--capture auto|kms|portal|x11|nvfbc|wlr|kwin]
+用法: ./commands/install-host.sh [--version v版本] [--capture auto|kms|portal|x11|nvfbc|wlr|kwin]
                       [--bind-address 本机TailnetIPv4]
 默认版本 v$QD_SUNSHINE_VERSION；最低版本 v$QD_SUNSHINE_FLOOR。
 不传 --capture 保留已有设置；auto 明确删除 capture 键。

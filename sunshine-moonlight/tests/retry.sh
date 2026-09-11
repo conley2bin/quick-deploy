@@ -1,6 +1,6 @@
 # Sourced by run.sh: installer/ownership integration in temporary HOME/PATH only.
 new_case
-run install-host.sh
+run commands/install-host.sh
 check 'managed retry initial install succeeds' test "$RC" -eq 0
 dir="$(qd_retry_dir)"
 check 'installed guard matches source bytes' cmp -s "$dir/check-tailnet.py" "$MODULE_DIR/service/check-tailnet.py"
@@ -12,7 +12,7 @@ check 'retry explicitly links graphical stop' contains "$dir/quick-deploy-retry.
 helper_stat="$(stat -c '%i:%Y' "$dir/check-tailnet.py")"
 drop_stat="$(stat -c '%i:%Y' "$dir/quick-deploy-retry.conf")"
 : >"$CASE/log"
-run install-host.sh
+run commands/install-host.sh
 check 'repeat retry install succeeds' test "$RC" -eq 0
 check 'repeat install keeps helper inode/mtime' test "$helper_stat" = "$(stat -c '%i:%Y' "$dir/check-tailnet.py")"
 check 'repeat install keeps drop inode/mtime' test "$drop_stat" = "$(stat -c '%i:%Y' "$dir/quick-deploy-retry.conf")"
@@ -25,7 +25,7 @@ for residue in helper-only both-unloaded; do
  dir="$(qd_retry_dir)"; mkdir -p "$dir"
  cp "$MODULE_DIR/service/check-tailnet.py" "$dir/check-tailnet.py"
  [ "$residue" != both-unloaded ] || qd_retry_content "$QD_SUNSHINE_CONFIG_DIR" >"$dir/quick-deploy-retry.conf"
- run install-host.sh
+ run commands/install-host.sh
  check "$residue interrupted retry installation converges" test "$RC" -eq 0
  check "$residue loads the managed drop-in" test -f "$CASE/loaded-retry"
  end_case
@@ -33,7 +33,7 @@ done
 
 new_case; installed; write_conf
 export MOCK_RESULT=start-limit-hit
-run install-host.sh
+run commands/install-host.sh
 check 'old start-limit state is repaired by install' test "$RC" -eq 0
 reset_line="$(grep -n 'reset-failed' "$CASE/log" | head -1 | cut -d: -f1)"
 start_line="$(grep -n 'systemctl --user start ' "$CASE/log" | head -1 | cut -d: -f1)"
@@ -54,11 +54,11 @@ for collision in helper drop extra-conf alias-conf directory-file directory-syml
  drop-symlink) qd_retry_content "$QD_SUNSHINE_CONFIG_DIR" >"$CASE/foreign-drop"; ln -s "$CASE/foreign-drop" "$dir/quick-deploy-retry.conf";;
  esac
  cp -a "$HOME/.config" "$CASE/config-before"
- run install-host.sh
+ run commands/install-host.sh
  check "$collision installation refused" test "$RC" -ne 0
  check "$collision refusal precedes package mutation" absent "$CASE/log" 'sudo '
  check "$collision installation preserves all config bytes" diff -qr "$CASE/config-before" "$HOME/.config"
- run uninstall.sh --host-package --force-remove-preexisting-package
+ run commands/uninstall.sh --host-package --force-remove-preexisting-package
  check "$collision removal refused" test "$RC" -ne 0
  check "$collision removal preserves all config bytes" diff -qr "$CASE/config-before" "$HOME/.config"
  check "$collision refusal leaves service active" test -f "$CASE/active"
@@ -67,13 +67,13 @@ for collision in helper drop extra-conf alias-conf directory-file directory-syml
 done
 
 for tampered in check-tailnet.py quick-deploy-retry.conf; do
- new_case; run install-host.sh
+ new_case; run commands/install-host.sh
  dir="$(qd_retry_dir)"
  printf '\n# edited by user\n' >>"$dir/$tampered"
  cp -a "$HOME/.config" "$CASE/config-before"; : >"$CASE/log"
- run install-host.sh
+ run commands/install-host.sh
  check "modified owned $tampered refused on repeat install" test "$RC" -ne 0
- run uninstall.sh --destroy-host-state
+ run commands/uninstall.sh --destroy-host-state
  check "modified owned $tampered refused on state deletion" test "$RC" -ne 0
  check "modified owned $tampered bytes preserved" diff -qr "$CASE/config-before" "$HOME/.config"
  check "modified owned $tampered service left running" absent "$CASE/log" 'disable --now'
@@ -81,7 +81,7 @@ for tampered in check-tailnet.py quick-deploy-retry.conf; do
 done
 
 for mismatch in restart delay limit partof extra-drop no-drop pre-missing pre-extra pre-ignored; do
- new_case; run install-host.sh
+ new_case; run commands/install-host.sh
  dir="$(qd_retry_dir)"
  case "$mismatch" in
  restart) export MOCK_RESTART=always;;
@@ -97,19 +97,19 @@ for mismatch in restart delay limit partof extra-drop no-drop pre-missing pre-ex
    else export MOCK_PRE="${pre//ignore_errors=no/ignore_errors=yes}"; fi;;
  esac
  cp -a "$HOME/.config" "$CASE/config-before"; : >"$CASE/log"
- run doctor.sh --host
+ run commands/doctor.sh --host
  check "effective $mismatch diagnosed" test "$RC" -ne 0
- run install-host.sh
+ run commands/install-host.sh
  check "effective $mismatch never starts/restarts unchecked unit" absent "$CASE/log" 'systemctl --user restart'
  check "effective $mismatch preserves config and artifacts" diff -qr "$CASE/config-before" "$HOME/.config"
- run uninstall.sh --destroy-host-state
+ run commands/uninstall.sh --destroy-host-state
  check "effective $mismatch removal refused" test "$RC" -ne 0
  check "effective $mismatch state retained" test -f "$QD_SUNSHINE_CONFIG_DIR/sunshine.conf"
  end_case
 done
 
 for removal in package state combined absent-package stop-failure; do
- new_case; run install-host.sh
+ new_case; run commands/install-host.sh
  dir="$(qd_retry_dir)"
  printf 'unrelated script\n' >"$dir/user-notes.py"
  printf 'credentials retained\n' >"$QD_SUNSHINE_CONFIG_DIR/credentials.json"
@@ -120,9 +120,9 @@ for removal in package state combined absent-package stop-failure; do
  stop-failure) export MOCK_STOP_FAIL=1;;
  esac
  case "$removal" in
- state) run uninstall.sh --destroy-host-state;;
- combined) run uninstall.sh --host-package --destroy-host-state;;
- *) run uninstall.sh --host-package;;
+ state) run commands/uninstall.sh --destroy-host-state;;
+ combined) run commands/uninstall.sh --host-package --destroy-host-state;;
+ *) run commands/uninstall.sh --host-package;;
  esac
  if [ "$removal" = stop-failure ]; then
    check 'failed stop prevents owned retry deletion' diff -qr "$CASE/retry-before" "$dir"
@@ -149,7 +149,7 @@ done
 new_case; write_conf
 mv "$QD_SUNSHINE_CONFIG_DIR/sunshine.conf" "$CASE/linked.conf"
 ln -s "$CASE/linked.conf" "$QD_SUNSHINE_CONFIG_DIR/sunshine.conf"
-run install-host.sh
+run commands/install-host.sh
 check 'existing installer contract rejects config-file symlink' test "$RC" -ne 0
 check 'config-file symlink refusal precedes package changes' absent "$CASE/log" 'sudo '
 check 'config-file symlink target preserved' contains "$CASE/linked.conf" 'bind_address = 100.64.0.2'
@@ -157,7 +157,7 @@ end_case
 
 new_case; installed; write_conf; active
 export MOCK_RETRY_COLLISION=1
-run install-host.sh
+run commands/install-host.sh
 dir="$(qd_retry_dir)"
 check 'late helper-directory collision refuses install' test "$RC" -ne 0
 check 'late collision preserves foreign sentinel' contains "$dir/check-tailnet.py/sentinel" 'foreign collision'
@@ -177,7 +177,7 @@ for shape in inline-comments embedded-list; do
  fi
  printf 'custom = unchanged # retain bytes\n' >>"$conf"
  printf 'credentials retained\n' >"$QD_SUNSHINE_CONFIG_DIR/credentials.json"
- run install-host.sh
+ run commands/install-host.sh
  check "$shape installer converges" test "$RC" -eq 0
  check "$shape family readback is native exact" test "$(qd_conf_get "$conf" address_family)" = ipv4
  check "$shape bind readback is native exact" test "$(qd_conf_get "$conf" bind_address)" = 100.64.0.2
@@ -192,9 +192,9 @@ for shape in inline-comments embedded-list; do
    check 'embedded pseudo-key list remains byte-identical' cmp -s "$CASE/list-before" "$CASE/list-after"
  fi
  cp "$conf" "$CASE/emitted"
- : >"$CASE/log"; run doctor.sh --host
+ : >"$CASE/log"; run commands/doctor.sh --host
  check "$shape doctor accepts repaired binding" test "$RC" -eq 0
- run install-host.sh
+ run commands/install-host.sh
  check "$shape repeat install succeeds" test "$RC" -eq 0
  check "$shape repeat leaves config identical" cmp -s "$CASE/emitted" "$conf"
  check "$shape repeat does not restart" absent "$CASE/log" 'systemctl --user restart'
@@ -211,7 +211,7 @@ for malformed in duplicate missing-equals list-value unclosed-list; do
  unclosed-list) printf 'unknown=[\n' >"$conf";;
  esac
  cp "$conf" "$CASE/before"
- run install-host.sh
+ run commands/install-host.sh
  check "$malformed rejected before install" test "$RC" -ne 0
  check "$malformed refusal preserves config" cmp -s "$CASE/before" "$conf"
  check "$malformed refusal precedes package mutation" absent "$CASE/log" 'sudo '
@@ -232,7 +232,7 @@ for parent in HOME XDG; do
   fi
   unset QD_SUNSHINE_CONFIG_DIR
   config="$(qd_host_config_dir)"
-  run install-host.sh
+  run commands/install-host.sh
   check "$parent linked-parent $removal installation succeeds" test "$RC" -eq 0
   dir="$(qd_retry_dir)"
   check "$parent loaded path is native-canonical" test "$(cat "$CASE/loaded-retry-path")" = "$(readlink -f "$dir/quick-deploy-retry.conf")"
@@ -242,12 +242,12 @@ for parent in HOME XDG; do
   printf 'unrelated sibling\n' >"$dir/user-notes.py"
   printf 'unrelated config sibling\n' >"${config%/*}/keep.txt"
   printf 'credentials retained\n' >"$config/credentials.json"
-  run doctor.sh --host
+  run commands/doctor.sh --host
   check "$parent linked-parent $removal doctor succeeds" test "$RC" -eq 0
   helper_stat="$(stat -c '%i:%Y' "$dir/check-tailnet.py")"
   drop_stat="$(stat -c '%i:%Y' "$dir/quick-deploy-retry.conf")"
   cp "$config/sunshine.conf" "$CASE/emitted"; : >"$CASE/log"
-  run install-host.sh
+  run commands/install-host.sh
   check "$parent linked-parent $removal repeat succeeds" test "$RC" -eq 0
   check "$parent repeat preserves helper inode/mtime" test "$helper_stat" = "$(stat -c '%i:%Y' "$dir/check-tailnet.py")"
   check "$parent repeat preserves drop inode/mtime" test "$drop_stat" = "$(stat -c '%i:%Y' "$dir/quick-deploy-retry.conf")"
@@ -257,12 +257,12 @@ for parent in HOME XDG; do
   pre="$(systemctl --user show "$QD_CANONICAL_UNIT" -p ExecStartPre --value)"
   real_dir="$(readlink -f "$dir")"
   export MOCK_PRE="${pre//"$dir"/"$real_dir"}"
-  run doctor.sh --host
+  run commands/doctor.sh --host
   check "$parent canonicalizing literal ExecStartPre is rejected" test "$RC" -ne 0
   unset MOCK_PRE
   : >"$CASE/log"
-  if [ "$removal" = package ]; then run uninstall.sh --host-package;
-  else run uninstall.sh --destroy-host-state; fi
+  if [ "$removal" = package ]; then run commands/uninstall.sh --host-package;
+  else run commands/uninstall.sh --destroy-host-state; fi
   check "$parent linked-parent $removal removal succeeds" test "$RC" -eq 0
   check "$parent removal deletes owned helper" test ! -e "$dir/check-tailnet.py"
   check "$parent removal deletes owned drop-in" test ! -e "$dir/quick-deploy-retry.conf"
