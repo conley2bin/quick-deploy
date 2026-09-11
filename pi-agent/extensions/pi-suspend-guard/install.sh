@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # Install pi-suspend-guard through one managed symlink under the Pi agent dir.
 # Conventions match pi-inline-images/install.sh: refuse Git-index-owned and
-# foreign targets, add a git info/exclude rule, never reload Pi.
+# foreign targets, add a git info/exclude rule when the PI home is a Git
+# worktree, never reload Pi. Without Git, the Git-only steps are skipped so
+# fresh machines still work.
 set -euo pipefail
 
 SOURCE_DIR=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
@@ -15,30 +17,35 @@ STAMP="$(date +%Y%m%d_%H%M%S)"
 
 die() { echo "pi-suspend-guard: $*" >&2; exit 1; }
 
-if ! git -C "$PI_HOME" rev-parse --git-dir >/dev/null 2>&1; then
-  die "PI home is not a Git worktree: $PI_HOME"
+IS_GIT_HOME=0
+if git -C "$PI_HOME" rev-parse --git-dir >/dev/null 2>&1; then
+  IS_GIT_HOME=1
+else
+  echo "pi-suspend-guard: $PI_HOME is not a Git worktree; skipping index/exclude checks"
 fi
 
-INDEXED=$(git -C "$PI_HOME" ls-files -- "extensions/pi-suspend-guard" "extensions/pi-suspend-guard/**")
-if [[ -n "$INDEXED" ]]; then
-  die "refusing Git-index-owned target: ${INDEXED%%$'\n'*}"
-fi
+if [ "$IS_GIT_HOME" = 1 ]; then
+  INDEXED=$(git -C "$PI_HOME" ls-files -- "extensions/pi-suspend-guard" "extensions/pi-suspend-guard/**")
+  if [[ -n "$INDEXED" ]]; then
+    die "refusing Git-index-owned target: ${INDEXED%%$'\n'*}"
+  fi
 
-EXCLUDE=$(git -C "$PI_HOME" rev-parse --git-path info/exclude)
-if [[ "$EXCLUDE" != /* ]]; then
-  GIT_DIR=$(git -C "$PI_HOME" rev-parse --absolute-git-dir)
-  EXCLUDE="$GIT_DIR/${EXCLUDE#*/}"
-fi
-[[ -f "$EXCLUDE" && -w "$EXCLUDE" ]] || die "Git exclude is not writable: $EXCLUDE"
+  EXCLUDE=$(git -C "$PI_HOME" rev-parse --git-path info/exclude)
+  if [[ "$EXCLUDE" != /* ]]; then
+    GIT_DIR=$(git -C "$PI_HOME" rev-parse --absolute-git-dir)
+    EXCLUDE="$GIT_DIR/${EXCLUDE#*/}"
+  fi
+  [[ -f "$EXCLUDE" && -w "$EXCLUDE" ]] || die "Git exclude is not writable: $EXCLUDE"
 
-if ! grep -Fqx -- "$RULE" "$EXCLUDE"; then
-  TMP=$(mktemp "${EXCLUDE}.tmp.XXXXXX")
-  trap 'rm -f -- "${TMP:-}"' EXIT
-  cat -- "$EXCLUDE" >"$TMP"
-  [[ ! -s "$TMP" || $(tail -c 1 "$TMP" | wc -l) -eq 1 ]] || printf '\n' >>"$TMP"
-  printf '%s\n' "$RULE" >>"$TMP"
-  mv -- "$TMP" "$EXCLUDE"
-  trap - EXIT
+  if ! grep -Fqx -- "$RULE" "$EXCLUDE"; then
+    TMP=$(mktemp "${EXCLUDE}.tmp.XXXXXX")
+    trap 'rm -f -- "${TMP:-}"' EXIT
+    cat -- "$EXCLUDE" >"$TMP"
+    [[ ! -s "$TMP" || $(tail -c 1 "$TMP" | wc -l) -eq 1 ]] || printf '\n' >>"$TMP"
+    printf '%s\n' "$RULE" >>"$TMP"
+    mv -- "$TMP" "$EXCLUDE"
+    trap - EXIT
+  fi
 fi
 
 if [[ -e "$TARGET" || -L "$TARGET" ]]; then
@@ -62,7 +69,9 @@ fi
 mkdir -p -- "$PI_HOME/extensions"
 ln -s -- "$SOURCE_DIR" "$TARGET"
 [[ $(readlink -f -- "$TARGET") == "$SOURCE_DIR" ]] || die "link verification failed"
-grep -Fqx -- "$RULE" "$EXCLUDE" || die "exclude verification failed"
+if [ "$IS_GIT_HOME" = 1 ]; then
+  grep -Fqx -- "$RULE" "$EXCLUDE" || die "exclude verification failed"
+fi
 
 echo "pi-suspend-guard: installed $TARGET -> $SOURCE_DIR"
 echo "Run /reload in Pi when you are ready; this installer does not reload or restart Pi."

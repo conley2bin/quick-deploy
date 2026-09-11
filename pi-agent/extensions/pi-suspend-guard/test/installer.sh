@@ -46,4 +46,14 @@ ln -s /foreign/extension "$TARGET"
 if run_installer >/dev/null 2>&1; then fail "foreign link was unexpectedly replaced"; fi
 [ "$(readlink "$TARGET")" = /foreign/extension ] || fail "foreign link was modified"
 
-echo 'PASS: pi-suspend-guard installer exact, legacy-migration, exclude, and foreign-path contracts'
+# Non-git PI home: link installs with git-only steps skipped, stays idempotent.
+PLAIN_HOME="$WORK/plain home/.pi/agent"
+PLAIN_TARGET="$PLAIN_HOME/extensions/pi-suspend-guard"
+mkdir -p "$PLAIN_HOME"
+env PI_CODING_AGENT_DIR="$PLAIN_HOME" "$INSTALLER" >/dev/null
+[ -L "$PLAIN_TARGET" ] || fail "non-git home install did not create a symlink"
+[ "$(readlink -f "$PLAIN_TARGET")" = "$EXTENSION_DIR" ] || fail "non-git home link target mismatch"
+env PI_CODING_AGENT_DIR="$PLAIN_HOME" "$INSTALLER" | grep -Fq 'already installed; skipped' \
+  || fail "non-git home re-run was not idempotent"
+
+echo 'PASS: pi-suspend-guard installer exact, legacy-migration, exclude, foreign-path, and non-git contracts'
