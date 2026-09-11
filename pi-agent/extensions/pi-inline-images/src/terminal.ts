@@ -4,17 +4,32 @@ import { deleteImage, deletePlacement, grid, placement, upload } from "../vendor
 
 export type Sink = { write(value: string): unknown };
 export type CellSize = { widthPx: number; heightPx: number };
+type TmuxResult = { status: number | null; stdout: string | null };
+type TmuxCommand = (
+  command: string,
+  args: string[],
+  options: { encoding: "utf8"; timeout: number },
+) => TmuxResult;
 
 export function supportsKitty(env: NodeJS.ProcessEnv = process.env, probe = probeTmux): boolean {
   const tmux = Boolean(env.TMUX || env.TERM?.startsWith("tmux"));
   const program = env.TERM_PROGRAM?.toLowerCase();
   const outer = Boolean(env.KITTY_WINDOW_ID || env.GHOSTTY_RESOURCES_DIR || env.WEZTERM_PANE || ["kitty", "ghostty", "wezterm"].includes(program || ""));
-  return outer && (!tmux || probe());
+  return outer && (!tmux || probe(env));
 }
 
-export function probeTmux(): boolean {
-  const result = spawnSync("tmux", ["show-options", "-gv", "allow-passthrough"], { encoding: "utf8", timeout: 1_000 });
-  return result.status === 0 && /^(on|yes|true|1)$/iu.test(result.stdout.trim());
+export function probeTmux(env: NodeJS.ProcessEnv = process.env, run: TmuxCommand = spawnSync): boolean {
+  const pane = env.TMUX_PANE?.trim();
+  if (!pane || !/^%\d+$/u.test(pane)) return false;
+  try {
+    const result = run("tmux", ["show-options", "-Apv", "-t", pane, "allow-passthrough"], {
+      encoding: "utf8",
+      timeout: 1_000,
+    });
+    return result.status === 0 && /^(on|all|yes|true|1)$/iu.test(result.stdout?.trim() ?? "");
+  } catch {
+    return false;
+  }
 }
 
 export function geometry(image: LoadedImage, availableWidth: number, cell: CellSize): { columns: number; rows: number } {

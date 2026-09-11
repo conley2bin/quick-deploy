@@ -10,7 +10,9 @@ model context retain the original Markdown.
 - Pi `0.85.1` (`@earendil-works/pi-coding-agent` / `pi-tui` host peers)
 - Node `>=22.19`
 - Ghostty, Kitty, or WezTerm with Kitty graphics support
-- Under tmux, `allow-passthrough` must be `on`
+- Under tmux, the originating pane's effective `allow-passthrough` must be `on`
+  or `all`. Use `all` for previews first rendered while their pane is invisible;
+  `on` forwards passthrough only from visible panes.
 - Local extension dependencies installed with the checked-in lock file
 
 The existing `pi-tmux-images` package may remain enabled. This extension does not
@@ -44,7 +46,13 @@ Repeated runs are idempotent. Run `/reload` yourself afterward.
   to 32 MP, HTTP fetches to 10 seconds, and displayed geometry to 80×24 cells.
 - Failures remain visible in place. Unsupported schemes/formats, bad content,
   missing files, unavailable Kitty/tmux passthrough, and the 64-active-image cap
-  are never silently dropped.
+  are never silently dropped. The tmux capability probe reads the originating
+  pane's effective inherited policy and fails closed on missing pane identity,
+  command errors, and unknown values.
+- tmux `allow-passthrough all` forwards arbitrary DCS passthrough from invisible
+  panes, not only image traffic. It still requires a ready, nonsuspended attached
+  client whose session contains the window; it is not a durable upload queue for
+  detached clients. Choose that policy deliberately and scope it appropriately.
 - Current-branch assistant text is reloaded on committed session start and tree
   navigation; shutdown also clears owned terminal images. A cancelled switch has
   no cleanup side effect. Resize redraw deletes an old owned placement before

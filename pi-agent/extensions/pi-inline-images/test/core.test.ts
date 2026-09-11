@@ -6,7 +6,7 @@ import test from "node:test";
 import { loadImage } from "../src/images.ts";
 import { parseMarkdownImages, transformMarkdown } from "../src/markdown.ts";
 import { assistantTextBlocks, ImageSession, MAX_ACTIVE_IMAGES } from "../src/session.ts";
-import { TerminalImages, geometry, supportsKitty } from "../src/terminal.ts";
+import { TerminalImages, geometry, probeTmux, supportsKitty } from "../src/terminal.ts";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const FIXTURE = join(HERE, "fixtures/color-block.png");
@@ -113,6 +113,26 @@ test("capability boundary and geometry are deterministic", () => {
   assert.equal(supportsKitty({ TERM_PROGRAM: "tmux", GHOSTTY_RESOURCES_DIR: "/x", TMUX: "yes" }, () => false), false);
   assert.equal(supportsKitty({ TERM_PROGRAM: "tmux", GHOSTTY_RESOURCES_DIR: "/x", TMUX: "yes" }, () => true), true);
   assert.deepEqual(geometry(image, 2, { widthPx: 10, heightPx: 20 }), { columns: 2, rows: 1 });
+});
+
+test("tmux probe reads the originating pane's effective passthrough policy and fails closed", () => {
+  const calls: string[][] = [];
+  const env = { TMUX: "socket", TMUX_PANE: "%42" };
+  const result = (stdout: string | null, status = 0) => probeTmux(env, (_command, args) => {
+    calls.push(args);
+    return { status, stdout };
+  });
+
+  for (const enabled of ["on", "all", "yes", "true", "1"]) assert.equal(result(enabled), true, enabled);
+  for (const disabled of ["off", "unknown", "", null]) assert.equal(result(disabled), false, String(disabled));
+  assert.equal(result("all", 1), false, "command failure must disable passthrough");
+  assert.deepEqual(calls[0], ["show-options", "-Apv", "-t", "%42", "allow-passthrough"]);
+
+  let invoked = false;
+  assert.equal(probeTmux({ TMUX: "socket" }, () => { invoked = true; return { status: 0, stdout: "all" }; }), false);
+  assert.equal(probeTmux({ TMUX: "socket", TMUX_PANE: "not-a-pane" }, () => { invoked = true; return { status: 0, stdout: "all" }; }), false);
+  assert.equal(invoked, false, "missing or invalid originating pane must not fall back to global policy");
+  assert.equal(probeTmux(env, () => { throw new Error("tmux unavailable"); }), false);
 });
 
 test("restore follows the active branch, reset clears state, and repeated paths are not globally suppressed", async () => {

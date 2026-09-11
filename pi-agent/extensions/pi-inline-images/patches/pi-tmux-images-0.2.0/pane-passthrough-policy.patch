@@ -1,0 +1,38 @@
+--- a/src/capabilities.ts
++++ b/src/capabilities.ts
+@@ -4,19 +4,27 @@
+ export type RenderMode = "kitty-placeholder" | "image" | "text";
+ export type Environment = Record<string, string | undefined>;
+ export type TmuxProbe = (env: Environment) => boolean;
++type TmuxResult = { status: number | null; stdout: string | null };
++type TmuxCommand = (command: string, args: string[], options: { encoding: "utf8"; timeout: number }) => TmuxResult;
+ 
+ export function isTmux(env: Environment): boolean {
+ 	return Boolean(env.TMUX || env.TERM?.startsWith("tmux"));
+ }
+ 
+-/** Fail closed: only an explicit tmux `allow-passthrough on` enables Kitty DCS wrapping. */
+-export const probeTmuxPassthrough: TmuxProbe = () => {
+-	const result = spawnSync("tmux", ["show-options", "-gv", "allow-passthrough"], {
+-		encoding: "utf8",
+-		timeout: 1_000,
+-	});
+-	return result.status === 0 && /^(on|yes|true|1)$/iu.test(result.stdout.trim());
+-};
++/** Fail closed unless the originating pane's effective policy enables passthrough. */
++export function probeTmuxPassthrough(env: Environment, run: TmuxCommand = spawnSync): boolean {
++	const pane = env.TMUX_PANE?.trim();
++	if (!pane || !/^%\d+$/u.test(pane)) return false;
++	try {
++		const result = run("tmux", ["show-options", "-Apv", "-t", pane, "allow-passthrough"], {
++			encoding: "utf8",
++			timeout: 1_000,
++		});
++		return result.status === 0 && /^(on|all|yes|true|1)$/iu.test(result.stdout?.trim() ?? "");
++	} catch {
++		return false;
++	}
++}
+ 
+ export function outerKittyCapable(env: Environment): boolean {
+ 	const program = env.TERM_PROGRAM?.toLowerCase();
