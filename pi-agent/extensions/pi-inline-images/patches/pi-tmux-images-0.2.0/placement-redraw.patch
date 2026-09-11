@@ -1,0 +1,9 @@
+--- a/src/runtime.ts
++++ b/src/runtime.ts
+@@ -141 +140,0 @@
+-			this.output.write(placement(id, size.columns, size.rows, tmuxMode));
+@@ -143,0 +143,4 @@
++		// Placement commands are unacknowledged (q=2), so refresh the owned
++		// placement on every render. A redraw can then recover a silently lost
++		// initial placement without re-uploading the cached image bytes.
++		this.output.write(placement(id, size.columns, size.rows, tmuxMode));
