@@ -112,7 +112,8 @@ qd_valid_capture() {
     case "$1" in ''|kms|portal|x11|nvfbc|wlr|kwin) return 0;; *) return 1;; esac
 }
 
-# Sunshine scalars and comma lists strip # comments. Unknown lines are untouched.
+# The two binding scalars share the guard's native parser; other legacy helpers
+# below retain their existing behavior (this is not a general config parser).
 _qd_conf_begin_write() {
     local file="$1"
     __QD_CONF_MODE=''
@@ -132,6 +133,10 @@ _qd_conf_read() { if [ -f "$1" ]; then cat -- "$1"; fi; }
 qd_conf_get() {
     local file="$1" key="$2"
     [ -f "$file" ] || return 1
+    case "$key" in address_family|bind_address)
+        python3 "$QD_SERVICE_SOURCE/check-tailnet.py" --binding-get "$file" "$key"
+        return $?;;
+    esac
     awk -v key="$key" '
         { line=$0; sub(/#.*/, "", line); sub(/^[ \t]+/, "", line)
           if (line ~ ("^" key "[ \t]*=")) {
@@ -144,6 +149,13 @@ qd_conf_get() {
 qd_conf_set() {
     local file="$1" key="$2" value="$3"
     _qd_conf_begin_write "$file"
+    case "$key" in address_family|bind_address)
+        python3 "$QD_SERVICE_SOURCE/check-tailnet.py" --binding-set "$file" "$key" "$value" >"$__QD_CONF_TMP" || {
+            rm -f "$__QD_CONF_TMP"; return 1;
+        }
+        _qd_conf_finish_write "$file"
+        return $?;;
+    esac
     _qd_conf_read "$file" | awk -v key="$key" -v value="$value" '
         { line=$0; stripped=line; sub(/^[ \t]+/, "", stripped)
           if (stripped ~ ("^" key "[ \t]*=")) {
@@ -211,13 +223,135 @@ qd_find_unit() {
     return 1
 }
 
-# Refuse overrides instead of trying to interpret arbitrary systemd execution rules.
-# This is read-only and is called before any package/config/service mutation.
+# The only supported override is our byte-verified retry policy. No runtime library
+# is installed: the one-shot guard uses only Python's standard library and ip.
+QD_SERVICE_SOURCE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../service" && pwd)"
+qd_retry_dir() { printf '%s/systemd/user/%s.d\n' "${XDG_CONFIG_HOME:-$HOME/.config}" "$QD_CANONICAL_UNIT"; }
+qd_retry_content() {
+    python3 - "$(qd_retry_dir)/check-tailnet.py" "$1" <<'PY'
+import sys
+
+def quote(s):
+    return '"' + s.replace('\\', '\\\\').replace('"', '\\"').replace('%', '%%') + '"'
+
+print('''# quick-deploy/sunshine-moonlight: managed retry policy
+[Unit]
+StartLimitIntervalSec=0
+PartOf=graphical-session.target
+
+[Service]
+Restart=on-failure
+RestartSec=5s''')
+# ':' disables environment expansion, '%%' escapes unit specifiers in paths.
+print('ExecStartPre=:/usr/bin/python3 ' + ' '.join(map(quote, sys.argv[1:])))
+PY
+}
+qd_check_retry_files() {
+    local wanted="$1" dir file
+    dir="$(qd_retry_dir)"
+    [ ! -L "$dir" ] || { qd_warn "拒绝符号链接 retry 目录: $dir"; return 1; }
+    [ ! -e "$dir" ] || [ -d "$dir" ] || { qd_warn "retry 目录被外来文件占用: $dir"; return 1; }
+    # Reject overrides not yet seen by daemon-reload; non-.conf siblings are unowned.
+    for file in "$dir"/*.conf "${dir%/*}/$QD_ALIAS_UNIT.d"/*.conf; do
+        [ -e "$file" ] || [ -L "$file" ] || continue
+        [ "$file" = "$dir/quick-deploy-retry.conf" ] || { qd_warn "拒绝额外 Sunshine drop-in: $file"; return 1; }
+    done
+    for file in "$dir/check-tailnet.py" "$dir/quick-deploy-retry.conf"; do
+        [ -e "$file" ] || [ -L "$file" ] || continue
+        [ -f "$file" ] && [ ! -L "$file" ] || { qd_warn "拒绝外来 retry 文件: $file"; return 1; }
+        if [[ "$file" = *.py ]]; then
+            cmp -s "$file" "$QD_SERVICE_SOURCE/check-tailnet.py" || { qd_warn "retry guard 已修改/非本流程文件: $file"; return 1; }
+        else
+            cmp -s "$file" <(qd_retry_content "$wanted") || { qd_warn "retry drop-in 已修改/配置目录不符: $file"; return 1; }
+        fi
+    done
+}
+qd_check_retry_effective() {
+    local unit="$1" drops="$2" wanted="$3" dir actual
+    dir="$(qd_retry_dir)"
+    [ -f "$dir/check-tailnet.py" ] && [ -f "$dir/quick-deploy-retry.conf" ] || {
+        qd_warn 'retry 策略文件不完整；请重跑安装器'; return 1;
+    }
+    python3 - "$drops" "$dir/quick-deploy-retry.conf" <<'PY' || return 1
+from pathlib import Path
+import shlex, sys
+try:
+    paths = shlex.split(sys.argv[1])
+    owned = Path(sys.argv[2])
+    loaded = Path(paths[0]) if len(paths) == 1 else None
+    # systemd 255 resolves HOME/XDG parent links in DropInPaths. Match the
+    # canonical pathname, not merely an inode (foreign hardlinks stay foreign).
+    # Leaf names and leaf file/directory symlink refusals remain exact.
+    matches = (loaded is not None and loaded.is_absolute()
+               and loaded.name == owned.name
+               and not loaded.is_symlink() and not loaded.parent.is_symlink()
+               and loaded.resolve(strict=True) == owned.resolve(strict=True))
+except (OSError, ValueError, RuntimeError):
+    matches = False
+if not matches:
+    print('警告: 拒绝未知/额外 Sunshine drop-in: ' + sys.argv[1], file=sys.stderr)
+    sys.exit(1)
+PY
+    local property expected
+    for property in Restart RestartUSec StartLimitIntervalUSec PartOf; do
+        case "$property" in
+            Restart) expected=on-failure;; RestartUSec) expected=5s;;
+            StartLimitIntervalUSec) expected=0;; PartOf) expected=graphical-session.target;;
+        esac
+        actual="$(qd_unit_property "$unit" "$property")" || return 1
+        [ "$actual" = "$expected" ] || { qd_warn "retry 有效 $property=$actual，期望 $expected；请核对/reload"; return 1; }
+    done
+    actual="$(qd_unit_property "$unit" ExecStartPre)" || return 1
+    python3 - "$actual" "$dir/check-tailnet.py" "$wanted" <<'PY'
+import re, sys
+# Ignore runtime pid/timestamp/status fields, not the executable/argv or '-' prefix.
+commands = re.findall(r'\{ path=(.*?) ; argv\[\]=(.*?) ; ignore_errors=(yes|no) ;', sys.argv[1])
+expected = [('/bin/sleep', '/bin/sleep 5', 'no'),
+            ('/usr/bin/python3', '/usr/bin/python3 ' + sys.argv[2] + ' ' + sys.argv[3], 'no')]
+if commands != expected:
+    print('警告: retry 有效 ExecStartPre 不符（须保留 vendor sleep 5 和受管 guard）', file=sys.stderr)
+    sys.exit(1)
+PY
+}
+qd_install_retry() {
+    local wanted="$1" dir staged file
+    qd_check_retry_files "$wanted" || qd_die 'retry 文件冲突，未覆盖'
+    dir="$(qd_retry_dir)"
+    mkdir -p "$dir"
+    for file in check-tailnet.py quick-deploy-retry.conf; do
+        [ ! -f "$dir/$file" ] || continue
+        qd_mktemp_file staged "$dir/.qd-retry.XXXXXX"
+        if [[ "$file" = *.py ]]; then cp "$QD_SERVICE_SOURCE/check-tailnet.py" "$staged";
+        else qd_retry_content "$wanted" >"$staged"; fi
+        chmod 644 "$staged"
+        # link(2) is atomic and refuses a collision appearing after the check.
+        ln -T -- "$staged" "$dir/$file" || qd_die "retry 文件创建冲突: $dir/$file"
+        rm -f "$staged"
+        SERVICE_CHANGED=true
+    done
+}
+qd_remove_retry() {
+    local wanted="$1" dir
+    qd_check_retry_files "$wanted" || qd_die 'retry 文件已修改，保留；未删除'
+    dir="$(qd_retry_dir)"
+    if [ -f "$dir/quick-deploy-retry.conf" ] || [ -f "$dir/check-tailnet.py" ]; then
+        rm -f "$dir/quick-deploy-retry.conf" "$dir/check-tailnet.py"
+        rmdir "$dir" 2>/dev/null || true
+        systemctl --user daemon-reload || qd_die '移除 retry 策略后 reload 失败'
+    fi
+}
+
+# Refuse arbitrary execution overrides; accept only our exact retry policy.
+# allow-pending is installer-only, for repairing an interrupted write/reload.
 qd_check_service_config() {
-    local wanted="$1" env root xdg actual unit load fragment drops execstart settings
+    local wanted="$1" pending="${2:-}" env root xdg actual unit load fragment drops execstart settings
+    qd_check_retry_files "$wanted" || return 1
     env="$(systemctl --user show-environment)" || { qd_warn '无法连接 systemd 用户管理器'; return 1; }
     root="$(sed -n 's/^CONFIGURATION_DIRECTORY=//p' <<<"$env")"
     xdg="$(sed -n 's/^XDG_CONFIG_HOME=//p' <<<"$env")"
+    [ "$(realpath -m "${XDG_CONFIG_HOME:-$HOME/.config}")" = "$(realpath -m "${xdg:-$HOME/.config}")" ] || {
+        qd_warn 'shell 与用户管理器的 systemd 配置目录不一致；请统一 XDG_CONFIG_HOME'; return 1;
+    }
     actual="$(qd_host_config_dir "$root" "$xdg")" || return 1
     [ "$wanted" = "$actual" ] || {
         qd_warn "当前 shell 配置目录 $wanted 与用户服务目录 $actual 不一致；请在同一图形登录环境运行并统一 XDG_CONFIG_HOME/CONFIGURATION_DIRECTORY"; return 1;
@@ -232,7 +366,11 @@ qd_check_service_config() {
             /usr/lib/systemd/user/"$QD_CANONICAL_UNIT"|/lib/systemd/user/"$QD_CANONICAL_UNIT"|/usr/lib/systemd/user/"$QD_ALIAS_UNIT"|/lib/systemd/user/"$QD_ALIAS_UNIT") ;;
             *) qd_warn "拒绝修改自定义 Sunshine 单元: $fragment；请先核对其 ExecStart/配置路径"; return 1;;
         esac
-        [ -z "$drops" ] || { qd_warn "发现 Sunshine service override: $drops；本流程不解释自定义 drop-in，请先人工核对/移除"; return 1; }
+        if [ -n "$drops" ]; then
+            qd_check_retry_effective "$unit" "$drops" "$wanted" || return 1
+        elif [ -f "$(qd_retry_dir)/quick-deploy-retry.conf" ] && [ "$pending" != allow-pending ]; then
+            qd_warn '受管 retry drop-in 尚未加载；请重跑安装器'; return 1
+        fi
         execstart="$(qd_unit_property "$unit" ExecStart)" || return 1
         [[ "$execstart" == *'argv[]=/usr/bin/sunshine ;'* ]] || {
             qd_warn "$unit 使用非默认 ExecStart；请先核对实际配置文件，不会修改可能未使用的配置"; return 1;

@@ -122,6 +122,8 @@ remove_client() {
 remove_host_package() {
     qd_section '移除 sunshine 包'
     if ! dpkg-query -W -f='${db:Status-Status}' sunshine 2>/dev/null | grep -qx installed; then
+        stop_host_service
+        qd_remove_retry "$CONFIG_DIR"
         rm -f "$STATE_FILE" "$STATE_DIR/last-install"
         local remaining
         remaining="$(qd_sunshine_processes)" || qd_die '无法查询残留 Sunshine 实例'
@@ -155,6 +157,7 @@ remove_host_package() {
     esac
 
     stop_host_service
+    qd_remove_retry "$CONFIG_DIR"
     qd_sudo apt-get remove -y sunshine
     if dpkg-query -W -f='${db:Status-Status}' sunshine 2>/dev/null | grep -qx installed; then
         qd_die 'apt remove 返回后 sunshine 仍处于 installed 状态；保留归属记录以便重试'
@@ -183,6 +186,7 @@ $remaining
 destroy_host_state() {
     qd_section '删除 Sunshine 主机状态'
     stop_host_service
+    qd_remove_retry "$CONFIG_DIR"
     qd_warn "即将删除 $CONFIG_DIR（不可恢复）；目录外的凭据不在删除范围。服务已停止并禁用，再次使用前请重跑 install-host.sh"
     if [ ! -d "$CONFIG_DIR" ]; then
         qd_info '配置目录不存在，无需删除'

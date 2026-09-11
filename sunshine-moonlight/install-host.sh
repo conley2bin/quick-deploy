@@ -20,6 +20,7 @@ WEB_UI_PORT=''
 CONFIG_CHANGED=false
 PACKAGE_CHANGED=false
 CAPS_CHANGED=false
+SERVICE_CHANGED=false
 
 usage() {
     cat <<USAGE
@@ -60,7 +61,7 @@ preflight() {
     for cmd in python3 curl sha256sum dpkg-deb systemctl loginctl tailscale ip ss; do qd_require_cmd "$cmd"; done
     CONFIG_DIR="$(qd_host_config_dir)" || exit 1
     CONFIG_FILE="$CONFIG_DIR/sunshine.conf"
-    qd_check_service_config "$CONFIG_DIR" || qd_die '用户服务配置不兼容；尚未安装或改写配置'
+    qd_check_service_config "$CONFIG_DIR" allow-pending || qd_die '用户服务配置不兼容；尚未安装或改写配置'
     session="$(qd_graphical_session)" || qd_die '没有当前用户的活动本地图形会话；请先登录主机桌面（SSH/linger 不能创建桌面）'
     qd_check_display_environment "$session" || exit 1
     qd_info "图形会话: $session"
@@ -71,6 +72,8 @@ preflight() {
     if [ -e "$CONFIG_FILE" ]; then
         [ -f "$CONFIG_FILE" ] && [ -r "$CONFIG_FILE" ] || qd_die "配置不是可读普通文件: $CONFIG_FILE"
     fi
+    python3 "$QD_SERVICE_SOURCE/check-tailnet.py" --binding-validate "$CONFIG_FILE" \
+        || qd_die '绑定配置结构不明确；请先修正重复/无效键或未闭合列表'
     BASE_PORT="$(qd_base_port "$CONFIG_FILE")" || exit 1
     WEB_UI_PORT=$((BASE_PORT + 1))
     origin="$(qd_conf_get "$CONFIG_FILE" origin_web_ui_allowed || true)"
@@ -301,19 +304,28 @@ configure_sunshine() {
 
 enable_service() {
     local unit attempt detail='' binary_status=0
-    systemctl --user daemon-reload || qd_die '用户管理器 daemon-reload 失败'
+    qd_install_retry "$CONFIG_DIR"
+    unit="$(qd_find_unit || true)"
+    if [ "$PACKAGE_CHANGED" = true ] || [ "$SERVICE_CHANGED" = true ] || [ -z "$unit" ] ||
+        [ "$(qd_unit_property "$unit" NeedDaemonReload)" = yes ] || [ -z "$(qd_unit_property "$unit" DropInPaths)" ]; then
+        systemctl --user daemon-reload || qd_die '用户管理器 daemon-reload 失败'
+        SERVICE_CHANGED=true
+    fi
     qd_check_service_config "$CONFIG_DIR" || qd_die '已安装包的用户服务配置不兼容；尚未启动'
     unit="$(qd_find_unit)" || qd_die '未找到 Sunshine 用户服务'
     systemctl --user enable "$unit" || qd_die "无法 enable $unit"
     if systemctl --user is-active --quiet "$unit"; then
         qd_running_binary_current "$unit" || binary_status=$?
-        if [ "$PACKAGE_CHANGED" = true ] || [ "$CAPS_CHANGED" = true ] || [ "$CONFIG_CHANGED" = true ] || [ "$binary_status" -eq 1 ]; then
-            qd_info '包、capability、配置或运行 executable 有变化，重启用户服务'
+        if [ "$PACKAGE_CHANGED" = true ] || [ "$CAPS_CHANGED" = true ] || [ "$CONFIG_CHANGED" = true ] || [ "$SERVICE_CHANGED" = true ] || [ "$binary_status" -eq 1 ]; then
+            qd_info '包、capability、配置、retry 策略或运行 executable 有变化，重启用户服务'
             systemctl --user restart "$unit" || qd_die "无法 restart $unit"
         else
             qd_info '包与配置无变化，不重启活动服务'
         fi
     else
+        if [ "$(qd_unit_property "$unit" Result)" = start-limit-hit ]; then
+            systemctl --user reset-failed "$unit" || qd_die "无法清除 $unit 的旧启动限流"
+        fi
         systemctl --user start "$unit" || qd_die "无法 start $unit；查看 journalctl --user -u $unit -e"
     fi
     systemctl --user is-enabled --quiet "$unit" || qd_die "$unit 未 enabled"

@@ -3,6 +3,7 @@
 set -euo pipefail
 TESTS_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 MODULE_DIR="$(dirname "$TESTS_DIR")"
+export QD_TEST_BINDING_HELPER="$MODULE_DIR/service/check-tailnet.py"
 BASE_PATH="$PATH"
 ORIGINAL_HOME="$HOME"
 # shellcheck source=../lib/common.sh
@@ -153,20 +154,49 @@ case "$1" in
     case "$prop" in
       LoadState) if [ "$unit" = sunshine.service ]; then echo not-found; elif [ "${MOCK_UNIT_PRESENT:-$present}" = 1 ]; then echo "${MOCK_LOAD_STATE:-loaded}"; else echo not-found; fi;;
       FragmentPath) echo "${MOCK_FRAGMENT:-/usr/lib/systemd/user/app-dev.lizardbyte.app.Sunshine.service}";;
-      DropInPaths) echo "${MOCK_DROPS:-}";;
+      DropInPaths)
+        if [ "${MOCK_DROPS+x}" ]; then printf '%s\n' "$MOCK_DROPS";
+        elif [ -f "$CASE/loaded-retry" ]; then cat "$CASE/loaded-retry-path"; fi;;
+      Restart) echo "${MOCK_RESTART:-on-failure}";;
+      RestartUSec) echo "${MOCK_RESTART_USEC:-5s}";;
+      StartLimitIntervalUSec) if [ -f "$CASE/loaded-retry" ]; then echo "${MOCK_LIMIT:-0}"; else echo 8min\ 20s; fi;;
+      PartOf) if [ -f "$CASE/loaded-retry" ]; then echo "${MOCK_PARTOF:-graphical-session.target}"; fi;;
+      NeedDaemonReload) echo "${MOCK_NEED_RELOAD:-no}";;
+      Result) echo "${MOCK_RESULT:-success}";;
+      ExecStartPre)
+        if [ "${MOCK_PRE+x}" ]; then printf '%s\n' "$MOCK_PRE"; else
+            printf '{ path=/bin/sleep ; argv[]=/bin/sleep 5 ; ignore_errors=no ; }'
+            if [ -f "$CASE/loaded-retry" ]; then
+                python3 - "$CASE/loaded-retry" <<'PY_MOCK'
+import shlex, sys
+for line in open(sys.argv[1]):
+    if line.startswith('ExecStartPre='):
+        args = shlex.split(line.partition('=')[2].strip().replace('%%', '%').lstrip(':'))
+        print(' ; { path=' + args[0] + ' ; argv[]=' + ' '.join(args) + ' ; ignore_errors=no ; }')
+PY_MOCK
+            fi
+        fi;;
       ExecStart) echo "${MOCK_EXECSTART:-{ path=/usr/bin/sunshine ; argv[]=/usr/bin/sunshine ; }}";;
       Environment) echo "${MOCK_UNIT_ENV:-}";;
       EnvironmentFiles|ConfigurationDirectory) echo '';;
       MainPID) if [ -f "$CASE/active" ]; then echo 4242; else echo 0; fi;;
       *) exit 99;;
     esac; exit 0;;
- is-active) [ -f "$CASE/active" ]; exit $?;;
+ is-active) [ -f "$CASE/active" ] || [ -f "$CASE/retrying" ]; exit $?;;
  is-enabled) [ -f "$CASE/enabled" ]; exit $?;;
- daemon-reload) exit 0;;
+ daemon-reload)
+    drop="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/app-dev.lizardbyte.app.Sunshine.service.d/quick-deploy-retry.conf"
+    if [ -f "$drop" ]; then
+        cp "$drop" "$CASE/loaded-retry"
+        # Native systemd 255 static loading records resolved parent paths.
+        readlink -f "$drop" >"$CASE/loaded-retry-path"
+    else rm -f "$CASE/loaded-retry" "$CASE/loaded-retry-path"; fi
+    exit 0;;
+ reset-failed) exit 0;;
  enable) touch "$CASE/enabled"; exit 0;;
  disable|stop)
     [ "${MOCK_STOP_FAIL:-0}" = 0 ] || exit 1
-    rm -f "$CASE/active"
+    rm -f "$CASE/active" "$CASE/retrying"
     if [ "$1" = disable ] && [ "${MOCK_STILL_ENABLED:-0}" = 0 ]; then rm -f "$CASE/enabled"; fi
     exit 0;;
  start|restart)
@@ -199,7 +229,8 @@ MOCK
 [ -f "$CASE/active" ] && [ "${MOCK_LISTEN:-yes}" != no ] || exit 0
 conf="$CASE/running.conf"
 base="$(sed -n 's/^port *= *\([0-9]*\).*/\1/p' "$conf")"; base="${base:-47989}"
-bind="${MOCK_LISTEN_BIND:-$(sed -n 's/^bind_address *= *\([^ #]*\).*/\1/p' "$conf") }"; bind="${bind% }"
+if [ "${MOCK_LISTEN_BIND+x}" ]; then bind="$MOCK_LISTEN_BIND";
+else bind="$(python3 "$QD_TEST_BINDING_HELPER" --binding-get "$conf" bind_address)" || exit 1; fi
 for off in -5 0 1 21; do
  [ "${MOCK_MISSING_OFFSET:-none}" != "$off" ] || continue
  owner="users:((\"sunshine\",pid=${MOCK_OWNER_PID:-4242},fd=9))"
@@ -235,6 +266,27 @@ MOCK
 if [ "${MOCK_FAIL_PROMOTE:-0}" = 1 ] && [[ "$1" == */.staging-* ]]; then exit 1; fi
 if [ "${MOCK_FAIL_CONFIG_COMMIT:-0}" = 1 ] && [ "${@: -1}" = "$QD_SUNSHINE_CONFIG_DIR/sunshine.conf" ]; then exit 1; fi
 exec /usr/bin/mv "$@"
+MOCK
+    cat >"$CASE/bin/ln" <<'MOCK'
+#!/bin/bash
+if [ "${MOCK_RETRY_COLLISION:-0}" = 1 ] && [[ "${@: -1}" == */check-tailnet.py ]]; then
+    mkdir -p "${@: -1}"
+    printf 'foreign collision\n' >"${@: -1}/sentinel"
+fi
+exec /usr/bin/ln "$@"
+MOCK
+    cat >"$CASE/bin/rm" <<'MOCK'
+#!/bin/bash
+printf 'rm %s\n' "$*" >>"$CASE/log"
+for path in "$@"; do
+    case "$path" in
+      */app-dev.lizardbyte.app.Sunshine.service.d/check-tailnet.py|*/app-dev.lizardbyte.app.Sunshine.service.d/quick-deploy-retry.conf)
+        if [ -f "$CASE/active" ] || [ -f "$CASE/retrying" ]; then
+            echo 'Refusing owned retry deletion before stop' >&2; exit 99
+        fi;;
+    esac
+done
+exec /usr/bin/rm "$@"
 MOCK
     cat >"$CASE/bin/sleep" <<'MOCK'
 #!/bin/bash
@@ -477,7 +529,8 @@ cp "$QD_SUNSHINE_CONFIG_DIR/sunshine.conf" "$CASE/before"
 run install-host.sh
 check 'commented config converges successfully' test "$RC" -eq 0
 check 'unknown scalar/comment preserved' contains "$QD_SUNSHINE_CONFIG_DIR/sunshine.conf" 'custom_key = custom value # untouched'
-check 'IPv4 setting converged with comment' contains "$QD_SUNSHINE_CONFIG_DIR/sunshine.conf" 'address_family = ipv4 # old choice'
+check 'IPv4 setting converged as native scalar' grep -qx 'address_family = ipv4' "$QD_SUNSHINE_CONFIG_DIR/sunshine.conf"
+check 'IPv4 comment preserved standalone' grep -qx '# old choice' "$QD_SUNSHINE_CONFIG_DIR/sunshine.conf"
 check 'origin inserted before comment' contains "$QD_SUNSHINE_CONFIG_DIR/sunshine.conf" 'https://existing.example:47990, https://100.64.0.2:48001 #trusted'
 check 'custom Moonlight address uses base' contains "$CASE/out" '100.64.0.2:48000'
 check 'custom UI address uses base+1' contains "$CASE/out" 'https://100.64.0.2:48001'
@@ -636,6 +689,11 @@ run uninstall.sh --host-package
 check 'already absent package clears stale ownership' test ! -e "$QD_HOST_STATE_DIR/host.state"
 end_case
 
+# New recovery checks reuse only these isolated fixtures.
+. "$TESTS_DIR/retry.sh"
+check 'native binding semantics and byte-preserving rewrite' python3 "$TESTS_DIR/binding.py"
+check 'real prestart guard and retry time model' python3 "$TESTS_DIR/retry.py"
+
 # Client extraction, pins/provenance, ownership and interrupted replacement.
 new_case; client_fixture; run install-client.sh
 check 'extracted AppImage client installs' test "$RC" -eq 0
@@ -743,7 +801,7 @@ run install-client.sh --version v9999
 check 'unpinned client version rejected' test "$RC" -ne 0
 end_case
 
-for script in "$MODULE_DIR"/*.sh "$MODULE_DIR"/lib/common.sh "$TESTS_DIR/run.sh"; do check "syntax: ${script##*/}" bash -n "$script"; done
-check 'scoped diff whitespace' git -C "$MODULE_DIR" diff --check -- .
+for script in "$MODULE_DIR"/*.sh "$MODULE_DIR"/lib/common.sh "$TESTS_DIR"/*.sh; do check "syntax: ${script##*/}" bash -n "$script"; done
+check 'scoped diff whitespace' git --no-pager -C "$MODULE_DIR" diff --check -- .
 printf '\nAssertions: passed=%d failed=%d\n' "$PASSED" "$FAILED"
 [ "$FAILED" -eq 0 ]
