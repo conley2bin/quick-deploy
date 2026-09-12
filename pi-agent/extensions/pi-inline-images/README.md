@@ -66,6 +66,42 @@ Repeated runs are idempotent. Run `/reload` yourself afterward.
   resolve to the latest prepared version. The 64-image bound counts immutable
   content versions and reports exhaustion in place.
 
+## Bounded transport foundation (Stage 1)
+
+`src/transport.ts` defines the captured-sink transport that the next integration
+stage will connect to image preparation. It is intentionally not called by the
+current synchronous renderer yet: this checkpoint establishes and tests the
+protocol boundary before changing lifecycle behavior.
+
+A direct multipart Kitty upload is one **complete transaction** and one
+`sink.write(...)` call. Its individual APC payloads remain at most 4096 base64
+bytes, continuation APCs contain only `m`, and placement/delete transactions can
+run only before or after that complete call. This prevents another JavaScript
+extension writer from inserting a graphics command between image chunks. A
+`write(false)` return means Node accepted that transaction; it does not mean the
+terminal acknowledged it. The owner sends nothing else until `drain` and never
+interprets quiet mode (`q=2`) as receipt confirmation.
+
+The concrete defaults are:
+
+- **1 MiB** maximum UTF-8 bytes per complete transaction, which is also the
+  actual maximum size of one sink write (not a per-chunk or per-frame claim)
+- **8 MiB** maximum queued, unsent transaction bytes
+- **64** queued, unsent jobs
+- **64** retained keyed resources per cancellation generation
+- **50 ms** minimum interval between transaction starts, at most 20 starts/s
+- **5000 ms** maximum wait for a required writable `drain`
+
+The single owner requires callers to present the generation they captured before
+asynchronous preparation, retains accepted content/version keys for deduplication,
+coalesces only unsent placement-style jobs to their latest value without moving
+their FIFO position, and rejects work before mutating the queue when a limit is
+exceeded. Generation cancellation rejects unsent jobs and clears pacing/drain
+waits; bytes already accepted by the writable are not claimed to be retractable.
+Sink error, close, or drain timeout rejects every unsent job. `dispose()` removes
+all owned sink listeners. A fresh extension runtime is required after a fatal
+sink failure.
+
 ## Validation
 
 ```bash
