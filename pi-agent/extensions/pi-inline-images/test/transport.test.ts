@@ -42,13 +42,16 @@ class CapturedSink extends EventEmitter implements TransportSink {
   writableNeedDrain = false;
   readonly writes: Array<{ value: string; at: number }> = [];
   readonly returns: boolean[] = [];
+  reflectNeedDrain = true;
+  onWrite?: (value: string, accepted: boolean) => void;
 
   constructor(private readonly clock: FakeClock) { super(); }
 
   write(value: string): boolean {
     this.writes.push({ value, at: this.clock.now() });
     const accepted = this.returns.shift() ?? true;
-    if (!accepted) this.writableNeedDrain = true;
+    this.onWrite?.(value, accepted);
+    if (!accepted && this.reflectNeedDrain) this.writableNeedDrain = true;
     return accepted;
   }
 
@@ -132,6 +135,65 @@ test("write(false) accepts the current transaction and blocks every later write 
   assert.equal((await second).status, "accepted");
   assert.equal(sink.listenerCount("drain"), 0);
   owner.dispose();
+});
+
+test("synchronous drain and reentrant enqueue during write cannot be lost or recursively pumped", async () => {
+  const { clock, sink, owner } = transport({ minIntervalMs: 0, drainTimeoutMs: 20 });
+  sink.reflectNeedDrain = false;
+  sink.returns.push(false, true);
+  let second!: Promise<unknown>;
+  sink.onWrite = (value) => {
+    if (value !== "first") return;
+    second = owner.enqueue(owner.generation, { transaction: "second" });
+    sink.emit("drain");
+    assert.deepEqual(sink.writes.map(({ value: written }) => written), ["first"], "reentrant enqueue cannot pump inside write()");
+  };
+
+  await owner.enqueue(owner.generation, { transaction: "first" });
+  clock.advance(0);
+  await second;
+  await owner.ready(owner.generation);
+  assert.deepEqual(sink.writes.map(({ value }) => value), ["first", "second"]);
+  assert.equal(sink.listenerCount("drain"), 0);
+  assert.equal(clock.count, 0);
+  owner.dispose();
+});
+
+test("cancellation preserves internally observed false-return flow control until real drain", async () => {
+  const { clock, sink, owner } = transport({ minIntervalMs: 0, drainTimeoutMs: 100 });
+  sink.reflectNeedDrain = false;
+  sink.returns.push(false, true);
+  await owner.enqueue(owner.generation, { transaction: "accepted-before-cancel" });
+  owner.cancel("switch generation");
+  owner.cancel("duplicate cancellation");
+  assert.equal(sink.listenerCount("drain"), 1, "duplicate cancel does not duplicate or remove flow-control observation");
+  const afterCancel = owner.enqueue(owner.generation, { transaction: "after-cancel" });
+  assert.deepEqual(sink.writes.map(({ value }) => value), ["accepted-before-cancel"]);
+  assert.equal(sink.listenerCount("drain"), 1);
+  sink.emit("drain");
+  await afterCancel;
+  assert.deepEqual(sink.writes.map(({ value }) => value), ["accepted-before-cancel", "after-cancel"]);
+  assert.equal(sink.listenerCount("drain"), 0);
+  assert.equal(clock.count, 0);
+  owner.dispose();
+});
+
+test("synchronous sink error and close during write reject the active job without recursive output", async () => {
+  for (const event of ["error", "close"] as const) {
+    const { sink, owner } = transport({ minIntervalMs: 0 });
+    sink.onWrite = () => {
+      if (event === "error") sink.emit("error", new Error("sync broken"));
+      else sink.emit("close");
+      assert.equal(sink.writes.length, 1);
+    };
+    await assert.rejects(
+      owner.enqueue(owner.generation, { transaction: event }),
+      event === "error" ? /sink error: sync broken/u : /sink closed/u,
+    );
+    assert.equal(owner.pendingJobs, 0);
+    assert.equal(sink.listenerCount("drain"), 0);
+    owner.dispose();
+  }
 });
 
 test("ready waits for accepted-false bytes to drain even when no later graphics job exists", async () => {
@@ -243,7 +305,7 @@ test("retained keys deduplicate accepted uploads and pending placement geometry 
   owner.dispose();
 });
 
-test("generation cancellation rejects queued jobs, clears stale drain/timers, and never writes them later", async () => {
+test("generation cancellation rejects queued jobs, preserves drain flow control, and never writes them later", async () => {
   const { clock, sink, owner } = transport({ minIntervalMs: 50, drainTimeoutMs: 500 });
   sink.returns.push(false);
   const accepted = owner.enqueue(owner.generation, { transaction: "accepted" });
@@ -258,10 +320,12 @@ test("generation cancellation rejects queued jobs, clears stale drain/timers, an
   assert.equal(owner.pendingJobs, 0);
   assert.equal(owner.pendingBytes, 0);
   assert.equal(owner.retainedResources, 0);
-  assert.equal(sink.listenerCount("drain"), 0);
-  assert.equal(clock.count, 0);
+  assert.equal(sink.listenerCount("drain"), 1, "flow-control listener survives generation cancellation");
+  assert.equal(clock.count, 1, "outstanding false return retains its drain deadline");
 
   sink.drain();
+  assert.equal(sink.listenerCount("drain"), 0);
+  assert.equal(clock.count, 0);
   clock.advance(1_000);
   assert.deepEqual(sink.writes.map(({ value }) => value), ["accepted"]);
   await assert.rejects(

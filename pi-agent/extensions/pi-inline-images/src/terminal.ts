@@ -188,18 +188,26 @@ export class TerminalImages {
     }
   }
 
-  /** Invalidate late work, remove owned terminal resources in order, and optionally dispose. */
+  /** Invalidate late work, then delete each owned resource with bounded admission. */
   async clear(dispose = false): Promise<void> {
-    const ids = [...this.images.values()].map(({ id }) => id);
     this.transport.cancel("image session reset");
-    this.images.clear();
-    this.residentPngBytes = 0;
-    if (this.capable) {
-      const generation = this.transport.generation;
-      await Promise.allSettled(ids.map((id) => this.transport.enqueue(generation, {
-        transaction: deleteImage(id, this.inTmux()),
-      })));
-      await this.transport.ready(generation).catch(() => undefined);
+    if (!this.capable) {
+      this.images.clear();
+      this.residentPngBytes = 0;
+      if (dispose) this.transport.dispose();
+      return;
+    }
+
+    const generation = this.transport.generation;
+    for (const [logicalId, state] of [...this.images]) {
+      await this.transport.enqueue(generation, {
+        transaction: deleteImage(state.id, this.inTmux()),
+      });
+      await this.transport.ready(generation);
+      if (this.images.get(logicalId) === state) {
+        this.images.delete(logicalId);
+        this.residentPngBytes -= state.image.png.length;
+      }
     }
     if (dispose) this.transport.dispose();
   }

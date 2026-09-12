@@ -122,11 +122,22 @@ Pi exposes no public way to invalidate a cached Markdown grid after a later
 placement. The catalog makes render pure without a new core hook or stdout
 interception.
 
-`write(false)` means Node accepted the complete current transaction. Preparation
-also waits for `drain` before returning, so native TUI output cannot overtake
-accepted-false graphics bytes. Generation cancellation rejects unsent work;
-accepted bytes cannot be retracted. Sink error, close, or slow drain rejects every
-unsent job and a fatal transport is not silently restarted.
+`write(false)` means Node accepted the complete current transaction. Drain
+observation is armed before calling the potentially reentrant sink; a synchronous
+`drain` cannot be lost, and reentrant enqueue cannot recursively pump another
+write. Preparation also waits for `drain` before returning, so native TUI output
+cannot overtake accepted-false graphics bytes. Generation cancellation rejects
+queued work but does not cancel sink flow control: an internally observed false
+return remains blocked until actual `drain`, `error`, or `close`, regardless of an
+optional `writableNeedDrain` value. Accepted bytes cannot be retracted. Sink
+error, close, or slow drain rejects every unsent job and a fatal transport is not
+silently restarted.
+
+Cleanup admits and drains one owned delete at a time, so it remains within the
+configured job/byte queue limits (including a one-job queue). Ownership and
+resident accounting are released only after that delete is accepted and drained;
+a cleanup error rejects explicitly and retains all unresolved IDs for diagnosis
+or a later owner decision.
 
 These limits reduce and bound extension-generated traffic. They do **not** prove
 or claim that Ghostty's GTK 4 Wayland `EAGAIN` process exit has been cured; that

@@ -77,7 +77,12 @@ function fakeImage(hash: string, png = Buffer.from(`png:${hash}`), width = 120, 
   return { source: hash, hash, width, height, previewWidth: width, previewHeight: height, png };
 }
 
-function runtime(options: { maxResidentPngBytes?: number; minIntervalMs?: number; cell?: { widthPx: number; heightPx: number } } = {}) {
+function runtime(options: {
+  maxResidentPngBytes?: number;
+  minIntervalMs?: number;
+  cell?: { widthPx: number; heightPx: number };
+  transportLimits?: Record<string, number>;
+} = {}) {
   const clock = new FakeClock();
   const sink = new CapturedSink(clock);
   const cell = options.cell ?? { widthPx: 10, heightPx: 20 };
@@ -91,7 +96,7 @@ function runtime(options: { maxResidentPngBytes?: number; minIntervalMs?: number
     {
       maxResidentPngBytes: options.maxResidentPngBytes,
       scheduler: clock,
-      transportLimits: { minIntervalMs: options.minIntervalMs ?? 50 },
+      transportLimits: { minIntervalMs: options.minIntervalMs ?? 50, ...options.transportLimits },
     },
   );
   return { clock, sink, terminal };
@@ -271,7 +276,8 @@ test("resident pressure and sink failures remain explicit at the original Markdo
   const failedSession = new ImageSession(failed.terminal, async () => fakeImage("broken"));
   const failedPrepared = await failedSession.prepare("before ![broken](x.png) after", "/fixture");
   assert.match(transformMarkdown(failedPrepared, 40, failed.terminal), /image unavailable: broken — graphics sink write failed/u);
-  await failedSession.reset(true);
+  await assert.rejects(failedSession.reset(true), /graphics sink write failed/u);
+  assert.equal(failed.terminal.count(), 1, "fatal sink retains unresolved owned image identity");
   assert.equal(MAX_RESIDENT_PNG_BYTES, 12 * 1024 * 1024);
 });
 
@@ -325,6 +331,27 @@ test("many large distinct prepared previews stay within aggregate resident and w
   assert.ok(uploadWrites.reduce((total, { value }) => total + Buffer.byteLength(value), 0) <= uploadWrites.length * DEFAULT_MAX_TRANSACTION_BYTES);
   assert.match(transformMarkdown(prepared, 1, terminal), /resident PNG budget reached/u);
   await session.reset(true);
+});
+
+test("cleanup admits deletes sequentially under a one-job queue and retains ownership on failure", async () => {
+  const bounded = runtime({ minIntervalMs: 0, transportLimits: { maxQueuedJobs: 1, maxQueuedBytes: 5_000 } });
+  await bounded.terminal.prepare("one", fakeImage("one"));
+  await bounded.terminal.prepare("two", fakeImage("two"));
+  const beforeDeletes = bounded.sink.writes.length;
+  await bounded.terminal.clear();
+  const deletes = bounded.sink.writes.slice(beforeDeletes).flatMap(({ value }) => graphicsCommands(value))
+    .filter((command) => command.get("a") === "d" && command.get("d") === "I");
+  assert.equal(deletes.length, 2);
+  assert.equal(bounded.terminal.count(), 0);
+  assert.equal(bounded.terminal.residentBytes(), 0);
+  await bounded.terminal.clear(true);
+
+  const failed = runtime({ minIntervalMs: 0, transportLimits: { maxQueuedJobs: 1, maxQueuedBytes: 5_000 } });
+  await failed.terminal.prepare("owned", fakeImage("owned"));
+  failed.sink.throwNext = new Error("delete failed");
+  await assert.rejects(failed.terminal.clear(), /graphics sink write failed/u);
+  assert.equal(failed.terminal.count(), 1, "failed delete retains unresolved ownership");
+  assert.equal(failed.terminal.residentBytes(), fakeImage("owned").png.length);
 });
 
 test("reset rejects late loads and cancels backpressured placements before ordered deletion", async () => {

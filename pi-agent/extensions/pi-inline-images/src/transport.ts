@@ -131,6 +131,8 @@ export class BoundedTransport {
   private drainTimer: unknown;
   private drainListener?: () => void;
   private backpressured = false;
+  private writing = false;
+  private drainedDuringWrite = false;
   private failure?: TransportError;
   private disposed = false;
 
@@ -251,11 +253,12 @@ export class BoundedTransport {
     if (this.disposed) return;
     this.currentGeneration++;
     this.clearPumpTimer();
-    this.clearDrainWait();
     this.rejectQueue(new TransportError("cancelled", reason));
     this.rejectReady(new TransportError("cancelled", reason));
     if (!options.retainAccepted) this.acceptedKeys.clear();
-    this.backpressured = this.sink.writableNeedDrain ?? this.backpressured;
+    if (this.sink.writableNeedDrain === true) this.backpressured = true;
+    if (this.backpressured) this.waitForDrain();
+    else this.clearDrainWait();
   }
 
   /** Permanently release sink listeners. The transport cannot be reused. */
@@ -268,13 +271,11 @@ export class BoundedTransport {
   }
 
   private resume(): void {
-    if (this.failure || this.disposed || this.queue.length === 0) return;
+    if (this.failure || this.disposed || this.queue.length === 0 || this.writing) return;
+    if (!this.backpressured && this.sink.writableNeedDrain === true) this.backpressured = true;
     if (this.backpressured) {
-      if (this.sink.writableNeedDrain === false) this.backpressured = false;
-      else {
-        this.waitForDrain();
-        return;
-      }
+      this.waitForDrain();
+      return;
     }
     const now = this.scheduler.now();
     const delay = this.lastWriteAt === undefined ? 0 : Math.max(0, this.lastWriteAt + this.limits.minIntervalMs - now);
@@ -293,14 +294,39 @@ export class BoundedTransport {
     }
 
     let accepted: boolean;
+    this.writing = true;
+    this.drainedDuringWrite = false;
+    this.observeDrain();
     try {
       accepted = this.sink.write(job.transaction);
       if (typeof accepted !== "boolean") throw new TypeError("graphics sink write() did not return a boolean");
     } catch (error) {
+      this.writing = false;
+      this.clearDrainWait();
       this.fail(new TransportError("sink", "graphics sink write failed", { cause: error }));
       return;
     }
-    if (this.failure) return;
+    this.writing = false;
+    if (this.failure) {
+      this.clearDrainWait();
+      return;
+    }
+    if (this.queue[0] !== job) {
+      // A reentrant cancel rejected/removed the active job while its bytes were
+      // still accepted by the sink. Preserve flow control but never settle or
+      // shift a newer-generation job in its place.
+      this.lastWriteAt = this.scheduler.now();
+      if (!accepted && !this.drainedDuringWrite) {
+        this.backpressured = true;
+        this.observeDrain();
+        this.startDrainTimeout();
+      } else {
+        this.backpressured = false;
+        this.clearDrainWait();
+        if (this.queue.length > 0) this.schedulePump(this.limits.minIntervalMs);
+      }
+      return;
+    }
 
     this.queue.shift();
     this.queuedBytes -= job.bytes;
@@ -312,13 +338,15 @@ export class BoundedTransport {
     this.lastWriteAt = this.scheduler.now();
     job.resolve({ status: "accepted", generation: job.generation, bytes: job.bytes });
 
-    if (!accepted) {
+    if (!accepted && !this.drainedDuringWrite) {
       this.backpressured = true;
-      this.waitForDrain();
-    } else if (this.queue.length > 0) {
-      this.schedulePump(this.limits.minIntervalMs);
+      this.observeDrain();
+      this.startDrainTimeout();
     } else {
-      this.settleReady();
+      this.backpressured = false;
+      this.clearDrainWait();
+      if (this.queue.length > 0) this.schedulePump(this.limits.minIntervalMs);
+      else this.settleReady();
     }
   }
 
@@ -327,20 +355,33 @@ export class BoundedTransport {
     this.pumpTimer = this.scheduler.setTimeout(() => this.pump(), delayMs);
   }
 
-  private waitForDrain(): void {
-    if (this.drainListener || this.failure || this.disposed || (this.queue.length === 0 && this.readyWaiters.length === 0)) return;
-    const generation = this.currentGeneration;
+  private observeDrain(): void {
+    if (this.drainListener || this.failure || this.disposed) return;
     const onDrain = () => {
+      if (this.writing) {
+        this.drainedDuringWrite = true;
+        return;
+      }
       this.clearDrainWait();
-      if (generation !== this.currentGeneration || this.failure || this.disposed) return;
+      if (this.failure || this.disposed) return;
       this.backpressured = false;
       this.resume();
       this.settleReady();
     };
     this.drainListener = onDrain;
     this.sink.on("drain", onDrain);
+  }
+
+  private waitForDrain(): void {
+    if (this.failure || this.disposed || (!this.backpressured && this.sink.writableNeedDrain !== true)) return;
+    this.observeDrain();
+    this.startDrainTimeout();
+  }
+
+  private startDrainTimeout(): void {
+    if (this.drainTimer !== undefined || !this.drainListener || this.failure || this.disposed) return;
     this.drainTimer = this.scheduler.setTimeout(() => {
-      if (this.drainListener !== onDrain) return;
+      if (!this.drainListener) return;
       this.fail(new TransportError("drain-timeout", `graphics sink did not drain within ${this.limits.drainTimeoutMs} ms`));
     }, this.limits.drainTimeoutMs);
   }
