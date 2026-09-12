@@ -1,38 +1,35 @@
 #!/bin/bash
-# Install the pinned Moonlight AppImage as an extracted, user-owned application (no FUSE).
+# Install a verified Moonlight AppImage as a user-owned extracted application.
 set -euo pipefail
-
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=../lib/common.sh
 . "$SCRIPT_DIR/lib/common.sh"
 
 GITHUB_REPO='moonlight-stream/moonlight-qt'
-DEFAULT_VERSION="v$QD_MOONLIGHT_VERSION"
-
-# Isolated tests substitute a small extraction fixture; production pins live in common.sh.
-PINNED_SHA256="${QD_TEST_MOONLIGHT_SHA256:-$QD_MOONLIGHT_SHA256}"
-PINNED_SIZE="${QD_TEST_MOONLIGHT_SIZE:-$QD_MOONLIGHT_SIZE}"
-
-MOONLIGHT_VERSION="$DEFAULT_VERSION"
-
 OPT_DIR="$HOME/.local/opt/moonlight"
 BIN_DIR="$HOME/.local/bin"
 APP_DIR="$HOME/.local/share/applications"
 MARKER_NAME='.quick-deploy-sha256'
 OWNERSHIP_MARK='# Managed by quick-deploy/sunshine-moonlight/install-client.sh'
-OWNERSHIP_GREP='quick-deploy/sunshine-moonlight'
+RELEASE_MODE=latest
+REQUESTED_TAG=''
+SELECTED_TAG=''
+SELECTED_NAME=''
+SELECTED_URL=''
+SELECTED_SHA=''
+SELECTED_SIZE=''
+TARGET_DIR=''
+DESKTOP_SRC=''
+ICON_SRC=''
 
 usage() {
     cat <<USAGE
-用法: ./commands/install-client.sh [选项]
+用法: ./commands/install-client.sh [--version v版本]
 
-安装 Moonlight 客户端（官方 AppImage 解包到 ~/.local/opt/moonlight/<版本>）。
-不要用 root/sudo 运行本脚本。不使用 Snap/Flatpak，不依赖 libfuse2。
-
-选项:
-  --version TAG   只接受固定版本 $DEFAULT_VERSION（内置 SHA-256+大小双重校验）。
-                  升级需核对新 AppImage 后更新 lib/common.sh 中的版本、摘要与大小。
-  -h, --help      显示帮助
+默认查询 Moonlight 最新稳定 release；缺失或较旧时安装，版本相同跳过下载，
+本机较新时保留且不降级。--version 选择一个明确的稳定 tag，但同样不降级。
+所有动态资产必须有 GitHub API sha256 摘要和精确大小。唯一例外是经审计的
+v$QD_MOONLIGHT_VERSION AppImage；其它缺少有效摘要的 release 会在修改前停止。
 USAGE
 }
 
@@ -40,133 +37,157 @@ parse_args() {
     while [ "$#" -gt 0 ]; do
         case "$1" in
             --version)
-                [ "$#" -ge 2 ] || qd_die '--version 需要一个参数'
-                [[ "$2" =~ ^v[0-9]+(\.[0-9]+)*$ ]] \
-                    || qd_die "--version 标签格式非法: $2（期望 v+数字+点）"
-                MOONLIGHT_VERSION="$2"; shift ;;
-            -h|--help) usage; exit 0 ;;
-            *) qd_die "未知参数: $1（-h 查看用法）" ;;
+                [ "$#" -ge 2 ] && qd_valid_release_tag "$2" || qd_die '--version 需要 lowercase v+至少两个数字组件'
+                REQUESTED_TAG="$2"; RELEASE_MODE=explicit; shift;;
+            -h|--help) usage; exit 0;;
+            *) qd_die "未知参数: $1（-h 查看用法）";;
         esac
         shift
     done
-    [ "$MOONLIGHT_VERSION" = "$DEFAULT_VERSION" ] \
-        || qd_die "拒绝安装非固定版本 $MOONLIGHT_VERSION：本脚本只信任内置固定校验值（$DEFAULT_VERSION）。
-升级流程：手工核对新版本后更新 lib/common.sh 的 Moonlight 版本、SHA-256 与大小。"
+    [ "$RELEASE_MODE" != explicit ] || qd_require_release_floor "$REQUESTED_TAG" "$QD_MOONLIGHT_FLOOR" Moonlight
 }
 
-# ---- 下载与校验 -------------------------------------------------------------------
+resolve_moonlight_release() {
+    local json selector fields
+    selector=latest
+    [ "$RELEASE_MODE" != explicit ] || selector="tags/$REQUESTED_TAG"
+    qd_info "查询 GitHub release: $GITHUB_REPO $selector"
+    qd_github_release_fetch "$GITHUB_REPO" "$selector" json || qd_die '无法获取可信 Moonlight release 元数据；未修改客户端'
+    mapfile -t fields < <(python3 - "$json" "$RELEASE_MODE" "$REQUESTED_TAG" "v$QD_MOONLIGHT_VERSION" "$QD_MOONLIGHT_SHA256" "$QD_MOONLIGHT_SIZE" <<'PY'
+import json, re, sys
+path, mode, requested, audited_tag, audited_sha, audited_size = sys.argv[1:]
+try:
+    with open(path, encoding='utf-8') as fh:
+        data = json.load(fh)
+except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+    print(f'错误: 无法解析 GitHub release JSON: {exc}', file=sys.stderr); raise SystemExit(1)
 
-download_appimage() {
-    local out="$1" ver_num="${MOONLIGHT_VERSION#v}"
-    qd_require_cmd curl curl
-    qd_require_cmd sha256sum coreutils
+def fail(message):
+    print('错误: ' + message, file=sys.stderr); raise SystemExit(1)
 
-    qd_curl -o "$out" \
-        "https://github.com/$GITHUB_REPO/releases/download/$MOONLIGHT_VERSION/Moonlight-$ver_num-x86_64.AppImage" \
-        || qd_die '下载失败；未对系统做任何修改'
-    local size
-    size="$(stat -c %s "$out")"
-    [ "$size" = "$PINNED_SIZE" ] \
-        || qd_die "文件大小不符（期望 $PINNED_SIZE，实际 $size）；已放弃，未做任何修改"
-    qd_info "大小校验通过: $size 字节"
-
-    qd_verify_sha256 "$out" "$PINNED_SHA256"
-    EXPECTED_SHA="$PINNED_SHA256"
+tag = data.get('tag_name')
+if data.get('draft') is not False or data.get('prerelease') is not False:
+    fail('release 必须明确为非 draft、非 prerelease')
+if not isinstance(tag, str) or not re.fullmatch(r'v[0-9]+(?:\.[0-9]+)+', tag):
+    fail(f'release tag 非严格数字稳定版本: {tag!r}')
+if mode == 'explicit' and tag != requested:
+    fail(f'release tag 不匹配（期望 {requested}，实际 {tag}）')
+assets = data.get('assets')
+if not isinstance(assets, list): fail('release assets 必须是数组')
+name = f'Moonlight-{tag[1:]}-x86_64.AppImage'
+items = [a for a in assets if isinstance(a, dict) and a.get('name') == name]
+if len(items) != 1: fail(f'找不到唯一的支持资产 {name}')
+asset = items[0]
+url = asset.get('browser_download_url')
+expected_url = f'https://github.com/moonlight-stream/moonlight-qt/releases/download/{tag}/{name}'
+if not isinstance(url, str) or url != expected_url: fail('资产 URL 不是对应 release/name 的规范 GitHub 下载 URL')
+if any(ord(c) < 32 or ord(c) == 127 for c in name + url): fail('资产名称或 URL 含控制字符')
+size = asset.get('size')
+if not isinstance(size, int) or isinstance(size, bool) or size <= 0: fail('资产 size 必须为正整数')
+digest = asset.get('digest')
+valid_digest = isinstance(digest, str) and re.fullmatch(r'sha256:[0-9a-fA-F]{64}', digest)
+release_id = data.get('id'); asset_id = asset.get('id')
+if valid_digest:
+    sha = digest[7:].lower()
+    if tag == audited_tag and name == 'Moonlight-6.1.0-x86_64.AppImage' and size == int(audited_size) and release_id == 175337682 and asset_id == 193059073 and sha != audited_sha:
+        fail('审计 v6.1.0 资产的 API digest 与内置审计 SHA-256 不一致')
+elif digest is None and tag == audited_tag and name == 'Moonlight-6.1.0-x86_64.AppImage' and size == int(audited_size) and release_id == 175337682 and asset_id == 193059073:
+    sha = audited_sha
+else:
+    fail(f'资产 {name} 没有可信 sha256 digest；需要经审阅的 tag 专用校验值')
+print(tag); print(name); print(url); print(sha); print(size)
+PY
+) || exit 1
+    [ "${#fields[@]}" -eq 5 ] || qd_die 'Moonlight release 解析未返回完整资产信息'
+    SELECTED_TAG="${fields[0]}"; SELECTED_NAME="${fields[1]}"; SELECTED_URL="${fields[2]}"
+    SELECTED_SHA="${fields[3]}"; SELECTED_SIZE="${fields[4]}"
+    qd_require_release_floor "$SELECTED_TAG" "$QD_MOONLIGHT_FLOOR" Moonlight
+    qd_info "选定资产: $SELECTED_NAME"
 }
 
-# ---- 外来资产拒止（在任何下载/修改之前执行） -----------------------------------------
-
-# 外来 = 已存在但无 quick-deploy 归属标记。对这类资产一律拒绝并退出，
-# 而不是覆盖（覆盖会毁掉用户原有文件，还会让 uninstall 把它误当受管文件删掉）。
-refuse_foreign_file() { # PATH 描述
-    local path="$1" desc="$2"
-    [ -e "$path" ] || return 0
-    if grep -q "$OWNERSHIP_GREP" "$path" 2>/dev/null; then
-        return 0   # 受管文件：允许收敛覆盖
+check_wrapper_and_desktop_ownership() {
+    local version target rc=0 wrapper="$BIN_DIR/moonlight" desktop="$APP_DIR/com.moonlight_stream.Moonlight.desktop"
+    qd_client_active_version "$OPT_DIR" "$wrapper" version target || rc=$?
+    case "$rc" in
+        0) ACTIVE_VERSION="$version"; ACTIVE_TARGET="$target";;
+        2) qd_die "拒绝覆盖外来 Moonlight 启动包装: $wrapper";;
+        *) qd_die "受管 Moonlight 启动包装结构损坏: $wrapper";;
+    esac
+    if [ -e "$desktop" ] && ! grep -Fqx "$OWNERSHIP_MARK" "$desktop" 2>/dev/null; then
+        qd_die "拒绝覆盖外来 Moonlight 桌面项: $desktop"
     fi
-    qd_die "拒绝覆盖外来$desc: $path（无 quick-deploy 归属标记）。
-请先自行备份并移除该文件后重跑；本脚本尚未做任何修改。"
 }
 
-check_no_foreign_assets() {
-    local ver_num="${MOONLIGHT_VERSION#v}"
-    refuse_foreign_file "$BIN_DIR/moonlight" '启动包装'
-    refuse_foreign_file "$APP_DIR/com.moonlight_stream.Moonlight.desktop" '桌面项'
-    if [ -e "$OPT_DIR/$ver_num" ] && [ ! -f "$OPT_DIR/$ver_num/$MARKER_NAME" ]; then
-        qd_die "拒绝覆盖外来目标目录: $OPT_DIR/$ver_num（缺少 $MARKER_NAME 归属标记）。
-请确认它不是你自己安装/构建的 Moonlight；如确认无用请手工移除后重跑。本脚本尚未做任何修改。"
-    fi
-    local stale
-    for stale in "$OPT_DIR"/.staging-"$ver_num".* "$OPT_DIR"/.backup-"$ver_num".*; do
-        [ -e "$stale" ] || continue
-        qd_die "发现上次安装中断/回滚残留的目录: $stale。
-为避免误删，请人工检查其内容后自行移除（或运行 ./commands/uninstall.sh --client，带标记的残留会被清掉），再重跑。"
+target_converged() {
+    local target="$1" expected="$2" recorded
+    [ -d "$target" ] && [ -x "$target/AppRun" ] && [ -f "$target/com.moonlight_stream.Moonlight.desktop" ] &&
+        [ -r "$target/moonlight.svg" ] && [ -f "$target/$MARKER_NAME" ] || return 1
+    recorded="$(cat "$target/$MARKER_NAME")"
+    [ "$recorded" = "$expected" ]
+}
+
+require_managed_target_or_absent() {
+    local target="$1"
+    [ ! -e "$target" ] && return 0
+    [ -f "$target/$MARKER_NAME" ] || qd_die "拒绝覆盖外来目标目录: $target（缺少 $MARKER_NAME）"
+}
+
+# Interrupted same-version promotion residue is ambiguous activation material.
+# Preserve it byte-for-byte and require an explicit cleanup instead of guessing.
+refuse_selected_residue() {
+    local version="${SELECTED_TAG#v}" residue
+    for residue in "$OPT_DIR"/.staging-"$version".* "$OPT_DIR"/.backup-"$version".*; do
+        [ -e "$residue" ] || continue
+        qd_die "发现未处理的 Moonlight 安装残留: $residue；为避免覆盖，请先人工核对或运行 commands/uninstall.sh --client"
     done
 }
 
-# ---- 解包安装（原子替换 + 受管目录回滚） ----------------------------------------------
+download_appimage() {
+    local out="$1" size
+    qd_info "下载: $SELECTED_URL"
+    qd_curl -o "$out" "$SELECTED_URL" || qd_die '下载失败；未修改客户端'
+    size="$(stat -c %s "$out")"
+    [ "$size" = "$SELECTED_SIZE" ] || qd_die "文件大小不符（API 期望 $SELECTED_SIZE，实际 $size）；未修改客户端"
+    qd_verify_sha256 "$out" "$SELECTED_SHA"
+}
 
-extract_and_install() {
-    local appimage="$1" ver_num="${MOONLIGHT_VERSION#v}"
-    local target="$OPT_DIR/$ver_num"
-    local extract_tmp staged backup
+set_target_sources() {
+    DESKTOP_SRC="$TARGET_DIR/com.moonlight_stream.Moonlight.desktop"
+    ICON_SRC="$TARGET_DIR/moonlight.svg"
+    [ -f "$DESKTOP_SRC" ] && [ -r "$ICON_SRC" ] || qd_die "选定 Moonlight 目标结构不完整: $TARGET_DIR"
+}
+
+extract_promote_target() {
+    local appimage="$1" version target extract_tmp staged backup=''
+    version="${SELECTED_TAG#v}"
+    target="$OPT_DIR/$version"
     qd_mktemp_dir extract_tmp
     chmod +x "$appimage"
-
     qd_info '解包 AppImage（--appimage-extract，不需要 FUSE/libfuse2）...'
-    if ! (cd "$extract_tmp" && "$appimage" --appimage-extract >/dev/null); then
-        qd_die 'AppImage 解包失败；未安装任何内容'
-    fi
-    [ -d "$extract_tmp/squashfs-root" ] || qd_die '解包结果缺少 squashfs-root；未安装任何内容'
-    [ -x "$extract_tmp/squashfs-root/AppRun" ] || qd_die '解包结果缺少 AppRun；未安装任何内容'
-
+    (cd "$extract_tmp" && "$appimage" --appimage-extract >/dev/null) || qd_die 'AppImage 解包失败；未激活新客户端'
+    [ -d "$extract_tmp/squashfs-root" ] && [ -x "$extract_tmp/squashfs-root/AppRun" ] || qd_die '解包结果缺少可执行 AppRun；未激活新客户端'
     mkdir -p "$OPT_DIR"
-    staged="$OPT_DIR/.staging-$ver_num.$$"
+    staged="$OPT_DIR/.staging-$version.$$"
     mv "$extract_tmp/squashfs-root" "$staged"
-    # 归属标记在晋级为正式目录之前就写入：中断残留的 .staging-* 因此可被 uninstall 安全识别
-    printf '%s\n' "$EXPECTED_SHA" >"$staged/$MARKER_NAME"
-
-    # 原子替换 + 回滚：受管的旧版本先换名为备份，新版本晋级失败则恢复原版本
-    backup=''
+    [ -f "$staged/com.moonlight_stream.Moonlight.desktop" ] && [ -r "$staged/moonlight.svg" ] || qd_die '解包结果缺少需要的桌面元数据；未激活新客户端'
+    printf '%s\n' "$SELECTED_SHA" >"$staged/$MARKER_NAME"
     if [ -e "$target" ]; then
-        backup="$OPT_DIR/.backup-$ver_num.$$"
+        [ -f "$target/$MARKER_NAME" ] || qd_die "拒绝替换外来目标目录: $target"
+        backup="$OPT_DIR/.backup-$version.$$"
         mv "$target" "$backup"
     fi
-    if mv "$staged" "$target"; then
-        [ -z "$backup" ] || rm -rf "$backup"
-    else
+    if ! mv "$staged" "$target"; then
         [ -z "$backup" ] || mv "$backup" "$target"
-        qd_die '替换安装目录失败，已回滚到原有版本'
+        qd_die '替换 Moonlight 目标目录失败，已恢复原目录'
     fi
-
-    # 记录上游桌面文件与图标（必须在 mv 之后、以最终路径查找）
-    DESKTOP_SRC="$(find "$target" -maxdepth 1 -name 'com.moonlight_stream.Moonlight.desktop' -print -quit)"
-    [ -n "$DESKTOP_SRC" ] || DESKTOP_SRC="$(find "$target" -maxdepth 1 -name '*.desktop' -print -quit)"
-    ICON_SRC="$(find "$target" -maxdepth 2 -name 'moonlight.svg' -print -quit)"
-    [ -n "$ICON_SRC" ] || ICON_SRC="$(find "$target" -maxdepth 1 -name '.DirIcon' -print -quit)"
-
-    qd_info "已安装到 $target"
+    [ -z "$backup" ] || rm -rf "$backup"
     TARGET_DIR="$target"
+    set_target_sources
 }
-
-already_converged() {
-    local ver_num target expected
-    ver_num="${MOONLIGHT_VERSION#v}"
-    target="$OPT_DIR/$ver_num"
-    [ -x "$target/AppRun" ] || return 1
-    [ -f "$target/com.moonlight_stream.Moonlight.desktop" ] || return 1
-    [ -r "$target/moonlight.svg" ] || return 1
-    [ -f "$target/$MARKER_NAME" ] || return 1
-    expected="$(cat "$target/$MARKER_NAME")"
-    [ "$expected" = "$PINNED_SHA256" ]
-}
-
-# ---- 启动包装与桌面项 -----------------------------------------------------------------
 
 install_wrapper() {
-    mkdir -p "$BIN_DIR"
     local wrapper="$BIN_DIR/moonlight" tmp
-    refuse_foreign_file "$wrapper" '启动包装'
+    mkdir -p "$BIN_DIR"
     qd_mktemp_file tmp "$wrapper.qdtmp.XXXXXX"
     cat >"$tmp" <<EOF_WRAP
 #!/bin/sh
@@ -175,73 +196,69 @@ exec "$TARGET_DIR/AppRun" "\$@"
 EOF_WRAP
     chmod 755 "$tmp"
     mv -f "$tmp" "$wrapper"
-    qd_info "启动包装: $wrapper -> $TARGET_DIR/AppRun"
 }
 
 install_desktop_entry() {
-    [ -n "${DESKTOP_SRC:-}" ] || qd_die '安装内容缺少 .desktop 文件；请修复安装后再使用桌面入口'
+    local dst="$APP_DIR/com.moonlight_stream.Moonlight.desktop" tmp
     mkdir -p "$APP_DIR"
-    local dst="$APP_DIR/com.moonlight_stream.Moonlight.desktop" tmp icon_path=''
-    refuse_foreign_file "$dst" '桌面项'
     qd_mktemp_file tmp "$dst.qdtmp.XXXXXX"
-    if [ -n "${ICON_SRC:-}" ]; then
-        icon_path="$TARGET_DIR/moonlight.svg"
-        [ "$ICON_SRC" = "$icon_path" ] || cp "$ICON_SRC" "$icon_path"
-    fi
-    # 以解包出的上游桌面项为底，改写 Exec/Icon 为安装后的绝对路径
-    sed -e "s|^Exec=.*|Exec=$BIN_DIR/moonlight|" \
-        ${icon_path:+-e "s|^Icon=.*|Icon=$icon_path|"} \
-        "$DESKTOP_SRC" >"$tmp"
+    sed -e "s|^Exec=.*|Exec=$BIN_DIR/moonlight|" -e "s|^Icon=.*|Icon=$TARGET_DIR/moonlight.svg|" "$DESKTOP_SRC" >"$tmp"
     grep -q '^Exec=' "$tmp" || printf 'Exec=%s/moonlight\n' "$BIN_DIR" >>"$tmp"
     printf '%s\n' "$OWNERSHIP_MARK" >>"$tmp"
     chmod 644 "$tmp"
     mv -f "$tmp" "$dst"
-    qd_info "桌面项: $dst"
-    if command -v update-desktop-database >/dev/null 2>&1; then
-        update-desktop-database "$APP_DIR" >/dev/null 2>&1 || true
-    fi
+    command -v update-desktop-database >/dev/null 2>&1 && update-desktop-database "$APP_DIR" >/dev/null 2>&1 || true
+}
+
+activate_target() {
+    # The desktop entry always targets the stable wrapper path. Repair it first:
+    # if this write fails, the old wrapper and therefore the old active payload
+    # remain untouched. Wrapper replacement is the sole activation commit point.
+    install_desktop_entry
+    install_wrapper
+    qd_info "Moonlight 已激活: $SELECTED_TAG"
 }
 
 main() {
     parse_args "$@"
     qd_require_not_root
     qd_require_ubuntu
+    [ "$(uname -m)" = x86_64 ] || qd_die 'Moonlight AppImage 仅支持 x86_64'
+    check_wrapper_and_desktop_ownership  # foreign/broken active state must not consume API quota
+    resolve_moonlight_release
 
-    local machine
-    machine="$(uname -m)"
-    [ "$machine" = x86_64 ] \
-        || qd_die "本脚本固定的 Moonlight AppImage 仅适用于 x86_64；当前架构 $machine 不受支持。"
-
-    qd_section "Moonlight $MOONLIGHT_VERSION (x86_64)"
-
-    check_no_foreign_assets   # 在任何下载/写入之前拒止外来资产
-
-    if already_converged; then
-        qd_info "安装记录的下载摘要符合固定值，跳过下载；未重新校验已解包程序的内容"
-        TARGET_DIR="$OPT_DIR/${MOONLIGHT_VERSION#v}"
-        # 修复可能被删掉的包装/桌面项
-        DESKTOP_SRC="$(find "$TARGET_DIR" -maxdepth 1 -name 'com.moonlight_stream.Moonlight.desktop' -print -quit)"
-        [ -n "$DESKTOP_SRC" ] || DESKTOP_SRC="$(find "$TARGET_DIR" -maxdepth 1 -name '*.desktop' -print -quit)"
-        ICON_SRC="$(find "$TARGET_DIR" -maxdepth 2 -name 'moonlight.svg' -print -quit)"
-        install_wrapper
+    local selected_target="$OPT_DIR/${SELECTED_TAG#v}" action=install
+    if [ -n "$ACTIVE_VERSION" ]; then
+        if qd_version_ge "v$ACTIVE_VERSION" "$SELECTED_TAG"; then
+            if [ "$ACTIVE_VERSION" = "${SELECTED_TAG#v}" ]; then action=equal; else action=keep-newer; fi
+        else action=install
+        fi
+    fi
+    if [ "$action" = keep-newer ]; then
+        local active_digest
+        active_digest="$(cat "$ACTIVE_TARGET/$MARKER_NAME")"
+        [[ "$active_digest" =~ ^[0-9a-fA-F]{64}$ ]] && target_converged "$ACTIVE_TARGET" "$active_digest" \
+            || qd_die '较新的活动 Moonlight 结构或来源记录无效；拒绝降级'
+        TARGET_DIR="$ACTIVE_TARGET"; set_target_sources
+        # Both owned front doors point at the preserved active target. Repair the
+        # desktop first; wrapper replacement (including mode 0755) is the commit.
         install_desktop_entry
+        install_wrapper
+        qd_info "已有更高活动版本 v$ACTIVE_VERSION，保留且不降级"
+        exit 0
+    fi
+
+    refuse_selected_residue
+    require_managed_target_or_absent "$selected_target"
+    if target_converged "$selected_target" "$SELECTED_SHA"; then
+        TARGET_DIR="$selected_target"; set_target_sources
+        qd_info "选定版本 $SELECTED_TAG 已验证；跳过下载；未重新校验已解包内容"
     else
         local appimage
         qd_mktemp_file appimage
         download_appimage "$appimage"
-        extract_and_install "$appimage"
-        install_wrapper
-        install_desktop_entry
+        extract_promote_target "$appimage"
     fi
-
-    qd_section '完成'
-    cat <<EOF_DONE
-Moonlight 已就绪。启动方式:
-  命令行:  ~/.local/bin/moonlight
-  桌面:    应用列表中的 Moonlight
-添加主机: 使用 commands/install-host.sh 输出的 <Tailnet IPv4>:<基准端口>。
-在主机 Web UI 核对待配对客户端与来源地址后，输入 Moonlight 显示的 PIN。
-EOF_DONE
+    activate_target
 }
-
 main "$@"

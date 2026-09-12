@@ -16,7 +16,7 @@ usage() {
     cat <<USAGE
 用法: ./install.sh [--host-only | --client-only]
 
-默认依次安装本机 Sunshine 主机（--capture kms）和 Moonlight 客户端。
+默认依次检查最新稳定 Sunshine 与 Moonlight：缺失/较旧时更新，相同跳过载荷，本机较新不降级；主机成功后才查询客户端。
   --host-only    只安装本机 Sunshine 主机（--capture kms）
   --client-only  只安装本机 Moonlight 客户端
   -h, --help     显示帮助

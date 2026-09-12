@@ -6,7 +6,13 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 . "$SCRIPT_DIR/lib/common.sh"
 
 GITHUB_REPO='LizardByte/Sunshine'
-VERSION_TAG="v$QD_SUNSHINE_VERSION"
+RELEASE_MODE=latest
+REQUESTED_TAG=''
+VERSION_TAG=''
+SELECTED_NAME=''
+SELECTED_URL=''
+SELECTED_SHA=''
+SELECTED_SIZE=''
 CONFIG_DIR=''
 CONFIG_FILE=''
 STATE_DIR="${QD_HOST_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/quick-deploy/sunshine-moonlight}"
@@ -25,24 +31,20 @@ SERVICE_CHANGED=false
 usage() {
     cat <<USAGE
 用法: ./commands/install-host.sh [--version v版本] [--capture auto|kms|portal|x11|nvfbc|wlr|kwin]
-                      [--bind-address 本机TailnetIPv4]
-默认版本 v$QD_SUNSHINE_VERSION；最低版本 v$QD_SUNSHINE_FLOOR。
-不传 --capture 保留已有设置；auto 明确删除 capture 键。
---bind-address 只能确认本机已分配的 Tailscale IPv4，不能用来绑定 LAN/公网/通配地址。
-请在已登录图形桌面的普通用户下运行。脚本会调用 sudo 安装原生包，不修改睡眠/锁屏。
+默认检查 Sunshine 最新稳定 release；缺失或较旧时安装，版本相同跳过包下载，
+本机较新时保留且不降级。--version 选择明确稳定 tag，但同样不降级。
+动态资产必须有 GitHub API sha256 digest 和精确 size。
 USAGE
 }
 parse_args() {
     while [ "$#" -gt 0 ]; do
         case "$1" in
             --version)
-                [ "$#" -ge 2 ] && [[ "$2" =~ ^v[0-9]+(\.[0-9]+)*$ ]] || qd_die '--version 需要 v+数字点分版本'
-                VERSION_TAG="$2"; shift;;
+                [ "$#" -ge 2 ] && qd_valid_release_tag "$2" || qd_die '--version 需要 lowercase v+至少两个数字组件'
+                REQUESTED_TAG="$2"; RELEASE_MODE=explicit; shift;;
             --capture)
                 [ "$#" -ge 2 ] || qd_die '--capture 需要参数'
-                if [ "$2" != auto ] && { [ -z "$2" ] || ! qd_valid_capture "$2"; }; then
-                    qd_die 'capture 只接受 auto|kms|portal|x11|nvfbc|wlr|kwin'
-                fi
+                if [ "$2" != auto ] && { [ -z "$2" ] || ! qd_valid_capture "$2"; }; then qd_die 'capture 只接受 auto|kms|portal|x11|nvfbc|wlr|kwin'; fi
                 CAPTURE="$2"; shift;;
             --bind-address)
                 [ "$#" -ge 2 ] && qd_valid_ipv4 "$2" || qd_die '--bind-address 需要标准 IPv4 地址'
@@ -52,10 +54,8 @@ parse_args() {
         esac
         shift
     done
-    qd_version_ge "$VERSION_TAG" "$QD_SUNSHINE_FLOOR" \
-        || qd_die "拒绝低于维护基线 v$QD_SUNSHINE_FLOOR 的版本；请使用包含 September 2026 上游安全修复的版本"
+    [ "$RELEASE_MODE" != explicit ] || qd_require_release_floor "$REQUESTED_TAG" "$QD_SUNSHINE_FLOOR" Sunshine
 }
-
 preflight() {
     local cmd ip session capture origin
     for cmd in python3 curl sha256sum dpkg-deb systemctl loginctl tailscale ip ss; do qd_require_cmd "$cmd"; done
@@ -92,80 +92,61 @@ preflight() {
     esac
 }
 
-pick_deb_asset() {
-    local json_file="$1" arch="$2" ubuntu_version="$3"
-    python3 - "$json_file" "$arch" "$ubuntu_version" "$VERSION_TAG" <<'PY'
+resolve_sunshine_release() {
+    local json selector fields
+    selector=latest
+    [ "$RELEASE_MODE" != explicit ] || selector="tags/$REQUESTED_TAG"
+    qd_info "查询 GitHub release: $GITHUB_REPO $selector"
+    qd_github_release_fetch "$GITHUB_REPO" "$selector" json || qd_die '无法获取可信 Sunshine release 元数据；未修改主机'
+    mapfile -t fields < <(python3 - "$json" "$RELEASE_MODE" "$REQUESTED_TAG" "$1" "$VERSION_ID" <<'PY_RELEASE'
 import json, re, sys
-
-path, arch, ubuntu_version, expected_tag = sys.argv[1:5]
-with open(path, encoding="utf-8") as fh:
-    data = json.load(fh)
-
-if data.get("tag_name") != expected_tag:
-    print(f"错误: release tag 不匹配（期望 {expected_tag}，实际 {data.get('tag_name')}）", file=sys.stderr)
-    sys.exit(1)
-
-assets = data.get("assets") or []
-preferred = f"sunshine-ubuntu-{ubuntu_version}-{arch}.deb"
-
-def matches(name):
-    n = name.lower()
-    return (
-        n.endswith(".deb")
-        and "ubuntu" in n
-        and ubuntu_version in n
-        and re.search(rf"(^|[^a-z0-9]){re.escape(arch)}([^a-z0-9]|$)", n)
-    )
-
-candidates = [a for a in assets if matches(a.get("name") or "")]
-chosen = None
-for a in candidates:
-    if a["name"] == preferred:
-        chosen = a
-        break
-if chosen is None and len(candidates) == 1:
-    chosen = candidates[0]
-if chosen is None:
-    names = ", ".join(a.get("name", "?") for a in assets) or "(无资产)"
-    print(f"错误: 无法唯一确定 Ubuntu {ubuntu_version}/{arch} 的 .deb 资产。release 资产列表: {names}", file=sys.stderr)
-    sys.exit(1)
-
-digest = chosen.get("digest") or ""
-if not digest.startswith("sha256:"):
-    print(f"错误: GitHub API 未提供资产 {chosen['name']} 的 sha256 digest，无法验证，拒绝继续。", file=sys.stderr)
-    sys.exit(1)
-
-print(f"{chosen['browser_download_url']}\t{digest[len('sha256:'):]}\t{chosen['name']}")
-PY
+from urllib.parse import quote
+path, mode, requested, arch, ubuntu = sys.argv[1:]
+try:
+    with open(path, encoding='utf-8') as fh: data=json.load(fh)
+except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+    print(f'错误: 无法解析 GitHub release JSON: {exc}', file=sys.stderr); raise SystemExit(1)
+def fail(s): print('错误: '+s, file=sys.stderr); raise SystemExit(1)
+tag=data.get('tag_name')
+if data.get('draft') is not False or data.get('prerelease') is not False: fail('release 必须明确为非 draft、非 prerelease')
+if not isinstance(tag,str) or not re.fullmatch(r'v[0-9]+(?:\.[0-9]+)+',tag): fail(f'release tag 非严格数字稳定版本: {tag!r}')
+if mode == 'explicit' and tag != requested: fail(f'release tag 不匹配（期望 {requested}，实际 {tag}）')
+assets=data.get('assets')
+if not isinstance(assets,list): fail('release assets 必须是数组')
+preferred=f'sunshine-ubuntu-{ubuntu}-{arch}.deb'
+def matches(a):
+    name=a.get('name') if isinstance(a,dict) else None
+    return isinstance(name,str) and name.lower().endswith('.deb') and 'ubuntu' in name.lower() and ubuntu in name and re.search(rf'(^|[^a-z0-9]){re.escape(arch)}([^a-z0-9]|$)',name.lower())
+candidates=[a for a in assets if matches(a)]
+chosen=next((a for a in candidates if a['name']==preferred),None)
+if chosen is None and len(candidates)==1: chosen=candidates[0]
+if chosen is None: fail(f'无法唯一确定 Ubuntu {ubuntu}/{arch} 的 .deb 资产')
+name=chosen['name']; url=chosen.get('browser_download_url'); expected=f'https://github.com/LizardByte/Sunshine/releases/download/{tag}/{quote(name, safe="")}'
+if any(ord(c)<32 or ord(c)==127 for c in name): fail('资产名称含控制字符')
+if not isinstance(url,str) or url != expected: fail('资产 URL 不是对应 release/name 的规范 GitHub 下载 URL')
+digest=chosen.get('digest')
+if not isinstance(digest,str) or not re.fullmatch(r'sha256:[0-9a-fA-F]{64}',digest): fail(f'资产 {name} 没有有效 sha256 digest')
+size=chosen.get('size')
+if not isinstance(size,int) or isinstance(size,bool) or size <= 0: fail('资产 size 必须为正整数')
+print(tag); print(name); print(url); print(digest[7:].lower()); print(size)
+PY_RELEASE
+) || exit 1
+    [ "${#fields[@]}" -eq 5 ] || qd_die 'Sunshine release 解析未返回完整资产信息'
+    VERSION_TAG="${fields[0]}"; SELECTED_NAME="${fields[1]}"; SELECTED_URL="${fields[2]}"; SELECTED_SHA="${fields[3]}"; SELECTED_SIZE="${fields[4]}"
+    qd_require_release_floor "$VERSION_TAG" "$QD_SUNSHINE_FLOOR" Sunshine
+    qd_info "选定资产: $SELECTED_NAME"
 }
 
 download_and_verify_deb() {
-    local arch="$1" json_file json_tmp url digest name deb
-    qd_require_cmd curl curl
-    qd_require_cmd python3 python3
-    qd_require_cmd sha256sum coreutils
-
-    qd_mktemp_file json_tmp
-    qd_info "查询 GitHub release: $GITHUB_REPO $VERSION_TAG"
-    qd_curl -o "$json_tmp" \
-        "https://api.github.com/repos/$GITHUB_REPO/releases/tags/$VERSION_TAG" \
-        || qd_die "无法获取 release 元数据（检查网络/代理；api.github.com 需要可达）"
-
-    json_file="$json_tmp"
-    local picked
-    picked="$(pick_deb_asset "$json_file" "$arch" "$VERSION_ID")" || exit 1
-    url="$(cut -f1 <<<"$picked")"
-    digest="$(cut -f2 <<<"$picked")"
-    name="$(cut -f3 <<<"$picked")"
-    qd_info "选定资产: $name"
-
+    local arch="$1" deb actual_size
     qd_mktemp_file deb --suffix=.deb
-    qd_info "下载: $url"
-    qd_curl -o "$deb" "$url" || qd_die '下载失败；未安装下载文件'
-    qd_verify_sha256 "$deb" "$digest"
+    qd_info "下载: $SELECTED_URL"
+    qd_curl -o "$deb" "$SELECTED_URL" || qd_die '下载失败；未安装下载文件'
+    actual_size="$(stat -c %s "$deb")"
+    [ "$actual_size" = "$SELECTED_SIZE" ] || qd_die "deb 文件大小不符（API 期望 $SELECTED_SIZE，实际 $actual_size）"
+    qd_verify_sha256 "$deb" "$SELECTED_SHA"
     DEB_FILE="$deb"
 }
-
 sunshine_pkg_installed() {
     dpkg-query -W -f='${db:Status-Status}' sunshine 2>/dev/null | grep -qx installed
 }
@@ -211,11 +192,7 @@ install_package() {
         installed="$(sunshine_pkg_version)"
         upstream="$(qd_upstream_version "$installed")" || qd_die "无法识别已安装版本: $installed"
         if qd_version_ge "$upstream" "${VERSION_TAG#v}"; then
-            if [ "$upstream" = "${VERSION_TAG#v}" ]; then
-                qd_info "已有请求的上游版本 ($installed)，跳过下载/重装"
-            else
-                qd_warn "已有更高上游版本 $upstream，保留现有包，不降级"
-            fi
+            if [ "$upstream" = "${VERSION_TAG#v}" ]; then qd_info "已有选定上游版本 ($installed)，跳过下载/apt"; else qd_info "已有更高上游版本 $upstream，保留且不降级"; fi
             record_ownership preexisting "$installed"
             return 0
         fi
@@ -224,8 +201,7 @@ install_package() {
     verify_deb_metadata "$arch"
     local -a apt_args=(install -y)
     if [ "$preexisting" = true ] && dpkg --compare-versions "$installed" gt "$DEB_VERSION"; then
-        # An old downstream epoch can sort above a newer official upstream release.
-        qd_info '已验证上游版本更新；允许切换到 Debian 排序较低的官方包版本'
+        qd_info '已验证上游版本更新；允许切换 Debian 排序较低的官方包版本'
         apt_args+=(--allow-downgrades)
     fi
     qd_sudo apt-get "${apt_args[@]}" "$DEB_FILE" || qd_die 'apt 安装失败；请检查 apt/dpkg 状态，本次未记录包归属'
@@ -236,7 +212,6 @@ install_package() {
     if [ "$preexisting" = true ]; then record_ownership preexisting "$now_version"; else record_ownership fresh "$now_version"; fi
     qd_info "包已安装: $now_version"
 }
-
 converge_caps() {
     local capture bin cur
     capture="${CAPTURE:-$(qd_conf_get "$CONFIG_FILE" capture || true)}"
@@ -349,6 +324,7 @@ main() {
     arch="$(dpkg --print-architecture)"
     case "$arch" in amd64|arm64) ;; *) qd_die "不支持架构 $arch";; esac
     preflight
+    resolve_sunshine_release "$arch"
     install_package "$arch"
     converge_caps
     converge_input_access

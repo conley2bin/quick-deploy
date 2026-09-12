@@ -4,6 +4,7 @@
 QD_SUNSHINE_VERSION='2026.906.222525'
 QD_SUNSHINE_FLOOR="$QD_SUNSHINE_VERSION"  # September 2026 upstream security fixes
 QD_MOONLIGHT_VERSION='6.1.0'
+QD_MOONLIGHT_FLOOR="$QD_MOONLIGHT_VERSION"
 QD_MOONLIGHT_SHA256='0e855ffd22d407e18ab5fdb575fed5f01ca119a3f91993c5f0213f15ac80b400'
 QD_MOONLIGHT_SIZE='55325888'
 QD_CANONICAL_UNIT='app-dev.lizardbyte.app.Sunshine.service'
@@ -87,7 +88,142 @@ qd_tailnet_ip() {
     printf '%s\n' "$ip"
 }
 
+# Asset bytes are public and may use GitHub/CDN redirects and bounded retries. Release
+# metadata deliberately uses qd_github_release_fetch instead: one request, no redirect.
 qd_curl() { curl -fL --retry 3 --connect-timeout 20 "$@"; }
+
+qd_valid_release_tag() { [[ "$1" =~ ^v[0-9]+(\.[0-9]+)+$ ]]; }
+qd_require_release_floor() {
+    local tag="$1" floor="$2" component="$3"
+    qd_valid_release_tag "$tag" || qd_die "$component release 标签格式无效: $tag"
+    qd_version_ge "$tag" "$floor" || qd_die "$component release $tag 低于维护基线 v$floor"
+}
+
+_qd_http_header() {
+    local headers="$1" wanted="${2,,}"
+    awk -v wanted="$wanted" 'BEGIN { IGNORECASE=1 }
+        { sub(/\r$/, ""); n=index($0, ":"); if (n) {
+            key=tolower(substr($0, 1, n - 1)); if (key == wanted) {
+                value=substr($0, n + 1); sub(/^[ \t]+/, "", value); print value; exit
+            }
+        }}' "$headers"
+}
+
+# Select without a precedence fallback: two different exported credentials make
+# the chosen GitHub identity ambiguous. The caller never prints this variable.
+qd_github_select_auth() {
+    local github="${GITHUB_TOKEN:-}" gh="${GH_TOKEN:-}"
+    if [[ "$github" == *$'\n'* || "$github" == *$'\r'* || "$gh" == *$'\n'* || "$gh" == *$'\r'* ]]; then
+        qd_die 'GitHub token 含有换行符，拒绝构造认证请求'
+    fi
+    if [ -n "$github" ] && [ -n "$gh" ] && [ "$github" != "$gh" ]; then
+        qd_die 'GITHUB_TOKEN 与 GH_TOKEN 同时设置但值不同；请只保留一个凭据'
+    fi
+    QD_GITHUB_TOKEN="${github:-$gh}"
+    QD_GITHUB_AUTH_SUPPLIED=false
+    [ -z "$QD_GITHUB_TOKEN" ] || QD_GITHUB_AUTH_SUPPLIED=true
+}
+
+_qd_github_report_failure() {
+    local repo="$1" selector="$2" curl_rc="$3" status="$4" headers="$5"
+    local remaining reset retry_after formatted
+    remaining="$(_qd_http_header "$headers" x-ratelimit-remaining || true)"
+    reset="$(_qd_http_header "$headers" x-ratelimit-reset || true)"
+    retry_after="$(_qd_http_header "$headers" retry-after || true)"
+    case "$status" in
+        401)
+            if [ "$QD_GITHUB_AUTH_SUPPLIED" = true ]; then qd_warn "GitHub API $repo/$selector: HTTP 401，提供的认证凭据被拒绝"
+            else qd_warn "GitHub API $repo/$selector: HTTP 401，未认证请求被拒绝"; fi;;
+        403)
+            if [ "$remaining" = 0 ]; then
+                if [[ "$reset" =~ ^[0-9]+$ ]]; then formatted="$(date -d "@$reset" --iso-8601=seconds 2>/dev/null || true)"; else formatted='不可用'; fi
+                qd_warn "GitHub API $repo/$selector: HTTP 403，rate limit remaining=0，reset epoch=$reset，时间=$formatted"
+                [ "$QD_GITHUB_AUTH_SUPPLIED" = true ] || qd_warn '未认证 GitHub API 默认每个公共出口 IP 每小时 60 次请求'
+            else qd_warn "GitHub API $repo/$selector: HTTP 403，访问被禁止（remaining=${remaining:-不可用}）"; fi;;
+        404) qd_warn "GitHub API $repo/$selector: HTTP 404，${selector#tags/} release 不存在或不可访问";;
+        429) qd_warn "GitHub API $repo/$selector: HTTP 429，已限流（remaining=${remaining:-不可用}，reset=${reset:-不可用}，Retry-After=${retry_after:-不可用}）";;
+        *) qd_warn "GitHub API $repo/$selector: curl exit $curl_rc，HTTP ${status:-000}";;
+    esac
+}
+
+# Fetch exactly one API metadata document. Auth is supplied only via an in-memory
+# curl config on stdin; curl's child environment has both conventional token names
+# removed and asset downloads never call this helper.
+qd_github_release_fetch() {
+    # Inspect and suppress xtrace before touching either token variable. Function
+    # arguments are public repository metadata; token selection/config never is.
+    local trace=false
+    [[ $- == *x* ]] && trace=true
+    [ "$trace" = true ] && set +x
+
+    local repo="$1" selector="$2" __out_var="$3" body headers stderr_file status_file status curl_rc=0
+    case "$selector" in latest|tags/*) ;; *) qd_die "内部错误：无效 GitHub release selector: $selector";; esac
+    qd_require_cmd curl curl
+    qd_require_cmd python3 python3
+    qd_github_select_auth
+    qd_mktemp_file body
+    qd_mktemp_file headers
+    qd_mktemp_file stderr_file
+    qd_mktemp_file status_file
+    {
+        printf '%s\n' 'header = "User-Agent: quick-deploy-sunshine-moonlight/1"'
+        printf '%s\n' 'header = "Accept: application/vnd.github+json"'
+        printf '%s\n' 'header = "X-GitHub-Api-Version: 2022-11-28"'
+        if [ -n "$QD_GITHUB_TOKEN" ]; then
+            local escaped="${QD_GITHUB_TOKEN//\\/\\\\}"
+            escaped="${escaped//\"/\\\"}"
+            printf 'header = "Authorization: Bearer %s"\n' "$escaped"
+        fi
+    } | env -u GITHUB_TOKEN -u GH_TOKEN curl --disable --config - --silent --show-error --connect-timeout 20 \
+        -D "$headers" -o "$body" -w '%{http_code}' \
+        "https://api.github.com/repos/$repo/releases/$selector" >"$status_file" 2>"$stderr_file" || curl_rc=${PIPESTATUS[1]}
+    QD_GITHUB_TOKEN=''
+    status="$(cat "$status_file")"
+    [[ "$status" =~ ^[0-9]{3}$ ]] || status=000
+    if [ "$curl_rc" -ne 0 ] || [ "$status" != 200 ]; then
+        _qd_github_report_failure "$repo" "$selector" "$curl_rc" "$status" "$headers"
+        [ "$trace" = true ] && set -x
+        return 1
+    fi
+    if ! python3 - "$body" <<'PY_JSON'; then
+import json, sys
+with open(sys.argv[1], encoding='utf-8') as fh:
+    value = json.load(fh)
+if not isinstance(value, dict):
+    raise SystemExit(1)
+PY_JSON
+        qd_warn "GitHub API $repo/$selector: HTTP 200 但响应不是 JSON object"
+        [ "$trace" = true ] && set -x
+        return 1
+    fi
+    printf -v "$__out_var" '%s' "$body"
+    [ "$trace" = true ] && set -x
+    return 0
+}
+
+# Wrapper, not version-directory enumeration, is the active Moonlight source of
+# truth. Return 0 for absent/active, 2 for a foreign wrapper, 3 for malformed
+# managed state. OUT_VERSION and OUT_TARGET are populated only for active.
+qd_client_active_version() {
+    local opt="$1" wrapper="$2" __version_var="$3" __target_var="$4" line _version _target marker
+    printf -v "$__version_var" '%s' ''
+    printf -v "$__target_var" '%s' ''
+    [ -e "$wrapper" ] || [ -L "$wrapper" ] || return 0
+    [ -f "$wrapper" ] || return 2
+    grep -Fqx '# Managed by quick-deploy/sunshine-moonlight/install-client.sh' "$wrapper" 2>/dev/null || return 2
+    line="$(grep -E '^exec "[^"]+/AppRun" "\$@"$' "$wrapper" 2>/dev/null || true)"
+    [ "$(printf '%s\n' "$line" | wc -l)" -eq 1 ] && [ -n "$line" ] || return 3
+    _target="${line#exec \"}"; _target="${_target%/AppRun\" \"\$@\"}"
+    case "$_target" in "$opt"/*) ;; *) return 3;; esac
+    _version="${_target#"$opt/"}"
+    qd_valid_release_tag "v$_version" || return 3
+    cmp -s "$wrapper" <(printf '#!/bin/sh\n# Managed by quick-deploy/sunshine-moonlight/install-client.sh\nexec "%s/AppRun" "$@"\n' "$_target") || return 3
+    marker="$_target/.quick-deploy-sha256"
+    [ -f "$marker" ] || return 3
+    printf -v "$__version_var" '%s' "$_version"
+    printf -v "$__target_var" '%s' "$_target"
+}
+
 qd_verify_sha256() {
     local file="$1" expected="$2" actual
     [[ "$expected" =~ ^[0-9a-f]{64}$ ]] || qd_die '来源没有有效 SHA-256 摘要'

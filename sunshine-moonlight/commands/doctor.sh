@@ -10,6 +10,7 @@ CHECK_CLIENT=false
 EXPLICIT_CLIENT=false
 FAILURES=0
 WARNINGS=0
+OWNERSHIP_MARK='# Managed by quick-deploy/sunshine-moonlight/install-client.sh'
 ok() { printf '  [通过] %s\n' "$*"; }
 warn() { printf '  [警告] %s\n' "$*"; WARNINGS=$((WARNINGS+1)); }
 bad() { printf '  [失败] %s\n' "$*"; FAILURES=$((FAILURES+1)); }
@@ -125,35 +126,44 @@ run_host_checks() {
 
 run_client_checks() {
     qd_section '客户端'
-    local opt="$HOME/.local/opt/moonlight" target wrapper desktop recorded
-    target="$opt/$QD_MOONLIGHT_VERSION"
-    wrapper="$HOME/.local/bin/moonlight"
-    desktop="$HOME/.local/share/applications/com.moonlight_stream.Moonlight.desktop"
-    [ "$(uname -m)" = x86_64 ] || bad '固定的 AppImage 只支持 x86_64'
-    if [ ! -d "$opt" ] && [ "$EXPLICIT_CLIENT" = false ]; then warn '未安装本流程的 Moonlight'; return 0; fi
-    if [ ! -x "$target/AppRun" ]; then bad "缺少可执行 AppRun: $target（运行 commands/install-client.sh 修复）"; fi
-    if [ -f "$target/.quick-deploy-sha256" ]; then
-        recorded="$(cat "$target/.quick-deploy-sha256")"
-        if [ "$recorded" = "$QD_MOONLIGHT_SHA256" ]; then
-            ok "v$QD_MOONLIGHT_VERSION 的下载摘要记录符合固定值；未重新校验已解包内容"
+    local opt="$HOME/.local/opt/moonlight" wrapper="$HOME/.local/bin/moonlight" desktop="$HOME/.local/share/applications/com.moonlight_stream.Moonlight.desktop"
+    local version='' target='' recorded='' rc=0
+    [ "$(uname -m)" = x86_64 ] || bad 'Moonlight AppImage 只支持 x86_64'
+    qd_client_active_version "$opt" "$wrapper" version target || rc=$?
+    case "$rc" in
+        0) ;;
+        2) bad 'Moonlight CLI 包装是外来文件'; return 0;;
+        *) bad '受管 Moonlight CLI 包装结构损坏'; return 0;;
+    esac
+    if [ -z "$version" ]; then
+        if [ "$EXPLICIT_CLIENT" = true ]; then bad '没有活动的受管 Moonlight 包装（仅有 dormant 目录不算安装）'; else warn '未安装活动的受管 Moonlight'; fi
+        return 0
+    fi
+    if [ -x "$wrapper" ]; then ok '活动 Moonlight CLI 包装可执行'; else bad '活动 Moonlight CLI 包装不可执行；运行 commands/install-client.sh 修复'; fi
+    if qd_version_ge "v$version" "$QD_MOONLIGHT_FLOOR"; then ok "活动 Moonlight v$version 达到维护基线 v$QD_MOONLIGHT_FLOOR"; else bad "活动 Moonlight v$version 低于维护基线"; fi
+    if [ -x "$target/AppRun" ] && [ -f "$target/com.moonlight_stream.Moonlight.desktop" ] && [ -r "$target/moonlight.svg" ]; then
+        ok "活动目标结构完整: $target"
+    else
+        bad "活动目标结构不完整: $target"
+    fi
+    recorded="$(cat "$target/.quick-deploy-sha256" 2>/dev/null || true)"
+    if [[ "$recorded" =~ ^[0-9a-fA-F]{64}$ ]]; then
+        if [ "v$version" = "v$QD_MOONLIGHT_VERSION" ] && [ "${recorded,,}" != "$QD_MOONLIGHT_SHA256" ]; then
+            bad '审计 v6.1.0 的下载摘要记录不匹配'
+        elif [ "v$version" = "v$QD_MOONLIGHT_VERSION" ]; then
+            ok '审计 v6.1.0 的下载摘要记录符合固定值；未重新校验已解包内容'
         else
-            bad '下载摘要记录不匹配；不能确认安装来源'
+            ok '活动版本带有格式正确的安装时来源记录；未重新校验或声称当前最新'
         fi
     else
-        bad '缺少 Moonlight 下载来源记录'
+        bad '活动 Moonlight 缺少有效 SHA-256 来源记录'
     fi
-    if [ -x "$wrapper" ] && grep -qF 'quick-deploy/sunshine-moonlight' "$wrapper" && grep -Fxq "exec \"$target/AppRun\" \"\$@\"" "$wrapper"; then
-        ok 'CLI 包装指向固定版本'
+    if [ -f "$desktop" ] && grep -Fqx "$OWNERSHIP_MARK" "$desktop" 2>/dev/null && grep -Fxq "Exec=$wrapper" "$desktop"; then
+        ok '桌面入口指向活动 CLI 包装'
     else
-        bad 'CLI 包装缺失、外来或指向错误版本'
-    fi
-    if [ -f "$desktop" ] && grep -qF 'quick-deploy/sunshine-moonlight' "$desktop" && grep -Fxq "Exec=$wrapper" "$desktop"; then
-        ok '桌面入口指向 CLI 包装'
-    else
-        bad '桌面入口缺失、外来或指向错误程序'
+        bad '桌面入口缺失、外来或未指向活动 CLI 包装'
     fi
 }
-
 main() {
     while [ "$#" -gt 0 ]; do
         case "$1" in

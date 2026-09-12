@@ -17,7 +17,7 @@
 ./install.sh
 ```
 
-它先以 `--capture kms` 安装本机 Sunshine，再安装 Moonlight，并只在系统 Python 无法导入 PyYAML 时通过 `sudo apt-get install python3-yaml` 安装该依赖。只安装 A 时使用 `./install.sh --host-only`，只安装 B 时使用 `./install.sh --client-only`；已在双角色安装中完成这两个角色时，不要在下面的编号步骤重复安装。高级版本、捕获或绑定选项仍直接传给 `commands/install-host.sh` 或 `commands/install-client.sh`。任一阶段失败会停止后续阶段，已成功完成的阶段不会自动回滚。
+它先检查最新稳定 Sunshine，再检查最新稳定 Moonlight，并只在系统 Python 无法导入 PyYAML 时通过 `sudo apt-get install python3-yaml` 安装该依赖。每个组件独立查询一次其 GitHub release：缺失或较旧时下载/更新，相同版本跳过载荷但仍收敛既有配置，本机较新时保留且不降级。主机阶段失败时客户端不会查询或修改。只安装 A 时使用 `./install.sh --host-only`，只安装 B 时使用 `./install.sh --client-only`；已在双角色安装中完成这两个角色时，不要在下面的编号步骤重复安装。高级版本、捕获或绑定选项仍直接传给 `commands/install-host.sh` 或 `commands/install-client.sh`。任一阶段失败会停止后续阶段，已成功完成的阶段不会自动回滚。
 
 ## 1. 在 A 安装 Sunshine
 
@@ -193,11 +193,13 @@ Doctor 只读；退出 1 表示必需条件不满足。它检查包、实际服�
 
 ## 升级、卸载与维护
 
-版本、维护基线及客户端固定摘要集中在 [`lib/common.sh`](lib/common.sh)。Sunshine 基线包含上游 2026 年 9 月公布的修复；下载先校验摘要和 deb 元数据，再安装。相同上游版本跳过重装，更高版本保留；包、capability、配置或 retry 策略变化时会重启活动服务，中断当前串流。
+版本、维护基线及审计例外集中在 [`lib/common.sh`](lib/common.sh)。默认安装会检查最新稳定 release；最新不是“无条件成功”的承诺：每个资产必须有 GitHub API 提供的 `sha256:` 摘要和正的精确大小，下载后再次核对大小和 SHA-256。缺少/无效摘要会在任何相关载荷修改前停止，绝不把 HTTPS 下载、下载后自己计算的 hash 或旧版本冒充最新。
 
-主机升级可用 `./commands/install-host.sh --version v版本号`。保留原配置及凭据，配置变化前备份为同目录的 `sunshine.conf.bak`。新版本可能改变显示编号，升级后核对选中的显示器。
+唯一受审计例外是 Moonlight 的精确 `v6.1.0` `Moonlight-6.1.0-x86_64.AppImage`（release ID `175337682`、asset ID `193059073`、大小 `55325888`、SHA-256 `0e855ffd22d407e18ab5fdb575fed5f01ca119a3f91993c5f0213f15ac80b400`）。它的旧 API 记录没有 digest；一旦 API 为这个精确资产给出 digest，必须与该记录一致。未来任一 digest-null Moonlight 最新版会停止，等待单独审阅的 tag 专用校验值，而不会降级或复用 6.1.0 的摘要。
 
-客户端只接受固定版本；升级前核对官方新 AppImage 的 SHA-256 与精确大小，再更新共享定义。目录中的摘要标记记录下载来源，不表示已重新校验解包后的全部内容。
+主机升级可用 `./commands/install-host.sh --version v版本号`，客户端同样支持该形式；tag 必须是稳定的数字版本且不低于维护基线。显式 tag 也不会降级本机较新版本。主机更新保留原配置及凭据，配置变化前备份为同目录的 `sunshine.conf.bak`；包、capability、配置或 retry 策略变化时会重启活动服务，中断当前串流。客户端目录中的摘要标记记录安装时的来源，不表示重新校验解包后的全部内容。
+
+若公共 GitHub API 配额耗尽，可临时在调用环境提供 `GITHUB_TOKEN` 或 `GH_TOKEN`；相同的双变量值可用，不同值会在联网前拒绝。脚本只通过内存中的 curl 配置发送认证头，不把 token 写入文件、日志、命令行或下载请求，也不会持久化它。
 
 ```bash
 ./commands/uninstall.sh --client                 # 只删本流程带标记的客户端内容

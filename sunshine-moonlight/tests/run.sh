@@ -27,6 +27,46 @@ run() {
     bash "$MODULE_DIR/$1" "${@:2}" >"$CASE/out" 2>"$CASE/err" || RC=$?
     cat "$CASE/err" >>"$CASE/out"
 }
+run_xtrace() {
+    RC=0
+    bash -x "$MODULE_DIR/$1" "${@:2}" >"$CASE/out" 2>"$CASE/err" || RC=$?
+    cat "$CASE/err" >>"$CASE/out"
+}
+run_resolver() {
+    RC=0
+    bash -c 'sed "$2" "$1/commands/install-client.sh" >"$3/client-resolver-lib.sh"; sed -i "s|^SCRIPT_DIR=.*|SCRIPT_DIR=\"$1\"|" "$3/client-resolver-lib.sh"; source "$3/client-resolver-lib.sh"; resolve_moonlight_release; printf "resolved=%s %s %s\\n" "$SELECTED_TAG" "$SELECTED_SHA" "$SELECTED_SIZE"' bash "$MODULE_DIR" '$d' "$CASE" >"$CASE/out" 2>"$CASE/err" || RC=$?
+    cat "$CASE/err" >>"$CASE/out"
+}
+run_sunshine_resolver() {
+    RC=0
+    bash -c 'sed "$2" "$1/commands/install-host.sh" >"$3/host-resolver-lib.sh"; sed -i "s|^SCRIPT_DIR=.*|SCRIPT_DIR=\"$1\"|" "$3/host-resolver-lib.sh"; source "$3/host-resolver-lib.sh"; VERSION_ID=24.04; resolve_sunshine_release amd64; printf "resolved=%s %s %s %s %s\\n" "$VERSION_TAG" "$SELECTED_NAME" "$SELECTED_URL" "$SELECTED_SHA" "$SELECTED_SIZE"' bash "$MODULE_DIR" '$d' "$CASE" >"$CASE/out" 2>"$CASE/err" || RC=$?
+    cat "$CASE/err" >>"$CASE/out"
+}
+run_real_curlrc_probe() {
+    local curl_home="$CASE/curl-home" curl_config_home="$CASE/curl-config-home" generated="$CASE/generated-curl.c" token='QD_REAL_CURLRC_SENTINEL'
+    mkdir -p "$curl_home" "$curl_config_home" "$CASE/real-curl-bin"
+    printf 'libcurl = "%s"\n' "$generated" >"$curl_home/.curlrc"
+    cp "$curl_home/.curlrc" "$curl_config_home/.curlrc"
+    # Positive control: the isolated fixture really serializes stdin config unless
+    # --disable is first. It uses only file:// and is removed before production probe.
+    printf 'header = "Authorization: Bearer %s"\n' "$token" | HOME="$curl_home" CURL_HOME="$curl_config_home" /usr/bin/curl --proto =file --config - --silent file:///dev/null >"$CASE/curlrc-control.out" 2>"$CASE/curlrc-control.err"
+    CURLRC_CONTROL_GENERATED=false
+    if [ -f "$generated" ] && grep -Fq "$token" "$generated"; then CURLRC_CONTROL_GENERATED=true; fi
+    rm -f "$generated"
+    cat >"$CASE/real-curl-bin/curl" <<'CURL_WRAPPER'
+#!/bin/bash
+printf 'first=%s args=%s\n' "$1" "$(printf '%q ' "$@")" >>"$CASE/real-curl-wrapper.log"
+[ "$1" = --disable ] || exit 88
+shift
+exec /usr/bin/curl --disable --proto =file "$@"
+CURL_WRAPPER
+    chmod +x "$CASE/real-curl-bin/curl"
+    RC=0
+    HOME="$curl_home" CURL_HOME="$curl_config_home" PATH="$CASE/real-curl-bin:/usr/bin:/bin" GITHUB_TOKEN="$token" \
+        bash -c 'source "$1/lib/common.sh"; qd_github_release_fetch LizardByte/Sunshine latest metadata' bash "$MODULE_DIR" >"$CASE/curlrc.out" 2>"$CASE/curlrc.err" || RC=$?
+    CURLRC_GENERATED=false
+    [ ! -e "$generated" ] || CURLRC_GENERATED=true
+}
 run_from() {
     RC=0
     (cd -- "$1" && "$2" "${@:3}") >"$CASE/out" 2>"$CASE/err" || RC=$?
@@ -38,7 +78,7 @@ end_case() {
     unset XDG_CONFIG_HOME CONFIGURATION_DIRECTORY QD_TEST_SYSTEM_PYTHON QD_TEST_YAML_AVAILABLE
     # All mutable mock controls are case-local.
     while IFS= read -r key; do unset "$key"; done < <(compgen -v | grep '^MOCK_' || true)
-    unset QD_TEST_MOONLIGHT_SHA256 QD_TEST_MOONLIGHT_SIZE TMPDIR
+    unset GITHUB_TOKEN GH_TOKEN TZ TMPDIR
 }
 new_case() {
     CASE="$(mktemp -d /tmp/qd-sm-test.XXXXXX)"
@@ -64,12 +104,31 @@ make_deb() {
     /usr/bin/dpkg-deb --build "$CASE/pkg" "$CASE/fixtures/sunshine.deb" >/dev/null
 }
 write_api() {
-    python3 - "$CASE" "$1" "$2" <<'PY'
-import hashlib,json,pathlib,sys
-case=pathlib.Path(sys.argv[1]); name=sys.argv[3]
-data={'tag_name':sys.argv[2], 'assets':[{'name':name,'browser_download_url':'https://example.invalid/'+name,'digest':'sha256:'+hashlib.sha256((case/'fixtures/sunshine.deb').read_bytes()).hexdigest()}]}
-(case/'fixtures/api.json').write_text(json.dumps(data))
-PY
+    python3 - "$CASE" "$1" "$2" <<'PY_API'
+import hashlib, json, pathlib, sys
+from urllib.parse import quote
+case=pathlib.Path(sys.argv[1]); tag=sys.argv[2]; name=sys.argv[3]
+deb=case/'fixtures/sunshine.deb'
+data={'id': 1, 'tag_name': tag, 'draft': False, 'prerelease': False, 'assets': [{'id': 2, 'name': name, 'browser_download_url': f'https://github.com/LizardByte/Sunshine/releases/download/{tag}/{quote(name, safe="")}', 'digest': 'sha256:'+hashlib.sha256(deb.read_bytes()).hexdigest(), 'size': deb.stat().st_size}]}
+(case/'fixtures/api-sunshine.json').write_text(json.dumps(data))
+PY_API
+}
+write_moonlight_api() {
+    python3 - "$CASE" <<'PY_MOONLIGHT_API'
+import hashlib, json, pathlib, sys
+case=pathlib.Path(sys.argv[1]); asset=case/'fixtures/moonlight.AppImage'; tag='v6.1.0'; name='Moonlight-6.1.0-x86_64.AppImage'
+data={'id': 999, 'tag_name': tag, 'draft': False, 'prerelease': False, 'assets': [{'id': 998, 'name': name, 'browser_download_url': f'https://github.com/moonlight-stream/moonlight-qt/releases/download/{tag}/{name}', 'digest': 'sha256:'+hashlib.sha256(asset.read_bytes()).hexdigest(), 'size': asset.stat().st_size}]}
+(case/'fixtures/api-moonlight.json').write_text(json.dumps(data))
+PY_MOONLIGHT_API
+}
+write_audited_moonlight_api() {
+    python3 - "$CASE" "$1" <<'PY_AUDITED_MOONLIGHT'
+import json, pathlib, sys
+case=pathlib.Path(sys.argv[1]); digest=None if sys.argv[2] == 'null' else sys.argv[2]
+tag='v6.1.0'; name='Moonlight-6.1.0-x86_64.AppImage'
+data={'id': 175337682, 'tag_name': tag, 'draft': False, 'prerelease': False, 'assets': [{'id': 193059073, 'name': name, 'browser_download_url': f'https://github.com/moonlight-stream/moonlight-qt/releases/download/{tag}/{name}', 'digest': digest, 'size': 55325888}]}
+(case/'fixtures/api-moonlight.json').write_text(json.dumps(data))
+PY_AUDITED_MOONLIGHT
 }
 write_conf() {
     mkdir -p "$QD_SUNSHINE_CONFIG_DIR"
@@ -111,17 +170,46 @@ ln -s usr/bin/moonlight squashfs-root/AppRun
 printf '[Desktop Entry]\nType=Application\nName=Moonlight\nExec=moonlight\nIcon=moonlight\n' >squashfs-root/com.moonlight_stream.Moonlight.desktop
 printf '<svg/>\n' >squashfs-root/moonlight.svg
 AI
-    export QD_TEST_MOONLIGHT_SHA256 QD_TEST_MOONLIGHT_SIZE
-    QD_TEST_MOONLIGHT_SHA256="$(sha256sum "$CASE/fixtures/moonlight.AppImage" | cut -d' ' -f1)"
-    QD_TEST_MOONLIGHT_SIZE="$(stat -c %s "$CASE/fixtures/moonlight.AppImage")"
+    write_moonlight_api
 }
 write_mocks() {
     cat >"$CASE/bin/curl" <<'MOCK'
 #!/bin/bash
-printf 'curl %s\n' "$*" >>"$CASE/log"
-out=''; url=''
-while [ "$#" -gt 0 ]; do case "$1" in -o) out="$2"; shift;; https:*) url="$1";; esac; shift; done
-case "$url" in *api.github.com*) src=api.json;; *.deb) src=sunshine.deb;; *.AppImage) src=moonlight.AppImage;; *) exit 22;; esac
+# Keep the original argv for security assertions. Only GitHub metadata invokes
+# curl with --config -, so asset downloads must not consume interactive stdin.
+args=("$@")
+out=''; headers=''; url=''; status="${MOCK_API_STATUS:-200}"; config=''; read_config=false
+for ((i=0; i<${#args[@]}; i++)); do
+    case "${args[i]}" in
+        --config)
+            ((i+=1))
+            [ "${args[i]:-}" = - ] && read_config=true;;
+        -o) ((i+=1)); out="${args[i]:-}";;
+        -D) ((i+=1)); headers="${args[i]:-}";;
+        -w) ((i+=1));;
+        https:*) url="${args[i]}";;
+    esac
+done
+$read_config && config="$(cat)"
+argv_has_auth=no
+for arg in "${args[@]}"; do [[ "$arg" == *Authorization* ]] && argv_has_auth=yes; done
+if [[ "$url" == *api.github.com* ]]; then
+    case "$url" in
+        *LizardByte/Sunshine*) src=api-sunshine.json;;
+        *moonlight-stream/moonlight-qt*) src=api-moonlight.json;;
+        *) src='';;
+    esac
+    [[ "$config" == *'Authorization: Bearer '* ]] && auth=present || auth=absent
+    printf 'api url=%s auth=%s env_github=%s env_gh=%s argv_has_auth=%s\n' \
+        "$url" "$auth" "${GITHUB_TOKEN:+present}" "${GH_TOKEN:+present}" "$argv_has_auth" >>"$CASE/log"
+    printf 'HTTP/1.1 %s fixture\r\nX-RateLimit-Remaining: %s\r\nX-RateLimit-Reset: %s\r\nRetry-After: %s\r\n\r\n' \
+        "$status" "${MOCK_RATE_REMAINING:-1}" "${MOCK_RATE_RESET:-1789145352}" "${MOCK_RETRY_AFTER:-30}" >"$headers"
+    [ -n "$src" ] && cp "$CASE/fixtures/$src" "$out" || : >"$out"
+    printf '%s' "$status"
+    exit "${MOCK_CURL_EXIT:-0}"
+fi
+printf 'asset url=%s auth_in_argv=%s\n' "$url" "$argv_has_auth" >>"$CASE/log"
+case "$url" in *.deb) src=sunshine.deb;; *.AppImage) src=moonlight.AppImage;; *) exit 22;; esac
 cp "$CASE/fixtures/$src" "$out"
 MOCK
     cat >"$CASE/bin/sudo" <<'MOCK'
@@ -412,7 +500,7 @@ done
 new_case; installed 2099.1.1; write_conf; active
 run commands/install-host.sh
 check 'newer upstream preserved' test "$RC" -eq 0
-check 'newer upstream not downloaded' absent "$CASE/log" 'curl '
+check 'newer upstream not downloaded' absent "$CASE/log" 'asset url='
 end_case
 new_case; installed '1:2026.516.143833-99'; write_conf; active
 run commands/doctor.sh --host
@@ -425,7 +513,7 @@ for issue in wrong-tag missing-digest; do
  if [ "$issue" = wrong-tag ]; then
      write_api v2099.1.1 'sunshine-ubuntu-24.04-amd64.deb'
  else
-     python3 - "$CASE/fixtures/api.json" <<'PY_TEST'
+     python3 - "$CASE/fixtures/api-sunshine.json" <<'PY_TEST'
 import json,sys
 p=sys.argv[1]; d=json.load(open(p)); d['assets'][0]['digest']=None
 with open(p,'w') as f: json.dump(d,f)
@@ -721,7 +809,7 @@ new_case; client_fixture; run commands/install-client.sh
 check 'extracted AppImage client installs' test "$RC" -eq 0
 check 'extracted AppRun resolves to executable' test -x "$HOME/.local/opt/moonlight/$QD_MOONLIGHT_VERSION/AppRun"
 : >"$CASE/log"; run commands/install-client.sh
-check 'client rerun skips download based on provenance' absent "$CASE/log" 'curl '
+check 'client rerun skips download based on provenance' absent "$CASE/log" 'asset url='
 check 'client provenance wording does not claim rehash' contains "$CASE/out" '未重新校验'
 rm "$HOME/.local/opt/moonlight/$QD_MOONLIGHT_VERSION/com.moonlight_stream.Moonlight.desktop"
 run commands/install-client.sh
@@ -747,8 +835,16 @@ end_case
 for failure in digest size extract foreign; do
  new_case; client_fixture
  case "$failure" in
- digest) export QD_TEST_MOONLIGHT_SHA256="$(printf '%064d' 0)";;
- size) export QD_TEST_MOONLIGHT_SIZE=1;;
+ digest) python3 - "$CASE/fixtures/api-moonlight.json" <<'PY_DIGEST'
+import json,sys
+p=sys.argv[1]; d=json.load(open(p)); d['assets'][0]['digest']='sha256:'+'0'*64; json.dump(d,open(p,'w'))
+PY_DIGEST
+ ;;
+ size) python3 - "$CASE/fixtures/api-moonlight.json" <<'PY_SIZE'
+import json,sys
+p=sys.argv[1]; d=json.load(open(p)); d['assets'][0]['size']=1; json.dump(d,open(p,'w'))
+PY_SIZE
+ ;;
  extract) export MOCK_EXTRACT_FAIL=1;;
  foreign) mkdir -p "$HOME/.local/bin"; printf 'foreign\n' >"$HOME/.local/bin/moonlight";;
  esac
@@ -853,6 +949,7 @@ new_case; client_fixture; system_python_fixture; export QD_TEST_YAML_AVAILABLE=1
 run install.sh
 check 'host failure stops combined installer' test "$RC" -ne 0
 check 'host failure leaves client unstarted' test ! -e "$HOME/.local/bin/moonlight"
+check 'host failure makes zero Moonlight metadata calls' test "$(grep -c 'moonlight-stream/moonlight-qt' "$CASE/log")" -eq 0
 check 'host failure reports partial-completion boundary' contains "$CASE/out" 'Moonlight 客户端未开始'
 end_case
 
@@ -894,9 +991,306 @@ check 'direct host installer refuses root' test "$RC" -ne 0
 end_case
 new_case; run commands/install-host.sh --version v2026.516.143833
 check 'obsolete security baseline rejected' test "$RC" -ne 0
-check 'obsolete version fails before network' absent "$CASE/log" 'curl '
+check 'obsolete version fails before network' absent "$CASE/log" 'api url='
 run commands/install-client.sh --version v9999
 check 'unpinned client version rejected' test "$RC" -ne 0
+end_case
+
+# The real curl probe blocks network with file:// protocol control while proving
+# the isolated .curlrc fixture can serialize config absent production --disable.
+new_case
+run_real_curlrc_probe
+check 'real curlrc fixture positive control detects persistent config' test "$CURLRC_CONTROL_GENERATED" = true
+check 'GitHub helper curlrc probe is blocked before network' test "$RC" -ne 0
+check 'GitHub helper passes --disable as first curl argument' contains "$CASE/real-curl-wrapper.log" 'first=--disable'
+check 'GitHub helper ignores ambient curlrc generated output' test "$CURLRC_GENERATED" = false
+check 'GitHub helper curlrc probe leaves no token in files/output/log' bash -c '! grep -R -Fq QD_REAL_CURLRC_SENTINEL "$1/curlrc.out" "$1/curlrc.err" "$1/real-curl-wrapper.log" "$1/home" "$1/curl-home" "$1/curl-config-home"' bash "$CASE"
+end_case
+
+# Sunshine release URLs are identity-bearing API input. The selected asset name
+# is encoded once as a URL path component; alternate representations are refused.
+new_case
+run_sunshine_resolver
+check 'encoded Sunshine API URL resolves' test "$RC" -eq 0
+check 'encoded Sunshine API URL retains %2B path component' contains "$CASE/out" '%2Bubuntu24.04_amd64.deb'
+check 'encoded Sunshine resolver makes no asset request' test "$(grep -c '^asset url=' "$CASE/log")" -eq 0
+end_case
+
+for url_mutation in raw alternate-host alternate-repo alternate-tag alternate-name query double-encoded; do
+    new_case
+    python3 - "$CASE/fixtures/api-sunshine.json" "$url_mutation" <<'PY_MUTATE_SUNSHINE_URL'
+import json, sys
+p, kind = sys.argv[1:]
+d = json.load(open(p)); a = d['assets'][0]; url = a['browser_download_url']
+if kind == 'raw': url = url.replace('%2B', '+')
+elif kind == 'alternate-host': url = url.replace('https://github.com/', 'https://example.invalid/')
+elif kind == 'alternate-repo': url = url.replace('/LizardByte/Sunshine/', '/Other/Sunshine/')
+elif kind == 'alternate-tag': url = url.replace('/v2026.906.222525/', '/v2026.906.222526/')
+elif kind == 'alternate-name': url = url.replace('_amd64.deb', '_arm64.deb')
+elif kind == 'query': url += '?download=1'
+elif kind == 'double-encoded': url = url.replace('%2B', '%252B')
+a['browser_download_url'] = url
+json.dump(d, open(p, 'w'))
+PY_MUTATE_SUNSHINE_URL
+    run_sunshine_resolver
+    check "Sunshine $url_mutation URL is rejected" test "$RC" -ne 0
+    check "Sunshine $url_mutation cannot reach asset request" test "$(grep -c '^asset url=' "$CASE/log")" -eq 0
+    end_case
+done
+
+# Resolver-boundary probes retain the real audited identifiers and avoid payload
+# flow entirely, so failure cannot be misattributed to later size/hash/extraction.
+new_case; client_fixture; write_audited_moonlight_api null
+run_resolver
+check 'audited null resolver accepts exact tuple' test "$RC" -eq 0
+check 'audited null resolver selects built-in audited SHA' contains "$CASE/out" "resolved=v6.1.0 $QD_MOONLIGHT_SHA256 55325888"
+check 'audited null resolver makes no payload request' test "$(grep -c '^asset url=' "$CASE/log")" -eq 0
+end_case
+
+new_case; client_fixture; write_audited_moonlight_api "sha256:$QD_MOONLIGHT_SHA256"
+run_resolver
+check 'audited matching API digest resolver accepts exact tuple' test "$RC" -eq 0
+check 'audited matching API digest retains audited SHA' contains "$CASE/out" "resolved=v6.1.0 $QD_MOONLIGHT_SHA256 55325888"
+check 'audited matching resolver makes no payload request' test "$(grep -c '^asset url=' "$CASE/log")" -eq 0
+end_case
+
+new_case; client_fixture; write_audited_moonlight_api "sha256:$(printf '%064d' 0)"
+run_resolver
+check 'audited conflicting API digest fails in resolver' test "$RC" -ne 0
+check 'audited conflicting API digest reports disagreement' contains "$CASE/out" 'API digest 与内置审计 SHA-256 不一致'
+check 'audited conflicting resolver makes zero payload requests' test "$(grep -c '^asset url=' "$CASE/log")" -eq 0
+end_case
+
+# xtrace must never serialize a credential. The mock records only safe auth
+# facts and keeps its original argv so auth-in-argv checks are meaningful.
+for auth_case in github gh dual-equal; do
+    new_case; client_fixture
+    sentinel="QD_XTRACE_${auth_case}_SENTINEL"
+    case "$auth_case" in
+        github) export GITHUB_TOKEN="$sentinel";;
+        gh) export GH_TOKEN="$sentinel";;
+        dual-equal) export GITHUB_TOKEN="$sentinel" GH_TOKEN="$sentinel";;
+    esac
+    run_xtrace commands/install-client.sh
+    check "xtrace $auth_case succeeds" test "$RC" -eq 0
+    check "xtrace $auth_case keeps sentinel out of output/log/files" bash -c '! grep -R -Fq "$1" "$2/out" "$2/err" "$2/log" "$2/fixtures"' bash "$sentinel" "$CASE"
+    check "xtrace $auth_case uses config auth without argv token" contains "$CASE/log" 'auth=present'
+    check "xtrace $auth_case preserves original argv evidence" contains "$CASE/log" 'argv_has_auth=no'
+    end_case
+done
+
+new_case; client_fixture; export GITHUB_TOKEN='QD_XTRACE_CONFLICT_SENTINEL_A' GH_TOKEN='QD_XTRACE_CONFLICT_SENTINEL_B'
+run_xtrace commands/install-client.sh
+check 'xtrace conflicting tokens rejects before network' test "$RC" -ne 0
+check 'xtrace conflicting tokens expose neither sentinel' bash -c '! grep -R -Fq QD_XTRACE_CONFLICT_SENTINEL "$1/out" "$1/err" "$1/log" "$1/fixtures"' bash "$CASE"
+check 'xtrace conflicting tokens makes no API request' test ! -s "$CASE/log"
+end_case
+
+new_case; client_fixture; export GITHUB_TOKEN=$'QD_XTRACE_UNSAFE_SENTINEL\nvalue'
+run_xtrace commands/install-client.sh
+check 'xtrace unsafe token rejects before network' test "$RC" -ne 0
+check 'xtrace unsafe token exposes no sentinel' bash -c '! grep -R -Fq QD_XTRACE_UNSAFE_SENTINEL "$1/out" "$1/err" "$1/log" "$1/fixtures"' bash "$CASE"
+check 'xtrace unsafe token makes no API request' test ! -s "$CASE/log"
+end_case
+
+# Latest-release and strict-integrity regression matrix. These use the same actual
+# scripts, fake HOME/PATH, and curl fixture; API and asset traffic are observable
+# separately so a metadata lookup cannot be mistaken for an asset download.
+new_case; client_fixture
+run commands/install-client.sh
+check 'client default queries exactly latest endpoint' grep -Fq 'releases/latest' "$CASE/log"
+check 'client default has one metadata request' test "$(grep -c '^api url=' "$CASE/log")" -eq 1
+check 'client default has one asset request' test "$(grep -c '^asset url=' "$CASE/log")" -eq 1
+end_case
+
+new_case; client_fixture
+run commands/install-client.sh --version v6.1.0
+check 'client explicit tag queries tags endpoint' grep -Fq 'releases/tags/v6.1.0' "$CASE/log"
+check 'client explicit tag makes one metadata request' test "$(grep -c '^api url=' "$CASE/log")" -eq 1
+end_case
+
+new_case; installed; write_conf; active
+run commands/install-host.sh
+check 'host equal still queries latest once' test "$(grep -c '^api url=' "$CASE/log")" -eq 1
+check 'host equal does not download deb bytes' test "$(grep -c '^asset url=' "$CASE/log")" -eq 0
+end_case
+
+new_case; installed 2099.1.1; write_conf; active
+run commands/install-host.sh --version v2026.906.222525
+check 'explicit lower host target preserves newer package' test "$RC" -eq 0
+check 'explicit lower host target still fetches exact tag once' test "$(grep -c 'releases/tags/v2026.906.222525' "$CASE/log")" -eq 1
+check 'explicit lower host target does not download' test "$(grep -c '^asset url=' "$CASE/log")" -eq 0
+end_case
+
+new_case; client_fixture
+export MOCK_API_STATUS=403 MOCK_RATE_REMAINING=0 MOCK_RATE_RESET=1789145352 TZ=UTC
+run commands/install-client.sh
+check 'quota response stops client before asset mutation' test "$RC" -ne 0
+check 'quota diagnostics include status and raw reset' contains "$CASE/out" 'HTTP 403，rate limit remaining=0，reset epoch=1789145352'
+check 'quota diagnostics format reset time' contains "$CASE/out" '2026-09-11T16:49:12+00:00'
+check 'quota failure makes no rate-limit followup or asset request' test "$(grep -c '^asset url=' "$CASE/log")" -eq 0
+end_case
+
+new_case; client_fixture
+export MOCK_API_STATUS=403 MOCK_RATE_REMAINING=1
+run commands/install-client.sh
+check 'nonquota 403 stops client' test "$RC" -ne 0
+check 'nonquota 403 is not mislabeled quota exhaustion' absent "$CASE/out" 'rate limit remaining=0'
+end_case
+
+new_case; client_fixture
+export GITHUB_TOKEN='qd-token-sentinel'
+run commands/install-client.sh
+check 'single GitHub token authenticates metadata' contains "$CASE/log" 'auth=present'
+check 'token absent from mock child environment' contains "$CASE/log" 'env_github= env_gh='
+check 'token absent from fixture files and output' bash -c '! grep -R -Fq qd-token-sentinel "$CASE"'
+end_case
+
+new_case; client_fixture
+export GITHUB_TOKEN='qd-token-sentinel' GH_TOKEN='qd-token-sentinel'
+run commands/install-client.sh
+check 'identical dual tokens use one authentication header' test "$RC" -eq 0
+check 'identical dual tokens do not enter argv' contains "$CASE/log" 'argv_has_auth=no'
+end_case
+
+new_case; client_fixture
+export GITHUB_TOKEN='qd-token-one' GH_TOKEN='qd-token-two'
+run commands/install-client.sh
+check 'conflicting token variables fail before network' test "$RC" -ne 0
+check 'conflicting token variables make zero API calls' test ! -s "$CASE/log"
+end_case
+
+new_case; client_fixture
+export GITHUB_TOKEN=$'unsafe\nvalue'
+run commands/install-client.sh
+check 'newline token is rejected before network' test "$RC" -ne 0
+check 'newline token makes zero API calls' test ! -s "$CASE/log"
+end_case
+
+for invalid in draft prerelease null-digest; do
+    new_case; client_fixture
+    python3 - "$CASE/fixtures/api-moonlight.json" "$invalid" <<'PY_MUTATE_MOON'
+import json, sys
+p=sys.argv[1]; d=json.load(open(p)); kind=sys.argv[2]
+if kind == 'draft': d['draft']=True
+elif kind == 'prerelease': d['prerelease']=True
+else: d['assets'][0]['digest']=None
+a=open(p,'w'); json.dump(d,a); a.close()
+PY_MUTATE_MOON
+    run commands/install-client.sh
+    check "Moonlight $invalid metadata fails before asset" test "$RC" -ne 0
+    check "Moonlight $invalid has zero asset request" test "$(grep -c '^asset url=' "$CASE/log")" -eq 0
+    end_case
+done
+
+new_case; client_fixture
+python3 - "$CASE/fixtures/api-moonlight.json" <<'PY_FUTURE_NULL'
+import json,sys
+p=sys.argv[1]; d=json.load(open(p)); d['tag_name']='v6.2.0'; a=d['assets'][0]; a['name']='Moonlight-6.2.0-x86_64.AppImage'; a['browser_download_url']='https://github.com/moonlight-stream/moonlight-qt/releases/download/v6.2.0/Moonlight-6.2.0-x86_64.AppImage'; a['digest']=None; json.dump(d,open(p,'w'))
+PY_FUTURE_NULL
+run commands/install-client.sh
+check 'future null digest fails before AppImage request' test "$RC" -ne 0
+check 'future null digest never reuses audited v6.1 checksum' test "$(grep -c '^asset url=' "$CASE/log")" -eq 0
+end_case
+
+new_case; client_fixture
+python3 - "$CASE/fixtures/api-moonlight.json" <<'PY_AUDIT_MISMATCH'
+import json,sys
+p=sys.argv[1]; d=json.load(open(p)); d['id']=175337682; a=d['assets'][0]; a['id']=193059073; a['size']=55325888; a['digest']='sha256:'+'0'*64; json.dump(d,open(p,'w'))
+PY_AUDIT_MISMATCH
+run commands/install-client.sh
+check 'audited tuple API digest disagreement fails before asset' test "$RC" -ne 0
+check 'audited tuple mismatch does not mutate target' test ! -e "$HOME/.local/opt/moonlight/6.1.0"
+end_case
+
+new_case; client_fixture
+mkdir -p "$HOME/.local/opt/moonlight/9.0.0" "$HOME/.local/bin"
+printf '%s\n' 'a123456789012345678901234567890123456789012345678901234567890123' >"$HOME/.local/opt/moonlight/9.0.0/.quick-deploy-sha256"
+touch "$HOME/.local/opt/moonlight/9.0.0/AppRun"; chmod +x "$HOME/.local/opt/moonlight/9.0.0/AppRun"
+cat >"$HOME/.local/bin/moonlight" <<EOF_NEWER_WRAP
+#!/bin/sh
+# Managed by quick-deploy/sunshine-moonlight/install-client.sh
+exec "$HOME/.local/opt/moonlight/9.0.0/AppRun" "\$@"
+EOF_NEWER_WRAP
+run commands/install-client.sh
+check 'newer active client requires complete target structure' test "$RC" -ne 0
+check 'broken newer active client is never downgraded' test ! -e "$HOME/.local/opt/moonlight/6.1.0"
+end_case
+
+new_case; client_fixture
+mkdir -p "$HOME/.local/opt/moonlight/9.0.0" "$HOME/.local/bin"
+printf '%064d\n' 1 >"$HOME/.local/opt/moonlight/9.0.0/.quick-deploy-sha256"
+printf '#!/bin/sh\nexit 0\n' >"$HOME/.local/opt/moonlight/9.0.0/AppRun"; chmod +x "$HOME/.local/opt/moonlight/9.0.0/AppRun"
+printf '[Desktop Entry]\nExec=old\nIcon=old\n' >"$HOME/.local/opt/moonlight/9.0.0/com.moonlight_stream.Moonlight.desktop"
+printf '<svg/>\n' >"$HOME/.local/opt/moonlight/9.0.0/moonlight.svg"
+cat >"$HOME/.local/bin/moonlight" <<EOF_VALID_NEWER
+#!/bin/sh
+# Managed by quick-deploy/sunshine-moonlight/install-client.sh
+exec "$HOME/.local/opt/moonlight/9.0.0/AppRun" "\$@"
+EOF_VALID_NEWER
+run commands/install-client.sh
+check 'valid newer active client remains active' test "$RC" -eq 0
+check 'valid newer active client skips selected download' test "$(grep -c '^asset url=' "$CASE/log")" -eq 0
+check 'valid newer active wrapper is not repointed' grep -Fq '/moonlight/9.0.0/AppRun' "$HOME/.local/bin/moonlight"
+: >"$CASE/log"; run commands/install-client.sh --version v6.1.0
+check 'explicit lower client target still does not downgrade' test "$RC" -eq 0
+check 'explicit lower client target makes no asset request' test "$(grep -c '^asset url=' "$CASE/log")" -eq 0
+end_case
+
+# A non-executable but exact historical wrapper remains parseable for repair.
+# Doctor independently treats it as unhealthy; newer-local repair never repoints it.
+new_case; client_fixture
+run commands/install-client.sh
+chmod 644 "$HOME/.local/bin/moonlight"
+run commands/doctor.sh --client
+check 'equal nonexecutable wrapper makes doctor fail' test "$RC" -ne 0
+check 'equal doctor identifies nonexecutable wrapper' contains "$CASE/out" 'CLI 包装不可执行'
+: >"$CASE/log"; run commands/install-client.sh
+check 'equal nonexecutable wrapper repair succeeds' test "$RC" -eq 0
+check 'equal wrapper repair restores mode 0755' test "$(stat -c %a "$HOME/.local/bin/moonlight")" = 755
+check 'equal wrapper repair downloads no payload' test "$(grep -c '^asset url=' "$CASE/log")" -eq 0
+end_case
+
+new_case; client_fixture
+mkdir -p "$HOME/.local/opt/moonlight/9.0.0" "$HOME/.local/bin"
+printf '%064d\n' 1 >"$HOME/.local/opt/moonlight/9.0.0/.quick-deploy-sha256"
+printf '#!/bin/sh\nexit 0\n' >"$HOME/.local/opt/moonlight/9.0.0/AppRun"; chmod +x "$HOME/.local/opt/moonlight/9.0.0/AppRun"
+printf '[Desktop Entry]\nExec=old\nIcon=old\n' >"$HOME/.local/opt/moonlight/9.0.0/com.moonlight_stream.Moonlight.desktop"
+printf '<svg/>\n' >"$HOME/.local/opt/moonlight/9.0.0/moonlight.svg"
+cat >"$HOME/.local/bin/moonlight" <<EOF_NONEXEC_NEWER
+#!/bin/sh
+# Managed by quick-deploy/sunshine-moonlight/install-client.sh
+exec "$HOME/.local/opt/moonlight/9.0.0/AppRun" "\$@"
+EOF_NONEXEC_NEWER
+chmod 644 "$HOME/.local/bin/moonlight"
+target_before="$(find "$HOME/.local/opt/moonlight/9.0.0" -type f -exec sha256sum {} + | sha256sum | awk '{print $1}')"
+run commands/doctor.sh --client
+check 'newer nonexecutable wrapper makes doctor fail' test "$RC" -ne 0
+check 'newer doctor identifies nonexecutable wrapper' contains "$CASE/out" 'CLI 包装不可执行'
+: >"$CASE/log"; run commands/install-client.sh
+check 'latest preserves and repairs newer wrapper' test "$RC" -eq 0
+check 'latest newer repair fetches one metadata document' test "$(grep -c '^api url=' "$CASE/log")" -eq 1
+check 'latest newer repair downloads zero payloads' test "$(grep -c '^asset url=' "$CASE/log")" -eq 0
+check 'latest newer repair restores wrapper mode' test "$(stat -c %a "$HOME/.local/bin/moonlight")" = 755
+check 'latest newer repair preserves wrapper target' grep -Fq '/moonlight/9.0.0/AppRun' "$HOME/.local/bin/moonlight"
+target_after="$(find "$HOME/.local/opt/moonlight/9.0.0" -type f -exec sha256sum {} + | sha256sum | awk '{print $1}')"
+check 'latest newer repair preserves target bytes' test "$target_before" = "$target_after"
+run commands/doctor.sh --client
+check 'newer doctor passes after wrapper repair' test "$RC" -eq 0
+chmod 644 "$HOME/.local/bin/moonlight"
+: >"$CASE/log"; run commands/install-client.sh --version v6.1.0
+check 'explicit lower preserves and repairs newer wrapper' test "$RC" -eq 0
+check 'explicit lower newer repair fetches one metadata document' test "$(grep -c '^api url=' "$CASE/log")" -eq 1
+check 'explicit lower newer repair downloads zero payloads' test "$(grep -c '^asset url=' "$CASE/log")" -eq 0
+check 'explicit lower newer repair restores wrapper mode' test "$(stat -c %a "$HOME/.local/bin/moonlight")" = 755
+check 'explicit lower newer repair preserves wrapper target' grep -Fq '/moonlight/9.0.0/AppRun' "$HOME/.local/bin/moonlight"
+end_case
+
+new_case; client_fixture
+mkdir -p "$HOME/.local/bin"; printf '#!/bin/sh\nexit 0\n' >"$HOME/.local/bin/moonlight"; chmod +x "$HOME/.local/bin/moonlight"
+run commands/install-client.sh
+check 'foreign active wrapper fails before API query' test "$RC" -ne 0
+check 'foreign active wrapper makes zero API calls' test ! -s "$CASE/log"
 end_case
 
 for script in "$MODULE_DIR"/*.sh "$MODULE_DIR"/commands/*.sh "$MODULE_DIR"/lib/common.sh "$TESTS_DIR"/*.sh; do check "syntax: ${script##*/}" bash -n "$script"; done
