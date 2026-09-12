@@ -13,5 +13,5 @@ c7272ee59ebc5f78c96c1740fcbcdf57cdc2480475241292cb91d3e158e0625a  ./src/capabili
 eccdbbf634a4aae5cf63c510c5c96ce88e590831aeb78f4350b728ce0f2fe4b7  ./src/kitty-placeholder.ts
 2168c57921e23d2f72abb745803644e0db8d24734d550e8bf189808231abbeb8  ./src/loader.ts
 5fe7c4bf7ad9db64421a0bbf30d639a528ea4a71a6fd5b3f3b75efe72e9b4c0b  ./src/renderer.ts
-7db69da01c21617b6ceed3f6f67ef7cc5d9428ee850008accd6dbcbcfa2bca25  ./src/runtime.ts
+4d9aadc3b5f6fd76f3a90cadb071a6b49c66a3e86063285a863e01c0bbd4580d  ./src/runtime.ts
 05df244cf5d747a519454f9d38824afc0d422bd8378adc9dcf6045f7be19fa14  ./src/transcript-entry.ts
