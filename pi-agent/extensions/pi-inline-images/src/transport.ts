@@ -261,11 +261,18 @@ export class BoundedTransport {
     else this.clearDrainWait();
   }
 
-  /** Permanently release sink listeners. The transport cannot be reused. */
+  /** Permanently settle work and release every owned timer/listener. */
   dispose(reason = "graphics transport disposed"): void {
     if (this.disposed) return;
-    this.cancel(reason);
     this.disposed = true;
+    this.currentGeneration++;
+    const error = new TransportError("closed", reason);
+    this.clearPumpTimer();
+    this.clearDrainWait();
+    this.rejectQueue(error);
+    this.rejectReady(error);
+    this.acceptedKeys.clear();
+    this.backpressured = false;
     this.sink.removeListener("error", this.errorListener);
     this.sink.removeListener("close", this.closeListener);
   }
@@ -307,6 +314,10 @@ export class BoundedTransport {
       return;
     }
     this.writing = false;
+    if (this.disposed) {
+      this.clearDrainWait();
+      return;
+    }
     if (this.failure) {
       this.clearDrainWait();
       return;

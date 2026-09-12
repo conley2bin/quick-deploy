@@ -137,7 +137,9 @@ Cleanup admits and drains one owned delete at a time, so it remains within the
 configured job/byte queue limits (including a one-job queue). Ownership and
 resident accounting are released only after that delete is accepted and drained;
 a cleanup error rejects explicitly and retains all unresolved IDs for diagnosis
-or a later owner decision.
+or a later owner decision. Final teardown (`clear(true)`) disposes in `finally`,
+so even a failed delete releases every drain/error/close listener and timer;
+ordinary `clear(false)` keeps the transport reusable.
 
 These limits reduce and bound extension-generated traffic. They do **not** prove
 or claim that Ghostty's GTK 4 Wayland `EAGAIN` process exit has been cured; that

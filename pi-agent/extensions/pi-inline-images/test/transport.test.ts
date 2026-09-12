@@ -196,6 +196,31 @@ test("synchronous sink error and close during write reject the active job withou
   }
 });
 
+test("dispose settles blocked work and removes every timer/listener before late drain", async () => {
+  const { clock, sink, owner } = transport({ minIntervalMs: 0, drainTimeoutMs: 100 });
+  sink.returns.push(false);
+  await owner.enqueue(owner.generation, { transaction: "accepted" });
+  const queued = owner.enqueue(owner.generation, { transaction: "queued" });
+  const queuedClosed = assert.rejects(queued, (error: unknown) => error instanceof Error && error.name === "TransportError" && (error as { code?: string }).code === "closed");
+  const ready = owner.ready(owner.generation);
+  const readyClosed = assert.rejects(ready, (error: unknown) => error instanceof Error && (error as { code?: string }).code === "closed");
+  assert.equal(sink.listenerCount("drain"), 1);
+  assert.equal(clock.count, 1);
+
+  owner.dispose();
+  owner.dispose("repeated dispose is inert");
+  await Promise.all([queuedClosed, readyClosed]);
+  assert.equal(sink.listenerCount("drain"), 0);
+  assert.equal(sink.listenerCount("error"), 0);
+  assert.equal(sink.listenerCount("close"), 0);
+  assert.equal(clock.count, 0);
+  const writes = sink.writes.length;
+  sink.drain();
+  clock.advance(1_000);
+  assert.equal(sink.writes.length, writes, "late drain/timer cannot write after disposal");
+  await assert.rejects(owner.enqueue(owner.generation, { transaction: "late" }), /transport disposed/u);
+});
+
 test("ready waits for accepted-false bytes to drain even when no later graphics job exists", async () => {
   const { clock, sink, owner } = transport({ drainTimeoutMs: 100 });
   sink.returns.push(false);

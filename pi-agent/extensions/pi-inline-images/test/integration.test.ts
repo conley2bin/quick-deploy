@@ -278,6 +278,9 @@ test("resident pressure and sink failures remain explicit at the original Markdo
   assert.match(transformMarkdown(failedPrepared, 40, failed.terminal), /image unavailable: broken — graphics sink write failed/u);
   await assert.rejects(failedSession.reset(true), /graphics sink write failed/u);
   assert.equal(failed.terminal.count(), 1, "fatal sink retains unresolved owned image identity");
+  assert.equal(failed.sink.listenerCount("drain"), 0);
+  assert.equal(failed.sink.listenerCount("error"), 0);
+  assert.equal(failed.sink.listenerCount("close"), 0);
   assert.equal(MAX_RESIDENT_PNG_BYTES, 12 * 1024 * 1024);
 });
 
@@ -349,9 +352,14 @@ test("cleanup admits deletes sequentially under a one-job queue and retains owne
   const failed = runtime({ minIntervalMs: 0, transportLimits: { maxQueuedJobs: 1, maxQueuedBytes: 5_000 } });
   await failed.terminal.prepare("owned", fakeImage("owned"));
   failed.sink.throwNext = new Error("delete failed");
-  await assert.rejects(failed.terminal.clear(), /graphics sink write failed/u);
+  await assert.rejects(failed.terminal.clear(true), /graphics sink write failed/u);
   assert.equal(failed.terminal.count(), 1, "failed delete retains unresolved ownership");
   assert.equal(failed.terminal.residentBytes(), fakeImage("owned").png.length);
+  assert.equal(failed.sink.listenerCount("drain"), 0);
+  assert.equal(failed.sink.listenerCount("error"), 0);
+  assert.equal(failed.sink.listenerCount("close"), 0);
+  failed.clock.advance(10_000);
+  assert.equal(failed.clock.count, 0);
 });
 
 test("reset rejects late loads and cancels backpressured placements before ordered deletion", async () => {

@@ -190,26 +190,28 @@ export class TerminalImages {
 
   /** Invalidate late work, then delete each owned resource with bounded admission. */
   async clear(dispose = false): Promise<void> {
-    this.transport.cancel("image session reset");
-    if (!this.capable) {
-      this.images.clear();
-      this.residentPngBytes = 0;
-      if (dispose) this.transport.dispose();
-      return;
-    }
-
-    const generation = this.transport.generation;
-    for (const [logicalId, state] of [...this.images]) {
-      await this.transport.enqueue(generation, {
-        transaction: deleteImage(state.id, this.inTmux()),
-      });
-      await this.transport.ready(generation);
-      if (this.images.get(logicalId) === state) {
-        this.images.delete(logicalId);
-        this.residentPngBytes -= state.image.png.length;
+    try {
+      this.transport.cancel("image session reset");
+      if (!this.capable) {
+        this.images.clear();
+        this.residentPngBytes = 0;
+        return;
       }
+
+      const generation = this.transport.generation;
+      for (const [logicalId, state] of [...this.images]) {
+        await this.transport.enqueue(generation, {
+          transaction: deleteImage(state.id, this.inTmux()),
+        });
+        await this.transport.ready(generation);
+        if (this.images.get(logicalId) === state) {
+          this.images.delete(logicalId);
+          this.residentPngBytes -= state.image.png.length;
+        }
+      }
+    } finally {
+      if (dispose) this.transport.dispose();
     }
-    if (dispose) this.transport.dispose();
   }
 
   private id(): number {
