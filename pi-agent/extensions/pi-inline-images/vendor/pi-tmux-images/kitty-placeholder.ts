@@ -280,12 +280,12 @@ export function upload(base64: string, imageId: number, inTmux: boolean): string
 function placementId(imageId: number): number {
 	return imageId & 0xffffff || 1;
 }
-export function placement(imageId: number, columns: number, rows: number, inTmux: boolean): string {
-	return kitty(`a=p,i=${imageId},p=${placementId(imageId)},U=1,c=${columns},r=${rows},q=2;`, inTmux);
+export function placement(imageId: number, columns: number, rows: number, inTmux: boolean, requestedPlacementId = placementId(imageId)): string {
+	return kitty(`a=p,i=${imageId},p=${requestedPlacementId},U=1,c=${columns},r=${rows},q=2;`, inTmux);
 }
 /** Delete one virtual placement while retaining its uploaded image data. */
-export function deletePlacement(imageId: number, inTmux: boolean): string {
-	return kitty(`a=d,d=i,i=${imageId},p=${placementId(imageId)},q=2;`, inTmux);
+export function deletePlacement(imageId: number, inTmux: boolean, requestedPlacementId = placementId(imageId)): string {
+	return kitty(`a=d,d=i,i=${imageId},p=${requestedPlacementId},q=2;`, inTmux);
 }
 export function deleteImage(imageId: number, inTmux: boolean): string {
 	return kitty(`a=d,d=I,i=${imageId},q=2;`, inTmux);
@@ -299,14 +299,14 @@ function rgb(code: 38 | 58, value: number): string {
 	return `${ESC}[${code};2;${(value >>> 16) & 255};${(value >>> 8) & 255};${value & 255}m`;
 }
 /** Kitty Unicode placeholder: foreground is image ID, underline is placement ID. */
-export function cell(column: number, row: number, imageId: number): string {
+export function cell(column: number, row: number, imageId: number, requestedPlacementId = placementId(imageId)): string {
 	const high = imageId >>> 24;
-	return `${rgb(38, imageId & 0xffffff)}${rgb(58, imageId & 0xffffff || 1)}${PLACEHOLDER_GLYPH}${mark(row)}${mark(column)}${high ? mark(high) : ""}${ESC}[39;59m`;
+	return `${rgb(38, imageId & 0xffffff)}${rgb(58, requestedPlacementId & 0xffffff || 1)}${PLACEHOLDER_GLYPH}${mark(row)}${mark(column)}${high ? mark(high) : ""}${ESC}[39;59m`;
 }
 /** End every row with SGR 0: Pi 0.85.1 otherwise carries a false dim state from SGR 58;2. */
-export function grid(columns: number, rows: number, imageId: number): string[] {
+export function grid(columns: number, rows: number, imageId: number, requestedPlacementId = placementId(imageId)): string[] {
 	return Array.from(
 		{ length: rows },
-		(_, row) => `${Array.from({ length: columns }, (_, column) => cell(column, row, imageId)).join("")}\x1b[0m`,
+		(_, row) => `${Array.from({ length: columns }, (_, column) => cell(column, row, imageId, requestedPlacementId)).join("")}\x1b[0m`,
 	);
 }

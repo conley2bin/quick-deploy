@@ -40,7 +40,9 @@ test("cancelled session switch preserves prepared image state through the instal
     runner.mode = "tui";
     const raw = `Before\n\n![fixture](${resolve("test/fixtures/color-block.png")})\n\nAfter`;
     const message = { role: "assistant", content: [{ type: "text", text: raw }], stopReason: "stop" };
+    const serializedBefore = JSON.stringify(message);
     await runner.emitMessageEnd({ type: "message_end", message });
+    assert.equal(JSON.stringify(message), serializedBefore, "async preparation does not mutate native message bytes");
     const context = { messageType: "assistant", isStreaming: false, availableWidth: 40 };
     const before = extension.markdownTransformer(raw, context);
     const runtime = new AgentSessionRuntime({ extensionRunner: runner }, { cwd: process.cwd() }, () => { throw new Error("cancelled switch must not replace session"); });

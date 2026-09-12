@@ -94,26 +94,32 @@ function tableCellText(value: string): string {
   return value.replace(/\r\n?|\n/gu, " ").replace(/\\/gu, "\\\\").replace(/\|/gu, "\\|");
 }
 
+function renderReference(prepared: PreparedMarkdown, reference: PreparedReference, width: number, terminal: TerminalImages): string {
+  if (reference.inTable) return `[image unavailable: ${tableCellText(reference.alt)} — inline images in tables unsupported]`;
+  if (reference.error) return `[image unavailable: ${reference.alt} — ${safeReason(reference.error)}]`;
+  if (!terminal.available()) return `[image unavailable: ${reference.alt} — Kitty graphics or tmux passthrough unavailable]`;
+
+  const prefix = structuralPrefix(prepared.source, reference.start);
+  const rows = terminal.render(reference.logicalId, Math.max(1, width - prefix.columns));
+  if (!rows.length) {
+    const reason = terminal.failure(reference.logicalId) ?? "image state unavailable";
+    return `[image unavailable: ${reference.alt} — ${safeReason(reason)}]`;
+  }
+  const lineEnd = prepared.source.indexOf("\n", reference.end);
+  const after = prepared.source.slice(reference.end, lineEnd < 0 ? prepared.source.length : lineEnd);
+  const standalone = prefix.before.trim() === prefix.before.slice(0, prefix.columns).trim() && !after.trim();
+  const joined = rows.join(`\n${prefix.continuation}`);
+  return standalone ? joined : `\n${prefix.continuation}${joined}\n${prefix.continuation}`;
+}
+
 export function transformMarkdown(prepared: PreparedMarkdown, width: number, terminal: TerminalImages): string {
+  // Terminal side effects are requested in source order; source replacement remains
+  // reverse-ordered so parser offsets stay valid.
+  const replacements = prepared.references.map((reference) => renderReference(prepared, reference, width, terminal));
   let output = prepared.source;
-  for (const reference of [...prepared.references].reverse()) {
-    let replacement: string;
-    if (reference.inTable) replacement = `[image unavailable: ${tableCellText(reference.alt)} — inline images in tables unsupported]`;
-    else if (reference.error) replacement = `[image unavailable: ${reference.alt} — ${safeReason(reference.error)}]`;
-    else if (!terminal.available()) replacement = `[image unavailable: ${reference.alt} — Kitty graphics or tmux passthrough unavailable]`;
-    else {
-      const prefix = structuralPrefix(prepared.source, reference.start);
-      const rows = terminal.render(reference.logicalId, Math.max(1, width - prefix.columns));
-      if (!rows.length) replacement = `[image unavailable: ${reference.alt} — image state unavailable]`;
-      else {
-        const lineEnd = prepared.source.indexOf("\n", reference.end);
-        const after = prepared.source.slice(reference.end, lineEnd < 0 ? prepared.source.length : lineEnd);
-        const standalone = prefix.before.trim() === prefix.before.slice(0, prefix.columns).trim() && !after.trim();
-        const joined = rows.join(`\n${prefix.continuation}`);
-        replacement = standalone ? joined : `\n${prefix.continuation}${joined}\n${prefix.continuation}`;
-      }
-    }
-    output = output.slice(0, reference.start) + replacement + output.slice(reference.end);
+  for (let index = prepared.references.length - 1; index >= 0; index--) {
+    const reference = prepared.references[index]!;
+    output = output.slice(0, reference.start) + replacements[index]! + output.slice(reference.end);
   }
   return output;
 }

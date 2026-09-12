@@ -1,4 +1,4 @@
-import { upload } from "../vendor/pi-tmux-images/kitty-placeholder.ts";
+import { kitty, upload } from "../vendor/pi-tmux-images/kitty-placeholder.ts";
 
 export const DEFAULT_MAX_TRANSACTION_BYTES = 1 * 1024 * 1024;
 export const DEFAULT_MAX_QUEUED_BYTES = 8 * 1024 * 1024;
@@ -75,6 +75,12 @@ type PendingJob = {
   reject: (error: Error) => void;
 };
 
+type ReadyWaiter = {
+  generation: number;
+  resolve: () => void;
+  reject: (error: Error) => void;
+};
+
 const defaultScheduler: TransportScheduler = {
   now: () => Date.now(),
   setTimeout: (callback, delayMs) => setTimeout(callback, delayMs),
@@ -97,8 +103,17 @@ export const DEFAULT_TRANSPORT_LIMITS: Readonly<TransportLimits> = Object.freeze
  * no intervening graphics command. Passing this entire string to one write()
  * call prevents another JavaScript writer from running between its chunks.
  */
-export function completeUploadTransaction(base64: string, imageId: number, inTmux: boolean): string {
-  return upload(base64, imageId, inTmux).join("");
+export function completeUploadTransaction(png: Buffer | string, imageId: number, inTmux: boolean): string {
+  if (typeof png === "string") return upload(png, imageId, inTmux).join("");
+  const rawChunkBytes = 3 * 4096 / 4;
+  let transaction = "";
+  const chunkCount = Math.max(1, Math.ceil(png.length / rawChunkBytes));
+  for (let index = 0; index < chunkCount; index++) {
+    const payload = png.subarray(index * rawChunkBytes, (index + 1) * rawChunkBytes).toString("base64");
+    const first = index === 0 ? `a=t,f=100,i=${imageId},q=2,` : "";
+    transaction += kitty(`${first}m=${index + 1 < chunkCount ? 1 : 0};${payload}`, inTmux);
+  }
+  return transaction;
 }
 
 /** Owns and serializes every graphics write made by one extension runtime. */
@@ -108,6 +123,7 @@ export class BoundedTransport {
   private readonly pendingKeys = new Map<string, PendingJob>();
   private readonly coalesced = new Map<string, PendingJob>();
   private readonly acceptedKeys = new Set<string>();
+  private readonly readyWaiters: ReadyWaiter[] = [];
   private queuedBytes = 0;
   private currentGeneration = 0;
   private lastWriteAt: number | undefined;
@@ -214,14 +230,31 @@ export class BoundedTransport {
     return promise;
   }
 
-  /** Cancel only unsent work and start a fresh dedupe generation. */
-  cancel(reason = "graphics generation cancelled"): void {
+  /** Wait until admitted work is written and a false-returning sink has drained. */
+  ready(generation: number): Promise<void> {
+    if (this.disposed) return Promise.reject(new TransportError("closed", "graphics transport disposed"));
+    if (this.failure) return Promise.reject(this.failure);
+    if (generation !== this.currentGeneration) {
+      return Promise.reject(new TransportError("cancelled", `stale graphics generation ${generation}; current generation is ${this.currentGeneration}`));
+    }
+    if (this.queue.length === 0 && !this.backpressured) return Promise.resolve();
+    const promise = new Promise<void>((resolve, reject) => {
+      this.readyWaiters.push({ generation, resolve, reject });
+    });
+    if (this.backpressured) this.waitForDrain();
+    else this.resume();
+    return promise;
+  }
+
+  /** Cancel only unsent work and start a fresh generation. */
+  cancel(reason = "graphics generation cancelled", options: { retainAccepted?: boolean } = {}): void {
     if (this.disposed) return;
     this.currentGeneration++;
     this.clearPumpTimer();
     this.clearDrainWait();
     this.rejectQueue(new TransportError("cancelled", reason));
-    this.acceptedKeys.clear();
+    this.rejectReady(new TransportError("cancelled", reason));
+    if (!options.retainAccepted) this.acceptedKeys.clear();
     this.backpressured = this.sink.writableNeedDrain ?? this.backpressured;
   }
 
@@ -284,6 +317,8 @@ export class BoundedTransport {
       this.waitForDrain();
     } else if (this.queue.length > 0) {
       this.schedulePump(this.limits.minIntervalMs);
+    } else {
+      this.settleReady();
     }
   }
 
@@ -293,13 +328,14 @@ export class BoundedTransport {
   }
 
   private waitForDrain(): void {
-    if (this.drainListener || this.failure || this.disposed || this.queue.length === 0) return;
+    if (this.drainListener || this.failure || this.disposed || (this.queue.length === 0 && this.readyWaiters.length === 0)) return;
     const generation = this.currentGeneration;
     const onDrain = () => {
       this.clearDrainWait();
       if (generation !== this.currentGeneration || this.failure || this.disposed) return;
       this.backpressured = false;
       this.resume();
+      this.settleReady();
     };
     this.drainListener = onDrain;
     this.sink.on("drain", onDrain);
@@ -316,6 +352,7 @@ export class BoundedTransport {
     this.clearPumpTimer();
     this.clearDrainWait();
     this.rejectQueue(error);
+    this.rejectReady(error);
   }
 
   private rejectQueue(error: TransportError): void {
@@ -324,6 +361,19 @@ export class BoundedTransport {
     this.pendingKeys.clear();
     this.coalesced.clear();
     for (const job of pending) job.reject(error);
+  }
+
+  private settleReady(): void {
+    if (this.queue.length > 0 || this.backpressured || this.failure || this.disposed) return;
+    const ready = this.readyWaiters.splice(0);
+    for (const waiter of ready) {
+      if (waiter.generation === this.currentGeneration) waiter.resolve();
+      else waiter.reject(new TransportError("cancelled", "stale graphics generation"));
+    }
+  }
+
+  private rejectReady(error: TransportError): void {
+    for (const waiter of this.readyWaiters.splice(0)) waiter.reject(error);
   }
 
   private clearPumpTimer(): void {

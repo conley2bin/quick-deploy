@@ -1,8 +1,20 @@
 import { spawnSync } from "node:child_process";
 import type { LoadedImage } from "./images.ts";
-import { deleteImage, deletePlacement, grid, placement, upload } from "../vendor/pi-tmux-images/kitty-placeholder.ts";
+import { MAX_PREVIEW_PNG_BYTES } from "./images.ts";
+import {
+  BoundedTransport,
+  completeUploadTransaction,
+  type TransportLimits,
+  type TransportScheduler,
+  type TransportSink,
+} from "./transport.ts";
+import { deleteImage, grid, placement } from "../vendor/pi-tmux-images/kitty-placeholder.ts";
 
-export type Sink = { write(value: string): unknown };
+export const MAX_ACTIVE_IMAGES = 64;
+export const MAX_RESIDENT_PNG_BYTES = 12 * 1024 * 1024;
+export const MAX_PLACEMENTS_PER_IMAGE = 80;
+export const MAX_PLACEMENT_CATALOG_BYTES = 80 * 56;
+
 export type CellSize = { widthPx: number; heightPx: number };
 type TmuxResult = { status: number | null; stdout: string | null };
 type TmuxCommand = (
@@ -10,6 +22,24 @@ type TmuxCommand = (
   args: string[],
   options: { encoding: "utf8"; timeout: number },
 ) => TmuxResult;
+
+type PreparedPlacement = { columns: number; rows: number; placementId: number };
+type StoredImage = {
+  image: LoadedImage;
+  id: number;
+  ready: boolean;
+  placements: Map<string, PreparedPlacement>;
+  cell: CellSize;
+  error?: string;
+};
+
+export type BasicSink = { write(value: string): boolean };
+
+export interface TerminalImageOptions {
+  maxResidentPngBytes?: number;
+  transportLimits?: Partial<TransportLimits>;
+  scheduler?: TransportScheduler;
+}
 
 export function supportsKitty(env: NodeJS.ProcessEnv = process.env, probe = probeTmux): boolean {
   const tmux = Boolean(env.TMUX || env.TERM?.startsWith("tmux"));
@@ -41,66 +71,158 @@ export function geometry(image: LoadedImage, availableWidth: number, cell: CellS
   };
 }
 
+function placementCatalog(image: LoadedImage, cell: CellSize): Map<string, PreparedPlacement> {
+  const catalog = new Map<string, PreparedPlacement>();
+  for (let availableWidth = 1; availableWidth <= 80; availableWidth++) {
+    const size = geometry(image, availableWidth, cell);
+    const signature = `${size.columns}:${size.rows}`;
+    if (!catalog.has(signature)) catalog.set(signature, { ...size, placementId: catalog.size + 1 });
+  }
+  return catalog;
+}
+
 export class TerminalImages {
-  private images = new Map<string, LoadedImage>();
-  private ids = new Map<string, number>();
-  private uploaded = new Map<number, string>();
-  private placements = new Map<number, string>();
+  private readonly images = new Map<string, StoredImage>();
+  private readonly usedIds = new Set<number>();
+  private readonly transport: BoundedTransport;
+  private readonly maxResidentPngBytes: number;
+  private residentPngBytes = 0;
 
   constructor(
-    private allocate: () => number,
-    private cellSize: () => CellSize,
-    private sink: Sink = process.stdout,
-    private env: NodeJS.ProcessEnv = process.env,
-    private capable = supportsKitty(env),
-  ) {}
+    private readonly allocate: () => number,
+    private readonly cellSize: () => CellSize,
+    sink: TransportSink | BasicSink = process.stdout,
+    private readonly env: NodeJS.ProcessEnv = process.env,
+    private readonly capable = supportsKitty(env),
+    options: TerminalImageOptions = {},
+  ) {
+    this.maxResidentPngBytes = options.maxResidentPngBytes ?? MAX_RESIDENT_PNG_BYTES;
+    if (!Number.isSafeInteger(this.maxResidentPngBytes) || this.maxResidentPngBytes < 1) {
+      throw new Error("maxResidentPngBytes must be a positive safe integer");
+    }
+    this.transport = new BoundedTransport(normalizeSink(sink), options.transportLimits, options.scheduler);
+  }
 
   available(): boolean { return this.capable; }
-  set(logicalId: string, image: LoadedImage): void {
-    const existing = this.images.get(logicalId);
-    if (existing && existing.hash !== image.hash) throw new Error(`immutable image resource '${logicalId}' cannot be overwritten`);
-    this.images.set(logicalId, image);
-  }
-  has(logicalId: string): boolean { return this.images.has(logicalId); }
+  has(logicalId: string): boolean { return this.images.get(logicalId)?.ready === true; }
   count(): number { return this.images.size; }
+  residentBytes(): number { return this.residentPngBytes; }
+  pendingJobs(): number { return this.transport.pendingJobs; }
+  failure(logicalId: string): string | undefined { return this.images.get(logicalId)?.error; }
 
-  private id(logicalId: string): number {
-    const prior = this.ids.get(logicalId);
-    if (prior) return prior;
+  async prepare(logicalId: string, image: LoadedImage): Promise<void> {
+    const existing = this.images.get(logicalId);
+    if (existing) {
+      if (existing.image.hash !== image.hash) throw new Error(`immutable image resource '${logicalId}' cannot be overwritten`);
+      if (existing.error) throw new Error(existing.error);
+      if (!existing.ready) throw new Error(`image resource '${logicalId}' is still pending`);
+      return;
+    }
+    if (this.images.size >= MAX_ACTIVE_IMAGES) throw new Error(`inline image capacity reached (${MAX_ACTIVE_IMAGES})`);
+    if (image.png.length > MAX_PREVIEW_PNG_BYTES) {
+      throw new Error(`derived PNG preview is ${image.png.length} bytes; limit is ${MAX_PREVIEW_PNG_BYTES} bytes`);
+    }
+    if (this.residentPngBytes + image.png.length > this.maxResidentPngBytes) {
+      throw new Error(`resident PNG budget reached (${this.maxResidentPngBytes} bytes)`);
+    }
+
+    const id = this.id();
+    const cell = this.cellSize();
+    const placements = placementCatalog(image, cell);
+    if (placements.size > MAX_PLACEMENTS_PER_IMAGE) {
+      throw new Error(`placement catalog has ${placements.size} entries; limit is ${MAX_PLACEMENTS_PER_IMAGE}`);
+    }
+    const state: StoredImage = { image, id, ready: false, placements, cell };
+    this.images.set(logicalId, state);
+    this.residentPngBytes += image.png.length;
+    const generation = this.transport.generation;
+    const upload = completeUploadTransaction(image.png, id, this.inTmux());
+    const placementCommands = [...placements.values()].map((candidate) =>
+      placement(id, candidate.columns, candidate.rows, this.inTmux(), candidate.placementId)).join("");
+    const placementBytes = Buffer.byteLength(placementCommands);
+    if (placementBytes > MAX_PLACEMENT_CATALOG_BYTES) {
+      state.error = `placement catalog is ${placementBytes} bytes; limit is ${MAX_PLACEMENT_CATALOG_BYTES} bytes`;
+      throw new Error(state.error);
+    }
+    try {
+      await this.transport.enqueue(generation, { transaction: upload, key: `upload:${id}:${image.hash}` });
+      await this.transport.enqueue(generation, { transaction: placementCommands });
+      await this.transport.ready(generation);
+      if (generation !== this.transport.generation || this.images.get(logicalId) !== state) {
+        throw new Error("image preparation completed in an abandoned generation");
+      }
+      state.ready = true;
+    } catch (error) {
+      if (this.images.get(logicalId) === state) {
+        state.error = error instanceof Error ? error.message : String(error);
+      }
+      throw error;
+    }
+  }
+
+  /** Pure synchronous render: every possible width placement was prepared first. */
+  render(logicalId: string, availableWidth: number): string[] {
+    const state = this.images.get(logicalId);
+    if (!state?.ready || state.error || !this.capable) return [];
+    const currentCell = this.cellSize();
+    if (currentCell.widthPx !== state.cell.widthPx || currentCell.heightPx !== state.cell.heightPx) {
+      state.error = `terminal cell dimensions changed from ${state.cell.widthPx}x${state.cell.heightPx} px to ${currentCell.widthPx}x${currentCell.heightPx} px; reload required`;
+      return [];
+    }
+    const size = geometry(state.image, availableWidth, state.cell);
+    const prepared = state.placements.get(`${size.columns}:${size.rows}`);
+    if (!prepared) {
+      state.error = `no prepared placement for ${size.columns}x${size.rows}`;
+      return [];
+    }
+    return grid(size.columns, size.rows, state.id, prepared.placementId);
+  }
+
+  /** Cancel unsent work while retaining successfully prepared resources in this runtime. */
+  reconcile(): void {
+    this.transport.cancel("image branch reconciliation", { retainAccepted: true });
+    for (const [logicalId, state] of this.images) {
+      if (state.ready) continue;
+      this.images.delete(logicalId);
+      this.residentPngBytes -= state.image.png.length;
+    }
+  }
+
+  /** Invalidate late work, remove owned terminal resources in order, and optionally dispose. */
+  async clear(dispose = false): Promise<void> {
+    const ids = [...this.images.values()].map(({ id }) => id);
+    this.transport.cancel("image session reset");
+    this.images.clear();
+    this.residentPngBytes = 0;
+    if (this.capable) {
+      const generation = this.transport.generation;
+      await Promise.allSettled(ids.map((id) => this.transport.enqueue(generation, {
+        transaction: deleteImage(id, this.inTmux()),
+      })));
+      await this.transport.ready(generation).catch(() => undefined);
+    }
+    if (dispose) this.transport.dispose();
+  }
+
+  private id(): number {
     let id = this.allocate() >>> 0;
-    while (!id || [...this.ids.values()].includes(id)) id = this.allocate() >>> 0;
-    this.ids.set(logicalId, id);
+    while (!id || this.usedIds.has(id)) id = this.allocate() >>> 0;
+    this.usedIds.add(id);
     return id;
   }
 
-  render(logicalId: string, availableWidth: number): string[] {
-    const image = this.images.get(logicalId);
-    if (!image || !this.capable) return [];
-    const id = this.id(logicalId);
-    const inTmux = Boolean(this.env.TMUX || this.env.TERM?.startsWith("tmux"));
-    const png = image.png.toString("base64");
-    if (this.uploaded.get(id) !== image.hash) {
-      for (const sequence of upload(png, id, inTmux)) this.sink.write(sequence);
-      this.uploaded.set(id, image.hash);
-    }
-    const size = geometry(image, availableWidth, this.cellSize());
-    const signature = `${size.columns}:${size.rows}`;
-    if (this.placements.get(id) !== signature) {
-      if (this.placements.has(id)) this.sink.write(deletePlacement(id, inTmux));
-      this.sink.write(placement(id, size.columns, size.rows, inTmux));
-      this.placements.set(id, signature);
-    }
-    return grid(size.columns, size.rows, id);
+  private inTmux(): boolean {
+    return Boolean(this.env.TMUX || this.env.TERM?.startsWith("tmux"));
   }
+}
 
-  clear(): void {
-    if (this.capable) {
-      const inTmux = Boolean(this.env.TMUX || this.env.TERM?.startsWith("tmux"));
-      for (const id of this.ids.values()) this.sink.write(deleteImage(id, inTmux));
-    }
-    this.images.clear();
-    this.ids.clear();
-    this.uploaded.clear();
-    this.placements.clear();
+function normalizeSink(sink: TransportSink | BasicSink): TransportSink {
+  if ("on" in sink && typeof sink.on === "function" && "removeListener" in sink && typeof sink.removeListener === "function") {
+    return sink as TransportSink;
   }
+  return {
+    write: (value) => sink.write(value),
+    on() { return this; },
+    removeListener() { return this; },
+  };
 }

@@ -21,9 +21,12 @@ export default function piInlineImages(pi: ExtensionAPI) {
 
   const restore = async (_event: unknown, context: { mode: string; cwd: string; sessionManager: { getBranch(): readonly never[] } }) => {
     if (context.mode === "tui") await session.restore(context.sessionManager.getBranch(), context.cwd);
-    else session.reset();
+    else await session.reset();
   };
   pi.on("session_start", restore as never);
-  pi.on("session_tree", restore as never);
-  pi.on("session_shutdown", () => session.reset());
+  pi.on("session_tree", (async (_event: unknown, context: { mode: string; cwd: string; sessionManager: { getBranch(): readonly never[] } }) => {
+    if (context.mode === "tui") await session.restore(context.sessionManager.getBranch(), context.cwd, true);
+    else await session.reset();
+  }) as never);
+  pi.on("session_shutdown", async () => session.reset(true));
 }

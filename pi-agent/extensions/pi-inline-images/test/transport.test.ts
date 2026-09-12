@@ -86,8 +86,9 @@ function transport(
 
 test("a multipart Kitty upload is one captured write with legal APC continuation structure", async () => {
   const { clock, sink, owner } = transport({ minIntervalMs: 25 });
-  const source = Buffer.alloc(7_000, 0xa5).toString("base64");
-  const upload = completeUploadTransaction(source, 0x71123456, false);
+  const sourceBytes = Buffer.alloc(7_000, 0xa5);
+  const source = sourceBytes.toString("base64");
+  const upload = completeUploadTransaction(sourceBytes, 0x71123456, false);
   const put = placement(0x71123456, 12, 7, false);
 
   const uploadResult = owner.enqueue(owner.generation, { transaction: upload, key: "upload:sha256" });
@@ -129,6 +130,22 @@ test("write(false) accepts the current transaction and blocks every later write 
   sink.drain();
   assert.deepEqual(sink.writes.map(({ value }) => value), ["first", "second"], "elapsed pacing permits the next write at drain");
   assert.equal((await second).status, "accepted");
+  assert.equal(sink.listenerCount("drain"), 0);
+  owner.dispose();
+});
+
+test("ready waits for accepted-false bytes to drain even when no later graphics job exists", async () => {
+  const { clock, sink, owner } = transport({ drainTimeoutMs: 100 });
+  sink.returns.push(false);
+  await owner.enqueue(owner.generation, { transaction: "accepted" });
+  let ready = false;
+  const waiting = owner.ready(owner.generation).then(() => { ready = true; });
+  clock.advance(99);
+  await Promise.resolve();
+  assert.equal(ready, false);
+  sink.drain();
+  await waiting;
+  assert.equal(ready, true);
   assert.equal(sink.listenerCount("drain"), 0);
   owner.dispose();
 });

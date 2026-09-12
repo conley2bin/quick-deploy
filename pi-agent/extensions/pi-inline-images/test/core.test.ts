@@ -11,12 +11,19 @@ import { TerminalImages, geometry, probeTmux, supportsKitty } from "../src/termi
 const HERE = dirname(fileURLToPath(import.meta.url));
 const FIXTURE = join(HERE, "fixtures/color-block.png");
 const kittyEnv = { TERM_PROGRAM: "ghostty" };
-const image = { source: FIXTURE, hash: "abc", width: 40, height: 40, png: readFileSync(FIXTURE) };
+const image = { source: FIXTURE, hash: "abc", width: 40, height: 40, previewWidth: 40, previewHeight: 40, png: readFileSync(FIXTURE) };
 
 function runtime() {
   let id = 0x71123400;
   const writes: string[] = [];
-  const terminal = new TerminalImages(() => ++id, () => ({ widthPx: 10, heightPx: 20 }), { write: (value) => writes.push(value) }, kittyEnv, true);
+  const terminal = new TerminalImages(
+    () => ++id,
+    () => ({ widthPx: 10, heightPx: 20 }),
+    { write: (value) => { writes.push(value); return true; } },
+    kittyEnv,
+    true,
+    { transportLimits: { minIntervalMs: 0 } },
+  );
   return { terminal, writes };
 }
 
@@ -97,14 +104,16 @@ test("list and quote placements retain structural continuation prefixes", async 
   assert.match(output, /\n> {3,}tail/);
 });
 
-test("resize deletes old owned placement before creating replacement; clear deletes only owned image", () => {
+test("all width placements are prepared before pure resize renders; clear deletes only owned image", async () => {
   const { terminal, writes } = runtime();
-  terminal.set("logical", image);
-  terminal.render("logical", 5);
-  const firstWrites = writes.length;
-  terminal.render("logical", 2);
-  assert.ok(writes.slice(firstWrites).some((value) => value.includes("a=d,d=i")), "old placement deleted on geometry change");
-  terminal.clear();
+  await terminal.prepare("logical", image);
+  assert.ok(writes.some((value) => value.includes("a=p")), "placement catalog is sent during async preparation");
+  const preparedWrites = writes.length;
+  const first = terminal.render("logical", 5);
+  const second = terminal.render("logical", 2);
+  assert.notDeepEqual(first, second);
+  assert.equal(writes.length, preparedWrites, "resize and stable render emit no terminal commands");
+  await terminal.clear();
   assert.ok(writes.some((value) => value.includes("a=d,d=I")), "owned image deleted on clear");
 });
 
@@ -149,7 +158,7 @@ test("restore follows the active branch, reset clears state, and repeated paths 
   await session.prepare(first, "/work");
   assert.equal(loads, 3, "byte-identical later text reloads the resource so file changes become visible consistently");
   assert.equal(session.markdown.size, 2);
-  session.reset();
+  await session.reset();
   assert.equal(session.markdown.size, 0);
   assert.equal(terminal.count(), 0);
   assert.deepEqual(assistantTextBlocks({ role: "assistant", content: [{ type: "thinking", text: "no" }, { type: "text", text: "  yes\n" }] }), ["yes"], "cache keys match Pi AssistantMessage's native trim");

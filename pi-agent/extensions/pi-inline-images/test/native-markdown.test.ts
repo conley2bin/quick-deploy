@@ -31,8 +31,8 @@ async function renderAssistant(source: string, width: number) {
   const module = await import(pathToFileURL(join(root, "dist/modes/interactive/components/assistant-message.js")).href);
   const theme = await import(pathToFileURL(join(root, "dist/modes/interactive/theme/theme.js")).href);
   theme.initTheme("dark", false);
-  const terminal = new TerminalImages(() => 0x07123456, () => ({ widthPx: 10, heightPx: 20 }), { write: () => undefined }, { TERM_PROGRAM: "ghostty" }, true);
-  const image = { source: "fixture", hash: "fixture", width: 100, height: 100, png: Buffer.from("fixture") };
+  const terminal = new TerminalImages(() => 0x07123456, () => ({ widthPx: 10, heightPx: 20 }), { write: () => true }, { TERM_PROGRAM: "ghostty" }, true, { transportLimits: { minIntervalMs: 0 } });
+  const image = { source: "fixture", hash: "fixture", width: 100, height: 100, previewWidth: 100, previewHeight: 100, png: Buffer.from("fixture") };
   const session = new ImageSession(terminal, async () => image);
   const prepared = await session.prepare(source.trim(), "/fixture");
   const transformer = (markdown: string, context: { messageType: string; isStreaming: boolean; availableWidth: number }) =>
@@ -90,10 +90,10 @@ test("native cached components retain immutable geometry across changed bytes an
   const theme = await import(pathToFileURL(join(root, "dist/modes/interactive/theme/theme.js")).href);
   theme.initTheme("dark", false);
   let allocated = 0x07123450;
-  const terminal = new TerminalImages(() => ++allocated, () => ({ widthPx: 10, heightPx: 20 }), { write: () => undefined }, { TERM_PROGRAM: "ghostty" }, true);
+  const terminal = new TerminalImages(() => ++allocated, () => ({ widthPx: 10, heightPx: 20 }), { write: () => true }, { TERM_PROGRAM: "ghostty" }, true, { transportLimits: { minIntervalMs: 0 } });
   const versions = [
-    { source: "fixture", hash: "large", width: 100, height: 100, png: Buffer.from("large") },
-    { source: "fixture", hash: "small", width: 20, height: 20, png: Buffer.from("small") },
+    { source: "fixture", hash: "large", width: 100, height: 100, previewWidth: 100, previewHeight: 100, png: Buffer.from("large") },
+    { source: "fixture", hash: "small", width: 20, height: 20, previewWidth: 20, previewHeight: 20, png: Buffer.from("small") },
   ];
   let load = 0;
   const session = new ImageSession(terminal, async () => {
@@ -147,10 +147,10 @@ test("native AssistantMessage uses the first normalized reference definition", a
   ];
   for (const { source, expected } of cases) {
     let loaded = "";
-    const terminal = new TerminalImages(() => 0x07123456, () => ({ widthPx: 10, heightPx: 20 }), { write: () => undefined }, { TERM_PROGRAM: "ghostty" }, true);
+    const terminal = new TerminalImages(() => 0x07123456, () => ({ widthPx: 10, heightPx: 20 }), { write: () => true }, { TERM_PROGRAM: "ghostty" }, true, { transportLimits: { minIntervalMs: 0 } });
     const session = new ImageSession(terminal, async (href) => {
       loaded = href;
-      return { source: href, hash: href, width: 20, height: 20, png: Buffer.from(href) };
+      return { source: href, hash: href, width: 20, height: 20, previewWidth: 20, previewHeight: 20, png: Buffer.from(href) };
     });
     const prepared = await session.prepare(source, "/fixture");
     const transformer = (markdown: string, context: { availableWidth: number }) => transformMarkdown(prepared, context.availableWidth, terminal);
@@ -174,6 +174,38 @@ test("native table notices escape decoded pipe, backslash, and newline alt text"
     assert.ok(tableLines.every((line) => (line.match(/│/gu) || []).length >= 3), source);
     assert.match(tableLines.map((line) => line.split("│")[2]?.trim() || "").join(""), /tail/, "tail stays in column two");
   }
+});
+
+test("native AssistantMessage output selects a precreated custom placement and emits no render traffic", async () => {
+  const root = installedPiRoot();
+  const module = await import(pathToFileURL(join(root, "dist/modes/interactive/components/assistant-message.js")).href);
+  const theme = await import(pathToFileURL(join(root, "dist/modes/interactive/theme/theme.js")).href);
+  theme.initTheme("dark", false);
+  const writes: string[] = [];
+  const terminal = new TerminalImages(
+    () => 0x07123456,
+    () => ({ widthPx: 10, heightPx: 20 }),
+    { write: (value) => { writes.push(value); return true; } },
+    { TERM_PROGRAM: "ghostty" },
+    true,
+    { transportLimits: { minIntervalMs: 0 } },
+  );
+  const source = "before\n\n![mapped](mapped.png)\n\nafter";
+  const session = new ImageSession(terminal, async () => ({
+    source: "mapped", hash: "mapped", width: 120, height: 80,
+    previewWidth: 120, previewHeight: 80, png: Buffer.from("mapped"),
+  }));
+  const prepared = await session.prepare(source, "/fixture");
+  const transformer = (markdown: string, context: { availableWidth: number }) => transformMarkdown(prepared, context.availableWidth, terminal);
+  const beforeRender = writes.length;
+  const rendered = (new module.AssistantMessageComponent(assistantMessage(source), false, undefined, "Thinking...", 1, [transformer]).render(24) as string[]).join("\n");
+  assert.equal(writes.length, beforeRender);
+  const underline = /\x1b\[58;2;0;0;(\d+)m/u.exec(rendered);
+  assert.ok(underline);
+  const placementId = underline[1]!;
+  assert.ok(writes.some((value) => value.includes(`p=${placementId},U=1`)), "native grid underline selects a prepared protocol placement ID");
+  assert.ok(rendered.includes(`${PLACEHOLDER_GLYPH}\u0305\u0305\u033f`), "native output retains image-ID high-byte diacritic");
+  await session.reset(true);
 });
 
 test("native AssistantMessage still renders paragraph and list images in source order", async () => {
