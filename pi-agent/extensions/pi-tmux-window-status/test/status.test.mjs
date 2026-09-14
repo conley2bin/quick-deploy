@@ -96,6 +96,7 @@ test("model/provider unavailable classifier accepts provider failures and reject
     "408 request timeout from provider",
     "stream ended before completion",
     "fetch failed: connection reset by peer during streaming transport",
+    "stream_read_error",
     "service unavailable: model overloaded",
     "OpenAI API error (520)",
     "LiteLLMCompletionStreamingIterator missing completed_response adapter signature",
@@ -111,6 +112,7 @@ test("model/provider unavailable classifier accepts provider failures and reject
     assistantError("stream parser failed unexpectedly"),
     assistantError("OpenAI API error (409): conflict on resource"),
     { role: "tool", stopReason: "error", errorMessage: "OpenAI API error (502)" },
+    { role: "tool", stopReason: "error", errorMessage: "stream_read_error" },
     { role: "assistant", stopReason: "stop", errorMessage: "OpenAI API error (502)" },
   ]) assert.equal(classifyModelUnavailable(message), false, JSON.stringify(message));
   assert.equal(classifyModelUnavailable(assistantError("400 bad request: insufficient_user_quota")), true, "strong quota phrase wins over ordinary 400 wording");
@@ -560,7 +562,7 @@ test("auto-continue schedules on idle model error, respects cancel/cap/throttle,
     const mod = await import("../index.ts?auto-continue-test");
     mod.default(pi);
     const fire = (name, ...args) => { for (const fn of handlers[name] || []) fn(...args); };
-    const errMsg = { role: "assistant", stopReason: "error", errorMessage: "Error: terminated" };
+    const errMsg = { role: "assistant", stopReason: "error", errorMessage: "stream_read_error" };
     fire("message_end", { message: errMsg });
     assert.deepEqual(sent, [], "no continue before settle");
     idle = true; pending = false;
