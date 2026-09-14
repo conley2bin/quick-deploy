@@ -57,6 +57,13 @@ tmux_conf_theme_window_status_fg="#080808"
 tmux_conf_theme_window_status_bg="#bcbcbc"
 tmux_conf_theme_window_status_attr="none"
 
+# Oh My Tmux 重载时会先生成 theme 格式，再重放下面的 important 直写格式。
+# 生成阶段也使用两格蓝色端点与灰色中心，避免中间态退回整块蓝色。
+tmux_conf_theme_window_status_current_fg="#0077aa"
+tmux_conf_theme_window_status_current_bg="#0077aa"
+tmux_conf_theme_window_status_current_attr="none"
+tmux_conf_theme_window_status_current_format='█#[fg=#{?@quick_deploy_pi_error,#ffffff,#{?window_bell_flag,#ffff00,#080808}},bg=#{?@quick_deploy_pi_error,#d70000,#{?@quick_deploy_pi_active,#{@quick_deploy_pi_bg},#bcbcbc}},bold] #{window_index} #{window_name}#{?window_bell_flag,!,}#{?window_zoomed_flag,Z,} #[fg=#0077aa,bg=#0077aa,none]█'
+
 # The Pi extension writes these window-scoped options only while work is active
 # or a model/provider error is latched. The Oh My Tmux generator expands its
 # theme variables before tmux can evaluate nested formats, so this narrow

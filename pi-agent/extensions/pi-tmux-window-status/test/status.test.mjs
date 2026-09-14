@@ -14,6 +14,29 @@ const ROOT = resolve(HERE, "../../../..");
 const trash = [];
 const temp = () => { const d = mkdtempSync(join(tmpdir(), "pi-tmux-status-")); trash.push(d); return d; };
 afterEach(() => { while (trash.length) rmSync(trash.pop(), { recursive: true, force: true }); });
+const withoutTmuxEnvironment = (source = process.env) => Object.fromEntries(Object.entries(source).filter(([key]) => key !== "TMUX" && !key.startsWith("TMUX_")));
+const isolatedTmux = (args, options = {}) => { const { env = process.env, ...rest } = options; return execFileSync("tmux", args, { ...rest, env: withoutTmuxEnvironment(env) }); };
+const styledCells = (value) => {
+  const line = String(value).split("\n")[0];
+  const cells = [], style = { fg: undefined, bg: undefined };
+  for (let offset = 0; offset < line.length;) {
+    if (line.startsWith("#[", offset)) {
+      const end = line.indexOf("]", offset + 2);
+      assert.notEqual(end, -1, `unterminated tmux style in ${line}`);
+      for (const field of line.slice(offset + 2, end).split(",")) {
+        if (field === "default") { style.fg = undefined; style.bg = undefined; }
+        else if (field.startsWith("fg=")) style.fg = field.slice(3);
+        else if (field.startsWith("bg=")) style.bg = field.slice(3);
+      }
+      offset = end + 1;
+      continue;
+    }
+    const char = String.fromCodePoint(line.codePointAt(offset));
+    cells.push({ char, fg: style.fg, bg: style.bg });
+    offset += char.length;
+  }
+  return cells;
+};
 const ident = (socket = "/tmp/tmux-status") => ({ socketPath: socket, windowId: "@8", paneId: "%9" });
 const real = (runId = "root", lastActivityAt = 100, state = "running", steps = []) => ({ runId, state, lastUpdate: lastActivityAt, steps });
 
@@ -26,6 +49,21 @@ test("24-frame breathing palette starts at idle baseline and hits symmetric perc
   assert.equal(FRAMES[12], GRAY_RANGE.idle);
   assert.equal(FRAMES[18], GRAY_RANGE.dark);
   assert.equal(FRAME_BLUE, "#0077aa", "selection frame color stays fixed and never breathes");
+});
+
+test("isolated tmux environment removes every ambient tmux routing variable", () => {
+  const clean = withoutTmuxEnvironment({
+    HOME: "/home/tester",
+    PATH: "/bin",
+    TERM: "xterm-256color",
+    TMUX: "/tmp/outer,1,0",
+    TMUX_PANE: "%9",
+    TMUX_SOCKET: "/tmp/outer",
+    TMUX_CONF: "/home/tester/.tmux.conf",
+    TMUX_CONF_LOCAL: "/home/tester/.tmux.conf.local",
+    TMUX_PROGRAM: "/usr/bin/tmux",
+  });
+  assert.deepEqual(clean, { HOME: "/home/tester", PATH: "/bin", TERM: "xterm-256color" });
 });
 
 test("monotonic frame phase wraps and skips delayed callbacks", () => {
@@ -502,7 +540,7 @@ test("auto-continue classifier additions cover terminated, weekly quota, mixed a
 
 test("auto-continue schedules on idle model error, respects cancel/cap/throttle, and never clears red", async () => {
   const runtime = temp(), work = temp(), socket = join(work, "server.sock");
-  const tmux = (args, options = {}) => execFileSync("tmux", args, { ...options });
+  const tmux = (args, options = {}) => isolatedTmux(args, options);
   tmux(["-S", socket, "-f", join(process.env.HOME, ".tmux.conf"), "new-session", "-d", "-s", "auto-continue"]);
   const windowId = tmux(["-S", socket, "display-message", "-p", "#{window_id}"], { encoding: "utf8" }).trim();
   const paneId = tmux(["-S", socket, "display-message", "-p", "#{pane_id}"], { encoding: "utf8" }).trim();
@@ -559,15 +597,15 @@ test("auto-continue schedules on idle model error, respects cancel/cap/throttle,
   }
 });
 
-test("detached animator process remains alive for later 60ms frames and exits after lease removal", async () => {
+test("detached animator process remains alive for later 42ms frames and exits after lease removal", async () => {
   const runtime = temp(), work = temp(), socket = join(work, "server.sock");
-  const tmux = (args, options = {}) => execFileSync("tmux", args, { ...options });
+  const tmux = (args, options = {}) => isolatedTmux(args, options);
   tmux(["-S", socket, "-f", join(process.env.HOME, ".tmux.conf"), "new-session", "-d", "-s", "animator-process"]);
   const windowId = tmux(["-S", socket, "display-message", "-p", "#{window_id}"], { encoding: "utf8" }).trim();
   const paneId = tmux(["-S", socket, "display-message", "-p", "#{pane_id}"], { encoding: "utf8" }).trim();
   const i = { socketPath: socket, windowId, paneId }, env = { QUICK_DEPLOY_PI_TMUX_WINDOW_STATUS_RUNTIME: runtime };
   publishLease(i, "process", "active", Date.now(), env);
-  const animator = spawn(process.execPath, [join(ROOT, "pi-agent/extensions/pi-tmux-window-status/animator.mjs"), socket], { env: { ...process.env, ...env }, stdio: "ignore" });
+  const animator = spawn(process.execPath, [join(ROOT, "pi-agent/extensions/pi-tmux-window-status/animator.mjs"), socket], { env: { ...withoutTmuxEnvironment(), ...env }, stdio: "ignore" });
   try {
     await new Promise((resolve) => setTimeout(resolve, FRAME_MS * 3 + 30));
     assert.equal(animator.exitCode, null, "referenced frame timer keeps the detached helper alive");
@@ -714,9 +752,95 @@ test("installer resolves the tracked source independently of the working directo
   assert.equal(resolve(readlinkSync(target)), repoSource, "default source resolves to the tracked extension");
 });
 
+test("full gpakosz load cannot follow polluted outer tmux routing", () => {
+  const work = temp(), outer = join(work, "outer.sock"), inner = join(work, "inner.sock");
+  const clean = withoutTmuxEnvironment();
+  const rawTmux = (args, options = {}) => execFileSync("tmux", args, { cwd: work, env: clean, ...options });
+  rawTmux(["-S", outer, "-f", "/dev/null", "new-session", "-d", "-s", "outer"]);
+  try {
+    rawTmux(["-S", outer, "set-option", "-g", "window-status-current-format", "OUTER_SENTINEL"]);
+    const outerPid = rawTmux(["-S", outer, "display-message", "-p", "#{pid}"], { encoding: "utf8" }).trim();
+    const polluted = {
+      ...process.env,
+      TMUX: `${outer},${outerPid},0`,
+      TMUX_PANE: "%0",
+      TMUX_SOCKET: outer,
+      TMUX_CONF: join(process.env.HOME, ".tmux.conf"),
+      TMUX_CONF_LOCAL: join(process.env.HOME, ".tmux.conf.local"),
+      TMUX_PROGRAM: "/usr/bin/tmux",
+    };
+    isolatedTmux(["-S", inner, "-f", join(process.env.HOME, ".tmux.conf"), "new-session", "-d", "-s", "inner"], { cwd: work, env: polluted });
+    execFileSync("sleep", ["1"]);
+    const outerFormat = rawTmux(["-S", outer, "show-options", "-gqv", "window-status-current-format"], { encoding: "utf8" }).trim();
+    assert.equal(outerFormat, "OUTER_SENTINEL", "secondary gpakosz commands stay on the explicit isolated socket");
+    const innerFormat = rawTmux(["-S", inner, "show-options", "-gqv", "window-status-current-format"], { encoding: "utf8" });
+    assert.match(innerFormat, new RegExp(FRAME_BLUE));
+  } finally {
+    for (const socket of [inner, outer]) {
+      try { rawTmux(["-S", socket, "kill-server"]); } catch {}
+    }
+  }
+});
+
+test("gpakosz generated reload stage keeps blue rails and a gray dynamic center", () => {
+  const work = temp(), home = join(work, "home"), socket = join(work, "server.sock");
+  mkdirSync(home, { recursive: true });
+  symlinkSync(join(process.env.HOME, ".tmux", ".tmux.conf"), join(home, ".tmux.conf"));
+  const localSource = join(ROOT, "fresh-install/modules/tmux/tmux.conf.local");
+  const localText = readFileSync(localSource, "utf8");
+  const directMatch = localText.match(/^setw -g window-status-current-format '(.*)' #!important$/m);
+  assert.ok(directMatch, "direct important current format is present");
+  const direct = directMatch[1];
+  const generatedOnly = localText
+    .split("\n")
+    .filter((line) => !line.startsWith("setw -g window-status-current-format "))
+    .join("\n");
+  writeFileSync(join(home, ".tmux.conf.local"), generatedOnly);
+  const env = { ...process.env, HOME: home, TERM: "xterm-256color" };
+  const tmux = (args, options = {}) => isolatedTmux(args, { cwd: work, env, ...options });
+  tmux(["-S", socket, "-f", join(home, ".tmux.conf"), "new-session", "-d", "-s", "q"]);
+  try {
+    execFileSync("sleep", ["1"]);
+    const current = tmux(["-S", socket, "show-options", "-gqv", "window-status-current-format"], { encoding: "utf8" });
+    const evalf = (format = current) => tmux(["-S", socket, "display-message", "-p", format], { encoding: "utf8" });
+    const assertMatchesFinalCellStyles = (label) => {
+      const generatedCells = styledCells(evalf(current));
+      const finalCells = styledCells(evalf(direct));
+      assert.equal(generatedCells.length, finalCells.length, `${label}: generated and final widths match`);
+      assert.deepEqual(
+        generatedCells.map(({ fg, bg }) => ({ fg, bg })),
+        finalCells.map(({ fg, bg }) => ({ fg, bg })),
+        `${label}: every generated cell has the final foreground/background`,
+      );
+      assert.equal(
+        generatedCells.slice(2, -2).map(({ char }) => char).join(""),
+        finalCells.slice(2, -2).map(({ char }) => char).join(""),
+        `${label}: center text matches the final format`,
+      );
+      assert.deepEqual(generatedCells.slice(0, 2).map(({ bg }) => bg), [FRAME_BLUE, FRAME_BLUE], `${label}: left rail is two blue cells`);
+      assert.deepEqual(generatedCells.slice(-2).map(({ bg }) => bg), [FRAME_BLUE, FRAME_BLUE], `${label}: right rail is two blue cells`);
+    };
+    assert.doesNotMatch(current, /#00afff/, "upstream theme generation has no whole-blue fallback");
+    assert.match(current, new RegExp(FRAME_BLUE));
+    assert.match(current, /@quick_deploy_pi_bg/);
+    assert.match(evalf(), /#bcbcbc/, "generated idle center is gray-white");
+    assertMatchesFinalCellStyles("idle");
+    tmux(["-S", socket, "set-option", "-w", "@quick_deploy_pi_active", "1"]);
+    tmux(["-S", socket, "set-option", "-w", "@quick_deploy_pi_bg", FRAMES[6]]);
+    assert.match(evalf(), new RegExp(FRAMES[6]), "generated active center follows the gray animator frame");
+    assertMatchesFinalCellStyles("active");
+    tmux(["-S", socket, "set-option", "-w", "@quick_deploy_pi_error", "1"]);
+    assert.match(evalf(), new RegExp(ERROR_BG), "generated error center stays red");
+    assert.match(evalf(), new RegExp(FRAME_BLUE), "generated error state keeps blue rails");
+    assertMatchesFinalCellStyles("error");
+  } finally {
+    tmux(["-S", socket, "kill-server"]);
+  }
+});
+
 test("isolated gpakosz load evaluates actual deployed formats across idle and two active frames", () => {
   const work = temp(), socket = join(work, "server.sock");
-  const tmux = (args, options = {}) => execFileSync("tmux", args, { cwd: work, ...options });
+  const tmux = (args, options = {}) => isolatedTmux(args, { cwd: work, ...options });
   const stripStyles = (s) => String(s).replace(/#\[[^\]]*\]/g, "");
   tmux(["-S", socket, "-f", join(process.env.HOME, ".tmux.conf"), "new-session", "-d", "-s", "q"]);
   try {
