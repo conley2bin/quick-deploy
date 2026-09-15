@@ -916,6 +916,25 @@ github_ssh_block() {
 # 84 个节点里 0 个放行 22，81 个 443 正常。换节点无解。
 # 症状：connect 成功后一个 RTT 内返回 0 字节即断开（github/gitlab/bitbucket/
 # kernel.org 一致），同节点 :443 与 :9418 正常。443 端口不受影响。
+#
+# 2026-09-15 更正：上面的「443 端口不受影响」已被证伪——443 只是能连、能完成
+# SSH 握手与公钥认证，会话数据照样被掐。当时的判据是 TCP 层 delay 探测，
+# 只能证明 connect，看不到会话阶段。本机实测：
+#   - 33 个节点逐一 ssh -T git@github.com（会话回复仅 ~90 字节）：31 个静默
+#     blackhole，2 个被对端 close；0 个成功。
+#   - 同节点 HTTPS 到 github.com 完全正常（200 OK，大文件照传），所以不是
+#     GitHub 或节点故障，是 SSH 这一层被针对。
+#   - 换出口即恢复：实验室机（ylang-U22）上同一把钥匙 :22 和 :443 都直接
+#     返回 "Hi conley2bin! You've successfully authenticated"。
+#   - 客户端不会报错而是挂住：mihomo 不把上游 stall 透传，本地 socket 只会
+#     重传（RTO backoff 到 120s，11 次重传，cwnd 跌到 1），约 15 分钟后才超时。
+# 当前生效的修法见 ~/.ssh/config 顶部的 pi 块：Host github.com 的 ProxyCommand
+# 经 4090 跳板，实测 git fetch 一个来回 4~11s（对比：机场路径无限挂起）。
+# 另一条可选路径是 HTTPS + PAT（HTTPS 走机场完全正常），不需要跳板但需要令牌。
+#
+# 若要用本脚本管理跳板：在下面 Host 块里加
+#   ProxyCommand ssh -o BatchMode=yes -o ConnectTimeout=8 -W %h:%p 4090
+# 注意这会引入对 4090 在线状态的依赖（离线时快速失败，不再挂 15 分钟）。
 Host github.com ssh.github.com
     Hostname ssh.github.com
     Port 443
@@ -978,7 +997,13 @@ configure_ssh() {
     echo ""
     echo "此配置让 GitHub SSH 走 ssh.github.com:443。"
     echo "实测原因：流量已正确路由到代理，是机场封禁出站 TCP/22（订阅内 84 个节点"
-    echo "逐一探测，0 个放行 22；换节点无用）。443 不受影响，已验证可用。"
+    echo "逐一探测，0 个放行 22；换节点无用）。"
+    echo ""
+    echo "warning 2026-09-15 更正：443 也不再够用。33 个节点逐一 ssh -T git@github.com"
+    echo "  全部失败（31 个静默 blackhole、2 个被 close）——握手和认证能过，会话数据被掐。"
+    echo "  同节点 HTTPS 到 github.com 正常，实验室机上同一把钥匙 :443 直接成功，"
+    echo "  所以是机场针对 SSH，不是端口问题。当前可用路径是 ~/.ssh/config 里的"
+    echo "  4090 跳板（ProxyCommand）；HTTPS + PAT 是另一条不需要跳板的路。"
     echo ""
     echo "与选项 1 的分工：选项 1 写入的 DST-PORT,22,DIRECT 让所有 22 端口直连，"
     echo "覆盖你自己的境外主机；本选项让 GitHub 改用 443，继续走代理，路径更稳。"
