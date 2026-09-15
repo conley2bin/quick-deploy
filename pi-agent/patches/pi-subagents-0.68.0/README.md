@@ -18,7 +18,13 @@ ln -s /tmp/pi-subagents-original/node_modules /tmp/pi-subagents-fixed/node_modul
 ./test/red-green.sh /tmp/pi-subagents-original /tmp/pi-subagents-fixed
 ```
 
-The no-provider harness executes the real detached runner with a scripted child factory. It proves the original mixed-generation stall, aligned success, and fail-closed behavior for missing/wrong confirmation, missing proceed, signal cancellation, protocol mismatch, and competing/reclaimed session leases.
+The no-provider harness executes the real detached runner with a scripted child factory. It proves the original mixed-generation stall, aligned success, and fail-closed behavior for missing/wrong confirmation, missing proceed, signal cancellation, protocol mismatch, and competing/reclaimed session leases. The harness detects an installed npm source under `node_modules` and uses its required Jiti launcher; the fixture remains outside the installation, so it never calls a model/provider.
+
+For a guarded installed-source smoke after application:
+
+```bash
+node ./test/startup-handshake.test.mjs --source ~/.pi/agent/npm/node_modules/pi-subagents
+```
 
 ## Installed-source and activation boundary
 

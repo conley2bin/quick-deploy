@@ -2,11 +2,16 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
+import { createRequire } from "node:module";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 
 const PROTOCOL = "lease-ack-confirm-proceed-v1";
+const testDir = path.dirname(fileURLToPath(import.meta.url));
+const fixtureFactory = path.join(testDir, "runner-child-session-factory.mjs");
+const require = createRequire(import.meta.url);
 const sourceArg = process.argv.indexOf("--source");
 const caseArg = process.argv.indexOf("--case");
 const source = sourceArg >= 0 ? path.resolve(process.argv[sourceArg + 1] ?? "") : "";
@@ -25,7 +30,8 @@ function atomicJson(file, value) {
 	fs.renameSync(temp, file);
 }
 
-async function waitFor(read, description, timeoutMs = 4_000) {
+// Cold Jiti runners need several seconds to compile the TypeScript graph before they can write `ready`.
+async function waitFor(read, description, timeoutMs = 12_000) {
 	const deadline = Date.now() + timeoutMs;
 	for (;;) {
 		const value = read();
@@ -76,13 +82,30 @@ function stage(name, options = {}) {
 		artifactConfig: { enabled: false },
 		asyncDir,
 		resultMode: "single",
-		childSessionFactoryModule: path.join(source, "test/support/runner-child-session-factory.ts"),
+		childSessionFactoryModule: fixtureFactory,
 		revivalLease: { sessionFile, runId, sourceRunId: `source-${name}`, parentSessionId: `parent-${name}` },
 		...(options.protocol === false ? {} : { revivalStartupProtocol: options.protocol ?? PROTOCOL }),
 	};
 	const configPath = path.join(root, `${runId}-config.json`);
 	fs.writeFileSync(configPath, JSON.stringify(config), { mode: 0o600 });
-	const child = spawn(process.execPath, ["--experimental-strip-types", path.join(source, "src/runs/background/subagent-runner.ts"), configPath], {
+	const runnerPath = path.join(source, "src/runs/background/subagent-runner.ts");
+	const sourceUnderNodeModules = source.split(path.sep).some((segment) => segment.toLowerCase() === "node_modules");
+	let jitiPackageJson;
+	try {
+		jitiPackageJson = require.resolve("jiti/package.json", { paths: [source] });
+	} catch {
+		// A source checkout with Node's native TypeScript support does not need Jiti.
+	}
+	const jitiPackage = jitiPackageJson ? JSON.parse(fs.readFileSync(jitiPackageJson, "utf8")) : undefined;
+	const jitiBin = typeof jitiPackage?.bin === "string" ? jitiPackage.bin : jitiPackage?.bin?.jiti;
+	const jitiCli = jitiPackageJson && jitiBin
+		? path.resolve(path.dirname(jitiPackageJson), jitiBin)
+		: undefined;
+	if (sourceUnderNodeModules && !jitiCli) throw new Error("installed pi-subagents startup test requires upstream jiti");
+	const runnerArgs = jitiCli
+		? [jitiCli, runnerPath, configPath]
+		: ["--experimental-strip-types", runnerPath, configPath];
+	const child = spawn(process.execPath, runnerArgs, {
 		cwd: source,
 		stdio: ["ignore", "ignore", "pipe"],
 		env: {
@@ -106,10 +129,14 @@ function stage(name, options = {}) {
 }
 
 async function startupState(s, state) {
-	return waitFor(() => {
-		const value = readJson(s.startup);
-		return value?.state === state ? value : value?.state === "error" ? value : undefined;
-	}, `startup state ${state}`);
+	try {
+		return await waitFor(() => {
+			const value = readJson(s.startup);
+			return value?.state === state ? value : value?.state === "error" ? value : undefined;
+		}, `startup state ${state}`);
+	} catch (error) {
+		throw new Error(`${error instanceof Error ? error.message : String(error)}; runner stderr: ${s.stderr()}`);
+	}
 }
 
 async function stop(s) {
