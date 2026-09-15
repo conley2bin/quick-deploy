@@ -47,10 +47,10 @@ class CapturedSink extends EventEmitter implements TransportSink {
 
   constructor(private readonly clock: FakeClock) { super(); }
 
-  write(value: string): boolean {
-    this.writes.push({ value, at: this.clock.now() });
+  write(value: Buffer): boolean {
+    this.writes.push({ value: value.toString("utf8"), at: this.clock.now() });
     const accepted = this.returns.shift() ?? true;
-    this.onWrite?.(value, accepted);
+    this.onWrite?.(value.toString("utf8"), accepted);
     if (!accepted && this.reflectNeedDrain) this.writableNeedDrain = true;
     return accepted;
   }
@@ -91,7 +91,9 @@ test("a multipart Kitty upload is one captured write with legal APC continuation
   const { clock, sink, owner } = transport({ minIntervalMs: 25 });
   const sourceBytes = Buffer.alloc(7_000, 0xa5);
   const source = sourceBytes.toString("base64");
-  const upload = completeUploadTransaction(sourceBytes, 0x71123456, false);
+  const uploadBuffer = completeUploadTransaction(sourceBytes, 0x71123456, false);
+  assert.ok(Buffer.isBuffer(uploadBuffer));
+  const upload = uploadBuffer.toString("utf8");
   const put = placement(0x71123456, 12, 7, false);
 
   const uploadResult = owner.enqueue(owner.generation, { transaction: upload, key: "upload:sha256" });
@@ -150,7 +152,7 @@ test("synchronous drain and reentrant enqueue during write cannot be lost or rec
   };
 
   await owner.enqueue(owner.generation, { transaction: "first" });
-  clock.advance(0);
+  clock.advance(1);
   await second;
   await owner.ready(owner.generation);
   assert.deepEqual(sink.writes.map(({ value }) => value), ["first", "second"]);
@@ -171,6 +173,7 @@ test("cancellation preserves internally observed false-return flow control until
   assert.deepEqual(sink.writes.map(({ value }) => value), ["accepted-before-cancel"]);
   assert.equal(sink.listenerCount("drain"), 1);
   sink.emit("drain");
+  clock.advance(1);
   await afterCancel;
   assert.deepEqual(sink.writes.map(({ value }) => value), ["accepted-before-cancel", "after-cancel"]);
   assert.equal(sink.listenerCount("drain"), 0);
@@ -239,20 +242,20 @@ test("ready waits for accepted-false bytes to drain even when no later graphics 
 
 test("documented default bounds equal the executable limits and enforce the exact maximum write", async () => {
   assert.deepEqual(DEFAULT_TRANSPORT_LIMITS, {
-    maxTransactionBytes: 1 * 1024 * 1024,
-    maxQueuedBytes: 8 * 1024 * 1024,
+    maxTransactionBytes: 44 * 1024 * 1024,
+    maxQueuedBytes: 96 * 1024 * 1024,
     maxQueuedJobs: 64,
     maxResources: 64,
     minIntervalMs: 50,
-    drainTimeoutMs: 5_000,
+    drainTimeoutMs: 60_000,
+    wireRateBytesPerSecond: 8 * 1024 * 1024,
   });
-  const { sink, owner } = transport();
-  const boundary = "x".repeat(DEFAULT_TRANSPORT_LIMITS.maxTransactionBytes);
-  await owner.enqueue(owner.generation, { transaction: boundary });
-  assert.equal(Buffer.byteLength(sink.writes[0]!.value), DEFAULT_TRANSPORT_LIMITS.maxTransactionBytes);
+  const { sink, owner } = transport({ maxTransactionBytes: 4, maxQueuedBytes: 8, minIntervalMs: 0 });
+  await owner.enqueue(owner.generation, { transaction: "1234" });
+  assert.equal(Buffer.byteLength(sink.writes[0]!.value), 4);
   await assert.rejects(
-    owner.enqueue(owner.generation, { transaction: `${boundary}x` }),
-    /transaction is 1048577 bytes; limit is 1048576/u,
+    owner.enqueue(owner.generation, { transaction: "12345" }),
+    /transaction is 5 bytes; limit is 4/u,
   );
   owner.dispose();
 });
@@ -262,6 +265,7 @@ test("maximum write bytes and transaction start rate are exact and finite", asyn
     maxTransactionBytes: 4,
     maxQueuedBytes: 16,
     minIntervalMs: 50,
+    wireRateBytesPerSecond: 4,
   });
   const one = owner.enqueue(owner.generation, { transaction: "aaaa" });
   const two = owner.enqueue(owner.generation, { transaction: "bbbb" });
@@ -272,9 +276,11 @@ test("maximum write bytes and transaction start rate are exact and finite", asyn
   assert.deepEqual(sink.writes.map(({ at }) => at), [0]);
   clock.advance(49);
   assert.deepEqual(sink.writes.map(({ at }) => at), [0]);
-  clock.advance(1);
   clock.advance(50);
-  assert.deepEqual(sink.writes.map(({ at }) => at), [0, 50, 100]);
+  assert.deepEqual(sink.writes.map(({ at }) => at), [0]);
+  clock.advance(950);
+  clock.advance(1_000);
+  assert.deepEqual(sink.writes.map(({ at }) => at), [0, 1_000, 2_000]);
   assert.ok(sink.writes.every(({ value }) => Buffer.byteLength(value) <= 4));
   await Promise.all([one, two, three]);
   owner.dispose();
@@ -283,7 +289,7 @@ test("maximum write bytes and transaction start rate are exact and finite", asyn
 test("job, queued-byte, and retained-resource limits reject without disturbing admitted work", async () => {
   const a = transport({
     maxTransactionBytes: 10,
-    maxQueuedBytes: 5,
+    maxQueuedBytes: 6,
     maxQueuedJobs: 2,
     maxResources: 2,
     minIntervalMs: 1,
@@ -299,12 +305,12 @@ test("job, queued-byte, and retained-resource limits reject without disturbing a
   a.owner.cancel("cancel test cleanup");
   await Promise.all([secondRejected, thirdRejected]);
 
-  const b = transport({ maxTransactionBytes: 10, maxQueuedBytes: 4, minIntervalMs: 1 });
+  const b = transport({ maxTransactionBytes: 10, maxQueuedBytes: 5, minIntervalMs: 1 });
   b.sink.returns.push(false);
   await b.owner.enqueue(b.owner.generation, { transaction: "x" });
   const queued = b.owner.enqueue(b.owner.generation, { transaction: "1234" });
   const queuedRejected = assert.rejects(queued, /byte test cleanup/u);
-  await assert.rejects(b.owner.enqueue(b.owner.generation, { transaction: "z" }), /queued graphics bytes would exceed 4/u);
+  await assert.rejects(b.owner.enqueue(b.owner.generation, { transaction: "z" }), /wire budget would exceed 5/u);
   b.owner.cancel("byte test cleanup");
   await queuedRejected;
   a.owner.dispose();
@@ -343,7 +349,7 @@ test("generation cancellation rejects queued jobs, preserves drain flow control,
   await abandonedRejected;
   assert.equal(owner.generation, 1);
   assert.equal(owner.pendingJobs, 0);
-  assert.equal(owner.pendingBytes, 0);
+  assert.equal(owner.pendingBytes, 8, "accepted-false bytes remain admitted until drain");
   assert.equal(owner.retainedResources, 0);
   assert.equal(sink.listenerCount("drain"), 1, "flow-control listener survives generation cancellation");
   assert.equal(clock.count, 1, "outstanding false return retains its drain deadline");

@@ -185,7 +185,7 @@ test("native AssistantMessage output selects a precreated custom placement and e
   const terminal = new TerminalImages(
     () => 0x07123456,
     () => ({ widthPx: 10, heightPx: 20 }),
-    { write: (value) => { writes.push(value); return true; } },
+    { write: (value: Buffer) => { writes.push(value.toString("utf8")); return true; } },
     { TERM_PROGRAM: "ghostty" },
     true,
     { transportLimits: { minIntervalMs: 0 } },

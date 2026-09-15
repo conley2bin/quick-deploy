@@ -19,7 +19,7 @@ function runtime() {
   const terminal = new TerminalImages(
     () => ++id,
     () => ({ widthPx: 10, heightPx: 20 }),
-    { write: (value) => { writes.push(value); return true; } },
+    { write: (value: Buffer) => { writes.push(value.toString("utf8")); return true; } },
     kittyEnv,
     true,
     { transportLimits: { minIntervalMs: 0 } },

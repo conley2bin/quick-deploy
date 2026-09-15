@@ -1,9 +1,10 @@
 import { spawnSync } from "node:child_process";
 import type { LoadedImage } from "./images.ts";
-import { MAX_PREVIEW_PNG_BYTES } from "./images.ts";
+import { MAX_FULL_PNG_BYTES } from "./images.ts";
 import {
   BoundedTransport,
-  completeUploadTransaction,
+  completeImageTransaction,
+  uploadTransactionBytes,
   type TransportLimits,
   type TransportScheduler,
   type TransportSink,
@@ -11,9 +12,10 @@ import {
 import { deleteImage, grid, placement } from "../vendor/pi-tmux-images/kitty-placeholder.ts";
 
 export const MAX_ACTIVE_IMAGES = 64;
-export const MAX_RESIDENT_PNG_BYTES = 12 * 1024 * 1024;
+export const MAX_RESIDENT_PNG_BYTES = 64 * 1024 * 1024;
 export const MAX_PLACEMENTS_PER_IMAGE = 80;
 export const MAX_PLACEMENT_CATALOG_BYTES = 80 * 56;
+export const MAX_IMAGE_TRANSACTION_BYTES = 44 * 1024 * 1024;
 
 export type CellSize = { widthPx: number; heightPx: number };
 type TmuxResult = { status: number | null; stdout: string | null };
@@ -33,7 +35,7 @@ type StoredImage = {
   error?: string;
 };
 
-export type BasicSink = { write(value: string): boolean };
+export type BasicSink = { write(value: Buffer): boolean };
 
 export interface TerminalImageOptions {
   maxResidentPngBytes?: number;
@@ -119,8 +121,8 @@ export class TerminalImages {
       return;
     }
     if (this.images.size >= MAX_ACTIVE_IMAGES) throw new Error(`inline image capacity reached (${MAX_ACTIVE_IMAGES})`);
-    if (image.png.length > MAX_PREVIEW_PNG_BYTES) {
-      throw new Error(`derived PNG preview is ${image.png.length} bytes; limit is ${MAX_PREVIEW_PNG_BYTES} bytes`);
+    if (image.png.length > MAX_FULL_PNG_BYTES) {
+      throw new Error(`full PNG is ${image.png.length} bytes; limit is ${MAX_FULL_PNG_BYTES} bytes`);
     }
     if (this.residentPngBytes + image.png.length > this.maxResidentPngBytes) {
       throw new Error(`resident PNG budget reached (${this.maxResidentPngBytes} bytes)`);
@@ -135,8 +137,6 @@ export class TerminalImages {
     const state: StoredImage = { image, id, ready: false, placements, cell };
     this.images.set(logicalId, state);
     this.residentPngBytes += image.png.length;
-    const generation = this.transport.generation;
-    const upload = completeUploadTransaction(image.png, id, this.inTmux());
     const placementCommands = [...placements.values()].map((candidate) =>
       placement(id, candidate.columns, candidate.rows, this.inTmux(), candidate.placementId)).join("");
     const placementBytes = Buffer.byteLength(placementCommands);
@@ -144,9 +144,20 @@ export class TerminalImages {
       state.error = `placement catalog is ${placementBytes} bytes; limit is ${MAX_PLACEMENT_CATALOG_BYTES} bytes`;
       throw new Error(state.error);
     }
+    const transactionBytes = uploadTransactionBytes(image.png.length, id, this.inTmux()) + placementBytes;
+    if (transactionBytes > MAX_IMAGE_TRANSACTION_BYTES) {
+      state.error = `full image transaction is ${transactionBytes} bytes; limit is ${MAX_IMAGE_TRANSACTION_BYTES} bytes`;
+      throw new Error(state.error);
+    }
+    const generation = this.transport.generation;
     try {
-      await this.transport.enqueue(generation, { transaction: upload, key: `upload:${id}:${image.hash}` });
-      await this.transport.enqueue(generation, { transaction: placementCommands });
+      // Reserve before base64 construction, then keep chunks and placements in
+      // one Buffer/write so no other graphics writer can split the multipart.
+      await this.transport.enqueue(generation, {
+        transaction: () => completeImageTransaction(image.png, id, this.inTmux(), placementCommands),
+        bytes: transactionBytes,
+        key: `upload:${id}:${image.hash}`,
+      });
       await this.transport.ready(generation);
       if (generation !== this.transport.generation || this.images.get(logicalId) !== state) {
         throw new Error("image preparation completed in an abandoned generation");
