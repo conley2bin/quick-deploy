@@ -187,9 +187,10 @@ fake_ip_filter_block() {
     - '*.bytedance.com'
     - 'dingtalk.com'
     - '*.dingtalk.com'
-    # GitHub 支持（主域名 + 通配符）
+    # GitHub 主站保持原有解析；不再过滤 *.github.com。
+    # ssh.github.com 需要 Fake-IP 映射保留域名，才能命中专用 DIRECT 规则。
+    # 原始 SSH 没有 TLS SNI，不能依靠 TLS sniffer 恢复这个域名。
     - 'github.com'
-    - '*.github.com'
     - 'githubusercontent.com'
     - '*.githubusercontent.com'
     - 'githubassets.com'
@@ -294,7 +295,7 @@ update_fake_ip_filter() {
         } >> "$file"
     fi
 
-    echo "pass Fake-IP Filter 已更新 (GitHub 主域名和通配符)"
+    echo "pass Fake-IP Filter 已更新（保留 ssh.github.com 的域名上下文）"
 }
 
 # 写入规范 TUN 配置（可重复执行）
@@ -439,6 +440,7 @@ print("")
 
 # 与 Script.js 的 forceTop 一一对应。mihomo /rules 的 type 是驼峰形式。
 force_top = [
+    ("Domain",       "ssh.github.com"),
     ("DstPort",      "22"),
     ("DomainSuffix", "dex-gem.ai"),
     ("DomainSuffix", "feishu.cn"),
@@ -751,6 +753,7 @@ function main(config) {
   // 例外全部遮蔽，services.googleapis.cn 从代理变直连，这是实打实的回归。
   // 所以对乙类，下面那个 existing.has(r) 跳过不是 bug，是正确行为，不要"顺手修掉"。
   const forceTop = [
+    "DOMAIN,ssh.github.com,DIRECT",
     "DST-PORT,22,DIRECT",
     "DOMAIN-SUFFIX,dex-gem.ai,DIRECT",
     "DOMAIN-SUFFIX,feishu.cn,DIRECT",
@@ -759,15 +762,10 @@ function main(config) {
   ];
 
   const prependRules = [
-    // 出站 TCP/22 必须直连。
-    // 实测（mihomo /proxies/<node>/delay 打 http://portquiz.net:22/，443 作存活对照）：
-    // 该订阅 84 个节点中 81 个 443 通、22 全部不通，另 3 个节点连 443 对照都不通。
-    // 0/84 放行出站 22 —— 这是机场服务级策略，不是某个节点的问题，换节点无用。
-    // 症状是 connect 成功后 0 字节 EOF，看起来像对端拒绝，实际是出口丢弃。
-    // 因此把 22 端口交给代理是确定性失败；直连至少可用（本地实测 github /
-    // gitlab / salsa.debian.org / sourceware.org 的 :22 直连均返回 SSH banner）。
-    // GitHub 若已由 ~/.ssh/config 改走 ssh.github.com:443，则不受此规则影响，
-    // 仍走代理 —— 那是更稳的路径，两者互补而非互斥。
+    // GitHub SSH 使用 443；端口 22 的规则不会匹配它，需要单独指定 DIRECT。
+    // 保留 ssh.github.com 的 Fake-IP 域名映射（见 fake_ip_filter_block）。
+    "DOMAIN,ssh.github.com,DIRECT",
+    // 保持原有的出站 22 端口直连策略；路由策略不等于远端可达性保证。
     "DST-PORT,22,DIRECT",
     // LiteLLM 模型网关（pi CLI 的默认 provider）直连，不走任何代理节点。
     // 事故记录（2026-08-09, conley-company）：Proxy 组选中节点失联后，
@@ -910,51 +908,17 @@ remove_managed_ssh_block() {
 github_ssh_block() {
     cat << 'EOF'
 # >>> tun-fix.sh github ssh >>>
-# GitHub SSH 走 443 端口。
-# 实测机制：流量已正确走代理，是机场封禁出站 TCP/22——不是某个节点的问题。
-# 逐节点探测（portquiz.net:22 走 /proxies/<node>/delay，443 作存活对照）：
-# 84 个节点里 0 个放行 22，81 个 443 正常。换节点无解。
-# 症状：connect 成功后一个 RTT 内返回 0 字节即断开（github/gitlab/bitbucket/
-# kernel.org 一致），同节点 :443 与 :9418 正常。443 端口不受影响。
-#
-# 2026-09-15 更正：上面的「443 端口不受影响」已被证伪——443 只是能连、能完成
-# SSH 握手与公钥认证，会话数据照样被掐。当时的判据是 TCP 层 delay 探测，
-# 只能证明 connect，看不到会话阶段。本机实测：
-#   - 33 个节点逐一 ssh -T git@github.com（会话回复仅 ~90 字节）：31 个静默
-#     blackhole，2 个被对端 close；0 个成功。
-#   - 同节点 HTTPS 到 github.com 完全正常（200 OK，大文件照传），所以不是
-#     GitHub 或节点故障，是 SSH 这一层被针对。
-#   - 换出口即恢复：实验室机（ylang-U22）上同一把钥匙 :22 和 :443 都直接
-#     返回 "Hi conley2bin! You've successfully authenticated"。
-#   - 客户端不会报错而是挂住：mihomo 不把上游 stall 透传，本地 socket 只会
-#     重传（RTO backoff 到 120s，11 次重传，cwnd 跌到 1），约 15 分钟后才超时。
-# 当前生效的修法见 ~/.ssh/config 顶部的 pi 块：Host github.com 的 ProxyCommand
-# 经 4090 跳板，实测 git fetch 一个来回 4~11s（对比：机场路径无限挂起）。
-# 另一条可选路径是 HTTPS + PAT（HTTPS 走机场完全正常），不需要跳板但需要令牌。
-#
-# 若要用本脚本管理跳板：在下面 Host 块里加
-#   ProxyCommand ssh -o BatchMode=yes -o ConnectTimeout=8 -W %h:%p 4090
-# 注意这会引入对 4090 在线状态的依赖（离线时快速失败，不再挂 15 分钟）。
+# GitHub SSH uses ssh.github.com:443; the port alone does not select a route.
+# Clash rule DOMAIN,ssh.github.com,DIRECT selects the local outbound.
+# IPQoS none avoids the reproduced post-auth stall on this machine's TUN path.
 Host github.com ssh.github.com
-    Hostname ssh.github.com
+    HostName ssh.github.com
     Port 443
     User git
-    # 显式指定密钥：SSH 远程会话/脚本里没有 ssh-agent 可用，不指定则
-    # 握手无钥可提供，报 Permission denied (publickey)。两台机器统一把
-    # 钥匙放在 ~/.ssh/conley，本脚本因此可以不加修改地在任一台上运行。
     IdentityFile ~/.ssh/conley
     IdentitiesOnly yes
-
-# 机场对所有境外 :22 都封，如需 GitLab / Bitbucket 取消下方注释即可
-#Host gitlab.com altssh.gitlab.com
-#    Hostname altssh.gitlab.com
-#    Port 443
-#    User git
-#
-#Host bitbucket.org altssh.bitbucket.org
-#    Hostname altssh.bitbucket.org
-#    Port 443
-#    User git
+    IPQoS none
+    ConnectTimeout 8
 # <<< tun-fix.sh github ssh <<<
 EOF
 }
@@ -962,25 +926,29 @@ EOF
 # 用 ssh 自己的解析结果确认块真的生效，而不是被更靠前的块遮蔽了。
 # 写入成功 ≠ 生效：SSH 取首个匹配到的值，且会需要考虑 Include 与 /etc/ssh/ssh_config。
 verify_github_ssh_config() {
-    local out h p
+    local out h p qos proxy
 
     if ! command -v ssh >/dev/null 2>&1; then
-        echo "未找到 ssh 命令，跳过生效检查"
-        return 0
+        echo "未找到 ssh 命令，跳过生效检查（不是通过）"
+        return 1
     fi
 
     out=$(ssh -G github.com 2>/dev/null || true)
     h=$(printf '%s\n' "$out" | awk '$1=="hostname"{print $2; exit}')
     p=$(printf '%s\n' "$out" | awk '$1=="port"{print $2; exit}')
+    qos=$(printf '%s\n' "$out" | awk '$1=="ipqos"{print $2 " " $3; exit}')
+    proxy=$(printf '%s\n' "$out" | awk '($1=="proxycommand" || $1=="proxyjump") && $2!="none"{print $1}')
 
-    if [ "$h" = "ssh.github.com" ] && [ "$p" = "443" ]; then
-        echo "pass ssh -G github.com 解析为 $h:$p，块已真正生效"
+    if [ "$h" = "ssh.github.com" ] && [ "$p" = "443" ] && \
+       [ "$qos" = "none none" ] && [ -z "$proxy" ]; then
+        echo "pass SSH 解析为 $h:$p，IPQoS none，无跳板"
+        echo "     这是静态配置检查；还需用 git ls-remote 和活跃连接确认 DIRECT 与仓库权限。"
         return 0
     fi
 
-    echo "fail ssh -G github.com 解析为 ${h:-?}:${p:-?}，本脚本写入的块没有生效"
-    echo "     SSH 取首个匹配到的值，说明还有更靠前的 Host / Match / Include 在覆盖它："
-    grep -nE '^[[:space:]]*(Host|Match|Include)[[:space:]]' "$HOME/.ssh/config" 2>/dev/null | head -20
+    echo "fail SSH 解析为 ${h:-?}:${p:-?}，IPQoS=${qos:-?}，跳板设置=${proxy:-无}"
+    echo "     检查 Host / Match / Include 的首值优先规则，以及旧的 ProxyCommand/ProxyJump："
+    grep -nE '^[[:space:]]*(Host|Match|Include|ProxyCommand|ProxyJump|IPQoS)[[:space:]]' "$HOME/.ssh/config" 2>/dev/null | head -20
     return 1
 }
 
@@ -995,19 +963,16 @@ configure_ssh() {
     echo "  配置 SSH for GitHub (可选)"
     echo "==========================================="
     echo ""
-    echo "此配置让 GitHub SSH 走 ssh.github.com:443。"
-    echo "实测原因：流量已正确路由到代理，是机场封禁出站 TCP/22（订阅内 84 个节点"
-    echo "逐一探测，0 个放行 22；换节点无用）。"
+    echo "此配置使用 ssh.github.com:443，并设置 IPQoS none，不增加跳板。"
+    echo "路由由 Clash 决定：选项 1 生成 DOMAIN,ssh.github.com,DIRECT。"
+    echo "DST-PORT,22,DIRECT 不覆盖 443；只改端口不等于直连。"
     echo ""
-    echo "warning 2026-09-15 更正：443 也不再够用。33 个节点逐一 ssh -T git@github.com"
-    echo "  全部失败（31 个静默 blackhole、2 个被 close）——握手和认证能过，会话数据被掐。"
-    echo "  同节点 HTTPS 到 github.com 正常，实验室机上同一把钥匙 :443 直接成功，"
-    echo "  所以是机场针对 SSH，不是端口问题。当前可用路径是 ~/.ssh/config 里的"
-    echo "  4090 跳板（ProxyCommand）；HTTPS + PAT 是另一条不需要跳板的路。"
+    echo "认证后卡住时，需区分路由与 QoS：同一 DIRECT 路径的 A/B/A 实测中，"
+    echo "默认 IPQoS 两次超时，IPQoS none 成功；不能仅凭换节点失败认定机场封 SSH。"
+    echo "ConnectTimeout 只限制连接/初始握手，不是整个 git 命令的超时。"
     echo ""
-    echo "与选项 1 的分工：选项 1 写入的 DST-PORT,22,DIRECT 让所有 22 端口直连，"
-    echo "覆盖你自己的境外主机；本选项让 GitHub 改用 443，继续走代理，路径更稳。"
-    echo "两者不冲突：GitHub 从此不再使用 22，DIRECT 规则自然不会命中它。"
+    echo "选项 2 只改 SSH；选项 1 会改更多路由和 DNS 设置。"
+    echo "若只修 GitHub，可在订阅 Rules 扩展 prepend 中加入专用 DIRECT 规则后重载。"
     echo ""
 
     # 检查是否已配置
@@ -1138,7 +1103,7 @@ verify_merge_yaml() {
 
     # 规范条目抽查（与 fake_ip_filter_block / tun_block 单源内容对应的代表项）
     local entry
-    for entry in "- 'github.com'" "- '*.github.com'" "- '*.tsinghua.edu.cn'" "- '+._tcp'"; do
+    for entry in "- 'github.com'" "- '*.tsinghua.edu.cn'" "- '+._tcp'"; do
         if grep -qF -- "$entry" "$file"; then
             echo "pass 条目在场: $entry"
         else
@@ -1146,6 +1111,14 @@ verify_merge_yaml() {
             fail=1
         fi
     done
+
+    # 不允许重新引入匹配 ssh.github.com 的通配符过滤，否则专用域名规则失去上下文。
+    if grep -qE "^[[:space:]]*-[[:space:]]*['\"]?(\*\.github\.com|ssh\.github\.com)['\"]?[[:space:]]*$" "$file"; then
+        echo "fail fake-ip-filter 过滤了 ssh.github.com，SSH 的 DIRECT 域名规则无法可靠匹配"
+        fail=1
+    else
+        echo "pass fake-ip-filter 保留 ssh.github.com 的域名上下文"
+    fi
 
     if grep -q 'route-exclude-address' "$file"; then
         echo "pass route-exclude-address 在场"
@@ -1230,7 +1203,7 @@ optimize_all() {
     echo "pass Fake-IP Filter: 已配置 (主域名 + 通配符)"
     echo "  - 本地网络 (*.local, *.lan)"
     echo "  - 企业应用 (飞书、钉钉、字节跳动)"
-    echo "  - GitHub (github.com, *.github.com, 等)"
+    echo "  - GitHub 主站及资源域名；ssh.github.com 保留 Fake-IP 域名映射"
     echo ""
     echo "TUN 模式: 已写入 tun: 块（route-exclude-address 排除 192.168.0.0/16、10.0.0.0/8、172.16.0.0/12、127.0.0.0/8）"
     echo "  尚未验证生效：需重载 Clash Verge 后，由 verify_tun_routes 看内核路由确认"
@@ -1245,8 +1218,8 @@ optimize_all() {
     echo "    DNS 的路径（DoH、排除段内 DNS、硬编码 IP）连接以真实 IP 裸进 TUN，此前"
     echo "    一路掉到 MATCH 走代理（2026-08-19 实测）。sniffer 从 TLS SNI 恢复域名，"
     echo "    litellm.dex-gem.ai 的直连不再依赖 fake-ip。由 verify_sniffer_live 实测"
-    echo "  - 出站 TCP/22 直连 (DST-PORT,22) —— 机场 84 个节点全部封禁出站 22，"
-    echo "    走代理必然是 connect 后 0 字节断开；直连是唯一可用路径"
+    echo "  - GitHub SSH 专用直连 (DOMAIN,ssh.github.com)，覆盖 443 端口"
+    echo "  - 保持出站 22 端口直连策略 (DST-PORT,22)，远端可达性仍需实测"
     echo "  - 中国大陆 IP (GEOIP,CN)"
     echo "  - 中国域名 (.cn, .com.cn)"
     echo "  - 常见中国网站 (B站、知乎、抖音、淘宝等)"
