@@ -1,0 +1,27 @@
+{
+  "package": "pi-subagents",
+  "version": "0.68.0",
+  "origin": "https://github.com/nicobailon/pi-subagents.git",
+  "upstreamTag": "v0.68.0",
+  "upstreamCommit": "f3ccf47dc236b6c0fcc0d897cec4a9e6da3e916d",
+  "patch": "0001-bind-revival-startup-protocol.patch",
+  "patchSha256": "3af85b735c00cfd5cdde2a95f95a96a6a4ee9a3e713c696b7059c4f6149e88fa",
+  "files": {
+    "package.json": {
+      "before": "6b2d3d85c5c8a97491be89ceb7bd0d5e7d71a2a260596db8c2c019d1f6842faa",
+      "after": "6b2d3d85c5c8a97491be89ceb7bd0d5e7d71a2a260596db8c2c019d1f6842faa"
+    },
+    "src/runs/background/async-execution.ts": {
+      "before": "b3870b8728828840345008704f9ddcaf1dfab1461e397f28924f75affb168587",
+      "after": "4023c6c472022420780f76441902dfdaacb65ce9bafb8c333671685a47f9a406"
+    },
+    "src/runs/background/subagent-runner.ts": {
+      "before": "dad54a5743ff8f112f561d701236f63a54080bfc2285b410e6c4c3134d9de382",
+      "after": "8de49ea4b358cbc2d89d4ab0025c869874edace03cf37ccd02667fe43d0ab57b"
+    },
+    "src/runs/shared/revival-startup-protocol.ts": {
+      "before": null,
+      "after": "58da65af820ab117d32d2921089d36d630f7e2e68a36c94131dd620dd259390e"
+    }
+  }
+}

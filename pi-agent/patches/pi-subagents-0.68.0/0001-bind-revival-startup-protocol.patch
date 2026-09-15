@@ -1,0 +1,37 @@
+diff --git a/src/runs/background/async-execution.ts b/src/runs/background/async-execution.ts
+index e5f5f62..b5aa4cb 100644
+--- a/src/runs/background/async-execution.ts
++++ b/src/runs/background/async-execution.ts
+@@ -80,0 +81 @@ import type { SessionLeaseRequest } from "../shared/session-lease.ts";
++import { REVIVAL_STARTUP_PROTOCOL } from "../shared/revival-startup-protocol.ts";
+@@ -710 +711,6 @@ function spawnRunner(cfg: object, suffix: string, cwd: string, initialStatus: Om
+-	const launchConfig = { ...cfg, runnerProcessInstanceId, ...(launchBarrierToken ? { launchBarrierToken } : {}) };
++	const launchConfig = {
++		...cfg,
++		runnerProcessInstanceId,
++		...(hasRevivalLease ? { revivalStartupProtocol: REVIVAL_STARTUP_PROTOCOL } : {}),
++		...(launchBarrierToken ? { launchBarrierToken } : {}),
++	};
+diff --git a/src/runs/background/subagent-runner.ts b/src/runs/background/subagent-runner.ts
+index 48410a9..49070dc 100644
+--- a/src/runs/background/subagent-runner.ts
++++ b/src/runs/background/subagent-runner.ts
+@@ -149,0 +150 @@ import { acquireSessionLease, type SessionLeaseRequest } from "../shared/session
++import { REVIVAL_STARTUP_PROTOCOL } from "../shared/revival-startup-protocol.ts";
+@@ -220,0 +222 @@ export interface SubagentRunConfig {
++	revivalStartupProtocol?: string;
+@@ -5241,0 +5244,3 @@ export async function runConfiguredSubagent(config: SubagentRunConfig, options?:
++			if (config.revivalStartupProtocol !== REVIVAL_STARTUP_PROTOCOL) {
++				throw new Error(`Runner revival startup protocol mismatch: expected '${REVIVAL_STARTUP_PROTOCOL}'. Reload the parent Pi session before retrying the retained resume.`);
++			}
+diff --git a/src/runs/shared/revival-startup-protocol.ts b/src/runs/shared/revival-startup-protocol.ts
+new file mode 100644
+index 0000000..face42a
+--- /dev/null
++++ b/src/runs/shared/revival-startup-protocol.ts
+@@ -0,0 +1,5 @@
++/**
++ * Parent/runner binding for the retained-session startup authority handshake.
++ * Bump this value whenever either side changes the ordered control states.
++ */
++export const REVIVAL_STARTUP_PROTOCOL = "lease-ack-confirm-proceed-v1";
