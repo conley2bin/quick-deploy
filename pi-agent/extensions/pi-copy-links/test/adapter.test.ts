@@ -37,13 +37,13 @@ function target(tui: TuiAltScreen, prefix: string) {
 function click(terminal: FakeTerminal, point: {x: number; y: number}, bits = 0) {
   terminal.input(sgr(point.x, point.y, bits)); terminal.input(sgr(point.x, point.y, bits, 'm'));
 }
-function fixture(source: string) {
+function fixture(source: string, tmuxRecovery = false) {
   const terminal = new FakeTerminal();
   const copied: string[] = [], opened: string[] = [], nativeOpened: string[] = [], notices: string[] = [];
   let active = true;
   const adapter = installAdapter({ version: VERSION, active: () => active,
     copy: async text => { copied.push(text); }, open: async url => { opened.push(url); },
-    notify: text => { notices.push(text); }, button: text => text });
+    notify: text => { notices.push(text); }, button: text => text, recoverTmuxRelease: () => tmuxRecovery });
   const component = new AssistantMessageComponent(message(source), false, undefined, "Thinking", 1, [adapter.transform]);
   const tui = new TuiAltScreen(terminal, false, undefined, { openUrl: url => nativeOpened.push(url), copySelection: async () => true });
   tui.addChild(component); tui.start(); tui.renderNow();
@@ -59,6 +59,7 @@ test("native assistant buttons copy exact code, including nested tabs and no vis
     ['> ```py\n> if True:\n>     print("中文")\n> ```', 'if True:\n    print("中文")'],
     ['Instructions\n\n    echo a\n    \techo b', 'echo a\n\techo b'],
     ['```\n```', ''],
+    ['```sh   example\necho metadata\n```', 'echo metadata'],
   ]) {
     const f = fixture(source!);
     try {
@@ -147,4 +148,38 @@ test("incompatible Pi refuses adaptation before any prototype changes", () => {
   assert.throws(() => installAdapter({ version: '9.9.9', active: () => true,
     copy: async () => {}, open: async () => {}, notify: () => {}, button: s => s }), /仅适配/);
   assert.equal(Markdown.prototype.render, original);
+});
+
+
+test("tmux lost-press recovery requires a recent modifier transition, stable screen and no drag", async () => {
+  const f = fixture('[link](https://example.com/)', true);
+  try {
+    let point = target(f.tui, 'https:');
+    f.terminal.input(sgr(point.x, point.y, 16, 'm')); await tick();
+    assert.deepEqual(f.opened, [], 'arbitrary orphan release is not a click');
+    click(f.terminal, point); await tick();
+    f.terminal.input(sgr(point.x, point.y, 16, 'm')); await tick();
+    assert.deepEqual(f.opened, ['https://example.com/'], 'known tmux modifier-transition loss is recovered');
+    click(f.terminal, point); await tick();
+    f.terminal.input(sgr(point.x + 1, point.y, 48));
+    f.terminal.input(sgr(point.x, point.y, 16, 'm')); await tick();
+    assert.equal(f.opened.length, 1, 'drag cancels recovery even if it returns to the same link');
+    click(f.terminal, point); await tick();
+    f.component.updateContent(message('inserted row\n\n[link](https://example.com/)')); f.tui.renderNow();
+    point = target(f.tui, 'https:');
+    f.terminal.input(sgr(point.x, point.y, 16, 'm')); await tick();
+    assert.equal(f.opened.length, 1, 'changed viewport cannot recover a missing press');
+  } finally { f.close(); }
+});
+
+test("native partial-fence trimming does not copy guessed or outdated code", async () => {
+  const f = fixture('start');
+  try {
+    f.component.updateContent(message('```sh\necho x\n``'), true); f.tui.renderNow();
+    assert.doesNotMatch(screen(f.tui).join('\n'), /pi-copy:\/\//);
+    assert.deepEqual(f.notices, []);
+    f.component.updateContent(message('```sh\necho x\n```'), false); f.tui.renderNow();
+    click(f.terminal, target(f.tui, 'pi-copy://')); await tick();
+    assert.deepEqual(f.copied, ['echo x']);
+  } finally { f.close(); }
 });

@@ -26,6 +26,7 @@ interface FullscreenRuntime extends TUI {
 }
 interface Frame { owner: MarkdownRuntime; blocks?: ReturnType<typeof codeBlocks>; entries?: CopyEntry[]; used: Set<number>; streaming?: boolean }
 interface Press { url: string; x: number; y: number; line: string; width: number; height: number; moved: boolean }
+interface Release { bits: number; at: number; screen: string[]; width: number; height: number }
 export interface AdapterOptions {
   version: string;
   active: () => boolean;
@@ -33,6 +34,7 @@ export interface AdapterOptions {
   open: (url: string) => Promise<void>;
   notify: (message: string, error?: boolean) => void;
   button: (text: string) => string;
+  recoverTmuxRelease?: () => boolean;
 }
 
 export function installAdapter(options: AdapterOptions) {
@@ -46,6 +48,7 @@ export function installAdapter(options: AdapterOptions) {
   const store = new CopyStore();
   const frames: Frame[] = [];
   const presses = new WeakMap<object, Press>();
+  const releases = new WeakMap<object, Release>();
   let enabled = true;
   let warned = false;
   let copyQueue = Promise.resolve();
@@ -80,7 +83,7 @@ export function installAdapter(options: AdapterOptions) {
     // values and language; never strip/dedent a rendered command to guess its source.
     const index = frame.blocks!.findIndex((block, i) => !frame.used.has(i) &&
       block.value.replace(/\t/gu, "   ") === value.text &&
-      [block.lang, block.meta].filter(Boolean).join(" ") === (value.lang ?? ""));
+      [block.lang, block.meta].filter(Boolean).join(" ").replace(/\s+/gu, " ") === (value.lang ?? "").trim().replace(/\s+/gu, " "));
     if (index < 0) {
       if (!warned && !frame.streaming) {
         warned = true;
@@ -140,6 +143,7 @@ export function installAdapter(options: AdapterOptions) {
     const pending = presses.get(this);
     if (!event) {
       presses.delete(this);
+      releases.delete(this);
       return original.input.call(this, data);
     }
     const bits = Number(event[1]);
@@ -156,19 +160,45 @@ export function installAdapter(options: AdapterOptions) {
       x >= 0 && x < width && y >= 0 && y < height && Array.isArray(this.previousScreen);
     const line = valid ? this.previousScreen[y] ?? "" : "";
     const url = getOsc8LinkAtColumn(line, x);
+    const actionable = url && (bits & 12) === 0 && (store.owns(url) || ((bits & 16) !== 0 && webUrl(url)));
+    const rememberRelease = () => {
+      if (valid && primary && release && !motion) releases.set(this, {
+        bits, at: performance.now(), screen: [...this.previousScreen], width, height,
+      });
+      else releases.delete(this);
+    };
     if (pending && !wheel) {
       if (motion || x !== pending.x || y !== pending.y) pending.moved = true;
       if (release) {
         presses.delete(this);
         if (primary && !pending.moved && valid && pending.url === url && pending.line === line &&
             pending.width === width && pending.height === height) invoke(pending.url);
+        if (pending.moved) releases.delete(this);
+        else rememberRelease();
       }
       return { consume: true };
     }
     if (wheel) presses.delete(this);
-    if (!wheel && !motion && !release && primary && valid && url && (bits & 12) === 0 &&
-        (store.owns(url) || ((bits & 16) !== 0 && webUrl(url)))) {
-      presses.set(this, { url, x, y, line, width, height, moved: false });
+    if (motion || wheel || !valid) releases.delete(this);
+    const previousRelease = releases.get(this);
+    // Tmux 3.4 discards a press *before key lookup* when modifiers change inside
+    // its multi-click timer (server_client_check_mouse leaves type=NOTYPE).
+    // Recover only this recent modifier transition on a stable screen. Forwarded
+    // drag events, focus/keyboard input, wheel and resize invalidate the evidence.
+    if (release && primary && !motion && actionable && valid && options.recoverTmuxRelease?.() &&
+        previousRelease && performance.now() - previousRelease.at <= 500 &&
+        (bits & 28) !== (previousRelease.bits & 28) && previousRelease.width === width &&
+        previousRelease.height === height && previousRelease.screen.length === this.previousScreen.length &&
+        previousRelease.screen.every((row, index) => row === this.previousScreen[index])) {
+      invoke(url!);
+      rememberRelease();
+      return { consume: true };
+    }
+    if (release) rememberRelease();
+    else if (primary && !motion && !wheel) releases.delete(this);
+    if (!wheel && !motion && !release && primary && valid && actionable) {
+      releases.delete(this);
+      presses.set(this, { url: url!, x, y, line, width, height, moved: false });
       return { consume: true };
     }
     // Keep native selection, scrolling and component dispatch. Native fullscreen
