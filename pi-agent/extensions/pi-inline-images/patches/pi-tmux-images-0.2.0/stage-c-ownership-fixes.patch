@@ -1,0 +1,236 @@
+diff --git a/extensions/index.ts b/extensions/index.ts
+index c63818a..999d866 100644
+--- a/extensions/index.ts
++++ b/extensions/index.ts
+@@ -7,6 +7,8 @@ import { PreviewRuntime, type SharedGraphicsHandle } from "../src/runtime.ts";
+ import { CLEAR_TYPE, type ClearEntry, ENTRY_TYPE, isPreview, type PreviewEntry } from "../src/transcript-entry.ts";
+-
++
+ const MAX_RECENT_PREVIEWS = 16;
++const OWNERSHIP_CHANGED = "pi-inline-images:read-preview-entries-changed";
++const COORDINATION = "pi-inline-images:read-preview-coordination";
+-
++
+ function branch(ctx: ExtensionContext): BranchEntry[] {
+-	return ctx.sessionManager.getBranch() as BranchEntry[];
++	return ctx.sessionManager.getBranch() as BranchEntry[];
+@@ -40,7 +42,11 @@ export function registerInlineImages(pi: ExtensionAPI, runtime = new PreviewRunt
+-	const provenance = new ReadOriginalTracker();
++	const provenance = new ReadOriginalTracker();
+-	const requestId = randomUUID();
++	const requestId = randomUUID();
+-	let rebuildRequest = false;
++	let rebuildRequest = false;
++	let coordinationReady = false;
++	let coordinated = new Set<string>();
++	let coordinationReason = "host image coordination has not completed";
+-	const builtinLocalRead = () => isBuiltinLocalRead(pi.getAllTools());
++	const builtinLocalRead = () => isBuiltinLocalRead(pi.getAllTools());
++	const ownershipChanged = () => pi.events.emit(OWNERSHIP_CHANGED, { version: 1 });
+-
++
+-	function enqueue(operation: () => Promise<void>): Promise<void> {
++	function enqueue(operation: () => Promise<void>): Promise<void> {
+-		const next = serial.then(operation, operation);
++		const next = serial.then(operation, operation);
+@@ -54,6 +60,16 @@ export function registerInlineImages(pi: ExtensionAPI, runtime = new PreviewRunt
+-		if (rebuildRequest) runtime.bindShared(handle);
++		if (rebuildRequest) runtime.bindShared(handle);
+-		else void enqueue(() => runtime.setShared(handle)).catch(() => undefined);
++		else void enqueue(() => runtime.setShared(handle)).catch(() => undefined);
+-	});
++	});
++	const removeCoordination = pi.events.on(COORDINATION, (value) => {
++		if (!value || typeof value !== "object") return;
++		const update = value as { version?: unknown; ready?: unknown; activeLogicalIds?: unknown; reason?: unknown };
++		if (update.version !== 1 || typeof update.ready !== "boolean" || !Array.isArray(update.activeLogicalIds)
++			|| update.activeLogicalIds.length > MAX_RECENT_PREVIEWS
++			|| update.activeLogicalIds.some((logicalId) => typeof logicalId !== "string" || logicalId.length > 128)) return;
++		coordinationReady = update.ready;
++		coordinated = new Set(update.activeLogicalIds as string[]);
++		coordinationReason = typeof update.reason === "string" && update.reason ? update.reason.slice(0, 512) : "host image coordination unavailable";
++	});
+-	const requestBridge = () => pi.events.emit("pi-inline-images:graphics-owner:request", { version: 1, owner: "read", requestId });
++	const requestBridge = () => pi.events.emit("pi-inline-images:graphics-owner:request", { version: 1, owner: "read", requestId });
+-	requestBridge();
++	requestBridge();
+-
++
+@@ -78,8 +94,11 @@ export function registerInlineImages(pi: ExtensionAPI, runtime = new PreviewRunt
+-
++
+-	pi.registerEntryRenderer<PreviewEntry>(ENTRY_TYPE, (entry, _options, theme) => {
++	pi.registerEntryRenderer<PreviewEntry>(ENTRY_TYPE, (entry, _options, theme) => {
+-		const data = isPreview(entry.data) ? entry.data : undefined;
++		const data = isPreview(entry.data) ? entry.data : undefined;
++		const coordinationFailure = data?.origin && (!coordinationReady || !coordinated.has(data.logicalId))
++			? `Native image ownership coordination unavailable: ${coordinationReason}. Custom bitmap withheld.`
++			: undefined;
+-		return data
++		return data
+-			? previewComponent(data, runtime, theme, stale.get(data.logicalId))
++			? previewComponent(data, runtime, theme, stale.get(data.logicalId), coordinationFailure)
+-			: wrappedNotice("[image] Invalid saved preview entry.");
++			: wrappedNotice("[image] Invalid saved preview entry.");
+-	});
++	});
+-	pi.registerEntryRenderer<ClearEntry>(CLEAR_TYPE, () => wrappedNotice("[image previews cleared]"));
++	pi.registerEntryRenderer<ClearEntry>(CLEAR_TYPE, () => wrappedNotice("[image previews cleared]"));
+@@ -123,10 +142,10 @@ export function registerInlineImages(pi: ExtensionAPI, runtime = new PreviewRunt
+-			for (const { block, origin } of automaticBlocks(message, messageOrdinal)) {
++			for (const { block, origin } of automaticBlocks(message, messageOrdinal)) {
+-				const token = originToken(origin);
++				const token = originToken(origin);
+-				if (pending.has(token) || hasPersistedOrigin(entries, origin)) continue;
++				if (pending.has(token) || hasPersistedOrigin(entries, origin)) continue;
+-				await evictOldest(ctx);
+-				pending.set(token, origin);
++				pending.set(token, origin);
+-				const logicalId = randomUUID().replaceAll("-", "");
++				const logicalId = randomUUID().replaceAll("-", "");
+-				try {
++				try {
++					await evictOldest(ctx);
+-					const toolCallId = origin.key.startsWith("tool:") ? origin.key.slice(5) : undefined;
++					const toolCallId = origin.key.startsWith("tool:") ? origin.key.slice(5) : undefined;
+-					const evidence = toolCallId ? provenance.consume(toolCallId, origin.blockIndex, origin.contentHash) : undefined;
++					const evidence = toolCallId ? provenance.consume(toolCallId, origin.blockIndex, origin.contentHash) : undefined;
+-					const verified = evidence?.status === "verified-local-original" ? evidence.capture : undefined;
++					const verified = evidence?.status === "verified-local-original" ? evidence.capture : undefined;
+@@ -147,9 +166,23 @@ export function registerInlineImages(pi: ExtensionAPI, runtime = new PreviewRunt
+-						origin,
++						origin,
+-						readProvenance: evidence ? provenance.persist(evidence, entry) : undefined,
++						readProvenance: evidence ? provenance.persist(evidence, entry) : undefined,
+-					});
++					});
+-				} catch {
+-					pending.delete(token);
++					pending.delete(token);
+-					// Keep Pi's original image block and native/error rendering unchanged.
++					ownershipChanged();
++				} catch (error) {
++					pending.delete(token);
++					if (expected !== generation) return;
++					const reason = error instanceof Error ? error.message : String(error);
++					pi.appendEntry<PreviewEntry>(ENTRY_TYPE, {
++						path: "attached image",
++						hash: origin.contentHash,
++						originalMime: block.mimeType as PreviewEntry["originalMime"],
++						width: 1,
++						height: 1,
++						logicalId,
++						origin,
++						error: `Automatic preview failed: ${reason}`.slice(0, 4096),
++					});
++					ownershipChanged();
+-				}
++				}
+-			}
++			}
+-		});
++		});
+@@ -178,6 +211,7 @@ export function registerInlineImages(pi: ExtensionAPI, runtime = new PreviewRunt
+-	pi.on("session_shutdown", async () => {
++	pi.on("session_shutdown", async () => {
+-		const expected = invalidate();
++		const expected = invalidate();
+-		removeBridgeReply();
++		removeBridgeReply();
++		removeCoordination();
+-		return enqueue(async () => { if (expected === generation) await runtime.clear(); });
++		return enqueue(async () => { if (expected === generation) await runtime.clear(); });
+-	});
++	});
+-	pi.on("message_end", async (event, ctx) => automatic(event.message, ctx, generation));
++	pi.on("message_end", async (event, ctx) => automatic(event.message, ctx, generation));
+@@ -192,6 +226,7 @@ export function registerInlineImages(pi: ExtensionAPI, runtime = new PreviewRunt
+-					await runtime.clear();
++					await runtime.clear();
+-					pi.appendEntry<ClearEntry>(CLEAR_TYPE, { marker: true });
++					pi.appendEntry<ClearEntry>(CLEAR_TYPE, { marker: true });
+-					stale.clear();
++					stale.clear();
++					ownershipChanged();
+-				});
++				});
+-			}
++			}
+-			const expected = generation;
++			const expected = generation;
+diff --git a/src/renderer.ts b/src/renderer.ts
+index b15aec4..293bd2b 100644
+--- a/src/renderer.ts
++++ b/src/renderer.ts
+@@ -19,8 +19,11 @@ export function previewComponent(
+-	runtime: PreviewRuntime,
++	runtime: PreviewRuntime,
+-	_theme: unknown,
++	_theme: unknown,
+-	stale?: string,
++	stale?: string,
++	coordinationFailure?: string,
+ ): Component {
+-	if (stale) return notice(entry, stale);
++	if (stale) return notice(entry, stale);
++	if (entry.error) return notice(entry, entry.error);
++	if (coordinationFailure) return notice(entry, coordinationFailure);
+-	if (!runtime.get(entry.logicalId)) return notice(entry, "Image is unavailable in this process.");
++	if (!runtime.get(entry.logicalId)) return notice(entry, "Image is unavailable in this process.");
+-	return {
++	return {
+-		render: (width) => {
++		render: (width) => {
+diff --git a/src/runtime.ts b/src/runtime.ts
+index 7d77ad1..6494c8d 100644
+--- a/src/runtime.ts
++++ b/src/runtime.ts
+@@ -121,6 +121,10 @@ export class PreviewRuntime {
+-		const status = new Map<string, string>();
++		const status = new Map<string, string>();
+-		for (const entry of [...entries].reverse()) {
++		for (const entry of [...entries].reverse()) {
+-			try {
++			try {
++				if (entry.error) {
++					status.set(entry.logicalId, entry.error);
++					continue;
++				}
+-				let source = entry.origin ? await resolve?.(entry) : undefined;
++				let source = entry.origin ? await resolve?.(entry) : undefined;
+-				if (entry.origin && !source) throw new Error("origin unavailable");
++				if (entry.origin && !source) throw new Error("origin unavailable");
+-				const image = source
++				const image = source
+diff --git a/src/transcript-entry.ts b/src/transcript-entry.ts
+index 0f1f0d6..9705cec 100644
+--- a/src/transcript-entry.ts
++++ b/src/transcript-entry.ts
+@@ -34,6 +34,8 @@ export interface PreviewEntry {
+-	logicalId: string;
++	logicalId: string;
+-	/** Origin metadata for automatic previews; the image bytes stay in the message block. */
++	/** Origin metadata for automatic previews; the image bytes stay in the message block. */
+-	origin?: { messageOrdinal: number; key: string; blockIndex: number; mimeType: string; contentHash: string };
++	origin?: { messageOrdinal: number; key: string; blockIndex: number; mimeType: string; contentHash: string };
++	/** Wrapped automatic-preview failure; raw tool-result content remains unchanged. */
++	error?: string;
+-	/** Display-only proof. It never replaces or rewrites the tool-result image block. */
++	/** Display-only proof. It never replaces or rewrites the tool-result image block. */
+-	readProvenance?: ReadProvenance;
++	readProvenance?: ReadProvenance;
+ }
+@@ -79,6 +81,7 @@ export function isPreview(value: unknown): value is PreviewEntry {
+-		Number.isSafeInteger(x.height) &&
++		Number.isSafeInteger(x.height) &&
+-		x.height > 0 &&
++		x.height > 0 &&
+-		x.height <= 100000 &&
++		x.height <= 100000 &&
++		(x.error === undefined || (typeof x.error === "string" && x.error.length > 0 && x.error.length <= 4096)) &&
+-		(origin === undefined ||
++		(origin === undefined ||
+-			(origin !== null &&
++			(origin !== null &&
+-				typeof origin === "object" &&
++				typeof origin === "object" &&

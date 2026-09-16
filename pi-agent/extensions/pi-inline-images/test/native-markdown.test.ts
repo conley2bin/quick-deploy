@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import test from "node:test";
+import { HostImageOwnershipAdapter } from "../src/host-adapter.ts";
 import { parseMarkdownImages, transformMarkdown } from "../src/markdown.ts";
 import { ImageSession } from "../src/session.ts";
 import { TerminalImages } from "../src/terminal.ts";
@@ -98,34 +99,55 @@ test("native cached components retain immutable geometry across changed bytes an
     return image;
   });
   const source = "Before\n\n![same](/tmp/image.png)\n\nAfter";
+  const withThinking = () => ({ ...assistantMessage(source), content: [{ type: "thinking", thinking: "fixture" }, { type: "text", text: source }] });
   const transformer = (markdown: string, context: { messageType: string; isStreaming: boolean; availableWidth: number }) => {
+    if (context.messageType !== "assistant" || context.isStreaming) return markdown;
     const prepared = session.preparedForRender(markdown);
     return prepared ? transformMarkdown(prepared, context.availableWidth, terminal) : markdown;
   };
-  const component = () => new module.AssistantMessageComponent(assistantMessage(source), false, undefined, "Thinking...", 1, [transformer]);
-
+  const component = (message: ReturnType<typeof withThinking>) =>
+    new module.AssistantMessageComponent(message, false, undefined, "Thinking...", 1, [transformer]);
+  const entry = (message: ReturnType<typeof withThinking>, id: string) => ({ type: "message", id, parentId: null, timestamp: "2026-09-16T00:00:00.000Z", message });
   const glyphs = (value: { render(width: number): string[] }, width = 16) =>
     value.render(width).join("\n").split(PLACEHOLDER_GLYPH).length - 1;
-  const firstPrepared = await session.prepare(source, "/fixture");
-  const first = component();
-  assert.equal(glyphs(first), 50);
-  const secondPrepared = await session.prepare(source, "/fixture");
-  const second = component();
+
+  const firstMessage = withThinking();
+  const firstPrepared = (await session.prepareMessage(firstMessage, "/fixture"))[0]!;
+  const first = component(firstMessage);
+  const secondMessage = withThinking();
+  const secondPrepared = (await session.prepareMessage(secondMessage, "/fixture"))[0]!;
+  const second = component(secondMessage);
+  const entries = [entry(firstMessage, "first"), entry(secondMessage, "second")];
+  const tui = { children: [first, second], terminal: { columns: 80 }, render: () => [], invalidate() {}, requestRender() {} };
+  const adapter = new HostImageOwnershipAdapter(
+    session,
+    () => undefined,
+    { version: "0.85.1", sessionEntryToContextMessages: (entry) => entry.message ? [entry.message] : [] },
+  );
+  adapter.setTui(tui as never);
+  assert.equal(adapter.reconcile(entries as never, entries as never), true);
+
   assert.notEqual(firstPrepared.references[0].logicalId, secondPrepared.references[0].logicalId, "changed bytes receive a distinct immutable resource ID");
-  assert.equal(glyphs(first), 50, "old same-width Markdown cache remains compatible with its old resource");
+  assert.equal(glyphs(first), 50);
+  assert.equal(glyphs(second), 2);
+  await Promise.resolve();
+  second.setHideThinkingBlock(true);
+  assert.equal(glyphs(first), 50, "cached first occurrence remains unchanged during a local second rebuild");
+  assert.equal(glyphs(second), 2, "component-local rebuild keeps the second occurrence binding");
 
-  first.invalidate();
-  assert.equal(glyphs(first), 50, "global recovery invalidation keeps the first occurrence bound to its prepared resource");
-  assert.equal(glyphs(second), 2, "the later identical occurrence keeps its own prepared resource");
-
-  await session.prepare(source, "/fixture");
-  const failed = component();
+  const failedMessage = withThinking();
+  await session.prepareMessage(failedMessage, "/fixture");
+  const failed = component(failedMessage);
+  entries.push(entry(failedMessage, "failed"));
+  tui.children.push(failed);
+  assert.equal(adapter.reconcile(entries as never, entries as never), true);
   first.invalidate();
   second.invalidate();
   assert.equal(glyphs(first), 50, "a later failed load cannot replace the first occurrence after invalidation");
   assert.equal(glyphs(second), 2, "a later failed load cannot replace the second occurrence after invalidation");
   const failedText = failed.render(40).join("\n").replace(/\x1b(?:\][^\x07]*\x07|\[[0-?]*[ -/]*[@-~])/gu, "");
   assert.match(failedText.replace(/\s+/gu, " "), /image unavailable: same — changed file unreadable/);
+  adapter.dispose();
 });
 
 test("native AssistantMessage preserves GFM table columns with an explicit in-cell notice", async () => {

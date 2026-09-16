@@ -4,12 +4,14 @@ mode=${1:?usage: replay-stage-c.sh check|apply PACKAGE_ROOT}
 root=${2:?usage: replay-stage-c.sh check|apply PACKAGE_ROOT}
 patch_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 patch_file="$patch_dir/stage-c-recent-cache.patch"
-upgrade_file="$patch_dir/stage-c-review-fixes.patch"
+review_upgrade="$patch_dir/stage-c-review-fixes.patch"
+ownership_upgrade="$patch_dir/stage-c-ownership-fixes.patch"
 
 [ "$mode" = check ] || [ "$mode" = apply ] || { echo "unknown mode: $mode" >&2; exit 2; }
 [ "$(node -p "require('$root/package.json').version")" = "0.2.0" ] || { echo 'expected pi-tmux-images 0.2.0' >&2; exit 1; }
-[ "$(sha256sum "$patch_file" | awk '{print $1}')" = 3c0058d32d1c3ab66385a413c62df2728c80d67dc33c6480aee57459ddcc11ff ] || { echo 'unexpected replay patch digest' >&2; exit 1; }
-[ "$(sha256sum "$upgrade_file" | awk '{print $1}')" = 4898db2958ee9c4541e468fc388dd663b9b1633df97de1abfe42cdabd787d46b ] || { echo 'unexpected upgrade patch digest' >&2; exit 1; }
+[ "$(sha256sum "$patch_file" | awk '{print $1}')" = fb8953b6d0f0369ca361038cfb760f9b41e0058e2173ff9b2ad7daeed44cbf52 ] || { echo 'unexpected replay patch digest' >&2; exit 1; }
+[ "$(sha256sum "$review_upgrade" | awk '{print $1}')" = 4898db2958ee9c4541e468fc388dd663b9b1633df97de1abfe42cdabd787d46b ] || { echo 'unexpected review upgrade patch digest' >&2; exit 1; }
+[ "$(sha256sum "$ownership_upgrade" | awk '{print $1}')" = 574520833d8678e07eec33fffecb45d87e67480e65241af1e983f85695697858 ] || { echo 'unexpected ownership upgrade patch digest' >&2; exit 1; }
 
 hash() { sha256sum "$root/$1" 2>/dev/null | awk '{print $1}'; }
 extension=$(hash extensions/index.ts)
@@ -38,12 +40,19 @@ elif [ "$extension" = b6fa457459741708cd643fedb9fda408c5f402e268d133c7fc2f31ddbf
   && [ "$renderer" = d917035605ae578a2d01a887ffe6619441ac042b055626154d87492adbef18e1 ] \
   && [ "$transcript" = f1375a025880f9095d8c31f930cc444e601ea59b6c66cba4baf818d4e56cdd47 ] \
   && [ "$provenance" = c15f4fc606fcf39806336ffb53ee899da7e2b6595c51fffa1df348665efa6f56 ]; then
-  state=previous-patched
+  state=legacy-patched
 elif [ "$extension" = 09b2245981f14df3a82c2acbfec874c4bf02bfd2c386b33bca21e6709b107618 ] \
   && [ "$loader" = 0b3996ff6fc475fac5985f1fa56a76c9009f86524b02f047812b9c0a7848ad1d ] \
   && [ "$runtime" = bb69de792f40dc5d576d26f50773ae9dd168d7e52c76abf42146e61d724c26e3 ] \
   && [ "$renderer" = d917035605ae578a2d01a887ffe6619441ac042b055626154d87492adbef18e1 ] \
   && [ "$transcript" = f1375a025880f9095d8c31f930cc444e601ea59b6c66cba4baf818d4e56cdd47 ] \
+  && [ "$provenance" = c15f4fc606fcf39806336ffb53ee899da7e2b6595c51fffa1df348665efa6f56 ]; then
+  state=previous-patched
+elif [ "$extension" = 30b096ffe344a8f0567ad5c804ae9f692b56596a54f145c05b8988ac8051f2a3 ] \
+  && [ "$loader" = 0b3996ff6fc475fac5985f1fa56a76c9009f86524b02f047812b9c0a7848ad1d ] \
+  && [ "$runtime" = 0f13f7c4212b14a3065bff2a65a833eae67a4a242ae514ba962ecf0e690946b9 ] \
+  && [ "$renderer" = 491a90b3b88a46f38e3669a45ce98ca5a2e610b633ec98a1c65b7935d64debb5 ] \
+  && [ "$transcript" = b82c32c5fbfbced297645c4fc6d4217fdd828317aba2d3ae8422a851951d9a70 ] \
   && [ "$provenance" = c15f4fc606fcf39806336ffb53ee899da7e2b6595c51fffa1df348665efa6f56 ]; then
   state=patched
 fi
@@ -68,9 +77,13 @@ if [ "$state" = patched ]; then
   echo 'already-patched'
   exit 0
 fi
-if [ "$state" = previous-patched ]; then
-  patch -d "$root" -p1 --dry-run < "$upgrade_file" >/dev/null
-  patch -d "$root" -p1 < "$upgrade_file" >/dev/null
+if [ "$state" = legacy-patched ]; then
+  patch -d "$root" -p1 --dry-run < "$review_upgrade" >/dev/null
+  patch -d "$root" -p1 < "$review_upgrade" >/dev/null
+  exec "$0" apply "$root"
+elif [ "$state" = previous-patched ]; then
+  patch -d "$root" -p1 --dry-run < "$ownership_upgrade" >/dev/null
+  patch -d "$root" -p1 < "$ownership_upgrade" >/dev/null
 else
   patch -d "$root" -p1 --dry-run < "$patch_file" >/dev/null
   patch -d "$root" -p1 < "$patch_file" >/dev/null

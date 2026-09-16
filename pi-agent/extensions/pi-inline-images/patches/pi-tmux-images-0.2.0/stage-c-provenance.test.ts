@@ -197,6 +197,7 @@ test("real handlers substitute only proven builtin-local originals and keep ever
     assert.match(runtime.fidelityNotice(verified.logicalId), /source is missing/u);
     await assertReceivedPixels(runtime, verified.logicalId, resized!.data);
 
+    bus.emit("pi-inline-images:read-preview-coordination", { version: 1, ready: true, activeLogicalIds: [verified.logicalId] });
     const renderer = fake.renderers.get(ENTRY_TYPE)!;
     for (const width of [16, 40]) {
       const rendered = renderer({ data: verified }, {}, {}).render(width);

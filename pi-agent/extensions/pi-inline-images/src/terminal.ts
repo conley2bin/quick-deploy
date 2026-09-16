@@ -335,9 +335,16 @@ export class TerminalImages {
   }
 
   async resetOwner(owner: Owner): Promise<void> {
-    const resources = [...this.images.keys()].filter((logicalId) => this.ownerOf(logicalId) === owner);
-    for (const logicalId of resources) this.transport.cancelResource(owner, this.uploadScope(logicalId), `${owner} graphics reset`);
-    for (const logicalId of resources) await this.release(logicalId);
+    const resources = [...this.images.entries()].filter(([logicalId]) => this.ownerOf(logicalId) === owner);
+    for (const [logicalId, image] of resources) {
+      image.releasing = true;
+      this.transport.cancelResource(owner, this.uploadScope(logicalId), `${owner} graphics reset`);
+    }
+    let failure: unknown;
+    for (const [logicalId] of resources) {
+      try { await this.release(logicalId); } catch (error) { failure ??= error; }
+    }
+    if (failure) throw failure;
   }
 
   async retainOwner(owner: Owner, logicalIds: ReadonlySet<string>): Promise<void> {

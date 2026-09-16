@@ -11,12 +11,12 @@ XVFB_BIN=/tmp/pi-inline-pixel-lane-20260910192606/root/usr/bin/Xvfb \
   test/private-fixture/run.sh "$PI_IMAGE_FIXTURE_OUT"
 ```
 
-The script refuses an existing output directory. It creates a private X display, DBus session, XDG roots, tmux socket, Pi agent/session directories, and disposable old-package copy. Pi runs offline with `--no-extensions` followed by exactly one old-read extension and one `pi-inline-images` extension; no prompt or provider call is made.
+The script refuses an existing output directory. It creates a private X display, DBus session, XDG roots, tmux socket, Pi agent/session directories, and disposable old-package copy. Its persisted session contains complete assistant `read` toolCall → matching toolResult image → custom preview chains, so Pi's native tool rows and custom ownership arbitration are both exercised. Pi runs offline with `--no-extensions` followed by exactly one old-read extension and one `pi-inline-images` extension; no prompt or provider call is made.
 
 Assertions performed during the run:
 
 - hidden-first preparation produces zero uploads;
-- the first compatible Ghostty client triggers 16 recent read uploads plus one 1920×1080 Markdown upload;
+- the first compatible Ghostty client triggers 16 recent read uploads plus one 1920×1080 Markdown upload, while coordinated recent read rows expose only the custom bitmap owner;
 - 3.5 seconds with the same attached client produces no repeat upload;
 - switching that same attached client to another tmux window and back produces no repeat upload;
 - detach plus a genuinely new Ghostty/tmux client identity triggers one complete resend and then remains stable;

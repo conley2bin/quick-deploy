@@ -40,6 +40,9 @@ class Sink extends EventEmitter implements TransportSink {
 function viewer(identity = "viewer-a"): ViewerState {
   return { ready: true, epoch: identity, reason: "", attached: [identity], receivers: [identity] };
 }
+function coordinate(bus: Bus, logicalIds: string[], ready = true): void {
+  bus.emit("pi-inline-images:read-preview-coordination", { version: 1, ready, activeLogicalIds: logicalIds, ...(!ready && { reason: "fixture mismatch" }) });
+}
 function image(hash: string, png = Buffer.from(`png:${hash}`)) {
   return { source: hash, hash, width: 8, height: 6, png };
 }
@@ -181,6 +184,36 @@ test("old read preserves byte-exact 8/16-bit PNGs through the shared terminal wi
   }
 });
 
+test("automatic corrupt read persists a wrapped failure without mutating the raw result", async () => {
+  const copy = disposablePackage();
+  const bus = new Bus();
+  const branch: Array<Record<string, unknown>> = [];
+  const fake = fakeApi(bus, branch);
+  const context = { cwd: "/fixture", sessionManager: { getBranch: () => branch }, ui: { notify() { throw new Error("automatic failures belong in transcript notices"); } } };
+  try {
+    const extensionModule = await import(`${pathToFileURL(resolve(copy.root, "extensions/index.ts")).href}?automatic-error=${Date.now()}`);
+    extensionModule.registerInlineImages(fake.api);
+    const source = await sharp(Buffer.alloc(12 * 6 * 4, 127), { raw: { width: 12, height: 6, channels: 4 } })
+      .png({ compressionLevel: 0 }).toBuffer();
+    const truncated = source.subarray(0, Math.floor(source.length / 2));
+    const message = { role: "toolResult", toolCallId: "corrupt-read", toolName: "read", content: [{ type: "image", mimeType: "image/png", data: truncated.toString("base64") }] };
+    const raw = JSON.stringify(message);
+    await emit(fake.handlers, "message_end", { message }, context);
+    assert.equal(JSON.stringify(message), raw);
+    const custom = branch.find((entry) => entry.type === "custom" && entry.customType === ENTRY_TYPE);
+    assert.ok(custom, "failed automatic preview persists an ownership/error entry");
+    const renderer = fake.renderers.get(ENTRY_TYPE)!;
+    for (const width of [16, 40]) {
+      const lines = renderer({ data: custom!.data }, {}, {}).render(width);
+      assert.match(lines.join(" ").replace(/\s+/gu, " "), /Automatic preview failed: Invalid image content/u);
+      assert.ok(lines.every((line) => visibleWidth(line) <= width));
+    }
+    await emit(fake.handlers, "session_shutdown", {}, context);
+  } finally {
+    copy.cleanup();
+  }
+});
+
 test("restore resolves and decodes newest entries incrementally within the resident budget", async () => {
   const copy = disposablePackage();
   try {
@@ -273,6 +306,8 @@ test("patched old extension sustains 20 previews through the real shared backend
     const renderer = fake.renderers.get(ENTRY_TYPE)!;
     const oldest = previews[0]!.data as Record<string, unknown>;
     const newest = previews.at(-1)!.data as Record<string, unknown>;
+    assert.match(renderer({ data: newest }, {}, {}).render(40).join(" "), /coordination unavailable/u);
+    coordinate(bus, previews.slice(-16).map((entry) => String((entry.data as { logicalId: unknown }).logicalId)));
     const expired = renderer({ data: { ...oldest, path: `/very/${"目录".repeat(45)}/old-image.png` } }, {}, {}).render(16);
     assert.match(expired.join(" "), /Expired/u);
     assert.ok(expired.length > 1);
@@ -358,6 +393,7 @@ test("old extension evicts by read byte budget before count saturation", async (
     assert.equal(terminal.count("read"), 2);
     assert.equal(terminal.residentBytes("read"), 24);
     assert.equal(runtime.residentBytes(), 24);
+    coordinate(bus, previews.slice(-2).map((entry) => String((entry.data as { logicalId: unknown }).logicalId)));
     const renderer = fake.renderers.get(ENTRY_TYPE)!;
     assert.match(renderer({ data: previews[0]!.data }, {}, {}).render(20).join(" "), /byte cache/u);
     assert.ok(renderer({ data: previews.at(-1)!.data }, {}, {}).render(20).length > 0);
@@ -404,6 +440,7 @@ test("old extension binds after either factory order and ignores a version-misma
     await emit(fake.handlers, "message_end", { message }, context);
     branch.push({ type: "message", message });
     const entry = branch.find((candidate) => candidate.type === "custom" && candidate.customType === ENTRY_TYPE)!.data as Record<string, unknown>;
+    coordinate(bus, [String(entry.logicalId)]);
     assert.equal(sink.writes.length, 0, "missing bridge has no independent graphics fallback");
     assert.match(fake.renderers.get(ENTRY_TYPE)!({ data: entry }, {}, {}).render(20).join("").replace(/\s/gu, ""), /bridgeunavailable/u);
 

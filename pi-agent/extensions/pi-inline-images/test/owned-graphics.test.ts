@@ -28,6 +28,19 @@ test("inline and read enforce independent resident byte quotas", async()=>{
  await terminal.clear(true);
 });
 
+test("owner reset marks every resource before awaiting drain so recovery cannot upload later resources", async()=>{
+ const sink=new Sink(); sink.returns.push(false); let id=80; const terminal=new TerminalImages(()=>id++,()=>({widthPx:1,heightPx:1}),sink,{TERM_PROGRAM:"ghostty"},true,{transportLimits:{minIntervalMs:0,drainTimeoutMs:1_000}}); terminal.setViewerManaged(true);
+ const bus=new Bus(); const stop=installGraphicsBridge(bus as never,terminal); let read!:GraphicsOwnerHandle; bus.on(IMAGE_BRIDGE_REPLY,(x)=>{const r=x as {handle:GraphicsOwnerHandle}; if(r.handle.owner==="read")read=r.handle}); bus.emit(IMAGE_BRIDGE_REQUEST,{version:IMAGE_BRIDGE_VERSION,owner:"read",requestId:"r"});
+ for(let n=0;n<3;n++)await read.prepare(String(n),image(`reset-${n}`));
+ const viewing=terminal.setViewer(viewer); for(let turn=0;turn<8&&sink.writes.length<1;turn++)await Promise.resolve(); assert.equal(sink.writes.length,1);
+ const resetting=read.reset(); sink.drain(); await Promise.all([viewing,resetting]);
+ const uploads=sink.writes.filter((value)=>value.includes(Buffer.from("a=t,"))).length;
+ const deletes=sink.writes.filter((value)=>value.includes(Buffer.from("a=d,d=I"))).length;
+ assert.equal(uploads,1,"later owner resources cannot upload after reset is requested");
+ assert.equal(deletes,1,"only the already transmitted terminal resource requires deletion");
+ assert.equal(terminal.count("read"),0); stop(); await terminal.clear(true);
+});
+
 test("read reset cancels only read work behind inline backpressure", async()=>{
  const sink=new Sink(); sink.returns.push(false); let id=100; const terminal=new TerminalImages(()=>id++,()=>({widthPx:1,heightPx:1}),sink,{TERM_PROGRAM:"ghostty"},true,{transportLimits:{minIntervalMs:0,drainTimeoutMs:1_000}}); terminal.setViewerManaged(true); await terminal.setViewer(viewer);
  const bus=new Bus(); const stop=installGraphicsBridge(bus as never,terminal); let read!:GraphicsOwnerHandle; let inline!:GraphicsOwnerHandle; bus.on(IMAGE_BRIDGE_REPLY,(x)=>{const r=x as {handle:GraphicsOwnerHandle}; if(r.handle.owner==="read")read=r.handle; else inline=r.handle}); bus.emit(IMAGE_BRIDGE_REQUEST,{version:IMAGE_BRIDGE_VERSION,owner:"read",requestId:"r"});bus.emit(IMAGE_BRIDGE_REQUEST,{version:IMAGE_BRIDGE_VERSION,owner:"inline",requestId:"i"});

@@ -36,6 +36,19 @@ for (let index = 0; index < 20; index++) {
   append({
     type: "message",
     message: {
+      role: "assistant",
+      content: [{ type: "toolCall", id: toolCallId, name: "read", arguments: { path: `fixture-${index}.png` } }],
+      api: "fixture",
+      provider: "none",
+      model: "none",
+      usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+      stopReason: "toolUse",
+      timestamp: 0,
+    },
+  });
+  append({
+    type: "message",
+    message: {
       role: "toolResult",
       toolCallId,
       toolName: "read",
@@ -51,7 +64,7 @@ for (let index = 0; index < 20; index++) {
     width,
     height,
     logicalId: `fixturepreview${String(index).padStart(4, "0")}`,
-    origin: { messageOrdinal: index, key: `tool:${toolCallId}`, blockIndex: 1, mimeType: "image/png", contentHash },
+    origin: { messageOrdinal: index * 2 + 1, key: `tool:${toolCallId}`, blockIndex: 1, mimeType: "image/png", contentHash },
     ...(index === 19 ? {
       readProvenance: {
         version: 1,
