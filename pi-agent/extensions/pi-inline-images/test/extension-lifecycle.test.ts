@@ -1,15 +1,11 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
 import { mkdtempSync, mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, resolve } from "node:path";
+import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import test from "node:test";
 
-function installedPiRoot(): string {
-  const cli = execFileSync("sh", ["-lc", "realpath \"$(command -v pi)\""], { encoding: "utf8" }).trim();
-  return dirname(dirname(dirname(cli)));
-}
+import { installedPiRoot } from "./pi-root.ts";
 
 test("cancelled session switch preserves prepared image state through the installed host runner", async () => {
   const temporary = mkdtempSync(resolve(tmpdir(), "pi-inline-lifecycle-"));

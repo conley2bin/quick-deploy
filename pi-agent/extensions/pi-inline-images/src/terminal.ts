@@ -5,11 +5,13 @@ import {
   BoundedTransport,
   completeImageTransaction,
   uploadTransactionBytes,
+  TransportError,
   type TransportLimits,
   type TransportScheduler,
   type TransportSink,
 } from "./transport.ts";
 import { deleteImage, grid, placement } from "../vendor/pi-tmux-images/kitty-placeholder.ts";
+import type { ViewerState } from "./viewers.ts";
 
 export const MAX_ACTIVE_IMAGES = 64;
 export const MAX_RESIDENT_PNG_BYTES = 64 * 1024 * 1024;
@@ -89,6 +91,10 @@ export class TerminalImages {
   private readonly transport: BoundedTransport;
   private readonly maxResidentPngBytes: number;
   private residentPngBytes = 0;
+  private viewerManaged = false;
+  private viewerReady = true;
+  private viewerEpoch = "initial";
+  private viewerReason = "";
 
   constructor(
     private readonly allocate: () => number,
@@ -110,14 +116,39 @@ export class TerminalImages {
   count(): number { return this.images.size; }
   residentBytes(): number { return this.residentPngBytes; }
   pendingJobs(): number { return this.transport.pendingJobs; }
-  failure(logicalId: string): string | undefined { return this.images.get(logicalId)?.error; }
+  failure(logicalId: string): string | undefined {
+    const state = this.images.get(logicalId);
+    return state?.error ?? (!state?.ready && this.viewerManaged ? this.viewerReason || "waiting for a compatible visible viewer" : undefined);
+  }
+
+  /** Viewer-aware mode keeps prepared pixels pending until a compatible receiver exists. */
+  setViewerManaged(managed: boolean): void {
+    this.viewerManaged = managed;
+    if (managed) this.viewerReady = false;
+  }
+
+  async setViewer(state: ViewerState): Promise<void> {
+    const changedEpoch = state.ready && state.epoch !== this.viewerEpoch;
+    this.viewerReady = state.ready;
+    this.viewerReason = state.reason;
+    if (!state.ready) return;
+    if (changedEpoch) {
+      this.viewerEpoch = state.epoch;
+      // A new receiver needs every image again. Cancellation removes only
+      // unsent work while retaining the shared sink's drain/rate debt.
+      this.transport.cancel("viewer receiver changed");
+      for (const image of this.images.values()) if (image.ready) image.ready = false;
+    }
+    for (const [logicalId, image] of this.images) {
+      if (!image.ready && !image.error) await this.upload(logicalId, image, state.epoch);
+    }
+  }
 
   async prepare(logicalId: string, image: LoadedImage): Promise<void> {
     const existing = this.images.get(logicalId);
     if (existing) {
       if (existing.image.hash !== image.hash) throw new Error(`immutable image resource '${logicalId}' cannot be overwritten`);
       if (existing.error) throw new Error(existing.error);
-      if (!existing.ready) throw new Error(`image resource '${logicalId}' is still pending`);
       return;
     }
     if (this.images.size >= MAX_ACTIVE_IMAGES) throw new Error(`inline image capacity reached (${MAX_ACTIVE_IMAGES})`);
@@ -149,24 +180,36 @@ export class TerminalImages {
       state.error = `full image transaction is ${transactionBytes} bytes; limit is ${MAX_IMAGE_TRANSACTION_BYTES} bytes`;
       throw new Error(state.error);
     }
+    if (this.viewerReady) await this.upload(logicalId, state, this.viewerEpoch, placementCommands, transactionBytes);
+  }
+
+  private async upload(
+    logicalId: string,
+    state: StoredImage,
+    epoch: string,
+    catalog?: string,
+    wireBytes?: number,
+  ): Promise<void> {
+    const placementCommands = catalog ?? [...state.placements.values()].map((candidate) =>
+      placement(state.id, candidate.columns, candidate.rows, this.inTmux(), candidate.placementId)).join("");
+    const transactionBytes = wireBytes ?? uploadTransactionBytes(state.image.png.length, state.id, this.inTmux()) + Buffer.byteLength(placementCommands);
     const generation = this.transport.generation;
     try {
-      // Reserve before base64 construction, then keep chunks and placements in
-      // one Buffer/write so no other graphics writer can split the multipart.
+      // Admission precedes base64 construction; the complete upload and catalog
+      // remain indivisible so no graphics writer can interleave a continuation.
       await this.transport.enqueue(generation, {
-        transaction: () => completeImageTransaction(image.png, id, this.inTmux(), placementCommands),
+        transaction: () => completeImageTransaction(state.image.png, state.id, this.inTmux(), placementCommands),
         bytes: transactionBytes,
-        key: `upload:${id}:${image.hash}`,
+        key: `upload:${state.id}:${state.image.hash}:${epoch}`,
       });
       await this.transport.ready(generation);
-      if (generation !== this.transport.generation || this.images.get(logicalId) !== state) {
-        throw new Error("image preparation completed in an abandoned generation");
+      if (generation !== this.transport.generation || this.images.get(logicalId) !== state || (this.viewerManaged && (!this.viewerReady || this.viewerEpoch !== epoch))) {
+        return;
       }
       state.ready = true;
     } catch (error) {
-      if (this.images.get(logicalId) === state) {
-        state.error = error instanceof Error ? error.message : String(error);
-      }
+      if (this.viewerManaged && error instanceof TransportError && error.code === "cancelled") return;
+      if (this.images.get(logicalId) === state) state.error = error instanceof Error ? error.message : String(error);
       throw error;
     }
   }
@@ -211,6 +254,11 @@ export class TerminalImages {
 
       const generation = this.transport.generation;
       for (const [logicalId, state] of [...this.images]) {
+        if (this.viewerManaged && !state.ready) {
+          this.images.delete(logicalId);
+          this.residentPngBytes -= state.image.png.length;
+          continue;
+        }
         await this.transport.enqueue(generation, {
           transaction: deleteImage(state.id, this.inTmux()),
         });

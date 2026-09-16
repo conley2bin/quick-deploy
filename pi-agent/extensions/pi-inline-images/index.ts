@@ -1,12 +1,41 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { allocateImageId, getCellDimensions } from "@earendil-works/pi-tui";
+import { installGraphicsBridge } from "./src/bridge.ts";
 import { transformMarkdown } from "./src/markdown.ts";
 import { assistantTextBlocks, ImageSession } from "./src/session.ts";
 import { TerminalImages } from "./src/terminal.ts";
+import { currentViewerState, ViewerMonitor } from "./src/viewers.ts";
+
+type TuiRepaint = { invalidate(): void; requestRender(force?: boolean): void };
 
 export default function piInlineImages(pi: ExtensionAPI) {
   const terminal = new TerminalImages(allocateImageId, getCellDimensions);
+  terminal.setViewerManaged(true);
   const session = new ImageSession(terminal);
+  let tui: TuiRepaint | undefined;
+  let repaintQueued = false;
+  const wake = () => {
+    if (!tui || repaintQueued) return;
+    repaintQueued = true;
+    queueMicrotask(() => {
+      repaintQueued = false;
+      tui?.invalidate();
+      tui?.requestRender(true);
+    });
+  };
+  const viewers = new ViewerMonitor({ snapshot: currentViewerState }, async (state) => {
+    await terminal.setViewer(state);
+    wake();
+  });
+  const removeBridge = installGraphicsBridge(pi.events, terminal);
+  const syncMonitor = () => terminal.count() > 0 ? viewers.start() : viewers.stop();
+
+  const installWakeWidget = (ui: { setWidget(key: string, content: unknown): void }) => {
+    ui.setWidget("pi-inline-images:repaint-bridge", (candidate: TuiRepaint) => {
+      tui = candidate;
+      return { render: () => [], invalidate() {} };
+    });
+  };
 
   pi.registerMarkdownTransformer((markdown, context) => {
     if (context.messageType !== "assistant" || context.isStreaming) return markdown;
@@ -17,16 +46,36 @@ export default function piInlineImages(pi: ExtensionAPI) {
   pi.on("message_end", async (event, context) => {
     if (context.mode !== "tui") return;
     for (const source of assistantTextBlocks(event.message as never)) await session.prepare(source, context.cwd);
+    syncMonitor();
+    wake();
   });
 
-  const restore = async (_event: unknown, context: { mode: string; cwd: string; sessionManager: { getBranch(): readonly never[] } }) => {
-    if (context.mode === "tui") await session.restore(context.sessionManager.getBranch(), context.cwd);
-    else await session.reset();
+  const restore = async (_event: unknown, context: { mode: string; cwd: string; ui: { setWidget(key: string, content: unknown): void }; sessionManager: { getBranch(): readonly never[] } }) => {
+    if (context.mode === "tui") {
+      installWakeWidget(context.ui);
+      await session.restore(context.sessionManager.getBranch(), context.cwd);
+      syncMonitor();
+      wake();
+    } else {
+      viewers.stop();
+      await session.reset();
+    }
   };
   pi.on("session_start", restore as never);
-  pi.on("session_tree", (async (_event: unknown, context: { mode: string; cwd: string; sessionManager: { getBranch(): readonly never[] } }) => {
-    if (context.mode === "tui") await session.restore(context.sessionManager.getBranch(), context.cwd, true);
-    else await session.reset();
+  pi.on("session_tree", (async (_event: unknown, context: { mode: string; cwd: string; ui: { setWidget(key: string, content: unknown): void }; sessionManager: { getBranch(): readonly never[] } }) => {
+    if (context.mode === "tui") {
+      installWakeWidget(context.ui);
+      await session.restore(context.sessionManager.getBranch(), context.cwd, true);
+      syncMonitor();
+      wake();
+    } else {
+      viewers.stop();
+      await session.reset();
+    }
   }) as never);
-  pi.on("session_shutdown", async () => session.reset(true));
+  pi.on("session_shutdown", async () => {
+    viewers.stop();
+    removeBridge();
+    await session.reset(true);
+  });
 }

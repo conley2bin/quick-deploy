@@ -9,7 +9,12 @@ declare module "@earendil-works/pi-coding-agent" {
     isStreaming: boolean;
     availableWidth: number;
   }
+  export interface EventBus {
+    emit(channel: string, data: unknown): void;
+    on(channel: string, handler: (data: unknown) => void): () => void;
+  }
   export interface ExtensionAPI {
+    events: EventBus;
     registerMarkdownTransformer(transformer: (markdown: string, context: MarkdownContext) => string): void;
     on(event: string, handler: (event: any, context: any) => unknown): void;
   }

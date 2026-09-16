@@ -1,6 +1,5 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import test from "node:test";
 import { parseMarkdownImages, transformMarkdown } from "../src/markdown.ts";
@@ -8,10 +7,7 @@ import { ImageSession } from "../src/session.ts";
 import { TerminalImages } from "../src/terminal.ts";
 import { grid, PLACEHOLDER_GLYPH } from "../vendor/pi-tmux-images/kitty-placeholder.ts";
 
-function installedPiRoot(): string {
-  const cli = execFileSync("sh", ["-lc", "realpath \"$(command -v pi)\""], { encoding: "utf8" }).trim();
-  return dirname(dirname(dirname(cli)));
-}
+import { installedPiRoot } from "./pi-root.ts";
 
 function assistantMessage(text: string) {
   return {

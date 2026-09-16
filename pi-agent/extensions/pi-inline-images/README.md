@@ -11,8 +11,8 @@ model context retain the original Markdown bytes.
 - Node `>=22.19`
 - Ghostty, Kitty, or WezTerm with Kitty graphics support
 - Under tmux, the originating pane's effective `allow-passthrough` must be `on`
-  or `all`. Use `all` for previews first rendered while their pane is invisible;
-  `on` forwards passthrough only from visible panes.
+  or `all`. The viewer monitor never uploads while that pane is not visibly
+  watched by compatible clients.
 - Local extension dependencies installed with the checked-in lock file
 
 The existing `pi-tmux-images` package may remain enabled. This extension does not
@@ -39,9 +39,11 @@ Repeated runs are idempotent. Run `/reload` yourself afterward.
   reference-style, list, and quote image syntax retain source order. Images
   embedded in a sentence become a block at that point. Table cells retain their
   columns and show an explicit unsupported notice instead of a bitmap grid.
-- Loads, validates, auto-orients, downsizes, PNG-encodes, and uploads resources in
-  source order during the async `message_end`/restore preparation hook. Pi awaits
-  this work before finalizing the displayed assistant message.
+- Loads and validates resources in source order during the async `message_end`/restore
+  preparation hook. Suitable unoriented PNGs retain their exact source bytes;
+  other supported formats are auto-oriented and PNG-encoded at full resolution,
+  without resizing or palette quantization. Images wait visibly in place until a
+  compatible viewer is present.
 - After each upload, preparation creates a finite catalog of every distinct
   `(columns, rows)` produced for available widths 1–80. Upload and catalog writes
   finish before the finalized grid can render, so portable Kitty order is always
@@ -78,43 +80,30 @@ Repeated runs are idempotent. Run `/reload` yourself afterward.
   cropping. Reload rebuilds the catalog for the new cell aspect ratio; Kitty fits
   the image without distortion inside each prepared rectangle.
 
-## Bounded preview and transport limits
+## Full-resolution and transport limits
 
-Preview derivation does not edit source files. Sharp uses auto-oriented source
-geometry, `fit: inside`, `withoutEnlargement`, and a metadata-free 8-bit PNG. It
-first bounds the derived preview to **1280 px width**, **768 px height**, and
-**131,072 pixels**, then reduces further only if needed to meet the byte cap.
-This can trade fine detail for finite memory/transport while preserving aspect
-ratio and the original geometry used for cell layout.
+Preview geometry and upload fidelity are separate. Layout remains at most 80×24
+cells, while upload retains every source pixel. Supported limits are explicit:
 
-The executable defaults are:
+- **20 MiB** encoded input, **32 MiPixels** decoded input, and **32 MiB** full PNG
+- **64 MiB** aggregate resident PNG state and **64** immutable resources
+- **44 MiB** maximum atomic upload-plus-catalog write, **96 MiB** admitted wire
+  budget including an accepted `write(false)` awaiting drain, and **64** queued jobs
+- **8 MiB/s** sustained transaction pacing after one bounded burst, at least 50 ms
+  between starts, and a 60-second drain deadline
 
-- **640 KiB** maximum resident PNG bytes for one derived preview
-- **12 MiB** aggregate resident PNG bytes and **64** immutable active resources
-- **80** maximum deduplicated virtual placements and **4480 bytes** maximum
-  catalog transaction per image (80 × the 56-byte worst-case tmux command); the
-  measured 80-entry worst-aspect fixture is 4432 bytes
-- **1 MiB** hard maximum UTF-8 bytes in any complete transport transaction/write
-- **878,123 bytes** maximum normal tmux upload write produced from a 640 KiB PNG
-  (worst-case 32-bit image ID); placement/delete writes are much smaller
-- **8 MiB** maximum queued, unsent transaction bytes and **64** queued jobs
-- **50 ms** minimum interval between transaction starts (at most 20 starts/s)
-- **5000 ms** maximum wait after `write(false)` for writable `drain`
+Each upload reserves its exact wire size before constructing base64. All 4096-byte
+Kitty chunks and the complete placement catalog are one Buffer write; continuations
+contain only `m`, and renders never emit graphics commands.
 
-Each image costs at most two preparation transactions: one atomic upload and one
-catalog containing at most 80 complete placement commands. Both use the same
-queue byte/job limits, 50 ms pacing, and writable backpressure. Catalog entries
-are deduplicated by `(columns, rows)` across widths 1–80; placement IDs are unique
-within the owned image ID, and the grid encodes the chosen placement ID plus the
-image-ID high byte. The 4480-byte ceiling is a measured/theoretical bound, not
-unaccounted command amplification.
+When resources exist, a single 1.5-second monitor checks the current tmux window,
+pane passthrough policy, and attached client identities. No viewer, failed snapshot,
+or an incompatible visible client keeps PNG bytes pending with zero upload. A hidden
+viewer returning with the same identity does not re-upload; a new identity starts a
+new receiver epoch and receives complete uploads. Meaningful preparation/viewer
+changes coalesce one public TUI invalidate/requestRender wakeup through a nonvisual
+widget; stable polls do not repaint.
 
-A multipart Kitty upload is one complete, size-bounded `sink.write(...)` call.
-Each APC payload remains at most 4096 base64 bytes, continuation APCs contain
-only `m`, and no placement/delete transaction can enter between its chunks. This
-preserves the official Kitty protocol even when the old image extension writes
-before or after the call. PNG state never retains a base64 copy; wire construction
-encodes 3072-byte Buffer slices directly into the one required transaction.
 
 Precreating bounded placements is lower risk than dynamic placement: official
 Kitty ordering requires a virtual placement before its placeholder cells, while
