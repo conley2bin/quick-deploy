@@ -107,7 +107,8 @@ hidden viewer returning with the same attachment identity does not re-upload;
 detach/reconnect creates an unseen identity and receives a complete upload.
 Meaningful preparation/viewer changes coalesce one public TUI
 invalidate/requestRender wakeup through a nonvisual widget; stable polls do not
-repaint or upload.
+repaint or upload, and ordinary live updates (streaming assistant tokens, a new
+live row) only coalesce a diff render without invalidating historical components.
 
 The old-read replay may display a local source original instead of Pi's resized
 model attachment only when public execution evidence proves the selected tool is
@@ -139,7 +140,9 @@ decorated per instance (never by prototype) so local thinking/invalidate rebuild
 retain exact historical Markdown occurrences. Successful compaction/tree rebuilds
 revoke old-generation claims before the first reconstructed frame and renew only
 after new public component identities appear. Every ownership transition coalesces
-one invalidate/render; stable public-tree/branch signatures do nothing.
+one invalidate/forced render; ordinary live binding updates coalesce a diff render
+only, and the widget gate keys on the public tree plus persisted claim identity, so
+streaming text alone never schedules work.
 
 Automatic read rejection persists bounded error metadata. An oversized encoded
 block records tool/user identity, block index, MIME, and encoded length without
