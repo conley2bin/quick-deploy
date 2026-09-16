@@ -2,6 +2,19 @@
 
 为 Clash Verge Rev 生成本地 DNS、TUN 和路由增强配置，并配置 GitHub SSH。脚本写入的文件需要被 Verge 合并、加载后才会生效。
 
+## 代码与策略边界
+
+```text
+tun-fix.sh       # 小型 CLI / 菜单分派器
+lib/config.sh     # registry 定位、Merge/Script 原子写入、备份与完整优化编排
+lib/diagnose.sh   # /rules、Fake-IP、TUN、LiteLLM 嗅探诊断
+lib/ssh.sh        # GitHub SSH 配置
+lib/rules.py      # 唯一的 YAML/registry/规则读取器与 Script 渲染器
+rules/*.yaml      # 日常可编辑的本地路由策略数据
+```
+
+`rules/` 中只有策略数据；实现和依赖声明在 `lib/`。`rules check/render` 是只读日常操作，`rules apply` 只更新已登记的全局 Script；完整菜单选项 1 才会同时处理 Merge、DNS、TUN 和订阅级 Merge。
+
 ## 本地路由覆盖（推荐的日常维护入口）
 
 路由的唯一可编辑来源是两个版本控制文件：
@@ -11,7 +24,7 @@ rules/direct.yaml   # 只能写 DIRECT 目标
 rules/proxy.yaml    # 只能写当前订阅已有的代理组目标；不写节点
 ```
 
-两者都使用严格的 `version: 1`、`pre: [...]`、`post: [...]` YAML 结构。规则是完整的 Mihomo 规则字符串，含明确的策略目标；例如 `"DOMAIN,example.com,DIRECT"` 或 `"DOMAIN,example.com,Proxy"`。解析器使用 [PyYAML](rules/requirements.txt)，而不是用 shell 文本匹配猜 YAML；在可编辑环境中先安装 `python3 -m pip install -r clash-verge/rules/requirements.txt`（系统包 `python3-yaml` 也可以）。
+两者都使用严格的 `version: 1`、`pre: [...]`、`post: [...]` YAML 结构。规则是完整的 Mihomo 规则字符串，含明确的策略目标；例如 `"DOMAIN,example.com,DIRECT"` 或 `"DOMAIN,example.com,Proxy"`。解析器使用 [PyYAML](lib/requirements.txt)，而不是用 shell 文本匹配猜 YAML；在可编辑环境中先安装 `python3 -m pip install -r clash-verge/lib/requirements.txt`（系统包 `python3-yaml` 也可以）。
 
 ```bash
 # 以下两项不读取 Clash Verge 的 profiles registry，因此可在任意 cwd 预检
@@ -29,7 +42,9 @@ rules/proxy.yaml    # 只能写当前订阅已有的代理组目标；不写节�
 
 Mihomo 是**首条命中**，不会因为 `DOMAIN` 比 `DOMAIN-SUFFIX` 更具体而自动获胜。`pre` 的顺序为 `direct.pre`、`proxy.pre`，并移到订阅规则前；相同的订阅条目按完整规范化规则串去重并提升。订阅原有规则在第一个 `MATCH` 前保持原序；缺失的 `direct.post`、`proxy.post` 插入在该 `MATCH` 前，已有的相同 `post` 条目保留原位置。这样 `post` 是订阅规则的补充，不会覆盖订阅已有例外。生成器拒绝不存在的代理组、缺少 `MATCH`、未知 YAML 字段、同一选择器相反目标，以及同一阶段具有相反目标的可证明域名重叠（`DOMAIN`/`DOMAIN-SUFFIX`、后缀嵌套）。它不会猜测规则特异性或重排订阅。
 
-支持的可编辑 matcher 是 `DOMAIN`、`DOMAIN-SUFFIX`、`DOMAIN-KEYWORD`、`DST-PORT`、`GEOIP`、`IP-CIDR` 和 `IP-CIDR6`。`IP-CIDR` 可使用 IPv4 或 IPv6 CIDR；端口必须是单一 1–65535 值或升序范围；`no-resolve` 只允许作为 `GEOIP`、`IP-CIDR` 或 `IP-CIDR6` 的最后一个选项。`rules check` 会在任何写入前拒绝未知 matcher、错误 payload/arity、错误选项和内置策略名作为 proxy 目标。
+支持的可编辑 matcher 是 `DOMAIN`、`DOMAIN-SUFFIX`、`DOMAIN-KEYWORD`、`DST-PORT`、`GEOIP`、`IP-CIDR` 和 `IP-CIDR6`。`PROCESS-NAME`、`PROCESS-PATH` 等进程 matcher 当前仍不支持。`IP-CIDR` 可使用 IPv4 或 IPv6 CIDR；端口必须是单一 1–65535 值或升序范围；`no-resolve` 只允许作为 `GEOIP`、`IP-CIDR` 或 `IP-CIDR6` 的最后一个选项。`rules check` 会在任何写入前拒绝未知 matcher、错误 payload/arity、错误选项和内置策略名作为 proxy 目标。
+
+完整优化的通用活跃规则诊断从两个 YAML 来源生成期望：`direct.pre`、`proxy.pre` 必须按该顺序成为 `/rules` 的精确前缀，`post` 只要求以正确目标出现在 `MATCH` 前，允许订阅已有同规则保留在更早位置。本定义允许本地 proxy 规则，不再使用“所有 DIRECT 必须位于首条 proxy 前”的旧屏障。`/rules` 只暴露 matcher、payload 和目标，通常不暴露 `no-resolve` 等完整文本选项；这些选项由来源检查和渲染验证，不能声称已由 `/rules` 证明。LiteLLM TLS-SNI、TUN 路由、Fake-IP 生成块和 GitHub SSH 是机制不同的专用检查；假设的策略不存在时会明确 `skip`，不会冒充通用路由证明。
 
 迁移说明：旧脚本中六条 `forceTop` 规则现在在 `direct.pre`；其余原有本地 DIRECT 规则都在 `direct.post`。每条匹配器、目标和 `no-resolve` 选项均保留。宽泛补充规则现在会让位于订阅中即使没有完全相同字符串的更早例外；这是为消除旧版“全部 prepend”遮蔽订阅例外的有意语义变化。
 
@@ -178,4 +193,4 @@ for i,r in enumerate(json.load(sys.stdin)["rules"]):
 python3 clash-verge/tests/github-ssh.py
 ```
 
-从仓库根目录执行。需要 Python 3、Bash、OpenSSH 和 Node.js；测试只在专用临时目录生成配置、解析 SSH 设置和运行规则合并函数，不连接远端、不修改真实 HOME 或代理设置。
+从仓库根目录执行。需要 Python 3、PyYAML、Bash、OpenSSH、Node.js 和 `verge-mihomo`。测试使用专用临时 HOME，覆盖 Merge 精确前后差异和幂等性、来源驱动的模拟 `/rules`、registry 边界、真实 Mihomo 配置验证、失败前无写入、唯一备份/恢复及 SSH 生成；不连接远端、不读取或修改真实 HOME/代理设置。

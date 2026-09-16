@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Offline route-source regressions; all writes use a dedicated temporary HOME."""
 from pathlib import Path
+import hashlib
 import json
 import os
 import re
@@ -30,7 +31,6 @@ def run(command, *, env, cwd, expected=0, input=None):
 
 def write_rules(directory, direct, proxy):
     directory.mkdir()
-    shutil.copy(CLASH / "rules" / "render-rules.py", directory / "render-rules.py")
     (directory / "direct.yaml").write_text(direct)
     (directory / "proxy.yaml").write_text(proxy)
 
@@ -55,12 +55,20 @@ update_sniffer_config(){ :; }
 '''
     stubs += r'''
 verify_merge_yaml(){ :; }
-verify_direct_rules(){ :; }
+verify_route_rules(){ :; }
 verify_sniffer_live(){ :; }
 verify_tun_routes(){ :; }
 '''
     return ["bash", "-c", 'source "$1"; ' + stubs + extra + '\noptimize_all "$2"',
             "test", str(source), str(merge_file)]
+
+
+def registry_with_merge(registry):
+    if "uid: Merge" in registry:
+        return registry
+    if "items: []" in registry:
+        registry = registry.replace("items: []", "items:")
+    return registry + "- uid: Merge\n  type: merge\n  file: Merge.yaml\n"
 
 
 def assert_optimizer_preflight_failure(root, rules, label, registry, *, profile_dir=True, extra="", input=None):
@@ -78,9 +86,10 @@ def assert_optimizer_preflight_failure(root, rules, label, registry, *, profile_
         script = profiles / "Script.js"
         subscription = state / "subscription-merge.yaml"
         subscription.write_text("subscription sentinel\n")
-    (state / "profiles.yaml").write_text(registry)
-    merge = state / "merge.yaml"
-    merge.write_text("merge sentinel\n")
+    (state / "profiles.yaml").write_text(registry_with_merge(registry))
+    merge = profiles / "Merge.yaml"
+    if profile_dir:
+        merge.write_text("merge sentinel\n")
     before_inventory = {
         str(path.relative_to(state)): path.read_bytes()
         for path in state.rglob("*.backup.*") if path.is_file()
@@ -89,9 +98,10 @@ def assert_optimizer_preflight_failure(root, rules, label, registry, *, profile_
     env = dict(os.environ, HOME=str(home), RULES_DIR=str(rules), OPTIMIZER_MARKER=str(marker))
     result = run(optimizer_shell(SOURCE, merge, extra), env=env, cwd=root, expected=1, input=input)
     check(not marker.exists(), f"optimizer {label} called a mutator before preparation failed")
-    check(merge.read_text() == "merge sentinel\n" and subscription.read_text() == "subscription sentinel\n",
-          f"optimizer {label} mutated Merge/subscription before Script preparation")
+    check(subscription.read_text() == "subscription sentinel\n",
+          f"optimizer {label} mutated subscription before Script preparation")
     if profile_dir:
+        check(merge.read_text() == "merge sentinel\n", f"optimizer {label} mutated Merge before preparation")
         check(script.read_text() == "// foreign optimizer sentinel\n",
               f"optimizer {label} mutated Script before preparation completed")
         check(not list(profiles.glob(".Script.js.candidate.*")), f"optimizer {label} left candidate")
@@ -101,7 +111,8 @@ def assert_optimizer_preflight_failure(root, rules, label, registry, *, profile_
         }
         check(after_inventory == before_inventory, f"optimizer {label} changed backup inventory")
     else:
-        check(not profiles.exists(), "missing target directory was created during failed optimizer preflight")
+        check(not merge.exists() and not profiles.exists(),
+              "missing target directory was created during failed optimizer preflight")
     return result
 
 
@@ -179,6 +190,137 @@ post:
         ssh.parent.mkdir()
         ssh.write_text("Host untouched\n")
         env = dict(os.environ, HOME=str(home), RULES_DIR=str(rules))
+
+        # Policy sources are data-only and must remain byte-identical through the refactor.
+        check(hashlib.sha256((CLASH / "rules/direct.yaml").read_bytes()).hexdigest() ==
+              "e1cb6b4d086b0d94cba3126c2d5a2953dcad150c87cf1e4148c331d9db39c3ba",
+              "direct.yaml changed during implementation refactor")
+        check(hashlib.sha256((CLASH / "rules/proxy.yaml").read_bytes()).hexdigest() ==
+              "8d318ea2f077eb5fad02a8560761343e71dd38b3acbf4a096f9cb28f7fd729c4",
+              "proxy.yaml changed during implementation refactor")
+
+        # Representative Merge mutation is an exact before/after fixture. It
+        # preserves unrelated keys/comments, replaces bounded blocks, and is idempotent.
+        merge_fixture = root / "merge-fixture.yaml"
+        merge_fixture.write_text(
+            "# fixture comment\nmode: rule # preserve\ndns:\n"
+            "  enable: true # preserve\n  fake-ip-filter:\n    - old\n    - rule-set:old\n"
+            "  nameserver:\n    - 1.1.1.1 # preserve\n"
+            "prepend-rules:\n  - DOMAIN,old.example,DIRECT\n"
+            "sniffer:\n  enable: false\ntun:\n  enable: false\n"
+            "experimental:\n  keep: yes # preserve\n"
+        )
+        mutate = ['source "$1"; remove_prepend_rules "$2"; update_fake_ip_filter "$2"; '
+                  'update_tun_config "$2"; update_sniffer_config "$2"; verify_merge_yaml "$2"']
+        run(["bash", "-c", mutate[0], "test", str(SOURCE), str(merge_fixture)], env=env, cwd=root)
+        fake_block = run(["bash", "-c", 'source "$1"; fake_ip_filter_block', "test", str(SOURCE)],
+                         env=env, cwd=root).stdout
+        sniffer_block = run(["bash", "-c", 'source "$1"; sniffer_block', "test", str(SOURCE)],
+                            env=env, cwd=root).stdout
+        tun_block = run(["bash", "-c", 'source "$1"; tun_block', "test", str(SOURCE)],
+                        env=env, cwd=root).stdout
+        expected_merge = (
+            "# fixture comment\nmode: rule # preserve\ndns:\n" + fake_block +
+            "  enable: true # preserve\n  nameserver:\n    - 1.1.1.1 # preserve\n"
+            "experimental:\n  keep: yes # preserve\n\n" + sniffer_block + "\n" + tun_block
+        )
+        check(merge_fixture.read_text() == expected_merge,
+              "Merge before/after fixture changed unrelated content or block ordering")
+        first_merge = merge_fixture.read_bytes()
+        run(["bash", "-c", mutate[0], "test", str(SOURCE), str(merge_fixture)], env=env, cwd=root)
+        check(merge_fixture.read_bytes() == first_merge, "Merge helpers are not byte-idempotent")
+
+        # A failing nested producer must stop before its trailing echo and before replacement.
+        false_marker = root / "false-helper.marker"
+        no_write_before = merge_fixture.read_bytes()
+        no_write = ('source "$1"; tun_block(){ false; echo leaked > "$FALSE_MARKER"; }; '
+                    'update_tun_config "$2"')
+        no_write_env = dict(env, FALSE_MARKER=str(false_marker))
+        run(["bash", "-c", no_write, "test", str(SOURCE), str(merge_fixture)],
+            env=no_write_env, cwd=root, expected=1)
+        check(not false_marker.exists() and merge_fixture.read_bytes() == no_write_before,
+              "false-then-echo helper was swallowed or mutated Merge")
+        check(not list(root.glob("merge-fixture.yaml.tmp.*")) and
+              not list(root.glob("merge-fixture.yaml.block.*")) and
+              not list(root.glob("merge-fixture.yaml.strip.*")),
+              "failed Merge helper leaked same-directory temporary files")
+
+        # Generic /rules diagnostics derive direct+proxy pre/post expectations
+        # from edited sources. Proxy pre may precede direct post; post may already
+        # exist earlier than source insertion order, so no old proxy barrier applies.
+        diagnostic_rules = root / "diagnostic-rules"
+        write_rules(diagnostic_rules, direct, proxy)
+        rules_json = root / "rules.json"
+        runtime_rules = [
+            {"type": "Domain", "payload": "force.example", "proxy": "DIRECT"},
+            {"type": "Domain", "payload": "ssh.github.com", "proxy": "DIRECT"},
+            {"type": "Domain", "payload": "proxy.example", "proxy": "Proxy"},
+            {"type": "Domain", "payload": "late.example", "proxy": "Proxy"},
+            {"type": "DomainSuffix", "payload": "cn", "proxy": "DIRECT"},
+            {"type": "IPCIDR", "payload": "2001:db8::/32", "proxy": "DIRECT"},
+            {"type": "Domain", "payload": "deleted.example", "proxy": "DIRECT"},
+            {"type": "Match", "payload": "", "proxy": "Proxy"},
+        ]
+        rules_json.write_text(json.dumps({"rules": runtime_rules}))
+        diagnostic_env = dict(env, RULES_DIR=str(diagnostic_rules), RULES_JSON=str(rules_json))
+        diagnostic_command = ('source "$1"; mihomo_api(){ cat "$RULES_JSON"; }; verify_route_rules')
+        diagnosed = run(["bash", "-c", diagnostic_command, "test", str(SOURCE)],
+                        env=diagnostic_env, cwd=root)
+        check("pre[2] domain,proxy.example -> Proxy" in diagnosed.stdout and
+              "post domain,late.example -> Proxy; first index 3" in diagnosed.stdout and
+              "not proven by this endpoint" in diagnosed.stdout,
+              "generic diagnostic did not report source-derived proxy/pre/post semantics or /rules limit")
+        (diagnostic_rules / "direct.yaml").write_text(
+            direct.replace('  - "DOMAIN,force.example,DIRECT"\n', ""))
+        runtime_rules.pop(0)
+        rules_json.write_text(json.dumps({"rules": runtime_rules}))
+        edited = run(["bash", "-c", diagnostic_command, "test", str(SOURCE)],
+                     env=diagnostic_env, cwd=root)
+        check("force.example" not in edited.stdout and "pre[1] domain,proxy.example -> Proxy" in edited.stdout,
+              "generic diagnostic retained deleted hardcoded expectations")
+        runtime_rules[1]["proxy"] = "WrongGroup"
+        rules_json.write_text(json.dumps({"rules": runtime_rules}))
+        wrong_target = run(["bash", "-c", diagnostic_command, "test", str(SOURCE)],
+                           env=diagnostic_env, cwd=root, expected=1)
+        check("runtime has domain,proxy.example -> WrongGroup" in wrong_target.stdout,
+              "generic diagnostic missed a local proxy target mismatch")
+        missing_api = run(["bash", "-c", 'source "$1"; mihomo_api(){ return 1; }; verify_route_rules',
+                           "test", str(SOURCE)], env=diagnostic_env, cwd=root, expected=1)
+        check("查不到活跃数据不是通过" in missing_api.stdout, "missing controller data passed silently")
+        probe_marker = root / "unexpected-specialized-probe"
+        probe_env = dict(diagnostic_env, PROBE_MARKER=str(probe_marker))
+        skipped_probe = run(["bash", "-c",
+                             'source "$1"; mihomo_api(){ echo called > "$PROBE_MARKER"; return 1; }; '
+                             'verify_sniffer_live', "test", str(SOURCE)],
+                            env=probe_env, cwd=root)
+        check("该专用探针不适用" in skipped_probe.stdout and not probe_marker.exists(),
+              "LiteLLM specialized probe ran without its assumed source policy")
+
+        # Every Bash registry helper is backed by the same strict YAML reader.
+        query_home = root / "query-home"
+        query_state = query_home / ".local/share/io.github.clash-verge-rev.clash-verge-rev"
+        query_state.mkdir(parents=True)
+        (query_state / "profiles.yaml").write_text(
+            "current: 'remote-a'\nitems:\n"
+            "- file: 'Merge.yaml'\n  uid: Merge\n  type: merge\n"
+            "- type: script\n  file: Script.js\n  uid: Script\n"
+            "- uid: local-merge\n  file: LocalMerge.yaml\n  type: merge\n"
+            "- uid: local-rules\n  type: rules\n  file: LocalRules.yaml\n"
+            "- option:\n    rules: local-rules\n    merge: local-merge\n"
+            "  name: 'Quoted Profile'\n  file: remote.yaml\n  type: remote\n  uid: remote-a\n"
+        )
+        query_env = dict(os.environ, HOME=str(query_home), RULES_DIR=str(rules))
+        queried = run(["bash", "-c",
+                       'source "$1"; get_merge_config; get_script_config; get_profile_name; '
+                       'get_current_profile_path; get_current_profile_option_path merge; '
+                       'get_current_profile_option_path rules; registry_query remote-merge-targets',
+                       "test", str(SOURCE)], env=query_env, cwd=root).stdout.splitlines()
+        check(queried == [str(query_state / "profiles/Merge.yaml"),
+                          str(query_state / "profiles/Script.js"), "Quoted Profile",
+                          str(query_state / "profiles/remote.yaml"),
+                          str(query_state / "profiles/LocalMerge.yaml"),
+                          str(query_state / "profiles/LocalRules.yaml"), "LocalMerge.yaml"],
+              f"registry helpers disagreed with quoted/reordered YAML: {queried}")
 
         # Read-only paths use arbitrary cwd and no profile registry.
         no_profile = dict(env, HOME=str(root / "no-profile"))
@@ -290,6 +432,23 @@ post:
         check(all(backup.name in listed_backups for backup in backups) and "备份时间" in listed_backups,
               "backup menu cannot discover/display collision-free Script backups")
 
+        restore_home = root / "restore-home"
+        restore_profiles = restore_home / ".local/share/io.github.clash-verge-rev.clash-verge-rev/profiles"
+        restore_profiles.mkdir(parents=True)
+        restore_target = restore_profiles / "Restore.yaml"
+        restore_target.write_text("original\n")
+        restore_env = dict(os.environ, HOME=str(restore_home), RULES_DIR=str(rules))
+        restored = run(["bash", "-c",
+                        'source "$1"; unique_backup "$2"; printf "changed\\n" > "$2"; restore_backup',
+                        "test", str(SOURCE), str(restore_target)],
+                       env=restore_env, cwd=root, input="1\n")
+        restore_backups = list(restore_profiles.glob("Restore.yaml.backup.*"))
+        check(restore_target.read_text() == "original\n" and len(restore_backups) == 1 and
+              re.fullmatch(r"Restore\.yaml\.backup\.\d{8}_\d{6}\.[A-Za-z0-9]+", restore_backups[0].name) and
+              "已恢复: Restore.yaml" in restored.stdout and
+              not list(restore_profiles.glob(".Restore.yaml.restore.*")),
+              "backup restore did not atomically recover the selected unique backup")
+
         # Full optimizer must prepare every Script-specific condition before it
         # reaches its Merge backup/clear/rewrite calls. Mutating helpers are stubbed.
         assert_optimizer_preflight_failure(root, rules, "null",
@@ -306,13 +465,25 @@ post:
             extra="render_route_script(){ return 1; }")
         assert_optimizer_preflight_failure(root, rules, "foreign-declined",
             "items:\n- uid: Script\n  type: script\n  file: Script.js\n", input="n\n")
+        assert_optimizer_preflight_failure(root, rules, "merge-null",
+            "items:\n- uid: Script\n  type: script\n  file: Script.js\n"
+            "- uid: Merge\n  type: merge\n  file: null\n")
+        assert_optimizer_preflight_failure(root, rules, "merge-duplicate",
+            "items:\n- uid: Script\n  type: script\n  file: Script.js\n"
+            "- uid: Merge\n  type: merge\n  file: Merge.yaml\n"
+            "- uid: Merge\n  type: merge\n  file: Other.yaml\n")
+        assert_optimizer_preflight_failure(root, rules, "remote-merge-missing",
+            "items:\n- uid: Script\n  type: script\n  file: Script.js\n"
+            "- uid: remote-a\n  type: remote\n  file: remote.yaml\n"
+            "  option:\n    merge: missing-merge\n")
 
         success_home = root / "optimizer-success-home"
         success_state = success_home / ".local/share/io.github.clash-verge-rev.clash-verge-rev"
         success_profiles = success_state / "profiles"
         success_profiles.mkdir(parents=True)
-        (success_state / "profiles.yaml").write_text("items:\n- uid: Script\n  type: script\n  file: Script.js\n")
-        success_merge = success_state / "merge.yaml"
+        (success_state / "profiles.yaml").write_text(registry_with_merge(
+            "items:\n- uid: Script\n  type: script\n  file: Script.js\n"))
+        success_merge = success_profiles / "Merge.yaml"
         success_merge.write_text("merge sentinel\n")
         success_env = dict(os.environ, HOME=str(success_home), RULES_DIR=str(rules))
         run(optimizer_shell(SOURCE, success_merge, forbid_mutators=False), env=success_env, cwd=root)
@@ -326,10 +497,11 @@ post:
         errexit_state = errexit_home / ".local/share/io.github.clash-verge-rev.clash-verge-rev"
         errexit_profiles = errexit_state / "profiles"
         errexit_profiles.mkdir(parents=True)
-        (errexit_state / "profiles.yaml").write_text("items:\n- uid: Script\n  type: script\n  file: Script.js\n")
+        (errexit_state / "profiles.yaml").write_text(registry_with_merge(
+            "items:\n- uid: Script\n  type: script\n  file: Script.js\n"))
         errexit_script = errexit_profiles / "Script.js"
         errexit_script.write_text("// Generated by tun-fix.sh sentinel\n")
-        errexit_merge = errexit_state / "merge.yaml"
+        errexit_merge = errexit_profiles / "Merge.yaml"
         errexit_merge.write_text("merge sentinel\n")
         errexit_marker = errexit_state / "should-not-run.marker"
         errexit_env = dict(os.environ, HOME=str(errexit_home), RULES_DIR=str(rules),
@@ -347,7 +519,7 @@ post:
               "ProxyCommand" not in ssh_block and "ProxyJump" not in ssh_block,
               "GitHub SSH no-jump/QoS policy regressed")
 
-    print("PASS: source grammar, YAML registry/migration preflight, host-faithful guard candidates, real Mihomo validation, optimizer no-mutation preparation, timestamped atomic backups, ordering, and isolated scope")
+    print("PASS: source-derived runtime diagnostics, exact Merge differentials/idempotence, strict YAML registry/migration, host-faithful guards, real Mihomo validation, preflight no-write failures, atomic unique backup/restore, and scoped probes")
 
 
 if __name__ == "__main__":

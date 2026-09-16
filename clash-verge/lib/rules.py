@@ -15,12 +15,19 @@ try:
     import yaml
 except ImportError as error:
     raise SystemExit(
-        "PyYAML is required to read route sources. Install clash-verge/rules/requirements.txt."
+        "PyYAML is required. Install clash-verge/lib/requirements.txt."
     ) from error
 
 
 class SourceError(Exception):
     pass
+
+
+@dataclass(frozen=True)
+class Registry:
+    document: dict[str, Any]
+    items: list[dict[str, Any]]
+    by_uid: dict[str, dict[str, Any]]
 
 
 @dataclass(frozen=True)
@@ -221,7 +228,7 @@ def validate(rules: dict[str, list[Rule]]) -> None:
                          f"same-phase domain overlap with {left.source}:{left.line}; Mihomo uses first match, not specificity")
 
 
-def load_registry(path: Path) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]]]:
+def load_registry(path: Path) -> Registry:
     try:
         document = yaml.safe_load(path.read_text(encoding="utf-8"))
     except OSError as error:
@@ -240,18 +247,85 @@ def load_registry(path: Path) -> tuple[list[dict[str, Any]], dict[str, dict[str,
             if uid in by_uid:
                 raise SourceError(f"{path}: duplicate registry uid {uid!r}")
             by_uid[uid] = item
-    return items, by_uid
+    return Registry(document, items, by_uid)
 
 
-def script_target(registry: Path) -> str:
-    items, _ = load_registry(registry)
-    scripts = [item for item in items if item.get("uid") == "Script"]
-    if len(scripts) != 1:
-        raise SourceError(f"{registry}: require exactly one uid Script entry, found {len(scripts)}")
-    script = scripts[0]
-    if script.get("type") != "script":
-        raise SourceError(f"{registry}: uid Script must have type script")
-    return safe_file(script.get("file"), f"{registry}: uid Script")
+def registered_file(registry_path: Path, uid: str, expected_type: str) -> str:
+    registry = load_registry(registry_path)
+    item = registry.by_uid.get(uid)
+    if item is None:
+        raise SourceError(f"{registry_path}: require exactly one uid {uid} entry, found 0")
+    if item.get("type") != expected_type:
+        raise SourceError(f"{registry_path}: uid {uid} must have type {expected_type}")
+    return safe_file(item.get("file"), f"{registry_path}: uid {uid}")
+
+
+def current_profile(registry_path: Path, registry: Registry) -> dict[str, Any]:
+    uid = registry.document.get("current")
+    if not isinstance(uid, str) or not uid:
+        raise SourceError(f"{registry_path}: current must name one registered profile uid")
+    item = registry.by_uid.get(uid)
+    if item is None:
+        raise SourceError(f"{registry_path}: current references missing uid {uid!r}")
+    return item
+
+
+def registry_query(registry_path: Path, query: str, option: str | None) -> list[str]:
+    if query == "merge-target":
+        return [registered_file(registry_path, "Merge", "merge")]
+    if query == "script-target":
+        return [registered_file(registry_path, "Script", "script")]
+
+    registry = load_registry(registry_path)
+    if query == "remote-merge-targets":
+        files: list[str] = []
+        seen: set[str] = set()
+        for profile in registry.items:
+            if profile.get("type") != "remote":
+                continue
+            options = profile.get("option")
+            if options is None:
+                continue
+            if not isinstance(options, dict):
+                raise SourceError(f"{registry_path}: remote uid {profile.get('uid')!r} option must be a mapping")
+            merge_uid = options.get("merge")
+            if merge_uid is None or merge_uid == "Merge":
+                continue
+            if not isinstance(merge_uid, str) or not merge_uid:
+                raise SourceError(f"{registry_path}: remote uid {profile.get('uid')!r} has invalid merge binding")
+            item = registry.by_uid.get(merge_uid)
+            if item is None or item.get("type") != "merge":
+                raise SourceError(f"{registry_path}: remote profile references invalid Merge uid {merge_uid!r}")
+            filename = safe_file(item.get("file"), f"{registry_path}: Merge uid {merge_uid!r}")
+            if filename not in seen:
+                seen.add(filename)
+                files.append(filename)
+        return files
+
+    profile = current_profile(registry_path, registry)
+    if query == "current-name":
+        name = profile.get("name")
+        return [name if isinstance(name, str) and name else "(未命名)"]
+    if query == "current-file":
+        return [safe_file(profile.get("file"), f"{registry_path}: current profile")]
+    if query == "current-option":
+        if option not in {"merge", "script", "rules", "proxies", "groups"}:
+            raise SourceError(f"{registry_path}: unsupported current option {option!r}")
+        options = profile.get("option")
+        if options is None:
+            return []
+        if not isinstance(options, dict):
+            raise SourceError(f"{registry_path}: current profile option must be a mapping")
+        bound_uid = options.get(option)
+        if bound_uid is None:
+            return []
+        if not isinstance(bound_uid, str) or not bound_uid:
+            raise SourceError(f"{registry_path}: current option {option} has an invalid uid")
+        item = registry.by_uid.get(bound_uid)
+        if item is None or item.get("type") != option:
+            raise SourceError(f"{registry_path}: current option {option} references invalid uid {bound_uid!r}")
+        return [safe_file(item.get("file"), f"{registry_path}: {option} uid {bound_uid!r}")]
+    raise SourceError(f"{registry_path}: unsupported registry query {query!r}")
 
 
 def extension_rules(path: Path) -> list[tuple[int, str]]:
@@ -279,7 +353,8 @@ def extension_rules(path: Path) -> list[tuple[int, str]]:
 
 
 def migration_check(registry: Path, local_rules: dict[str, list[Rule]]) -> None:
-    items, by_uid = load_registry(registry)
+    registry_data = load_registry(registry)
+    items, by_uid = registry_data.items, registry_data.by_uid
     tracked = {rule.normalized for phase in ("pre", "post") for rule in local_rules[phase]}
     tracked.add(LEGACY_GITHUB_RULE)
     failures: list[str] = []
@@ -313,6 +388,162 @@ def render(rules: dict[str, list[Rule]]) -> str:
     return """// Generated by tun-fix.sh from rules/direct.yaml and rules/proxy.yaml. Do not edit.\n\nconst localRules = %s;\nconst requiredProxyGroups = %s;\n\nfunction localRulesFailure(config, code, detail) {\n  // Clash Verge Rev 2.5.2 swallows thrown Script errors and returns the original\n  // config. Return a JSON object with an unsupported Mihomo matcher instead so\n  // the following core validation fails visibly instead of dropping overrides.\n  const marker = \"LOCAL-RULES-ERROR-\" + code + \"-\" + String(detail).replace(/[^A-Za-z0-9-]/g, \"-\");\n  config.rules = [marker + \",local-route-guard,DIRECT\"];\n  return config;\n}\n\nfunction main(config) {\n  const groups = Array.isArray(config[\"proxy-groups\"]) ? config[\"proxy-groups\"] : [];\n  const groupNames = new Set(groups.map(group => group && group.name).filter(Boolean));\n  const missingGroups = requiredProxyGroups.filter(name => !groupNames.has(name));\n  if (missingGroups.length) {\n    return localRulesFailure(config, \"MISSING-PROXY-GROUP\", missingGroups.join(\"-\"));\n  }\n\n  const norm = (rule) => {\n    const parts = String(rule).split(\",\").map(part => part.trim());\n    if (parts.length) parts[0] = parts[0].toUpperCase();\n    return parts.join(\",\");\n  };\n  const base = Array.isArray(config.rules) ? config.rules.slice() : [];\n  const pre = [...localRules.pre];\n  const post = [...localRules.post];\n  const preSet = new Set(pre.map(norm));\n  const withoutPre = base.filter(rule => !preSet.has(norm(rule)));\n  const matchIndex = withoutPre.findIndex(rule => norm(rule).split(\",\")[0] === \"MATCH\");\n  if (matchIndex < 0) {\n    return localRulesFailure(config, \"MISSING-MATCH\", \"incoming-rules\");\n  }\n  const beforeMatch = withoutPre.slice(0, matchIndex);\n  const fromMatch = withoutPre.slice(matchIndex);\n  const existing = new Set(withoutPre.map(norm));\n  const missingPost = post.filter(rule => !existing.has(norm(rule)));\n  config.rules = [...pre, ...beforeMatch, ...missingPost, ...fromMatch];\n  return config;\n}\n""" % (json.dumps(packed, ensure_ascii=False, indent=2), json.dumps(proxy_targets, ensure_ascii=False))
 
 
+def matcher_key(value: Any) -> str:
+    return re.sub(r"[^a-z0-9]", "", str(value).lower())
+
+
+def runtime_signature(rule: Rule) -> tuple[str, str, str]:
+    kind, payload = rule.selector
+    return matcher_key(kind), payload, rule.target
+
+
+def runtime_entry_signature(entry: dict[str, Any]) -> tuple[str, str, str]:
+    return matcher_key(entry.get("type")), str(entry.get("payload", "")), str(entry.get("proxy", ""))
+
+
+def format_signature(signature: tuple[str, str, str]) -> str:
+    kind, payload, target = signature
+    return f"{kind},{payload} -> {target}"
+
+
+def verify_runtime_rules(rules: dict[str, list[Rule]], stream: Any) -> bool:
+    try:
+        document = json.load(stream)
+    except (TypeError, ValueError) as error:
+        raise SourceError(f"/rules response is not valid JSON: {error}") from error
+    runtime = document.get("rules") if isinstance(document, dict) else None
+    if not isinstance(runtime, list) or not all(isinstance(item, dict) for item in runtime):
+        raise SourceError("/rules response must contain a rules list of objects")
+    if not runtime:
+        raise SourceError("/rules returned an empty rules list")
+
+    failed = False
+    print(f"runtime rules: {len(runtime)}")
+    expected_pre = rules["pre"]
+    for index, expected_rule in enumerate(expected_pre):
+        expected = runtime_signature(expected_rule)
+        actual = runtime_entry_signature(runtime[index]) if index < len(runtime) else None
+        label = f"pre[{index}] {format_signature(expected)}"
+        if actual == expected:
+            print(f"pass {label}")
+        else:
+            got = "missing" if actual is None else format_signature(actual)
+            print(f"fail {label}; runtime has {got}")
+            failed = True
+
+    match_index = next(
+        (index for index, entry in enumerate(runtime) if matcher_key(entry.get("type")) == "match"),
+        None,
+    )
+    if match_index is None:
+        print("fail runtime rules have no MATCH fallback")
+        failed = True
+    else:
+        print(f"MATCH index: {match_index}")
+        for expected_rule in rules["post"]:
+            expected = runtime_signature(expected_rule)
+            hits = [
+                index for index, entry in enumerate(runtime[:match_index])
+                if runtime_entry_signature(entry) == expected
+            ]
+            label = f"post {format_signature(expected)}"
+            if hits:
+                print(f"pass {label}; first index {hits[0]} before MATCH")
+            else:
+                print(f"fail {label}; no metadata-equivalent rule before MATCH")
+                failed = True
+
+    print("note /rules exposes matcher, payload, and target but not complete textual options;")
+    print("     no-resolve and other source options are validated by rules check/render, not proven by this endpoint.")
+    return not failed
+
+
+def policy_host_match(rules: dict[str, list[Rule]], host: str, target: str) -> tuple[str, str, str] | None:
+    normalized_host = host.lower().rstrip(".")
+    for phase in ("pre", "post"):
+        for rule in rules[phase]:
+            selector = domain_selector(rule)
+            if rule.target != target or selector is None:
+                continue
+            kind, value = selector
+            if (kind == "DOMAIN" and normalized_host == value) or (
+                kind == "DOMAIN-SUFFIX"
+                and (normalized_host == value or normalized_host.endswith("." + value))
+            ):
+                return phase, kind, value
+    return None
+
+
+def json_object(stream: Any, label: str) -> dict[str, Any]:
+    try:
+        document = json.load(stream)
+    except (TypeError, ValueError) as error:
+        raise SourceError(f"{label} is not valid JSON: {error}") from error
+    if not isinstance(document, dict):
+        raise SourceError(f"{label} must be a JSON object")
+    return document
+
+
+def sniffer_enabled(stream: Any) -> bool:
+    config = json_object(stream, "/configs response")
+    sniffing = config.get("sniffing")
+    sniffer = config.get("sniffer") or {}
+    return bool(sniffing) or (isinstance(sniffer, dict) and bool(sniffer.get("enable")))
+
+
+def doh_address(stream: Any) -> str:
+    document = json_object(stream, "DoH response")
+    answers = document.get("Answer")
+    if not isinstance(answers, list):
+        raise SourceError("DoH response has no Answer list")
+    for answer in answers:
+        if isinstance(answer, dict) and answer.get("type") == 1:
+            value = answer.get("data")
+            try:
+                address = ipaddress.ip_address(value)
+            except ValueError:
+                continue
+            if address.version == 4:
+                return str(address)
+    raise SourceError("DoH response has no IPv4 A answer")
+
+
+def connection_result(stream: Any, host: str, address: str) -> str | None:
+    document = json_object(stream, "/connections response")
+    connections = document.get("connections")
+    if not isinstance(connections, list):
+        raise SourceError("/connections response has no connections list")
+    found: dict[str, Any] | None = None
+    for connection in connections:
+        metadata = connection.get("metadata", {}) if isinstance(connection, dict) else {}
+        if isinstance(metadata, dict) and metadata.get("sniffHost") == host:
+            found = connection
+            break
+    if found is None:
+        for connection in connections:
+            metadata = connection.get("metadata", {}) if isinstance(connection, dict) else {}
+            if not isinstance(metadata, dict) or metadata.get("host") != "":
+                continue
+            if metadata.get("destinationIP") == address or metadata.get("remoteDestination") == address:
+                found = connection
+                break
+    if found is None:
+        return None
+    chains = found.get("chains")
+    chain_text = "|".join(str(value) for value in chains) if isinstance(chains, list) else ""
+    return f"{found.get('rule', '')} | {found.get('rulePayload', '')} | {chain_text}"
+
+
+
+def check_yaml(path: Path) -> None:
+    try:
+        yaml.safe_load(path.read_text(encoding="utf-8"))
+    except OSError as error:
+        raise SourceError(f"{path}: cannot read YAML: {error}") from error
+    except yaml.YAMLError as error:
+        raise SourceError(f"{path}: invalid YAML: {error}") from error
+
+
 def parsed_sources(direct: Path, proxy: Path) -> dict[str, list[Rule]]:
     direct_rules, proxy_rules = load_source(direct, "DIRECT"), load_source(proxy, "PROXY")
     rules = {phase: direct_rules[phase] + proxy_rules[phase] for phase in ("pre", "post")}
@@ -325,19 +556,48 @@ def main() -> int:
     parser.add_argument("--direct", type=Path)
     parser.add_argument("--proxy", type=Path)
     parser.add_argument("--registry", type=Path)
-    parser.add_argument("--check", action="store_true")
-    parser.add_argument("--render", action="store_true")
-    parser.add_argument("--script-target", action="store_true")
-    parser.add_argument("--migration-check", action="store_true")
+    parser.add_argument("--option", choices=("merge", "script", "rules", "proxies", "groups"))
+    parser.add_argument("--policy-target", default="DIRECT")
+    parser.add_argument("--connection-host", default="litellm.dex-gem.ai")
+    parser.add_argument("--connection-address")
+    actions = parser.add_mutually_exclusive_group(required=True)
+    actions.add_argument("--check", action="store_true")
+    actions.add_argument("--render", action="store_true")
+    actions.add_argument("--migration-check", action="store_true")
+    actions.add_argument(
+        "--registry-query",
+        choices=("merge-target", "script-target", "current-name", "current-file", "current-option", "remote-merge-targets"),
+    )
+    actions.add_argument("--verify-runtime", action="store_true")
+    actions.add_argument("--policy-host")
+    actions.add_argument("--yaml-check", type=Path)
+    actions.add_argument("--sniffer-enabled", action="store_true")
+    actions.add_argument("--doh-address", action="store_true")
+    actions.add_argument("--connection-result", action="store_true")
     args = parser.parse_args()
-    actions = sum((args.check, args.render, args.script_target, args.migration_check))
-    if actions != 1:
-        parser.error("choose exactly one action")
     try:
-        if args.script_target:
+        if args.registry_query:
             if not args.registry:
-                parser.error("--script-target requires --registry")
-            print(script_target(args.registry))
+                parser.error("--registry-query requires --registry")
+            for value in registry_query(args.registry, args.registry_query, args.option):
+                print(value)
+            return 0
+        if args.yaml_check:
+            check_yaml(args.yaml_check)
+            print(f"YAML valid: {args.yaml_check}")
+            return 0
+        if args.sniffer_enabled:
+            print("true" if sniffer_enabled(sys.stdin) else "false")
+            return 0
+        if args.doh_address:
+            print(doh_address(sys.stdin))
+            return 0
+        if args.connection_result:
+            if not args.connection_address:
+                parser.error("--connection-result requires --connection-address")
+            result = connection_result(sys.stdin, args.connection_host, args.connection_address)
+            if result is not None:
+                print(result)
             return 0
         if not args.direct or not args.proxy:
             parser.error("source actions require --direct and --proxy")
@@ -349,6 +609,14 @@ def main() -> int:
             print("no bound local Rules duplicates")
         elif args.render:
             print(render(rules), end="")
+        elif args.verify_runtime:
+            return 0 if verify_runtime_rules(rules, sys.stdin) else 1
+        elif args.policy_host:
+            match = policy_host_match(rules, args.policy_host, args.policy_target)
+            if match is None:
+                print("absent")
+                return 2
+            print("\t".join(match))
         else:
             print(f"route sources valid: {sum(len(value) for value in rules.values())} rule(s)")
     except SourceError as error:

@@ -1,2 +1,0 @@
-# Required by rules/render-rules.py for strict local route-source parsing.
-PyYAML>=6.0,<7
