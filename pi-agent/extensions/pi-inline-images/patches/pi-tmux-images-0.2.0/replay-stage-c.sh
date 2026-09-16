@@ -9,12 +9,13 @@ ownership_upgrade="$patch_dir/stage-c-ownership-fixes.patch"
 
 [ "$mode" = check ] || [ "$mode" = apply ] || { echo "unknown mode: $mode" >&2; exit 2; }
 [ "$(node -p "require('$root/package.json').version")" = "0.2.0" ] || { echo 'expected pi-tmux-images 0.2.0' >&2; exit 1; }
-[ "$(sha256sum "$patch_file" | awk '{print $1}')" = fb8953b6d0f0369ca361038cfb760f9b41e0058e2173ff9b2ad7daeed44cbf52 ] || { echo 'unexpected replay patch digest' >&2; exit 1; }
+[ "$(sha256sum "$patch_file" | awk '{print $1}')" = b5e012eb04c5462369a161a47fd182692d7513138c81f19eeb256a4426973ce5 ] || { echo 'unexpected replay patch digest' >&2; exit 1; }
 [ "$(sha256sum "$review_upgrade" | awk '{print $1}')" = 4898db2958ee9c4541e468fc388dd663b9b1633df97de1abfe42cdabd787d46b ] || { echo 'unexpected review upgrade patch digest' >&2; exit 1; }
-[ "$(sha256sum "$ownership_upgrade" | awk '{print $1}')" = 574520833d8678e07eec33fffecb45d87e67480e65241af1e983f85695697858 ] || { echo 'unexpected ownership upgrade patch digest' >&2; exit 1; }
+[ "$(sha256sum "$ownership_upgrade" | awk '{print $1}')" = a768036ba2e7800d5c814938b2a289d572d5f905358ea05c4c8aa76789f70b56 ] || { echo 'unexpected ownership upgrade patch digest' >&2; exit 1; }
 
 hash() { sha256sum "$root/$1" 2>/dev/null | awk '{print $1}'; }
 extension=$(hash extensions/index.ts)
+automatic=$(hash src/automatic.ts)
 loader=$(hash src/loader.ts)
 runtime=$(hash src/runtime.ts)
 renderer=$(hash src/renderer.ts)
@@ -28,6 +29,7 @@ esac
 
 state=unknown
 if [ "$extension" = f5609ccf498e1d8a93725ded160d9cb256168c9423585f4053bb227deeb46de3 ] \
+  && [ "$automatic" = 1a105684fcbbb5a8e110b7add2af8941cdfbcd51d581857508ab6f525b8de381 ] \
   && [ "$loader" = 2168c57921e23d2f72abb745803644e0db8d24734d550e8bf189808231abbeb8 ] \
   && [ "$runtime" = 4d9aadc3b5f6fd76f3a90cadb071a6b49c66a3e86063285a863e01c0bbd4580d ] \
   && [ "$renderer" = 5fe7c4bf7ad9db64421a0bbf30d639a528ea4a71a6fd5b3f3b75efe72e9b4c0b ] \
@@ -35,6 +37,7 @@ if [ "$extension" = f5609ccf498e1d8a93725ded160d9cb256168c9423585f4053bb227deeb4
   && [ "$provenance" = absent ]; then
   state=pristine
 elif [ "$extension" = b6fa457459741708cd643fedb9fda408c5f402e268d133c7fc2f31ddbf0c29ec ] \
+  && [ "$automatic" = 1a105684fcbbb5a8e110b7add2af8941cdfbcd51d581857508ab6f525b8de381 ] \
   && [ "$loader" = 2168c57921e23d2f72abb745803644e0db8d24734d550e8bf189808231abbeb8 ] \
   && [ "$runtime" = 41c3e8b0125f2f8e97fc2ca48fd365fa90ad9c509d78b3c76648e93c012e5e8a ] \
   && [ "$renderer" = d917035605ae578a2d01a887ffe6619441ac042b055626154d87492adbef18e1 ] \
@@ -42,17 +45,19 @@ elif [ "$extension" = b6fa457459741708cd643fedb9fda408c5f402e268d133c7fc2f31ddbf
   && [ "$provenance" = c15f4fc606fcf39806336ffb53ee899da7e2b6595c51fffa1df348665efa6f56 ]; then
   state=legacy-patched
 elif [ "$extension" = 09b2245981f14df3a82c2acbfec874c4bf02bfd2c386b33bca21e6709b107618 ] \
+  && [ "$automatic" = 1a105684fcbbb5a8e110b7add2af8941cdfbcd51d581857508ab6f525b8de381 ] \
   && [ "$loader" = 0b3996ff6fc475fac5985f1fa56a76c9009f86524b02f047812b9c0a7848ad1d ] \
   && [ "$runtime" = bb69de792f40dc5d576d26f50773ae9dd168d7e52c76abf42146e61d724c26e3 ] \
   && [ "$renderer" = d917035605ae578a2d01a887ffe6619441ac042b055626154d87492adbef18e1 ] \
   && [ "$transcript" = f1375a025880f9095d8c31f930cc444e601ea59b6c66cba4baf818d4e56cdd47 ] \
   && [ "$provenance" = c15f4fc606fcf39806336ffb53ee899da7e2b6595c51fffa1df348665efa6f56 ]; then
   state=previous-patched
-elif [ "$extension" = 30b096ffe344a8f0567ad5c804ae9f692b56596a54f145c05b8988ac8051f2a3 ] \
+elif [ "$extension" = c387310e555708f5d8a9f110cc5b70f9b103f59a69d78a59b2a4c466928063eb ] \
+  && [ "$automatic" = 34978081cc6e08a4dec9e5415dbea0ca469b2ae7731b9503d49acb38a9aa0c13 ] \
   && [ "$loader" = 0b3996ff6fc475fac5985f1fa56a76c9009f86524b02f047812b9c0a7848ad1d ] \
   && [ "$runtime" = 0f13f7c4212b14a3065bff2a65a833eae67a4a242ae514ba962ecf0e690946b9 ] \
   && [ "$renderer" = 491a90b3b88a46f38e3669a45ce98ca5a2e610b633ec98a1c65b7935d64debb5 ] \
-  && [ "$transcript" = b82c32c5fbfbced297645c4fc6d4217fdd828317aba2d3ae8422a851951d9a70 ] \
+  && [ "$transcript" = ef9c21f1406c9a041c8db35f19fd0bfccbddabb9233ba25f585e986840103d14 ] \
   && [ "$provenance" = c15f4fc606fcf39806336ffb53ee899da7e2b6595c51fffa1df348665efa6f56 ]; then
   state=patched
 fi
@@ -61,6 +66,7 @@ if [ "$state" = unknown ]; then
   echo "unknown/partial pi-tmux-images source state" >&2
   printf '%s\n' \
     "extensions/index.ts $extension" \
+    "src/automatic.ts $automatic" \
     "src/loader.ts $loader" \
     "src/runtime.ts $runtime" \
     "src/renderer.ts $renderer" \

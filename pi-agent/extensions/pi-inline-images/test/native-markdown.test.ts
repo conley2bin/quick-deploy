@@ -114,11 +114,8 @@ test("native cached components retain immutable geometry across changed bytes an
   const firstMessage = withThinking();
   const firstPrepared = (await session.prepareMessage(firstMessage, "/fixture"))[0]!;
   const first = component(firstMessage);
-  const secondMessage = withThinking();
-  const secondPrepared = (await session.prepareMessage(secondMessage, "/fixture"))[0]!;
-  const second = component(secondMessage);
-  const entries = [entry(firstMessage, "first"), entry(secondMessage, "second")];
-  const tui = { children: [first, second], terminal: { columns: 80 }, render: () => [], invalidate() {}, requestRender() {} };
+  const entries = [entry(firstMessage, "first")];
+  const tui = { children: [first], terminal: { columns: 80 }, render: () => [], invalidate() {}, requestRender() {} };
   const adapter = new HostImageOwnershipAdapter(
     session,
     () => undefined,
@@ -127,9 +124,19 @@ test("native cached components retain immutable geometry across changed bytes an
   adapter.setTui(tui as never);
   assert.equal(adapter.reconcile(entries as never, entries as never), true);
 
+  const secondMessage = withThinking();
+  const secondPrepared = (await session.prepareMessage(secondMessage, "/fixture"))[0]!;
+  const second = component(secondMessage);
+  tui.children.push(second);
+  adapter.observeMessage("start", secondMessage);
+  adapter.observeMessage("update", secondMessage);
+  adapter.observeMessage("end", secondMessage);
+  assert.equal(adapter.reconcile(entries as never, entries as never), true, "live identical assistant tail binds before persistence");
   assert.notEqual(firstPrepared.references[0].logicalId, secondPrepared.references[0].logicalId, "changed bytes receive a distinct immutable resource ID");
   assert.equal(glyphs(first), 50);
   assert.equal(glyphs(second), 2);
+  entries.push(entry(secondMessage, "second"));
+  assert.equal(adapter.reconcile(entries as never, entries as never), true, "persisted final message replaces only its live binding");
   await Promise.resolve();
   second.setHideThinkingBlock(true);
   assert.equal(glyphs(first), 50, "cached first occurrence remains unchanged during a local second rebuild");

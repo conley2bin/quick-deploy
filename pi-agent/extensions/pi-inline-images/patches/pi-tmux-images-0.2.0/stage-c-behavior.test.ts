@@ -214,6 +214,64 @@ test("automatic corrupt read persists a wrapped failure without mutating the raw
   }
 });
 
+test("automatic encoded-input overflow persists bounded metadata without hashing or decoding payload", async () => {
+  const copy = disposablePackage();
+  const bus = new Bus();
+  const branch: Array<Record<string, unknown>> = [];
+  const fake = fakeApi(bus, branch);
+  const context = { cwd: "/fixture", sessionManager: { getBranch: () => branch }, ui: { notify() { throw new Error("overflow belongs in transcript notice"); } } };
+  try {
+    const runtimeModule = await import(`${pathToFileURL(resolve(copy.root, "src/runtime.ts")).href}?overflow=${Date.now()}`);
+    let decoded = false;
+    const runtime = new runtimeModule.PreviewRuntime({ byteLoader: async () => { decoded = true; throw new Error("must not decode oversized input"); } });
+    const extensionModule = await import(`${pathToFileURL(resolve(copy.root, "extensions/index.ts")).href}?overflow=${Date.now()}`);
+    extensionModule.registerInlineImages(fake.api, runtime);
+    const data = Buffer.alloc(20 * 1024 * 1024 + 1).toString("base64");
+    const message = { role: "toolResult", toolCallId: "oversized-read", toolName: "read", content: [{ type: "image", mimeType: "image/png", data }] };
+    const raw = JSON.stringify(message);
+    await emit(fake.handlers, "message_end", { message }, context);
+    assert.equal(decoded, false);
+    assert.equal(JSON.stringify(message), raw);
+    const custom = branch.find((entry) => entry.type === "custom" && entry.customType === ENTRY_TYPE)!;
+    const saved = custom.data as { error: string; origin: { rejected: boolean; contentLength: number } };
+    assert.match(saved.error, /encoded input exceeds the 20 MB limit/u);
+    assert.equal(saved.origin.rejected, true);
+    assert.equal(saved.origin.contentLength, data.length);
+    const renderer = fake.renderers.get(ENTRY_TYPE)!;
+    for (const width of [16, 40]) assert.ok(renderer({ data: saved }, {}, {}).render(width).every((line) => visibleWidth(line) <= width));
+    await emit(fake.handlers, "session_shutdown", {}, context);
+  } finally {
+    copy.cleanup();
+  }
+});
+
+test("user attachment keeps independent custom ownership without tool-row coordination", async () => {
+  const copy = disposablePackage();
+  const sink = new Sink(); let nextId = 350;
+  const terminal = new TerminalImages(() => nextId++, () => ({ widthPx: 8, heightPx: 16 }), sink, { TERM_PROGRAM: "ghostty" }, true, { transportLimits: { minIntervalMs: 0 } });
+  terminal.setViewerManaged(true); await terminal.setViewer(viewer());
+  const bus = new Bus(); const removeBridge = installGraphicsBridge(bus as never, terminal);
+  const branch: Array<Record<string, unknown>> = []; const fake = fakeApi(bus, branch);
+  const context = { cwd: "/fixture", sessionManager: { getBranch: () => branch }, ui: { notify() {} } };
+  try {
+    const runtimeModule = await import(`${pathToFileURL(resolve(copy.root, "src/runtime.ts")).href}?user=${Date.now()}`);
+    const extensionModule = await import(`${pathToFileURL(resolve(copy.root, "extensions/index.ts")).href}?user=${Date.now()}`);
+    extensionModule.registerInlineImages(fake.api, new runtimeModule.PreviewRuntime({ byteLoader: loadedFromBytes }));
+    await emit(fake.handlers, "session_start", {}, context);
+    const source = await sharp(Buffer.alloc(4 * 4 * 4, 180), { raw: { width: 4, height: 4, channels: 4 } }).png().toBuffer();
+    const message = { role: "user", content: [{ type: "text", text: "attachment" }, { type: "image", mimeType: "image/png", data: source.toString("base64") }] };
+    const raw = JSON.stringify(message);
+    await emit(fake.handlers, "message_end", { message }, context);
+    assert.equal(JSON.stringify(message), raw);
+    const custom = branch.find((entry) => entry.type === "custom" && entry.customType === ENTRY_TYPE)!;
+    assert.equal((custom.data as { origin: { key: string } }).origin.key, "user");
+    assert.ok(fake.renderers.get(ENTRY_TYPE)!({ data: custom.data }, {}, {}).render(20).some((line) => line.includes("\u{10EEEE}")));
+    await emit(fake.handlers, "session_shutdown", {}, context);
+  } finally {
+    removeBridge(); await terminal.clear(true).catch(() => undefined); copy.cleanup();
+  }
+});
+
 test("restore resolves and decodes newest entries incrementally within the resident budget", async () => {
   const copy = disposablePackage();
   try {

@@ -133,6 +133,54 @@ test("row-level native suppression requires custom coverage for every image bloc
   adapter.dispose();
 });
 
+test("pending row learns visible preference from its result and clear restores native display", async () => {
+  const host = await hostComponents();
+  const assistant = assistantMessage("assistant-pending", [{ id: "read-one", name: "read" }]);
+  const assistantRow = host.assistant(assistant);
+  const readRow = host.tool("read", "read-one");
+  const initial = [messageEntry("assistant-entry", assistant)];
+  const { adapter, events } = adapterFixture([assistantRow, readRow]);
+  assert.equal(adapter.reconcile(initial as never, initial as never), true);
+  assert.equal(hasNativeImage(readRow), false, "pending row has unknown preference, not a proven false preference");
+
+  const resultEntry = toolResult("result", "read-one");
+  readRow.updateResult((resultEntry as { message: object }).message);
+  assert.equal(hasNativeImage(readRow), true);
+  const owned = [...initial, resultEntry, preview("preview-one", "read-one")];
+  assert.equal(adapter.reconcile(owned as never, owned as never), true);
+  assert.equal(hasNativeImage(readRow), false);
+  assert.deepEqual(events.at(-1)?.activeLogicalIds, ["preview-one"]);
+
+  const cleared = [...owned, { type: "custom", customType: "pi-tmux-images.clear", id: "clear", parentId: null, timestamp, data: { marker: true } }];
+  assert.equal(adapter.reconcile(cleared as never, cleared as never), true);
+  assert.equal(hasNativeImage(readRow), true, "clear restores the proven host-visible preference");
+  adapter.dispose();
+});
+
+test("external off/on while claimed transfers authorization between zero and one owner", async () => {
+  const host = await hostComponents();
+  const assistant = assistantMessage("assistant-preference", [{ id: "read-one", name: "read" }]);
+  const assistantRow = host.assistant(assistant);
+  const readRow = host.tool("read", "read-one");
+  const resultEntry = toolResult("result", "read-one");
+  readRow.updateResult((resultEntry as { message: object }).message);
+  const owned = [messageEntry("assistant-entry", assistant), resultEntry, preview("preview-one", "read-one")];
+  const { adapter, events } = adapterFixture([assistantRow, readRow]);
+  assert.equal(adapter.reconcile(owned as never, owned as never), true);
+  assert.deepEqual(events.at(-1)?.activeLogicalIds, ["preview-one"]);
+
+  readRow.setShowImages(false);
+  assert.equal(adapter.reconcile(owned as never, owned as never), true);
+  assert.equal(hasNativeImage(readRow), false);
+  assert.deepEqual(events.at(-1)?.activeLogicalIds, [], "external off revokes custom authorization too");
+
+  readRow.setShowImages(true);
+  assert.equal(adapter.reconcile(owned as never, owned as never), true);
+  assert.equal(hasNativeImage(readRow), false, "external on re-enables the one custom owner, not native duplication");
+  assert.deepEqual(events.at(-1)?.activeLogicalIds, ["preview-one"]);
+  adapter.dispose();
+});
+
 test("association mismatch restores only adapter-owned suppression and publishes fail-closed coordination", async () => {
   const host = await hostComponents();
   const assistant = assistantMessage("assistant-mismatch", [{ id: "read-one", name: "read" }]);

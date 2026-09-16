@@ -10,7 +10,7 @@ const patch = resolve("patches/pi-tmux-images-0.2.0/stage-c-recent-cache.patch")
 const reviewUpgrade = resolve("patches/pi-tmux-images-0.2.0/stage-c-review-fixes.patch");
 const ownershipUpgrade = resolve("patches/pi-tmux-images-0.2.0/stage-c-ownership-fixes.patch");
 const replay = resolve("patches/pi-tmux-images-0.2.0/replay-stage-c.sh");
-const files = ["extensions/index.ts", "src/loader.ts", "src/runtime.ts", "src/renderer.ts", "src/transcript-entry.ts", "src/provenance.ts"];
+const files = ["extensions/index.ts", "src/automatic.ts", "src/loader.ts", "src/runtime.ts", "src/renderer.ts", "src/transcript-entry.ts", "src/provenance.ts"];
 
 function run(mode: "check" | "apply", root: string): string {
   return execFileSync(replay, [mode, root], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
@@ -42,6 +42,7 @@ test("Stage C replay is exact-source guarded and idempotent before or after depl
     assert.deepEqual(snapshot(copy), once, "second apply changes no source bytes");
 
     const extension = readFileSync(resolve(copy, "extensions/index.ts"), "utf8");
+    const automatic = readFileSync(resolve(copy, "src/automatic.ts"), "utf8");
     const loader = readFileSync(resolve(copy, "src/loader.ts"), "utf8");
     const renderer = readFileSync(resolve(copy, "src/renderer.ts"), "utf8");
     const runtime = readFileSync(resolve(copy, "src/runtime.ts"), "utf8");
@@ -53,6 +54,8 @@ test("Stage C replay is exact-source guarded and idempotent before or after depl
     assert.match(extension, /await runtime\.clear\(\)/u);
     assert.match(extension, /read-preview-coordination/u);
     assert.match(extension, /Automatic preview failed/u);
+    assert.match(automatic, /bounded metadata without hashing\/copying/u);
+    assert.match(automatic, /rejectedOriginFor/u);
     assert.match(renderer, /new Text\([^)]*\)\.render/u);
     assert.doesNotMatch(renderer, /new Image\(/u);
     assert.match(loader, /await sharp\(bytes, options\)\.stats\(\)/u);

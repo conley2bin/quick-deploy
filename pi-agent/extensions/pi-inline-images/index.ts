@@ -22,41 +22,44 @@ export default function piInlineImages(pi: ExtensionAPI) {
   const terminal = new TerminalImages(allocateImageId, getCellDimensions);
   terminal.setViewerManaged(true);
   const session = new ImageSession(terminal);
+  let wake = () => undefined;
   const host = new HostImageOwnershipAdapter(
     session,
     (coordination) => pi.events.emit(READ_PREVIEW_COORDINATION, coordination),
     { version: VERSION, sessionEntryToContextMessages },
+    () => wake(),
   );
   let tui: TUI | undefined;
   let hostContext: HostContext | undefined;
-  let publicTreeSignature: string | undefined;
+  let reconciliationSignature: string | undefined;
   let treeReconcileQueued = false;
   const reconcileHost = () => {
     if (tui && hostContext) return host.reconcile(hostContext.sessionManager.buildContextEntries(), hostContext.sessionManager.getBranch());
     return false;
   };
+  const currentReconciliationSignature = () => hostContext
+    ? host.reconciliationSignature(hostContext.sessionManager.buildContextEntries(), hostContext.sessionManager.getBranch())
+    : host.publicTreeSignature();
   const scheduleTreeReconcile = () => {
-    const observed = host.publicTreeSignature();
-    if (treeReconcileQueued || observed === publicTreeSignature) return;
+    const observed = currentReconciliationSignature();
+    if (treeReconcileQueued || observed === reconciliationSignature) return;
     treeReconcileQueued = true;
     queueMicrotask(() => {
       treeReconcileQueued = false;
-      const current = host.publicTreeSignature();
-      if (current === publicTreeSignature) return;
-      publicTreeSignature = current;
-      if (reconcileHost()) {
-        tui?.invalidate();
-        tui?.requestRender(true);
-      }
+      const current = currentReconciliationSignature();
+      if (current === reconciliationSignature) return;
+      reconciliationSignature = current;
+      wake();
     });
   };
   let repaintQueued = false;
-  const wake = () => {
+  wake = () => {
     if (!tui || repaintQueued) return;
     repaintQueued = true;
     queueMicrotask(() => {
       repaintQueued = false;
       reconcileHost();
+      reconciliationSignature = currentReconciliationSignature();
       tui?.invalidate();
       tui?.requestRender(true);
     });
@@ -83,7 +86,7 @@ export default function piInlineImages(pi: ExtensionAPI) {
     ui.setWidget("pi-inline-images:repaint-bridge", (candidate: TUI) => {
       tui = candidate;
       host.setTui(candidate);
-      publicTreeSignature = undefined;
+      reconciliationSignature = undefined;
       return { render: () => { scheduleTreeReconcile(); return []; }, invalidate() {} };
     });
   };
@@ -94,9 +97,18 @@ export default function piInlineImages(pi: ExtensionAPI) {
     return prepared ? transformMarkdown(prepared, context.availableWidth, terminal) : markdown;
   });
 
+  const observeLiveMessage = (phase: "start" | "update", event: { message: unknown }, context: HostContext) => {
+    if (context.mode !== "tui") return;
+    hostContext = context;
+    host.observeMessage(phase, event.message);
+    wake();
+  };
+  pi.on("message_start", ((event: { message: unknown }, context: HostContext) => observeLiveMessage("start", event, context)) as never);
+  pi.on("message_update", ((event: { message: unknown }, context: HostContext) => observeLiveMessage("update", event, context)) as never);
   pi.on("message_end", async (event, context) => {
     if (context.mode !== "tui") return;
     hostContext = context as unknown as HostContext;
+    host.observeMessage("end", event.message);
     await session.prepareMessage(event.message as never, context.cwd);
     syncMonitor();
     wake();
@@ -135,7 +147,7 @@ export default function piInlineImages(pi: ExtensionAPI) {
     removeOwnershipChanged();
     host.dispose();
     hostContext = undefined;
-    publicTreeSignature = undefined;
+    reconciliationSignature = undefined;
     treeReconcileQueued = false;
     widgetUi?.setWidget("pi-inline-images:repaint-bridge", undefined);
     widgetUi = undefined;

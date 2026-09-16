@@ -1,5 +1,5 @@
 diff --git a/extensions/index.ts b/extensions/index.ts
-index c63818a..999d866 100644
+index c63818a..b62260e 100644
 --- a/extensions/index.ts
 +++ b/extensions/index.ts
 @@ -7,6 +7,8 @@ import { PreviewRuntime, type SharedGraphicsHandle } from "../src/runtime.ts";
@@ -63,7 +63,7 @@ index c63818a..999d866 100644
 +	pi.registerEntryRenderer<PreviewEntry>(ENTRY_TYPE, (entry, _options, theme) => {
 -		const data = isPreview(entry.data) ? entry.data : undefined;
 +		const data = isPreview(entry.data) ? entry.data : undefined;
-+		const coordinationFailure = data?.origin && (!coordinationReady || !coordinated.has(data.logicalId))
++		const coordinationFailure = data?.origin?.key.startsWith("tool:") && (!coordinationReady || !coordinated.has(data.logicalId))
 +			? `Native image ownership coordination unavailable: ${coordinationReason}. Custom bitmap withheld.`
 +			: undefined;
 -		return data
@@ -76,9 +76,15 @@ index c63818a..999d866 100644
 +	});
 -	pi.registerEntryRenderer<ClearEntry>(CLEAR_TYPE, () => wrappedNotice("[image previews cleared]"));
 +	pi.registerEntryRenderer<ClearEntry>(CLEAR_TYPE, () => wrappedNotice("[image previews cleared]"));
-@@ -123,10 +142,10 @@ export function registerInlineImages(pi: ExtensionAPI, runtime = new PreviewRunt
+@@ -120,13 +139,28 @@ export function registerInlineImages(pi: ExtensionAPI, runtime = new PreviewRunt
+-				reservedOrdinals.add(messageOrdinal);
++				reservedOrdinals.add(messageOrdinal);
+-			}
++			}
+-			for (const [token, origin] of pending) if (hasPersistedOrigin(entries, origin)) pending.delete(token);
++			for (const [token, origin] of pending) if (hasPersistedOrigin(entries, origin)) pending.delete(token);
 -			for (const { block, origin } of automaticBlocks(message, messageOrdinal)) {
-+			for (const { block, origin } of automaticBlocks(message, messageOrdinal)) {
++			for (const { block, origin, error: rejected } of automaticBlocks(message, messageOrdinal)) {
 -				const token = originToken(origin);
 +				const token = originToken(origin);
 -				if (pending.has(token) || hasPersistedOrigin(entries, origin)) continue;
@@ -91,13 +97,28 @@ index c63818a..999d866 100644
 -				try {
 +				try {
 +					await evictOldest(ctx);
++					if (rejected) {
++						pi.appendEntry<PreviewEntry>(ENTRY_TYPE, {
++							path: "attached image",
++							hash: origin.contentHash,
++							originalMime: block.mimeType as PreviewEntry["originalMime"],
++							width: 1,
++							height: 1,
++							logicalId,
++							origin,
++							error: `Automatic preview failed: ${rejected}`.slice(0, 4096),
++						});
++						pending.delete(token);
++						ownershipChanged();
++						continue;
++					}
 -					const toolCallId = origin.key.startsWith("tool:") ? origin.key.slice(5) : undefined;
 +					const toolCallId = origin.key.startsWith("tool:") ? origin.key.slice(5) : undefined;
 -					const evidence = toolCallId ? provenance.consume(toolCallId, origin.blockIndex, origin.contentHash) : undefined;
 +					const evidence = toolCallId ? provenance.consume(toolCallId, origin.blockIndex, origin.contentHash) : undefined;
 -					const verified = evidence?.status === "verified-local-original" ? evidence.capture : undefined;
 +					const verified = evidence?.status === "verified-local-original" ? evidence.capture : undefined;
-@@ -147,9 +166,23 @@ export function registerInlineImages(pi: ExtensionAPI, runtime = new PreviewRunt
+@@ -147,9 +181,23 @@ export function registerInlineImages(pi: ExtensionAPI, runtime = new PreviewRunt
 -						origin,
 +						origin,
 -						readProvenance: evidence ? provenance.persist(evidence, entry) : undefined,
@@ -130,7 +151,7 @@ index c63818a..999d866 100644
 +			}
 -		});
 +		});
-@@ -178,6 +211,7 @@ export function registerInlineImages(pi: ExtensionAPI, runtime = new PreviewRunt
+@@ -178,6 +226,7 @@ export function registerInlineImages(pi: ExtensionAPI, runtime = new PreviewRunt
 -	pi.on("session_shutdown", async () => {
 +	pi.on("session_shutdown", async () => {
 -		const expected = invalidate();
@@ -144,7 +165,7 @@ index c63818a..999d866 100644
 +	});
 -	pi.on("message_end", async (event, ctx) => automatic(event.message, ctx, generation));
 +	pi.on("message_end", async (event, ctx) => automatic(event.message, ctx, generation));
-@@ -192,6 +226,7 @@ export function registerInlineImages(pi: ExtensionAPI, runtime = new PreviewRunt
+@@ -192,6 +241,7 @@ export function registerInlineImages(pi: ExtensionAPI, runtime = new PreviewRunt
 -					await runtime.clear();
 +					await runtime.clear();
 -					pi.appendEntry<ClearEntry>(CLEAR_TYPE, { marker: true });
@@ -158,6 +179,155 @@ index c63818a..999d866 100644
 +			}
 -			const expected = generation;
 +			const expected = generation;
+diff --git a/src/automatic.ts b/src/automatic.ts
+index 1070298..3cb8e24 100644
+--- a/src/automatic.ts
++++ b/src/automatic.ts
+@@ -14,7 +14,11 @@ export interface AutomaticOrigin {
+-	blockIndex: number;
++	blockIndex: number;
+-	mimeType: string;
++	mimeType: string;
+-	contentHash: string;
++	contentHash: string;
++	/** Rejected sources use bounded metadata identity and are never payload-hashed. */
++	rejected?: true;
++	contentLength?: number;
+ }
++export type AutomaticBlock = { block: ImageBlock; index: number; origin: AutomaticOrigin; error?: string };
+ export type BranchEntry = { type?: unknown; customType?: unknown; data?: unknown; message?: unknown };
+-
++
+ export function imageBlocks(message: unknown): Array<{ block: ImageBlock; index: number }> {
+@@ -22,60 +26,58 @@ export function imageBlocks(message: unknown): Array<{ block: ImageBlock; index:
+-	const content = (message as { content?: unknown }).content;
++	const content = (message as { content?: unknown }).content;
+-	if (!Array.isArray(content)) return [];
++	if (!Array.isArray(content)) return [];
+-	return content.flatMap((value, index) =>
++	return content.flatMap((value, index) =>
+-		value &&
+-		typeof value === "object" &&
+-		(value as Partial<ImageBlock>).type === "image" &&
+-		typeof (value as Partial<ImageBlock>).mimeType === "string" &&
+-		typeof (value as Partial<ImageBlock>).data === "string"
++		value && typeof value === "object" && (value as Partial<ImageBlock>).type === "image"
++		&& typeof (value as Partial<ImageBlock>).mimeType === "string" && typeof (value as Partial<ImageBlock>).data === "string"
+-			? [{ block: value as ImageBlock, index }]
++			? [{ block: value as ImageBlock, index }]
+-			: [],
+-	);
++			: []);
++}
++
++function originKey(message: unknown): string | undefined {
++	if (!message || typeof message !== "object") return undefined;
++	const value = message as { role?: unknown; toolCallId?: unknown };
++	if (value.role === "toolResult" && typeof value.toolCallId === "string" && value.toolCallId) return `tool:${value.toolCallId}`;
++	if (value.role === "user") return "user";
++	return undefined;
+ }
+-
++
+ /** Build persisted metadata only after the encoded bytes pass the pre-hash guard. */
+-export function originFor(
+-	message: unknown,
+-	messageOrdinal: number,
+-	blockIndex: number,
+-	data: string,
+-): AutomaticOrigin | undefined {
+-	if (!message || typeof message !== "object" || !Number.isSafeInteger(messageOrdinal) || messageOrdinal < 0)
+-		return undefined;
++export function originFor(message: unknown, messageOrdinal: number, blockIndex: number, data: string): AutomaticOrigin | undefined {
++	if (!Number.isSafeInteger(messageOrdinal) || messageOrdinal < 0) return undefined;
+-	validateEncodedImageData(data);
++	validateEncodedImageData(data);
+-	const value = message as { role?: unknown; toolCallId?: unknown };
++	const key = originKey(message);
+-	const mimeType = imageBlocks(message).find(({ index }) => index === blockIndex)?.block.mimeType;
++	const mimeType = imageBlocks(message).find(({ index }) => index === blockIndex)?.block.mimeType;
+-	if (typeof mimeType !== "string") return undefined;
+-	const contentHash = createHash("sha256").update(data).digest("hex");
+-	if (value.role === "toolResult" && typeof value.toolCallId === "string" && value.toolCallId)
+-		return { messageOrdinal, key: `tool:${value.toolCallId}`, blockIndex, mimeType, contentHash };
+-	if (value.role === "user") return { messageOrdinal, key: "user", blockIndex, mimeType, contentHash };
+-	return undefined;
++	if (!key || typeof mimeType !== "string") return undefined;
++	return { messageOrdinal, key, blockIndex, mimeType, contentHash: createHash("sha256").update(data).digest("hex") };
++}
++
++/** Identify a rejected block from bounded metadata without hashing/copying its oversized payload. */
++function rejectedOriginFor(message: unknown, messageOrdinal: number, blockIndex: number, block: ImageBlock): AutomaticOrigin | undefined {
++	if (!Number.isSafeInteger(messageOrdinal) || messageOrdinal < 0 || !Number.isSafeInteger(block.data.length)) return undefined;
++	const key = originKey(message);
++	if (!key) return undefined;
++	const contentLength = block.data.length;
++	const contentHash = createHash("sha256").update(`${key}\0${blockIndex}\0${block.mimeType}\0${contentLength}`).digest("hex");
++	return { messageOrdinal, key, blockIndex, mimeType: block.mimeType, contentHash, rejected: true, contentLength };
+ }
+-
++
+-/** Return only blocks whose encoded input is safe to hash and decode. */
+-export function automaticBlocks(
+-	message: unknown,
+-	messageOrdinal: number,
+-): Array<{ block: ImageBlock; index: number; origin: AutomaticOrigin }> {
++/** Return accepted blocks plus bounded metadata failures for supported message origins. */
++export function automaticBlocks(message: unknown, messageOrdinal: number): AutomaticBlock[] {
+-	return imageBlocks(message).flatMap(({ block, index }) => {
++	return imageBlocks(message).flatMap(({ block, index }) => {
+-		try {
++		try {
+-			validateEncodedImageInput(block.data, block.mimeType);
++			validateEncodedImageInput(block.data, block.mimeType);
+-			const origin = originFor(message, messageOrdinal, index, block.data);
++			const origin = originFor(message, messageOrdinal, index, block.data);
+-			return origin ? [{ block, index, origin }] : [];
++			return origin ? [{ block, index, origin }] : [];
+-		} catch {
+-			return [];
++		} catch (error) {
++			const origin = rejectedOriginFor(message, messageOrdinal, index, block);
++			return origin ? [{ block, index, origin, error: error instanceof Error ? error.message : String(error) }] : [];
+-		}
++		}
+-	});
++	});
+ }
+-
++
+ function sameOrigin(left: AutomaticOrigin, right: AutomaticOrigin): boolean {
+-	return (
+-		left.messageOrdinal === right.messageOrdinal &&
+-		left.key === right.key &&
+-		left.blockIndex === right.blockIndex &&
+-		left.mimeType === right.mimeType &&
+-		left.contentHash === right.contentHash
+-	);
++	return left.messageOrdinal === right.messageOrdinal && left.key === right.key && left.blockIndex === right.blockIndex
++		&& left.mimeType === right.mimeType && left.contentHash === right.contentHash && left.rejected === right.rejected
++		&& left.contentLength === right.contentLength;
+ }
+-
++
+ /** Resolve only the persisted regular-message ordinal; never search for a later collision. */
+@@ -85,7 +87,9 @@ export function findOrigin(entries: BranchEntry[], preview: PreviewEntry): Image
+-	const block = imageBlocks(source).find(({ index }) => index === preview.origin?.blockIndex)?.block;
++	const block = imageBlocks(source).find(({ index }) => index === preview.origin?.blockIndex)?.block;
+-	if (!block) return undefined;
++	if (!block) return undefined;
+-	try {
++	try {
+-		const origin = originFor(source, preview.origin.messageOrdinal, preview.origin.blockIndex, block.data);
++		const origin = preview.origin.rejected
++			? rejectedOriginFor(source, preview.origin.messageOrdinal, preview.origin.blockIndex, block)
++			: originFor(source, preview.origin.messageOrdinal, preview.origin.blockIndex, block.data);
+-		return origin && sameOrigin(origin, preview.origin) ? block : undefined;
++		return origin && sameOrigin(origin, preview.origin) ? block : undefined;
+-	} catch {
++	} catch {
+-		return undefined;
++		return undefined;
 diff --git a/src/renderer.ts b/src/renderer.ts
 index b15aec4..293bd2b 100644
 --- a/src/renderer.ts
@@ -203,16 +373,18 @@ index 7d77ad1..6494c8d 100644
 -				const image = source
 +				const image = source
 diff --git a/src/transcript-entry.ts b/src/transcript-entry.ts
-index 0f1f0d6..9705cec 100644
+index 0f1f0d6..18cf818 100644
 --- a/src/transcript-entry.ts
 +++ b/src/transcript-entry.ts
-@@ -34,6 +34,8 @@ export interface PreviewEntry {
+@@ -33,7 +33,9 @@ export interface PreviewEntry {
+-	/** Durable, session-scoped identity; terminal image IDs are never persisted. */
++	/** Durable, session-scoped identity; terminal image IDs are never persisted. */
 -	logicalId: string;
 +	logicalId: string;
 -	/** Origin metadata for automatic previews; the image bytes stay in the message block. */
 +	/** Origin metadata for automatic previews; the image bytes stay in the message block. */
 -	origin?: { messageOrdinal: number; key: string; blockIndex: number; mimeType: string; contentHash: string };
-+	origin?: { messageOrdinal: number; key: string; blockIndex: number; mimeType: string; contentHash: string };
++	origin?: { messageOrdinal: number; key: string; blockIndex: number; mimeType: string; contentHash: string; rejected?: true; contentLength?: number };
 +	/** Wrapped automatic-preview failure; raw tool-result content remains unchanged. */
 +	error?: string;
 -	/** Display-only proof. It never replaces or rewrites the tool-result image block. */
@@ -234,3 +406,21 @@ index 0f1f0d6..9705cec 100644
 +			(origin !== null &&
 -				typeof origin === "object" &&
 +				typeof origin === "object" &&
+@@ -90,7 +93,11 @@ export function isPreview(value: unknown): value is PreviewEntry {
+-				origin.blockIndex >= 0 &&
++				origin.blockIndex >= 0 &&
+-				MIME.has(origin.mimeType) &&
++				MIME.has(origin.mimeType) &&
+-				typeof origin.contentHash === "string" &&
++				typeof origin.contentHash === "string" &&
+-				HASH.test(origin.contentHash))) &&
++				HASH.test(origin.contentHash) &&
++				(origin.rejected === undefined
++					? origin.contentLength === undefined
++					: origin.rejected === true && Number.isSafeInteger(origin.contentLength) && Number(origin.contentLength) > 0
++						&& Number(origin.contentLength) <= 100_000_000 && typeof x.error === "string"))) &&
+-		(x.readProvenance === undefined || validReadProvenance(x.readProvenance, x))
++		(x.readProvenance === undefined || validReadProvenance(x.readProvenance, x))
+-	);
++	);
+ }

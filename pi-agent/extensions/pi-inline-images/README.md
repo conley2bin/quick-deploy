@@ -119,6 +119,25 @@ block/file metadata. Extension wrappers such as ShellGate have no per-read backe
 stamp, so their actual received pixels remain authoritative and a wrapped notice
 states that original resolution is unavailable/unverified.
 
+For Pi **0.85.1**, a host-version guard reconciles persisted branch messages with
+public live message events and the public TUI/Container component sequence. Only a
+positively associated tool row with complete recent custom-block coverage hands
+display ownership to the full-resolution custom preview. Streaming assistant tails
+preserve the already-bound prefix; ambiguous mappings keep native display and show
+a custom-withheld notice. User attachment previews bypass tool-row arbitration.
+The adapter treats pending native image preference as unknown, observes it only
+from a rendered result or public `setShowImages` call, and transfers authorization
+on external off/on and clear without blindly enabling images. Assistant component
+`render` is decorated per instance (never by prototype) so local thinking/invalidate
+rebuilds retain exact historical Markdown occurrences. Every ownership transition
+coalesces one invalidate/render; stable public-tree/branch signatures do nothing.
+
+Automatic read rejection persists bounded error metadata. An oversized encoded
+block records tool/user identity, block index, MIME, and encoded length without
+hashing, decoding, or copying its payload; raw tool/model/session content is never
+rewritten. The notice uses the same width-aware renderer as corrupt, resident-budget,
+expired, provenance, and clear failures.
+
 Precreating bounded placements is lower risk than dynamic placement: official
 Kitty ordering requires a virtual placement before its placeholder cells, while
 Pi exposes no public way to invalidate a cached Markdown grid after a later
