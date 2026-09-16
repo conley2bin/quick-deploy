@@ -1,8 +1,10 @@
-# pi-tmux-images 0.2.0 capability-only local repair
+# pi-tmux-images 0.2.0 local replay repairs
 
 ## Active scope
 
 This directory carries one active local repair for the installed `pi-tmux-images@0.2.0`: `pane-passthrough-policy.patch` changes only `src/capabilities.ts`. The earlier unconditional placement replay is retired. `retire-placement-replay.patch` is a one-way removal patch for installations that received it; it is not an installation patch for pristine packages.
+
+`stage-c-recent-cache.patch` is deliberately **not deployed**. It is an exact-source guarded replay for a disposable package copy: it retains only the newest 16 preview resources at restore, marks older custom entries as expired, removes the 16-entry admission stop, routes stale notices through native `Text.render(width)`, and requests the public versioned `pi-inline-images` read bridge. A missing bridge remains visible; it must never restore independent graphics writes. `apply-stage-c-disposable.sh` refuses a different package version or source hash before applying.
 
 The active capability repair queries the originating pane's effective tmux policy with:
 
