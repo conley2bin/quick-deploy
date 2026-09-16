@@ -114,13 +114,17 @@ get_profile_name() {
 get_current_profile_path() {
     local file
     file=$(registry_query current-file) || return 1
-    printf '%s/profiles/%s\n' "$CLASH_DIR" "$file"
+    if [ -n "$file" ]; then
+        printf '%s/profiles/%s\n' "$CLASH_DIR" "$file"
+    fi
 }
 
 get_current_profile_option_path() {
     local file
     file=$(registry_query current-option --option "$1") || return 1
-    [ -n "$file" ] && printf '%s/profiles/%s\n' "$CLASH_DIR" "$file"
+    if [ -n "$file" ]; then
+        printf '%s/profiles/%s\n' "$CLASH_DIR" "$file"
+    fi
 }
 
 # 规范 fake-ip-filter 块 —— 全脚本唯一副本（2 空格键、4 空格条目）
@@ -238,8 +242,9 @@ strip_top_level_block() {
     local output="$3"
     local trim_tail="${4:-0}"
     awk -v key="$key" -v trim_tail="$trim_tail" '
+        function is_key(line, name) {return index(line, name ":") == 1}
         BEGIN {skip=0; pending=0}
-        $0 == key ":" {skip=1; next}
+        is_key($0, key) {skip=1; next}
         skip && /^[^[:space:]]/ {skip=0}
         skip {next}
         trim_tail == 1 && /^[[:space:]]*$/ {pending++; next}
@@ -276,10 +281,12 @@ replace_top_level_block() (
     stripped=$(mktemp "${file}.strip.XXXXXX")
     strip_top_level_block "$file" "$key" "$stripped" 1
     content=$(cat "$block")
-    if [ -n "$before" ] && grep -qF -- "$before:" "$stripped"; then
+    if [ -n "$before" ]; then
         awk -v before="$before" -v block="$content" '
-            $0 == before ":" {print block; print ""; print; next}
+            function is_key(line, name) {return index(line, name ":") == 1}
+            !placed && is_key($0, before) {print block; print ""; placed=1}
             {print}
+            END {if (!placed) {print ""; print block}}
         ' "$stripped" > "$output"
     else
         {

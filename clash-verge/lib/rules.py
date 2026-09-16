@@ -260,10 +260,12 @@ def registered_file(registry_path: Path, uid: str, expected_type: str) -> str:
     return safe_file(item.get("file"), f"{registry_path}: uid {uid}")
 
 
-def current_profile(registry_path: Path, registry: Registry) -> dict[str, Any]:
-    uid = registry.document.get("current")
+def current_profile(registry_path: Path, registry: Registry) -> dict[str, Any] | None:
+    if "current" not in registry.document:
+        return None
+    uid = registry.document["current"]
     if not isinstance(uid, str) or not uid:
-        raise SourceError(f"{registry_path}: current must name one registered profile uid")
+        raise SourceError(f"{registry_path}: explicit current must name one registered profile uid")
     item = registry.by_uid.get(uid)
     if item is None:
         raise SourceError(f"{registry_path}: current references missing uid {uid!r}")
@@ -303,6 +305,12 @@ def registry_query(registry_path: Path, query: str, option: str | None) -> list[
         return files
 
     profile = current_profile(registry_path, registry)
+    if profile is None:
+        if query == "current-name":
+            return ["(profiles.yaml 中没有 current)"]
+        if query in {"current-file", "current-option"}:
+            return []
+    assert profile is not None
     if query == "current-name":
         name = profile.get("name")
         return [name if isinstance(name, str) and name else "(未命名)"]
