@@ -14,7 +14,7 @@ import type { ViewerState } from "../../src/viewers.ts";
 import { installedPiRoot } from "../../test/pi-root.ts";
 
 const installed = process.env.PI_TMUX_IMAGES_ROOT ?? resolve(process.env.HOME!, ".pi/agent/npm/node_modules/pi-tmux-images");
-const replay = resolve("patches/pi-tmux-images-0.2.0/apply-stage-c-disposable.sh");
+const replay = resolve("patches/pi-tmux-images-0.2.0/replay-stage-c.sh");
 const ENTRY_TYPE = "pi-tmux-images.preview";
 
 type Handler = (event: unknown, context: unknown) => unknown;
@@ -65,7 +65,7 @@ function visibleWidth(value: string): number {
 function disposablePackage(): { root: string; cleanup(): void } {
   const root = mkdtempSync(resolve(tmpdir(), "pi-tmux-images-behavior-"));
   cpSync(installed, root, { recursive: true });
-  execFileSync(replay, [root], { stdio: "pipe" });
+  execFileSync(replay, ["apply", root], { stdio: "pipe" });
   const modules = resolve(root, "node_modules");
   mkdirSync(resolve(modules, "@earendil-works"), { recursive: true });
   const piRoot = installedPiRoot();
@@ -143,15 +143,20 @@ test("patched old extension sustains 20 previews through the real shared backend
 
     await terminal.prepare("inline:fixed", image("inline-fixed"));
     const baselineUploads = uploadCount(sink);
+    const messages: Array<Record<string, unknown>> = [];
     for (let index = 0; index < 20; index++) {
       const data = Buffer.from(`tool-image-${index}`).toString("base64");
       const message = { role: "toolResult", toolCallId: `call-${index}`, content: [{ type: "image", mimeType: "image/png", data }] };
       await emit(fake.handlers, "message_end", { message }, context);
       branch.push({ type: "message", message });
+      messages.push(message);
     }
+    const beforeDuplicateUploads = uploadCount(sink);
+    await emit(fake.handlers, "message_end", { message: messages.at(-1) }, context);
 
     const previews = branch.filter((entry) => entry.type === "custom" && entry.customType === ENTRY_TYPE);
-    assert.equal(previews.length, 20, "admission continues after the sixteenth preview");
+    assert.equal(previews.length, 20, "admission continues after the sixteenth preview without duplicating a repeated tool identity");
+    assert.equal(uploadCount(sink), beforeDuplicateUploads, "repeated message_end does not re-prepare a persisted tool block");
     assert.equal(terminal.count("read"), 16);
     assert.equal(terminal.count("inline"), 1);
     assert.equal(uploadCount(sink) - baselineUploads, 20);
@@ -169,15 +174,27 @@ test("patched old extension sustains 20 previews through the real shared backend
     assert.ok(expiredWide.every((line) => visibleWidth(line) <= 40), "long expired notices fit width 40");
     assert.ok(renderer({ data: newest }, {}, {}).render(20).length > 0, "latest preview renders a shared placement grid");
 
+    const rawMessages = JSON.stringify(messages);
     const beforeRestoreUploads = uploadCount(sink);
     await emit(fake.handlers, "session_tree", {}, context);
     assert.equal(terminal.count("read"), 16);
     assert.equal(uploadCount(sink) - beforeRestoreUploads, 16, "restore re-prepares the newest read resources through the bridge");
+    assert.equal(JSON.stringify(messages), rawMessages, "reload/restore never rewrites raw tool messages");
 
     await fake.commands.get("image")!.handler("clear", context);
     assert.equal(terminal.count("read"), 0);
     assert.equal(terminal.count("inline"), 1, "old clear cannot erase inline resources");
     assert.ok(terminal.render("inline:fixed", 20).length > 0);
+    assert.equal(JSON.stringify(messages), rawMessages, "clear leaves tool/model content byte-identical");
+
+    const noticeComponents = [
+      renderer({ data: { ...newest, path: `/missing/${"x".repeat(91)}-${"目录".repeat(20)}.png` } }, {}, {}),
+      renderer({ data: { invalid: true } }, {}, {}),
+      fake.renderers.get("pi-tmux-images.clear")!({ data: { marker: true } }, {}, {}),
+    ];
+    for (const width of [16, 40]) for (const component of noticeComponents) {
+      assert.ok(component.render(width).every((line) => visibleWidth(line) <= width), `notice fits width ${width}`);
+    }
 
     await emit(fake.handlers, "session_shutdown", {}, context);
     removeBridge();
@@ -192,7 +209,66 @@ test("patched old extension sustains 20 previews through the real shared backend
   }
 });
 
-test("late bridge binding prepares retained old-read images without any legacy graphics writer", async () => {
+test("old extension evicts by read byte budget before count saturation", async () => {
+  const copy = disposablePackage();
+  const sink = new Sink();
+  let nextId = 400;
+  const terminal = new TerminalImages(() => nextId++, () => ({ widthPx: 8, heightPx: 16 }), sink, { TERM_PROGRAM: "ghostty" }, true, {
+    maxReadResidentPngBytes: 30,
+    transportLimits: { minIntervalMs: 0, wireRateBytesPerSecond: 1_000_000_000 },
+  });
+  terminal.setViewerManaged(true);
+  await terminal.setViewer(viewer());
+  const bus = new Bus();
+  const removeBridge = installGraphicsBridge(bus as never, terminal);
+  const branch: Array<Record<string, unknown>> = [];
+  const fake = fakeApi(bus, branch);
+  const context = { cwd: "/fixture", sessionManager: { getBranch: () => branch }, ui: { notify() {} } };
+  try {
+    const runtimeModule = await import(`${pathToFileURL(resolve(copy.root, "src/runtime.ts")).href}?bytes=${Date.now()}`);
+    const extensionModule = await import(`${pathToFileURL(resolve(copy.root, "extensions/index.ts")).href}?bytes=${Date.now()}`);
+    const runtime = new runtimeModule.PreviewRuntime({
+      maxResidentPngBytes: 30,
+      byteLoader: async (data: string, _mime: string, path: string) => ({
+        path,
+        hash: createHash("sha256").update(Buffer.from(data, "base64")).digest("hex"),
+        originalMime: "image/png" as const,
+        width: 8,
+        height: 6,
+        png: Buffer.alloc(12, Buffer.from(data, "base64")[0] ?? 0),
+      }),
+    });
+    extensionModule.registerInlineImages(fake.api, runtime);
+    await emit(fake.handlers, "session_start", {}, context);
+    for (let index = 0; index < 4; index++) {
+      const data = Buffer.from(`byte-image-${index}`).toString("base64");
+      const message = { role: "toolResult", toolCallId: `byte-${index}`, content: [{ type: "image", mimeType: "image/png", data }] };
+      await emit(fake.handlers, "message_end", { message }, context);
+      branch.push({ type: "message", message });
+    }
+    const previews = branch.filter((entry) => entry.type === "custom" && entry.customType === ENTRY_TYPE);
+    assert.equal(previews.length, 4);
+    assert.equal(terminal.count("read"), 2);
+    assert.equal(terminal.residentBytes("read"), 24);
+    assert.equal(runtime.residentBytes(), 24);
+    const renderer = fake.renderers.get(ENTRY_TYPE)!;
+    assert.match(renderer({ data: previews[0]!.data }, {}, {}).render(20).join(" "), /byte cache/u);
+    assert.ok(renderer({ data: previews.at(-1)!.data }, {}, {}).render(20).length > 0);
+    const beforeRestore = uploadCount(sink);
+    await emit(fake.handlers, "session_tree", {}, context);
+    assert.equal(terminal.count("read"), 2);
+    assert.equal(runtime.residentBytes(), 24);
+    assert.equal(uploadCount(sink) - beforeRestore, 2, "restore retains the newest byte-bounded subset");
+    assert.match(renderer({ data: previews[0]!.data }, {}, {}).render(20).join(" "), /byte cache/u);
+    await emit(fake.handlers, "session_shutdown", {}, context);
+  } finally {
+    removeBridge();
+    await terminal.clear(true).catch(() => undefined);
+    copy.cleanup();
+  }
+});
+
+test("old extension binds after either factory order and ignores a version-mismatched bridge", async () => {
   const copy = disposablePackage();
   const sink = new Sink();
   let nextId = 500;
@@ -202,25 +278,40 @@ test("late bridge binding prepares retained old-read images without any legacy g
   terminal.setViewerManaged(true);
   await terminal.setViewer(viewer());
   const bus = new Bus();
+  const branch: Array<Record<string, unknown>> = [];
+  const fake = fakeApi(bus, branch);
+  const context = { cwd: "/fixture", sessionManager: { getBranch: () => branch }, ui: { notify() {} } };
+  let request: Record<string, unknown> | undefined;
+  bus.on("pi-inline-images:graphics-owner:request", (value) => { request = value as Record<string, unknown>; });
+  let removeBridge: (() => void) | undefined;
   try {
     const runtimeModule = await import(`${pathToFileURL(resolve(copy.root, "src/runtime.ts")).href}?late=${Date.now()}`);
+    const extensionModule = await import(`${pathToFileURL(resolve(copy.root, "extensions/index.ts")).href}?late=${Date.now()}`);
     const runtime = new runtimeModule.PreviewRuntime({ loader: loadedFromPath, byteLoader: loadedFromBytes });
-    const data = Buffer.from("late-image").toString("base64");
-    const entry = await runtime.addBytes(data, "image/png", "late-read", "attached image");
-    assert.equal(sink.writes.length, 0, "old runtime has no independent graphics fallback");
-    assert.match(runtime.sharedFailure(entry.logicalId), /bridge unavailable/u);
+    extensionModule.registerInlineImages(fake.api, runtime);
+    await emit(fake.handlers, "session_start", {}, context);
+    assert.ok(request, "old-first factory order emits a bridge request");
 
-    let readHandle: unknown;
-    bus.on("pi-inline-images:graphics-owner:reply", (value) => { readHandle = (value as { handle?: unknown }).handle; });
-    const removeBridge = installGraphicsBridge(bus as never, terminal);
-    bus.emit("pi-inline-images:graphics-owner:request", { version: 1, owner: "read", requestId: "late" });
-    await runtime.setShared(readHandle as never);
+    const data = Buffer.from("late-image").toString("base64");
+    const message = { role: "toolResult", toolCallId: "late", content: [{ type: "image", mimeType: "image/png", data }] };
+    await emit(fake.handlers, "message_end", { message }, context);
+    branch.push({ type: "message", message });
+    const entry = branch.find((candidate) => candidate.type === "custom" && candidate.customType === ENTRY_TYPE)!.data as Record<string, unknown>;
+    assert.equal(sink.writes.length, 0, "missing bridge has no independent graphics fallback");
+    assert.match(fake.renderers.get(ENTRY_TYPE)!({ data: entry }, {}, {}).render(20).join("").replace(/\s/gu, ""), /bridgeunavailable/u);
+
+    bus.emit("pi-inline-images:graphics-owner:reply", { ...request, version: 2, handle: {} });
+    assert.equal(sink.writes.length, 0, "version mismatch cannot bind an unverified handle");
+    assert.match(runtime.sharedFailure(String(entry.logicalId)), /bridge unavailable/u);
+
+    removeBridge = installGraphicsBridge(bus as never, terminal);
+    await emit(fake.handlers, "session_tree", {}, context);
     assert.equal(terminal.count("read"), 1);
     assert.equal(uploadCount(sink), 1);
-    assert.ok(runtime.emitPlaceholder(entry.logicalId, 20).length > 0);
-    removeBridge();
-    await runtime.clear();
+    assert.ok(runtime.emitPlaceholder(String(entry.logicalId), 20).length > 0);
+    await emit(fake.handlers, "session_shutdown", {}, context);
   } finally {
+    removeBridge?.();
     await terminal.clear(true).catch(() => undefined);
     copy.cleanup();
   }

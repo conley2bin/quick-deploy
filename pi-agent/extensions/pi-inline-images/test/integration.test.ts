@@ -159,6 +159,34 @@ test("suitable PNGs remain byte-exact at full resolution and fit the 44 MiB tran
   await settleWithClock(terminal.clear(true), clock);
 });
 
+test("orientation conversion and 16-bit PNG fidelity never downsample", async () => {
+  const orientedRaw = Buffer.from([
+    255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255,
+    255, 255, 0, 255, 255, 0, 255, 255, 0, 255, 255, 255,
+  ]);
+  const orientedJpeg = await sharp(orientedRaw, { raw: { width: 3, height: 2, channels: 4 } })
+    .jpeg({ quality: 100 })
+    .withMetadata({ orientation: 6 })
+    .toBuffer();
+  const oriented = await loadImage(`data:image/jpeg;base64,${orientedJpeg.toString("base64")}`, "/fixture");
+  const expectedOrientation = await sharp(orientedJpeg).autoOrient().png({ palette: false }).toBuffer();
+  assert.deepEqual([oriented.width, oriented.height], [2, 3]);
+  assert.deepEqual(oriented.png, expectedOrientation, "orientation is applied at full dimensions with the lossless PNG path");
+
+  const width = 7, height = 5, channels = 4;
+  const raw16 = new Uint16Array(width * height * channels);
+  for (let index = 0; index < raw16.length; index++) raw16[index] = (index * 1954) & 0xffff;
+  const png16 = await sharp(raw16, { raw: { width, height, channels } })
+    .toColourspace("rgb16")
+    .png()
+    .toBuffer();
+  const metadata = await sharp(png16).metadata();
+  assert.equal(metadata.depth, "ushort");
+  const loaded16 = await loadImage(`data:image/png;base64,${png16.toString("base64")}`, "/fixture");
+  assert.deepEqual([loaded16.width, loaded16.height], [width, height]);
+  assert.deepEqual(loaded16.png, png16, "unoriented 16-bit PNG keeps exact source bytes and bit depth");
+});
+
 test("worst catalog deduplicates widths to 80 entries and remains within its metadata budget", async () => {
   const clock = new FakeClock();
   const sink = new CapturedSink(clock);

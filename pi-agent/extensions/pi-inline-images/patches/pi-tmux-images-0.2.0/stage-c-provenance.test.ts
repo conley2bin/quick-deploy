@@ -13,7 +13,7 @@ import type { TransportSink } from "../../src/transport.ts";
 import { installedPiRoot } from "../../test/pi-root.ts";
 
 const installed = process.env.PI_TMUX_IMAGES_ROOT ?? resolve(process.env.HOME!, ".pi/agent/npm/node_modules/pi-tmux-images");
-const replay = resolve("patches/pi-tmux-images-0.2.0/apply-stage-c-disposable.sh");
+const replay = resolve("patches/pi-tmux-images-0.2.0/replay-stage-c.sh");
 const ENTRY_TYPE = "pi-tmux-images.preview";
 const PLACEHOLDER = "\u{10EEEE}";
 
@@ -56,7 +56,7 @@ function visibleWidth(value: string): number {
 function disposablePackage(): { root: string; cleanup(): void } {
   const root = mkdtempSync(resolve(tmpdir(), "pi-tmux-images-provenance-"));
   cpSync(installed, root, { recursive: true });
-  execFileSync(replay, [root], { stdio: "pipe" });
+  execFileSync(replay, ["apply", root], { stdio: "pipe" });
   const modules = resolve(root, "node_modules");
   mkdirSync(resolve(modules, "@earendil-works"), { recursive: true });
   const piRoot = installedPiRoot();

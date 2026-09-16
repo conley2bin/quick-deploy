@@ -1,18 +1,38 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { cpSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { appendFileSync, cpSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 import test from "node:test";
 
 const installed = process.env.PI_TMUX_IMAGES_ROOT ?? resolve(process.env.HOME!, ".pi/agent/npm/node_modules/pi-tmux-images");
-const replay = resolve("patches/pi-tmux-images-0.2.0/apply-stage-c-disposable.sh");
+const patch = resolve("patches/pi-tmux-images-0.2.0/stage-c-recent-cache.patch");
+const replay = resolve("patches/pi-tmux-images-0.2.0/replay-stage-c.sh");
+const files = ["extensions/index.ts", "src/runtime.ts", "src/renderer.ts", "src/transcript-entry.ts", "src/provenance.ts"];
 
-test("Stage C replay is exact-version guarded and applies only to a disposable package copy", () => {
+function run(mode: "check" | "apply", root: string): string {
+  return execFileSync(replay, [mode, root], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
+}
+function snapshot(root: string): string[] {
+  return files.map((file) => readFileSync(resolve(root, file)).toString("base64"));
+}
+
+test("Stage C replay is exact-source guarded and idempotent before or after deployment", () => {
   const copy = mkdtempSync(resolve(tmpdir(), "pi-tmux-images-stage-c-"));
   try {
     cpSync(installed, copy, { recursive: true });
-    execFileSync(replay, [copy], { stdio: "pipe" });
+    const installedState = run("check", copy);
+    assert.match(installedState, /^(?:pristine|patched)$/u);
+    if (installedState === "patched") {
+      execFileSync("patch", ["-R", "-d", copy, "-p1"], { input: readFileSync(patch), stdio: ["pipe", "pipe", "pipe"] });
+    }
+    assert.equal(run("check", copy), "pristine");
+    assert.equal(run("apply", copy), "patched");
+    assert.equal(run("check", copy), "patched");
+    const once = snapshot(copy);
+    assert.equal(run("apply", copy), "already-patched");
+    assert.deepEqual(snapshot(copy), once, "second apply changes no source bytes");
+
     const extension = readFileSync(resolve(copy, "extensions/index.ts"), "utf8");
     const renderer = readFileSync(resolve(copy, "src/renderer.ts"), "utf8");
     const runtime = readFileSync(resolve(copy, "src/runtime.ts"), "utf8");
@@ -36,6 +56,10 @@ test("Stage C replay is exact-version guarded and applies only to a disposable p
     assert.match(provenance, /await import\("@earendil-works\/pi-coding-agent"\)/u);
     assert.match(provenance, /resizeImage\(capture\.bytes, capture\.mimeType\)/u);
     assert.match(transcript, /verified-local-original/u);
+
+    appendFileSync(resolve(copy, "src/runtime.ts"), "\n// unknown edit\n");
+    assert.throws(() => run("check", copy), /unknown\/partial pi-tmux-images source state/u);
+    assert.throws(() => run("apply", copy), /unknown\/partial pi-tmux-images source state/u);
   } finally {
     rmSync(copy, { recursive: true, force: true });
   }
