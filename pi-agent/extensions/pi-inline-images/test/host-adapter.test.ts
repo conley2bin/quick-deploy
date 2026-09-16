@@ -239,6 +239,33 @@ test("reconstruction hold renews only on a new public component generation", asy
   adapter.dispose();
 });
 
+test("observed preference survives same-call reconstruction but not new-session call-id reuse", async () => {
+  const host = await hostComponents(); host.setNativeProtocol(null);
+  const assistant = assistantMessage("assistant-pref-life", [{ id: "read-one", name: "read" }]);
+  const resultEntry = toolResult("result", "read-one");
+  const entries = [messageEntry("assistant-entry", assistant), resultEntry, preview("preview-one", "read-one")];
+  const firstAssistant = host.assistant(assistant); const firstRow = host.tool("read", "read-one"); firstRow.updateResult((resultEntry as { message: object }).message);
+  const children: object[] = [firstAssistant, firstRow]; const { adapter, events } = adapterFixture(children, () => null);
+  assert.equal(adapter.reconcile(entries as never, entries as never, "session-a"), true);
+  firstRow.setShowImages(false); assert.equal(adapter.reconcile(entries as never, entries as never, "session-a"), true);
+  assert.deepEqual(events.at(-1)?.activeLogicalIds, []);
+
+  adapter.suspend("compaction");
+  const secondAssistant = host.assistant(assistant); const secondRow = host.tool("read", "read-one"); secondRow.updateResult((resultEntry as { message: object }).message);
+  children.splice(0, children.length, secondAssistant, secondRow);
+  assert.equal(adapter.reconcile(entries as never, entries as never, "session-a"), true);
+  assert.deepEqual(events.at(-1)?.activeLogicalIds, [], "same-session reconstruction retains explicit off");
+  secondRow.setShowImages(true); assert.equal(adapter.reconcile(entries as never, entries as never, "session-a"), true);
+  assert.deepEqual(events.at(-1)?.activeLogicalIds, ["preview-one"], "subsequent explicit on restores exactly one custom owner");
+
+  secondRow.setShowImages(false); adapter.suspend("new session");
+  const thirdAssistant = host.assistant(assistant); const thirdRow = host.tool("read", "read-one"); thirdRow.updateResult((resultEntry as { message: object }).message);
+  children.splice(0, children.length, thirdAssistant, thirdRow);
+  assert.equal(adapter.reconcile(entries as never, entries as never, "session-b"), true);
+  assert.deepEqual(events.at(-1)?.activeLogicalIds, ["preview-one"], "new session does not inherit the old session's explicit off choice");
+  adapter.dispose(); host.setNativeProtocol("kitty");
+});
+
 test("association mismatch restores only adapter-owned suppression and publishes fail-closed coordination", async () => {
   const host = await hostComponents();
   const assistant = assistantMessage("assistant-mismatch", [{ id: "read-one", name: "read" }]);

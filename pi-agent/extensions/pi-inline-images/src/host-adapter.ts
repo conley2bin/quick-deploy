@@ -9,6 +9,7 @@ const SUPPORTED_HOST_VERSION = "0.85.1";
 const ENTRY_TYPE = "pi-tmux-images.preview";
 const CLEAR_TYPE = "pi-tmux-images.clear";
 const PLACEHOLDER = "\u{10EEEE}";
+const MAX_REMEMBERED_PREFERENCES = 256;
 
 export type HostSessionEntry = {
   type: string;
@@ -199,6 +200,8 @@ export class HostImageOwnershipAdapter {
   private readonly persistedAssistantCounts = new Map<string, number>();
   private readonly liveResults = new Map<string, object>();
   private preferenceRevision = 0;
+  private preferenceScope?: string;
+  private readonly rememberedPreferences = new Map<string, boolean>();
   private reconstructionHold?: { reason: string; priorTree: string };
 
   constructor(
@@ -222,10 +225,10 @@ export class HostImageOwnershipAdapter {
     }
   }
 
-  reconciliationSignature(renderEntries: readonly HostSessionEntry[], branch: readonly HostSessionEntry[]): string {
+  reconciliationSignature(renderEntries: readonly HostSessionEntry[], branch: readonly HostSessionEntry[], sessionScope = "default"): string {
     const tree = this.publicTreeSignature();
     const data = reconciliationDataSignature(branch, this.liveAssistant?.message, this.liveResults);
-    return `${tree}|${data}|pref:${this.preferenceRevision}|native:${this.host.nativeImageProtocol?.() ?? "unknown"}|render:${renderEntries.length}`;
+    return `${tree}|${data}|scope:${sessionScope}|pref:${this.preferenceRevision}|native:${this.host.nativeImageProtocol?.() ?? "unknown"}|render:${renderEntries.length}`;
   }
 
   publicTreeSignature(): string {
@@ -234,8 +237,9 @@ export class HostImageOwnershipAdapter {
     return `${this.tui.children.length}|${observed.map(({ kind, component }) => `${kind}:${this.componentId(component)}`).join(",")}`;
   }
 
-  reconcile(renderEntries: readonly HostSessionEntry[], branch: readonly HostSessionEntry[]): boolean {
+  reconcile(renderEntries: readonly HostSessionEntry[], branch: readonly HostSessionEntry[], sessionScope = "default"): boolean {
     if (this.host.version !== SUPPORTED_HOST_VERSION || !this.tui) return this.fail(`unsupported Pi host ${this.host.version}`);
+    this.setPreferenceScope(sessionScope);
     if (this.reconstructionHold) {
       if (this.publicTreeSignature() === this.reconstructionHold.priorTree) {
         this.publish({ version: READ_PREVIEW_COORDINATION_VERSION, ready: false, activeLogicalIds: [], reason: this.reconstructionHold.reason });
@@ -256,6 +260,7 @@ export class HostImageOwnershipAdapter {
     for (const id of persistedResults) this.liveResults.delete(id);
 
     const expected = expectedComponents(messages, this.liveAssistant?.message);
+    this.prunePreferences(new Set(expected.flatMap((item) => item.kind === "tool" ? [item.toolCallId] : [])));
     const observed = observedComponents(this.tui);
     if (expected.length !== observed.length || expected.some((item, index) => item.kind !== observed[index]?.kind)) {
       return this.fail(`host component sequence mismatch (${expected.length} expected, ${observed.length} observed)`);
@@ -305,7 +310,10 @@ export class HostImageOwnershipAdapter {
         for (const logicalId of claimed!.values()) accepted.add(logicalId);
         continue;
       }
-      if (complete && binding.externalDesired === undefined && containsNativeBitmap(row.render(Math.max(1, this.tui.terminal.columns)))) binding.externalDesired = true;
+      if (complete && binding.externalDesired === undefined && containsNativeBitmap(row.render(Math.max(1, this.tui.terminal.columns)))) {
+        binding.externalDesired = true;
+        this.rememberPreference(id, true);
+      }
       if (complete && binding.externalDesired === true) {
         this.suppress(row);
         for (const logicalId of claimed!.values()) accepted.add(logicalId);
@@ -336,6 +344,8 @@ export class HostImageOwnershipAdapter {
     this.liveResults.clear();
     this.liveAssistant = undefined;
     this.persistedAssistantCounts.clear();
+    this.rememberedPreferences.clear();
+    this.preferenceScope = undefined;
     this.reconstructionHold = undefined;
     this.publish({ version: READ_PREVIEW_COORDINATION_VERSION, ready: false, activeLogicalIds: [], reason: "adapter disposed" });
     this.tui = undefined;
@@ -347,6 +357,32 @@ export class HostImageOwnershipAdapter {
     const id = this.nextComponentId++;
     this.componentIds.set(component, id);
     return id;
+  }
+
+  private setPreferenceScope(scope: string): void {
+    if (this.preferenceScope === scope) return;
+    this.preferenceScope = scope;
+    this.rememberedPreferences.clear();
+    this.preferenceRevision++;
+  }
+
+  private prunePreferences(activeCalls: ReadonlySet<string>): void {
+    let changed = false;
+    for (const callId of this.rememberedPreferences.keys()) if (!activeCalls.has(callId)) {
+      this.rememberedPreferences.delete(callId);
+      changed = true;
+    }
+    if (changed) this.preferenceRevision++;
+  }
+
+  private rememberPreference(callId: string, show: boolean): void {
+    this.rememberedPreferences.delete(callId);
+    this.rememberedPreferences.set(callId, show);
+    while (this.rememberedPreferences.size > MAX_REMEMBERED_PREFERENCES) {
+      const oldest = this.rememberedPreferences.keys().next().value as string | undefined;
+      if (!oldest) break;
+      this.rememberedPreferences.delete(oldest);
+    }
   }
 
   private bindAssistant(component: AssistantComponent, expected: Extract<Expected, { kind: "assistant" }>): void {
@@ -384,12 +420,13 @@ export class HostImageOwnershipAdapter {
       wrapper: original,
       active: true,
       suppressed: false,
-      externalDesired: undefined,
+      externalDesired: this.rememberedPreferences.get(id),
     };
     binding.wrapper = (show) => {
       if (!binding.active) return binding.original.call(component, show);
       const changed = binding.externalDesired !== show;
       binding.externalDesired = show;
+      this.rememberPreference(binding.toolCallId, show);
       binding.original.call(component, binding.suppressed ? false : show);
       if (changed) {
         this.preferenceRevision++;

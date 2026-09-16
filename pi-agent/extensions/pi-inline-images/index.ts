@@ -15,7 +15,7 @@ type HostContext = {
   mode: string;
   cwd: string;
   ui: { setWidget(key: string, content: unknown): void };
-  sessionManager: { getBranch(): SessionEntry[]; buildContextEntries(): SessionEntry[] };
+  sessionManager: { getBranch(): SessionEntry[]; buildContextEntries(): SessionEntry[]; getSessionId(): string };
 };
 
 export default function piInlineImages(pi: ExtensionAPI) {
@@ -34,11 +34,11 @@ export default function piInlineImages(pi: ExtensionAPI) {
   let reconciliationSignature: string | undefined;
   let treeReconcileQueued = false;
   const reconcileHost = () => {
-    if (tui && hostContext) return host.reconcile(hostContext.sessionManager.buildContextEntries(), hostContext.sessionManager.getBranch());
+    if (tui && hostContext) return host.reconcile(hostContext.sessionManager.buildContextEntries(), hostContext.sessionManager.getBranch(), hostContext.sessionManager.getSessionId());
     return false;
   };
   const currentReconciliationSignature = () => hostContext
-    ? host.reconciliationSignature(hostContext.sessionManager.buildContextEntries(), hostContext.sessionManager.getBranch())
+    ? host.reconciliationSignature(hostContext.sessionManager.buildContextEntries(), hostContext.sessionManager.getBranch(), hostContext.sessionManager.getSessionId())
     : host.publicTreeSignature();
   const scheduleTreeReconcile = () => {
     const observed = currentReconciliationSignature();
