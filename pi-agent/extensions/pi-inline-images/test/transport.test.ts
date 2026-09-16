@@ -336,6 +336,32 @@ test("retained keys deduplicate accepted uploads and pending placement geometry 
   owner.dispose();
 });
 
+test("owner cancellation removes only matching unsent jobs and preserves shared backpressure and rate debt", async () => {
+  const { clock, sink, owner } = transport({ minIntervalMs: 50, drainTimeoutMs: 500, wireRateBytesPerSecond: 13 });
+  sink.returns.push(false, true);
+  await owner.enqueue(owner.generation, { transaction: "inline-active", owner: "inline", resource: "upload:inline" });
+  const read = owner.enqueue(owner.generation, { transaction: "read-queued", owner: "read", resource: "upload:read" });
+  const inline = owner.enqueue(owner.generation, { transaction: "inline-queued", owner: "inline", resource: "upload:inline-2" });
+  const readCancelled = assert.rejects(read, /read reset/u);
+
+  owner.cancelOwner("read", "read reset");
+  await readCancelled;
+  assert.equal(owner.generation, 0, "selective cancellation does not invalidate the other owner");
+  assert.equal(owner.pendingJobs, 1);
+  assert.equal(owner.pendingBytes, Buffer.byteLength("inline-active") + Buffer.byteLength("inline-queued"));
+  assert.deepEqual(sink.writes.map(({ value }) => value), ["inline-active"]);
+  assert.equal(sink.listenerCount("drain"), 1, "shared drain observation survives owner cancellation");
+
+  sink.drain();
+  clock.advance(999);
+  assert.deepEqual(sink.writes.map(({ value }) => value), ["inline-active"]);
+  clock.advance(1);
+  await inline;
+  assert.deepEqual(sink.writes.map(({ value }) => value), ["inline-active", "inline-queued"]);
+  assert.equal(sink.listenerCount("drain"), 0);
+  owner.dispose();
+});
+
 test("generation cancellation rejects queued jobs, preserves drain flow control, and never writes them later", async () => {
   const { clock, sink, owner } = transport({ minIntervalMs: 50, drainTimeoutMs: 500 });
   sink.returns.push(false);

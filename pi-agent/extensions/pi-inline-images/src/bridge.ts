@@ -29,15 +29,18 @@ function request(value: unknown): value is Request {
 }
 
 /** Publishes exactly two handles backed by the one inline graphics transport. */
-export function installGraphicsBridge(events: EventBus, terminal: TerminalImages): () => void {
+export function installGraphicsBridge(events: EventBus, terminal: TerminalImages, resourcesChanged: () => void = () => {}): () => void {
+  const lifecycle = async (operation: () => Promise<void>): Promise<void> => {
+    try { await operation(); } finally { resourcesChanged(); }
+  };
   const makeHandle = (owner: Owner): GraphicsOwnerHandle => ({
     version: IMAGE_BRIDGE_VERSION,
     owner,
-    prepare: (logicalId, image) => terminal.prepare(`${owner}:${logicalId}`, image),
+    prepare: (logicalId, image) => lifecycle(() => terminal.prepare(`${owner}:${logicalId}`, image)),
     render: (logicalId, width) => terminal.render(`${owner}:${logicalId}`, width),
     failure: (logicalId) => terminal.failure(`${owner}:${logicalId}`),
-    release: (logicalId) => terminal.release(`${owner}:${logicalId}`),
-    reset: () => terminal.resetOwner(owner),
+    release: (logicalId) => lifecycle(() => terminal.release(`${owner}:${logicalId}`)),
+    reset: () => lifecycle(() => terminal.resetOwner(owner)),
   });
   const handles = new Map<Owner, GraphicsOwnerHandle>([["inline", makeHandle("inline")], ["read", makeHandle("read")]]);
   return events.on(IMAGE_BRIDGE_REQUEST, (value: unknown) => {

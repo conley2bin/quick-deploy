@@ -4,7 +4,9 @@
 
 This directory carries one active local repair for the installed `pi-tmux-images@0.2.0`: `pane-passthrough-policy.patch` changes only `src/capabilities.ts`. The earlier unconditional placement replay is retired. `retire-placement-replay.patch` is a one-way removal patch for installations that received it; it is not an installation patch for pristine packages.
 
-`stage-c-recent-cache.patch` is deliberately **not deployed**. It is an exact-source guarded replay for a disposable package copy: it retains only the newest 16 preview resources at restore, marks older custom entries as expired, removes the 16-entry admission stop, routes stale notices through native `Text.render(width)`, and requests the public versioned `pi-inline-images` read bridge. A missing bridge remains visible; it must never restore independent graphics writes. `apply-stage-c-disposable.sh` refuses a different package version or source hash before applying.
+`stage-c-recent-cache.patch` is deliberately **not deployed** until the later provenance/review slice. It is an exact-source guarded replay for a disposable package copy. The replay retains the newest 16 read resources, evicts the oldest resource before every later admission, restores the newest eligible entries after the latest clear marker, and leaves older custom history visible as wrapped expired notices. All preparation, rendering, release, reset, restore, and late binding use the public versioned `pi-inline-images` read bridge. The old runtime retains no terminal IDs, placement/upload maps, native `Image` branch, or graphics output fallback. Missing/version-mismatched bridges remain visible through `Text.render(width)`. `apply-stage-c-disposable.sh` refuses a different package version or source hash before applying.
+
+The shared backend enforces independent owner residency: inline has 64 images/64 MiB and read has 16 images/64 MiB. Both use one bounded transport, while resource/owner cancellation removes only matching unsent jobs and preserves global backpressure and rate debt. Read-only resources invoke the same monitor lifecycle callback as Markdown resources; stopping the monitor invalidates stale readiness before a later resource can upload.
 
 The active capability repair queries the originating pane's effective tmux policy with:
 
@@ -98,10 +100,12 @@ NODE_PATH="$(npm root -g)/@earendil-works/pi-coding-agent/node_modules:$HOME/.pi
 PI_TMUX_IMAGES_ROOT="$HOME/.pi/agent/npm/node_modules/pi-tmux-images" \
   pi-agent/extensions/pi-inline-images/node_modules/.bin/tsx --test \
   pi-agent/extensions/pi-inline-images/patches/pi-tmux-images-0.2.0/placement-lifecycle.test.ts \
-  pi-agent/extensions/pi-inline-images/patches/pi-tmux-images-0.2.0/pane-passthrough-policy.test.ts
+  pi-agent/extensions/pi-inline-images/patches/pi-tmux-images-0.2.0/pane-passthrough-policy.test.ts \
+  pi-agent/extensions/pi-inline-images/patches/pi-tmux-images-0.2.0/stage-c-replay.test.ts \
+  pi-agent/extensions/pi-inline-images/patches/pi-tmux-images-0.2.0/stage-c-behavior.test.ts
 ```
 
-`placement-lifecycle.test.ts` checks initial upload plus placement for two IDs, 2,000 unchanged renders with zero commands, delete-then-recreate on geometry change, another 1,000 stable renders with zero commands, preservation of the other ID, and explicit lifecycle teardown. `pane-passthrough-policy.test.ts` checks the pane-effective command, enabled values, and fail-closed cases.
+`placement-lifecycle.test.ts` checks the installed capability-only runtime's bounded placement lifecycle. `pane-passthrough-policy.test.ts` checks the pane-effective command, enabled values, and fail-closed cases. `stage-c-replay.test.ts` applies only to a disposable copy and rejects retained native graphics paths. `stage-c-behavior.test.ts` runs the patched extension/runtime against the real shared backend and a captured sink: 20 automatic entries, 16-resource eviction, restore preparation, inline-preserving clear, late bridge binding, and width-16/40 CJK notices.
 
 ## Boundary of the capability repair
 

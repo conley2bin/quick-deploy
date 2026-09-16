@@ -24,13 +24,21 @@ export default function piInlineImages(pi: ExtensionAPI) {
     });
   };
   const viewers = new ViewerMonitor({ snapshot: currentViewerState }, async (state) => {
-    await terminal.setViewer(state);
-    wake();
+    try { await terminal.setViewer(state); } finally { wake(); }
   });
-  const removeBridge = installGraphicsBridge(pi.events, terminal);
-  const syncMonitor = () => terminal.count() > 0 ? viewers.start() : viewers.stop();
+  const syncMonitor = () => {
+    if (terminal.count() > 0) viewers.start();
+    else {
+      viewers.stop();
+      terminal.pauseViewers();
+    }
+  };
+  const resourcesChanged = () => { syncMonitor(); wake(); };
+  const removeBridge = installGraphicsBridge(pi.events, terminal, resourcesChanged);
+  let widgetUi: { setWidget(key: string, content: unknown): void } | undefined;
 
   const installWakeWidget = (ui: { setWidget(key: string, content: unknown): void }) => {
+    widgetUi = ui;
     ui.setWidget("pi-inline-images:repaint-bridge", (candidate: TuiRepaint) => {
       tui = candidate;
       return { render: () => [], invalidate() {} };
@@ -76,6 +84,9 @@ export default function piInlineImages(pi: ExtensionAPI) {
   pi.on("session_shutdown", async () => {
     viewers.stop();
     removeBridge();
+    widgetUi?.setWidget("pi-inline-images:repaint-bridge", undefined);
+    widgetUi = undefined;
+    tui = undefined;
     await session.reset(true);
   });
 }

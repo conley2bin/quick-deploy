@@ -55,9 +55,16 @@ export class ImageSession {
   async restore(entries: readonly Entry[], cwd: string, reusePrepared = false): Promise<void> {
     const previous = reusePrepared ? new Map(this.markdown) : undefined;
     const generation = ++this.generation;
+    const sources = entries.flatMap((entry) => assistantTextBlocks(entry.type === "message" ? entry.message : undefined));
+    const retained = new Set<string>();
+    if (previous) {
+      for (const source of sources) {
+        const prepared = previous.get(source);
+        if (prepared?.cwd === cwd) for (const reference of prepared.references) if (!reference.inTable && !reference.error) retained.add(reference.logicalId);
+      }
+      await this.terminal.retainOwner("inline", retained);
+    } else await this.terminal.resetOwner("inline");
     this.markdown.clear();
-    if (reusePrepared) this.terminal.reconcile();
-    else await this.terminal.clear();
     if (generation !== this.generation) return;
 
     for (const entry of entries) {
@@ -74,6 +81,7 @@ export class ImageSession {
   async reset(dispose = false): Promise<void> {
     this.generation++;
     this.markdown.clear();
-    await this.terminal.clear(dispose);
+    if (dispose) await this.terminal.clear(true);
+    else await this.terminal.resetOwner("inline");
   }
 }

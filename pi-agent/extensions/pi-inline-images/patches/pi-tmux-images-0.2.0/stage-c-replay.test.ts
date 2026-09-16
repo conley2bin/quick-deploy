@@ -19,8 +19,12 @@ test("Stage C replay is exact-version guarded and applies only to a disposable p
     assert.match(extension, /MAX_RECENT_PREVIEWS = 16/u);
     assert.doesNotMatch(extension, /activeEntries\(ctx\)\.length >= 16/u);
     assert.match(extension, /graphics-owner:request/u);
+    assert.match(extension, /await runtime\.clear\(\)/u);
     assert.match(renderer, /new Text\([^)]*\)\.render/u);
+    assert.doesNotMatch(renderer, /new Image\(/u);
     assert.match(runtime, /SharedGraphicsHandle/u);
+    assert.match(runtime, /await this\.shared\.prepare/u);
+    assert.doesNotMatch(runtime, /process\.stdout|terminalIds|renderMode|deleteImage|\bupload\(/u);
   } finally {
     rmSync(copy, { recursive: true, force: true });
   }

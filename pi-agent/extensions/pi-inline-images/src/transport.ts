@@ -54,6 +54,9 @@ export interface TransportRequest {
   bytes?: number;
   key?: string;
   coalesceKey?: string;
+  /** Optional lifecycle scope. Selective cancellation never changes shared drain/rate debt. */
+  owner?: string;
+  resource?: string;
 }
 
 export interface TransportResult {
@@ -67,6 +70,8 @@ type PendingJob = {
   bytes: number;
   key?: string;
   coalesceKey?: string;
+  owner?: string;
+  resource?: string;
   generation: number;
   promise: Promise<TransportResult>;
   resolve: (result: TransportResult) => void;
@@ -171,6 +176,7 @@ export class BoundedTransport {
   /** All admitted wire bytes, including accepted output that has not drained. */
   get pendingBytes(): number { return this.queuedBytes + this.undrainedBytes; }
   get retainedResources(): number { return this.acceptedKeys.size + this.pendingKeys.size; }
+  get terminalFailure(): TransportError | undefined { return this.failure; }
 
   enqueue(generation: number, request: TransportRequest): Promise<TransportResult> {
     if (this.disposed) return Promise.reject(new TransportError("closed", "graphics transport disposed"));
@@ -208,6 +214,8 @@ export class BoundedTransport {
         if (replacementBytes > this.limits.maxQueuedBytes) return Promise.reject(new TransportError("limit", `graphics wire budget would exceed ${this.limits.maxQueuedBytes}`));
         pending.build = build;
         pending.bytes = bytes;
+        pending.owner = request.owner;
+        pending.resource = request.resource;
         this.queuedBytes += bytes - oldBytes;
         return pending.promise;
       }
@@ -218,7 +226,18 @@ export class BoundedTransport {
     let resolve!: (result: TransportResult) => void;
     let reject!: (error: Error) => void;
     const promise = new Promise<TransportResult>((yes, no) => { resolve = yes; reject = no; });
-    const job: PendingJob = { build, bytes, key: request.key, coalesceKey: request.coalesceKey, generation: this.currentGeneration, promise, resolve, reject };
+    const job: PendingJob = {
+      build,
+      bytes,
+      key: request.key,
+      coalesceKey: request.coalesceKey,
+      owner: request.owner,
+      resource: request.resource,
+      generation: this.currentGeneration,
+      promise,
+      resolve,
+      reject,
+    };
     this.queue.push(job);
     this.queuedBytes += bytes;
     if (job.key) this.pendingKeys.set(job.key, job);
@@ -237,7 +256,17 @@ export class BoundedTransport {
     return promise;
   }
 
-  /** Cancellation removes only unsent owner jobs; sink drain/rate debt survive. */
+  /** Remove one owner's unsent work without changing another owner or shared flow-control debt. */
+  cancelOwner(owner: string, reason = `graphics owner '${owner}' cancelled`): void {
+    this.cancelWhere((job) => job.owner === owner, reason);
+  }
+
+  /** Remove one resource's unsent work without changing another resource or shared flow-control debt. */
+  cancelResource(owner: string, resource: string, reason = `graphics resource '${resource}' cancelled`): void {
+    this.cancelWhere((job) => job.owner === owner && job.resource === resource, reason);
+  }
+
+  /** Global generation cancellation is reserved for full-runtime reconciliation/disposal. */
   cancel(reason = "graphics generation cancelled", options: { retainAccepted?: boolean } = {}): void {
     if (this.disposed) return;
     this.currentGeneration++;
@@ -263,6 +292,26 @@ export class BoundedTransport {
     this.backpressured = false;
     this.sink.removeListener("error", this.errorListener);
     this.sink.removeListener("close", this.closeListener);
+  }
+
+  private cancelWhere(matches: (job: PendingJob) => boolean, reason: string): void {
+    if (this.disposed || this.failure) return;
+    const error = new TransportError("cancelled", reason);
+    let removed = false;
+    for (let index = this.queue.length - 1; index >= 0; index--) {
+      const job = this.queue[index]!;
+      if ((this.writing && index === 0) || !matches(job)) continue;
+      this.queue.splice(index, 1);
+      this.queuedBytes -= job.bytes;
+      if (job.key && this.pendingKeys.get(job.key) === job) this.pendingKeys.delete(job.key);
+      if (job.coalesceKey && this.coalesced.get(job.coalesceKey) === job) this.coalesced.delete(job.coalesceKey);
+      job.reject(error);
+      removed = true;
+    }
+    if (!removed) return;
+    this.clearPumpTimer();
+    if (this.queue.length === 0) this.settleReady();
+    else this.resume();
   }
 
   private resume(): void {

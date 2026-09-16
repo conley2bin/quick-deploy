@@ -86,7 +86,7 @@ Preview geometry and upload fidelity are separate. Layout remains at most 80×24
 cells, while upload retains every source pixel. Supported limits are explicit:
 
 - **20 MiB** encoded input, **32 MiPixels** decoded input, and **32 MiB** full PNG
-- **64 MiB** aggregate resident PNG state and **64** immutable resources
+- independent resident quotas: inline **64 MiB / 64** resources and old-read **64 MiB / 16** recent resources
 - **44 MiB** maximum atomic upload-plus-catalog write, **96 MiB** admitted wire
   budget including an accepted `write(false)` awaiting drain, and **64** queued jobs
 - **8 MiB/s** sustained transaction pacing after one bounded burst, at least 50 ms
@@ -96,13 +96,18 @@ Each upload reserves its exact wire size before constructing base64. All 4096-by
 Kitty chunks and the complete placement catalog are one Buffer write; continuations
 contain only `m`, and renders never emit graphics commands.
 
-When resources exist, a single 1.5-second monitor checks the current tmux window,
-pane passthrough policy, and attached client identities. No viewer, failed snapshot,
-or an incompatible visible client keeps PNG bytes pending with zero upload. A hidden
-viewer returning with the same identity does not re-upload; a new identity starts a
-new receiver epoch and receives complete uploads. Meaningful preparation/viewer
-changes coalesce one public TUI invalidate/requestRender wakeup through a nonvisual
-widget; stable polls do not repaint.
+When inline or bridged read resources exist, a single 1.5-second monitor checks the
+current tmux window, zoom/pane visibility, passthrough policy, suspension, and at
+most 32 attached client identities with a 1-second/64-KiB snapshot bound. An
+inactive pane remains visible in an unzoomed window; a zoomed window exposes only
+its active pane. No viewer, failed/unknown snapshot, suspended viewer, or
+incompatible visible client keeps PNG bytes pending with zero upload. Each resource
+tracks the bounded identities it has served separately from current visibility. A
+hidden viewer returning with the same attachment identity does not re-upload;
+detach/reconnect creates an unseen identity and receives a complete upload.
+Meaningful preparation/viewer changes coalesce one public TUI
+invalidate/requestRender wakeup through a nonvisual widget; stable polls do not
+repaint or upload.
 
 
 Precreating bounded placements is lower risk than dynamic placement: official

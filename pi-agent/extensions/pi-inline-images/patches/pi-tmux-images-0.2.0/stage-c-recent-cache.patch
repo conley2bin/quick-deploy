@@ -1,79 +1,181 @@
 diff --git a/extensions/index.ts b/extensions/index.ts
-index 6ccf227..cb5333e 100644
+index 6ccf227..e7e1770 100644
 --- a/extensions/index.ts
 +++ b/extensions/index.ts
-@@ -8,7 +8,8 @@ import { CLEAR_TYPE, type ClearEntry, ENTRY_TYPE, isPreview, type PreviewEntry }
+@@ -1,25 +1,32 @@
+ import { randomUUID } from "node:crypto";
+ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+ import { automaticBlocks, type BranchEntry, findOrigin, hasPersistedOrigin, originToken } from "../src/automatic.ts";
+-import { previewComponent } from "../src/renderer.ts";
+-import { PreviewRuntime } from "../src/runtime.ts";
++import { previewComponent, wrappedNotice } from "../src/renderer.ts";
++import { PreviewRuntime, type SharedGraphicsHandle } from "../src/runtime.ts";
+ import { CLEAR_TYPE, type ClearEntry, ENTRY_TYPE, isPreview, type PreviewEntry } from "../src/transcript-entry.ts";
+ 
++const MAX_RECENT_PREVIEWS = 16;
++
  function branch(ctx: ExtensionContext): BranchEntry[] {
  	return ctx.sessionManager.getBranch() as BranchEntry[];
  }
 -function activeEntries(ctx: ExtensionContext): PreviewEntry[] {
-+const MAX_RECENT_PREVIEWS = 16;
 +function allEntries(ctx: ExtensionContext): PreviewEntry[] {
  	const entries = branch(ctx);
  	let latestClear = -1;
  	entries.forEach((entry, index) => {
-@@ -18,9 +19,9 @@ function activeEntries(ctx: ExtensionContext): PreviewEntry[] {
- 		.slice(latestClear + 1)
- 		.flatMap((entry) =>
- 			entry.type === "custom" && entry.customType === ENTRY_TYPE && isPreview(entry.data) ? [entry.data] : [],
+ 		if (entry.type === "custom" && entry.customType === CLEAR_TYPE) latestClear = index;
+ 	});
+-	return entries
+-		.slice(latestClear + 1)
+-		.flatMap((entry) =>
+-			entry.type === "custom" && entry.customType === ENTRY_TYPE && isPreview(entry.data) ? [entry.data] : [],
 -		)
 -		.slice(-16);
-+		);
++	return entries.slice(latestClear + 1).flatMap((entry) =>
++		entry.type === "custom" && entry.customType === ENTRY_TYPE && isPreview(entry.data) ? [entry.data] : []);
++}
++function activeEntries(ctx: ExtensionContext): PreviewEntry[] {
++	return allEntries(ctx).slice(-MAX_RECENT_PREVIEWS);
++}
++function sharedHandle(value: unknown): value is SharedGraphicsHandle {
++	if (!value || typeof value !== "object") return false;
++	const handle = value as Partial<SharedGraphicsHandle>;
++	return typeof handle.prepare === "function" && typeof handle.render === "function" && typeof handle.failure === "function"
++		&& typeof handle.release === "function" && typeof handle.reset === "function";
  }
-+function activeEntries(ctx: ExtensionContext): PreviewEntry[] { return allEntries(ctx).slice(-MAX_RECENT_PREVIEWS); }
  
  export function registerInlineImages(pi: ExtensionAPI, runtime = new PreviewRuntime()) {
- 	let stale = new Map<string, string>();
-@@ -29,6 +30,9 @@ export function registerInlineImages(pi: ExtensionAPI, runtime = new PreviewRunt
+@@ -29,11 +36,22 @@ export function registerInlineImages(pi: ExtensionAPI, runtime = new PreviewRunt
  	const pending = new Map<string, NonNullable<PreviewEntry["origin"]>>();
  	let messageOrdinals = new WeakMap<object, number>();
  	const reservedOrdinals = new Set<number>();
 +	const requestId = randomUUID();
-+	pi.events.on("pi-inline-images:graphics-owner:reply", (value) => { const r=value as {version?:unknown;owner?:unknown;requestId?:unknown;handle?:unknown}; if(r.version===1&&r.owner==="read"&&r.requestId===requestId&&r.handle) runtime.setShared(r.handle as never); });
-+	const requestBridge=()=>pi.events.emit("pi-inline-images:graphics-owner:request",{version:1,owner:"read",requestId}); requestBridge();
++
  	function enqueue(operation: () => Promise<void>): Promise<void> {
  		const next = serial.then(operation, operation);
  		serial = next.catch(() => undefined);
-@@ -55,7 +59,8 @@ export function registerInlineImages(pi: ExtensionAPI, runtime = new PreviewRunt
+ 		return next;
+ 	}
++	const removeBridgeReply = pi.events.on("pi-inline-images:graphics-owner:reply", (value) => {
++		const reply = value as { version?: unknown; owner?: unknown; requestId?: unknown; handle?: unknown };
++		const handle = reply.handle;
++		if (reply.version !== 1 || reply.owner !== "read" || reply.requestId !== requestId || !sharedHandle(handle)) return;
++		void enqueue(() => runtime.setShared(handle)).catch(() => undefined);
++	});
++	const requestBridge = () => pi.events.emit("pi-inline-images:graphics-owner:request", { version: 1, owner: "read", requestId });
++	requestBridge();
++
+ 	function invalidate(): number {
+ 		generation++;
+ 		pending.clear();
+@@ -41,36 +59,43 @@ export function registerInlineImages(pi: ExtensionAPI, runtime = new PreviewRunt
+ 		reservedOrdinals.clear();
+ 		return generation;
+ 	}
++	async function evictOldest(ctx: ExtensionContext): Promise<void> {
++		const active = activeEntries(ctx);
++		if (active.length < MAX_RECENT_PREVIEWS) return;
++		const oldest = active[0]!;
++		await runtime.release(oldest.logicalId);
++		stale.set(oldest.logicalId, "Expired from the recent preview cache.");
++	}
++
+ 	pi.registerEntryRenderer<PreviewEntry>(ENTRY_TYPE, (entry, _options, theme) => {
+ 		const data = isPreview(entry.data) ? entry.data : undefined;
+ 		return data
+ 			? previewComponent(data, runtime, theme, stale.get(data.logicalId))
+-			: { render: () => ["[image] Invalid saved preview entry."], invalidate() {} };
++			: wrappedNotice("[image] Invalid saved preview entry.");
+ 	});
+-	pi.registerEntryRenderer<ClearEntry>(CLEAR_TYPE, () => ({
+-		render: () => ["[image previews cleared]"],
+-		invalidate() {},
+-	}));
++	pi.registerEntryRenderer<ClearEntry>(CLEAR_TYPE, () => wrappedNotice("[image previews cleared]"));
++
+ 	function rebuild(ctx: ExtensionContext, expected: number) {
  		return enqueue(async () => {
  			if (expected !== generation) return;
- 			runtime.clear();
+-			runtime.clear();
 -			const entries = activeEntries(ctx);
 +			const all = allEntries(ctx);
 +			const entries = all.slice(-MAX_RECENT_PREVIEWS);
  			const restored = await runtime.rehydrate(entries, ctx.cwd, (entry) => {
  				const block = findOrigin(branch(ctx), entry);
  				return block ? { data: block.data, mimeType: block.mimeType } : undefined;
-@@ -64,7 +69,7 @@ export function registerInlineImages(pi: ExtensionAPI, runtime = new PreviewRunt
- 				runtime.clear();
+ 			});
+ 			if (expected !== generation) {
+-				runtime.clear();
++				await runtime.clear();
  				return;
  			}
 -			stale = restored;
-+			stale = new Map(all.slice(0,-MAX_RECENT_PREVIEWS).map((entry)=>[entry.logicalId,"Expired from the recent preview cache."])); for (const [id,reason] of restored) stale.set(id,reason);
++			stale = new Map(all.slice(0, -MAX_RECENT_PREVIEWS).map((entry) => [entry.logicalId, "Expired from the recent preview cache."]));
++			for (const [logicalId, reason] of restored) stale.set(logicalId, reason);
  		});
  	}
++
  	function automatic(message: unknown, ctx: ExtensionContext, expected: number) {
-@@ -83,7 +88,7 @@ export function registerInlineImages(pi: ExtensionAPI, runtime = new PreviewRunt
+ 		return enqueue(async () => {
+-			if (expected !== generation || runtime.mode() !== "kitty-placeholder" || !message || typeof message !== "object")
+-				return;
++			if (expected !== generation || !message || typeof message !== "object") return;
+ 			const entries = branch(ctx);
+ 			const persistedMessageCount = entries.filter((entry) => entry.type === "message").length;
+ 			for (const ordinal of reservedOrdinals) if (ordinal < persistedMessageCount) reservedOrdinals.delete(ordinal);
+@@ -83,18 +108,17 @@ export function registerInlineImages(pi: ExtensionAPI, runtime = new PreviewRunt
  			}
  			for (const [token, origin] of pending) if (hasPersistedOrigin(entries, origin)) pending.delete(token);
  			for (const { block, origin } of automaticBlocks(message, messageOrdinal)) {
 -				if (activeEntries(ctx).length >= 16) return;
-+				if (activeEntries(ctx).length >= MAX_RECENT_PREVIEWS) await runtime.release(activeEntries(ctx)[0]!.logicalId);
  				const token = originToken(origin);
  				if (pending.has(token) || hasPersistedOrigin(entries, origin)) continue;
++				await evictOldest(ctx);
  				pending.set(token, origin);
-@@ -103,8 +108,8 @@ export function registerInlineImages(pi: ExtensionAPI, runtime = new PreviewRunt
++				const logicalId = randomUUID().replaceAll("-", "");
+ 				try {
+-					const logicalId = randomUUID().replaceAll("-", "");
+ 					const entry = await runtime.addBytes(block.data, block.mimeType, logicalId, "attached image");
+ 					if (expected !== generation) {
+-						runtime.clear();
++						await runtime.release(logicalId);
+ 						return;
+ 					}
+-					// message_end precedes persistence, so custom metadata intentionally comes first.
+ 					pi.appendEntry<PreviewEntry>(ENTRY_TYPE, { ...entry, origin });
+ 				} catch {
+ 					pending.delete(token);
+@@ -103,15 +127,16 @@ export function registerInlineImages(pi: ExtensionAPI, runtime = new PreviewRunt
  			}
  		});
  	}
 -	pi.on("session_start", async (_event, ctx) => rebuild(ctx, invalidate()));
 -	pi.on("session_tree", async (_event, ctx) => rebuild(ctx, invalidate()));
++
 +	pi.on("session_start", async (_event, ctx) => { requestBridge(); return rebuild(ctx, invalidate()); });
 +	pi.on("session_tree", async (_event, ctx) => { requestBridge(); return rebuild(ctx, invalidate()); });
  	pi.on("session_shutdown", async () => {
  		const expected = invalidate();
- 		return enqueue(async () => {
-@@ -127,10 +132,7 @@ export function registerInlineImages(pi: ExtensionAPI, runtime = new PreviewRunt
+-		return enqueue(async () => {
+-			if (expected === generation) runtime.clear();
+-		});
++		removeBridgeReply();
++		return enqueue(async () => { if (expected === generation) await runtime.clear(); });
+ 	});
+ 	pi.on("message_end", async (event, ctx) => automatic(event.message, ctx, generation));
++
+ 	pi.registerCommand("image", {
+ 		description: "Display a local image in the TUI without model context. Use /image clear to remove previews.",
+ 		handler: async (args, ctx) => {
+@@ -119,7 +144,7 @@ export function registerInlineImages(pi: ExtensionAPI, runtime = new PreviewRunt
+ 				const expected = invalidate();
+ 				return enqueue(async () => {
+ 					if (expected !== generation) return;
+-					runtime.clear();
++					await runtime.clear();
+ 					pi.appendEntry<ClearEntry>(CLEAR_TYPE, { marker: true });
+ 					stale.clear();
+ 				});
+@@ -127,14 +152,12 @@ export function registerInlineImages(pi: ExtensionAPI, runtime = new PreviewRunt
  			const expected = generation;
  			return enqueue(async () => {
  				if (expected !== generation) return;
@@ -81,35 +183,64 @@ index 6ccf227..cb5333e 100644
 -					ctx.ui.notify("Image preview limit reached (16). Use /image clear before adding another image.", "error");
 -					return;
 -				}
-+				if (activeEntries(ctx).length >= MAX_RECENT_PREVIEWS) await runtime.release(activeEntries(ctx)[0]!.logicalId);
++				await evictOldest(ctx);
  				try {
- 					const entry = await runtime.add(args, randomUUID().replaceAll("-", ""), ctx.cwd);
+-					const entry = await runtime.add(args, randomUUID().replaceAll("-", ""), ctx.cwd);
++					const logicalId = randomUUID().replaceAll("-", "");
++					const entry = await runtime.add(args, logicalId, ctx.cwd);
  					if (expected !== generation) {
+-						runtime.clear();
++						await runtime.release(logicalId);
+ 						return;
+ 					}
+ 					pi.appendEntry<PreviewEntry>(ENTRY_TYPE, entry);
+@@ -145,6 +168,7 @@ export function registerInlineImages(pi: ExtensionAPI, runtime = new PreviewRunt
+ 		},
+ 	});
+ }
++
+ export default function inlineImages(pi: ExtensionAPI) {
+ 	registerInlineImages(pi);
+ }
 diff --git a/src/renderer.ts b/src/renderer.ts
-index bfaaa84..fa60340 100644
+index bfaaa84..dd5725f 100644
 --- a/src/renderer.ts
 +++ b/src/renderer.ts
-@@ -1,10 +1,9 @@
+@@ -1,35 +1,32 @@
 -import { type Component, Image, type ImageTheme } from "@earendil-works/pi-tui";
-+import { type Component, type ImageTheme, Text } from "@earendil-works/pi-tui";
++import { type Component, Text } from "@earendil-works/pi-tui";
  import type { PreviewRuntime } from "./runtime.ts";
  import type { PreviewEntry } from "./transcript-entry.ts";
  
--export function fallback(entry: PreviewEntry, reason?: string): string[] {
--	return [`[image] ${reason ?? `${entry.originalMime} ${entry.width}×${entry.height}`}: ${entry.path}`];
--}
-+export function fallback(entry: PreviewEntry, reason?: string): string[] { return [`[image] ${reason ?? `${entry.originalMime} ${entry.width}×${entry.height}`}: ${entry.path}`]; }
-+function notice(entry: PreviewEntry, reason?: string): Component { const text=fallback(entry,reason).join("\n"); return { render:(width)=>new Text(text,0,0).render(Math.max(1,width)),invalidate(){} }; }
- function imageTheme(theme: unknown): ImageTheme {
- 	const candidate = theme as { fallbackColor?: unknown } | undefined;
- 	return {
-@@ -20,16 +19,8 @@ export function previewComponent(
- 	theme: unknown,
+ export function fallback(entry: PreviewEntry, reason?: string): string[] {
+ 	return [`[image] ${reason ?? `${entry.originalMime} ${entry.width}×${entry.height}`}: ${entry.path}`];
+ }
+-function imageTheme(theme: unknown): ImageTheme {
+-	const candidate = theme as { fallbackColor?: unknown } | undefined;
+-	return {
+-		fallbackColor:
+-			typeof candidate?.fallbackColor === "function"
+-				? (candidate.fallbackColor as (text: string) => string)
+-				: (text) => text,
+-	};
++
++export function wrappedNotice(text: string): Component {
++	return { render: (width) => new Text(text, 0, 0).render(Math.max(1, width)), invalidate() {} };
++}
++
++function notice(entry: PreviewEntry, reason?: string): Component {
++	return wrappedNotice(fallback(entry, reason).join("\n"));
+ }
++
+ export function previewComponent(
+ 	entry: PreviewEntry,
+ 	runtime: PreviewRuntime,
+-	theme: unknown,
++	_theme: unknown,
  	stale?: string,
  ): Component {
 -	if (stale) return { render: () => fallback(entry, stale), invalidate() {} };
-+	if (stale) return notice(entry, stale);
- 	const image = runtime.get(entry.logicalId);
+-	const image = runtime.get(entry.logicalId);
 -	if (!image) return { render: () => fallback(entry, "Image is unavailable in this process."), invalidate() {} };
 -	if (runtime.mode() === "kitty-placeholder")
 -		return { render: (width) => runtime.emitPlaceholder(entry.logicalId, width), invalidate() {} };
@@ -120,72 +251,206 @@ index bfaaa84..fa60340 100644
 -			imageId: runtime.terminalId(entry.logicalId),
 -		});
 -	return { render: () => fallback(entry), invalidate() {} };
-+	if (!image) return notice(entry, "Image is unavailable in this process.");
-+	return { render: (width) => { const rows=runtime.emitPlaceholder(entry.logicalId,width); return rows.length ? rows : notice(entry,runtime.sharedFailure(entry.logicalId)).render(width); }, invalidate() {} };
++	if (stale) return notice(entry, stale);
++	if (!runtime.get(entry.logicalId)) return notice(entry, "Image is unavailable in this process.");
++	return {
++		render: (width) => {
++			const rows = runtime.emitPlaceholder(entry.logicalId, width);
++			return rows.length ? rows : notice(entry, runtime.sharedFailure(entry.logicalId)).render(width);
++		},
++		invalidate() {},
++	};
  }
 diff --git a/src/runtime.ts b/src/runtime.ts
-index 73949b5..2069ec7 100644
+index 73949b5..16d6aee 100644
 --- a/src/runtime.ts
 +++ b/src/runtime.ts
-@@ -4,6 +4,7 @@ import { deleteImage, deletePlacement, grid, placement, type Sink, upload } from
+@@ -1,157 +1,138 @@
+-import { allocateImageId, getCapabilities, getCellDimensions } from "@earendil-works/pi-tui";
+-import { type Environment, isTmux, type RenderMode, renderMode, type TmuxProbe } from "./capabilities.ts";
+-import { deleteImage, deletePlacement, grid, placement, type Sink, upload } from "./kitty-placeholder.ts";
  import { type FileOps, type LoadedImage, loadImage, loadImageBytes } from "./loader.ts";
  import type { PreviewEntry } from "./transcript-entry.ts";
  
-+export interface SharedGraphicsHandle { prepare(logicalId: string, image: { source: string; hash: string; width: number; height: number; png: Buffer }): Promise<void>; render(logicalId: string, width: number): string[]; failure(logicalId: string): string | undefined; release(logicalId: string): Promise<void>; reset(): Promise<void>; }
++export interface SharedGraphicsHandle {
++	prepare(logicalId: string, image: { source: string; hash: string; width: number; height: number; png: Buffer }): Promise<void>;
++	render(logicalId: string, width: number): string[];
++	failure(logicalId: string): string | undefined;
++	release(logicalId: string): Promise<void>;
++	reset(): Promise<void>;
++}
  export interface RuntimeDeps {
- 	env?: Environment;
- 	output?: Sink;
-@@ -43,6 +44,7 @@ export class PreviewRuntime {
- 	private readonly uploaded = new Map<number, string>();
- 	/** Current terminal placement geometry, keyed by runtime-owned image ID. */
- 	private readonly placements = new Map<number, string>();
+-	env?: Environment;
+-	output?: Sink;
+ 	loader?: typeof loadImage;
+ 	byteLoader?: typeof loadImageBytes;
+ 	fs?: FileOps;
+-	/** Test/runtime override for Pi's detected image protocol. */
+-	imageProtocol?: "kitty" | "iterm2" | null;
+-	allocateImageId?: () => number;
+-	/** Test override for the bounded tmux passthrough capability probe. */
+-	tmuxProbe?: TmuxProbe;
+-}
+-export function geometry(
+-	width: number,
+-	height: number,
+-	maxColumns = 80,
+-	maxRows = 24,
+-	cell = getCellDimensions(),
+-): { columns: number; rows: number } {
+-	const scale = Math.min((maxColumns * cell.widthPx) / width, (maxRows * cell.heightPx) / height, 1);
+-	return {
+-		columns: Math.max(1, Math.ceil((width * scale) / cell.widthPx)),
+-		rows: Math.max(1, Math.ceil((height * scale) / cell.heightPx)),
+-	};
+ }
++
++/** Retains only the recent decoded images; the shared backend owns all terminal graphics state. */
+ export class PreviewRuntime {
+-	private readonly env: Environment;
+-	private readonly output: Sink;
+ 	private readonly loader: typeof loadImage;
+ 	private readonly byteLoader: typeof loadImageBytes;
+ 	private readonly fs?: FileOps;
+-	private readonly allocate: () => number;
+-	private readonly protocol: "kitty" | "iterm2" | null;
+-	private readonly renderMode: RenderMode;
+ 	private readonly images = new Map<string, LoadedImage>();
+-	private readonly terminalIds = new Map<string, number>();
+-	private readonly uploaded = new Map<number, string>();
+-	/** Current terminal placement geometry, keyed by runtime-owned image ID. */
+-	private readonly placements = new Map<number, string>();
++	private readonly sharedErrors = new Map<string, string>();
 +	private shared?: SharedGraphicsHandle;
++
  	constructor(deps: RuntimeDeps = {}) {
- 		this.env = deps.env ?? process.env;
- 		this.output = deps.output ?? { write: (s) => process.stdout.write(s) };
-@@ -54,9 +56,11 @@ export class PreviewRuntime {
- 		// Probe once per runtime rather than during every component render.
- 		this.renderMode = renderMode(this.env, this.protocol, deps.tmuxProbe);
+-		this.env = deps.env ?? process.env;
+-		this.output = deps.output ?? { write: (s) => process.stdout.write(s) };
+ 		this.loader = deps.loader ?? loadImage;
+ 		this.byteLoader = deps.byteLoader ?? loadImageBytes;
+ 		this.fs = deps.fs;
+-		this.allocate = deps.allocateImageId ?? allocateImageId;
+-		this.protocol = deps.imageProtocol === undefined ? getCapabilities().images : deps.imageProtocol;
+-		// Probe once per runtime rather than during every component render.
+-		this.renderMode = renderMode(this.env, this.protocol, deps.tmuxProbe);
  	}
 -	mode(): RenderMode {
 -		return this.renderMode;
--	}
-+	mode(): RenderMode { return this.renderMode; }
-+	setShared(handle: SharedGraphicsHandle | undefined): void { this.shared = handle; }
-+	sharedFailure(id: string): string | undefined { return this.shared ? this.shared.failure(id) : "Shared inline image bridge unavailable."; }
-+	async release(id: string): Promise<void> { this.images.delete(id); this.terminalIds.delete(id); if (this.shared) await this.shared.release(id); }
-+	async reset(): Promise<void> { this.images.clear(); this.terminalIds.clear(); if (this.shared) await this.shared.reset(); }
- 	private id(logicalId: string): number {
- 		const existing = this.terminalIds.get(logicalId);
- 		if (existing) return existing;
-@@ -72,6 +76,7 @@ export class PreviewRuntime {
- 		const image = await this.loader(path, { cwd, fs: this.fs });
- 		this.images.set(logicalId, image);
- 		this.id(logicalId);
-+		if (this.shared) await this.shared.prepare(logicalId, { source: image.path, hash: image.hash, width: image.width, height: image.height, png: image.png });
- 		return {
- 			path: image.path,
- 			hash: image.hash,
-@@ -88,6 +93,7 @@ export class PreviewRuntime {
- 		const image = await this.byteLoader(data, mimeType, path);
- 		this.images.set(logicalId, image);
- 		this.id(logicalId);
-+		if (this.shared) await this.shared.prepare(logicalId, { source: image.path, hash: image.hash, width: image.width, height: image.height, png: image.png });
- 		return {
- 			path: image.path,
- 			hash: image.hash,
-@@ -115,42 +121,17 @@ export class PreviewRuntime {
- 				else {
- 					this.images.set(entry.logicalId, image);
- 					this.id(entry.logicalId);
-+					if (this.shared) await this.shared.prepare(entry.logicalId, { source: image.path, hash: image.hash, width: image.width, height: image.height, png: image.png });
- 				}
- 			} catch {
- 				state.set(entry.logicalId, "Image is missing or no longer readable.");
- 			}
- 		return state;
++
++	/** Bind after either extension factory loads and prepare every retained recent image exactly once. */
++	async setShared(handle: SharedGraphicsHandle): Promise<void> {
++		this.shared = handle;
++		this.sharedErrors.clear();
++		for (const [logicalId, image] of this.images) {
++			try {
++				await handle.prepare(logicalId, this.sharedImage(image));
++			} catch (error) {
++				this.sharedErrors.set(logicalId, error instanceof Error ? error.message : String(error));
++			}
++		}
++	}
++
++	sharedFailure(logicalId: string): string | undefined {
++		return this.sharedErrors.get(logicalId)
++			?? (this.shared ? this.shared.failure(logicalId) : "Shared inline image bridge unavailable.");
  	}
--	emitPlaceholder(logicalId: string, availableWidth: number): string[] {
+-	private id(logicalId: string): number {
+-		const existing = this.terminalIds.get(logicalId);
+-		if (existing) return existing;
+-		let id = this.allocate() >>> 0;
+-		while (!id || [...this.terminalIds.values()].includes(id)) id = this.allocate() >>> 0;
+-		this.terminalIds.set(logicalId, id);
+-		return id;
++
++	async release(logicalId: string): Promise<void> {
++		if (this.shared) await this.shared.release(logicalId);
++		this.images.delete(logicalId);
++		this.sharedErrors.delete(logicalId);
+ 	}
+-	terminalId(logicalId: string): number | undefined {
+-		return this.terminalIds.get(logicalId);
++
++	async reset(): Promise<void> {
++		if (this.shared) await this.shared.reset();
++		this.images.clear();
++		this.sharedErrors.clear();
+ 	}
++
+ 	async add(path: string, logicalId: string, cwd?: string): Promise<PreviewEntry> {
+ 		const image = await this.loader(path, { cwd, fs: this.fs });
+-		this.images.set(logicalId, image);
+-		this.id(logicalId);
+-		return {
+-			path: image.path,
+-			hash: image.hash,
+-			originalMime: image.originalMime,
+-			width: image.width,
+-			height: image.height,
+-			logicalId,
+-		};
++		await this.admit(logicalId, image);
++		return this.entry(logicalId, image);
+ 	}
+-	get(id: string): LoadedImage | undefined {
+-		return this.images.get(id);
++
++	get(logicalId: string): LoadedImage | undefined {
++		return this.images.get(logicalId);
+ 	}
++
+ 	async addBytes(data: string, mimeType: string, logicalId: string, path = "attached image"): Promise<PreviewEntry> {
+ 		const image = await this.byteLoader(data, mimeType, path);
+-		this.images.set(logicalId, image);
+-		this.id(logicalId);
+-		return {
+-			path: image.path,
+-			hash: image.hash,
+-			originalMime: image.originalMime,
+-			width: image.width,
+-			height: image.height,
+-			logicalId,
+-		};
++		await this.admit(logicalId, image);
++		return this.entry(logicalId, image);
+ 	}
++
+ 	async rehydrate(
+ 		entries: PreviewEntry[],
+ 		cwd?: string,
+ 		resolve?: (entry: PreviewEntry) => { data: string; mimeType: string } | undefined,
+ 	): Promise<Map<string, string>> {
+-		this.images.clear();
+-		const state = new Map<string, string>();
+-		for (const entry of entries)
++		await this.reset();
++		const status = new Map<string, string>();
++		for (const entry of entries) {
+ 			try {
+ 				const source = entry.origin ? resolve?.(entry) : undefined;
+ 				if (entry.origin && !source) throw new Error("origin unavailable");
+ 				const image = source
+ 					? await this.byteLoader(source.data, source.mimeType, entry.path)
+ 					: await this.loader(entry.path, { cwd, fs: this.fs });
+-				if (image.hash !== entry.hash) state.set(entry.logicalId, "Image changed since this preview was saved.");
+-				else {
+-					this.images.set(entry.logicalId, image);
+-					this.id(entry.logicalId);
+-				}
+-			} catch {
+-				state.set(entry.logicalId, "Image is missing or no longer readable.");
++				if (image.hash !== entry.hash) status.set(entry.logicalId, "Image changed since this preview was saved.");
++				else await this.admit(entry.logicalId, image);
++			} catch (error) {
++				status.set(entry.logicalId, error instanceof Error && error.message !== "origin unavailable"
++					? error.message
++					: "Image is missing or no longer readable.");
+ 			}
+-		return state;
++		}
++		return status;
+ 	}
++
+ 	emitPlaceholder(logicalId: string, availableWidth: number): string[] {
 -		const image = this.images.get(logicalId);
 -		if (!image) return [];
 -		const size = geometry(image.width, image.height, Math.max(1, Math.min(80, availableWidth - 2)));
@@ -204,9 +469,26 @@ index 73949b5..2069ec7 100644
 -			if (previousGeometry !== undefined) this.output.write(deletePlacement(id, tmuxMode));
 -			this.output.write(placement(id, size.columns, size.rows, tmuxMode));
 -			this.placements.set(id, placementGeometry);
--		}
++		return this.shared ? this.shared.render(logicalId, availableWidth) : [];
++	}
++
++	async clear(): Promise<void> {
++		await this.reset();
++	}
++
++	private async admit(logicalId: string, image: LoadedImage): Promise<void> {
++		this.images.set(logicalId, image);
++		this.sharedErrors.delete(logicalId);
++		if (!this.shared) return;
++		try {
++			await this.shared.prepare(logicalId, this.sharedImage(image));
++		} catch (error) {
++			this.images.delete(logicalId);
++			try { await this.shared.release(logicalId); } catch { /* Preserve the preparation error. */ }
++			throw error;
+ 		}
 -		return grid(size.columns, size.rows, id);
--	}
+ 	}
 -	clear(): void {
 -		const kitty = this.mode() === "kitty-placeholder" || (this.mode() === "image" && this.protocol === "kitty");
 -		if (kitty) for (const id of this.terminalIds.values()) this.output.write(deleteImage(id, isTmux(this.env)));
@@ -214,11 +496,21 @@ index 73949b5..2069ec7 100644
 -		this.terminalIds.clear();
 -		this.uploaded.clear();
 -		this.placements.clear();
--	}
-+	emitPlaceholder(logicalId: string, availableWidth: number): string[] { return this.shared ? this.shared.render(logicalId, availableWidth) : []; }
 +
-+	async clear(): Promise<void> { await this.reset(); }
-+
- 	activeIds(): number[] {
- 		return [...this.terminalIds.values()];
++	private sharedImage(image: LoadedImage) {
++		return { source: image.path, hash: image.hash, width: image.width, height: image.height, png: image.png };
  	}
+-	activeIds(): number[] {
+-		return [...this.terminalIds.values()];
++
++	private entry(logicalId: string, image: LoadedImage): PreviewEntry {
++		return {
++			path: image.path,
++			hash: image.hash,
++			originalMime: image.originalMime,
++			width: image.width,
++			height: image.height,
++			logicalId,
++		};
+ 	}
+ }
