@@ -2,6 +2,33 @@
 
 为 Clash Verge Rev 生成本地 DNS、TUN 和路由增强配置，并配置 GitHub SSH。脚本写入的文件需要被 Verge 合并、加载后才会生效。
 
+## 本地路由覆盖（推荐的日常维护入口）
+
+路由的唯一可编辑来源是两个版本控制文件：
+
+```text
+rules/direct.yaml   # 只能写 DIRECT 目标
+rules/proxy.yaml    # 只能写当前订阅已有的代理组目标；不写节点
+```
+
+两者都使用严格的 `version: 1`、`pre: [...]`、`post: [...]` YAML 结构。规则是完整的 Mihomo 规则字符串，含明确的策略目标；例如 `"DOMAIN,example.com,DIRECT"` 或 `"DOMAIN,example.com,Proxy"`。解析器使用 [PyYAML](rules/requirements.txt)，而不是用 shell 文本匹配猜 YAML；在可编辑环境中先安装 `python3 -m pip install -r clash-verge/rules/requirements.txt`（系统包 `python3-yaml` 也可以）。
+
+```bash
+# 以下两项不读取 Clash Verge 的 profiles registry，因此可在任意 cwd 预检
+./clash-verge/tun-fix.sh rules check
+./clash-verge/tun-fix.sh rules render > /tmp/Script.js
+
+# 仅替换 profiles.yaml 中已登记的全局 Script.js；不改 Merge、DNS、TUN、SSH、
+# 订阅级扩展、运行时 YAML，也不重载核心。
+./clash-verge/tun-fix.sh rules apply
+```
+
+`apply` 先渲染候选 Script，再检查已登记的全局 Script 目标；未登记时会报错而不会写一个 Verge 永远不会加载的孤儿文件。已有非本工具脚本会要求确认并备份。完成后在 Verge GUI 中重载当前订阅/配置。`clash-verge.yaml` 是 Verge 生成的运行时输出，不能手改，也不是这些 YAML 的来源。
+
+Mihomo 是**首条命中**，不会因为 `DOMAIN` 比 `DOMAIN-SUFFIX` 更具体而自动获胜。`pre` 的顺序为 `direct.pre`、`proxy.pre`，并移到订阅规则前；相同的订阅条目按完整规范化规则串去重并提升。订阅原有规则在第一个 `MATCH` 前保持原序；缺失的 `direct.post`、`proxy.post` 插入在该 `MATCH` 前，已有的相同 `post` 条目保留原位置。这样 `post` 是订阅规则的补充，不会覆盖订阅已有例外。生成器拒绝不存在的代理组、缺少 `MATCH`、未知 YAML 字段、同一选择器相反目标，以及同一阶段具有相反目标的可证明域名重叠（`DOMAIN`/`DOMAIN-SUFFIX`、后缀嵌套）。它不会猜测规则特异性或重排订阅。
+
+迁移说明：旧脚本中六条 `forceTop` 规则现在在 `direct.pre`；其余原有本地 DIRECT 规则都在 `direct.post`。每条匹配器、目标和 `no-resolve` 选项均保留。宽泛补充规则现在会让位于订阅中即使没有完全相同字符串的更早例外；这是为消除旧版“全部 prepend”遮蔽订阅例外的有意语义变化。
+
 ## 只修 GitHub SSH
 
 如果只想在本机拉取 GitHub 仓库，不必运行会修改多个站点路由的“一键优化”。需要配合两处设置。

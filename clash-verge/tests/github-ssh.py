@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Offline GitHub SSH/routing regression checks; never uses the real HOME."""
+"""Offline regression checks for the local route-source flow; never uses real HOME."""
 from pathlib import Path
 import json
 import os
@@ -8,7 +8,9 @@ import shutil
 import subprocess
 import tempfile
 
-SOURCE = Path(__file__).resolve().parents[1] / "tun-fix.sh"
+ROOT = Path(__file__).resolve().parents[2]
+CLASH = ROOT / "clash-verge"
+SOURCE = CLASH / "tun-fix.sh"
 
 
 def check(condition, message):
@@ -16,113 +18,186 @@ def check(condition, message):
         raise AssertionError(message)
 
 
-def main():
-    for program in ("bash", "ssh", "node"):
-        check(shutil.which(program), f"missing prerequisite: {program}")
-    real_ssh = shutil.which("ssh")
-    source = SOURCE.read_text()
-    check(source.endswith("\nmain\n"), "review entrypoint extraction after source changes")
+def run(command, *, env, cwd, expected=0, input=None):
+    result = subprocess.run(command, cwd=cwd, env=env, text=True, input=input,
+                            capture_output=True, check=False)
+    check(result.returncode == expected,
+          f"unexpected rc {result.returncode}, expected {expected}:\n"
+          f"$ {' '.join(command)}\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}")
+    return result
 
-    # tempfile owns this exact directory. Do not use shell HOME as a cleanup target.
-    with tempfile.TemporaryDirectory(prefix="clash-github-check-") as td:
+
+def write_rules(directory, direct, proxy):
+    directory.mkdir()
+    shutil.copy(CLASH / "rules" / "render-rules.py", directory / "render-rules.py")
+    (directory / "direct.yaml").write_text(direct)
+    (directory / "proxy.yaml").write_text(proxy)
+
+
+def run_js(script, config, *, expected=0):
+    program = r'''
+const fs = require('node:fs'), vm = require('node:vm');
+const sandbox = {}; vm.createContext(sandbox);
+vm.runInContext(fs.readFileSync(process.argv[1], 'utf8'), sandbox);
+const config = JSON.parse(process.argv[2]); const before = JSON.stringify(config);
+try {
+  const result = sandbox.main(config);
+  console.log(JSON.stringify({result: result.rules, changed: JSON.stringify(config) !== before}));
+} catch (error) {
+  console.error(JSON.stringify({error: error.message, changed: JSON.stringify(config) !== before}));
+  process.exit(7);
+}
+'''
+    result = subprocess.run(["node", "-e", program, str(script), json.dumps(config)],
+                            text=True, capture_output=True, check=False)
+    check((0 if result.returncode == 0 else 1) == expected,
+          f"JS rc={result.returncode}, expected={expected}: {result.stderr}")
+    return result
+
+
+def main():
+    for program in ("bash", "ssh", "node", "python3"):
+        check(shutil.which(program), f"missing prerequisite: {program}")
+    run(["python3", "-c", "import yaml"], env=os.environ, cwd=ROOT)
+    real_ssh = shutil.which("ssh")
+
+    with tempfile.TemporaryDirectory(prefix="clash-rules-check-") as td:
         root = Path(td)
         home = root / "home"
-        clash = home / ".local/share/io.github.clash-verge-rev.clash-verge-rev"
-        profiles = clash / "profiles"
+        clash_state = home / ".local/share/io.github.clash-verge-rev.clash-verge-rev"
+        profiles = clash_state / "profiles"
         profiles.mkdir(parents=True)
-        (clash / "profiles.yaml").write_text(
-            "items:\n- uid: Merge\n  type: merge\n  file: Merge.yaml\n"
-            "- uid: Script\n  type: script\n  file: Script.js\n"
+        rules = root / "rules"
+        direct = '''version: 1
+pre:
+  - "DOMAIN,force.example,DIRECT"
+post:
+  - "DOMAIN-SUFFIX,cn,DIRECT"
+  - "DOMAIN,local.example,DIRECT"
+'''
+        proxy = '''version: 1
+pre:
+  - "DOMAIN,proxy.example,Proxy"
+post:
+  - "DOMAIN,late.example,Proxy"
+'''
+        write_rules(rules, direct, proxy)
+        (clash_state / "profiles.yaml").write_text(
+            "items:\n- uid: Script\n  type: script\n  file: Script.js\n"
         )
+        # Rules-only apply must leave unrelated local/runtime artifacts intact.
+        merge_sentinel = profiles / "Merge.yaml"
+        runtime_sentinel = clash_state / "clash-verge.yaml"
+        ssh_sentinel = home / ".ssh" / "config"
+        merge_sentinel.write_text("merge stays untouched\n")
+        runtime_sentinel.write_text("runtime stays untouched\n")
+        ssh_sentinel.parent.mkdir()
+        ssh_sentinel.write_text("Host preserved\n")
+        env = dict(os.environ, HOME=str(home), RULES_DIR=str(rules))
+
+        # check/render must work from arbitrary cwd without profiles; no state writes.
+        no_profile_env = dict(env, HOME=str(root / "no-profile"))
+        checked = run(["bash", str(SOURCE), "rules", "check"], env=no_profile_env, cwd=root)
+        check("route sources valid: 5 rule(s)" in checked.stdout, "check did not read isolated sources")
+        rendered = run(["bash", str(SOURCE), "rules", "render"], env=no_profile_env, cwd=root).stdout
+        check(rendered.startswith("// Generated by tun-fix.sh from rules/"), "render has no generated ownership marker")
+        check(not (root / "no-profile").exists(), "read-only check/render wrote profile state")
+
+        # Apply targets only the registered global Script and is deterministic.
+        run(["bash", str(SOURCE), "rules", "apply"], env=env, cwd=root)
+        js_file = profiles / "Script.js"
+        check(merge_sentinel.read_text() == "merge stays untouched\n", "rules apply changed Merge")
+        check(runtime_sentinel.read_text() == "runtime stays untouched\n", "rules apply changed runtime YAML")
+        check(ssh_sentinel.read_text() == "Host preserved\n", "rules apply changed SSH config")
+        first = js_file.read_text()
+        run(["bash", str(SOURCE), "rules", "apply"], env=env, cwd=root)
+        check(js_file.read_text() == first, "repeat rules apply changed generated JS")
+
+        incoming = {
+            "proxy-groups": [{"name": "Proxy"}],
+            "rules": [
+                "DOMAIN-SUFFIX,example,DIRECT", "DOMAIN,force.example,DIRECT",
+                "DOMAIN,proxy.example,Proxy", "DOMAIN,subscription.cn,Proxy",
+                "DOMAIN-SUFFIX,cn,DIRECT", "MATCH,Proxy"
+            ],
+        }
+        ordered = json.loads(run_js(js_file, incoming).stdout)["result"]
+        check(ordered == [
+            "DOMAIN,force.example,DIRECT", "DOMAIN,proxy.example,Proxy",
+            "DOMAIN-SUFFIX,example,DIRECT", "DOMAIN,subscription.cn,Proxy",
+            "DOMAIN-SUFFIX,cn,DIRECT", "DOMAIN,local.example,DIRECT",
+            "DOMAIN,late.example,Proxy", "MATCH,Proxy"
+        ], f"unexpected first-match ordering: {ordered}")
+        check(ordered.count("MATCH,Proxy") == 1, "duplicate MATCH was created")
+
+        missing_group = run_js(js_file, {"proxy-groups": [], "rules": ["MATCH,Proxy"]}, expected=1)
+        check("missing group" in missing_group.stderr and not json.loads(missing_group.stderr)["changed"],
+              "missing proxy group did not fail before mutation")
+        no_match = run_js(js_file, {"proxy-groups": [{"name": "Proxy"}], "rules": []}, expected=1)
+        check("no MATCH" in no_match.stderr and not json.loads(no_match.stderr)["changed"],
+              "missing MATCH did not fail before mutation")
+
+        # Removing a source entry changes the next clean subscription rebuild.
+        (rules / "direct.yaml").write_text(direct.replace('  - "DOMAIN,local.example,DIRECT"\n', ""))
+        run(["bash", str(SOURCE), "rules", "apply"], env=env, cwd=root)
+        regenerated = js_file.read_text()
+        check("local.example" not in regenerated, "deleted local rule remained in regenerated script")
+        after_delete = json.loads(run_js(js_file, incoming).stdout)["result"]
+        check("DOMAIN,local.example,DIRECT" not in after_delete, "deleted rule was injected into clean base")
+
+        # Source failures cannot replace an existing extension.
+        stable = js_file.read_text()
+        (rules / "direct.yaml").write_text("version: 1\npre: [not-a-rule]\npost: []\n")
+        bad = run(["bash", str(SOURCE), "rules", "apply"], env=env, cwd=root, expected=1)
+        check("route source error" in bad.stderr, "bad YAML/source diagnostic missing")
+        check(js_file.read_text() == stable, "bad source mutated Script.js")
+        full_merge = root / "full-optimizer-merge.yaml"
+        full_merge.write_text("sentinel: unchanged\n")
+        run(["bash", "-c", 'source "$1"; optimize_all "$2"', "test", str(SOURCE), str(full_merge)],
+            env=env, cwd=root, expected=1)
+        check(full_merge.read_text() == "sentinel: unchanged\n",
+              "full optimizer wrote Merge before local source preflight")
+
+        # An unregistered target produces no orphan Script.js.
+        orphan_home = root / "orphan-home"
+        orphan_state = orphan_home / ".local/share/io.github.clash-verge-rev.clash-verge-rev"
+        (orphan_state / "profiles").mkdir(parents=True)
+        (orphan_state / "profiles.yaml").write_text("items: []\n")
+        orphan_env = dict(env, HOME=str(orphan_home))
+        run(["bash", str(SOURCE), "rules", "apply"], env=orphan_env, cwd=root, expected=1)
+        check(not (orphan_state / "profiles" / "Script.js").exists(), "unregistered apply wrote orphan Script.js")
+
+        # A foreign script requires confirmation and remains untouched when declined.
+        (rules / "direct.yaml").write_text(direct)
+        foreign = profiles / "Script.js"
+        foreign.write_text("// user-owned script\n")
+        run(["bash", str(SOURCE), "rules", "apply"], env=env, cwd=root, expected=1, input="n\n")
+        check(foreign.read_text() == "// user-owned script\n", "declined foreign replacement changed Script.js")
+
+        # Same-phase overlap and opposite target selector diagnostics are source errors.
+        (rules / "direct.yaml").write_text('version: 1\npre:\n  - "DOMAIN-SUFFIX,example.com,DIRECT"\npost: []\n')
+        (rules / "proxy.yaml").write_text('version: 1\npre:\n  - "DOMAIN,api.example.com,Proxy"\npost: []\n')
+        overlap = run(["bash", str(SOURCE), "rules", "check"], env=env, cwd=root, expected=1)
+        check("same-phase domain overlap" in overlap.stderr, "domain overlap was accepted")
+
+        # Keep the pre-existing GitHub SSH testable from the changed source entry.
         functions = root / "functions.sh"
-        functions.write_text(source[:-len("main\n")])
+        functions.write_text(SOURCE.read_text())
+        ssh_config = root / "ssh.config"
         bindir = root / "bin"
         bindir.mkdir()
-        ssh_config = root / "ssh.config"
         wrapper = bindir / "ssh"
-        wrapper.write_text(
-            "#!/bin/sh\n"
-            '[ "$1" = "-G" ] || { echo "network SSH forbidden in this test" >&2; exit 2; }\n'
-            f'exec {real_ssh} -F "$SSH_TEST_CONFIG" "$@"\n'
-        )
+        wrapper.write_text("#!/bin/sh\n[ \"$1\" = \"-G\" ] || exit 2\nexec " + real_ssh + " -F \"$SSH_TEST_CONFIG\" \"$@\"\n")
         wrapper.chmod(0o700)
-        env = dict(os.environ, HOME=str(home), SSH_TEST_CONFIG=str(ssh_config))
-        env["PATH"] = str(bindir) + os.pathsep + os.environ["PATH"]
-
-        def bash(body, expected=0):
-            result = subprocess.run(
-                ["bash", "-c", 'source "$1"; ' + body, "test", str(functions)],
-                cwd=root, env=env, text=True, capture_output=True, check=False,
-            )
-            check(result.returncode == expected,
-                  f"unexpected rc {result.returncode}, expected {expected}:\n"
-                  f"{result.stdout}\n{result.stderr}")
-            return result.stdout
-
-        generated = bash("github_ssh_block")
-        check("ProxyCommand" not in generated and "ProxyJump" not in generated,
-              "generator must not introduce a jump host")
+        ssh_env = dict(env, SSH_TEST_CONFIG=str(ssh_config), PATH=str(bindir) + os.pathsep + os.environ["PATH"])
+        generated = run(["bash", "-c", 'source "$1"; github_ssh_block', "test", str(functions)], env=ssh_env, cwd=root).stdout
         ssh_config.write_text(generated)
-        bash("verify_github_ssh_config")
-        parsed = subprocess.run(
-            [real_ssh, "-G", "-F", str(ssh_config), "github.com"],
-            text=True, capture_output=True, check=True,
-        ).stdout
-        for expected in ("hostname ssh.github.com\n", "port 443\n", "ipqos none none\n"):
-            check(expected in parsed, f"missing effective setting: {expected.strip()}")
-        for wrong_setting in ("IPQoS throughput", "ProxyCommand false", "ProxyJump jump.invalid"):
-            ssh_config.write_text("Host github.com\n    " + wrong_setting + "\n" + generated)
-            bash("verify_github_ssh_config", expected=1)
-        ssh_config.write_text(generated)
+        run(["bash", "-c", 'source "$1"; verify_github_ssh_config', "test", str(functions)], env=ssh_env, cwd=root)
+        parsed = subprocess.run([real_ssh, "-G", "-F", str(ssh_config), "github.com"], text=True, capture_output=True, check=True).stdout
+        check("hostname ssh.github.com\n" in parsed and "ipqos none none\n" in parsed,
+              "GitHub SSH policy regressed while adding route command entry")
 
-        bash("update_direct_rules")
-        js_file = profiles / "Script.js"
-        js = js_file.read_text()
-        bash("update_direct_rules")
-        check(js_file.read_text() == js, "rule generator is not repeatable")
-        node_test = r'''
-const fs = require('node:fs');
-const vm = require('node:vm');
-const sandbox = {};
-vm.createContext(sandbox);
-vm.runInContext(fs.readFileSync(process.argv[1], 'utf8'), sandbox);
-const rule = 'DOMAIN,ssh.github.com,DIRECT';
-const original = [
-  'DOMAIN-SUFFIX,github.com,Proxy', rule,
-  'DOMAIN-SUFFIX,services.googleapis.cn,Proxy',
-  'DOMAIN-SUFFIX,cn,DIRECT', 'GEOIP,CN,DIRECT,no-resolve', 'MATCH,Proxy'
-];
-const once = sandbox.main({rules: original.slice()}).rules;
-if (once[0] !== rule || once.filter(x => x === rule).length !== 1)
-  throw Error('GitHub SSH exception must be first and unique');
-const retained = once.filter(x => original.includes(x) && x !== rule);
-if (JSON.stringify(retained) !== JSON.stringify(original.filter(x => x !== rule)))
-  throw Error('existing unrelated rules changed order or disappeared');
-const twice = sandbox.main({rules: once.slice()}).rules;
-if (JSON.stringify(once) !== JSON.stringify(twice)) throw Error('merge is not idempotent');
-console.log(JSON.stringify({first: once[0], idempotent: true}));
-'''
-        result = subprocess.run(
-            ["node", "-e", node_test, str(js_file)],
-            text=True, capture_output=True, check=True, env=env,
-        )
-        check(json.loads(result.stdout)["idempotent"], "rule-merge check did not complete")
-
-        dns = bash("fake_ip_filter_block")
-        filters = re.findall(r"^\s*- '([^']+)'", dns, re.M)
-        check("*.github.com" not in filters and "ssh.github.com" not in filters,
-              "filter must preserve GitHub SSH domain mapping")
-        check("github.com" in filters, "unrelated exact web-domain filter changed")
-        merge = profiles / "Merge.yaml"
-        merge.write_text("dns:\n" + dns + "\n" + bash("tun_block") + "\n" + bash("sniffer_block"))
-        bash('verify_merge_yaml "$CLASH_DIR/profiles/Merge.yaml"')
-        original_merge = merge.read_text()
-        for bad_filter in ("*.github.com", "ssh.github.com"):
-            merge.write_text(original_merge.replace("  fake-ip-filter:\n",
-                "  fake-ip-filter:\n    - '" + bad_filter + "'\n", 1))
-            bash('verify_merge_yaml "$CLASH_DIR/profiles/Merge.yaml"', expected=1)
-
-    print("PASS: GitHub SSH QoS/no-jump policy, verifier rejection, rule ordering/idempotence, DNS mapping guard")
+    print("PASS: isolated YAML check/render/apply, generated first-match ordering, clean regeneration, diagnostics, ownership, and GitHub SSH")
 
 
 if __name__ == "__main__":

@@ -1,0 +1,10 @@
+# Local proxy-route overrides. Targets must name a proxy group supplied by the
+# current subscription; node definitions never belong here.
+version: 1
+pre: []
+post: []
+# Examples (keep disabled until the corresponding group exists in every profile):
+# pre:
+#   - "DOMAIN,example.com,Proxy"
+# post:
+#   - "DOMAIN-SUFFIX,example.net,Proxy"
