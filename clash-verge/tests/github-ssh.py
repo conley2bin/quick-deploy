@@ -3,6 +3,7 @@
 from pathlib import Path
 import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -32,6 +33,56 @@ def write_rules(directory, direct, proxy):
     shutil.copy(CLASH / "rules" / "render-rules.py", directory / "render-rules.py")
     (directory / "direct.yaml").write_text(direct)
     (directory / "proxy.yaml").write_text(proxy)
+
+
+def optimizer_shell(source, merge_file, extra=""):
+    stubs = r'''
+clear_subscription_merge(){ :; }
+remove_prepend_rules(){ :; }
+update_fake_ip_filter(){ :; }
+update_tun_config(){ :; }
+update_sniffer_config(){ :; }
+verify_merge_yaml(){ :; }
+verify_direct_rules(){ :; }
+verify_sniffer_live(){ :; }
+verify_tun_routes(){ :; }
+'''
+    return ["bash", "-c", 'source "$1"; ' + stubs + extra + '\noptimize_all "$2"',
+            "test", str(source), str(merge_file)]
+
+
+def assert_optimizer_preflight_failure(root, rules, label, registry, *, profile_dir=True, extra="", input=None):
+    home = root / f"optimizer-{label}-home"
+    state = home / ".local/share/io.github.clash-verge-rev.clash-verge-rev"
+    state.mkdir(parents=True)
+    profiles = state / "profiles"
+    if profile_dir:
+        profiles.mkdir()
+        script = profiles / "Script.js"
+        script.write_text("// foreign optimizer sentinel\n")
+        subscription = profiles / "subscription-merge.yaml"
+        subscription.write_text("subscription sentinel\n")
+    else:
+        script = profiles / "Script.js"
+        subscription = state / "subscription-merge.yaml"
+        subscription.write_text("subscription sentinel\n")
+    (state / "profiles.yaml").write_text(registry)
+    merge = state / "merge.yaml"
+    merge.write_text("merge sentinel\n")
+    before_inventory = {path.name: path.read_bytes() for path in profiles.glob("*.backup.*")} if profiles.exists() else {}
+    env = dict(os.environ, HOME=str(home), RULES_DIR=str(rules))
+    result = run(optimizer_shell(SOURCE, merge, extra), env=env, cwd=root, expected=1, input=input)
+    check(merge.read_text() == "merge sentinel\n" and subscription.read_text() == "subscription sentinel\n",
+          f"optimizer {label} mutated Merge/subscription before Script preparation")
+    if profile_dir:
+        check(script.read_text() == "// foreign optimizer sentinel\n",
+              f"optimizer {label} mutated Script before preparation completed")
+        check(not list(profiles.glob(".Script.js.candidate.*")), f"optimizer {label} left candidate")
+        after_inventory = {path.name: path.read_bytes() for path in profiles.glob("*.backup.*")}
+        check(after_inventory == before_inventory, f"optimizer {label} changed backup inventory")
+    else:
+        check(not profiles.exists(), "missing target directory was created during failed optimizer preflight")
+    return result
 
 
 def host_wrapped_js(script, config):
@@ -212,6 +263,42 @@ post:
         check(len(backups) >= 2 and any(backup.read_text() == "// foreign script\n" for backup in backups),
               "rapid applies overwrote the foreign-script backup")
         check(not list(profiles.glob(".Script.js.candidate.*")), "failed/finished apply left candidate files")
+        check(all(re.fullmatch(r"Script\.js\.backup\.\d{8}_\d{6}\.[A-Za-z0-9]+", backup.name) for backup in backups),
+              "Script backup no longer has the backup-menu timestamp prefix")
+        listed_backups = run(["bash", "-c", 'source "$1"; get_backup_files; list_backups', "test", str(SOURCE)],
+                             env=env, cwd=root).stdout
+        check(all(backup.name in listed_backups for backup in backups) and "备份时间" in listed_backups,
+              "backup menu cannot discover/display collision-free Script backups")
+
+        # Full optimizer must prepare every Script-specific condition before it
+        # reaches its Merge backup/clear/rewrite calls. Mutating helpers are stubbed.
+        assert_optimizer_preflight_failure(root, rules, "null",
+            "items:\n- uid: Script\n  type: script\n  file: null\n")
+        assert_optimizer_preflight_failure(root, rules, "absent", "items: []\n")
+        assert_optimizer_preflight_failure(root, rules, "wrong-type",
+            "items:\n- uid: Script\n  type: merge\n  file: Script.js\n")
+        assert_optimizer_preflight_failure(root, rules, "unsafe",
+            "items:\n- uid: Script\n  type: script\n  file: ../Script.js\n")
+        assert_optimizer_preflight_failure(root, rules, "missing-directory",
+            "items:\n- uid: Script\n  type: script\n  file: Script.js\n", profile_dir=False)
+        assert_optimizer_preflight_failure(root, rules, "renderer-failure",
+            "items:\n- uid: Script\n  type: script\n  file: Script.js\n",
+            extra="render_route_script(){ return 1; }")
+        assert_optimizer_preflight_failure(root, rules, "foreign-declined",
+            "items:\n- uid: Script\n  type: script\n  file: Script.js\n", input="n\n")
+
+        success_home = root / "optimizer-success-home"
+        success_state = success_home / ".local/share/io.github.clash-verge-rev.clash-verge-rev"
+        success_profiles = success_state / "profiles"
+        success_profiles.mkdir(parents=True)
+        (success_state / "profiles.yaml").write_text("items:\n- uid: Script\n  type: script\n  file: Script.js\n")
+        success_merge = success_state / "merge.yaml"
+        success_merge.write_text("merge sentinel\n")
+        success_env = dict(os.environ, HOME=str(success_home), RULES_DIR=str(rules))
+        run(optimizer_shell(SOURCE, success_merge), env=success_env, cwd=root)
+        check((success_profiles / "Script.js").read_text().startswith("// Generated by tun-fix.sh") and
+              not list(success_profiles.glob(".Script.js.candidate.*")),
+              "stubbed optimizer success did not consume its preflight candidate")
 
         # The pre-existing GitHub SSH generator remains callable from the new CLI source.
         ssh_block = run(["bash", "-c", 'source "$1"; github_ssh_block', "test", str(SOURCE)], env=env, cwd=root).stdout
@@ -219,7 +306,7 @@ post:
               "ProxyCommand" not in ssh_block and "ProxyJump" not in ssh_block,
               "GitHub SSH no-jump/QoS policy regressed")
 
-    print("PASS: source grammar, YAML registry/migration preflight, host-faithful guard candidates, real Mihomo validation, atomic backups, ordering, and isolated scope")
+    print("PASS: source grammar, YAML registry/migration preflight, host-faithful guard candidates, real Mihomo validation, optimizer no-mutation preparation, timestamped atomic backups, ordering, and isolated scope")
 
 
 if __name__ == "__main__":
