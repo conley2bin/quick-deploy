@@ -103,6 +103,7 @@ export class TerminalImages {
   private viewerManaged = false;
   private viewerReady = true;
   private viewerEpoch = "legacy";
+  private viewerRevision = 0;
   private viewerReason = "";
   private viewerReceivers: readonly string[] = [];
 
@@ -148,6 +149,7 @@ export class TerminalImages {
     if (!this.viewerManaged) return;
     this.viewerReady = false;
     this.viewerEpoch = "paused";
+    this.viewerRevision++;
     this.viewerReason = reason;
     this.viewerReceivers = [];
   }
@@ -158,6 +160,7 @@ export class TerminalImages {
     this.viewerEpoch = snapshot.epoch;
     this.viewerReason = snapshot.reason;
     this.viewerReceivers = snapshot.receivers;
+    if (changed) this.viewerRevision++;
 
     if (snapshot.attached) {
       const attached = new Set(snapshot.attached);
@@ -233,8 +236,9 @@ export class TerminalImages {
         continue;
       }
       const epoch = this.viewerEpoch;
+      const revision = this.viewerRevision;
       const targets = receivers.filter((identity) => !image.sent.has(identity));
-      const operation = this.upload(logicalId, image, epoch, targets, catalog, wireBytes);
+      const operation = this.upload(logicalId, image, epoch, revision, targets, catalog, wireBytes);
       image.uploading = operation;
       try {
         await operation;
@@ -250,6 +254,7 @@ export class TerminalImages {
     logicalId: string,
     image: StoredImage,
     epoch: string,
+    revision: number,
     targets: readonly string[],
     catalog?: string,
     wireBytes?: number,
@@ -268,7 +273,7 @@ export class TerminalImages {
       image.terminalResource = true;
       await this.transport.ready(generation);
       if (this.images.get(logicalId) !== image || image.releasing) return;
-      if (this.viewerManaged && (!this.viewerReady || this.viewerEpoch !== epoch
+      if (this.viewerManaged && (!this.viewerReady || this.viewerEpoch !== epoch || this.viewerRevision !== revision
         || targets.some((identity) => !this.viewerReceivers.includes(identity)))) return;
       for (const identity of targets) image.sent.add(identity);
     } catch (error) {

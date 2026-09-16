@@ -187,6 +187,30 @@ test("orientation conversion and 16-bit PNG fidelity never downsample", async ()
   assert.deepEqual(loaded16.png, png16, "unoriented 16-bit PNG keeps exact source bytes and bit depth");
 });
 
+test("byte-exact PNG fast path rejects truncated pixel streams", async () => {
+  const source = await sharp(Buffer.alloc(12 * 6 * 4, 127), { raw: { width: 12, height: 6, channels: 4 } })
+    .png({ compressionLevel: 0 })
+    .toBuffer();
+  let offset = 8;
+  let idatData = -1;
+  let idatLength = 0;
+  while (offset + 12 <= source.length) {
+    const length = source.readUInt32BE(offset);
+    if (source.subarray(offset + 4, offset + 8).toString("ascii") === "IDAT") {
+      idatData = offset + 8;
+      idatLength = length;
+      break;
+    }
+    offset += length + 12;
+  }
+  assert.ok(idatData > 0 && idatLength > 1);
+  const truncated = source.subarray(0, idatData + Math.floor(idatLength / 2));
+  await assert.rejects(
+    loadImage(`data:image/png;base64,${truncated.toString("base64")}`, "/fixture"),
+    /invalid image content/u,
+  );
+});
+
 test("worst catalog deduplicates widths to 80 entries and remains within its metadata budget", async () => {
   const clock = new FakeClock();
   const sink = new CapturedSink(clock);

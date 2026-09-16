@@ -1,5 +1,5 @@
 diff --git a/extensions/index.ts b/extensions/index.ts
-index 6ccf227..bbd800a 100644
+index 6ccf227..c63818a 100644
 --- a/extensions/index.ts
 +++ b/extensions/index.ts
 @@ -1,25 +1,33 @@
@@ -10,21 +10,28 @@ index 6ccf227..bbd800a 100644
 -import { PreviewRuntime } from "../src/runtime.ts";
 +import { isBuiltinLocalRead, provenanceNotice, ReadOriginalTracker } from "../src/provenance.ts";
 +import { previewComponent, wrappedNotice } from "../src/renderer.ts";
-+import { PreviewRuntime, type RehydratedImageSource, type SharedGraphicsHandle } from "../src/runtime.ts";
++import { PreviewRuntime, type SharedGraphicsHandle } from "../src/runtime.ts";
  import { CLEAR_TYPE, type ClearEntry, ENTRY_TYPE, isPreview, type PreviewEntry } from "../src/transcript-entry.ts";
- 
+-
++
 +const MAX_RECENT_PREVIEWS = 16;
 +
  function branch(ctx: ExtensionContext): BranchEntry[] {
- 	return ctx.sessionManager.getBranch() as BranchEntry[];
+-	return ctx.sessionManager.getBranch() as BranchEntry[];
++	return ctx.sessionManager.getBranch() as BranchEntry[];
  }
 -function activeEntries(ctx: ExtensionContext): PreviewEntry[] {
 +function allEntries(ctx: ExtensionContext): PreviewEntry[] {
- 	const entries = branch(ctx);
- 	let latestClear = -1;
- 	entries.forEach((entry, index) => {
- 		if (entry.type === "custom" && entry.customType === CLEAR_TYPE) latestClear = index;
- 	});
+-	const entries = branch(ctx);
++	const entries = branch(ctx);
+-	let latestClear = -1;
++	let latestClear = -1;
+-	entries.forEach((entry, index) => {
++	entries.forEach((entry, index) => {
+-		if (entry.type === "custom" && entry.customType === CLEAR_TYPE) latestClear = index;
++		if (entry.type === "custom" && entry.customType === CLEAR_TYPE) latestClear = index;
+-	});
++	});
 -	return entries
 -		.slice(latestClear + 1)
 -		.flatMap((entry) =>
@@ -43,22 +50,31 @@ index 6ccf227..bbd800a 100644
 +	return typeof handle.prepare === "function" && typeof handle.render === "function" && typeof handle.failure === "function"
 +		&& typeof handle.release === "function" && typeof handle.reset === "function";
  }
- 
+-
++
  export function registerInlineImages(pi: ExtensionAPI, runtime = new PreviewRuntime()) {
-@@ -29,48 +37,79 @@ export function registerInlineImages(pi: ExtensionAPI, runtime = new PreviewRunt
- 	const pending = new Map<string, NonNullable<PreviewEntry["origin"]>>();
- 	let messageOrdinals = new WeakMap<object, number>();
- 	const reservedOrdinals = new Set<number>();
+@@ -29,48 +37,78 @@ export function registerInlineImages(pi: ExtensionAPI, runtime = new PreviewRunt
+-	const pending = new Map<string, NonNullable<PreviewEntry["origin"]>>();
++	const pending = new Map<string, NonNullable<PreviewEntry["origin"]>>();
+-	let messageOrdinals = new WeakMap<object, number>();
++	let messageOrdinals = new WeakMap<object, number>();
+-	const reservedOrdinals = new Set<number>();
++	const reservedOrdinals = new Set<number>();
 +	const provenance = new ReadOriginalTracker();
 +	const requestId = randomUUID();
 +	let rebuildRequest = false;
 +	const builtinLocalRead = () => isBuiltinLocalRead(pi.getAllTools());
 +
- 	function enqueue(operation: () => Promise<void>): Promise<void> {
- 		const next = serial.then(operation, operation);
- 		serial = next.catch(() => undefined);
- 		return next;
- 	}
+-	function enqueue(operation: () => Promise<void>): Promise<void> {
++	function enqueue(operation: () => Promise<void>): Promise<void> {
+-		const next = serial.then(operation, operation);
++		const next = serial.then(operation, operation);
+-		serial = next.catch(() => undefined);
++		serial = next.catch(() => undefined);
+-		return next;
++		return next;
+-	}
++	}
 +	const removeBridgeReply = pi.events.on("pi-inline-images:graphics-owner:reply", (value) => {
 +		const reply = value as { version?: unknown; owner?: unknown; requestId?: unknown; handle?: unknown };
 +		const handle = reply.handle;
@@ -69,14 +85,21 @@ index 6ccf227..bbd800a 100644
 +	const requestBridge = () => pi.events.emit("pi-inline-images:graphics-owner:request", { version: 1, owner: "read", requestId });
 +	requestBridge();
 +
- 	function invalidate(): number {
- 		generation++;
- 		pending.clear();
+-	function invalidate(): number {
++	function invalidate(): number {
+-		generation++;
++		generation++;
+-		pending.clear();
++		pending.clear();
 +		provenance.reset();
- 		messageOrdinals = new WeakMap();
- 		reservedOrdinals.clear();
- 		return generation;
- 	}
+-		messageOrdinals = new WeakMap();
++		messageOrdinals = new WeakMap();
+-		reservedOrdinals.clear();
++		reservedOrdinals.clear();
+-		return generation;
++		return generation;
+-	}
++	}
 +	async function evictOldest(ctx: ExtensionContext, force = false): Promise<boolean> {
 +		const active = activeEntries(ctx).filter((entry) => runtime.get(entry.logicalId));
 +		if (!active.length || (!force && active.length < MAX_RECENT_PREVIEWS)) return false;
@@ -88,68 +111,93 @@ index 6ccf227..bbd800a 100644
 +		return true;
 +	}
 +
- 	pi.registerEntryRenderer<PreviewEntry>(ENTRY_TYPE, (entry, _options, theme) => {
- 		const data = isPreview(entry.data) ? entry.data : undefined;
- 		return data
- 			? previewComponent(data, runtime, theme, stale.get(data.logicalId))
+-	pi.registerEntryRenderer<PreviewEntry>(ENTRY_TYPE, (entry, _options, theme) => {
++	pi.registerEntryRenderer<PreviewEntry>(ENTRY_TYPE, (entry, _options, theme) => {
+-		const data = isPreview(entry.data) ? entry.data : undefined;
++		const data = isPreview(entry.data) ? entry.data : undefined;
+-		return data
++		return data
+-			? previewComponent(data, runtime, theme, stale.get(data.logicalId))
++			? previewComponent(data, runtime, theme, stale.get(data.logicalId))
 -			: { render: () => ["[image] Invalid saved preview entry."], invalidate() {} };
 +			: wrappedNotice("[image] Invalid saved preview entry.");
- 	});
+-	});
++	});
 -	pi.registerEntryRenderer<ClearEntry>(CLEAR_TYPE, () => ({
 -		render: () => ["[image previews cleared]"],
 -		invalidate() {},
 -	}));
 +	pi.registerEntryRenderer<ClearEntry>(CLEAR_TYPE, () => wrappedNotice("[image previews cleared]"));
 +
- 	function rebuild(ctx: ExtensionContext, expected: number) {
- 		return enqueue(async () => {
- 			if (expected !== generation) return;
+-	function rebuild(ctx: ExtensionContext, expected: number) {
++	function rebuild(ctx: ExtensionContext, expected: number) {
+-		return enqueue(async () => {
++		return enqueue(async () => {
+-			if (expected !== generation) return;
++			if (expected !== generation) return;
 -			runtime.clear();
 -			const entries = activeEntries(ctx);
 -			const restored = await runtime.rehydrate(entries, ctx.cwd, (entry) => {
+-				const block = findOrigin(branch(ctx), entry);
+-				return block ? { data: block.data, mimeType: block.mimeType } : undefined;
 +			const all = allEntries(ctx);
 +			const entries = all.slice(-MAX_RECENT_PREVIEWS);
-+			const sources = new Map<string, RehydratedImageSource>();
-+			for (const entry of entries) {
- 				const block = findOrigin(branch(ctx), entry);
--				return block ? { data: block.data, mimeType: block.mimeType } : undefined;
++			const currentBranch = branch(ctx);
++			const restored = await runtime.rehydrate(entries, ctx.cwd, async (entry) => {
++				const block = findOrigin(currentBranch, entry);
++				if (!block) return undefined;
++				return entry.readProvenance
++					? provenance.restore(entry, block, builtinLocalRead())
++					: { data: block.data, mimeType: block.mimeType, path: entry.path };
 -			});
-+				if (!block) continue;
-+				sources.set(entry.logicalId, entry.readProvenance
-+					? await provenance.restore(entry, block, builtinLocalRead())
-+					: { data: block.data, mimeType: block.mimeType, path: entry.path });
-+			}
-+			const restored = await runtime.rehydrate(entries, ctx.cwd, (entry) => sources.get(entry.logicalId));
- 			if (expected !== generation) {
++			});
+-			if (expected !== generation) {
++			if (expected !== generation) {
 -				runtime.clear();
 +				await runtime.clear();
- 				return;
- 			}
+-				return;
++				return;
+-			}
++			}
 -			stale = restored;
 +			stale = new Map(all.slice(0, -MAX_RECENT_PREVIEWS).map((entry) => [entry.logicalId, "Expired from the recent preview cache."]));
 +			for (const [logicalId, reason] of restored) stale.set(logicalId, reason);
- 		});
- 	}
+-		});
++		});
+-	}
++	}
 +
- 	function automatic(message: unknown, ctx: ExtensionContext, expected: number) {
- 		return enqueue(async () => {
+-	function automatic(message: unknown, ctx: ExtensionContext, expected: number) {
++	function automatic(message: unknown, ctx: ExtensionContext, expected: number) {
+-		return enqueue(async () => {
++		return enqueue(async () => {
 -			if (expected !== generation || runtime.mode() !== "kitty-placeholder" || !message || typeof message !== "object")
 -				return;
 +			if (expected !== generation || !message || typeof message !== "object") return;
- 			const entries = branch(ctx);
- 			const persistedMessageCount = entries.filter((entry) => entry.type === "message").length;
- 			for (const ordinal of reservedOrdinals) if (ordinal < persistedMessageCount) reservedOrdinals.delete(ordinal);
-@@ -83,19 +122,32 @@ export function registerInlineImages(pi: ExtensionAPI, runtime = new PreviewRunt
- 			}
- 			for (const [token, origin] of pending) if (hasPersistedOrigin(entries, origin)) pending.delete(token);
- 			for (const { block, origin } of automaticBlocks(message, messageOrdinal)) {
+-			const entries = branch(ctx);
++			const entries = branch(ctx);
+-			const persistedMessageCount = entries.filter((entry) => entry.type === "message").length;
++			const persistedMessageCount = entries.filter((entry) => entry.type === "message").length;
+-			for (const ordinal of reservedOrdinals) if (ordinal < persistedMessageCount) reservedOrdinals.delete(ordinal);
++			for (const ordinal of reservedOrdinals) if (ordinal < persistedMessageCount) reservedOrdinals.delete(ordinal);
+@@ -83,19 +121,32 @@ export function registerInlineImages(pi: ExtensionAPI, runtime = new PreviewRunt
+-			}
++			}
+-			for (const [token, origin] of pending) if (hasPersistedOrigin(entries, origin)) pending.delete(token);
++			for (const [token, origin] of pending) if (hasPersistedOrigin(entries, origin)) pending.delete(token);
+-			for (const { block, origin } of automaticBlocks(message, messageOrdinal)) {
++			for (const { block, origin } of automaticBlocks(message, messageOrdinal)) {
 -				if (activeEntries(ctx).length >= 16) return;
- 				const token = originToken(origin);
- 				if (pending.has(token) || hasPersistedOrigin(entries, origin)) continue;
+-				const token = originToken(origin);
++				const token = originToken(origin);
+-				if (pending.has(token) || hasPersistedOrigin(entries, origin)) continue;
++				if (pending.has(token) || hasPersistedOrigin(entries, origin)) continue;
 +				await evictOldest(ctx);
- 				pending.set(token, origin);
+-				pending.set(token, origin);
++				pending.set(token, origin);
 +				const logicalId = randomUUID().replaceAll("-", "");
- 				try {
+-				try {
++				try {
 -					const logicalId = randomUUID().replaceAll("-", "");
 -					const entry = await runtime.addBytes(block.data, block.mimeType, logicalId, "attached image");
 +					const toolCallId = origin.key.startsWith("tool:") ? origin.key.slice(5) : undefined;
@@ -163,11 +211,14 @@ index 6ccf227..bbd800a 100644
 +						evidence?.status === "unverified" ? provenanceNotice(evidence.reason ?? "result-mismatch") : undefined,
 +						() => evictOldest(ctx, true),
 +					);
- 					if (expected !== generation) {
+-					if (expected !== generation) {
++					if (expected !== generation) {
 -						runtime.clear();
 +						await runtime.release(logicalId);
- 						return;
- 					}
+-						return;
++						return;
+-					}
++					}
 -					// message_end precedes persistence, so custom metadata intentionally comes first.
 -					pi.appendEntry<PreviewEntry>(ENTRY_TYPE, { ...entry, origin });
 +					pi.appendEntry<PreviewEntry>(ENTRY_TYPE, {
@@ -175,13 +226,19 @@ index 6ccf227..bbd800a 100644
 +						origin,
 +						readProvenance: evidence ? provenance.persist(evidence, entry) : undefined,
 +					});
- 				} catch {
- 					pending.delete(token);
- 					// Keep Pi's original image block and native/error rendering unchanged.
-@@ -103,15 +155,34 @@ export function registerInlineImages(pi: ExtensionAPI, runtime = new PreviewRunt
- 			}
- 		});
- 	}
+-				} catch {
++				} catch {
+-					pending.delete(token);
++					pending.delete(token);
+-					// Keep Pi's original image block and native/error rendering unchanged.
++					// Keep Pi's original image block and native/error rendering unchanged.
+@@ -103,15 +154,34 @@ export function registerInlineImages(pi: ExtensionAPI, runtime = new PreviewRunt
+-			}
++			}
+-		});
++		});
+-	}
++	}
 -	pi.on("session_start", async (_event, ctx) => rebuild(ctx, invalidate()));
 -	pi.on("session_tree", async (_event, ctx) => rebuild(ctx, invalidate()));
 +
@@ -205,54 +262,148 @@ index 6ccf227..bbd800a 100644
 +	};
 +	pi.on("session_start", async (_event, ctx) => rebuildEvent(ctx));
 +	pi.on("session_tree", async (_event, ctx) => rebuildEvent(ctx));
- 	pi.on("session_shutdown", async () => {
- 		const expected = invalidate();
+-	pi.on("session_shutdown", async () => {
++	pi.on("session_shutdown", async () => {
+-		const expected = invalidate();
++		const expected = invalidate();
 -		return enqueue(async () => {
 -			if (expected === generation) runtime.clear();
 -		});
 +		removeBridgeReply();
 +		return enqueue(async () => { if (expected === generation) await runtime.clear(); });
- 	});
- 	pi.on("message_end", async (event, ctx) => automatic(event.message, ctx, generation));
+-	});
++	});
+-	pi.on("message_end", async (event, ctx) => automatic(event.message, ctx, generation));
++	pi.on("message_end", async (event, ctx) => automatic(event.message, ctx, generation));
 +
- 	pi.registerCommand("image", {
- 		description: "Display a local image in the TUI without model context. Use /image clear to remove previews.",
- 		handler: async (args, ctx) => {
-@@ -119,7 +190,7 @@ export function registerInlineImages(pi: ExtensionAPI, runtime = new PreviewRunt
- 				const expected = invalidate();
- 				return enqueue(async () => {
- 					if (expected !== generation) return;
+-	pi.registerCommand("image", {
++	pi.registerCommand("image", {
+-		description: "Display a local image in the TUI without model context. Use /image clear to remove previews.",
++		description: "Display a local image in the TUI without model context. Use /image clear to remove previews.",
+-		handler: async (args, ctx) => {
++		handler: async (args, ctx) => {
+@@ -119,7 +189,7 @@ export function registerInlineImages(pi: ExtensionAPI, runtime = new PreviewRunt
+-				const expected = invalidate();
++				const expected = invalidate();
+-				return enqueue(async () => {
++				return enqueue(async () => {
+-					if (expected !== generation) return;
++					if (expected !== generation) return;
 -					runtime.clear();
 +					await runtime.clear();
- 					pi.appendEntry<ClearEntry>(CLEAR_TYPE, { marker: true });
- 					stale.clear();
- 				});
-@@ -127,14 +198,12 @@ export function registerInlineImages(pi: ExtensionAPI, runtime = new PreviewRunt
- 			const expected = generation;
- 			return enqueue(async () => {
- 				if (expected !== generation) return;
+-					pi.appendEntry<ClearEntry>(CLEAR_TYPE, { marker: true });
++					pi.appendEntry<ClearEntry>(CLEAR_TYPE, { marker: true });
+-					stale.clear();
++					stale.clear();
+-				});
++				});
+@@ -127,14 +197,12 @@ export function registerInlineImages(pi: ExtensionAPI, runtime = new PreviewRunt
+-			const expected = generation;
++			const expected = generation;
+-			return enqueue(async () => {
++			return enqueue(async () => {
+-				if (expected !== generation) return;
++				if (expected !== generation) return;
 -				if (activeEntries(ctx).length >= 16) {
 -					ctx.ui.notify("Image preview limit reached (16). Use /image clear before adding another image.", "error");
 -					return;
 -				}
 +				await evictOldest(ctx);
- 				try {
+-				try {
++				try {
 -					const entry = await runtime.add(args, randomUUID().replaceAll("-", ""), ctx.cwd);
 +					const logicalId = randomUUID().replaceAll("-", "");
 +					const entry = await runtime.add(args, logicalId, ctx.cwd, () => evictOldest(ctx, true));
- 					if (expected !== generation) {
+-					if (expected !== generation) {
++					if (expected !== generation) {
 -						runtime.clear();
 +						await runtime.release(logicalId);
- 						return;
- 					}
- 					pi.appendEntry<PreviewEntry>(ENTRY_TYPE, entry);
-@@ -145,6 +214,7 @@ export function registerInlineImages(pi: ExtensionAPI, runtime = new PreviewRunt
- 		},
- 	});
+-						return;
++						return;
+-					}
++					}
+-					pi.appendEntry<PreviewEntry>(ENTRY_TYPE, entry);
++					pi.appendEntry<PreviewEntry>(ENTRY_TYPE, entry);
+@@ -145,6 +213,7 @@ export function registerInlineImages(pi: ExtensionAPI, runtime = new PreviewRunt
+-		},
++		},
+-	});
++	});
  }
 +
  export default function inlineImages(pi: ExtensionAPI) {
- 	registerInlineImages(pi);
+-	registerInlineImages(pi);
++	registerInlineImages(pi);
+ }
+diff --git a/src/loader.ts b/src/loader.ts
+index 1427de7..09be8c0 100644
+--- a/src/loader.ts
++++ b/src/loader.ts
+@@ -6,6 +6,7 @@ import sharp from "sharp";
+-
++
+ export const MAX_INPUT_BYTES = 20 * 1024 * 1024;
+ export const MAX_PIXELS = 32 * 1024 * 1024;
++export const MAX_FULL_PNG_BYTES = 32 * 1024 * 1024;
+ export type OriginalMime = "image/png" | "image/jpeg" | "image/webp";
+ export interface LoadedImage {
+-	path: string;
++	path: string;
+@@ -38,24 +39,34 @@ function mime(format?: string): OriginalMime {
+ }
+ async function decodeImage(bytes: Buffer, path: string): Promise<LoadedImage> {
+-	try {
++	try {
+-		const metadata = await sharp(bytes, { limitInputPixels: MAX_PIXELS, failOn: "error" }).metadata();
+-		const width = metadata.width ?? 0,
+-			height = metadata.height ?? 0;
++		const options = { limitInputPixels: MAX_PIXELS, failOn: "error" as const };
++		const metadata = await sharp(bytes, options).metadata();
++		const width = metadata.autoOrient?.width ?? metadata.width ?? 0,
++			height = metadata.autoOrient?.height ?? metadata.height ?? 0;
+-		if (!width || !height) throw new Error("Image has no dimensions.");
++		if (!width || !height) throw new Error("Image has no dimensions.");
+-		if (width * height > MAX_PIXELS)
++		if (width * height > MAX_PIXELS)
+-			throw new Error(`Image is too large when decoded: ${width}×${height} exceeds 32 MP.`);
++			throw new Error(`Image is too large when decoded: ${width}×${height} exceeds 32 MP.`);
+-		const png = await sharp(bytes, { limitInputPixels: MAX_PIXELS, failOn: "error" }).rotate().png().toBuffer();
+-		const rotated = await sharp(png).metadata();
++		const originalMime = mime(metadata.format);
++		let png: Buffer;
++		if (metadata.format === "png" && (!metadata.orientation || metadata.orientation === 1)) {
++			await sharp(bytes, options).stats();
++			png = bytes;
++		} else {
++			const pipeline = sharp(bytes, options).autoOrient();
++			if (metadata.depth === "ushort") pipeline.toColourspace("rgb16");
++			png = await pipeline.png({ palette: false }).toBuffer();
++		}
++		if (png.length > MAX_FULL_PNG_BYTES) throw new Error("Full PNG exceeds the 32 MB limit.");
+-		return {
++		return {
+-			path,
++			path,
+-			hash: createHash("sha256").update(bytes).digest("hex"),
++			hash: createHash("sha256").update(bytes).digest("hex"),
+-			originalMime: mime(metadata.format),
+-			width: rotated.width ?? width,
+-			height: rotated.height ?? height,
++			originalMime,
++			width,
++			height,
+-			png,
++			png,
+-		};
++		};
+-	} catch (error) {
++	} catch (error) {
+-		if (error instanceof Error && /Unsupported|too large|no dimensions/u.test(error.message)) throw error;
++		if (error instanceof Error && /Unsupported|too large|no dimensions|Full PNG exceeds/u.test(error.message)) throw error;
+-		throw new Error(`Invalid image content: ${path}`);
++		throw new Error(`Invalid image content: ${path}`);
+-	}
++	}
  }
 diff --git a/src/provenance.ts b/src/provenance.ts
 new file mode 100644
@@ -645,9 +796,11 @@ index bfaaa84..b15aec4 100644
 +import { type Component, Text } from "@earendil-works/pi-tui";
  import type { PreviewRuntime } from "./runtime.ts";
  import type { PreviewEntry } from "./transcript-entry.ts";
- 
+-
++
  export function fallback(entry: PreviewEntry, reason?: string): string[] {
- 	return [`[image] ${reason ?? `${entry.originalMime} ${entry.width}×${entry.height}`}: ${entry.path}`];
+-	return [`[image] ${reason ?? `${entry.originalMime} ${entry.width}×${entry.height}`}: ${entry.path}`];
++	return [`[image] ${reason ?? `${entry.originalMime} ${entry.width}×${entry.height}`}: ${entry.path}`];
  }
 -function imageTheme(theme: unknown): ImageTheme {
 -	const candidate = theme as { fallbackColor?: unknown } | undefined;
@@ -667,11 +820,14 @@ index bfaaa84..b15aec4 100644
  }
 +
  export function previewComponent(
- 	entry: PreviewEntry,
- 	runtime: PreviewRuntime,
+-	entry: PreviewEntry,
++	entry: PreviewEntry,
+-	runtime: PreviewRuntime,
++	runtime: PreviewRuntime,
 -	theme: unknown,
 +	_theme: unknown,
- 	stale?: string,
+-	stale?: string,
++	stale?: string,
  ): Component {
 -	if (stale) return { render: () => fallback(entry, stale), invalidate() {} };
 -	const image = runtime.get(entry.logicalId);
@@ -698,16 +854,17 @@ index bfaaa84..b15aec4 100644
 +	};
  }
 diff --git a/src/runtime.ts b/src/runtime.ts
-index 73949b5..6f6e1cb 100644
+index 73949b5..7d77ad1 100644
 --- a/src/runtime.ts
 +++ b/src/runtime.ts
-@@ -1,157 +1,199 @@
+@@ -1,157 +1,198 @@
 -import { allocateImageId, getCapabilities, getCellDimensions } from "@earendil-works/pi-tui";
 -import { type Environment, isTmux, type RenderMode, renderMode, type TmuxProbe } from "./capabilities.ts";
 -import { deleteImage, deletePlacement, grid, placement, type Sink, upload } from "./kitty-placeholder.ts";
  import { type FileOps, type LoadedImage, loadImage, loadImageBytes } from "./loader.ts";
  import type { PreviewEntry } from "./transcript-entry.ts";
- 
+-
++
 +const MAX_READ_PNG_BYTES = 64 * 1024 * 1024;
 +
 +export interface SharedGraphicsHandle {
@@ -720,9 +877,12 @@ index 73949b5..6f6e1cb 100644
  export interface RuntimeDeps {
 -	env?: Environment;
 -	output?: Sink;
- 	loader?: typeof loadImage;
- 	byteLoader?: typeof loadImageBytes;
- 	fs?: FileOps;
+-	loader?: typeof loadImage;
++	loader?: typeof loadImage;
+-	byteLoader?: typeof loadImageBytes;
++	byteLoader?: typeof loadImageBytes;
+-	fs?: FileOps;
++	fs?: FileOps;
 -	/** Test/runtime override for Pi's detected image protocol. */
 -	imageProtocol?: "kitty" | "iterm2" | null;
 -	allocateImageId?: () => number;
@@ -756,14 +916,18 @@ index 73949b5..6f6e1cb 100644
  export class PreviewRuntime {
 -	private readonly env: Environment;
 -	private readonly output: Sink;
- 	private readonly loader: typeof loadImage;
- 	private readonly byteLoader: typeof loadImageBytes;
- 	private readonly fs?: FileOps;
+-	private readonly loader: typeof loadImage;
++	private readonly loader: typeof loadImage;
+-	private readonly byteLoader: typeof loadImageBytes;
++	private readonly byteLoader: typeof loadImageBytes;
+-	private readonly fs?: FileOps;
++	private readonly fs?: FileOps;
 -	private readonly allocate: () => number;
 -	private readonly protocol: "kitty" | "iterm2" | null;
 -	private readonly renderMode: RenderMode;
 +	private readonly maxResidentPngBytes: number;
- 	private readonly images = new Map<string, LoadedImage>();
+-	private readonly images = new Map<string, LoadedImage>();
++	private readonly images = new Map<string, LoadedImage>();
 -	private readonly terminalIds = new Map<string, number>();
 -	private readonly uploaded = new Map<number, string>();
 -	/** Current terminal placement geometry, keyed by runtime-owned image ID. */
@@ -773,12 +937,16 @@ index 73949b5..6f6e1cb 100644
 +	private residentPngBytes = 0;
 +	private shared?: SharedGraphicsHandle;
 +
- 	constructor(deps: RuntimeDeps = {}) {
+-	constructor(deps: RuntimeDeps = {}) {
++	constructor(deps: RuntimeDeps = {}) {
 -		this.env = deps.env ?? process.env;
 -		this.output = deps.output ?? { write: (s) => process.stdout.write(s) };
- 		this.loader = deps.loader ?? loadImage;
- 		this.byteLoader = deps.byteLoader ?? loadImageBytes;
- 		this.fs = deps.fs;
+-		this.loader = deps.loader ?? loadImage;
++		this.loader = deps.loader ?? loadImage;
+-		this.byteLoader = deps.byteLoader ?? loadImageBytes;
++		this.byteLoader = deps.byteLoader ?? loadImageBytes;
+-		this.fs = deps.fs;
++		this.fs = deps.fs;
 -		this.allocate = deps.allocateImageId ?? allocateImageId;
 -		this.protocol = deps.imageProtocol === undefined ? getCapabilities().images : deps.imageProtocol;
 -		// Probe once per runtime rather than during every component render.
@@ -849,7 +1017,8 @@ index 73949b5..6f6e1cb 100644
 +	}
 +
 +	async add(path: string, logicalId: string, cwd?: string, evict?: CapacityEvictor): Promise<PreviewEntry> {
- 		const image = await this.loader(path, { cwd, fs: this.fs });
+-		const image = await this.loader(path, { cwd, fs: this.fs });
++		const image = await this.loader(path, { cwd, fs: this.fs });
 -		this.images.set(logicalId, image);
 -		this.id(logicalId);
 -		return {
@@ -866,17 +1035,20 @@ index 73949b5..6f6e1cb 100644
 +
 +	get(logicalId: string): LoadedImage | undefined {
 +		return this.images.get(logicalId);
- 	}
+-	}
++	}
 -	get(id: string): LoadedImage | undefined {
 -		return this.images.get(id);
 +
 +	residentBytes(): number {
 +		return this.residentPngBytes;
- 	}
+-	}
++	}
 -	async addBytes(data: string, mimeType: string, logicalId: string, path = "attached image"): Promise<PreviewEntry> {
 +
 +	async addBytes(data: string, mimeType: string, logicalId: string, path = "attached image", notice?: string, evict?: CapacityEvictor): Promise<PreviewEntry> {
- 		const image = await this.byteLoader(data, mimeType, path);
+-		const image = await this.byteLoader(data, mimeType, path);
++		const image = await this.byteLoader(data, mimeType, path);
 -		this.images.set(logicalId, image);
 -		this.id(logicalId);
 -		return {
@@ -890,61 +1062,73 @@ index 73949b5..6f6e1cb 100644
 +		await this.admit(logicalId, image, evict);
 +		if (notice) this.fidelityNotices.set(logicalId, notice);
 +		return this.entry(logicalId, image);
- 	}
+-	}
++	}
 +
- 	async rehydrate(
- 		entries: PreviewEntry[],
- 		cwd?: string,
+-	async rehydrate(
++	async rehydrate(
+-		entries: PreviewEntry[],
++		entries: PreviewEntry[],
+-		cwd?: string,
++		cwd?: string,
 -		resolve?: (entry: PreviewEntry) => { data: string; mimeType: string } | undefined,
-+		resolve?: (entry: PreviewEntry) => RehydratedImageSource | undefined,
- 	): Promise<Map<string, string>> {
++		resolve?: (entry: PreviewEntry) => RehydratedImageSource | undefined | Promise<RehydratedImageSource | undefined>,
+-	): Promise<Map<string, string>> {
++	): Promise<Map<string, string>> {
 -		this.images.clear();
 -		const state = new Map<string, string>();
 -		for (const entry of entries)
 +		await this.reset();
 +		const status = new Map<string, string>();
-+		const candidates: Array<{ entry: PreviewEntry; image: LoadedImage; source?: RehydratedImageSource }> = [];
-+		for (const entry of entries) {
- 			try {
- 				const source = entry.origin ? resolve?.(entry) : undefined;
- 				if (entry.origin && !source) throw new Error("origin unavailable");
- 				const image = source
++		for (const entry of [...entries].reverse()) {
+-			try {
++			try {
+-				const source = entry.origin ? resolve?.(entry) : undefined;
++				let source = entry.origin ? await resolve?.(entry) : undefined;
+-				if (entry.origin && !source) throw new Error("origin unavailable");
++				if (entry.origin && !source) throw new Error("origin unavailable");
+-				const image = source
++				const image = source
 -					? await this.byteLoader(source.data, source.mimeType, entry.path)
 +					? await this.byteLoader(source.data, source.mimeType, source.path ?? entry.path)
- 					: await this.loader(entry.path, { cwd, fs: this.fs });
+-					: await this.loader(entry.path, { cwd, fs: this.fs });
++					: await this.loader(entry.path, { cwd, fs: this.fs });
 -				if (image.hash !== entry.hash) state.set(entry.logicalId, "Image changed since this preview was saved.");
 -				else {
 -					this.images.set(entry.logicalId, image);
 -					this.id(entry.logicalId);
++				const expectedHash = source?.expectedHash ?? entry.hash;
++				const notice = source?.notice;
++				source = undefined;
++				if (image.hash !== expectedHash) {
++					image.png = Buffer.alloc(0);
++					status.set(entry.logicalId, "Image changed since this preview was saved.");
++					continue;
++				}
++				if (this.residentPngBytes + image.png.length > this.maxResidentPngBytes) {
++					image.png = Buffer.alloc(0);
++					status.set(entry.logicalId, "Expired from the recent preview byte cache.");
++					continue;
 -				}
++				}
 -			} catch {
 -				state.set(entry.logicalId, "Image is missing or no longer readable.");
-+				if (image.hash !== (source?.expectedHash ?? entry.hash)) status.set(entry.logicalId, "Image changed since this preview was saved.");
-+				else candidates.push({ entry, image, source });
++				await this.admit(entry.logicalId, image);
++				if (notice) this.fidelityNotices.set(entry.logicalId, notice);
 +			} catch (error) {
 +				status.set(entry.logicalId, error instanceof Error && error.message !== "origin unavailable"
 +					? error.message
 +					: "Image is missing or no longer readable.");
- 			}
+-			}
++			}
 -		return state;
 +		}
-+		const selected = new Set<string>();
-+		let bytes = 0;
-+		for (const candidate of [...candidates].reverse()) {
-+			if (bytes + candidate.image.png.length <= this.maxResidentPngBytes) {
-+				selected.add(candidate.entry.logicalId);
-+				bytes += candidate.image.png.length;
-+			} else status.set(candidate.entry.logicalId, "Expired from the recent preview byte cache.");
-+		}
-+		for (const candidate of candidates) {
-+			if (!selected.has(candidate.entry.logicalId)) continue;
-+			await this.admit(candidate.entry.logicalId, candidate.image);
-+			if (candidate.source?.notice) this.fidelityNotices.set(candidate.entry.logicalId, candidate.source.notice);
-+		}
 +		return status;
- 	}
+-	}
++	}
 +
- 	emitPlaceholder(logicalId: string, availableWidth: number): string[] {
+-	emitPlaceholder(logicalId: string, availableWidth: number): string[] {
++	emitPlaceholder(logicalId: string, availableWidth: number): string[] {
 -		const image = this.images.get(logicalId);
 -		if (!image) return [];
 -		const size = geometry(image.width, image.height, Math.max(1, Math.min(80, availableWidth - 2)));
@@ -990,9 +1174,11 @@ index 73949b5..6f6e1cb 100644
 +				try { await this.shared.release(logicalId); } catch { /* Preserve the preparation error. */ }
 +				throw error;
 +			}
- 		}
+-		}
++		}
 -		return grid(size.columns, size.rows, id);
- 	}
+-	}
++	}
 -	clear(): void {
 -		const kitty = this.mode() === "kitty-placeholder" || (this.mode() === "image" && this.protocol === "kitty");
 -		if (kitty) for (const id of this.terminalIds.values()) this.output.write(deleteImage(id, isTmux(this.env)));
@@ -1003,7 +1189,8 @@ index 73949b5..6f6e1cb 100644
 +
 +	private sharedImage(image: LoadedImage) {
 +		return { source: image.path, hash: image.hash, width: image.width, height: image.height, png: image.png };
- 	}
+-	}
++	}
 -	activeIds(): number[] {
 -		return [...this.terminalIds.values()];
 +
@@ -1016,7 +1203,8 @@ index 73949b5..6f6e1cb 100644
 +			height: image.height,
 +			logicalId,
 +		};
- 	}
+-	}
++	}
  }
 diff --git a/src/transcript-entry.ts b/src/transcript-entry.ts
 index cc3761b..0f1f0d6 100644
@@ -1050,17 +1238,23 @@ index cc3761b..0f1f0d6 100644
 +	| { status: "unverified"; reason: ReadProvenanceReason }
 +);
  export interface PreviewEntry {
- 	path: string;
- 	hash: string;
+-	path: string;
++	path: string;
+-	hash: string;
++	hash: string;
 @@ -10,11 +34,31 @@ export interface PreviewEntry {
- 	logicalId: string;
- 	/** Origin metadata for automatic previews; the image bytes stay in the message block. */
- 	origin?: { messageOrdinal: number; key: string; blockIndex: number; mimeType: string; contentHash: string };
+-	logicalId: string;
++	logicalId: string;
+-	/** Origin metadata for automatic previews; the image bytes stay in the message block. */
++	/** Origin metadata for automatic previews; the image bytes stay in the message block. */
+-	origin?: { messageOrdinal: number; key: string; blockIndex: number; mimeType: string; contentHash: string };
++	origin?: { messageOrdinal: number; key: string; blockIndex: number; mimeType: string; contentHash: string };
 +	/** Display-only proof. It never replaces or rewrites the tool-result image block. */
 +	readProvenance?: ReadProvenance;
  }
  export interface ClearEntry {
- 	marker: true;
+-	marker: true;
++	marker: true;
  }
  const MIME = new Set(["image/png", "image/jpeg", "image/webp"]);
 +const REASON = new Set<ReadProvenanceReason>(["tool-source-unverified", "capture-unavailable", "source-missing", "source-changed", "result-mismatch"]);
@@ -1082,14 +1276,20 @@ index cc3761b..0f1f0d6 100644
 +		&& original.width === entry.width && original.height === entry.height);
 +}
  export function isPreview(value: unknown): value is PreviewEntry {
- 	if (!value || typeof value !== "object") return false;
- 	const x = value as Partial<PreviewEntry>;
+-	if (!value || typeof value !== "object") return false;
++	if (!value || typeof value !== "object") return false;
+-	const x = value as Partial<PreviewEntry>;
++	const x = value as Partial<PreviewEntry>;
 @@ -46,6 +90,7 @@ export function isPreview(value: unknown): value is PreviewEntry {
- 				origin.blockIndex >= 0 &&
- 				MIME.has(origin.mimeType) &&
- 				typeof origin.contentHash === "string" &&
+-				origin.blockIndex >= 0 &&
++				origin.blockIndex >= 0 &&
+-				MIME.has(origin.mimeType) &&
++				MIME.has(origin.mimeType) &&
+-				typeof origin.contentHash === "string" &&
++				typeof origin.contentHash === "string" &&
 -				/^[a-f0-9]{64}$/u.test(origin.contentHash)))
 +				HASH.test(origin.contentHash))) &&
 +		(x.readProvenance === undefined || validReadProvenance(x.readProvenance, x))
- 	);
+-	);
++	);
  }

@@ -1,0 +1,196 @@
+diff --git a/extensions/index.ts b/extensions/index.ts
+index bbd800a..c63818a 100644
+--- a/extensions/index.ts
++++ b/extensions/index.ts
+@@ -3,7 +3,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
+ import { automaticBlocks, type BranchEntry, findOrigin, hasPersistedOrigin, originToken } from "../src/automatic.ts";
+ import { isBuiltinLocalRead, provenanceNotice, ReadOriginalTracker } from "../src/provenance.ts";
+ import { previewComponent, wrappedNotice } from "../src/renderer.ts";
+-import { PreviewRuntime, type RehydratedImageSource, type SharedGraphicsHandle } from "../src/runtime.ts";
++import { PreviewRuntime, type SharedGraphicsHandle } from "../src/runtime.ts";
+ import { CLEAR_TYPE, type ClearEntry, ENTRY_TYPE, isPreview, type PreviewEntry } from "../src/transcript-entry.ts";
+-
++
+ const MAX_RECENT_PREVIEWS = 16;
+@@ -89,15 +89,14 @@ export function registerInlineImages(pi: ExtensionAPI, runtime = new PreviewRunt
+-			if (expected !== generation) return;
++			if (expected !== generation) return;
+-			const all = allEntries(ctx);
++			const all = allEntries(ctx);
+-			const entries = all.slice(-MAX_RECENT_PREVIEWS);
++			const entries = all.slice(-MAX_RECENT_PREVIEWS);
+-			const sources = new Map<string, RehydratedImageSource>();
+-			for (const entry of entries) {
+-				const block = findOrigin(branch(ctx), entry);
+-				if (!block) continue;
+-				sources.set(entry.logicalId, entry.readProvenance
+-					? await provenance.restore(entry, block, builtinLocalRead())
+-					: { data: block.data, mimeType: block.mimeType, path: entry.path });
+-			}
+-			const restored = await runtime.rehydrate(entries, ctx.cwd, (entry) => sources.get(entry.logicalId));
++			const currentBranch = branch(ctx);
++			const restored = await runtime.rehydrate(entries, ctx.cwd, async (entry) => {
++				const block = findOrigin(currentBranch, entry);
++				if (!block) return undefined;
++				return entry.readProvenance
++					? provenance.restore(entry, block, builtinLocalRead())
++					: { data: block.data, mimeType: block.mimeType, path: entry.path };
++			});
+-			if (expected !== generation) {
++			if (expected !== generation) {
+-				await runtime.clear();
++				await runtime.clear();
+-				return;
++				return;
+diff --git a/src/loader.ts b/src/loader.ts
+index 1427de7..09be8c0 100644
+--- a/src/loader.ts
++++ b/src/loader.ts
+@@ -6,6 +6,7 @@ import sharp from "sharp";
+-
++
+ export const MAX_INPUT_BYTES = 20 * 1024 * 1024;
+ export const MAX_PIXELS = 32 * 1024 * 1024;
++export const MAX_FULL_PNG_BYTES = 32 * 1024 * 1024;
+ export type OriginalMime = "image/png" | "image/jpeg" | "image/webp";
+ export interface LoadedImage {
+-	path: string;
++	path: string;
+@@ -38,24 +39,34 @@ function mime(format?: string): OriginalMime {
+ }
+ async function decodeImage(bytes: Buffer, path: string): Promise<LoadedImage> {
+-	try {
++	try {
+-		const metadata = await sharp(bytes, { limitInputPixels: MAX_PIXELS, failOn: "error" }).metadata();
+-		const width = metadata.width ?? 0,
+-			height = metadata.height ?? 0;
++		const options = { limitInputPixels: MAX_PIXELS, failOn: "error" as const };
++		const metadata = await sharp(bytes, options).metadata();
++		const width = metadata.autoOrient?.width ?? metadata.width ?? 0,
++			height = metadata.autoOrient?.height ?? metadata.height ?? 0;
+-		if (!width || !height) throw new Error("Image has no dimensions.");
++		if (!width || !height) throw new Error("Image has no dimensions.");
+-		if (width * height > MAX_PIXELS)
++		if (width * height > MAX_PIXELS)
+-			throw new Error(`Image is too large when decoded: ${width}×${height} exceeds 32 MP.`);
++			throw new Error(`Image is too large when decoded: ${width}×${height} exceeds 32 MP.`);
+-		const png = await sharp(bytes, { limitInputPixels: MAX_PIXELS, failOn: "error" }).rotate().png().toBuffer();
+-		const rotated = await sharp(png).metadata();
++		const originalMime = mime(metadata.format);
++		let png: Buffer;
++		if (metadata.format === "png" && (!metadata.orientation || metadata.orientation === 1)) {
++			await sharp(bytes, options).stats();
++			png = bytes;
++		} else {
++			const pipeline = sharp(bytes, options).autoOrient();
++			if (metadata.depth === "ushort") pipeline.toColourspace("rgb16");
++			png = await pipeline.png({ palette: false }).toBuffer();
++		}
++		if (png.length > MAX_FULL_PNG_BYTES) throw new Error("Full PNG exceeds the 32 MB limit.");
+-		return {
++		return {
+-			path,
++			path,
+-			hash: createHash("sha256").update(bytes).digest("hex"),
++			hash: createHash("sha256").update(bytes).digest("hex"),
+-			originalMime: mime(metadata.format),
+-			width: rotated.width ?? width,
+-			height: rotated.height ?? height,
++			originalMime,
++			width,
++			height,
+-			png,
++			png,
+-		};
++		};
+-	} catch (error) {
++	} catch (error) {
+-		if (error instanceof Error && /Unsupported|too large|no dimensions/u.test(error.message)) throw error;
++		if (error instanceof Error && /Unsupported|too large|no dimensions|Full PNG exceeds/u.test(error.message)) throw error;
+-		throw new Error(`Invalid image content: ${path}`);
++		throw new Error(`Invalid image content: ${path}`);
+-	}
++	}
+ }
+diff --git a/src/runtime.ts b/src/runtime.ts
+index 6f6e1cb..7d77ad1 100644
+--- a/src/runtime.ts
++++ b/src/runtime.ts
+@@ -115,39 +115,38 @@ export class PreviewRuntime {
+-	async rehydrate(
++	async rehydrate(
+-		entries: PreviewEntry[],
++		entries: PreviewEntry[],
+-		cwd?: string,
++		cwd?: string,
+-		resolve?: (entry: PreviewEntry) => RehydratedImageSource | undefined,
++		resolve?: (entry: PreviewEntry) => RehydratedImageSource | undefined | Promise<RehydratedImageSource | undefined>,
+-	): Promise<Map<string, string>> {
++	): Promise<Map<string, string>> {
+-		await this.reset();
++		await this.reset();
+-		const status = new Map<string, string>();
++		const status = new Map<string, string>();
+-		const candidates: Array<{ entry: PreviewEntry; image: LoadedImage; source?: RehydratedImageSource }> = [];
+-		for (const entry of entries) {
++		for (const entry of [...entries].reverse()) {
+-			try {
++			try {
+-				const source = entry.origin ? resolve?.(entry) : undefined;
++				let source = entry.origin ? await resolve?.(entry) : undefined;
+-				if (entry.origin && !source) throw new Error("origin unavailable");
++				if (entry.origin && !source) throw new Error("origin unavailable");
+-				const image = source
++				const image = source
+-					? await this.byteLoader(source.data, source.mimeType, source.path ?? entry.path)
++					? await this.byteLoader(source.data, source.mimeType, source.path ?? entry.path)
+-					: await this.loader(entry.path, { cwd, fs: this.fs });
++					: await this.loader(entry.path, { cwd, fs: this.fs });
+-				if (image.hash !== (source?.expectedHash ?? entry.hash)) status.set(entry.logicalId, "Image changed since this preview was saved.");
+-				else candidates.push({ entry, image, source });
++				const expectedHash = source?.expectedHash ?? entry.hash;
++				const notice = source?.notice;
++				source = undefined;
++				if (image.hash !== expectedHash) {
++					image.png = Buffer.alloc(0);
++					status.set(entry.logicalId, "Image changed since this preview was saved.");
++					continue;
++				}
++				if (this.residentPngBytes + image.png.length > this.maxResidentPngBytes) {
++					image.png = Buffer.alloc(0);
++					status.set(entry.logicalId, "Expired from the recent preview byte cache.");
++					continue;
++				}
++				await this.admit(entry.logicalId, image);
++				if (notice) this.fidelityNotices.set(entry.logicalId, notice);
+-			} catch (error) {
++			} catch (error) {
+-				status.set(entry.logicalId, error instanceof Error && error.message !== "origin unavailable"
++				status.set(entry.logicalId, error instanceof Error && error.message !== "origin unavailable"
+-					? error.message
++					? error.message
+-					: "Image is missing or no longer readable.");
++					: "Image is missing or no longer readable.");
+-			}
++			}
+-		}
++		}
+-		const selected = new Set<string>();
+-		let bytes = 0;
+-		for (const candidate of [...candidates].reverse()) {
+-			if (bytes + candidate.image.png.length <= this.maxResidentPngBytes) {
+-				selected.add(candidate.entry.logicalId);
+-				bytes += candidate.image.png.length;
+-			} else status.set(candidate.entry.logicalId, "Expired from the recent preview byte cache.");
+-		}
+-		for (const candidate of candidates) {
+-			if (!selected.has(candidate.entry.logicalId)) continue;
+-			await this.admit(candidate.entry.logicalId, candidate.image);
+-			if (candidate.source?.notice) this.fidelityNotices.set(candidate.entry.logicalId, candidate.source.notice);
+-		}
+-		return status;
++		return status;
+-	}
++	}
+-
++

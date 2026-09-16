@@ -99,24 +99,33 @@ test("native cached components retain immutable geometry across changed bytes an
   });
   const source = "Before\n\n![same](/tmp/image.png)\n\nAfter";
   const transformer = (markdown: string, context: { messageType: string; isStreaming: boolean; availableWidth: number }) => {
-    const prepared = session.markdown.get(markdown);
+    const prepared = session.preparedForRender(markdown);
     return prepared ? transformMarkdown(prepared, context.availableWidth, terminal) : markdown;
   };
   const component = () => new module.AssistantMessageComponent(assistantMessage(source), false, undefined, "Thinking...", 1, [transformer]);
 
+  const glyphs = (value: { render(width: number): string[] }, width = 16) =>
+    value.render(width).join("\n").split(PLACEHOLDER_GLYPH).length - 1;
   const firstPrepared = await session.prepare(source, "/fixture");
   const first = component();
-  assert.equal(first.render(16).join("\n").split(PLACEHOLDER_GLYPH).length - 1, 50);
+  assert.equal(glyphs(first), 50);
   const secondPrepared = await session.prepare(source, "/fixture");
   const second = component();
-  assert.equal(second.render(16).join("\n").split(PLACEHOLDER_GLYPH).length - 1, 2);
   assert.notEqual(firstPrepared.references[0].logicalId, secondPrepared.references[0].logicalId, "changed bytes receive a distinct immutable resource ID");
-  assert.equal(first.render(16).join("\n").split(PLACEHOLDER_GLYPH).length - 1, 50, "old same-width Markdown cache remains compatible with its old resource");
+  assert.equal(glyphs(first), 50, "old same-width Markdown cache remains compatible with its old resource");
+
+  first.invalidate();
+  assert.equal(glyphs(first), 50, "global recovery invalidation keeps the first occurrence bound to its prepared resource");
+  assert.equal(glyphs(second), 2, "the later identical occurrence keeps its own prepared resource");
 
   await session.prepare(source, "/fixture");
-  const failed = component().render(40).join("\n").replace(/\x1b(?:\][^\x07]*\x07|\[[0-?]*[ -/]*[@-~])/gu, "");
-  assert.match(failed.replace(/\s+/gu, " "), /image unavailable: same — changed file unreadable/);
-  assert.equal(first.render(16).join("\n").split(PLACEHOLDER_GLYPH).length - 1, 50, "a later failure does not invalidate cached old grids");
+  const failed = component();
+  first.invalidate();
+  second.invalidate();
+  assert.equal(glyphs(first), 50, "a later failed load cannot replace the first occurrence after invalidation");
+  assert.equal(glyphs(second), 2, "a later failed load cannot replace the second occurrence after invalidation");
+  const failedText = failed.render(40).join("\n").replace(/\x1b(?:\][^\x07]*\x07|\[[0-?]*[ -/]*[@-~])/gu, "");
+  assert.match(failedText.replace(/\s+/gu, " "), /image unavailable: same — changed file unreadable/);
 });
 
 test("native AssistantMessage preserves GFM table columns with an explicit in-cell notice", async () => {

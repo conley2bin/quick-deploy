@@ -85,7 +85,13 @@ async function fullPng(bytes: Buffer, metadata: Metadata): Promise<Buffer> {
   // A PNG with no EXIF rotation is already the most faithful PNG conversion: do
   // not decode/re-encode it, because that could alter its palette, bit depth,
   // colour profile, alpha representation, or byte identity.
-  if (metadata.format === "png" && (!metadata.orientation || metadata.orientation === 1)) return bytes;
+  if (metadata.format === "png" && (!metadata.orientation || metadata.orientation === 1)) {
+    // metadata() can succeed after reading only the PNG header. Force a full
+    // pixel scan so truncated/corrupt IDAT data fails before the byte-exact
+    // fast path is admitted to the quiet Kitty transport.
+    await sharp(bytes, { limitInputPixels: MAX_PIXELS, failOn: "error" }).stats();
+    return bytes;
+  }
 
   // JPEG/WebP are inherently 8-bit in the supported input set. For a rotated
   // higher-depth PNG retain 16-bit RGB(A) rather than silently reducing it.

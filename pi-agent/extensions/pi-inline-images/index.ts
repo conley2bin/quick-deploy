@@ -47,7 +47,7 @@ export default function piInlineImages(pi: ExtensionAPI) {
 
   pi.registerMarkdownTransformer((markdown, context) => {
     if (context.messageType !== "assistant" || context.isStreaming) return markdown;
-    const prepared = session.markdown.get(markdown);
+    const prepared = session.preparedForRender(markdown);
     return prepared ? transformMarkdown(prepared, context.availableWidth, terminal) : markdown;
   });
 

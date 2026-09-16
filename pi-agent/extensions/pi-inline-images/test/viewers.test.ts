@@ -4,7 +4,7 @@ import test from "node:test";
 import { IMAGE_BRIDGE_REPLY, IMAGE_BRIDGE_REQUEST, IMAGE_BRIDGE_VERSION, installGraphicsBridge, type GraphicsOwnerHandle } from "../src/bridge.ts";
 import { TerminalImages } from "../src/terminal.ts";
 import type { TransportScheduler, TransportSink } from "../src/transport.ts";
-import { currentViewerState, MAX_TMUX_CLIENTS, MAX_TMUX_OUTPUT_BYTES, TMUX_SNAPSHOT_TIMEOUT_MS, type TmuxSnapshotRun, type ViewerState } from "../src/viewers.ts";
+import { currentViewerState, MAX_TMUX_CLIENTS, MAX_TMUX_OUTPUT_BYTES, TMUX_SNAPSHOT_TIMEOUT_MS, type TmuxSnapshotRun, type ViewerState, ViewerMonitor } from "../src/viewers.ts";
 
 class Clock implements TransportScheduler {
   private time = 0;
@@ -27,7 +27,18 @@ class Clock implements TransportScheduler {
 
 class Sink extends EventEmitter implements TransportSink {
   readonly writes: Buffer[] = [];
-  write(value: Buffer): boolean { this.writes.push(Buffer.from(value)); return true; }
+  readonly returns: boolean[] = [];
+  writableNeedDrain = false;
+  write(value: Buffer): boolean {
+    this.writes.push(Buffer.from(value));
+    const accepted = this.returns.shift() ?? true;
+    if (!accepted) this.writableNeedDrain = true;
+    return accepted;
+  }
+  drain(): void {
+    this.writableNeedDrain = false;
+    this.emit("drain");
+  }
 }
 
 class Bus {
@@ -85,6 +96,65 @@ test("viewer-aware preparation is pending until a compatible visible receiver an
   assert.equal(sink.writes.length, 3, "a reconnected identity receives pixels");
   await terminal.setViewer(viewer("mixed", false, "an incompatible client is viewing this window"));await terminal.prepare("two", image("second"));
   assert.equal(sink.writes.length, 3, "incompatible visible viewer remains pending with zero PNG traffic");
+  await settle(terminal.clear(true), clock);
+});
+
+test("viewer polling observes hide while recovery is blocked and resends on the same receiver's return", async () => {
+  const { clock, sink, terminal } = runtime();
+  for (let index = 0; index < 3; index++) await terminal.prepare(`blocked-${index}`, image(`blocked-${index}`));
+  sink.returns.push(false);
+  const visible: ViewerState = { ready: true, epoch: "visible-a", reason: "", attached: ["viewer-a"], receivers: ["viewer-a"] };
+  const hidden: ViewerState = { ready: false, epoch: "hidden-a", reason: "no client is viewing this window", attached: ["viewer-a"], receivers: [] };
+  let snapshot = visible;
+  let snapshots = 0;
+  const monitor = new ViewerMonitor(
+    { snapshot: () => { snapshots++; return snapshot; } },
+    (state) => terminal.setViewer(state),
+    clock,
+  );
+
+  monitor.start();
+  await Promise.resolve();
+  assert.equal(sink.writes.length, 1, "first recovery transaction is accepted into backpressure");
+  snapshot = hidden;
+  clock.advance(1_500);
+  await Promise.resolve();
+  assert.equal(snapshots, 2, "snapshot cadence is independent of the blocked recovery promise");
+  assert.equal(sink.writes.length, 1, "hidden transition cancels every unsent recovery transaction");
+
+  sink.drain();
+  for (let turn = 0; turn < 20; turn++) await Promise.resolve();
+  assert.equal(sink.writes.length, 1, "drain cannot dispatch later images using the obsolete visible snapshot");
+  assert.equal(terminal.render("blocked-2", 20).length, 0);
+
+  snapshot = visible;
+  clock.advance(1_500);
+  for (let turn = 0; turn < 40; turn++) {
+    await Promise.resolve();
+    clock.advance(10);
+  }
+  assert.equal(sink.writes.length, 4, "the unconfirmed first image and two unsent images are recovered on return");
+  assert.ok(terminal.render("blocked-2", 20).length > 0);
+
+  monitor.stop();
+  await settle(terminal.clear(true), clock);
+});
+
+test("an intervening hidden snapshot invalidates an undrained upload even if the same receiver returns first", async () => {
+  const { clock, sink, terminal } = runtime();
+  await terminal.prepare("revision", image("revision"));
+  sink.returns.push(false);
+  const visible: ViewerState = { ready: true, epoch: "visible-a", reason: "", attached: ["viewer-a"], receivers: ["viewer-a"] };
+  const hidden: ViewerState = { ready: false, epoch: "hidden-a", reason: "no client is viewing this window", attached: ["viewer-a"], receivers: [] };
+  const first = terminal.setViewer(visible);
+  await Promise.resolve();
+  assert.equal(sink.writes.length, 1);
+  await terminal.setViewer(hidden);
+  const returned = terminal.setViewer(visible);
+  sink.drain();
+  await settle(Promise.all([first, returned]), clock);
+  assert.equal(sink.writes.length, 2, "the pre-hide accepted write cannot be marked served after an intervening visibility change");
+  assert.ok(terminal.render("revision", 20).length > 0);
   await settle(terminal.clear(true), clock);
 });
 

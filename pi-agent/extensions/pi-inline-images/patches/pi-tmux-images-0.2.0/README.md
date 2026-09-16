@@ -4,9 +4,9 @@
 
 This directory carries one active local repair for the installed `pi-tmux-images@0.2.0`: `pane-passthrough-policy.patch` changes only `src/capabilities.ts`. The earlier unconditional placement replay is retired. `retire-placement-replay.patch` is a one-way removal patch for installations that received it; it is not an installation patch for pristine packages.
 
-`stage-c-recent-cache.patch` is deliberately **not deployed** until final independent review. It is an exact-source guarded replay. The replay retains the newest 16 read resources, evicts the oldest resource before every later admission, restores the newest eligible entries after the latest clear marker, and leaves older custom history visible as wrapped expired notices. All preparation, rendering, release, reset, restore, and late binding use the public versioned `pi-inline-images` read bridge. The old runtime retains no terminal IDs, placement/upload maps, native `Image` branch, or graphics output fallback. Missing/version-mismatched bridges remain visible through `Text.render(width)`.
+`stage-c-recent-cache.patch` is the deployed, exact-source guarded Stage C replay. It retains the newest 16 read resources, evicts the oldest resource before later admission, restores newest entries incrementally within the 64 MiB decoded-PNG budget, and leaves older custom history visible as wrapped expired notices. Suitable PNGs are fully decoded for validity and then retain their exact encoded bytes and bit depth. All preparation, rendering, release, reset, restore, and late binding use the public versioned `pi-inline-images` read bridge. The old runtime retains no terminal IDs, placement/upload maps, native `Image` branch, or graphics output fallback. Missing/version-mismatched bridges remain visible through `Text.render(width)`.
 
-`replay-stage-c.sh check PACKAGE_ROOT` accepts exactly the pristine or fully patched `pi-tmux-images@0.2.0` sources plus either the pristine or retained effective-pane capability hash. `replay-stage-c.sh apply PACKAGE_ROOT` applies only from the complete pristine state and is byte-idempotent from the complete patched state. It also guards the replay patch digest and rejects mixed, partial, symlinked, version-mismatched, or otherwise unknown source instead of overwriting it. These modes are the deployment entrypoint; the older disposable-only apply script is retired.
+`stage-c-review-fixes.patch` upgrades the exact earlier Stage C deployment without reverting the retained capability repair. `replay-stage-c.sh check PACKAGE_ROOT` accepts only the pristine, exact previous-patched, or fully patched `pi-tmux-images@0.2.0` states. `replay-stage-c.sh apply PACKAGE_ROOT` applies the cumulative replay from pristine, the guarded upgrade from previous-patched, and is byte-idempotent from patched. It guards both patch digests and rejects mixed, partial, version-mismatched, or otherwise unknown source instead of overwriting it. These modes are the deployment entrypoint; the older disposable-only apply script is retired.
 
 Original-file substitution is display-only and fail-closed. At `tool_call`, the tracker accepts only Pi's exact selected builtin-read source tuple and freezes a stable, canonical, bounded local image identity/hash/bytes. At `tool_result`, it requires the source to remain unchanged and the received block to equal either the original or the public host `resizeImage` result. Persisted proof records tool call/block identity, received hash/MIME, and original path/identity/hash metadata without changing the result or model message. Restore repeats the tool-source, file, block, and resize relation checks. ShellGate and other overrides therefore keep the actual received pixels and show a wrapped original-resolution-unverified notice, even when a same-path local derivative is byte-identical.
 
@@ -46,8 +46,11 @@ Kitty commands still use `q=2`, so the runtime receives no upload or placement a
 - Retired placement-replay `src/runtime.ts`: `7db69da01c21617b6ceed3f6f67ef7cc5d9428ee850008accd6dbcbcfa2bca25`
 - Pristine `src/capabilities.ts`: `b9a498a9839ae04909995e530a8c052d0490653eadde7c7a5ec1941ea27357c8`
 - Capability-patched `src/capabilities.ts`: `c7272ee59ebc5f78c96c1740fcbcdf57cdc2480475241292cb91d3e158e0625a`
+- Stage C `extensions/index.ts`: `09b2245981f14df3a82c2acbfec874c4bf02bfd2c386b33bca21e6709b107618`
+- Stage C `src/loader.ts`: `0b3996ff6fc475fac5985f1fa56a76c9009f86524b02f047812b9c0a7848ad1d`
+- Stage C `src/runtime.ts`: `bb69de792f40dc5d576d26f50773ae9dd168d7e52c76abf42146e61d724c26e3`
 
-`installed-before.sha256` records the integrity-verified pristine package. `installed-after.sha256` records the capability-only installed state; only `src/capabilities.ts` differs.
+`installed-before.sha256` records the integrity-verified pristine package. `installed-after.sha256` records the capability-only state that preceded Stage C; the replay script is the authoritative Stage C manifest.
 
 ## Guarded retirement for an already placement-patched installation
 
@@ -100,17 +103,13 @@ An npm reinstall/update can overwrite the local capability repair. Re-verify the
 The tests use injected output sinks and tmux probes; they do not launch Ghostty or Pi, write escapes to a terminal, probe a live pane, or make model calls.
 
 ```bash
+cd pi-agent/extensions/pi-inline-images
 NODE_PATH="$(npm root -g)/@earendil-works/pi-coding-agent/node_modules:$HOME/.pi/agent/npm/node_modules" \
 PI_TMUX_IMAGES_ROOT="$HOME/.pi/agent/npm/node_modules/pi-tmux-images" \
-  pi-agent/extensions/pi-inline-images/node_modules/.bin/tsx --test \
-  pi-agent/extensions/pi-inline-images/patches/pi-tmux-images-0.2.0/placement-lifecycle.test.ts \
-  pi-agent/extensions/pi-inline-images/patches/pi-tmux-images-0.2.0/pane-passthrough-policy.test.ts \
-  pi-agent/extensions/pi-inline-images/patches/pi-tmux-images-0.2.0/stage-c-replay.test.ts \
-  pi-agent/extensions/pi-inline-images/patches/pi-tmux-images-0.2.0/stage-c-behavior.test.ts \
-  pi-agent/extensions/pi-inline-images/patches/pi-tmux-images-0.2.0/stage-c-provenance.test.ts
+  node --test --import tsx patches/pi-tmux-images-0.2.0/*.test.ts
 ```
 
-`placement-lifecycle.test.ts` validates the capability-only runtime before deployment and shared-handle-only behavior afterward. `pane-passthrough-policy.test.ts` checks the pane-effective command, enabled values, and fail-closed cases. `stage-c-replay.test.ts` proves pristine apply, patched check, byte-idempotent reapply, and unknown-edit refusal from either installed state. `stage-c-behavior.test.ts` runs the patched extension/runtime against the real shared backend and a captured sink: 20 automatic entries, 16-resource eviction, restore preparation, inline-preserving clear, late bridge binding, and width-16/40 CJK notices. `stage-c-provenance.test.ts` executes real extension handlers for verified builtin originals, host resize relation, source changes/missing files/mismatches, builtin-shaped wrappers, restore re-verification, alpha/dimensions, immutable tool/model blocks, and width-16/40 provenance notices.
+`placement-lifecycle.test.ts` validates the capability-only runtime before deployment and shared-handle-only behavior afterward. `pane-passthrough-policy.test.ts` checks the pane-effective command, enabled values, and fail-closed cases. `stage-c-replay.test.ts` proves guarded previous-state upgrade, pristine apply, patched check, byte-idempotent reapply, and unknown-edit refusal. `stage-c-behavior.test.ts` runs the patched extension/runtime against the real shared backend and captured wire: byte-exact 8/16-bit PNGs, incremental bounded restore, 20 automatic entries, 16-resource eviction, inline-preserving clear, both factory orders, and width-16/40 CJK notices. `stage-c-provenance.test.ts` executes real extension handlers for verified builtin originals, host resize relation, source changes/missing files/mismatches, builtin-shaped wrappers, restore re-verification, alpha/dimensions, immutable tool/model blocks, and width-16/40 provenance notices.
 
 ## Boundary of the capability repair
 

@@ -21,6 +21,16 @@ export interface ViewerProbe {
   snapshot(): ViewerState;
 }
 
+export interface ViewerScheduler {
+  setTimeout(callback: () => void, delayMs: number): unknown;
+  clearTimeout(handle: unknown): void;
+}
+
+const defaultViewerScheduler: ViewerScheduler = {
+  setTimeout: (callback, delayMs) => setTimeout(callback, delayMs),
+  clearTimeout: (handle) => clearTimeout(handle as NodeJS.Timeout),
+};
+
 export type TmuxSnapshotResult = { status: number | null; stdout?: string | null; error?: Error };
 export type TmuxSnapshotRun = (
   args: string[],
@@ -141,29 +151,33 @@ export function currentViewerState(
   }
 }
 
-/** One nonoverlapping poller. It emits only state transitions, never ticks. */
+/** One nonoverlapping snapshot poller. Transition work never delays the next snapshot. */
 export class ViewerMonitor {
-  private timer: NodeJS.Timeout | undefined;
+  private timer: unknown;
   private checking = false;
   private active = false;
   private previous?: ViewerState;
 
-  constructor(private readonly probe: ViewerProbe, private readonly onTransition: (state: ViewerState) => void | Promise<void>) {}
+  constructor(
+    private readonly probe: ViewerProbe,
+    private readonly onTransition: (state: ViewerState) => void | Promise<void>,
+    private readonly scheduler: ViewerScheduler = defaultViewerScheduler,
+  ) {}
 
   start(): void {
     if (this.active) return;
     this.active = true;
-    void this.check();
+    this.check();
   }
 
   stop(): void {
     this.active = false;
-    if (this.timer) clearTimeout(this.timer);
+    if (this.timer !== undefined) this.scheduler.clearTimeout(this.timer);
     this.timer = undefined;
     this.previous = undefined;
   }
 
-  private async check(): Promise<void> {
+  private check(): void {
     if (!this.active || this.checking) return;
     this.checking = true;
     try {
@@ -175,13 +189,17 @@ export class ViewerMonitor {
       }
       if (!this.previous || next.ready !== this.previous.ready || next.epoch !== this.previous.epoch || next.reason !== this.previous.reason) {
         this.previous = next;
-        try { await this.onTransition(next); } catch { /* Keep polling after a bounded upload/snapshot failure. */ }
+        try {
+          void Promise.resolve(this.onTransition(next)).catch(() => undefined);
+        } catch { /* Keep polling after a synchronous transition failure. */ }
       }
     } finally {
       this.checking = false;
       if (this.active) {
-        this.timer = setTimeout(() => void this.check(), VIEWER_POLL_MS);
-        this.timer.unref();
+        this.timer = this.scheduler.setTimeout(() => this.check(), VIEWER_POLL_MS);
+        if (this.timer && typeof this.timer === "object" && "unref" in this.timer) {
+          (this.timer as { unref(): void }).unref();
+        }
       }
     }
   }

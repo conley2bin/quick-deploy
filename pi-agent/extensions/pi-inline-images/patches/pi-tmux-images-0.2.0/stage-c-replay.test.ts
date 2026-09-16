@@ -7,8 +7,9 @@ import test from "node:test";
 
 const installed = process.env.PI_TMUX_IMAGES_ROOT ?? resolve(process.env.HOME!, ".pi/agent/npm/node_modules/pi-tmux-images");
 const patch = resolve("patches/pi-tmux-images-0.2.0/stage-c-recent-cache.patch");
+const upgrade = resolve("patches/pi-tmux-images-0.2.0/stage-c-review-fixes.patch");
 const replay = resolve("patches/pi-tmux-images-0.2.0/replay-stage-c.sh");
-const files = ["extensions/index.ts", "src/runtime.ts", "src/renderer.ts", "src/transcript-entry.ts", "src/provenance.ts"];
+const files = ["extensions/index.ts", "src/loader.ts", "src/runtime.ts", "src/renderer.ts", "src/transcript-entry.ts", "src/provenance.ts"];
 
 function run(mode: "check" | "apply", root: string): string {
   return execFileSync(replay, [mode, root], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
@@ -22,10 +23,14 @@ test("Stage C replay is exact-source guarded and idempotent before or after depl
   try {
     cpSync(installed, copy, { recursive: true });
     const installedState = run("check", copy);
-    assert.match(installedState, /^(?:pristine|patched)$/u);
-    if (installedState === "patched") {
-      execFileSync("patch", ["-R", "-d", copy, "-p1"], { input: readFileSync(patch), stdio: ["pipe", "pipe", "pipe"] });
+    assert.match(installedState, /^(?:pristine|previous-patched|patched)$/u);
+    if (installedState === "pristine") assert.equal(run("apply", copy), "patched");
+    if (run("check", copy) === "patched") {
+      execFileSync("patch", ["-R", "-d", copy, "-p1"], { input: readFileSync(upgrade), stdio: ["pipe", "pipe", "pipe"] });
     }
+    assert.equal(run("check", copy), "previous-patched");
+    assert.equal(run("apply", copy), "patched", "the exact previously deployed state upgrades without a pristine reinstall");
+    execFileSync("patch", ["-R", "-d", copy, "-p1"], { input: readFileSync(patch), stdio: ["pipe", "pipe", "pipe"] });
     assert.equal(run("check", copy), "pristine");
     assert.equal(run("apply", copy), "patched");
     assert.equal(run("check", copy), "patched");
@@ -34,6 +39,7 @@ test("Stage C replay is exact-source guarded and idempotent before or after depl
     assert.deepEqual(snapshot(copy), once, "second apply changes no source bytes");
 
     const extension = readFileSync(resolve(copy, "extensions/index.ts"), "utf8");
+    const loader = readFileSync(resolve(copy, "src/loader.ts"), "utf8");
     const renderer = readFileSync(resolve(copy, "src/renderer.ts"), "utf8");
     const runtime = readFileSync(resolve(copy, "src/runtime.ts"), "utf8");
     const provenance = readFileSync(resolve(copy, "src/provenance.ts"), "utf8");
@@ -44,8 +50,12 @@ test("Stage C replay is exact-source guarded and idempotent before or after depl
     assert.match(extension, /await runtime\.clear\(\)/u);
     assert.match(renderer, /new Text\([^)]*\)\.render/u);
     assert.doesNotMatch(renderer, /new Image\(/u);
+    assert.match(loader, /await sharp\(bytes, options\)\.stats\(\)/u);
+    assert.match(loader, /metadata\.depth === "ushort"/u);
     assert.match(runtime, /SharedGraphicsHandle/u);
     assert.match(runtime, /await this\.shared\.prepare/u);
+    assert.match(runtime, /for \(const entry of \[\.\.\.entries\]\.reverse\(\)\)/u);
+    assert.doesNotMatch(runtime, /const candidates:/u);
     assert.doesNotMatch(runtime, /process\.stdout|terminalIds|renderMode|deleteImage|\bupload\(/u);
     assert.match(extension, /pi\.on\("tool_call"/u);
     assert.match(extension, /pi\.on\("tool_result"/u);
