@@ -23,4 +23,6 @@
 | `extensions/<name>/` | 扩展源码（`index.ts` 入口） | 各自的 `install.sh` 创建 `~/.pi/agent/extensions/<name>` 受管符号链接；PI home 是 git worktree 时同时写入 `info/exclude` |
 | `skills/` | 技能源码（`SKILL.md`） | `skills/install-skills.sh` 交互式复制到 `~/.pi/agent/skills/` |
 
-扩展测试在各自 `test/` 下，例如 `extensions/pi-suspend-guard/test/run.sh`、`extensions/pi-tmux-window-status/test/installer.sh`。
+`pi-copy-links` 提供代码块右下角复制按钮和 Ctrl+左键打开网页；安装后需在 Pi 的 `/settings` 中开启 `fullscreen`。它不修改全局设置，当前适配 Pi 0.85.1，详见 [使用说明](extensions/pi-copy-links/README.md)。
+
+扩展测试在各自 `test/` 下，例如 `extensions/pi-suspend-guard/test/run.sh`、`extensions/pi-tmux-window-status/test/installer.sh`；`pi-copy-links` 使用 `npm run check`。

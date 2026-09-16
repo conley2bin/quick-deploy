@@ -1,0 +1,32 @@
+{
+  "name": "pi-copy-links",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Source-exact code copy buttons and Ctrl-click web links in Pi fullscreen",
+  "pi": { "extensions": ["./index.ts"] },
+  "scripts": {
+    "test": "node test/setup-pi.mjs && node --import tsx --test test/*.test.ts",
+    "typecheck": "node test/setup-pi.mjs && tsc --noEmit",
+    "check": "npm run typecheck && npm test"
+  },
+  "dependencies": {
+    "remark-parse": "11.0.0",
+    "unified": "11.0.5"
+  },
+  "devDependencies": {
+    "@types/mdast": "4.0.4",
+    "@types/node": "^22.19.0",
+    "tsx": "^4.22.3",
+    "typescript": "^5.9.0"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
+  },
+  "peerDependenciesMeta": {
+    "@earendil-works/pi-coding-agent": { "optional": true },
+    "@earendil-works/pi-tui": { "optional": true }
+  },
+  "engines": { "node": ">=22.19.0" }
+}
