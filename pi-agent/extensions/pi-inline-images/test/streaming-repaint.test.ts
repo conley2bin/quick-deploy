@@ -9,13 +9,15 @@ import { installedPiRoot } from "./pi-root.ts";
 /**
  * Regression: a streaming assistant turn must not force-repaint history.
  *
- * Live evidence (2026-09-16, window marker_pen): every assistant token reached
+ * Live evidence (2026-09-16): every assistant token reached
  * `message_update -> observeLiveMessage -> wake()`, which invalidated the whole tree and called
- * `requestRender(true)`. On the main-screen renderer that resets render state and re-emits the entire
- * scrollback (`ESC[2J ESC[H ESC[3J` + every line) — 10 full 4 911-line renders in 10 s while the
- * transcript itself was static. This test drives real message_start/message_update/message_end events
- * through the real extension runner and paints through a real TuiMainScreen, so the defect shows up as
- * repeated banner emissions, scrollback wipes and bulk invalidations of historical components.
+ * `requestRender(true)` (stack captured in the looping session; a separate nonpausing `PI_TUI_DEBUG_REDRAW`
+ * sample from the Documents process pid 1387282 recorded ten `terminal width changed (-1 -> 201)` full
+ * renders in 10 s, `new=4911` lines). On the main-screen renderer a forced render resets render state and
+ * re-emits the entire scrollback (`ESC[2J ESC[H ESC[3J` + every line) while the transcript itself is static.
+ * This test drives real message_start/message_update/message_end events through the real extension runner and
+ * paints through a real TuiMainScreen, so the defect shows up as repeated banner emissions, scrollback wipes
+ * and bulk invalidations of historical components.
  */
 test("streaming assistant updates never force a history repaint but ownership transitions still do", () => {
   const source = resolve(".");

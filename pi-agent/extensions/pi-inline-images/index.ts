@@ -1,4 +1,3 @@
-import { createHash } from "node:crypto";
 import { sessionEntryToContextMessages, VERSION, type ExtensionAPI, type SessionEntry } from "@earendil-works/pi-coding-agent";
 import { allocateImageId, getCapabilities, getCellDimensions, type TUI } from "@earendil-works/pi-tui";
 import { installGraphicsBridge } from "./src/bridge.ts";
@@ -32,43 +31,28 @@ export default function piInlineImages(pi: ExtensionAPI) {
   );
   let tui: TUI | undefined;
   let hostContext: HostContext | undefined;
-  let treeSignature: string | undefined;
+  let reconciliationSignature: string | undefined;
   let treeReconcileQueued = false;
   const reconcileHost = () => {
     if (tui && hostContext) return host.reconcile(hostContext.sessionManager.buildContextEntries(), hostContext.sessionManager.getBranch(), hostContext.sessionManager.getSessionId());
     return false;
   };
+  const currentReconciliationSignature = () => hostContext
+    ? host.reconciliationSignature(hostContext.sessionManager.buildContextEntries(), hostContext.sessionManager.getBranch(), hostContext.sessionManager.getSessionId())
+    : host.publicTreeSignature();
   /**
-   * Identity of persisted claims (preview/clear entries, message roles and call ids). Deliberately cheaper
-   * and narrower than the adapter's reconciliation signature: it excludes live streaming text, so a frame
-   * that only carried new token text can never look like an ownership change.
-   */
-  const persistedDataSignature = () => {
-    const entries = hostContext?.sessionManager.buildContextEntries() ?? [];
-    const hash = createHash("sha256");
-    for (const entry of entries) {
-      const message = (entry as { message?: { role?: unknown; toolCallId?: unknown } }).message;
-      const data = (entry as { data?: { logicalId?: unknown; origin?: { key?: unknown; blockIndex?: unknown } } }).data;
-      hash.update(`${entry.type}\u0000${String(entry.customType ?? "")}\u0000${String(message?.role ?? "")}\u0000${String(message?.toolCallId ?? "")}\u0000${String(data?.logicalId ?? "")}\u0000${String(data?.origin?.key ?? "")}\u0000${String(data?.origin?.blockIndex ?? "")}\u0000`);
-    }
-    return hash.digest("hex").slice(0, 16);
-  };
-  /** Structural + persisted-claim gate; both parts ignore streaming churn. */
-  const currentTreeSignature = () => `${host.publicTreeSignature()}|${persistedDataSignature()}`;
-  /**
-   * Safety net for host-side changes that emit no extension event (component rebuilds, peer claims).
-   * Guarded by identity signatures so ordinary streaming never schedules work; the reconcile it lowers to
-   * is a diff repaint, never a full-history replay.
+   * Safety net for host-side changes that emit no extension event. It lowers to the diff path: the host owns
+   * rendering streaming text, so a reconcile here must never reset renderer state.
    */
   const scheduleTreeReconcile = () => {
-    const observed = currentTreeSignature();
-    if (treeReconcileQueued || observed === treeSignature) return;
+    const observed = currentReconciliationSignature();
+    if (treeReconcileQueued || observed === reconciliationSignature) return;
     treeReconcileQueued = true;
     queueMicrotask(() => {
       treeReconcileQueued = false;
-      const current = currentTreeSignature();
-      if (current === treeSignature) return;
-      treeSignature = current;
+      const current = currentReconciliationSignature();
+      if (current === reconciliationSignature) return;
+      reconciliationSignature = current;
       wake(false);
     });
   };
@@ -90,6 +74,7 @@ export default function piInlineImages(pi: ExtensionAPI) {
       const forceRepaint = forceRepaintQueued;
       forceRepaintQueued = false;
       reconcileHost();
+      reconciliationSignature = currentReconciliationSignature();
       if (forceRepaint) {
         tui?.invalidate();
         tui?.requestRender(true);
@@ -121,7 +106,7 @@ export default function piInlineImages(pi: ExtensionAPI) {
     ui.setWidget("pi-inline-images:repaint-bridge", (candidate: TUI) => {
       tui = candidate;
       host.setTui(candidate);
-      treeSignature = undefined;
+      reconciliationSignature = undefined;
       return { render: () => { scheduleTreeReconcile(); return []; }, invalidate() {} };
     });
   };
@@ -166,14 +151,14 @@ export default function piInlineImages(pi: ExtensionAPI) {
   pi.on("session_start", restore as never);
   pi.on("session_compact", (() => {
     host.suspend("compaction component reconstruction");
-    treeSignature = undefined;
+    reconciliationSignature = undefined;
     wake();
   }) as never);
   pi.on("session_compact_failed", (() => wake()) as never);
   pi.on("session_tree", (async (_event: unknown, context: HostContext) => {
     if (context.mode === "tui") {
       host.suspend("session tree component reconstruction", false);
-      treeSignature = undefined;
+      reconciliationSignature = undefined;
       hostContext = context;
       installWakeWidget(context.ui);
       await session.restore(context.sessionManager.buildContextEntries(), context.cwd, true);
@@ -191,7 +176,7 @@ export default function piInlineImages(pi: ExtensionAPI) {
     removeOwnershipChanged();
     host.dispose();
     hostContext = undefined;
-    treeSignature = undefined;
+    reconciliationSignature = undefined;
     treeReconcileQueued = false;
     widgetUi?.setWidget("pi-inline-images:repaint-bridge", undefined);
     widgetUi = undefined;

@@ -140,9 +140,9 @@ decorated per instance (never by prototype) so local thinking/invalidate rebuild
 retain exact historical Markdown occurrences. Successful compaction/tree rebuilds
 revoke old-generation claims before the first reconstructed frame and renew only
 after new public component identities appear. Every ownership transition coalesces
-one invalidate/forced render; ordinary live binding updates coalesce a diff render
-only, and the widget gate keys on the public tree plus persisted claim identity, so
-streaming text alone never schedules work.
+one invalidate/forced render; ordinary live binding updates (streaming tokens, structural
+live-binding changes) coalesce a diff render only, so a token can reconcile but never resets
+renderer state or re-emits scrollback.
 
 Automatic read rejection persists bounded error metadata. An oversized encoded
 block records tool/user identity, block index, MIME, and encoded length without

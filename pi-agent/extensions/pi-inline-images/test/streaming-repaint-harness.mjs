@@ -173,7 +173,6 @@ const liveToolBound = Boolean(toolRow) && toolRow.setShowImages !== ToolExecutio
 
 await runner.emit({ type: "session_shutdown" });
 await settle();
-assert.equal(forceRenders, forceRenders, "counter sanity");
 console.log(`STREAM_JSON ${JSON.stringify({
   tokens: TOKENS, historyRows: historical.length, streaming, streamingTextPreserved,
   messageEnd: { forceRenders: messageEnd.forceRenders },
