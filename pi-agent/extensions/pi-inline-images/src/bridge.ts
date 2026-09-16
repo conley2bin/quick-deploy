@@ -17,6 +17,8 @@ export interface GraphicsOwnerHandle {
   prepare(logicalId: string, image: LoadedImage): Promise<void>;
   render(logicalId: string, width: number): string[];
   failure(logicalId: string): string | undefined;
+  release(logicalId: string): Promise<void>;
+  reset(): Promise<void>;
 }
 
 function request(value: unknown): value is Request {
@@ -34,6 +36,8 @@ export function installGraphicsBridge(events: EventBus, terminal: TerminalImages
     prepare: (logicalId, image) => terminal.prepare(`${owner}:${logicalId}`, image),
     render: (logicalId, width) => terminal.render(`${owner}:${logicalId}`, width),
     failure: (logicalId) => terminal.failure(`${owner}:${logicalId}`),
+    release: (logicalId) => terminal.release(`${owner}:${logicalId}`),
+    reset: () => terminal.resetOwner(owner),
   });
   const handles = new Map<Owner, GraphicsOwnerHandle>([["inline", makeHandle("inline")], ["read", makeHandle("read")]]);
   return events.on(IMAGE_BRIDGE_REQUEST, (value: unknown) => {

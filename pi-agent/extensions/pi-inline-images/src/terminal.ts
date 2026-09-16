@@ -14,6 +14,7 @@ import { deleteImage, grid, placement } from "../vendor/pi-tmux-images/kitty-pla
 import type { ViewerState } from "./viewers.ts";
 
 export const MAX_ACTIVE_IMAGES = 64;
+export const MAX_READ_IMAGES = 16;
 export const MAX_RESIDENT_PNG_BYTES = 64 * 1024 * 1024;
 export const MAX_PLACEMENTS_PER_IMAGE = 80;
 export const MAX_PLACEMENT_CATALOG_BYTES = 80 * 56;
@@ -111,10 +112,12 @@ export class TerminalImages {
     this.transport = new BoundedTransport(normalizeSink(sink), options.transportLimits, options.scheduler);
   }
 
-  available(): boolean { return this.capable; }
+  available(): boolean { return this.viewerManaged || this.capable; }
   has(logicalId: string): boolean { return this.images.get(logicalId)?.ready === true; }
   count(): number { return this.images.size; }
   residentBytes(): number { return this.residentPngBytes; }
+  private ownerOf(logicalId: string): "inline" | "read" { return logicalId.startsWith("read:") ? "read" : "inline"; }
+  private ownerCount(owner: "inline" | "read"): number { return [...this.images.keys()].filter((id) => this.ownerOf(id) === owner).length; }
   pendingJobs(): number { return this.transport.pendingJobs; }
   failure(logicalId: string): string | undefined {
     const state = this.images.get(logicalId);
@@ -151,7 +154,9 @@ export class TerminalImages {
       if (existing.error) throw new Error(existing.error);
       return;
     }
-    if (this.images.size >= MAX_ACTIVE_IMAGES) throw new Error(`inline image capacity reached (${MAX_ACTIVE_IMAGES})`);
+    const owner = this.ownerOf(logicalId);
+    const ownerLimit = owner === "read" ? MAX_READ_IMAGES : MAX_ACTIVE_IMAGES;
+    if (this.ownerCount(owner) >= ownerLimit) throw new Error(`${owner} image capacity reached (${ownerLimit})`);
     if (image.png.length > MAX_FULL_PNG_BYTES) {
       throw new Error(`full PNG is ${image.png.length} bytes; limit is ${MAX_FULL_PNG_BYTES} bytes`);
     }
@@ -217,7 +222,7 @@ export class TerminalImages {
   /** Pure synchronous render: every possible width placement was prepared first. */
   render(logicalId: string, availableWidth: number): string[] {
     const state = this.images.get(logicalId);
-    if (!state?.ready || state.error || !this.capable) return [];
+    if (!state?.ready || state.error || (!this.viewerManaged && !this.capable)) return [];
     const currentCell = this.cellSize();
     if (currentCell.widthPx !== state.cell.widthPx || currentCell.heightPx !== state.cell.heightPx) {
       state.error = `terminal cell dimensions changed from ${state.cell.widthPx}x${state.cell.heightPx} px to ${currentCell.widthPx}x${currentCell.heightPx} px; reload required`;
@@ -230,6 +235,22 @@ export class TerminalImages {
       return [];
     }
     return grid(size.columns, size.rows, state.id, prepared.placementId);
+  }
+
+  /** Release one owner's resource without touching other owner state or drain debt. */
+  async release(logicalId: string): Promise<void> {
+    const state = this.images.get(logicalId);
+    if (!state) return;
+    this.images.delete(logicalId);
+    this.residentPngBytes -= state.image.png.length;
+    if (!state.ready || (!this.viewerManaged && !this.capable)) return;
+    const generation = this.transport.generation;
+    await this.transport.enqueue(generation, { transaction: deleteImage(state.id, this.inTmux()) });
+    await this.transport.ready(generation);
+  }
+
+  async resetOwner(owner: "inline" | "read"): Promise<void> {
+    for (const logicalId of [...this.images.keys()]) if (this.ownerOf(logicalId) === owner) await this.release(logicalId);
   }
 
   /** Cancel unsent work while retaining successfully prepared resources in this runtime. */
@@ -246,7 +267,7 @@ export class TerminalImages {
   async clear(dispose = false): Promise<void> {
     try {
       this.transport.cancel("image session reset");
-      if (!this.capable) {
+      if (!this.capable && !this.viewerManaged) {
         this.images.clear();
         this.residentPngBytes = 0;
         return;

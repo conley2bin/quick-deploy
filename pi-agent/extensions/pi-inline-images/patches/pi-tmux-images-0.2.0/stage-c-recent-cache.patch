@@ -1,5 +1,5 @@
 diff --git a/extensions/index.ts b/extensions/index.ts
-index 6ccf227..121e6b6 100644
+index 6ccf227..cb5333e 100644
 --- a/extensions/index.ts
 +++ b/extensions/index.ts
 @@ -8,7 +8,8 @@ import { CLEAR_TYPE, type ClearEntry, ENTRY_TYPE, isPreview, type PreviewEntry }
@@ -24,21 +24,17 @@ index 6ccf227..121e6b6 100644
  
  export function registerInlineImages(pi: ExtensionAPI, runtime = new PreviewRuntime()) {
  	let stale = new Map<string, string>();
-@@ -29,6 +30,13 @@ export function registerInlineImages(pi: ExtensionAPI, runtime = new PreviewRunt
+@@ -29,6 +30,9 @@ export function registerInlineImages(pi: ExtensionAPI, runtime = new PreviewRunt
  	const pending = new Map<string, NonNullable<PreviewEntry["origin"]>>();
  	let messageOrdinals = new WeakMap<object, number>();
  	const reservedOrdinals = new Set<number>();
 +	const requestId = randomUUID();
-+	pi.events.on("pi-inline-images:graphics-owner:reply", (value) => {
-+		const reply = value as { version?: unknown; owner?: unknown; requestId?: unknown; handle?: unknown };
-+		if (reply.version === 1 && reply.owner === "read" && reply.requestId === requestId && reply.handle) runtime.setShared(reply.handle as never);
-+	});
-+	function requestBridge() { pi.events.emit("pi-inline-images:graphics-owner:request", { version: 1, owner: "read", requestId }); }
-+	requestBridge();
++	pi.events.on("pi-inline-images:graphics-owner:reply", (value) => { const r=value as {version?:unknown;owner?:unknown;requestId?:unknown;handle?:unknown}; if(r.version===1&&r.owner==="read"&&r.requestId===requestId&&r.handle) runtime.setShared(r.handle as never); });
++	const requestBridge=()=>pi.events.emit("pi-inline-images:graphics-owner:request",{version:1,owner:"read",requestId}); requestBridge();
  	function enqueue(operation: () => Promise<void>): Promise<void> {
  		const next = serial.then(operation, operation);
  		serial = next.catch(() => undefined);
-@@ -55,7 +63,8 @@ export function registerInlineImages(pi: ExtensionAPI, runtime = new PreviewRunt
+@@ -55,7 +59,8 @@ export function registerInlineImages(pi: ExtensionAPI, runtime = new PreviewRunt
  		return enqueue(async () => {
  			if (expected !== generation) return;
  			runtime.clear();
@@ -48,25 +44,25 @@ index 6ccf227..121e6b6 100644
  			const restored = await runtime.rehydrate(entries, ctx.cwd, (entry) => {
  				const block = findOrigin(branch(ctx), entry);
  				return block ? { data: block.data, mimeType: block.mimeType } : undefined;
-@@ -64,7 +73,8 @@ export function registerInlineImages(pi: ExtensionAPI, runtime = new PreviewRunt
+@@ -64,7 +69,7 @@ export function registerInlineImages(pi: ExtensionAPI, runtime = new PreviewRunt
  				runtime.clear();
  				return;
  			}
 -			stale = restored;
-+			stale = new Map(all.slice(0, -MAX_RECENT_PREVIEWS).map((entry) => [entry.logicalId, "Expired from the recent preview cache."]));
-+			for (const [logicalId, reason] of restored) stale.set(logicalId, reason);
++			stale = new Map(all.slice(0,-MAX_RECENT_PREVIEWS).map((entry)=>[entry.logicalId,"Expired from the recent preview cache."])); for (const [id,reason] of restored) stale.set(id,reason);
  		});
  	}
  	function automatic(message: unknown, ctx: ExtensionContext, expected: number) {
-@@ -83,7 +93,6 @@ export function registerInlineImages(pi: ExtensionAPI, runtime = new PreviewRunt
+@@ -83,7 +88,7 @@ export function registerInlineImages(pi: ExtensionAPI, runtime = new PreviewRunt
  			}
  			for (const [token, origin] of pending) if (hasPersistedOrigin(entries, origin)) pending.delete(token);
  			for (const { block, origin } of automaticBlocks(message, messageOrdinal)) {
 -				if (activeEntries(ctx).length >= 16) return;
++				if (activeEntries(ctx).length >= MAX_RECENT_PREVIEWS) await runtime.release(activeEntries(ctx)[0]!.logicalId);
  				const token = originToken(origin);
  				if (pending.has(token) || hasPersistedOrigin(entries, origin)) continue;
  				pending.set(token, origin);
-@@ -103,8 +112,8 @@ export function registerInlineImages(pi: ExtensionAPI, runtime = new PreviewRunt
+@@ -103,8 +108,8 @@ export function registerInlineImages(pi: ExtensionAPI, runtime = new PreviewRunt
  			}
  		});
  	}
@@ -77,7 +73,7 @@ index 6ccf227..121e6b6 100644
  	pi.on("session_shutdown", async () => {
  		const expected = invalidate();
  		return enqueue(async () => {
-@@ -127,10 +136,6 @@ export function registerInlineImages(pi: ExtensionAPI, runtime = new PreviewRunt
+@@ -127,10 +132,7 @@ export function registerInlineImages(pi: ExtensionAPI, runtime = new PreviewRunt
  			const expected = generation;
  			return enqueue(async () => {
  				if (expected !== generation) return;
@@ -85,30 +81,29 @@ index 6ccf227..121e6b6 100644
 -					ctx.ui.notify("Image preview limit reached (16). Use /image clear before adding another image.", "error");
 -					return;
 -				}
++				if (activeEntries(ctx).length >= MAX_RECENT_PREVIEWS) await runtime.release(activeEntries(ctx)[0]!.logicalId);
  				try {
  					const entry = await runtime.add(args, randomUUID().replaceAll("-", ""), ctx.cwd);
  					if (expected !== generation) {
 diff --git a/src/renderer.ts b/src/renderer.ts
-index bfaaa84..cabc68a 100644
+index bfaaa84..fa60340 100644
 --- a/src/renderer.ts
 +++ b/src/renderer.ts
-@@ -1,10 +1,14 @@
+@@ -1,10 +1,9 @@
 -import { type Component, Image, type ImageTheme } from "@earendil-works/pi-tui";
-+import { type Component, Image, type ImageTheme, Text } from "@earendil-works/pi-tui";
++import { type Component, type ImageTheme, Text } from "@earendil-works/pi-tui";
  import type { PreviewRuntime } from "./runtime.ts";
  import type { PreviewEntry } from "./transcript-entry.ts";
  
- export function fallback(entry: PreviewEntry, reason?: string): string[] {
- 	return [`[image] ${reason ?? `${entry.originalMime} ${entry.width}×${entry.height}`}: ${entry.path}`];
- }
-+function notice(entry: PreviewEntry, reason?: string): Component {
-+	const value = fallback(entry, reason).join("\n");
-+	return { render: (width) => new Text(value, 0, 0).render(Math.max(1, width)), invalidate() {} };
-+}
+-export function fallback(entry: PreviewEntry, reason?: string): string[] {
+-	return [`[image] ${reason ?? `${entry.originalMime} ${entry.width}×${entry.height}`}: ${entry.path}`];
+-}
++export function fallback(entry: PreviewEntry, reason?: string): string[] { return [`[image] ${reason ?? `${entry.originalMime} ${entry.width}×${entry.height}`}: ${entry.path}`]; }
++function notice(entry: PreviewEntry, reason?: string): Component { const text=fallback(entry,reason).join("\n"); return { render:(width)=>new Text(text,0,0).render(Math.max(1,width)),invalidate(){} }; }
  function imageTheme(theme: unknown): ImageTheme {
  	const candidate = theme as { fallbackColor?: unknown } | undefined;
  	return {
-@@ -20,11 +24,14 @@ export function previewComponent(
+@@ -20,16 +19,8 @@ export function previewComponent(
  	theme: unknown,
  	stale?: string,
  ): Component {
@@ -116,33 +111,31 @@ index bfaaa84..cabc68a 100644
 +	if (stale) return notice(entry, stale);
  	const image = runtime.get(entry.logicalId);
 -	if (!image) return { render: () => fallback(entry, "Image is unavailable in this process."), invalidate() {} };
-+	if (!image) return notice(entry, "Image is unavailable in this process.");
- 	if (runtime.mode() === "kitty-placeholder")
+-	if (runtime.mode() === "kitty-placeholder")
 -		return { render: (width) => runtime.emitPlaceholder(entry.logicalId, width), invalidate() {} };
-+		return { render: (width) => {
-+			const rows = runtime.emitPlaceholder(entry.logicalId, width);
-+			return rows.length ? rows : notice(entry, runtime.sharedFailure(entry.logicalId)).render(width);
-+		}, invalidate() {} };
- 	if (runtime.mode() === "image")
- 		return new Image(image.png.toString("base64"), "image/png", imageTheme(theme), {
- 			maxWidthCells: 80,
+-	if (runtime.mode() === "image")
+-		return new Image(image.png.toString("base64"), "image/png", imageTheme(theme), {
+-			maxWidthCells: 80,
+-			maxHeightCells: 24,
+-			imageId: runtime.terminalId(entry.logicalId),
+-		});
+-	return { render: () => fallback(entry), invalidate() {} };
++	if (!image) return notice(entry, "Image is unavailable in this process.");
++	return { render: (width) => { const rows=runtime.emitPlaceholder(entry.logicalId,width); return rows.length ? rows : notice(entry,runtime.sharedFailure(entry.logicalId)).render(width); }, invalidate() {} };
+ }
 diff --git a/src/runtime.ts b/src/runtime.ts
-index 73949b5..b90506c 100644
+index 73949b5..2069ec7 100644
 --- a/src/runtime.ts
 +++ b/src/runtime.ts
-@@ -4,6 +4,11 @@ import { deleteImage, deletePlacement, grid, placement, type Sink, upload } from
+@@ -4,6 +4,7 @@ import { deleteImage, deletePlacement, grid, placement, type Sink, upload } from
  import { type FileOps, type LoadedImage, loadImage, loadImageBytes } from "./loader.ts";
  import type { PreviewEntry } from "./transcript-entry.ts";
  
-+export interface SharedGraphicsHandle {
-+	prepare(logicalId: string, image: { source: string; hash: string; width: number; height: number; png: Buffer }): Promise<void>;
-+	render(logicalId: string, width: number): string[];
-+	failure(logicalId: string): string | undefined;
-+}
++export interface SharedGraphicsHandle { prepare(logicalId: string, image: { source: string; hash: string; width: number; height: number; png: Buffer }): Promise<void>; render(logicalId: string, width: number): string[]; failure(logicalId: string): string | undefined; release(logicalId: string): Promise<void>; reset(): Promise<void>; }
  export interface RuntimeDeps {
  	env?: Environment;
  	output?: Sink;
-@@ -43,6 +48,7 @@ export class PreviewRuntime {
+@@ -43,6 +44,7 @@ export class PreviewRuntime {
  	private readonly uploaded = new Map<number, string>();
  	/** Current terminal placement geometry, keyed by runtime-owned image ID. */
  	private readonly placements = new Map<number, string>();
@@ -150,16 +143,22 @@ index 73949b5..b90506c 100644
  	constructor(deps: RuntimeDeps = {}) {
  		this.env = deps.env ?? process.env;
  		this.output = deps.output ?? { write: (s) => process.stdout.write(s) };
-@@ -57,6 +63,8 @@ export class PreviewRuntime {
- 	mode(): RenderMode {
- 		return this.renderMode;
+@@ -54,9 +56,11 @@ export class PreviewRuntime {
+ 		// Probe once per runtime rather than during every component render.
+ 		this.renderMode = renderMode(this.env, this.protocol, deps.tmuxProbe);
  	}
+-	mode(): RenderMode {
+-		return this.renderMode;
+-	}
++	mode(): RenderMode { return this.renderMode; }
 +	setShared(handle: SharedGraphicsHandle | undefined): void { this.shared = handle; }
-+	sharedFailure(logicalId: string): string | undefined { return this.shared ? this.shared.failure(logicalId) : "Shared inline image bridge unavailable."; }
++	sharedFailure(id: string): string | undefined { return this.shared ? this.shared.failure(id) : "Shared inline image bridge unavailable."; }
++	async release(id: string): Promise<void> { this.images.delete(id); this.terminalIds.delete(id); if (this.shared) await this.shared.release(id); }
++	async reset(): Promise<void> { this.images.clear(); this.terminalIds.clear(); if (this.shared) await this.shared.reset(); }
  	private id(logicalId: string): number {
  		const existing = this.terminalIds.get(logicalId);
  		if (existing) return existing;
-@@ -72,6 +80,7 @@ export class PreviewRuntime {
+@@ -72,6 +76,7 @@ export class PreviewRuntime {
  		const image = await this.loader(path, { cwd, fs: this.fs });
  		this.images.set(logicalId, image);
  		this.id(logicalId);
@@ -167,7 +166,7 @@ index 73949b5..b90506c 100644
  		return {
  			path: image.path,
  			hash: image.hash,
-@@ -88,6 +97,7 @@ export class PreviewRuntime {
+@@ -88,6 +93,7 @@ export class PreviewRuntime {
  		const image = await this.byteLoader(data, mimeType, path);
  		this.images.set(logicalId, image);
  		this.id(logicalId);
@@ -175,12 +174,51 @@ index 73949b5..b90506c 100644
  		return {
  			path: image.path,
  			hash: image.hash,
-@@ -124,6 +134,8 @@ export class PreviewRuntime {
- 	emitPlaceholder(logicalId: string, availableWidth: number): string[] {
- 		const image = this.images.get(logicalId);
- 		if (!image) return [];
-+		if (this.shared) return this.shared.render(logicalId, availableWidth);
-+		return [];
- 		const size = geometry(image.width, image.height, Math.max(1, Math.min(80, availableWidth - 2)));
- 		const id = this.id(logicalId),
- 			png = image.png.toString("base64"),
+@@ -115,42 +121,17 @@ export class PreviewRuntime {
+ 				else {
+ 					this.images.set(entry.logicalId, image);
+ 					this.id(entry.logicalId);
++					if (this.shared) await this.shared.prepare(entry.logicalId, { source: image.path, hash: image.hash, width: image.width, height: image.height, png: image.png });
+ 				}
+ 			} catch {
+ 				state.set(entry.logicalId, "Image is missing or no longer readable.");
+ 			}
+ 		return state;
+ 	}
+-	emitPlaceholder(logicalId: string, availableWidth: number): string[] {
+-		const image = this.images.get(logicalId);
+-		if (!image) return [];
+-		const size = geometry(image.width, image.height, Math.max(1, Math.min(80, availableWidth - 2)));
+-		const id = this.id(logicalId),
+-			png = image.png.toString("base64"),
+-			tmuxMode = isTmux(this.env);
+-		if (this.uploaded.get(id) !== png) {
+-			for (const sequence of upload(png, id, tmuxMode)) this.output.write(sequence);
+-			this.uploaded.set(id, png);
+-		}
+-		const placementGeometry = `${size.columns}:${size.rows}`;
+-		const previousGeometry = this.placements.get(id);
+-		if (previousGeometry !== placementGeometry) {
+-			// A new a=p command does not replace an existing virtual placement.
+-			// Remove the old placement first so resize redraws cannot overlap or band.
+-			if (previousGeometry !== undefined) this.output.write(deletePlacement(id, tmuxMode));
+-			this.output.write(placement(id, size.columns, size.rows, tmuxMode));
+-			this.placements.set(id, placementGeometry);
+-		}
+-		return grid(size.columns, size.rows, id);
+-	}
+-	clear(): void {
+-		const kitty = this.mode() === "kitty-placeholder" || (this.mode() === "image" && this.protocol === "kitty");
+-		if (kitty) for (const id of this.terminalIds.values()) this.output.write(deleteImage(id, isTmux(this.env)));
+-		this.images.clear();
+-		this.terminalIds.clear();
+-		this.uploaded.clear();
+-		this.placements.clear();
+-	}
++	emitPlaceholder(logicalId: string, availableWidth: number): string[] { return this.shared ? this.shared.render(logicalId, availableWidth) : []; }
++
++	async clear(): Promise<void> { await this.reset(); }
++
+ 	activeIds(): number[] {
+ 		return [...this.terminalIds.values()];
+ 	}
