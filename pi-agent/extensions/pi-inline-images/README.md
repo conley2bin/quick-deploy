@@ -127,16 +127,25 @@ preserve the already-bound prefix; ambiguous mappings keep native display and sh
 a custom-withheld notice. User attachment previews bypass tool-row arbitration.
 The adapter treats pending native image preference as unknown, observes it only
 from a rendered result or public `setShowImages` call, and transfers authorization
-on external off/on and clear without blindly enabling images. Assistant component
-`render` is decorated per instance (never by prototype) so local thinking/invalidate
-rebuilds retain exact historical Markdown occurrences. Every ownership transition
-coalesces one invalidate/render; stable public-tree/branch signatures do nothing.
+on external off/on and clear without blindly enabling images. Native protocol
+capability is separate: when Pi reports `images:null` (ordinary tmux), no native
+bitmap can compete, so the ready custom owner is authorized unless an explicit
+public off choice was observed; the latent host flag is never rewritten. Capability
+changes are part of the reconciliation signature. Assistant component `render` is
+decorated per instance (never by prototype) so local thinking/invalidate rebuilds
+retain exact historical Markdown occurrences. Successful compaction/tree rebuilds
+revoke old-generation claims before the first reconstructed frame and renew only
+after new public component identities appear. Every ownership transition coalesces
+one invalidate/render; stable public-tree/branch signatures do nothing.
 
 Automatic read rejection persists bounded error metadata. An oversized encoded
 block records tool/user identity, block index, MIME, and encoded length without
 hashing, decoding, or copying its payload; raw tool/model/session content is never
-rewritten. The notice uses the same width-aware renderer as corrupt, resident-budget,
-expired, provenance, and clear failures.
+rewritten. Coordination, cache expiry, backend readiness/failure, and provenance
+are evaluated from bounded in-memory state during each pure component render, so
+an existing entry follows unready→ready→revoked→ready without recreation. Notices
+use the same width-aware renderer for corrupt, resident-budget, expired, provenance,
+and clear failures.
 
 Precreating bounded placements is lower risk than dynamic placement: official
 Kitty ordering requires a virtual placement before its placeholder cells, while

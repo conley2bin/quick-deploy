@@ -19,6 +19,8 @@ export type HostSessionEntry = {
 export type HostAdapterApi = {
   version: string;
   sessionEntryToContextMessages(entry: HostSessionEntry): unknown[];
+  /** Public native protocol capability; null means no native bitmap can compete. */
+  nativeImageProtocol?(): "kitty" | "iterm2" | null;
 };
 type AssistantComponent = Component & {
   setHideThinkingBlock(hidden: boolean): void;
@@ -197,6 +199,7 @@ export class HostImageOwnershipAdapter {
   private readonly persistedAssistantCounts = new Map<string, number>();
   private readonly liveResults = new Map<string, object>();
   private preferenceRevision = 0;
+  private reconstructionHold?: { reason: string; priorTree: string };
 
   constructor(
     private readonly session: ImageSession,
@@ -222,7 +225,7 @@ export class HostImageOwnershipAdapter {
   reconciliationSignature(renderEntries: readonly HostSessionEntry[], branch: readonly HostSessionEntry[]): string {
     const tree = this.publicTreeSignature();
     const data = reconciliationDataSignature(branch, this.liveAssistant?.message, this.liveResults);
-    return `${tree}|${data}|pref:${this.preferenceRevision}|render:${renderEntries.length}`;
+    return `${tree}|${data}|pref:${this.preferenceRevision}|native:${this.host.nativeImageProtocol?.() ?? "unknown"}|render:${renderEntries.length}`;
   }
 
   publicTreeSignature(): string {
@@ -233,6 +236,13 @@ export class HostImageOwnershipAdapter {
 
   reconcile(renderEntries: readonly HostSessionEntry[], branch: readonly HostSessionEntry[]): boolean {
     if (this.host.version !== SUPPORTED_HOST_VERSION || !this.tui) return this.fail(`unsupported Pi host ${this.host.version}`);
+    if (this.reconstructionHold) {
+      if (this.publicTreeSignature() === this.reconstructionHold.priorTree) {
+        this.publish({ version: READ_PREVIEW_COORDINATION_VERSION, ready: false, activeLogicalIds: [], reason: this.reconstructionHold.reason });
+        return false;
+      }
+      this.reconstructionHold = undefined;
+    }
     const messages = contextMessages(renderEntries, this.host);
     const assistantCounts = new Map<string, number>();
     for (const message of messages) if (role(message) === "assistant") {
@@ -282,15 +292,20 @@ export class HostImageOwnershipAdapter {
     const results = resultImages(messages, this.liveResults);
     const claims = activeClaims(branch);
     const accepted = new Set<string>();
+    const nativeProtocol = this.host.nativeImageProtocol?.();
     for (const [id, row] of toolRows) {
       const result = results.get(id);
       const claimed = claims.get(id);
       const complete = Boolean(result?.size && claimed && result.size === claimed.size
         && [...result].every((blockIndex) => claimed.has(blockIndex)));
       const binding = this.tools.get(row)!;
-      if (complete && binding.externalDesired === undefined && containsNativeBitmap(row.render(Math.max(1, this.tui.terminal.columns)))) {
-        binding.externalDesired = true;
+      if (complete && binding.externalDesired !== false && nativeProtocol === null) {
+        // Native protocol absence is capability, not user intent: keep the latent row flag untouched.
+        this.release(row);
+        for (const logicalId of claimed!.values()) accepted.add(logicalId);
+        continue;
       }
+      if (complete && binding.externalDesired === undefined && containsNativeBitmap(row.render(Math.max(1, this.tui.terminal.columns)))) binding.externalDesired = true;
       if (complete && binding.externalDesired === true) {
         this.suppress(row);
         for (const logicalId of claimed!.values()) accepted.add(logicalId);
@@ -298,6 +313,19 @@ export class HostImageOwnershipAdapter {
     }
     this.publish({ version: READ_PREVIEW_COORDINATION_VERSION, ready: true, activeLogicalIds: [...accepted].sort() });
     return true;
+  }
+
+  suspend(reason: string, waitForNewGeneration = true): void {
+    const priorTree = this.publicTreeSignature();
+    for (const binding of this.tools.values()) this.restoreTool(binding);
+    for (const binding of this.assistants.values()) this.restoreAssistant(binding);
+    this.tools.clear();
+    this.assistants.clear();
+    this.liveResults.clear();
+    this.liveAssistant = undefined;
+    this.persistedAssistantCounts.clear();
+    this.reconstructionHold = waitForNewGeneration ? { reason, priorTree } : undefined;
+    this.publish({ version: READ_PREVIEW_COORDINATION_VERSION, ready: false, activeLogicalIds: [], reason });
   }
 
   dispose(): void {
@@ -308,6 +336,7 @@ export class HostImageOwnershipAdapter {
     this.liveResults.clear();
     this.liveAssistant = undefined;
     this.persistedAssistantCounts.clear();
+    this.reconstructionHold = undefined;
     this.publish({ version: READ_PREVIEW_COORDINATION_VERSION, ready: false, activeLogicalIds: [], reason: "adapter disposed" });
     this.tui = undefined;
   }

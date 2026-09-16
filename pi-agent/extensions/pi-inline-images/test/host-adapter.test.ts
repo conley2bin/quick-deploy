@@ -48,17 +48,18 @@ async function hostComponents() {
   return {
     assistant: (message: object) => new assistantModule.AssistantMessageComponent(message, false, undefined, "Thinking...", 1, []),
     tool: (name: string, id: string) => new toolModule.ToolExecutionComponent(name, id, {}, { showImages: true, imageWidthCells: 60 }, undefined, ui, "/fixture"),
+    setNativeProtocol: (images: "kitty" | "iterm2" | null) => tui.setCapabilities({ images, trueColor: true, hyperlinks: true }),
   };
 }
 
-function adapterFixture(children: object[]) {
+function adapterFixture(children: object[], nativeImageProtocol?: () => "kitty" | "iterm2" | null) {
   const terminal = new TerminalImages(() => 1, () => ({ widthPx: 8, heightPx: 16 }), { write: () => true }, { TERM_PROGRAM: "ghostty" }, true, { transportLimits: { minIntervalMs: 0 } });
   const session = new ImageSession(terminal);
   const events: ReadPreviewCoordination[] = [];
   const adapter = new HostImageOwnershipAdapter(
     session,
     (event) => events.push(event),
-    { version: "0.85.1", sessionEntryToContextMessages: (entry) => entry.message ? [entry.message] : [] },
+    { version: "0.85.1", sessionEntryToContextMessages: (entry) => entry.message ? [entry.message] : [], nativeImageProtocol },
   );
   const tui = { children, terminal: { columns: 80 }, render: () => [], invalidate() {}, requestRender() {} };
   adapter.setTui(tui as never);
@@ -177,6 +178,63 @@ test("external off/on while claimed transfers authorization between zero and one
   readRow.setShowImages(true);
   assert.equal(adapter.reconcile(owned as never, owned as never), true);
   assert.equal(hasNativeImage(readRow), false, "external on re-enables the one custom owner, not native duplication");
+  assert.deepEqual(events.at(-1)?.activeLogicalIds, ["preview-one"]);
+  adapter.dispose();
+});
+
+test("native capability null authorizes custom without inventing preference and follows explicit off/on", async () => {
+  const host = await hostComponents();
+  host.setNativeProtocol(null);
+  let protocol: "kitty" | "iterm2" | null = null;
+  const assistant = assistantMessage("assistant-tmux", [{ id: "read-one", name: "read" }]);
+  const assistantRow = host.assistant(assistant);
+  const readRow = host.tool("read", "read-one");
+  const resultEntry = toolResult("result", "read-one");
+  readRow.updateResult((resultEntry as { message: object }).message);
+  assert.equal(hasNativeImage(readRow), false);
+  const owned = [messageEntry("assistant-entry", assistant), resultEntry, preview("preview-one", "read-one")];
+  const { adapter, events } = adapterFixture([assistantRow, readRow], () => protocol);
+  assert.equal(adapter.reconcile(owned as never, owned as never), true);
+  assert.deepEqual(events.at(-1)?.activeLogicalIds, ["preview-one"], "native capability absence cannot masquerade as user image-off");
+
+  readRow.setShowImages(false);
+  assert.equal(adapter.reconcile(owned as never, owned as never), true);
+  assert.deepEqual(events.at(-1)?.activeLogicalIds, []);
+  readRow.setShowImages(true);
+  assert.equal(adapter.reconcile(owned as never, owned as never), true);
+  assert.deepEqual(events.at(-1)?.activeLogicalIds, ["preview-one"]);
+  protocol = "kitty"; host.setNativeProtocol("kitty"); readRow.invalidate();
+  assert.equal(adapter.reconcile(owned as never, owned as never), true);
+  assert.equal(hasNativeImage(readRow), false, "later native capability is suppressed before custom authorization remains active");
+  protocol = null; host.setNativeProtocol(null); readRow.invalidate();
+  assert.equal(adapter.reconcile(owned as never, owned as never), true);
+  assert.deepEqual(events.at(-1)?.activeLogicalIds, ["preview-one"]);
+
+  const cleared = [...owned, { type: "custom", customType: "pi-tmux-images.clear", id: "clear", parentId: null, timestamp, data: { marker: true } }];
+  assert.equal(adapter.reconcile(cleared as never, cleared as never), true);
+  protocol = "kitty"; host.setNativeProtocol("kitty"); readRow.invalidate();
+  assert.equal(adapter.reconcile(cleared as never, cleared as never), true);
+  assert.equal(hasNativeImage(readRow), true, "clear preserved the latent host-enabled flag while native capability was absent");
+  adapter.dispose();
+});
+
+test("reconstruction hold renews only on a new public component generation", async () => {
+  const host = await hostComponents();
+  const assistant = assistantMessage("assistant-rebuild", [{ id: "read-one", name: "read" }]);
+  const resultEntry = toolResult("result", "read-one");
+  const entries = [messageEntry("assistant-entry", assistant), resultEntry, preview("preview-one", "read-one")];
+  const firstAssistant = host.assistant(assistant); const firstRow = host.tool("read", "read-one");
+  firstRow.updateResult((resultEntry as { message: object }).message);
+  const children: object[] = [firstAssistant, firstRow];
+  const { adapter, events } = adapterFixture(children);
+  assert.equal(adapter.reconcile(entries as never, entries as never), true);
+  adapter.suspend("fixture reconstruction");
+  assert.equal(adapter.reconcile(entries as never, entries as never), false, "old component generation cannot reacquire during reconstruction hold");
+  assert.equal(events.at(-1)?.ready, false);
+
+  const nextAssistant = host.assistant(assistant); const nextRow = host.tool("read", "read-one");
+  nextRow.updateResult((resultEntry as { message: object }).message); children.splice(0, children.length, nextAssistant, nextRow);
+  assert.equal(adapter.reconcile(entries as never, entries as never), true);
   assert.deepEqual(events.at(-1)?.activeLogicalIds, ["preview-one"]);
   adapter.dispose();
 });

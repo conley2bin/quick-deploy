@@ -9,9 +9,9 @@ ownership_upgrade="$patch_dir/stage-c-ownership-fixes.patch"
 
 [ "$mode" = check ] || [ "$mode" = apply ] || { echo "unknown mode: $mode" >&2; exit 2; }
 [ "$(node -p "require('$root/package.json').version")" = "0.2.0" ] || { echo 'expected pi-tmux-images 0.2.0' >&2; exit 1; }
-[ "$(sha256sum "$patch_file" | awk '{print $1}')" = b5e012eb04c5462369a161a47fd182692d7513138c81f19eeb256a4426973ce5 ] || { echo 'unexpected replay patch digest' >&2; exit 1; }
+[ "$(sha256sum "$patch_file" | awk '{print $1}')" = f233b9eb57668791eb3159e80f68c6e26dc84816d4793fe910fa9e371a263dff ] || { echo 'unexpected replay patch digest' >&2; exit 1; }
 [ "$(sha256sum "$review_upgrade" | awk '{print $1}')" = 4898db2958ee9c4541e468fc388dd663b9b1633df97de1abfe42cdabd787d46b ] || { echo 'unexpected review upgrade patch digest' >&2; exit 1; }
-[ "$(sha256sum "$ownership_upgrade" | awk '{print $1}')" = a768036ba2e7800d5c814938b2a289d572d5f905358ea05c4c8aa76789f70b56 ] || { echo 'unexpected ownership upgrade patch digest' >&2; exit 1; }
+[ "$(sha256sum "$ownership_upgrade" | awk '{print $1}')" = 61b262f43893e8c8ac48b1ff9b23e44c095c5edc4ef769fe10375c33d159135d ] || { echo 'unexpected ownership upgrade patch digest' >&2; exit 1; }
 
 hash() { sha256sum "$root/$1" 2>/dev/null | awk '{print $1}'; }
 extension=$(hash extensions/index.ts)
@@ -52,11 +52,11 @@ elif [ "$extension" = 09b2245981f14df3a82c2acbfec874c4bf02bfd2c386b33bca21e6709b
   && [ "$transcript" = f1375a025880f9095d8c31f930cc444e601ea59b6c66cba4baf818d4e56cdd47 ] \
   && [ "$provenance" = c15f4fc606fcf39806336ffb53ee899da7e2b6595c51fffa1df348665efa6f56 ]; then
   state=previous-patched
-elif [ "$extension" = c387310e555708f5d8a9f110cc5b70f9b103f59a69d78a59b2a4c466928063eb ] \
+elif [ "$extension" = ae0a7dcf44cfb4a0bb5656ac6aed67c929fe5378fad7b067e099dbd4c3f4b0f0 ] \
   && [ "$automatic" = 34978081cc6e08a4dec9e5415dbea0ca469b2ae7731b9503d49acb38a9aa0c13 ] \
   && [ "$loader" = 0b3996ff6fc475fac5985f1fa56a76c9009f86524b02f047812b9c0a7848ad1d ] \
   && [ "$runtime" = 0f13f7c4212b14a3065bff2a65a833eae67a4a242ae514ba962ecf0e690946b9 ] \
-  && [ "$renderer" = 491a90b3b88a46f38e3669a45ce98ca5a2e610b633ec98a1c65b7935d64debb5 ] \
+  && [ "$renderer" = 79f0c47716ccb8af14f3d7c1fe0923ff8933b65a5f64aa719cd71f5ed7a75c23 ] \
   && [ "$transcript" = ef9c21f1406c9a041c8db35f19fd0bfccbddabb9233ba25f585e986840103d14 ] \
   && [ "$provenance" = c15f4fc606fcf39806336ffb53ee899da7e2b6595c51fffa1df348665efa6f56 ]; then
   state=patched

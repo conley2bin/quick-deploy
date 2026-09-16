@@ -1,5 +1,5 @@
 import { sessionEntryToContextMessages, VERSION, type ExtensionAPI, type SessionEntry } from "@earendil-works/pi-coding-agent";
-import { allocateImageId, getCellDimensions, type TUI } from "@earendil-works/pi-tui";
+import { allocateImageId, getCapabilities, getCellDimensions, type TUI } from "@earendil-works/pi-tui";
 import { installGraphicsBridge } from "./src/bridge.ts";
 import {
   HostImageOwnershipAdapter,
@@ -26,7 +26,7 @@ export default function piInlineImages(pi: ExtensionAPI) {
   const host = new HostImageOwnershipAdapter(
     session,
     (coordination) => pi.events.emit(READ_PREVIEW_COORDINATION, coordination),
-    { version: VERSION, sessionEntryToContextMessages },
+    { version: VERSION, sessionEntryToContextMessages, nativeImageProtocol: () => getCapabilities().images },
     () => wake(),
   );
   let tui: TUI | undefined;
@@ -128,8 +128,16 @@ export default function piInlineImages(pi: ExtensionAPI) {
     }
   };
   pi.on("session_start", restore as never);
+  pi.on("session_compact", (() => {
+    host.suspend("compaction component reconstruction");
+    reconciliationSignature = undefined;
+    wake();
+  }) as never);
+  pi.on("session_compact_failed", (() => wake()) as never);
   pi.on("session_tree", (async (_event: unknown, context: HostContext) => {
     if (context.mode === "tui") {
+      host.suspend("session tree component reconstruction", false);
+      reconciliationSignature = undefined;
       hostContext = context;
       installWakeWidget(context.ui);
       await session.restore(context.sessionManager.buildContextEntries(), context.cwd, true);

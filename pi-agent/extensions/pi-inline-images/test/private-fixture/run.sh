@@ -173,6 +173,19 @@ assert not summary["errors"], summary
 assert sum(1 for group in summary["groups"] if group["width"] == 1920 and group["height"] == 1080) == 2, summary
 PY
 env -u TMUX tmux -S "$SOCK" capture-pane -p -e -t "$PANE_ID" -S -240 >"$OUT/artifacts/pane-second-client.txt"
+python3 - "$OUT/artifacts/pane-first-client.txt" "$OUT/artifacts/pane-second-client.txt" "$OUT/artifacts/read-preview-visible-summary.json" <<'PY'
+import json,sys
+summaries=[]
+for path in sys.argv[1:3]:
+    text=open(path,encoding="utf-8",errors="replace").read()
+    summary={"path":path,"expiredNotices":text.count("Expired from"),"withheldNotices":text.count("Custom bitmap withheld"),"originalNotices":text.count("Original resolution unavailable/unverified"),"placeholderGlyphs":text.count("\U0010eeee")}
+    assert summary["expiredNotices"] == 4, summary
+    assert summary["withheldNotices"] == 0, summary
+    assert summary["originalNotices"] >= 1, summary
+    assert summary["placeholderGlyphs"] > 1840, summary
+    summaries.append(summary)
+open(sys.argv[3],"w").write(json.dumps(summaries,indent=2)+"\n")
+PY
 python3 - "$OUT/artifacts/fixture-summary.json" "$DISPLAY" "$PRE" "$FIRST" "$STABLE" "$HIDDEN" "$RESHOWN" "$SECOND" "$SECOND_STABLE" <<'PY'
 import json,sys
 path,display,*values=sys.argv[1:]

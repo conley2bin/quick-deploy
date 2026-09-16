@@ -9,6 +9,7 @@ declare module "@earendil-works/pi-tui" {
     requestRender(force?: boolean): void;
   }
   export function allocateImageId(): number;
+  export function getCapabilities(): { images: "kitty" | "iterm2" | null; trueColor: boolean; hyperlinks: boolean };
   export function getCellDimensions(): { widthPx: number; heightPx: number };
 }
 

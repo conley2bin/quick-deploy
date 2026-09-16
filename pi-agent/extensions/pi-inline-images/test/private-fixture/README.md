@@ -22,6 +22,6 @@ Assertions performed during the run:
 - detach plus a genuinely new Ghostty/tmux client identity triggers one complete resend and then remains stable;
 - every upload is a complete Kitty `m=0` group with legal continuations;
 - the >1 MiB 1920×1080 PNG is reconstructed twice with exact encoded SHA-256 and RGBA pixel/alpha SHA-256;
-- native-Markdown screenshots require a large colorful rendered region, while the read-preview screenshot and PTY/pane captures remain available for review.
+- native-Markdown screenshots require a large colorful rendered region; pane captures require four expired notices, zero custom-withheld notices, and placeholder counts proving all 16 recent read previews plus the Markdown image are actually rendered.
 
 Review `artifacts/fixture-summary.json`, `artifacts/wire/wire-summary.json`, `first-client-native-markdown.png`, `first-client-read-previews.png`, `first-client-after-hide-show.png`, `second-client-resend.png`, `pane-*.txt`, and `pty-output.log`. Logs and temporary package/session state remain under the chosen output directory. The fixture makes no GTK crash claim.

@@ -364,8 +364,15 @@ test("patched old extension sustains 20 previews through the real shared backend
     const renderer = fake.renderers.get(ENTRY_TYPE)!;
     const oldest = previews[0]!.data as Record<string, unknown>;
     const newest = previews.at(-1)!.data as Record<string, unknown>;
-    assert.match(renderer({ data: newest }, {}, {}).render(40).join(" "), /coordination unavailable/u);
-    coordinate(bus, previews.slice(-16).map((entry) => String((entry.data as { logicalId: unknown }).logicalId)));
+    const newestComponent = renderer({ data: newest }, {}, {});
+    assert.match(newestComponent.render(40).join(" "), /coordination unavailable/u);
+    const coordinatedIds = previews.slice(-16).map((entry) => String((entry.data as { logicalId: unknown }).logicalId));
+    coordinate(bus, coordinatedIds);
+    assert.ok(newestComponent.render(20).some((line) => line.includes("\u{10EEEE}")), "the same component observes coordination readiness at render time");
+    coordinate(bus, []);
+    assert.match(newestComponent.render(40).join(" ").replace(/\s+/gu, " "), /Custom bitmap withheld/u);
+    coordinate(bus, coordinatedIds);
+    assert.ok(newestComponent.render(20).some((line) => line.includes("\u{10EEEE}")), "the same component follows revoked then renewed ownership");
     const expired = renderer({ data: { ...oldest, path: `/very/${"目录".repeat(45)}/old-image.png` } }, {}, {}).render(16);
     assert.match(expired.join(" "), /Expired/u);
     assert.ok(expired.length > 1);

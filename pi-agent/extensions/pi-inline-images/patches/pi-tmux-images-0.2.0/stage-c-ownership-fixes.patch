@@ -1,5 +1,5 @@
 diff --git a/extensions/index.ts b/extensions/index.ts
-index c63818a..b62260e 100644
+index c63818a..7dac800 100644
 --- a/extensions/index.ts
 +++ b/extensions/index.ts
 @@ -7,6 +7,8 @@ import { PreviewRuntime, type SharedGraphicsHandle } from "../src/runtime.ts";
@@ -56,27 +56,27 @@ index c63818a..b62260e 100644
 +	requestBridge();
 -
 +
-@@ -78,8 +94,11 @@ export function registerInlineImages(pi: ExtensionAPI, runtime = new PreviewRunt
--
-+
+@@ -79,7 +95,12 @@ export function registerInlineImages(pi: ExtensionAPI, runtime = new PreviewRunt
 -	pi.registerEntryRenderer<PreviewEntry>(ENTRY_TYPE, (entry, _options, theme) => {
 +	pi.registerEntryRenderer<PreviewEntry>(ENTRY_TYPE, (entry, _options, theme) => {
 -		const data = isPreview(entry.data) ? entry.data : undefined;
 +		const data = isPreview(entry.data) ? entry.data : undefined;
-+		const coordinationFailure = data?.origin?.key.startsWith("tool:") && (!coordinationReady || !coordinated.has(data.logicalId))
-+			? `Native image ownership coordination unavailable: ${coordinationReason}. Custom bitmap withheld.`
-+			: undefined;
 -		return data
 +		return data
 -			? previewComponent(data, runtime, theme, stale.get(data.logicalId))
-+			? previewComponent(data, runtime, theme, stale.get(data.logicalId), coordinationFailure)
++			? previewComponent(data, runtime, theme, () => ({
++				stale: stale.get(data.logicalId),
++				coordinationFailure: data.origin?.key.startsWith("tool:") && (!coordinationReady || !coordinated.has(data.logicalId))
++					? `Native image ownership coordination unavailable: ${coordinationReason}. Custom bitmap withheld.`
++					: undefined,
++			}))
 -			: wrappedNotice("[image] Invalid saved preview entry.");
 +			: wrappedNotice("[image] Invalid saved preview entry.");
 -	});
 +	});
 -	pi.registerEntryRenderer<ClearEntry>(CLEAR_TYPE, () => wrappedNotice("[image previews cleared]"));
 +	pi.registerEntryRenderer<ClearEntry>(CLEAR_TYPE, () => wrappedNotice("[image previews cleared]"));
-@@ -120,13 +139,28 @@ export function registerInlineImages(pi: ExtensionAPI, runtime = new PreviewRunt
+@@ -120,13 +141,28 @@ export function registerInlineImages(pi: ExtensionAPI, runtime = new PreviewRunt
 -				reservedOrdinals.add(messageOrdinal);
 +				reservedOrdinals.add(messageOrdinal);
 -			}
@@ -118,7 +118,7 @@ index c63818a..b62260e 100644
 +					const evidence = toolCallId ? provenance.consume(toolCallId, origin.blockIndex, origin.contentHash) : undefined;
 -					const verified = evidence?.status === "verified-local-original" ? evidence.capture : undefined;
 +					const verified = evidence?.status === "verified-local-original" ? evidence.capture : undefined;
-@@ -147,9 +181,23 @@ export function registerInlineImages(pi: ExtensionAPI, runtime = new PreviewRunt
+@@ -147,9 +183,23 @@ export function registerInlineImages(pi: ExtensionAPI, runtime = new PreviewRunt
 -						origin,
 +						origin,
 -						readProvenance: evidence ? provenance.persist(evidence, entry) : undefined,
@@ -151,7 +151,7 @@ index c63818a..b62260e 100644
 +			}
 -		});
 +		});
-@@ -178,6 +226,7 @@ export function registerInlineImages(pi: ExtensionAPI, runtime = new PreviewRunt
+@@ -178,6 +228,7 @@ export function registerInlineImages(pi: ExtensionAPI, runtime = new PreviewRunt
 -	pi.on("session_shutdown", async () => {
 +	pi.on("session_shutdown", async () => {
 -		const expected = invalidate();
@@ -165,7 +165,7 @@ index c63818a..b62260e 100644
 +	});
 -	pi.on("message_end", async (event, ctx) => automatic(event.message, ctx, generation));
 +	pi.on("message_end", async (event, ctx) => automatic(event.message, ctx, generation));
-@@ -192,6 +241,7 @@ export function registerInlineImages(pi: ExtensionAPI, runtime = new PreviewRunt
+@@ -192,6 +243,7 @@ export function registerInlineImages(pi: ExtensionAPI, runtime = new PreviewRunt
 -					await runtime.clear();
 +					await runtime.clear();
 -					pi.appendEntry<ClearEntry>(CLEAR_TYPE, { marker: true });
@@ -329,28 +329,43 @@ index 1070298..3cb8e24 100644
 -		return undefined;
 +		return undefined;
 diff --git a/src/renderer.ts b/src/renderer.ts
-index b15aec4..293bd2b 100644
+index b15aec4..cc756b5 100644
 --- a/src/renderer.ts
 +++ b/src/renderer.ts
-@@ -19,8 +19,11 @@ export function previewComponent(
+@@ -14,16 +14,20 @@ function notice(entry: PreviewEntry, reason?: string): Component {
+-	return wrappedNotice(fallback(entry, reason).join("\n"));
++	return wrappedNotice(fallback(entry, reason).join("\n"));
+ }
+-
++
++/** Every volatile ownership/cache/backend decision is read during render; render performs no I/O or graphics writes. */
+ export function previewComponent(
+-	entry: PreviewEntry,
++	entry: PreviewEntry,
 -	runtime: PreviewRuntime,
 +	runtime: PreviewRuntime,
 -	_theme: unknown,
 +	_theme: unknown,
 -	stale?: string,
-+	stale?: string,
-+	coordinationFailure?: string,
++	status: () => { stale?: string; coordinationFailure?: string } = () => ({}),
  ): Component {
 -	if (stale) return notice(entry, stale);
-+	if (stale) return notice(entry, stale);
-+	if (entry.error) return notice(entry, entry.error);
-+	if (coordinationFailure) return notice(entry, coordinationFailure);
 -	if (!runtime.get(entry.logicalId)) return notice(entry, "Image is unavailable in this process.");
-+	if (!runtime.get(entry.logicalId)) return notice(entry, "Image is unavailable in this process.");
 -	return {
 +	return {
 -		render: (width) => {
 +		render: (width) => {
++			const current = status();
++			if (current.stale) return notice(entry, current.stale).render(width);
++			if (entry.error) return notice(entry, entry.error).render(width);
++			if (current.coordinationFailure) return notice(entry, current.coordinationFailure).render(width);
++			if (!runtime.get(entry.logicalId)) return notice(entry, "Image is unavailable in this process.").render(width);
+-			const rows = runtime.emitPlaceholder(entry.logicalId, width);
++			const rows = runtime.emitPlaceholder(entry.logicalId, width);
+-			const fidelity = runtime.fidelityNotice(entry.logicalId);
++			const fidelity = runtime.fidelityNotice(entry.logicalId);
+-			const output = rows.length ? rows : notice(entry, runtime.sharedFailure(entry.logicalId)).render(width);
++			const output = rows.length ? rows : notice(entry, runtime.sharedFailure(entry.logicalId)).render(width);
 diff --git a/src/runtime.ts b/src/runtime.ts
 index 7d77ad1..6494c8d 100644
 --- a/src/runtime.ts
