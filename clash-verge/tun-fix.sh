@@ -1130,7 +1130,10 @@ verify_merge_yaml() {
 }
 
 # 一键优化
-optimize_all() {
+optimize_all() (
+    # This trap is scoped to the optimizer subshell: any failure after preparing
+    # a candidate removes it without changing outer shell traps or state.
+    trap 'cleanup_prepared_route_rules' EXIT
     local file="$1"
 
     echo ""
@@ -1150,20 +1153,16 @@ optimize_all() {
     # 前两步（清空订阅级 merge、改写 fake-ip-filter）的改动无备份可回
     if [ -f "$file" ]; then
         local pre_backup="$file.backup.$(date +%Y%m%d_%H%M%S)"
-        if ! cp "$file" "$pre_backup"; then
-            cleanup_prepared_route_rules
-            return 1
-        fi
+        cp "$file" "$pre_backup"
         echo "已备份原 Merge 配置: $pre_backup"
         echo ""
     fi
 
-    if ! clear_subscription_merge || ! remove_prepend_rules "$file" || \
-       ! update_fake_ip_filter "$file" || ! update_tun_config "$file" || \
-       ! update_sniffer_config "$file"; then
-        cleanup_prepared_route_rules
-        return 1
-    fi
+    clear_subscription_merge
+    remove_prepend_rules "$file"
+    update_fake_ip_filter "$file"
+    update_tun_config "$file"
+    update_sniffer_config "$file"
     update_direct_rules "$file"
 
     # 文本手术的成功输出 ≠ 文件结构正确，写后校验未通过就以非零退出
@@ -1218,7 +1217,7 @@ optimize_all() {
     # 写文本 ≠ 内核生效。下面的结果反映的是重载前的内核状态，
     # 只有在 Clash Verge 重载配置、重建 TUN 之后重跑才能当作结论。
     verify_tun_routes
-}
+)
 
 # 显示菜单
 show_menu() {
