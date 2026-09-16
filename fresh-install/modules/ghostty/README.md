@@ -172,7 +172,14 @@ locale 一并换成英文（日期、报错、man 页）。病灶在 fontconfig 
 
 配置采用“幂等重置”语义：重跑会把它恢复为模块的基准内容。内容变化时，脚本先备份为 `config.ghostty.bak.<时间戳>`，再用同目录临时文件和原子 `mv` 替换；写完会回读，并通过 Ghostty 自身解析配置。
 
-本模块不会另写主题文件，也不会改写软件包提供的 desktop 文件。
+本模块不会另写主题文件，也不会改写软件包提供的 desktop 文件，不写用户级 desktop
+override，也不写 `gtk-single-instance` 配置。日常启动（应用菜单、Ctrl+Alt+T）沿用软件包
+desktop 入口与 Ghostty 自身默认：`gtk-single-instance` 默认 `detect`（见本机
+`man 1 ghostty`），无 CLI 参数且 `TERM_PROGRAM` 为空时按单实例复用。本模块不做
+“每次外部启动都独立进程”的隔离，也不注入 `GDK_BACKEND`，会话保持原生 Wayland。
+
+`install.sh` 里唯一的 `--gtk-single-instance=false` 属于 GUI 冒烟测试：只让那一次探针
+进程独立，避免复用或波及用户已在运行的 Ghostty，不是模块的启动策略。
 
 ## 默认接管 Ctrl+Alt+T
 
@@ -199,9 +206,10 @@ emulator），不是对 X11 API 的依赖。切到 Wayland 后，只有“按键
 相同，本模块写的包装脚本两边都生效。
 
 > fcitx5 中文输入则是另一回事：上游 issue #12679 报告 Ghostty 在
-> **GNOME Wayland** 下 fcitx5 候选框错位、中文不上屏（工作区变通是
-> `GDK_BACKEND=x11 ghostty` 强制走 XWayland）。本机当前是 X11 会话，不受
-> 影响；若以后切到 Wayland 且中文输入异常，先试该环境变量。
+> **GNOME Wayland** 下 fcitx5 候选框错位、中文不上屏。本模块不设置
+> `GDK_BACKEND`，默认走会话原生的 Wayland；若真的遇到该症状，再临时用
+> `GDK_BACKEND=x11 ghostty` 强制走 XWayland 验证，那是排障手段，不是本模块
+> 写入的配置。
 
 ## `--check` 是只读预检
 

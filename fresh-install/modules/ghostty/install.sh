@@ -1152,6 +1152,10 @@ smoke_test() {
     # Ghostty 能否加载 fcitx5 immodule」，不该依赖运行安装脚本的那个终端
     # 恰好有这些变量——全新首开机跑 setup.sh 时就没有（im-config 要等下次
     # 登录才设置），会把一次正常安装误判成冒烟失败。
+    # 这里的 --gtk-single-instance=false 只服务这一次冒烟：让探针进程独立于
+    # 用户已经在运行的 Ghostty。没有它，单实例模式下新进程会把请求交给已有
+    # 实例后立即退出，下面的存活判定随即误报“提前退出”。它不改变任何日常
+    # 外部启动的复用行为，不要移除，也不要把它当成模块的启动策略。
     GTK_IM_MODULE=fcitx QT_IM_MODULE=fcitx XMODIFIERS=@im=fcitx \
         "$GHOSTTY_BIN" --gtk-single-instance=false > /dev/null 2>"$log" &
     pid=$!
