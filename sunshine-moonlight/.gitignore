@@ -1,3 +1,5 @@
 # 本机清单可能包含个人主机名与地址：新默认文件与旧文件名都忽略，避免入库。
 /machines.yaml
 /machines.local.yaml
+# 示例由成功安装后生成，不作为受版本管理的成品入库。
+/machines.example.yaml

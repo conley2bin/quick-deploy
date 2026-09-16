@@ -21,6 +21,10 @@ usage() {
   --client-only  只安装本机 Moonlight 客户端
   -h, --help     显示帮助
 
+所选安装阶段全部成功后，在模块根目录生成/刷新全字段中文示例 machines.example.yaml：
+它是通用占位模板，不含真实地址，每次成功安装都会重写，可放心覆盖。
+实际清单 machines.yaml 仍由你手工维护：本入口不创建、不迁移也不覆盖它。
+
 高级主机/客户端选项请直接运行 commands/install-host.sh 或 commands/install-client.sh。
 本入口不配置自动登录、电源策略或远程机器。
 USAGE
@@ -73,6 +77,14 @@ run_client() {
     qd_die 'Moonlight 客户端安装失败。此前成功的 Sunshine 主机安装不会自动回滚。'
 }
 
+# The example is generated source, never a tracked artifact: refresh it only after
+# every selected stage succeeded, relative to the module (never the caller's cwd).
+generate_example() {
+    "$SYSTEM_PYTHON" "$SCRIPT_DIR/lib/machines_example.py" "$SCRIPT_DIR/machines.example.yaml" \
+        || qd_die '所选安装阶段已完成，但生成/刷新 machines.example.yaml 失败或遭拒绝（示例路径可能是符号链接、目录或不可写）。实际 machines.yaml 未被创建或修改；请处理后重跑 ./install.sh。'
+    qd_info '已生成/刷新全字段中文示例 machines.example.yaml；实际清单仍请手工维护 machines.yaml。'
+}
+
 main() {
     parse_args "$@"
     qd_require_not_root
@@ -80,6 +92,7 @@ main() {
     ensure_pyyaml
     [ "$INSTALL_HOST" = false ] || run_host
     [ "$INSTALL_CLIENT" = false ] || run_client
+    generate_example
     qd_info '所选本机安装阶段已完成。配对和实际 Desktop 串流仍需分别验证。'
 }
 

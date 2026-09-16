@@ -8,6 +8,7 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import textwrap
 import unittest
@@ -74,12 +75,16 @@ class RunServerTests(unittest.TestCase):
         self.root = Path(self.tmp.name)
         self.module = self.root / "repo with spaces" / "sunshine-moonlight"
         (self.module / "service").mkdir(parents=True)
+        (self.module / "lib").mkdir()
         shutil.copy2(MODULE / "run_server.sh", self.module / "run_server.sh")
         shutil.copy2(MODULE / "service/run-server.py", self.module / "service/run-server.py")
-        shutil.copy2(MODULE / "machines.example.yaml", self.module / "machines.example.yaml")
+        shutil.copy2(MODULE / "lib/machines_example.py", self.module / "lib/machines_example.py")
         self.default = self.module / "machines.yaml"
         self.legacy = self.module / "machines.local.yaml"
         self.example = self.module / "machines.example.yaml"
+        # The example is not a tracked template: create it with the real generator,
+        # exactly as one successful module-root install would.
+        self.generate_example()
         self.home = self.root / "fake home"
         self.bin = self.root / "fake bin"
         self.log = self.root / "program.json"
@@ -108,6 +113,18 @@ class RunServerTests(unittest.TestCase):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content)
         path.chmod(0o755)
+
+    def generate_example(self) -> subprocess.CompletedProcess[str]:
+        """Run the module's real generator from an unrelated cwd."""
+        result = subprocess.run(
+            [sys.executable, str(self.module / "lib/machines_example.py")],
+            cwd=self.root,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result
 
     def write_default(self, content: str = VALID) -> Path:
         self.default.write_text(textwrap.dedent(content))
@@ -216,7 +233,7 @@ class RunServerTests(unittest.TestCase):
         self.assert_no_program()
 
     def test_missing_default_guides_manual_copy_and_never_falls_back(self) -> None:
-        # The repository example is present, but it is a static template, not a fallback.
+        # The generated example is present, but it is only a template, never a fallback.
         result = self.invoke("--list")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("清单不存在", result.stderr)
@@ -320,8 +337,45 @@ class RunServerTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.recorded()["argv"][1:], ["stream", "--", "100.64.0.10:47989", "Desktop"])
 
+    def test_generator_writes_module_example_regardless_of_cwd(self) -> None:
+        self.example.unlink()
+        unrelated = self.root / "generator cwd"
+        unrelated.mkdir()
+        result = subprocess.run(
+            [sys.executable, str(self.module / "lib/machines_example.py")],
+            cwd=unrelated,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(self.example.is_file())
+        self.assertEqual(self.example.stat().st_mode & 0o777, 0o644)
+        self.assertFalse((unrelated / "machines.example.yaml").exists())
+        self.assertFalse(self.default.exists())
+        self.assertFalse(self.legacy.exists())
+
+    def test_fresh_clone_without_generated_example_guides_one_successful_install(self) -> None:
+        # A fresh clone has no example until the root installer succeeds once.
+        self.example.unlink()
+        self.assertFalse(self.example.exists())
+        result = self.invoke("--list")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("清单不存在", result.stderr)
+        self.assertIn(str(self.default), result.stderr)
+        self.assertIn("./install.sh", result.stderr)
+        self.assertIn("尚未生成", result.stderr)
+        # Copying the absent example must not be presented as the actionable step.
+        self.assertFalse(
+            any(line.strip().startswith("cp ") for line in result.stderr.splitlines()), result.stderr
+        )
+        self.assertFalse(self.example.exists())
+        self.assertFalse(self.default.exists())
+        self.assert_no_program()
+        self.assert_no_tailscale()
+
     def test_example_documents_every_field_in_chinese(self) -> None:
-        text = (MODULE / "machines.example.yaml").read_text(encoding="utf-8")
+        text = self.example.read_text(encoding="utf-8")
         keys = ("machines", "desktop", "ssh", "tailnet_ip", "moonlight_port", "ssh_port", "note")
         for key in keys:
             match = re.search(rf"^[ \t]*#?[ \t]*{re.escape(key)}:", text, re.M)

@@ -25,6 +25,35 @@ class InventoryError(Exception):
     """A local inventory is absent or violates the closed schema."""
 
 
+def example_available() -> bool:
+    """The example only exists after one successful module-root install."""
+    try:
+        return EXAMPLE_INVENTORY.is_file()
+    except OSError:
+        return False
+
+
+def missing_inventory_message(path: Path) -> str:
+    inventory_help = (
+        f"清单不存在: {path}\n"
+        f"清单不会自动探测或生成；实际 machines.yaml 由你手动维护，也不会读取旧文件或示例兜底。"
+    )
+    if example_available():
+        return (
+            f"{inventory_help}\n"
+            f"示例模板由一次成功的根安装器生成，现已存在：{EXAMPLE_INVENTORY}\n"
+            f"请手动复制后按其中文注释填写，例如：\n"
+            f"    cp -- {shlex.quote(str(EXAMPLE_INVENTORY))} {shlex.quote(str(path))}"
+        )
+    return (
+        f"{inventory_help}\n"
+        f"示例模板 machines.example.yaml 尚未生成：全新 clone 在首次成功安装前没有该文件。\n"
+        f"请先在模块目录运行一次根安装器（所选安装阶段全部成功后才生成/刷新示例）：\n"
+        f"    cd -- {shlex.quote(str(MODULE_ROOT))} && ./install.sh\n"
+        f"成功后示例位于 {EXAMPLE_INVENTORY}，再手动复制为实际清单并按其中文注释填写。"
+    )
+
+
 def parser() -> argparse.ArgumentParser:
     argument_parser = argparse.ArgumentParser(
         description="Launch local Moonlight Desktop streaming or an interactive SSH login."
@@ -75,11 +104,7 @@ def load_yaml(path: Path) -> Any:
         with path.open(encoding="utf-8") as inventory_file:
             return yaml.load(inventory_file, Loader=UniqueKeyLoader)
     except FileNotFoundError as error:
-        raise InventoryError(
-            f"清单不存在: {path}\n"
-            f"清单不会自动探测或生成；请手动复制本模块的示例模板并编辑，例如：\n"
-            f"    cp -- {shlex.quote(str(EXAMPLE_INVENTORY))} {shlex.quote(str(path))}"
-        ) from error
+        raise InventoryError(missing_inventory_message(path)) from error
     except UnicodeDecodeError as error:
         raise InventoryError(f"清单不是有效 UTF-8 文本: {path}") from error
     except OSError as error:

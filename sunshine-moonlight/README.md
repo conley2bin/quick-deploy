@@ -17,7 +17,7 @@
 ./install.sh
 ```
 
-它先检查最新稳定 Sunshine，再检查最新稳定 Moonlight，并只在系统 Python 无法导入 PyYAML 时通过 `sudo apt-get install python3-yaml` 安装该依赖。每个组件独立查询一次其 GitHub release：缺失或较旧时下载/更新，相同版本跳过载荷但仍收敛既有配置，本机较新时保留且不降级。主机阶段失败时客户端不会查询或修改。只安装 A 时使用 `./install.sh --host-only`，只安装 B 时使用 `./install.sh --client-only`；已在双角色安装中完成这两个角色时，不要在下面的编号步骤重复安装。高级版本、捕获或绑定选项仍直接传给 `commands/install-host.sh` 或 `commands/install-client.sh`。任一阶段失败会停止后续阶段，已成功完成的阶段不会自动回滚。
+它先检查最新稳定 Sunshine，再检查最新稳定 Moonlight，并只在系统 Python 无法导入 PyYAML 时通过 `sudo apt-get install python3-yaml` 安装该依赖。每个组件独立查询一次其 GitHub release：缺失或较旧时下载/更新，相同版本跳过载荷但仍收敛既有配置，本机较新时保留且不降级。主机阶段失败时客户端不会查询或修改。只安装 A 时使用 `./install.sh --host-only`，只安装 B 时使用 `./install.sh --client-only`；已在双角色安装中完成这两个角色时，不要在下面的编号步骤重复安装。所选安装阶段全部成功后，本入口还会在模块根目录生成/刷新全字段中文示例 `machines.example.yaml`（见第 3 节）；示例只是占位模板，实际清单 `machines.yaml` 仍由你手工维护。高级版本、捕获或绑定选项仍直接传给 `commands/install-host.sh` 或 `commands/install-client.sh`。任一阶段失败会停止后续阶段，已成功完成的阶段不会自动回滚。
 
 ## 1. 在 A 安装 Sunshine
 
@@ -62,18 +62,20 @@ Web UI 只绑定 A 的 Tailnet IPv4；远端 `localhost:47990` 不是它的监�
 
 ## 3. 用本机清单连接
 
-安装完成后，先从仓库自带的静态示例手动建立本机清单；它包含机器名、Tailnet IPv4 与 SSH 目标，不保存密码、PIN、私钥或命令参数：
+连接前先建立本机清单：它包含机器名、Tailnet IPv4 与 SSH 目标，不保存密码、PIN、私钥或命令参数。示例模板 `machines.example.yaml` 不是随仓库提供的成品文件，而是由模块根目录的 `./install.sh` 在所选安装阶段全部成功后生成/刷新的全字段中文占位模板；前面第 1、2 节里成功跑过的那次安装（包括 B 的 `./install.sh --client-only`）已经生成过它，所以这里不要再补跑裸 `./install.sh`：默认安装同时启用主机与客户端，会把只装客户端的 B 扩大成 Sunshine 主机安装。全新 clone 在首次成功安装前根本没有这个文件，此时连接器会提示先运行安装器；若这台机器还没成功安装过，按实际用途在 `./install.sh`、`./install.sh --host-only`、`./install.sh --client-only` 中选一个执行一次，并保持第 1、2 节已经选定的角色不变。每次成功安装都会重写示例，因此不要往示例里填真实信息。实际清单 `machines.yaml` 始终由你手工维护：
 
 ```bash
 cd ~/quick-deploy/sunshine-moonlight
+# 第 1、2 节的成功安装已生成示例；尚未安装过才需要先按实际用途选好角色跑一次安装，
+# 不要在这里补跑默认的 ./install.sh（它同时启用主机与客户端）。
 [ -e machines.yaml ] || cp machines.example.yaml machines.yaml
 $EDITOR machines.yaml
 ./run_server.sh --list
 ```
 
-`machines.yaml` 与旧文件名 `machines.local.yaml` 都被模块 `.gitignore` 忽略，真实清单不会入库。清单由你手工创建和编辑：安装器与连接器都不会自动生成、迁移或覆盖它，也不会自动读取旧文件；你要用旧文件时，显式 `--config machines.local.yaml` 仍会照常读取。**默认清单始终是模块根目录的 `machines.yaml`，从任意当前目录运行都取同一份；文件缺失时连接器直接报错并给出路径与手动复制示例的办法，不会自动改用示例模板、旧文件或第一台机器。** 用 `--config PATH` 指定其它清单时，PATH 按当前工作目录解析，适合临时、明确指定的文件。
+`machines.yaml`、旧文件名 `machines.local.yaml` 与生成出来的 `machines.example.yaml` 都被模块 `.gitignore` 忽略，三者都不会入库。清单由你手工创建和编辑：安装器只会生成/刷新示例，从不创建、迁移或覆盖实际清单，也不会自动读取旧文件；你要用旧文件时，显式 `--config machines.local.yaml` 仍会照常读取。示例路径若已经是符号链接、目录或不可写，安装器显式拒绝并报错停止：既不追随链接去改写别的文件，也不声称安装已全部完成。**默认清单始终是模块根目录的 `machines.yaml`，从任意当前目录运行都取同一份；文件缺失时连接器直接报错：示例已生成就给出路径与手动复制办法，尚未生成则提示先运行一次成功的 `./install.sh`，绝不自动改用示例模板、旧文件或第一台机器。** 用 `--config PATH` 指定其它清单时，PATH 按当前工作目录解析，适合临时、明确指定的文件。
 
-每个名称需有一个 `ssh`（单个别名或 `[user@]hostname/IP`）和 `tailnet_ip`（IPv4）；`moonlight_port` 可省略并默认 `47989`（基准端口，不是 Web UI 端口），`ssh_port` 可选（省略时不传 `-p`）。字段的必填/可选、用途与取值形态以 [`machines.example.yaml`](machines.example.yaml) 的中文注释为准；未知字段、重复键、非字符串地址、布尔值/字符串端口、无效 IP 或端口都会在启动本地程序前报错。
+每个名称需有一个 `ssh`（单个别名或 `[user@]hostname/IP`）和 `tailnet_ip`（IPv4）；`moonlight_port` 可省略并默认 `47989`（基准端口，不是 Web UI 端口），`ssh_port` 可选（省略时不传 `-p`）。字段的必填/可选、用途与取值形态以安装器生成的 `machines.example.yaml` 中文注释为准（克隆里没有静态副本可链接，安装成功后在本模块根目录直接打开即可）；未知字段、重复键、非字符串地址、布尔值/字符串端口、无效 IP 或端口都会在启动本地程序前报错。
 
 清单只决定本机连接路由：连接器不查询 Tailscale（不枚举成员，也不探测远端地址），不读取或改写 SSH 配置、密钥与 known_hosts。`ssh` 写成别名时，由系统 SSH 自己按你的 `~/.ssh/config`、密钥/agent 与 known_hosts 解析；连接器只把清单里的目标追加到 `ssh` 参数。
 
@@ -197,7 +199,7 @@ Doctor 只读；退出 1 表示必需条件不满足。它检查包、实际服�
 
 ## 升级、卸载与维护
 
-版本、维护基线及审计例外集中在 [`lib/common.sh`](lib/common.sh)。默认安装会检查最新稳定 release；最新不是“无条件成功”的承诺：每个资产必须有 GitHub API 提供的 `sha256:` 摘要和正的精确大小，下载后再次核对大小和 SHA-256。缺少/无效摘要会在任何相关载荷修改前停止，绝不把 HTTPS 下载、下载后自己计算的 hash 或旧版本冒充最新。
+版本、维护基线及审计例外集中在 [`lib/common.sh`](lib/common.sh)，示例模板（含各字段中文说明）集中在 [`lib/machines_example.py`](lib/machines_example.py)：改模板就是改这一份生成器源码，下次成功安装后自动生效。默认安装会检查最新稳定 release；最新不是“无条件成功”的承诺：每个资产必须有 GitHub API 提供的 `sha256:` 摘要和正的精确大小，下载后再次核对大小和 SHA-256。缺少/无效摘要会在任何相关载荷修改前停止，绝不把 HTTPS 下载、下载后自己计算的 hash 或旧版本冒充最新。
 
 唯一受审计例外是 Moonlight 的精确 `v6.1.0` `Moonlight-6.1.0-x86_64.AppImage`（release ID `175337682`、asset ID `193059073`、大小 `55325888`、SHA-256 `0e855ffd22d407e18ab5fdb575fed5f01ca119a3f91993c5f0213f15ac80b400`）。它的旧 API 记录没有 digest；一旦 API 为这个精确资产给出 digest，必须与该记录一致。未来任一 digest-null Moonlight 最新版会停止，等待单独审阅的 tag 专用校验值，而不会降级或复用 6.1.0 的摘要。
 
@@ -215,7 +217,7 @@ Doctor 只读；退出 1 表示必需条件不满足。它检查包、实际服�
 
 主机包移除默认保留凭据，预先存在的包默认拒绝删除；`--help` 说明显式强制选项。状态删除会停止并禁用服务，避免下次图形登录用默认配置启动；再次使用前重跑 `./commands/install-host.sh` 恢复 Tailnet 配置与服务。配置目录本身若为符号链接，会在停止服务前拒绝删除；普通 HOME/XDG 父目录链接不受此限制。目录外的凭据不在删除范围；其他用户或手动启动的 Sunshine 实例会报告 PID/UID，不会被终止。
 
-维护时运行 `./tests/run.sh` 及 `python3 ./tests/run_server.py`：前者在临时 HOME/PATH 下实际执行启动检查，覆盖地址缺失、配置来源变化、归属与卸载顺序，以及 HOME/XDG 父目录链接下的安装、复装、doctor 和移除；后者在带空格的临时模块副本中实际执行 `run_server.sh`→Python→假 Moonlight/SSH，核对参数、stdin、退出码与无副作用拒绝，并覆盖默认清单取自模块目录且不受当前目录影响、只有旧文件名或只有示例模板时都不隐式采用、两份并存时只用新文件、`--config` 相对调用目录，以及不探测 Tailscale、不改写既有 SSH 配置。延迟超过 500 秒及停止重试采用离散时间模型，不是真实 systemd 运行验收。有 `systemd-analyze` 时另做静态单元解析和加载路径核对；APT 仅模拟，不安装包或操作真实服务，也不验证实际画面/输入。
+维护时运行 `./tests/run.sh` 及 `python3 ./tests/run_server.py`：前者在临时 HOME/PATH 下实际执行启动检查，覆盖地址缺失、配置来源变化、归属与卸载顺序，以及 HOME/XDG 父目录链接下的安装、复装、doctor 和移除；根安装器的测试在只复制公开代码的临时模块副本中实际运行安装与生成：三种角色成功与同版本重跑都在模块目录生成/刷新全字段中文示例，`--help`、参数错误、依赖或安装阶段失败都不生成；任意 cwd 与带空格路径仍取模块目录，示例路径为符号链接/目录或不可写时显式拒绝且不触碰实际清单，并在示例缺失、示例已存在、实际+旧清单已存在三种状态下核对示例刷新与实际清单的字节/权限不变；真实 checkout 只对照运行前后的存在形态、类型、权限与时间戳，从不读取实际清单。后者在带空格的临时模块副本中实际执行 `run_server.sh`→Python→假 Moonlight/SSH，核对参数、stdin、退出码与无副作用拒绝，示例由真实生成器（而非被追踪的成品文件）创建，覆盖默认清单取自模块目录且不受当前目录影响、示例尚未生成时提示先运行一次成功的 `./install.sh`、只有旧文件名时不隐式采用、两份并存时只用新文件、`--config` 相对调用目录，以及不探测 Tailscale、不改写既有 SSH 配置。延迟超过 500 秒及停止重试采用离散时间模型，不是真实 systemd 运行验收。有 `systemd-analyze` 时另做静态单元解析和加载路径核对；APT 仅模拟，不安装包或操作真实服务，也不验证实际画面/输入。
 
 绑定解析测试使用已核对的原生解析结果。若本地有对应标签源码和 C++ 编译器，可额外运行 `python3 tests/binding.py --native-source /path/to/Sunshine-2026.906.222525/src/config.cpp`，离线编译该文件的原始解析函数，对照输入、重写结果和隔离安装器输出；不会构建或运行 Sunshine。
 
