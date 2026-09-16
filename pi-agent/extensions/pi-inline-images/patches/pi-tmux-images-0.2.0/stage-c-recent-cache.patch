@@ -1,15 +1,16 @@
 diff --git a/extensions/index.ts b/extensions/index.ts
-index 6ccf227..e7e1770 100644
+index 6ccf227..1f9b223 100644
 --- a/extensions/index.ts
 +++ b/extensions/index.ts
-@@ -1,25 +1,32 @@
+@@ -1,25 +1,33 @@
  import { randomUUID } from "node:crypto";
  import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
  import { automaticBlocks, type BranchEntry, findOrigin, hasPersistedOrigin, originToken } from "../src/automatic.ts";
 -import { previewComponent } from "../src/renderer.ts";
 -import { PreviewRuntime } from "../src/runtime.ts";
++import { isBuiltinLocalRead, provenanceNotice, ReadOriginalTracker } from "../src/provenance.ts";
 +import { previewComponent, wrappedNotice } from "../src/renderer.ts";
-+import { PreviewRuntime, type SharedGraphicsHandle } from "../src/runtime.ts";
++import { PreviewRuntime, type RehydratedImageSource, type SharedGraphicsHandle } from "../src/runtime.ts";
  import { CLEAR_TYPE, type ClearEntry, ENTRY_TYPE, isPreview, type PreviewEntry } from "../src/transcript-entry.ts";
  
 +const MAX_RECENT_PREVIEWS = 16;
@@ -44,11 +45,13 @@ index 6ccf227..e7e1770 100644
  }
  
  export function registerInlineImages(pi: ExtensionAPI, runtime = new PreviewRuntime()) {
-@@ -29,11 +36,22 @@ export function registerInlineImages(pi: ExtensionAPI, runtime = new PreviewRunt
+@@ -29,48 +37,74 @@ export function registerInlineImages(pi: ExtensionAPI, runtime = new PreviewRunt
  	const pending = new Map<string, NonNullable<PreviewEntry["origin"]>>();
  	let messageOrdinals = new WeakMap<object, number>();
  	const reservedOrdinals = new Set<number>();
++	const provenance = new ReadOriginalTracker();
 +	const requestId = randomUUID();
++	const builtinLocalRead = () => isBuiltinLocalRead(pi.getAllTools());
 +
  	function enqueue(operation: () => Promise<void>): Promise<void> {
  		const next = serial.then(operation, operation);
@@ -67,7 +70,8 @@ index 6ccf227..e7e1770 100644
  	function invalidate(): number {
  		generation++;
  		pending.clear();
-@@ -41,36 +59,43 @@ export function registerInlineImages(pi: ExtensionAPI, runtime = new PreviewRunt
++		provenance.reset();
+ 		messageOrdinals = new WeakMap();
  		reservedOrdinals.clear();
  		return generation;
  	}
@@ -97,12 +101,20 @@ index 6ccf227..e7e1770 100644
  			if (expected !== generation) return;
 -			runtime.clear();
 -			const entries = activeEntries(ctx);
+-			const restored = await runtime.rehydrate(entries, ctx.cwd, (entry) => {
 +			const all = allEntries(ctx);
 +			const entries = all.slice(-MAX_RECENT_PREVIEWS);
- 			const restored = await runtime.rehydrate(entries, ctx.cwd, (entry) => {
++			const sources = new Map<string, RehydratedImageSource>();
++			for (const entry of entries) {
  				const block = findOrigin(branch(ctx), entry);
- 				return block ? { data: block.data, mimeType: block.mimeType } : undefined;
- 			});
+-				return block ? { data: block.data, mimeType: block.mimeType } : undefined;
+-			});
++				if (!block) continue;
++				sources.set(entry.logicalId, entry.readProvenance
++					? await provenance.restore(entry, block, builtinLocalRead())
++					: { data: block.data, mimeType: block.mimeType, path: entry.path });
++			}
++			const restored = await runtime.rehydrate(entries, ctx.cwd, (entry) => sources.get(entry.logicalId));
  			if (expected !== generation) {
 -				runtime.clear();
 +				await runtime.clear();
@@ -122,7 +134,7 @@ index 6ccf227..e7e1770 100644
  			const entries = branch(ctx);
  			const persistedMessageCount = entries.filter((entry) => entry.type === "message").length;
  			for (const ordinal of reservedOrdinals) if (ordinal < persistedMessageCount) reservedOrdinals.delete(ordinal);
-@@ -83,18 +108,17 @@ export function registerInlineImages(pi: ExtensionAPI, runtime = new PreviewRunt
+@@ -83,19 +117,31 @@ export function registerInlineImages(pi: ExtensionAPI, runtime = new PreviewRunt
  			}
  			for (const [token, origin] of pending) if (hasPersistedOrigin(entries, origin)) pending.delete(token);
  			for (const { block, origin } of automaticBlocks(message, messageOrdinal)) {
@@ -134,23 +146,47 @@ index 6ccf227..e7e1770 100644
 +				const logicalId = randomUUID().replaceAll("-", "");
  				try {
 -					const logicalId = randomUUID().replaceAll("-", "");
- 					const entry = await runtime.addBytes(block.data, block.mimeType, logicalId, "attached image");
+-					const entry = await runtime.addBytes(block.data, block.mimeType, logicalId, "attached image");
++					const toolCallId = origin.key.startsWith("tool:") ? origin.key.slice(5) : undefined;
++					const evidence = toolCallId ? provenance.consume(toolCallId, origin.blockIndex, origin.contentHash) : undefined;
++					const verified = evidence?.status === "verified-local-original" ? evidence.capture : undefined;
++					const entry = await runtime.addBytes(
++						verified ? verified.bytes.toString("base64") : block.data,
++						verified ? verified.mimeType : block.mimeType,
++						logicalId,
++						verified ? verified.canonicalPath : "attached image",
++						evidence?.status === "unverified" ? provenanceNotice(evidence.reason ?? "result-mismatch") : undefined,
++					);
  					if (expected !== generation) {
 -						runtime.clear();
 +						await runtime.release(logicalId);
  						return;
  					}
 -					// message_end precedes persistence, so custom metadata intentionally comes first.
- 					pi.appendEntry<PreviewEntry>(ENTRY_TYPE, { ...entry, origin });
+-					pi.appendEntry<PreviewEntry>(ENTRY_TYPE, { ...entry, origin });
++					pi.appendEntry<PreviewEntry>(ENTRY_TYPE, {
++						...entry,
++						origin,
++						readProvenance: evidence ? provenance.persist(evidence, entry) : undefined,
++					});
  				} catch {
  					pending.delete(token);
-@@ -103,15 +127,16 @@ export function registerInlineImages(pi: ExtensionAPI, runtime = new PreviewRunt
+ 					// Keep Pi's original image block and native/error rendering unchanged.
+@@ -103,15 +149,24 @@ export function registerInlineImages(pi: ExtensionAPI, runtime = new PreviewRunt
  			}
  		});
  	}
 -	pi.on("session_start", async (_event, ctx) => rebuild(ctx, invalidate()));
 -	pi.on("session_tree", async (_event, ctx) => rebuild(ctx, invalidate()));
 +
++	pi.on("tool_call", async (event, ctx) => {
++		if (event.toolName !== "read") return;
++		await provenance.begin(event.toolCallId, event.input, ctx.cwd, builtinLocalRead());
++	});
++	pi.on("tool_result", async (event) => {
++		if (event.toolName !== "read") return;
++		await provenance.finish(event.toolCallId, event.content, builtinLocalRead(), !event.isError);
++	});
 +	pi.on("session_start", async (_event, ctx) => { requestBridge(); return rebuild(ctx, invalidate()); });
 +	pi.on("session_tree", async (_event, ctx) => { requestBridge(); return rebuild(ctx, invalidate()); });
  	pi.on("session_shutdown", async () => {
@@ -166,7 +202,7 @@ index 6ccf227..e7e1770 100644
  	pi.registerCommand("image", {
  		description: "Display a local image in the TUI without model context. Use /image clear to remove previews.",
  		handler: async (args, ctx) => {
-@@ -119,7 +144,7 @@ export function registerInlineImages(pi: ExtensionAPI, runtime = new PreviewRunt
+@@ -119,7 +174,7 @@ export function registerInlineImages(pi: ExtensionAPI, runtime = new PreviewRunt
  				const expected = invalidate();
  				return enqueue(async () => {
  					if (expected !== generation) return;
@@ -175,7 +211,7 @@ index 6ccf227..e7e1770 100644
  					pi.appendEntry<ClearEntry>(CLEAR_TYPE, { marker: true });
  					stale.clear();
  				});
-@@ -127,14 +152,12 @@ export function registerInlineImages(pi: ExtensionAPI, runtime = new PreviewRunt
+@@ -127,14 +182,12 @@ export function registerInlineImages(pi: ExtensionAPI, runtime = new PreviewRunt
  			const expected = generation;
  			return enqueue(async () => {
  				if (expected !== generation) return;
@@ -194,7 +230,7 @@ index 6ccf227..e7e1770 100644
  						return;
  					}
  					pi.appendEntry<PreviewEntry>(ENTRY_TYPE, entry);
-@@ -145,6 +168,7 @@ export function registerInlineImages(pi: ExtensionAPI, runtime = new PreviewRunt
+@@ -145,6 +198,7 @@ export function registerInlineImages(pi: ExtensionAPI, runtime = new PreviewRunt
  		},
  	});
  }
@@ -202,11 +238,393 @@ index 6ccf227..e7e1770 100644
  export default function inlineImages(pi: ExtensionAPI) {
  	registerInlineImages(pi);
  }
+diff --git a/src/provenance.ts b/src/provenance.ts
+new file mode 100644
+index 0000000..22621e6
+--- /dev/null
++++ b/src/provenance.ts
+@@ -0,0 +1,376 @@
++import { createHash } from "node:crypto";
++import { lstat, readFile, realpath, stat } from "node:fs/promises";
++import { homedir } from "node:os";
++import { isAbsolute, normalize, resolve } from "node:path";
++import type { ToolInfo } from "@earendil-works/pi-coding-agent";
++import sharp from "sharp";
++import { MAX_INPUT_BYTES, MAX_PIXELS, type OriginalMime, validateEncodedImageInput } from "./loader.ts";
++import type { PreviewEntry, ReadProvenance, ReadProvenanceReason } from "./transcript-entry.ts";
++
++const MAX_TRACKED_READS = 64;
++const MAX_FROZEN_BYTES = 64 * 1024 * 1024;
++const HASH = /^[a-f0-9]{64}$/u;
++
++type FileCapture = {
++	resolvedPath: string;
++	canonicalPath: string;
++	identityHash: string;
++	sourceHash: string;
++	mimeType: OriginalMime;
++	bytes: Buffer;
++};
++type PendingRead =
++	| { kind: "captured"; capture: FileCapture }
++	| { kind: "unverified"; reason: ReadProvenanceReason };
++export type ReadDisplayEvidence = {
++	status: "verified-local-original" | "unverified";
++	toolCallId: string;
++	blockIndex: number;
++	blockHash: string;
++	receivedHash: string;
++	receivedMime: OriginalMime;
++	reason?: ReadProvenanceReason;
++	capture?: FileCapture;
++	ownsFrozenBytes?: boolean;
++};
++export type RestoredReadSource = {
++	data: string;
++	mimeType: string;
++	path: string;
++	expectedHash: string;
++	notice?: string;
++};
++
++type ImageBlock = { type: "image"; data: string; mimeType: string };
++
++class CaptureError extends Error {
++	constructor(readonly reason: ReadProvenanceReason) { super(reason); }
++}
++
++function sha256(value: string | Buffer): string {
++	return createHash("sha256").update(value).digest("hex");
++}
++
++function originalMime(format?: string): OriginalMime | undefined {
++	if (format === "png") return "image/png";
++	if (format === "jpeg") return "image/jpeg";
++	if (format === "webp") return "image/webp";
++	return undefined;
++}
++
++function resolveInputPath(raw: string, cwd: string): string {
++	const trimmed = raw.trim().replace(/^@/u, "");
++	if (!trimmed) throw new CaptureError("capture-unavailable");
++	const expanded = trimmed === "~" || trimmed.startsWith("~/") ? `${homedir()}${trimmed.slice(1)}` : trimmed;
++	return normalize(isAbsolute(expanded) ? expanded : resolve(cwd, expanded));
++}
++
++function statFingerprint(value: Awaited<ReturnType<typeof stat>> | Awaited<ReturnType<typeof lstat>>): string {
++	const candidate = value as unknown as {
++		dev: bigint | number; ino: bigint | number; mode: bigint | number; size: bigint | number;
++		mtimeNs?: bigint; ctimeNs?: bigint; mtimeMs: bigint | number; ctimeMs: bigint | number;
++	};
++	return [candidate.dev, candidate.ino, candidate.mode, candidate.size,
++		candidate.mtimeNs ?? candidate.mtimeMs, candidate.ctimeNs ?? candidate.ctimeMs].map(String).join(":");
++}
++
++async function captureResolved(resolvedPath: string): Promise<FileCapture> {
++	try {
++		const linkBefore = await lstat(resolvedPath, { bigint: true });
++		const canonicalPath = await realpath(resolvedPath);
++		const targetBefore = await stat(canonicalPath, { bigint: true });
++		if (!targetBefore.isFile()) throw new CaptureError("capture-unavailable");
++		if (targetBefore.size > BigInt(MAX_INPUT_BYTES)) throw new CaptureError("capture-unavailable");
++		const bytes = await readFile(canonicalPath);
++		if (bytes.length > MAX_INPUT_BYTES) throw new CaptureError("capture-unavailable");
++		const [linkAfter, targetAfter, canonicalAfter] = await Promise.all([
++			lstat(resolvedPath, { bigint: true }),
++			stat(canonicalPath, { bigint: true }),
++			realpath(resolvedPath),
++		]);
++		const beforeIdentity = `${statFingerprint(linkBefore)}\u0000${statFingerprint(targetBefore)}`;
++		const afterIdentity = `${statFingerprint(linkAfter)}\u0000${statFingerprint(targetAfter)}`;
++		if (canonicalAfter !== canonicalPath || beforeIdentity !== afterIdentity || targetAfter.size !== BigInt(bytes.length)) {
++			throw new CaptureError("source-changed");
++		}
++		const metadata = await sharp(bytes, { limitInputPixels: MAX_PIXELS, failOn: "error" }).metadata();
++		const mimeType = originalMime(metadata.format);
++		if (!mimeType) throw new CaptureError("capture-unavailable");
++		return {
++			resolvedPath,
++			canonicalPath,
++			identityHash: sha256(`${resolvedPath}\u0000${canonicalPath}\u0000${afterIdentity}`),
++			sourceHash: sha256(bytes),
++			mimeType,
++			bytes,
++		};
++	} catch (error) {
++		if (error instanceof CaptureError) throw error;
++		const code = error && typeof error === "object" && "code" in error ? String((error as { code?: unknown }).code) : "";
++		throw new CaptureError(code === "ENOENT" || code === "ENOTDIR" ? "source-missing" : "capture-unavailable");
++	}
++}
++
++async function captureInput(raw: string, cwd: string): Promise<FileCapture> {
++	return captureResolved(resolveInputPath(raw, cwd));
++}
++
++function imageBlocks(content: readonly unknown[]): Array<{ block: ImageBlock; blockIndex: number }> {
++	return content.flatMap((value, blockIndex) => value && typeof value === "object"
++		&& (value as Partial<ImageBlock>).type === "image"
++		&& typeof (value as Partial<ImageBlock>).data === "string"
++		&& typeof (value as Partial<ImageBlock>).mimeType === "string"
++		? [{ block: value as ImageBlock, blockIndex }]
++		: []);
++}
++
++function normalizedMime(value: string): OriginalMime | undefined {
++	const mime = value.split(";", 1)[0]!.trim().toLowerCase();
++	if (mime === "image/png" || mime === "image/jpeg" || mime === "image/webp") return mime;
++	return undefined;
++}
++
++async function relation(capture: FileCapture, block: ImageBlock): Promise<{ blockHash: string; receivedHash: string; receivedMime: OriginalMime; verified: boolean }> {
++	const receivedMime = normalizedMime(block.mimeType);
++	if (!receivedMime) throw new CaptureError("result-mismatch");
++	try { validateEncodedImageInput(block.data, receivedMime); } catch { throw new CaptureError("result-mismatch"); }
++	const received = Buffer.from(block.data, "base64");
++	const base = { blockHash: sha256(block.data), receivedHash: sha256(received), receivedMime };
++	if (receivedMime === capture.mimeType && received.equals(capture.bytes)) return { ...base, verified: true };
++	const { resizeImage } = await import("@earendil-works/pi-coding-agent");
++	const resized = await resizeImage(capture.bytes, capture.mimeType);
++	return { ...base, verified: Boolean(resized && resized.mimeType === receivedMime && resized.data === block.data) };
++}
++
++export function isBuiltinLocalRead(tools: readonly ToolInfo[]): boolean {
++	const matches = tools.filter((tool) => tool.name === "read");
++	if (matches.length !== 1) return false;
++	const source = matches[0]!.sourceInfo;
++	return source.path === "<builtin:read>" && source.source === "builtin"
++		&& source.scope === "temporary" && source.origin === "top-level" && source.baseDir === undefined;
++}
++
++export function provenanceNotice(reason: ReadProvenanceReason, path?: string): string {
++	const target = path ? ` for ${path}` : "";
++	const detail: Record<ReadProvenanceReason, string> = {
++		"tool-source-unverified": "the read tool is not the standard builtin local reader",
++		"capture-unavailable": "a bounded local original could not be frozen at tool call",
++		"source-missing": "the verified local source is missing",
++		"source-changed": "the verified local source changed",
++		"result-mismatch": "the received image does not match the local original or Pi resize",
++	};
++	return `Original resolution unavailable/unverified${target}: ${detail[reason]}. Displaying received pixels.`;
++}
++
++export class ReadOriginalTracker {
++	private readonly pending = new Map<string, PendingRead>();
++	private readonly results = new Map<string, ReadDisplayEvidence>();
++	private frozenBytes = 0;
++	private serial = Promise.resolve();
++	private generation = 0;
++
++	begin(toolCallId: string, input: Record<string, unknown>, cwd: string, builtinLocal: boolean): Promise<void> {
++		const generation = this.generation;
++		return this.enqueue(() => this.beginNow(toolCallId, input, cwd, builtinLocal, generation));
++	}
++
++	private async beginNow(toolCallId: string, input: Record<string, unknown>, cwd: string, builtinLocal: boolean, generation: number): Promise<void> {
++		if (generation !== this.generation) return;
++		this.dropPending(toolCallId);
++		this.ensureRecordCapacity();
++		if (!builtinLocal || typeof input.path !== "string") {
++			this.pending.set(toolCallId, { kind: "unverified", reason: builtinLocal ? "capture-unavailable" : "tool-source-unverified" });
++			return;
++		}
++		try {
++			const capture = await captureInput(input.path, cwd);
++			if (generation !== this.generation) return;
++			if (this.frozenBytes + capture.bytes.length > MAX_FROZEN_BYTES) {
++				this.pending.set(toolCallId, { kind: "unverified", reason: "capture-unavailable" });
++				return;
++			}
++			this.frozenBytes += capture.bytes.length;
++			this.pending.set(toolCallId, { kind: "captured", capture });
++		} catch (error) {
++			this.pending.set(toolCallId, { kind: "unverified", reason: error instanceof CaptureError ? error.reason : "capture-unavailable" });
++		}
++	}
++
++	finish(toolCallId: string, content: readonly unknown[], builtinLocal: boolean, successful = true): Promise<void> {
++		const generation = this.generation;
++		return this.enqueue(() => this.finishNow(toolCallId, content, builtinLocal, successful, generation));
++	}
++
++	private async finishNow(toolCallId: string, content: readonly unknown[], builtinLocal: boolean, successful: boolean, generation: number): Promise<void> {
++		if (generation !== this.generation) return;
++		const pending = this.pending.get(toolCallId);
++		this.pending.delete(toolCallId);
++		if (!pending) return;
++		const blocks = imageBlocks(content);
++		if (!blocks.length) { this.releasePending(pending); return; }
++
++		let capture = pending.kind === "captured" ? pending.capture : undefined;
++		let reason = pending.kind === "unverified" ? pending.reason : undefined;
++		if (!successful) reason = "result-mismatch";
++		else if (capture && !builtinLocal) reason = "tool-source-unverified";
++		if (capture && !reason) {
++			try {
++				const current = await captureResolved(capture.resolvedPath);
++				if (generation !== this.generation) return;
++				if (current.canonicalPath !== capture.canonicalPath || current.identityHash !== capture.identityHash
++					|| current.sourceHash !== capture.sourceHash || current.mimeType !== capture.mimeType) reason = "source-changed";
++			} catch (error) {
++				reason = error instanceof CaptureError && error.reason === "source-missing" ? "source-missing" : "source-changed";
++			}
++		}
++
++		let frozenTransferred = false;
++		for (const { block, blockIndex } of blocks) {
++			let related: Awaited<ReturnType<typeof relation>> | undefined;
++			try { if (capture) related = await relation(capture, block); } catch { /* Recorded as mismatch below. */ }
++			if (generation !== this.generation) return;
++			const status = capture && !reason && related?.verified && !frozenTransferred ? "verified-local-original" : "unverified";
++			const evidence: ReadDisplayEvidence = {
++				status,
++				toolCallId,
++				blockIndex,
++				blockHash: related?.blockHash ?? sha256(block.data),
++				receivedHash: related?.receivedHash ?? sha256(Buffer.from(block.data, "base64")),
++				receivedMime: related?.receivedMime ?? normalizedMime(block.mimeType) ?? "image/png",
++				reason: status === "unverified" ? reason ?? "result-mismatch" : undefined,
++				capture: status === "verified-local-original" ? capture : undefined,
++				ownsFrozenBytes: status === "verified-local-original",
++			};
++			if (evidence.ownsFrozenBytes) frozenTransferred = true;
++			this.setResult(evidence);
++		}
++		if (!frozenTransferred) this.releasePending(pending);
++	}
++
++	consume(toolCallId: string, blockIndex: number, blockHash: string): ReadDisplayEvidence | undefined {
++		const key = this.key(toolCallId, blockIndex, blockHash);
++		const evidence = this.results.get(key);
++		if (!evidence) return undefined;
++		this.results.delete(key);
++		if (evidence.ownsFrozenBytes && evidence.capture) this.frozenBytes -= evidence.capture.bytes.length;
++		return evidence;
++	}
++
++	persist(evidence: ReadDisplayEvidence, entry: PreviewEntry): ReadProvenance {
++		const base = {
++			version: 1 as const,
++			status: evidence.status,
++			toolCallId: evidence.toolCallId,
++			blockIndex: evidence.blockIndex,
++			blockHash: evidence.blockHash,
++			receivedHash: evidence.receivedHash,
++			receivedMime: evidence.receivedMime,
++		};
++		if (evidence.status === "verified-local-original" && evidence.capture) {
++			return {
++				...base,
++				status: "verified-local-original",
++				original: {
++					resolvedPath: evidence.capture.resolvedPath,
++					canonicalPath: evidence.capture.canonicalPath,
++					identityHash: evidence.capture.identityHash,
++					sourceHash: evidence.capture.sourceHash,
++					mimeType: evidence.capture.mimeType,
++					bytes: evidence.capture.bytes.length,
++					width: entry.width,
++					height: entry.height,
++				},
++			};
++		}
++		return { ...base, status: "unverified", reason: evidence.reason ?? "result-mismatch" };
++	}
++
++	restore(entry: PreviewEntry, block: ImageBlock, builtinLocal: boolean): Promise<RestoredReadSource> {
++		const generation = this.generation;
++		return this.enqueue(() => this.restoreNow(entry, block, builtinLocal, generation));
++	}
++
++	private async restoreNow(entry: PreviewEntry, block: ImageBlock, builtinLocal: boolean, generation: number): Promise<RestoredReadSource> {
++		const proof = entry.readProvenance!;
++		const received = {
++			data: block.data,
++			mimeType: block.mimeType,
++			path: "attached image",
++			expectedHash: proof.receivedHash,
++		};
++		if (proof.status !== "verified-local-original") {
++			return { ...received, notice: provenanceNotice(proof.reason) };
++		}
++		if (!builtinLocal) return { ...received, notice: provenanceNotice("tool-source-unverified", proof.original.canonicalPath) };
++		try {
++			const current = await captureResolved(proof.original.resolvedPath);
++			const related = await relation(current, block);
++			if (generation !== this.generation) return { ...received, notice: provenanceNotice("capture-unavailable", proof.original.canonicalPath) };
++			if (current.canonicalPath !== proof.original.canonicalPath || current.identityHash !== proof.original.identityHash
++				|| current.sourceHash !== proof.original.sourceHash || current.mimeType !== proof.original.mimeType
++				|| current.bytes.length !== proof.original.bytes || related.blockHash !== proof.blockHash
++				|| related.receivedHash !== proof.receivedHash || related.receivedMime !== proof.receivedMime || !related.verified) {
++				return { ...received, notice: provenanceNotice("source-changed", proof.original.canonicalPath) };
++			}
++			return {
++				data: current.bytes.toString("base64"),
++				mimeType: current.mimeType,
++				path: current.canonicalPath,
++				expectedHash: current.sourceHash,
++			};
++		} catch (error) {
++			const reason = error instanceof CaptureError && error.reason === "source-missing" ? "source-missing" : "source-changed";
++			return { ...received, notice: provenanceNotice(reason, proof.original.canonicalPath) };
++		}
++	}
++
++	reset(): void {
++		this.generation++;
++		this.pending.clear();
++		this.results.clear();
++		this.frozenBytes = 0;
++	}
++
++	private enqueue<T>(operation: () => Promise<T>): Promise<T> {
++		const next = this.serial.then(operation, operation);
++		this.serial = next.then(() => undefined, () => undefined);
++		return next;
++	}
++
++	private setResult(evidence: ReadDisplayEvidence): void {
++		while (this.results.size >= MAX_TRACKED_READS) {
++			const oldest = this.results.keys().next().value as string | undefined;
++			if (!oldest) break;
++			const removed = this.results.get(oldest);
++			this.results.delete(oldest);
++			if (removed?.ownsFrozenBytes && removed.capture) this.frozenBytes -= removed.capture.bytes.length;
++		}
++		this.results.set(this.key(evidence.toolCallId, evidence.blockIndex, evidence.blockHash), evidence);
++	}
++
++	private ensureRecordCapacity(): void {
++		while (this.pending.size + this.results.size >= MAX_TRACKED_READS) {
++			const oldest = this.pending.keys().next().value as string | undefined;
++			if (oldest) { this.dropPending(oldest); continue; }
++			const result = this.results.keys().next().value as string | undefined;
++			if (!result) break;
++			const removed = this.results.get(result);
++			this.results.delete(result);
++			if (removed?.ownsFrozenBytes && removed.capture) this.frozenBytes -= removed.capture.bytes.length;
++		}
++	}
++
++	private dropPending(toolCallId: string): void {
++		const pending = this.pending.get(toolCallId);
++		this.pending.delete(toolCallId);
++		if (pending) this.releasePending(pending);
++	}
++
++	private releasePending(pending: PendingRead): void {
++		if (pending.kind === "captured") this.frozenBytes -= pending.capture.bytes.length;
++	}
++
++	private key(toolCallId: string, blockIndex: number, blockHash: string): string {
++		return `${toolCallId}\u0000${blockIndex}\u0000${HASH.test(blockHash) ? blockHash : "invalid"}`;
++	}
++}
 diff --git a/src/renderer.ts b/src/renderer.ts
-index bfaaa84..dd5725f 100644
+index bfaaa84..b15aec4 100644
 --- a/src/renderer.ts
 +++ b/src/renderer.ts
-@@ -1,35 +1,32 @@
+@@ -1,35 +1,34 @@
 -import { type Component, Image, type ImageTheme } from "@earendil-works/pi-tui";
 +import { type Component, Text } from "@earendil-works/pi-tui";
  import type { PreviewRuntime } from "./runtime.ts";
@@ -256,16 +674,18 @@ index bfaaa84..dd5725f 100644
 +	return {
 +		render: (width) => {
 +			const rows = runtime.emitPlaceholder(entry.logicalId, width);
-+			return rows.length ? rows : notice(entry, runtime.sharedFailure(entry.logicalId)).render(width);
++			const fidelity = runtime.fidelityNotice(entry.logicalId);
++			const output = rows.length ? rows : notice(entry, runtime.sharedFailure(entry.logicalId)).render(width);
++			return fidelity ? [...output, ...wrappedNotice(`[image] ${fidelity}`).render(width)] : output;
 +		},
 +		invalidate() {},
 +	};
  }
 diff --git a/src/runtime.ts b/src/runtime.ts
-index 73949b5..16d6aee 100644
+index 73949b5..236df15 100644
 --- a/src/runtime.ts
 +++ b/src/runtime.ts
-@@ -1,157 +1,138 @@
+@@ -1,157 +1,156 @@
 -import { allocateImageId, getCapabilities, getCellDimensions } from "@earendil-works/pi-tui";
 -import { type Environment, isTmux, type RenderMode, renderMode, type TmuxProbe } from "./capabilities.ts";
 -import { deleteImage, deletePlacement, grid, placement, type Sink, upload } from "./kitty-placeholder.ts";
@@ -290,7 +710,7 @@ index 73949b5..16d6aee 100644
 -	allocateImageId?: () => number;
 -	/** Test override for the bounded tmux passthrough capability probe. */
 -	tmuxProbe?: TmuxProbe;
--}
+ }
 -export function geometry(
 -	width: number,
 -	height: number,
@@ -303,6 +723,12 @@ index 73949b5..16d6aee 100644
 -		columns: Math.max(1, Math.ceil((width * scale) / cell.widthPx)),
 -		rows: Math.max(1, Math.ceil((height * scale) / cell.heightPx)),
 -	};
++export interface RehydratedImageSource {
++	data: string;
++	mimeType: string;
++	path?: string;
++	expectedHash?: string;
++	notice?: string;
  }
 +
 +/** Retains only the recent decoded images; the shared backend owns all terminal graphics state. */
@@ -321,6 +747,7 @@ index 73949b5..16d6aee 100644
 -	/** Current terminal placement geometry, keyed by runtime-owned image ID. */
 -	private readonly placements = new Map<number, string>();
 +	private readonly sharedErrors = new Map<string, string>();
++	private readonly fidelityNotices = new Map<string, string>();
 +	private shared?: SharedGraphicsHandle;
 +
  	constructor(deps: RuntimeDeps = {}) {
@@ -362,18 +789,24 @@ index 73949b5..16d6aee 100644
 -		this.terminalIds.set(logicalId, id);
 -		return id;
 +
++	fidelityNotice(logicalId: string): string | undefined {
++		return this.fidelityNotices.get(logicalId);
+ 	}
+-	terminalId(logicalId: string): number | undefined {
+-		return this.terminalIds.get(logicalId);
++
 +	async release(logicalId: string): Promise<void> {
 +		if (this.shared) await this.shared.release(logicalId);
 +		this.images.delete(logicalId);
 +		this.sharedErrors.delete(logicalId);
- 	}
--	terminalId(logicalId: string): number | undefined {
--		return this.terminalIds.get(logicalId);
++		this.fidelityNotices.delete(logicalId);
++	}
 +
 +	async reset(): Promise<void> {
 +		if (this.shared) await this.shared.reset();
 +		this.images.clear();
 +		this.sharedErrors.clear();
++		this.fidelityNotices.clear();
  	}
 +
  	async add(path: string, logicalId: string, cwd?: string): Promise<PreviewEntry> {
@@ -397,8 +830,9 @@ index 73949b5..16d6aee 100644
 +	get(logicalId: string): LoadedImage | undefined {
 +		return this.images.get(logicalId);
  	}
+-	async addBytes(data: string, mimeType: string, logicalId: string, path = "attached image"): Promise<PreviewEntry> {
 +
- 	async addBytes(data: string, mimeType: string, logicalId: string, path = "attached image"): Promise<PreviewEntry> {
++	async addBytes(data: string, mimeType: string, logicalId: string, path = "attached image", notice?: string): Promise<PreviewEntry> {
  		const image = await this.byteLoader(data, mimeType, path);
 -		this.images.set(logicalId, image);
 -		this.id(logicalId);
@@ -411,13 +845,15 @@ index 73949b5..16d6aee 100644
 -			logicalId,
 -		};
 +		await this.admit(logicalId, image);
++		if (notice) this.fidelityNotices.set(logicalId, notice);
 +		return this.entry(logicalId, image);
  	}
 +
  	async rehydrate(
  		entries: PreviewEntry[],
  		cwd?: string,
- 		resolve?: (entry: PreviewEntry) => { data: string; mimeType: string } | undefined,
+-		resolve?: (entry: PreviewEntry) => { data: string; mimeType: string } | undefined,
++		resolve?: (entry: PreviewEntry) => RehydratedImageSource | undefined,
  	): Promise<Map<string, string>> {
 -		this.images.clear();
 -		const state = new Map<string, string>();
@@ -429,17 +865,19 @@ index 73949b5..16d6aee 100644
  				const source = entry.origin ? resolve?.(entry) : undefined;
  				if (entry.origin && !source) throw new Error("origin unavailable");
  				const image = source
- 					? await this.byteLoader(source.data, source.mimeType, entry.path)
+-					? await this.byteLoader(source.data, source.mimeType, entry.path)
++					? await this.byteLoader(source.data, source.mimeType, source.path ?? entry.path)
  					: await this.loader(entry.path, { cwd, fs: this.fs });
 -				if (image.hash !== entry.hash) state.set(entry.logicalId, "Image changed since this preview was saved.");
--				else {
++				if (image.hash !== (source?.expectedHash ?? entry.hash)) status.set(entry.logicalId, "Image changed since this preview was saved.");
+ 				else {
 -					this.images.set(entry.logicalId, image);
 -					this.id(entry.logicalId);
--				}
++					await this.admit(entry.logicalId, image);
++					if (source?.notice) this.fidelityNotices.set(entry.logicalId, source.notice);
+ 				}
 -			} catch {
 -				state.set(entry.logicalId, "Image is missing or no longer readable.");
-+				if (image.hash !== entry.hash) status.set(entry.logicalId, "Image changed since this preview was saved.");
-+				else await this.admit(entry.logicalId, image);
 +			} catch (error) {
 +				status.set(entry.logicalId, error instanceof Error && error.message !== "origin unavailable"
 +					? error.message
@@ -513,4 +951,79 @@ index 73949b5..16d6aee 100644
 +			logicalId,
 +		};
  	}
+ }
+diff --git a/src/transcript-entry.ts b/src/transcript-entry.ts
+index cc3761b..0f1f0d6 100644
+--- a/src/transcript-entry.ts
++++ b/src/transcript-entry.ts
+@@ -1,5 +1,29 @@
+ export const ENTRY_TYPE = "pi-tmux-images.preview";
+ export const CLEAR_TYPE = "pi-tmux-images.clear";
++export type ReadProvenanceReason = "tool-source-unverified" | "capture-unavailable" | "source-missing" | "source-changed" | "result-mismatch";
++export type ReadProvenance = {
++	version: 1;
++	toolCallId: string;
++	blockIndex: number;
++	blockHash: string;
++	receivedHash: string;
++	receivedMime: "image/png" | "image/jpeg" | "image/webp";
++} & (
++	| {
++		status: "verified-local-original";
++		original: {
++			resolvedPath: string;
++			canonicalPath: string;
++			identityHash: string;
++			sourceHash: string;
++			mimeType: "image/png" | "image/jpeg" | "image/webp";
++			bytes: number;
++			width: number;
++			height: number;
++		};
++	}
++	| { status: "unverified"; reason: ReadProvenanceReason }
++);
+ export interface PreviewEntry {
+ 	path: string;
+ 	hash: string;
+@@ -10,11 +34,31 @@ export interface PreviewEntry {
+ 	logicalId: string;
+ 	/** Origin metadata for automatic previews; the image bytes stay in the message block. */
+ 	origin?: { messageOrdinal: number; key: string; blockIndex: number; mimeType: string; contentHash: string };
++	/** Display-only proof. It never replaces or rewrites the tool-result image block. */
++	readProvenance?: ReadProvenance;
+ }
+ export interface ClearEntry {
+ 	marker: true;
+ }
+ const MIME = new Set(["image/png", "image/jpeg", "image/webp"]);
++const REASON = new Set<ReadProvenanceReason>(["tool-source-unverified", "capture-unavailable", "source-missing", "source-changed", "result-mismatch"]);
++const HASH = /^[a-f0-9]{64}$/u;
++function validReadProvenance(value: unknown, entry: Partial<PreviewEntry>): value is ReadProvenance {
++	if (!value || typeof value !== "object" || !entry.origin) return false;
++	const proof = value as Partial<ReadProvenance> & { original?: Record<string, unknown> };
++	if (proof.version !== 1 || (proof.status !== "verified-local-original" && proof.status !== "unverified")
++		|| typeof proof.toolCallId !== "string" || !proof.toolCallId || entry.origin.key !== `tool:${proof.toolCallId}`
++		|| proof.blockIndex !== entry.origin.blockIndex || !HASH.test(proof.blockHash ?? "") || proof.blockHash !== entry.origin.contentHash
++		|| !HASH.test(proof.receivedHash ?? "") || !MIME.has(proof.receivedMime ?? "") || proof.receivedMime !== entry.origin.mimeType) return false;
++	if (proof.status === "unverified") return REASON.has(proof.reason as ReadProvenanceReason) && proof.receivedHash === entry.hash;
++	const original = proof.original;
++	return Boolean(original && typeof original.resolvedPath === "string" && original.resolvedPath.length > 0 && original.resolvedPath.length <= 8192
++		&& typeof original.canonicalPath === "string" && original.canonicalPath.length > 0 && original.canonicalPath.length <= 8192
++		&& HASH.test(String(original.identityHash ?? "")) && HASH.test(String(original.sourceHash ?? ""))
++		&& original.sourceHash === entry.hash && MIME.has(String(original.mimeType ?? "")) && original.mimeType === entry.originalMime
++		&& Number.isSafeInteger(original.bytes) && Number(original.bytes) > 0 && Number(original.bytes) <= 20 * 1024 * 1024
++		&& original.width === entry.width && original.height === entry.height);
++}
+ export function isPreview(value: unknown): value is PreviewEntry {
+ 	if (!value || typeof value !== "object") return false;
+ 	const x = value as Partial<PreviewEntry>;
+@@ -46,6 +90,7 @@ export function isPreview(value: unknown): value is PreviewEntry {
+ 				origin.blockIndex >= 0 &&
+ 				MIME.has(origin.mimeType) &&
+ 				typeof origin.contentHash === "string" &&
+-				/^[a-f0-9]{64}$/u.test(origin.contentHash)))
++				HASH.test(origin.contentHash))) &&
++		(x.readProvenance === undefined || validReadProvenance(x.readProvenance, x))
+ 	);
  }

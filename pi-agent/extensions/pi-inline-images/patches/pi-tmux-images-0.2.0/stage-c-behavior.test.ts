@@ -81,6 +81,7 @@ function fakeApi(bus: Bus, branch: Array<Record<string, unknown>>) {
   const commands = new Map<string, { handler(args: string, context: unknown): Promise<void> }>();
   const api = {
     events: bus,
+    getAllTools: () => [{ name: "read", description: "read", parameters: {}, promptGuidelines: [], sourceInfo: { path: "<builtin:read>", source: "builtin", scope: "temporary", origin: "top-level" } }],
     on(name: string, handler: Handler) { const list = handlers.get(name) ?? []; list.push(handler); handlers.set(name, list); },
     registerEntryRenderer(type: string, renderer: Renderer) { renderers.set(type, renderer); },
     registerCommand(name: string, command: { handler(args: string, context: unknown): Promise<void> }) { commands.set(name, command); },

@@ -16,6 +16,8 @@ test("Stage C replay is exact-version guarded and applies only to a disposable p
     const extension = readFileSync(resolve(copy, "extensions/index.ts"), "utf8");
     const renderer = readFileSync(resolve(copy, "src/renderer.ts"), "utf8");
     const runtime = readFileSync(resolve(copy, "src/runtime.ts"), "utf8");
+    const provenance = readFileSync(resolve(copy, "src/provenance.ts"), "utf8");
+    const transcript = readFileSync(resolve(copy, "src/transcript-entry.ts"), "utf8");
     assert.match(extension, /MAX_RECENT_PREVIEWS = 16/u);
     assert.doesNotMatch(extension, /activeEntries\(ctx\)\.length >= 16/u);
     assert.match(extension, /graphics-owner:request/u);
@@ -25,6 +27,15 @@ test("Stage C replay is exact-version guarded and applies only to a disposable p
     assert.match(runtime, /SharedGraphicsHandle/u);
     assert.match(runtime, /await this\.shared\.prepare/u);
     assert.doesNotMatch(runtime, /process\.stdout|terminalIds|renderMode|deleteImage|\bupload\(/u);
+    assert.match(extension, /pi\.on\("tool_call"/u);
+    assert.match(extension, /pi\.on\("tool_result"/u);
+    assert.match(extension, /pi\.getAllTools\(\)/u);
+    assert.match(provenance, /MAX_TRACKED_READS = 64/u);
+    assert.match(provenance, /MAX_FROZEN_BYTES = 64 \* 1024 \* 1024/u);
+    assert.match(provenance, /<builtin:read>/u);
+    assert.match(provenance, /await import\("@earendil-works\/pi-coding-agent"\)/u);
+    assert.match(provenance, /resizeImage\(capture\.bytes, capture\.mimeType\)/u);
+    assert.match(transcript, /verified-local-original/u);
   } finally {
     rmSync(copy, { recursive: true, force: true });
   }

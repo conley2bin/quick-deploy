@@ -109,6 +109,15 @@ Meaningful preparation/viewer changes coalesce one public TUI
 invalidate/requestRender wakeup through a nonvisual widget; stable polls do not
 repaint or upload.
 
+The old-read replay may display a local source original instead of Pi's resized
+model attachment only when public execution evidence proves the selected tool is
+Pi's exact builtin read. It freezes bounded canonical bytes and file identity at
+`tool_call`, then requires an unchanged source and exact original-or-host-
+`resizeImage` relation at `tool_result`. The tool result and model/session message
+remain unchanged. Restore repeats those checks against persisted display-only
+block/file metadata. Extension wrappers such as ShellGate have no per-read backend
+stamp, so their actual received pixels remain authoritative and a wrapped notice
+states that original resolution is unavailable/unverified.
 
 Precreating bounded placements is lower risk than dynamic placement: official
 Kitty ordering requires a virtual placement before its placeholder cells, while
