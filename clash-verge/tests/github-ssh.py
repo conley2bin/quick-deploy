@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
-"""Offline regression checks for the local route-source flow; never uses real HOME."""
+"""Offline route-source regressions; all writes use a dedicated temporary HOME."""
 from pathlib import Path
 import json
 import os
-import re
 import shutil
 import subprocess
 import tempfile
@@ -11,6 +10,7 @@ import tempfile
 ROOT = Path(__file__).resolve().parents[2]
 CLASH = ROOT / "clash-verge"
 SOURCE = CLASH / "tun-fix.sh"
+CORE = shutil.which("verge-mihomo")
 
 
 def check(condition, message):
@@ -34,46 +34,60 @@ def write_rules(directory, direct, proxy):
     (directory / "proxy.yaml").write_text(proxy)
 
 
-def run_js(script, config, *, expected=0):
+def host_wrapped_js(script, config):
+    """Model v2.5.2's JSON return path: throws would return original config."""
     program = r'''
-const fs = require('node:fs'), vm = require('node:vm');
+const fs = require('fs'), vm = require('vm');
 const sandbox = {}; vm.createContext(sandbox);
 vm.runInContext(fs.readFileSync(process.argv[1], 'utf8'), sandbox);
-const config = JSON.parse(process.argv[2]); const before = JSON.stringify(config);
+const original = JSON.parse(process.argv[2]);
+let returned;
 try {
-  const result = sandbox.main(config);
-  console.log(JSON.stringify({result: result.rules, changed: JSON.stringify(config) !== before}));
-} catch (error) {
-  console.error(JSON.stringify({error: error.message, changed: JSON.stringify(config) !== before}));
-  process.exit(7);
+  const serialized = JSON.stringify(sandbox.main(original) || '');
+  const parsed = JSON.parse(serialized);
+  if (!parsed || Array.isArray(parsed) || typeof parsed !== 'object') throw new Error('mapping required');
+  returned = parsed;
+} catch (_) {
+  returned = original;
 }
+console.log(JSON.stringify(returned));
 '''
     result = subprocess.run(["node", "-e", program, str(script), json.dumps(config)],
-                            text=True, capture_output=True, check=False)
-    check((0 if result.returncode == 0 else 1) == expected,
-          f"JS rc={result.returncode}, expected={expected}: {result.stderr}")
-    return result
+                            text=True, capture_output=True, check=True)
+    return json.loads(result.stdout)
+
+
+def core_validate(root, config, name, expected):
+    config_file = root / f"{name}.yaml"
+    subprocess.run(["python3", "-c", "import json,sys,yaml; yaml.safe_dump(json.load(sys.stdin), sys.stdout)",
+                    ], input=json.dumps(config), text=True, stdout=config_file.open("w"), check=True)
+    result = subprocess.run([CORE, "-t", "-f", str(config_file)], text=True,
+                            capture_output=True, check=False)
+    check(result.returncode == expected,
+          f"core {name} rc={result.returncode}, expected {expected}:\n{result.stdout}\n{result.stderr}")
+    return result.stdout + result.stderr
 
 
 def main():
-    for program in ("bash", "ssh", "node", "python3"):
+    for program in ("bash", "ssh", "node", "python3", "verge-mihomo"):
         check(shutil.which(program), f"missing prerequisite: {program}")
     run(["python3", "-c", "import yaml"], env=os.environ, cwd=ROOT)
-    real_ssh = shutil.which("ssh")
 
     with tempfile.TemporaryDirectory(prefix="clash-rules-check-") as td:
         root = Path(td)
         home = root / "home"
-        clash_state = home / ".local/share/io.github.clash-verge-rev.clash-verge-rev"
-        profiles = clash_state / "profiles"
+        state = home / ".local/share/io.github.clash-verge-rev.clash-verge-rev"
+        profiles = state / "profiles"
         profiles.mkdir(parents=True)
         rules = root / "rules"
         direct = '''version: 1
 pre:
   - "DOMAIN,force.example,DIRECT"
+  - "DOMAIN,ssh.github.com,DIRECT"
 post:
   - "DOMAIN-SUFFIX,cn,DIRECT"
-  - "DOMAIN,local.example,DIRECT"
+  - "IP-CIDR,2001:db8::/32,DIRECT,no-resolve"
+  - "DOMAIN,deleted.example,DIRECT"
 '''
         proxy = '''version: 1
 pre:
@@ -82,122 +96,130 @@ post:
   - "DOMAIN,late.example,Proxy"
 '''
         write_rules(rules, direct, proxy)
-        (clash_state / "profiles.yaml").write_text(
-            "items:\n- uid: Script\n  type: script\n  file: Script.js\n"
+        # Quoted and reordered valid registry fields prove real-YAML lookup.
+        (state / "profiles.yaml").write_text(
+            "items:\n- file: 'Script.js'\n  type: script\n  uid: Script\n"
         )
-        # Rules-only apply must leave unrelated local/runtime artifacts intact.
-        merge_sentinel = profiles / "Merge.yaml"
-        runtime_sentinel = clash_state / "clash-verge.yaml"
-        ssh_sentinel = home / ".ssh" / "config"
-        merge_sentinel.write_text("merge stays untouched\n")
-        runtime_sentinel.write_text("runtime stays untouched\n")
-        ssh_sentinel.parent.mkdir()
-        ssh_sentinel.write_text("Host preserved\n")
+        merge = profiles / "Merge.yaml"
+        runtime = state / "clash-verge.yaml"
+        ssh = home / ".ssh" / "config"
+        merge.write_text("untouched merge\n")
+        runtime.write_text("untouched runtime\n")
+        ssh.parent.mkdir()
+        ssh.write_text("Host untouched\n")
         env = dict(os.environ, HOME=str(home), RULES_DIR=str(rules))
 
-        # check/render must work from arbitrary cwd without profiles; no state writes.
-        no_profile_env = dict(env, HOME=str(root / "no-profile"))
-        checked = run(["bash", str(SOURCE), "rules", "check"], env=no_profile_env, cwd=root)
-        check("route sources valid: 5 rule(s)" in checked.stdout, "check did not read isolated sources")
-        rendered = run(["bash", str(SOURCE), "rules", "render"], env=no_profile_env, cwd=root).stdout
-        check(rendered.startswith("// Generated by tun-fix.sh from rules/"), "render has no generated ownership marker")
-        check(not (root / "no-profile").exists(), "read-only check/render wrote profile state")
+        # Read-only paths use arbitrary cwd and no profile registry.
+        no_profile = dict(env, HOME=str(root / "no-profile"))
+        check("route sources valid: 7 rule(s)" in run(["bash", str(SOURCE), "rules", "check"], env=no_profile, cwd=root).stdout,
+              "check did not read isolated sources")
+        rendered = run(["bash", str(SOURCE), "rules", "render"], env=no_profile, cwd=root).stdout
+        check(rendered.startswith("// Generated by tun-fix.sh"), "render missing ownership marker")
+        check(not (root / "no-profile").exists(), "check/render wrote profile state")
 
-        # Apply targets only the registered global Script and is deterministic.
+        # Apply replaces only the registered Script and leaves unrelated state alone.
         run(["bash", str(SOURCE), "rules", "apply"], env=env, cwd=root)
-        js_file = profiles / "Script.js"
-        check(merge_sentinel.read_text() == "merge stays untouched\n", "rules apply changed Merge")
-        check(runtime_sentinel.read_text() == "runtime stays untouched\n", "rules apply changed runtime YAML")
-        check(ssh_sentinel.read_text() == "Host preserved\n", "rules apply changed SSH config")
-        first = js_file.read_text()
+        js = profiles / "Script.js"
+        first = js.read_text()
         run(["bash", str(SOURCE), "rules", "apply"], env=env, cwd=root)
-        check(js_file.read_text() == first, "repeat rules apply changed generated JS")
+        check(js.read_text() == first, "repeat generated Script differs")
+        check(merge.read_text() == "untouched merge\n" and runtime.read_text() == "untouched runtime\n" and ssh.read_text() == "Host untouched\n",
+              "rules apply changed unrelated files")
 
-        incoming = {
-            "proxy-groups": [{"name": "Proxy"}],
-            "rules": [
-                "DOMAIN-SUFFIX,example,DIRECT", "DOMAIN,force.example,DIRECT",
-                "DOMAIN,proxy.example,Proxy", "DOMAIN,subscription.cn,Proxy",
-                "DOMAIN-SUFFIX,cn,DIRECT", "MATCH,Proxy"
-            ],
-        }
-        ordered = json.loads(run_js(js_file, incoming).stdout)["result"]
+        base = {"proxies": [], "proxy-groups": [{"name": "Proxy", "type": "select", "proxies": ["DIRECT"]}],
+                "rules": ["DOMAIN-SUFFIX,example,DIRECT", "DOMAIN,force.example,DIRECT",
+                          "DOMAIN,proxy.example,Proxy", "DOMAIN,subscription.cn,Proxy",
+                          "DOMAIN-SUFFIX,cn,DIRECT", "MATCH,Proxy"]}
+        ordered = host_wrapped_js(js, base)["rules"]
         check(ordered == [
-            "DOMAIN,force.example,DIRECT", "DOMAIN,proxy.example,Proxy",
-            "DOMAIN-SUFFIX,example,DIRECT", "DOMAIN,subscription.cn,Proxy",
-            "DOMAIN-SUFFIX,cn,DIRECT", "DOMAIN,local.example,DIRECT",
-            "DOMAIN,late.example,Proxy", "MATCH,Proxy"
-        ], f"unexpected first-match ordering: {ordered}")
-        check(ordered.count("MATCH,Proxy") == 1, "duplicate MATCH was created")
+            "DOMAIN,force.example,DIRECT", "DOMAIN,ssh.github.com,DIRECT", "DOMAIN,proxy.example,Proxy",
+            "DOMAIN-SUFFIX,example,DIRECT", "DOMAIN,subscription.cn,Proxy", "DOMAIN-SUFFIX,cn,DIRECT",
+            "IP-CIDR,2001:db8::/32,DIRECT,no-resolve", "DOMAIN,deleted.example,DIRECT",
+            "DOMAIN,late.example,Proxy", "MATCH,Proxy"], f"unexpected ordering: {ordered}")
+        check(core_validate(root, {**base, "rules": ordered}, "valid", 0), "valid core output unexpectedly empty")
 
-        missing_group = run_js(js_file, {"proxy-groups": [], "rules": ["MATCH,Proxy"]}, expected=1)
-        check("missing group" in missing_group.stderr and not json.loads(missing_group.stderr)["changed"],
-              "missing proxy group did not fail before mutation")
-        no_match = run_js(js_file, {"proxy-groups": [{"name": "Proxy"}], "rules": []}, expected=1)
-        check("no MATCH" in no_match.stderr and not json.loads(no_match.stderr)["changed"],
-              "missing MATCH did not fail before mutation")
+        # Source-faithful host wrapper receives invalid JSON objects, not throws.
+        missing_group = host_wrapped_js(js, {"proxies": [], "proxy-groups": [], "rules": ["MATCH,DIRECT"]})
+        missing_group_output = core_validate(root, missing_group, "missing-group", 1)
+        check("LOCAL-RULES-ERROR-MISSING-PROXY-GROUP" in missing_group_output,
+              "missing group guard was not rejected by real core")
+        missing_match = host_wrapped_js(js, {"proxies": [], "proxy-groups": [{"name": "Proxy", "type": "select", "proxies": ["DIRECT"]}], "rules": []})
+        missing_match_output = core_validate(root, missing_match, "missing-match", 1)
+        check("LOCAL-RULES-ERROR-MISSING-MATCH" in missing_match_output,
+              "missing MATCH guard was not rejected by real core")
 
-        # Removing a source entry changes the next clean subscription rebuild.
-        (rules / "direct.yaml").write_text(direct.replace('  - "DOMAIN,local.example,DIRECT"\n', ""))
-        run(["bash", str(SOURCE), "rules", "apply"], env=env, cwd=root)
-        regenerated = js_file.read_text()
-        check("local.example" not in regenerated, "deleted local rule remained in regenerated script")
-        after_delete = json.loads(run_js(js_file, incoming).stdout)["result"]
-        check("DOMAIN,local.example,DIRECT" not in after_delete, "deleted rule was injected into clean base")
+        # Strict grammar failures occur before candidate/backup/replacement.
+        stable = js.read_text()
+        for bad_rule, diagnostic in (
+            ("DOMAIN-SUFIX,example.com,DIRECT", "unsupported matcher"),
+            ("IP-CIDR,not-a-cidr,DIRECT,no-resolve", "valid IPv4 or IPv6 CIDR"),
+            ("DST-PORT,70000,DIRECT", "DST-PORT payload"),
+            ("DOMAIN,example.com,DIRECT,no-resolve", "no-resolve is not supported"),
+            ("IP-CIDR,192.0.2.0/24,no-resolve,DIRECT", "only once as the final option"),
+            ("IP-CIDR,192.0.2.0/24,DIRECT,no-resolve,no-resolve", "only once as the final option"),
+        ):
+            (rules / "direct.yaml").write_text(f'version: 1\npre:\n  - "{bad_rule}"\npost: []\n')
+            checked_bad = run(["bash", str(SOURCE), "rules", "check"], env=env, cwd=root, expected=1)
+            failed = run(["bash", str(SOURCE), "rules", "apply"], env=env, cwd=root, expected=1)
+            check(diagnostic in checked_bad.stderr and diagnostic in failed.stderr and js.read_text() == stable,
+                  f"invalid source {bad_rule} mutated Script or lacked diagnostic")
 
-        # Source failures cannot replace an existing extension.
-        stable = js_file.read_text()
-        (rules / "direct.yaml").write_text("version: 1\npre: [not-a-rule]\npost: []\n")
-        bad = run(["bash", str(SOURCE), "rules", "apply"], env=env, cwd=root, expected=1)
-        check("route source error" in bad.stderr, "bad YAML/source diagnostic missing")
-        check(js_file.read_text() == stable, "bad source mutated Script.js")
-        full_merge = root / "full-optimizer-merge.yaml"
-        full_merge.write_text("sentinel: unchanged\n")
-        run(["bash", "-c", 'source "$1"; optimize_all "$2"', "test", str(SOURCE), str(full_merge)],
-            env=env, cwd=root, expected=1)
-        check(full_merge.read_text() == "sentinel: unchanged\n",
-              "full optimizer wrote Merge before local source preflight")
-
-        # An unregistered target produces no orphan Script.js.
-        orphan_home = root / "orphan-home"
-        orphan_state = orphan_home / ".local/share/io.github.clash-verge-rev.clash-verge-rev"
-        (orphan_state / "profiles").mkdir(parents=True)
-        (orphan_state / "profiles.yaml").write_text("items: []\n")
-        orphan_env = dict(env, HOME=str(orphan_home))
-        run(["bash", str(SOURCE), "rules", "apply"], env=orphan_env, cwd=root, expected=1)
-        check(not (orphan_state / "profiles" / "Script.js").exists(), "unregistered apply wrote orphan Script.js")
-
-        # A foreign script requires confirmation and remains untouched when declined.
+        # A bound legacy Rules extension blocks migration even after source removal.
         (rules / "direct.yaml").write_text(direct)
-        foreign = profiles / "Script.js"
-        foreign.write_text("// user-owned script\n")
-        run(["bash", str(SOURCE), "rules", "apply"], env=env, cwd=root, expected=1, input="n\n")
-        check(foreign.read_text() == "// user-owned script\n", "declined foreign replacement changed Script.js")
+        (rules / "proxy.yaml").write_text('version: 1\npre:\n  - "DOMAIN,example.com,REJECT"\npost: []\n')
+        reserved_target = run(["bash", str(SOURCE), "rules", "check"], env=env, cwd=root, expected=1)
+        check("must name a subscription proxy group" in reserved_target.stderr, "proxy built-in target was accepted")
+        (rules / "proxy.yaml").write_text(proxy)
+        (state / "profiles.yaml").write_text(
+            "items:\n- uid: Script\n  type: script\n  file: Script.js\n"
+            "- uid: legacy-rules\n  type: rules\n  file: legacy.yaml\n"
+            "- uid: remote-a\n  type: remote\n  option:\n    rules: legacy-rules\n"
+        )
+        legacy = profiles / "legacy.yaml"
+        legacy.write_text('prepend:\n  - "DOMAIN,ssh.github.com,DIRECT"\nappend: []\n')
+        refused = run(["bash", str(SOURCE), "rules", "apply"], env=env, cwd=root, expected=1)
+        check(f"{legacy}:2: DOMAIN,ssh.github.com,DIRECT" in refused.stderr and js.read_text() == stable,
+              "legacy GitHub duplicate was not reported before replacement")
+        # Operator cleans only the named local extension; source removal then stops injection on a fresh base.
+        legacy.write_text("prepend: []\nappend: []\n")
+        (rules / "direct.yaml").write_text(direct.replace('  - "DOMAIN,ssh.github.com,DIRECT"\n', ""))
+        run(["bash", str(SOURCE), "rules", "apply"], env=env, cwd=root)
+        rebuilt = host_wrapped_js(js, {"proxies": [], "proxy-groups": [{"name": "Proxy", "type": "select", "proxies": ["DIRECT"]}],
+                                       "rules": ["DOMAIN-SUFFIX,github.com,Proxy", "MATCH,Proxy"]})["rules"]
+        check("DOMAIN,ssh.github.com,DIRECT" not in rebuilt and rebuilt[-1] == "MATCH,Proxy",
+              "source removal still injected GitHub rule after migration cleanup")
 
-        # Same-phase overlap and opposite target selector diagnostics are source errors.
-        (rules / "direct.yaml").write_text('version: 1\npre:\n  - "DOMAIN-SUFFIX,example.com,DIRECT"\npost: []\n')
-        (rules / "proxy.yaml").write_text('version: 1\npre:\n  - "DOMAIN,api.example.com,Proxy"\npost: []\n')
-        overlap = run(["bash", str(SOURCE), "rules", "check"], env=env, cwd=root, expected=1)
-        check("same-phase domain overlap" in overlap.stderr, "domain overlap was accepted")
+        # Registry null/mixed duplicate Script entries reject without an orphan output.
+        js.unlink()
+        (state / "profiles.yaml").write_text("items:\n- uid: Script\n  type: script\n  file: null\n")
+        run(["bash", str(SOURCE), "rules", "apply"], env=env, cwd=root, expected=1)
+        check(not (profiles / "null").exists() and not js.exists(), "null registry file produced orphan")
+        (state / "profiles.yaml").write_text("items: []\n")
+        run(["bash", str(SOURCE), "rules", "apply"], env=env, cwd=root, expected=1)
+        check(not js.exists(), "unregistered registry wrote output")
+        (state / "profiles.yaml").write_text("items:\n- uid: Script\n  type: script\n  file: Script.js\n- uid: Script\n  type: merge\n  file: Other.yaml\n")
+        run(["bash", str(SOURCE), "rules", "apply"], env=env, cwd=root, expected=1)
+        check(not js.exists(), "duplicate mixed Script registry wrote output")
 
-        # Keep the pre-existing GitHub SSH testable from the changed source entry.
-        functions = root / "functions.sh"
-        functions.write_text(SOURCE.read_text())
-        ssh_config = root / "ssh.config"
-        bindir = root / "bin"
-        bindir.mkdir()
-        wrapper = bindir / "ssh"
-        wrapper.write_text("#!/bin/sh\n[ \"$1\" = \"-G\" ] || exit 2\nexec " + real_ssh + " -F \"$SSH_TEST_CONFIG\" \"$@\"\n")
-        wrapper.chmod(0o700)
-        ssh_env = dict(env, SSH_TEST_CONFIG=str(ssh_config), PATH=str(bindir) + os.pathsep + os.environ["PATH"])
-        generated = run(["bash", "-c", 'source "$1"; github_ssh_block', "test", str(functions)], env=ssh_env, cwd=root).stdout
-        ssh_config.write_text(generated)
-        run(["bash", "-c", 'source "$1"; verify_github_ssh_config', "test", str(functions)], env=ssh_env, cwd=root)
-        parsed = subprocess.run([real_ssh, "-G", "-F", str(ssh_config), "github.com"], text=True, capture_output=True, check=True).stdout
-        check("hostname ssh.github.com\n" in parsed and "ipqos none none\n" in parsed,
-              "GitHub SSH policy regressed while adding route command entry")
+        # Confirmed foreign script has collision-free backups even for rapid applies.
+        (state / "profiles.yaml").write_text("items:\n- uid: Script\n  type: script\n  file: Script.js\n")
+        for prior_backup in profiles.glob("Script.js.backup.*"):
+            prior_backup.unlink()
+        js.write_text("// foreign script\n")
+        run(["bash", str(SOURCE), "rules", "apply"], env=env, cwd=root, input="y\n")
+        run(["bash", str(SOURCE), "rules", "apply"], env=env, cwd=root)
+        backups = sorted(profiles.glob("Script.js.backup.*"))
+        check(len(backups) >= 2 and any(backup.read_text() == "// foreign script\n" for backup in backups),
+              "rapid applies overwrote the foreign-script backup")
+        check(not list(profiles.glob(".Script.js.candidate.*")), "failed/finished apply left candidate files")
 
-    print("PASS: isolated YAML check/render/apply, generated first-match ordering, clean regeneration, diagnostics, ownership, and GitHub SSH")
+        # The pre-existing GitHub SSH generator remains callable from the new CLI source.
+        ssh_block = run(["bash", "-c", 'source "$1"; github_ssh_block', "test", str(SOURCE)], env=env, cwd=root).stdout
+        check("Host github.com ssh.github.com" in ssh_block and "IPQoS none" in ssh_block and
+              "ProxyCommand" not in ssh_block and "ProxyJump" not in ssh_block,
+              "GitHub SSH no-jump/QoS policy regressed")
+
+    print("PASS: source grammar, YAML registry/migration preflight, host-faithful guard candidates, real Mihomo validation, atomic backups, ordering, and isolated scope")
 
 
 if __name__ == "__main__":

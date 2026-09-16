@@ -23,13 +23,19 @@ rules/proxy.yaml    # 只能写当前订阅已有的代理组目标；不写节�
 ./clash-verge/tun-fix.sh rules apply
 ```
 
-`apply` 先渲染候选 Script，再检查已登记的全局 Script 目标；未登记时会报错而不会写一个 Verge 永远不会加载的孤儿文件。已有非本工具脚本会要求确认并备份。完成后在 Verge GUI 中重载当前订阅/配置。`clash-verge.yaml` 是 Verge 生成的运行时输出，不能手改，也不是这些 YAML 的来源。
+`apply` 先校验来源及已绑定的订阅级 Rules 扩展，再渲染候选 Script，并检查已登记的全局 Script 目标。首次从旧的订阅级规则迁移时，它会列出精确的 `路径:行号:规则`，包括历史 `DOMAIN,ssh.github.com,DIRECT`；请只手动删掉列出的本地扩展条目后重试。它绝不改写订阅或扩展文件。删除 YAML 规则只会停止**本生成器**注入该规则；独立订阅规则仍会保留其自身行为。
+
+未登记、歧义或不安全的 Script 目标会报错而不会写一个 Verge 永远不会加载的孤儿文件。已有非本工具脚本会要求确认并建立唯一备份。完成后在 Verge GUI 中重载当前订阅/配置。`clash-verge.yaml` 是 Verge 生成的运行时输出，不能手改，也不是这些 YAML 的来源。若之后配置的订阅级 Merge 或 Script 重写 `config.rules`，它们在该全局 Script 之后运行，能够覆盖这份输出；此流程不会替代那种后续扩展。
 
 Mihomo 是**首条命中**，不会因为 `DOMAIN` 比 `DOMAIN-SUFFIX` 更具体而自动获胜。`pre` 的顺序为 `direct.pre`、`proxy.pre`，并移到订阅规则前；相同的订阅条目按完整规范化规则串去重并提升。订阅原有规则在第一个 `MATCH` 前保持原序；缺失的 `direct.post`、`proxy.post` 插入在该 `MATCH` 前，已有的相同 `post` 条目保留原位置。这样 `post` 是订阅规则的补充，不会覆盖订阅已有例外。生成器拒绝不存在的代理组、缺少 `MATCH`、未知 YAML 字段、同一选择器相反目标，以及同一阶段具有相反目标的可证明域名重叠（`DOMAIN`/`DOMAIN-SUFFIX`、后缀嵌套）。它不会猜测规则特异性或重排订阅。
 
+支持的可编辑 matcher 是 `DOMAIN`、`DOMAIN-SUFFIX`、`DOMAIN-KEYWORD`、`DST-PORT`、`GEOIP`、`IP-CIDR` 和 `IP-CIDR6`。`IP-CIDR` 可使用 IPv4 或 IPv6 CIDR；端口必须是单一 1–65535 值或升序范围；`no-resolve` 只允许作为 `GEOIP`、`IP-CIDR` 或 `IP-CIDR6` 的最后一个选项。`rules check` 会在任何写入前拒绝未知 matcher、错误 payload/arity、错误选项和内置策略名作为 proxy 目标。
+
 迁移说明：旧脚本中六条 `forceTop` 规则现在在 `direct.pre`；其余原有本地 DIRECT 规则都在 `direct.post`。每条匹配器、目标和 `no-resolve` 选项均保留。宽泛补充规则现在会让位于订阅中即使没有完全相同字符串的更早例外；这是为消除旧版“全部 prepend”遮蔽订阅例外的有意语义变化。
 
-## 只修 GitHub SSH
+## 只修 GitHub SSH（不用全局规则流程时的替代方案）
+
+如果你**不使用**上面的全局 `rules apply` 流程、只想在某一个订阅上修 GitHub SSH，可使用这一替代方案。不要同时保留订阅级 `DOMAIN,ssh.github.com,DIRECT` 与全局两文件流：`rules apply` 的迁移预检会指出该重复项，需从绑定的 Rules 扩展中手动删除后再采用全局流。
 
 如果只想在本机拉取 GitHub 仓库，不必运行会修改多个站点路由的“一键优化”。需要配合两处设置。
 
