@@ -1,2 +1,3 @@
-# Local machine inventory may contain personal host names and addresses.
-machines.local.yaml
+# 本机清单可能包含个人主机名与地址：新默认文件与旧文件名都忽略，避免入库。
+/machines.yaml
+/machines.local.yaml

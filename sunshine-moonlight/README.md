@@ -62,18 +62,22 @@ Web UI 只绑定 A 的 Tailnet IPv4；远端 `localhost:47990` 不是它的监�
 
 ## 3. 用本机清单连接
 
-安装完成后，先从示例建立本机清单；它包含机器名、Tailnet IPv4 与 SSH 目标，不保存密码、PIN、私钥或命令参数：
+安装完成后，先从仓库自带的静态示例手动建立本机清单；它包含机器名、Tailnet IPv4 与 SSH 目标，不保存密码、PIN、私钥或命令参数：
 
 ```bash
 cd ~/quick-deploy/sunshine-moonlight
-[ -e machines.local.yaml ] || cp machines.example.yaml machines.local.yaml
-$EDITOR machines.local.yaml
+[ -e machines.yaml ] || cp machines.example.yaml machines.yaml
+$EDITOR machines.yaml
 ./run_server.sh --list
 ```
 
-`machines.local.yaml` 被模块的 `.gitignore` 忽略；已有本地文件不会被安装器或连接器改写。默认清单始终是 `run_server.sh` 同目录的 `machines.local.yaml`，不会因当前目录改变。用 `--config PATH` 时，PATH 按当前工作目录解析，适合临时、明确指定的清单。
+`machines.yaml` 与旧文件名 `machines.local.yaml` 都被模块 `.gitignore` 忽略，真实清单不会入库。清单由你手工创建和编辑：安装器与连接器都不会自动生成、迁移或覆盖它，也不会自动读取旧文件；你要用旧文件时，显式 `--config machines.local.yaml` 仍会照常读取。**默认清单始终是模块根目录的 `machines.yaml`，从任意当前目录运行都取同一份；文件缺失时连接器直接报错并给出路径与手动复制示例的办法，不会自动改用示例模板、旧文件或第一台机器。** 用 `--config PATH` 指定其它清单时，PATH 按当前工作目录解析，适合临时、明确指定的文件。
 
-每个名称需有一个 `ssh`（单个别名或 `[user@]hostname/IP`）和 `tailnet_ip`（IPv4）；`moonlight_port` 可省略并默认 `47989`，`ssh_port` 可选。字段以 [`machines.example.yaml`](machines.example.yaml) 为准；未知字段、重复键、非字符串地址、布尔值/字符串端口、无效 IP 或端口都会在启动本地程序前报错。
+每个名称需有一个 `ssh`（单个别名或 `[user@]hostname/IP`）和 `tailnet_ip`（IPv4）；`moonlight_port` 可省略并默认 `47989`（基准端口，不是 Web UI 端口），`ssh_port` 可选（省略时不传 `-p`）。字段的必填/可选、用途与取值形态以 [`machines.example.yaml`](machines.example.yaml) 的中文注释为准；未知字段、重复键、非字符串地址、布尔值/字符串端口、无效 IP 或端口都会在启动本地程序前报错。
+
+清单只决定本机连接路由：连接器不查询 Tailscale（不枚举成员，也不探测远端地址），不读取或改写 SSH 配置、密钥与 known_hosts。`ssh` 写成别名时，由系统 SSH 自己按你的 `~/.ssh/config`、密钥/agent 与 known_hosts 解析；连接器只把清单里的目标追加到 `ssh` 参数。
+
+需要区分职责：主机安装器与 `./commands/doctor.sh --host` 仍会只读查询**本机** Tailscale 状态和 `tailscale0` 上已分配的 Tailnet IPv4，用于确认 Sunshine 的绑定与服务启动条件（见「重启、等待网络与熄屏」）；这属于被控主机的本机网络就绪检查，不生成、不读取也不维护远端机器清单。
 
 在 **Moonlight 中独立完成配对** 后，以名称启动 Desktop 串流：
 
@@ -211,7 +215,7 @@ Doctor 只读；退出 1 表示必需条件不满足。它检查包、实际服�
 
 主机包移除默认保留凭据，预先存在的包默认拒绝删除；`--help` 说明显式强制选项。状态删除会停止并禁用服务，避免下次图形登录用默认配置启动；再次使用前重跑 `./commands/install-host.sh` 恢复 Tailnet 配置与服务。配置目录本身若为符号链接，会在停止服务前拒绝删除；普通 HOME/XDG 父目录链接不受此限制。目录外的凭据不在删除范围；其他用户或手动启动的 Sunshine 实例会报告 PID/UID，不会被终止。
 
-维护时运行 `./tests/run.sh` 及 `python3 ./tests/run_server.py`：前者在临时 HOME/PATH 下实际执行启动检查，覆盖地址缺失、配置来源变化、归属与卸载顺序，以及 HOME/XDG 父目录链接下的安装、复装、doctor 和移除；后者在带空格的临时模块副本中实际执行 `run_server.sh`→Python→假 Moonlight/SSH，核对参数、stdin、退出码和无副作用拒绝。延迟超过 500 秒及停止重试采用离散时间模型，不是真实 systemd 运行验收。有 `systemd-analyze` 时另做静态单元解析和加载路径核对；APT 仅模拟，不安装包或操作真实服务，也不验证实际画面/输入。
+维护时运行 `./tests/run.sh` 及 `python3 ./tests/run_server.py`：前者在临时 HOME/PATH 下实际执行启动检查，覆盖地址缺失、配置来源变化、归属与卸载顺序，以及 HOME/XDG 父目录链接下的安装、复装、doctor 和移除；后者在带空格的临时模块副本中实际执行 `run_server.sh`→Python→假 Moonlight/SSH，核对参数、stdin、退出码与无副作用拒绝，并覆盖默认清单取自模块目录且不受当前目录影响、只有旧文件名或只有示例模板时都不隐式采用、两份并存时只用新文件、`--config` 相对调用目录，以及不探测 Tailscale、不改写既有 SSH 配置。延迟超过 500 秒及停止重试采用离散时间模型，不是真实 systemd 运行验收。有 `systemd-analyze` 时另做静态单元解析和加载路径核对；APT 仅模拟，不安装包或操作真实服务，也不验证实际画面/输入。
 
 绑定解析测试使用已核对的原生解析结果。若本地有对应标签源码和 C++ 编译器，可额外运行 `python3 tests/binding.py --native-source /path/to/Sunshine-2026.906.222525/src/config.cpp`，离线编译该文件的原始解析函数，对照输入、重写结果和隔离安装器输出；不会构建或运行 Sunshine。
 

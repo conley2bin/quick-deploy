@@ -7,9 +7,13 @@ import ipaddress
 import os
 from pathlib import Path
 import re
+import shlex
 import sys
 from typing import Any
 
+MODULE_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_INVENTORY = MODULE_ROOT / "machines.yaml"
+EXAMPLE_INVENTORY = MODULE_ROOT / "machines.example.yaml"
 DEFAULT_MOONLIGHT_PORT = 47989
 MIN_MOONLIGHT_PORT = 1029
 MAX_MOONLIGHT_PORT = 65514
@@ -71,7 +75,11 @@ def load_yaml(path: Path) -> Any:
         with path.open(encoding="utf-8") as inventory_file:
             return yaml.load(inventory_file, Loader=UniqueKeyLoader)
     except FileNotFoundError as error:
-        raise InventoryError(f"清单不存在: {path}") from error
+        raise InventoryError(
+            f"清单不存在: {path}\n"
+            f"清单不会自动探测或生成；请手动复制本模块的示例模板并编辑，例如：\n"
+            f"    cp -- {shlex.quote(str(EXAMPLE_INVENTORY))} {shlex.quote(str(path))}"
+        ) from error
     except UnicodeDecodeError as error:
         raise InventoryError(f"清单不是有效 UTF-8 文本: {path}") from error
     except OSError as error:
@@ -162,7 +170,7 @@ def main(argv: list[str]) -> None:
     elif args.name is None:
         parser().error("必须指定机器名；使用 --list 查看可用名称")
 
-    config_path = args.config if args.config is not None else Path(__file__).resolve().parents[1] / "machines.local.yaml"
+    config_path = args.config if args.config is not None else DEFAULT_INVENTORY
     try:
         machines = validate_inventory(load_yaml(config_path))
     except InventoryError as error:
