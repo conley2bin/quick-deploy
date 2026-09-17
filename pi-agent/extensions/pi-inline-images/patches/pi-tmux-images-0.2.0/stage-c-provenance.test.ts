@@ -201,9 +201,9 @@ test("real handlers substitute only proven builtin-local originals and keep ever
     const renderer = fake.renderers.get(ENTRY_TYPE)!;
     for (const width of [16, 40]) {
       const rendered = renderer({ data: verified }, {}, {}).render(width);
-      const noticeLines = rendered.filter((line) => !line.includes(PLACEHOLDER));
-      assert.match(noticeLines.join("").replace(/\s/gu, ""), /Originalresolutionunavailable\/unverified/u);
-      assert.ok(noticeLines.every((line) => visibleWidth(line) <= width), `provenance notice fits width ${width}`);
+      assert.doesNotMatch(rendered.join("\n"), /Original resolution unavailable/u, "unverified origins render without a display notice");
+      assert.ok(rendered.some((line) => line.includes(PLACEHOLDER)), `received pixels still render at width ${width}`);
+      assert.ok(rendered.every((line) => visibleWidth(line) <= width), `rows fit width ${width}`);
     }
 
     const changed = await runRead("changed", changedPath, changedResized!.data, changedResized!.mimeType, () => {

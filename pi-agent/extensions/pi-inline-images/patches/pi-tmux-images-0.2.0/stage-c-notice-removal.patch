@@ -1,0 +1,14 @@
+diff --git a/src/renderer.ts b/src/renderer.ts
+--- a/src/renderer.ts
++++ b/src/renderer.ts
+@@ -29,9 +29,7 @@
+ 			if (current.coordinationFailure) return notice(entry, current.coordinationFailure).render(width);
+ 			if (!runtime.get(entry.logicalId)) return notice(entry, "Image is unavailable in this process.").render(width);
+ 			const rows = runtime.emitPlaceholder(entry.logicalId, width);
+-			const fidelity = runtime.fidelityNotice(entry.logicalId);
+-			const output = rows.length ? rows : notice(entry, runtime.sharedFailure(entry.logicalId)).render(width);
+-			return fidelity ? [...output, ...wrappedNotice(`[image] ${fidelity}`).render(width)] : output;
++			return rows.length ? rows : notice(entry, runtime.sharedFailure(entry.logicalId)).render(width);
+ 		},
+ 		invalidate() {},
+ 	};

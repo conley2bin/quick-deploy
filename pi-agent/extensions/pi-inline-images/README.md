@@ -123,8 +123,8 @@ Pi's exact builtin read. It freezes bounded canonical bytes and file identity at
 `resizeImage` relation at `tool_result`. The tool result and model/session message
 remain unchanged. Restore repeats those checks against persisted display-only
 block/file metadata. Extension wrappers such as ShellGate have no per-read backend
-stamp, so their actual received pixels remain authoritative and a wrapped notice
-states that original resolution is unavailable/unverified.
+stamp, so their actual received pixels remain authoritative and are rendered as
+received without an original-resolution notice.
 
 For Pi **0.85.1**, a host-version guard reconciles persisted branch messages with
 public live message events and the public TUI/Container component sequence. Only a

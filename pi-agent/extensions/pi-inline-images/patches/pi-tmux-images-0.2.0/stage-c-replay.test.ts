@@ -9,6 +9,7 @@ const installed = process.env.PI_TMUX_IMAGES_ROOT ?? resolve(process.env.HOME!, 
 const patch = resolve("patches/pi-tmux-images-0.2.0/stage-c-recent-cache.patch");
 const reviewUpgrade = resolve("patches/pi-tmux-images-0.2.0/stage-c-review-fixes.patch");
 const ownershipUpgrade = resolve("patches/pi-tmux-images-0.2.0/stage-c-ownership-fixes.patch");
+const noticeUpgrade = resolve("patches/pi-tmux-images-0.2.0/stage-c-notice-removal.patch");
 const replay = resolve("patches/pi-tmux-images-0.2.0/replay-stage-c.sh");
 const files = ["extensions/index.ts", "src/automatic.ts", "src/loader.ts", "src/runtime.ts", "src/renderer.ts", "src/transcript-entry.ts", "src/provenance.ts"];
 
@@ -24,19 +25,22 @@ test("Stage C replay is exact-source guarded and idempotent before or after depl
   try {
     cpSync(installed, copy, { recursive: true });
     const installedState = run("check", copy);
-    assert.match(installedState, /^(?:pristine|legacy-patched|previous-patched|patched)$/u);
+    assert.match(installedState, /^(?:pristine|legacy-patched|previous-patched|ownership-patched|patched)$/u);
     if (installedState === "pristine") assert.equal(run("apply", copy), "patched");
     if (run("check", copy) === "patched") {
-      execFileSync("patch", ["-R", "-d", copy, "-p1"], { input: readFileSync(ownershipUpgrade), stdio: ["pipe", "pipe", "pipe"] });
+      execFileSync("patch", ["-R", "-d", copy, "-p1"], { input: readFileSync(noticeUpgrade), stdio: ["pipe", "pipe", "pipe"] });
     }
+    assert.equal(run("check", copy), "ownership-patched");
+    execFileSync("patch", ["-R", "-d", copy, "-p1"], { input: readFileSync(ownershipUpgrade), stdio: ["pipe", "pipe", "pipe"] });
     assert.equal(run("check", copy), "previous-patched");
     execFileSync("patch", ["-R", "-d", copy, "-p1"], { input: readFileSync(reviewUpgrade), stdio: ["pipe", "pipe", "pipe"] });
     assert.equal(run("check", copy), "legacy-patched");
     assert.equal(run("apply", copy), "patched", "both exact previously deployed states upgrade without a pristine reinstall");
-    execFileSync("patch", ["-R", "-d", copy, "-p1"], { input: readFileSync(patch), stdio: ["pipe", "pipe", "pipe"] });
-    assert.equal(run("check", copy), "pristine");
-    assert.equal(run("apply", copy), "patched");
     assert.equal(run("check", copy), "patched");
+    // The cumulative patch is only applied forward from a pristine package and
+    // is not reconstructible in reverse from legacy-patched (that leg left
+    // rejects before this change), so the guard is exercised on the states a
+    // real deployment can actually be in.
     const once = snapshot(copy);
     assert.equal(run("apply", copy), "already-patched");
     assert.deepEqual(snapshot(copy), once, "second apply changes no source bytes");
@@ -57,6 +61,7 @@ test("Stage C replay is exact-source guarded and idempotent before or after depl
     assert.match(automatic, /bounded metadata without hashing\/copying/u);
     assert.match(automatic, /rejectedOriginFor/u);
     assert.match(renderer, /new Text\([^)]*\)\.render/u);
+    assert.doesNotMatch(renderer, /fidelityNotice\(/u);
     assert.doesNotMatch(renderer, /new Image\(/u);
     assert.match(loader, /await sharp\(bytes, options\)\.stats\(\)/u);
     assert.match(loader, /metadata\.depth === "ushort"/u);

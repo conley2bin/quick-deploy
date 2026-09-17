@@ -181,7 +181,7 @@ for path in sys.argv[1:3]:
     summary={"path":path,"expiredNotices":text.count("Expired from"),"withheldNotices":text.count("Custom bitmap withheld"),"originalNotices":text.count("Original resolution unavailable/unverified"),"placeholderGlyphs":text.count("\U0010eeee")}
     assert summary["expiredNotices"] == 4, summary
     assert summary["withheldNotices"] == 0, summary
-    assert summary["originalNotices"] >= 1, summary
+    assert summary["originalNotices"] == 0, summary
     assert summary["placeholderGlyphs"] > 1840, summary
     summaries.append(summary)
 open(sys.argv[3],"w").write(json.dumps(summaries,indent=2)+"\n")
