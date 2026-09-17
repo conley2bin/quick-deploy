@@ -1,97 +1,124 @@
-# Clash Verge 配置优化工具
+# Clash Verge 本地路由工具
 
-为 Clash Verge Rev 生成本地 DNS、TUN 和路由增强配置，并配置 GitHub SSH。脚本写入的文件需要被 Verge 合并、加载后才会生效。
+把「哪些流量直连、哪些走代理」放进两个可编辑的 YAML，生成已登记的全局 Script，
+再在 Verge 里重载。工具只写路由，不改订阅、Merge、DNS、TUN、运行 YAML 或 SSH。
 
-## 代码与策略边界
-
-```text
-tun-fix.sh       # 小型 CLI / 菜单分派器
-lib/config.sh     # registry 定位、Merge/Script 原子写入、备份与完整优化编排
-lib/diagnose.sh   # /rules、Fake-IP、TUN、LiteLLM 嗅探诊断
-lib/ssh.sh        # GitHub SSH 配置
-lib/rules.py      # 唯一的 YAML/registry/规则读取器与 Script 渲染器
-rules/*.yaml      # 日常可编辑的本地路由策略数据
+```bash
+./clash-verge/tun-fix.sh          # 打开菜单；回车 = 更新规则
 ```
 
-`rules/` 中只有策略数据；实现和依赖声明在 `lib/`。`rules check/render` 是只读日常操作，`rules apply` 只更新已登记的全局 Script；完整菜单选项 1 才会同时处理 Merge、DNS、TUN 和订阅级 Merge。
+菜单：
 
-## 本地路由覆盖（推荐的日常维护入口）
+```text
+1. 更新直连/代理规则（默认，回车执行）   校验并渲染两个 YAML，替换已登记的全局 Script
+2. 配置 GitHub SSH                     可选；只改 ~/.ssh/config 中本工具管理的块
+3. 查看本机应用识别结果                 只读盘点五个受支持应用的路径与未解决原因
+4. 恢复上次规则                        从全局 Script 最近的同目录备份恢复
+0. 退出
+```
 
-路由的唯一可编辑来源是两个版本控制文件：
+菜单顶部始终打印本次实际使用的绝对路径：`rules/direct.yaml`、`rules/proxy.yaml`、
+已登记的全局 Script，以及只读的 `profiles.yaml`/订阅文件。输入空行等于选项 1；
+EOF 直接退出且不写任何文件；某个动作失败会打印原因并回到菜单，不会假装成功。
+
+## 日常修改路由
+
+只有两个文件需要编辑：
 
 ```text
 rules/direct.yaml   # 只能写 DIRECT 目标
-rules/proxy.yaml    # 只能写当前订阅已有的代理组目标；不写节点
+rules/proxy.yaml    # 只能写当前订阅已有的代理组名；不写节点
 ```
 
-两者都使用严格的 `version: 1`、`pre: [...]`、`post: [...]` YAML 结构。列表可混用完整 Mihomo 规则字符串和五个受支持应用的声明。解析器使用 [PyYAML](lib/requirements.txt)，而不是用 shell 文本匹配猜 YAML；在可编辑环境中先安装 `python3 -m pip install -r clash-verge/lib/requirements.txt`（系统包 `python3-yaml` 也可以）。
+两者都是严格的 `version: 1` + `pre` / `post` 列表，条目可以混用完整 Mihomo 规则字符串
+和五个受支持的应用声明。解析使用 [PyYAML](lib/requirements.txt)；可编辑机器上先装
+`python3 -m pip install -r clash-verge/lib/requirements.txt`（系统包 `python3-yaml` 亦可）。
 
 ```yaml
-# direct.yaml：DIRECT 由文件推断，路径在 render/apply 时才发现
+# direct.yaml
+version: 1
 pre:
   - app: baidunetdisk
   - "DOMAIN,example.com,DIRECT"
-
-# proxy.yaml：必须明确给出当前订阅已有的组名
 post:
+  - "DOMAIN-SUFFIX,cn,DIRECT"
+
+# proxy.yaml：必须写明当前订阅已有的组名
+version: 1
+pre:
   - app: wemeet
     target: Proxy
+post: []
 ```
 
-合法应用 ID 仅有 `baidunetdisk`（百度网盘）、`wemeet`（腾讯会议）、`feishu`（飞书）、`wechat`（微信）和 `spark-store`（星火应用商店）。声明没有路径、命令或任意名称字段；未知 ID、缺失/多余字段和内置策略名作为 proxy `target` 都会被拒绝。
+改完执行菜单回车（或 `./clash-verge/tun-fix.sh rules apply`），然后在 Verge 中重载/重新
+生成配置。**重载前运行中的核心仍是旧规则**；工具只报告写入成功，不会声称已经生效。
 
-```bash
-# check 只校验便携的 YAML/策略语法；app 路径只在 render/apply 解析
-./clash-verge/tun-fix.sh rules check
-./clash-verge/tun-fix.sh rules render > /tmp/Script.js
+### 应用声明
 
-# 只读盘点安装证据、主程序/助手路径和未解决状态；不会启动应用
-./clash-verge/tun-fix.sh apps discover [ID ...]
+受支持的 ID 只有 `baidunetdisk`（百度网盘）、`wemeet`（腾讯会议）、`feishu`（飞书）、
+`wechat`（微信）、`spark-store`（星火应用商店）。声明只写 `app`（direct 里）或
+`app` + `target`（proxy 里），没有路径、命令或任意名称字段。
 
-# 仅替换 profiles.yaml 中已登记的全局 Script.js；不改 Merge、DNS、TUN、SSH、
-# 订阅级扩展、运行时 YAML，也不重载核心。
-./clash-verge/tun-fix.sh rules apply
-```
+每次更新做一次只读发现，把声明展开成该位置上的 `PROCESS-PATH` 规则：
 
-`apply` 先校验来源及已绑定的订阅级 Rules 扩展，再将同一次发现结果渲染为候选 Script；任何声明的应用若缺失、歧义、包装器/共享运行时或不可表示路径，候选、备份和已登记 Script 都不会被替换。首次从旧的订阅级规则迁移时，它会列出精确的 `路径:行号:规则`，包括历史 `DOMAIN,ssh.github.com,DIRECT`；请只手动删掉列出的本地扩展条目后重试。它绝不改写订阅或扩展文件。删除 YAML 规则只会停止**本生成器**注入该规则；独立订阅规则仍会保留其自身行为。
+- 证据来自固定 Debian 包 ID 的 dpkg 清单，以及指定 desktop 文件和相关的 `/proc`
+  `comm`/`exe`；不扫描磁盘、不启动应用、不读私有数据。
+- 包 launcher 不等于可归属主体：软链必须指向包清单内的原生 ELF，共享 runtime
+  （`node`、`python3`、`aria2c`、shell、Wine）不会被归给应用。
+- 百度网盘的 GUI 与 `netdisk_service` 会一起展开。
+- Flatpak、AppImage、Wine、RPM 和任意桌面包装器会明确显示为 missing/unsupported，
+  不会猜测。
+- 声明的应用未安装、路径不可表示、或多处冲突时，更新在写任何文件之前失败。
 
-未登记、歧义或不安全的 Script 目标会报错而不会写一个 Verge 永远不会加载的孤儿文件。已有非本工具脚本会要求确认并建立唯一备份。完成后在 Verge GUI 中重载当前订阅/配置。`clash-verge.yaml` 是 Verge 生成的运行时输出，不能手改，也不是这些 YAML 的来源。若之后配置的订阅级 Merge 或 Script 重写 `config.rules`，它们在该全局 Script 之后运行，能够覆盖这份输出；此流程不会替代那种后续扩展。
+安装或升级应用后需要重新更新，才能把新路径写进 Script。发现结果和生成结果都不证明
+某个连接已经路由。
 
-Mihomo 是**首条命中**，不会因为 `DOMAIN` 比 `DOMAIN-SUFFIX` 更具体而自动获胜。`pre` 的顺序为 `direct.pre`、`proxy.pre`，并移到订阅规则前；相同的订阅条目按完整规范化规则串去重并提升。应用声明在它们原来的列表位置连续展开为一个或多个 `PROCESS-PATH`，不会因为它们是进程规则而自动前移。订阅原有规则在第一个 `MATCH` 前保持原序；缺失的 `direct.post`、`proxy.post` 插入在该 `MATCH` 前，已有的相同 `post` 条目保留原位置。这样 `post` 是订阅规则的补充，不会覆盖订阅已有例外。生成器拒绝不存在的代理组、缺少 `MATCH`、未知 YAML 字段、同一选择器相反目标，以及同一阶段具有相反目标的可证明域名重叠（`DOMAIN`/`DOMAIN-SUFFIX`、后缀嵌套）。解析后的应用路径与手写 `PROCESS-PATH` 的相同 payload/相反 target 也会拒绝；它不会猜测规则特异性或重排订阅。
+### 规则顺序与去重
 
-支持的可编辑 matcher 是 `DOMAIN`、`DOMAIN-SUFFIX`、`DOMAIN-KEYWORD`、`DST-PORT`、`GEOIP`、`IP-CIDR`、`IP-CIDR6`、`PROCESS-NAME` 和 `PROCESS-PATH`。`PROCESS-NAME` 是可移植的字面可执行文件**基名**（例如 `PROCESS-NAME,feishu,DIRECT`）：它不比较目录，所以同名但无关的程序也可能命中；它不是应用声明发现失败时的回退。`PROCESS-PATH` 是带空格也有效的绝对、字面路径；逗号、控制字符、通配符、正则和 `no-resolve` 都会被拒绝，避免 Mihomo 逗号字段误解析。应用发现只支持受证据支持的原生 Linux Debian 包：读取固定包 ID/清单、指定 desktop metadata 和相关 `/proc` `comm`/`exe`，不扫描磁盘、不运行应用、不读私有数据。Baidu 的 GUI 与 `netdisk_service` 都会展开；共享 `node`、`python`、`aria2c`、shell 或 Wine host 不会被归属给应用。Flatpak、AppImage、Wine、RPM 和任意桌面包装器形式会明确显示为未解决/不支持，而不会猜测。安装或升级后需重新 `rules apply` 才能把新路径写入生成 Script；发现路径不证明旧 Script 已重载，也不证明某个连接已路由。
+Mihomo 按**首条命中**判定，`DOMAIN` 不会因为比 `DOMAIN-SUFFIX` 更具体而自动获胜。
+生成结果固定为：`direct.pre` → `proxy.pre` → 订阅原有规则 → 缺失的 `post` → 第一个
+`MATCH`。已有相同 `post` 条目保留原位置，所以 `post` 是订阅规则的补充，而不是覆盖。
 
-完整优化的通用活跃规则诊断从两个 YAML 来源生成期望：`direct.pre`、`proxy.pre` 必须按该顺序成为 `/rules` 的精确前缀，`post` 只要求以正确目标出现在 `MATCH` 前，允许订阅已有同规则保留在更早位置。本定义允许本地 proxy 和展开的 process 规则，不再使用“所有 DIRECT 必须位于首条 proxy 前”的旧屏障。`/rules` 只暴露 matcher、payload 和目标，通常不暴露 `no-resolve` 等完整文本选项；这些选项由来源检查和渲染验证，不能声称已由 `/rules` 证明。它显示的是**当前运行核心**的规则，而发现命令描述当前安装；升级后未重新 apply/reload 时两者可不同。进程匹配还要求流量进入 Mihomo、运行在 rule 模式，且 `find-process-mode` 不是 `off`（`strict`/`always` 的可用性取决于权限和核心）。发现路径和 `/rules` 条目均不能代替对新建连接实际命中/出站的核对。LiteLLM TLS-SNI、TUN 路由、Fake-IP 生成块和 GitHub SSH 是机制不同的专用检查；假设的策略不存在时会明确 `skip`，不会冒充通用路由证明。
+解析器拒绝：未知 YAML 字段、未知应用 ID、未知 matcher、非法 payload、
+proxy 目标写成内置策略（`DIRECT`/`REJECT`/…）、同一选择器相反目标、同阶段可证明的
+域名重叠。支持的可编辑 matcher 是 `DOMAIN`、`DOMAIN-SUFFIX`、`DOMAIN-KEYWORD`、
+`DST-PORT`、`GEOIP`、`IP-CIDR`、`IP-CIDR6`、`PROCESS-NAME`、`PROCESS-PATH`；
+`no-resolve` 只能作为最后一个字段出现在 `GEOIP`/`IP-CIDR`/`IP-CIDR6` 上。
+`PROCESS-NAME` 是字面可执行文件**基名**，同名但无关的程序也会命中，它不是应用发现
+失败时的回退。
 
-迁移说明：旧脚本中六条 `forceTop` 规则现在在 `direct.pre`；其余原有本地 DIRECT 规则都在 `direct.post`。每条匹配器、目标和 `no-resolve` 选项均保留。宽泛补充规则现在会让位于订阅中即使没有完全相同字符串的更早例外；这是为消除旧版“全部 prepend”遮蔽订阅例外的有意语义变化。
+### 迁移：清掉旧的订阅级重复规则
 
-## 只修 GitHub SSH（不用全局规则流程时的替代方案）
+如果之前用订阅级 Rules 扩展手工加过同一条本地规则（例如
+`DOMAIN,ssh.github.com,DIRECT`），更新会报错并列出精确的 `路径:行号:规则`。只手动删除
+列出的本地扩展条目后重试；生成器不会改写订阅或扩展文件。删除 YAML 里的规则只停止
+**本生成器**注入它，独立存在的订阅规则仍保留自己的行为。
 
-如果你**不使用**上面的全局 `rules apply` 流程、只想在某一个订阅上修 GitHub SSH，可使用这一替代方案。不要同时保留订阅级 `DOMAIN,ssh.github.com,DIRECT` 与全局两文件流：`rules apply` 的迁移预检会指出该重复项，需从绑定的 Rules 扩展中手动删除后再采用全局流。
+## 写入范围与恢复
 
-如果只想在本机拉取 GitHub 仓库，不必运行会修改多个站点路由的“一键优化”。需要配合两处设置。
+一次更新只做这些事：按 `profiles.yaml` 中 `Script` 条目定位目标 → 渲染候选 → 已有目标
+先建立同目录唯一备份 → 原子替换。
 
-### 1. 指定 GitHub SSH 的直连路由
+- `rules/direct.yaml`、`rules/proxy.yaml` 永不被改写。
+- 生成结果与现有目标逐字节相同时是空操作：不改写、不新建备份、mtime 与权限不变。
+- 目标不存在时直接创建；目标存在但不是本工具生成的文件（首行缺少生成标记）会要求
+  确认，EOF 视为取消。
+- `profiles.yaml` 未登记 Script、登记类型或文件名不安全、目标目录不存在时，报错并且
+  不创建任何孤儿文件。**不需要 Merge 登记**，路由只依赖 Script。
+- 还原：菜单选项 4 只认「已登记 Script 文件名 + `.backup.YYYYMMDD_HHMMSS[.后缀]`」的
+  同目录普通文件，选最新一个，显示备份与目标并确认；先把当前内容另存为新的唯一备份，
+  再原子替换。没有可用备份时不删除当前 Script，只报告没有可恢复版本。
+  恢复不回改两个 YAML 来源——之后再更新会按当前来源重新生成。
+- 不自动重载核心，也不声称已经生效，请在 Verge 中手动重载/重新生成配置。
 
-在所用订阅的 **Rules 扩展**中加入：
+备份名形如 `Script.js.backup.20260917_191624`；同一秒内多次备份会追加数字后缀，不会
+互相覆盖。它们只是本工具的同目录回滚点，不涉及订阅或云端。
 
-```yaml
-prepend:
-  - DOMAIN,ssh.github.com,DIRECT
+## GitHub SSH（可选的独立动作）
 
-append: []
-delete: []
-```
-
-保留文件中已有的其他条目，不要覆盖它们。Rules 扩展文件由 `profiles.yaml` 中该订阅的 `option.rules` 绑定；不要把扩展直接写进会被订阅更新覆盖的原始订阅文件。切换订阅时，需要对应订阅也有这条规则。
-
-保存后让 Verge 重新生成并加载配置。这个精确域名规则只改变 GitHub SSH 的出站路径；`github.com` 网站、API、下载等仍按原有规则处理。
-
-`DST-PORT,22,DIRECT` 只匹配目标端口 22，**不会匹配 `ssh.github.com:443`**。SSH 本身不要求代理，改端口本身也不决定走直连还是代理。
-
-### 2. 配置 SSH
-
-菜单选项 2 生成如下 GitHub 专用设置；密钥路径应与自己的 GitHub 密钥一致：
+只有菜单选项 2 会碰 `~/.ssh/config`；更新、恢复、应用识别都不会。脚本备份原文件后，
+把下面这段原子写到文件顶部并保留其他用户的 Host/Include 配置：
 
 ```sshconfig
 Host github.com ssh.github.com
@@ -104,110 +131,67 @@ Host github.com ssh.github.com
     ConnectTimeout 8
 ```
 
-这里不设置 `ProxyCommand` 或 `ProxyJump`，不依赖其他机器。已有的跳板设置可能来自后面的 `Host` 或 `Include`，需要用 `ssh -G` 检查最终解析值。脚本不会删除不属于它的用户配置块。
-
-`IPQoS none` 禁用 SSH 设置的 IP 优先级标记。在复现过的 TUN 环境中，同一域名、地址、密钥和 `DIRECT` 路由下，默认 QoS 在认证后切换标记并停顿；只改成 `IPQoS none` 后，Git 取回了远端分支信息，再切回默认值又复现停顿。它是针对这个 QoS 敏感问题的配置修正，不是“SSH 必须用代理”或“代理商故意封 SSH”的证据。
-
-`ConnectTimeout` 限制建立连接和初始握手，**不是整个 Git 命令的超时**。
-
-### 3. 验证默认 Git 操作和实际路由
+写入后脚本用 `ssh -G github.com` 检查最终解析值（hostname/port/ipqos/跳板），这是静态
+检查，不建立连接。`IPQoS none` 针对的是本机 TUN 路径上复现过的认证后停顿：同样的
+域名、地址、密钥和 `DIRECT` 路由下，只有 QoS 设置不同，默认值会停顿，
+`IPQoS none` 可以完成取回。它不设置 `ProxyCommand`/`ProxyJump`，也不代表 GitHub 被
+封或必须走代理。真实权限与传输仍要自己验证：
 
 ```bash
-# 查看最终 SSH 设置，不建立网络连接
 ssh -G github.com | grep -E '^(hostname|port|ipqos|proxycommand|proxyjump) '
-
-# 在目标仓库中验证权限和传输，不切分支、不合并内容
 git ls-remote origin
-git fetch --dry-run origin
 ```
 
-预期 `hostname ssh.github.com`、`port 443`、`ipqos none none`，且没有有效的跳板设置。`ssh -T git@github.com` 的欢迎消息只验证账号认证，不证明某个具体仓库的访问权限；GitHub 的该命令通常以退出码 1 结束。
-
-在 Clash 的连接列表中，确认这次新建的 `ssh.github.com` 连接命中 `Domain` 规则、出站为 `DIRECT`。只看到配置文件中有一行规则还不够。
-
-使用默认 Unix 控制套接字时，可只读查看相关运行规则：
-
-```bash
-curl -fsS --unix-socket /tmp/verge/verge-mihomo.sock http://localhost/rules \
-  | python3 -c 'import json,sys
-for i,r in enumerate(json.load(sys.stdin)["rules"]):
-    if r.get("payload") in ("ssh.github.com", "github.com", "22"):
-        print(i, r.get("type"), r.get("payload"), r.get("proxy"))'
-```
-
-专用 `ssh.github.com → DIRECT` 规则应排在更宽泛的 `github.com → Proxy` 规则之前。
-
-### Fake-IP 与直连可以同时工作
-
-`198.18.x.x` 或 `fdfe:dcba:9876::/48` 地址可以是本机 TUN 使用的 Fake-IP。Mihomo 根据映射恢复域名，再按规则用本机出口建立连接；看到 Fake-IP 本身并不说明 DNS 错误，也不代表流量一定经过境外代理节点。
-
-这条 GitHub SSH 域名规则需要保留 `ssh.github.com` 的域名上下文。不要用 `*.github.com` 等 `fake-ip-filter` 条目把它排除掉。原始 SSH 没有 TLS SNI，不能指望 TLS 嗅探把丢失的域名补回来。脚本保留 GitHub 主站和资源域名原有的精确过滤，但不再生成 `*.github.com` 过滤。
+GitHub SSH 走 `ssh.github.com:443`，`DST-PORT,22` 不会匹配它，所以
+`direct.yaml` 里需要 `DOMAIN,ssh.github.com,DIRECT`（默认已包含）。这条规则依赖
+`ssh.github.com` 的域名上下文：不要在 `fake-ip-filter` 里用 `*.github.com` 把它排除，
+原始 SSH 没有 TLS SNI，嗅探无法补回丢失的域名。
 
 ## 安装 Clash Verge Rev
 
-仓库内置 2.5.2 的 amd64 安装包：
+仓库内置 2.5.2 的 amd64 安装包，`./install.sh` 会校验架构、用 dpkg 安装并回查结果。
+其他架构请用官方安装包。
 
-```bash
-./install.sh
-```
-
-安装器校验架构与安装包，并用 dpkg 查询安装结果。内置包不需要另从 GitHub Releases 下载；系统依赖是否需要联网取决于本机状态。其他架构请使用官方对应安装包。
-
-## 完整脚本的使用范围
-
-```bash
-./tun-fix.sh
-```
-
-- **选项 1：一键优化 Clash 配置。** 生成全局 Merge 和 Script，涉及 DNS、TUN 本地网段排除、GitHub SSH、飞书/Lark、模型网关和国内站点路由。会备份并清空已绑定的订阅级 Merge，以避免其覆盖全局增强。只修 GitHub 时不必执行这一整套操作。
-- **选项 2：配置 GitHub SSH。** 备份后更新 `~/.ssh/config` 中脚本管理的块，保留其他用户块；检查解析出的端口、QoS 和跳板状态。它不替代 Clash 路由加载。
-- **选项 3：查看配置路径。** 从 `profiles.yaml` 查找实际绑定的文件名。
-- **选项 4：备份管理。** 查看、恢复或按提示清理脚本备份。
-
-配置生成后，通过 Verge 重载。随后核对运行规则和实际 Git 请求，不要把菜单的“已写入”提示当成网络验证结果。
-
-## 配置的来源与生效链
+配置文件常见位置：
 
 ```text
-本地订阅 Rules 扩展 / 全局 Merge、Script
-              + 原始订阅
-                    ↓ Verge 合并生成
-              clash-verge.yaml
-                    ↓ 加载
-              Mihomo 运行规则
-```
-
-全局 Merge 和 Script 的文件名由 `profiles.yaml` 中 `Merge`、`Script` 条目决定，通常是 `profiles/Merge.yaml`、`profiles/Script.js`。**条目已登记不等于文件仍存在，也不等于运行中的核心已加载。** 缺失文件要先恢复或重新生成；仅重载旧运行文件不会自动恢复它们。
-
-菜单选项 1 使用全局扩展，适用于加载这些扩展的订阅；手动添加的订阅级 Rules 则只属于其绑定的订阅。订阅更新通常保留本地扩展，但删除本地文件、改变绑定或未加载都会使增强失效。
-
-常见位置：
-
-```text
-~/.local/share/io.github.clash-verge-rev.clash-verge-rev/profiles.yaml
-~/.local/share/io.github.clash-verge-rev.clash-verge-rev/profiles/<rules-uid>.yaml
-~/.local/share/io.github.clash-verge-rev.clash-verge-rev/profiles/Merge.yaml
-~/.local/share/io.github.clash-verge-rev.clash-verge-rev/profiles/Script.js
-~/.local/share/io.github.clash-verge-rev.clash-verge-rev/clash-verge.yaml
+~/.local/share/io.github.clash-verge-rev.clash-verge-rev/profiles.yaml     # 注册表
+~/.local/share/io.github.clash-verge-rev.clash-verge-rev/profiles/Script.js # 生成的路由
+~/.local/share/io.github.clash-verge-rev.clash-verge-rev/clash-verge.yaml   # Verge 生成，不要手改
 ~/.ssh/config
 ```
 
-原始订阅与运行 YAML 可能包含订阅凭据、节点密码等信息。排查时只输出必要字段，不要公开整份配置。
+订阅和运行 YAML 可能包含凭据或节点信息；排查时只给出必要字段。
 
-## 仍然卡住时
+## 代码结构与自动化入口
 
-1. 用 `ssh -G` 确认目标、端口、QoS 和跳板设置。
-2. 确认本地增强文件存在、绑定正确，并出现在 **运行规则**中。
-3. 在新建连接中确认实际命中规则和出站链。
-4. 若认证成功后停顿，保持相同目标和路由比较 QoS 设置；若仅 IPv4 路径成功，再单独比较地址族。每次只改一个变量。
-5. 用 `git ls-remote` 验证目标仓库，而不是仅看端口连通或 SSH 欢迎消息。
+```text
+tun-fix.sh          # 菜单与 CLI 分派
+lib/config.sh       # registry 定位、候选渲染、原子写入、备份与恢复
+lib/ssh.sh          # GitHub SSH 配置
+lib/rules.py        # 唯一的 YAML/registry/规则读取器与 Script 渲染器
+lib/discover_apps.py# 只读原生应用发现
+lib/report_apps.py  # 菜单选项 3 的人类可读渲染
+rules/*.yaml        # 日常编辑的路由来源
+```
 
-`Connection closed`、超时和 Fake-IP 地址本身都不足以定位故障。多个节点测试共享同一套本机 TUN，也不能单凭全部失败认定出口策略。`ls-remote` 耗时包含握手、服务端处理等，不能当作大文件带宽。
+```bash
+./clash-verge/tun-fix.sh rules check     # 只校验两个 YAML 的语法/策略/冲突
+./clash-verge/tun-fix.sh rules render    # 输出解析后的 Script.js 到 stdout，不写文件
+./clash-verge/tun-fix.sh rules apply     # 更新已登记的全局 Script（等价菜单选项 1）
+./clash-verge/tun-fix.sh apps discover   # JSON 形式的只读应用盘点
+```
+
+`rules check/render` 不读注册表；`rules apply` 在取消时以退出码 2 结束。
 
 ## 离线回归检查
 
 ```bash
-python3 clash-verge/tests/github-ssh.py
+python3 clash-verge/tests/route-menu.py       # 菜单、更新、恢复、SSH 隔离与写入边界
+python3 clash-verge/tests/app-integration.py  # 规则语法、registry、应用展开、Script 守卫
+python3 clash-verge/tests/discover-apps.py    # 原生应用发现
 ```
 
-从仓库根目录执行。需要 Python 3、PyYAML、Bash、OpenSSH、Node.js 和 `verge-mihomo`。测试使用专用临时 HOME，覆盖 Merge 精确前后差异和幂等性、来源驱动的模拟 `/rules`、registry 边界、真实 Mihomo 配置验证、失败前无写入、唯一备份/恢复及 SSH 生成；不连接远端、不读取或修改真实 HOME/代理设置。
+从仓库根目录执行。需要 Python 3、PyYAML、Bash、Node.js 和 `verge-mihomo`。全部用例
+只使用专用临时 HOME 与合成配置：不读真实 HOME、不启动应用、不访问控制器、不建立网络
+连接，`dpkg-query`/`ssh` 被替身取代，`curl`/`openssl`/`ip` 等被守卫。
