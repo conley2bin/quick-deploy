@@ -102,13 +102,13 @@ configure_ssh() {
     if [ -f "$ssh_config" ] && grep -qE '^# >>> tun-fix\.sh github ssh >>>|^[[:space:]]*Host[[:space:]].*github\.com' "$ssh_config"; then
         has_github=1
         echo "warning 检测到已有 GitHub SSH 配置"
-        grep -A 10 '^Host github.com' "$ssh_config" || true
+        grep -A 10 -E '^[[:space:]]*Host[[:space:]].*github\.com' "$ssh_config" || true
         echo -n "是否覆盖本工具管理的块并将新块置顶？[y/N]: "
         local overwrite
-        read -r overwrite
+        read -r overwrite || true
         if [[ ! "$overwrite" =~ ^[Yy]$ ]]; then
             echo "已取消 SSH 配置"
-            return
+            return 2
         fi
     fi
 
@@ -146,8 +146,12 @@ configure_ssh() {
     fi
 
     echo ""
+    local resolved=0
     if verify_github_ssh_config; then
         echo "测试具体仓库权限与传输: git ls-remote origin"
+    else
+        resolved=1
     fi
     echo ""
+    return "$resolved"
 }
