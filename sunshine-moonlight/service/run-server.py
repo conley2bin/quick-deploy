@@ -13,7 +13,6 @@ from typing import Any
 
 MODULE_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_INVENTORY = MODULE_ROOT / "machines.yaml"
-EXAMPLE_INVENTORY = MODULE_ROOT / "machines.example.yaml"
 DEFAULT_MOONLIGHT_PORT = 47989
 MIN_MOONLIGHT_PORT = 1029
 MAX_MOONLIGHT_PORT = 65514
@@ -25,32 +24,21 @@ class InventoryError(Exception):
     """A local inventory is absent or violates the closed schema."""
 
 
-def example_available() -> bool:
-    """The example only exists after one successful module-root install."""
-    try:
-        return EXAMPLE_INVENTORY.is_file()
-    except OSError:
-        return False
-
-
 def missing_inventory_message(path: Path) -> str:
-    inventory_help = (
-        f"清单不存在: {path}\n"
-        f"清单不会自动探测或生成；实际 machines.yaml 由你手动维护，也不会读取旧文件或示例兜底。"
-    )
-    if example_available():
+    """The installer refreshes only the module-root inventory; any other path is
+    read exactly as given, so an absent custom path gets path-shaped advice."""
+    if path != DEFAULT_INVENTORY:
         return (
-            f"{inventory_help}\n"
-            f"示例模板由一次成功的根安装器生成，现已存在：{EXAMPLE_INVENTORY}\n"
-            f"请手动复制后按其中文注释填写，例如：\n"
-            f"    cp -- {shlex.quote(str(EXAMPLE_INVENTORY))} {shlex.quote(str(path))}"
+            f"清单不存在: {path}\n"
+            f"连接器只读取指定的这一个文件，不会自动探测、生成或改用其它清单。\n"
+            f"请核对该路径，或省略 --config 使用模块根目录的默认清单：{DEFAULT_INVENTORY}"
         )
     return (
-        f"{inventory_help}\n"
-        f"示例模板 machines.example.yaml 尚未生成：全新 clone 在首次成功安装前没有该文件。\n"
-        f"请先在模块目录运行一次根安装器（所选安装阶段全部成功后才生成/刷新示例）：\n"
+        f"清单不存在: {path}\n"
+        f"它由一次成功的模块根安装器生成/刷新，内容是不含真实地址的通用占位清单，也不会读取旧文件兜底。\n"
+        f"请先按实际用途在模块目录运行一次安装器（所选安装阶段全部成功后才会刷新该清单）：\n"
         f"    cd -- {shlex.quote(str(MODULE_ROOT))} && ./install.sh\n"
-        f"成功后示例位于 {EXAMPLE_INVENTORY}，再手动复制为实际清单并按其中文注释填写。"
+        f"成功后直接编辑 {shlex.quote(str(path))}，按其中文注释填入你的真实机器信息。"
     )
 
 

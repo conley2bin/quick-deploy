@@ -24,16 +24,16 @@ check() {
 contains() { grep -Fq -- "$2" "$1"; }
 absent() { ! grep -Fq -- "$2" "$1"; }
 # The suite must leave the real checkout exactly as it found it. Record metadata
-# (type/mode/size/mtime) for the example and both inventory paths before any case
-# runs, then re-check after the last one. Personal inventories are lstat-ed only:
-# the suite never reads, copies, creates, or deletes them.
+# (type/mode/size/mtime) for all three inventory path names before any case runs,
+# then re-check after the last one. The configured and legacy inventories are
+# lstat-ed only: the suite never reads, copies, creates, or deletes them.
 checkout_path_state() {
     if [ ! -e "$1" ] && [ ! -L "$1" ]; then printf 'absent\n'; return 0; fi
     stat -c '%F|%a|%s|%y' -- "$1"
 }
-REAL_EXAMPLE_STATE="$(checkout_path_state "$MODULE_DIR/machines.example.yaml")"
-REAL_ACTUAL_STATE="$(checkout_path_state "$MODULE_DIR/machines.yaml")"
+REAL_INVENTORY_STATE="$(checkout_path_state "$MODULE_DIR/machines.yaml")"
 REAL_LEGACY_STATE="$(checkout_path_state "$MODULE_DIR/machines.local.yaml")"
+REAL_STALE_STATE="$(checkout_path_state "$MODULE_DIR/machines.example.yaml")"
 run() {
     RC=0
     bash "$MODULE_DIR/$1" "${@:2}" >"$CASE/out" 2>"$CASE/err" || RC=$?
@@ -84,7 +84,7 @@ run_from() {
     (cd -- "$1" && "$2" "${@:3}") >"$CASE/out" 2>"$CASE/err" || RC=$?
     cat "$CASE/err" >>"$CASE/out"
 }
-# Root-install tests copy only public module code into a case-local module, so example
+# Root-install tests copy only public module code into a case-local module, so inventory
 # generation never writes into the real checkout and no private inventory is copied.
 make_module_copy() {
     MODULE_COPY="$CASE/${1:-module copy}/sunshine-moonlight"
@@ -96,8 +96,8 @@ run_install() {
     bash "$MODULE_COPY/install.sh" "$@" >"$CASE/out" 2>"$CASE/err" || RC=$?
     cat "$CASE/err" >>"$CASE/out"
 }
-write_expected_example() {
-    python3 "$MODULE_DIR/lib/machines_example.py" --stdout >"$CASE/expected-example"
+write_expected_inventory() {
+    python3 "$MODULE_DIR/lib/machines_inventory.py" --stdout >"$CASE/expected-inventory"
 }
 end_case() {
     rm -rf -- "$CASE"; CASE=''; MODULE_COPY=''
@@ -941,9 +941,8 @@ new_case; make_module_copy; client_fixture; system_python_fixture; export QD_TES
 printf 'machines:\n  keep:\n    ssh: keep-alias\n    tailnet_ip: 100.64.0.9\n' >"$MODULE_COPY/machines.yaml"
 printf 'machines:\n  legacy-keep:\n    ssh: legacy-alias\n    tailnet_ip: 100.64.0.8\n' >"$MODULE_COPY/machines.local.yaml"
 chmod 600 "$MODULE_COPY/machines.yaml" "$MODULE_COPY/machines.local.yaml"
-cp "$MODULE_COPY/machines.yaml" "$CASE/inventory-before"
 cp "$MODULE_COPY/machines.local.yaml" "$CASE/legacy-before"
-write_expected_example
+write_expected_inventory
 run_install
 check 'combined installer succeeds' test "$RC" -eq 0
 check 'combined installer invokes host before client' test "$(grep -n 'api.github.com/repos/LizardByte/Sunshine' "$CASE/log" | head -1 | cut -d: -f1)" -lt "$(grep -n 'Moonlight-6.1.0-x86_64.AppImage' "$CASE/log" | head -1 | cut -d: -f1)"
@@ -951,56 +950,54 @@ check 'combined installer selects KMS capture' grep -Fxq 'capture = kms' "$QD_SU
 check 'combined installer creates client wrapper' test -x "$HOME/.local/bin/moonlight"
 check 'combined installer skips apt when system Python has PyYAML' absent "$CASE/log" 'apt-get install -y python3-yaml'
 check 'client ownership marker keeps historic bytes' grep -Fxq '# Managed by quick-deploy/sunshine-moonlight/install-client.sh' "$HOME/.local/bin/moonlight"
-check 'combined installer generates module example' cmp -s "$CASE/expected-example" "$MODULE_COPY/machines.example.yaml"
-check 'generated example mode is 644' test "$(stat -c %a "$MODULE_COPY/machines.example.yaml")" = 644
-check 'generated example carries no real inventory data' bash -c '! grep -Fq keep-alias "$1"' bash "$MODULE_COPY/machines.example.yaml"
-check 'generated example is ignored by module gitignore' git --no-pager -C "$MODULE_DIR" check-ignore -q --no-index machines.example.yaml
-check 'combined installer preserves actual inventory bytes' cmp -s "$CASE/inventory-before" "$MODULE_COPY/machines.yaml"
-check 'combined installer preserves actual inventory mode' test "$(stat -c %a "$MODULE_COPY/machines.yaml")" = 600
+check 'combined installer refreshes the module inventory' cmp -s "$CASE/expected-inventory" "$MODULE_COPY/machines.yaml"
+check 'refreshed inventory mode is 644' test "$(stat -c %a "$MODULE_COPY/machines.yaml")" = 644
+check 'refreshed inventory drops the previous bytes' bash -c '! grep -Fq keep-alias "$1"' bash "$MODULE_COPY/machines.yaml"
+check 'refreshed inventory is ignored by module gitignore' git --no-pager -C "$MODULE_DIR" check-ignore -q --no-index machines.yaml
 check 'combined installer preserves legacy inventory bytes' cmp -s "$CASE/legacy-before" "$MODULE_COPY/machines.local.yaml"
 check 'combined installer preserves legacy inventory mode' test "$(stat -c %a "$MODULE_COPY/machines.local.yaml")" = 600
-printf 'stale placeholder\n' >"$MODULE_COPY/machines.example.yaml"
+printf 'stale placeholder\n' >"$MODULE_COPY/machines.yaml"
 : >"$CASE/log"
 run_install
 check 'same-version repeat succeeds' test "$RC" -eq 0
 check 'same-version repeat downloads no payload' absent "$CASE/log" 'asset url='
-check 'same-version repeat refreshes generated example' cmp -s "$CASE/expected-example" "$MODULE_COPY/machines.example.yaml"
-check 'same-version repeat preserves actual inventory bytes' cmp -s "$CASE/inventory-before" "$MODULE_COPY/machines.yaml"
+check 'same-version repeat refreshes the module inventory' cmp -s "$CASE/expected-inventory" "$MODULE_COPY/machines.yaml"
+check 'same-version repeat preserves legacy inventory bytes' cmp -s "$CASE/legacy-before" "$MODULE_COPY/machines.local.yaml"
 end_case
 
 new_case; make_module_copy; system_python_fixture; export QD_TEST_YAML_AVAILABLE=1
-write_expected_example
+write_expected_inventory
 run_install --host-only
 check 'host-only installer succeeds' test "$RC" -eq 0
 check 'host-only installer skips client' test ! -e "$HOME/.local/bin/moonlight"
-check 'host-only installer generates example' cmp -s "$CASE/expected-example" "$MODULE_COPY/machines.example.yaml"
-check 'host-only installer creates no actual inventory' test ! -e "$MODULE_COPY/machines.yaml"
+check 'host-only installer refreshes the module inventory' cmp -s "$CASE/expected-inventory" "$MODULE_COPY/machines.yaml"
 check 'host-only installer creates no legacy inventory' test ! -e "$MODULE_COPY/machines.local.yaml"
 end_case
 
 new_case; make_module_copy; client_fixture; system_python_fixture; export QD_TEST_YAML_AVAILABLE=1
-write_expected_example
+write_expected_inventory
 run_install --client-only
 check 'client-only installer succeeds' test "$RC" -eq 0
 check 'client-only installer skips host' test ! -s "$CASE/version"
-check 'client-only installer generates example' cmp -s "$CASE/expected-example" "$MODULE_COPY/machines.example.yaml"
-check 'client-only installer creates no actual inventory' test ! -e "$MODULE_COPY/machines.yaml"
+check 'client-only installer refreshes the module inventory' cmp -s "$CASE/expected-inventory" "$MODULE_COPY/machines.yaml"
+check 'client-only installer creates no legacy inventory' test ! -e "$MODULE_COPY/machines.local.yaml"
 end_case
 
 new_case; make_module_copy; client_fixture; system_python_fixture
-write_expected_example
+write_expected_inventory
 run_install --client-only
 check 'missing PyYAML is installed through privileged apt' test "$RC" -eq 0
 check 'missing PyYAML apt request uses package name' contains "$CASE/log" 'apt-get install -y python3-yaml'
 check 'PyYAML installation precedes client installation' test "$(grep -n 'python3-yaml' "$CASE/log" | head -1 | cut -d: -f1)" -lt "$(grep -n 'Moonlight-6.1.0-x86_64.AppImage' "$CASE/log" | head -1 | cut -d: -f1)"
-check 'successful PyYAML install also generates example' cmp -s "$CASE/expected-example" "$MODULE_COPY/machines.example.yaml"
+check 'successful PyYAML install also refreshes the module inventory' cmp -s "$CASE/expected-inventory" "$MODULE_COPY/machines.yaml"
 end_case
 
 new_case; make_module_copy; system_python_fixture; export MOCK_APT_FAIL=1
 run_install --client-only
 check 'PyYAML apt failure is surfaced' test "$RC" -ne 0
 check 'PyYAML apt failure starts no client install' test ! -e "$HOME/.local/bin/moonlight"
-check 'PyYAML apt failure generates no example' test ! -e "$MODULE_COPY/machines.example.yaml"
+check 'PyYAML apt failure generates no inventory' test ! -e "$MODULE_COPY/machines.yaml"
+check 'PyYAML apt failure creates no legacy inventory' test ! -e "$MODULE_COPY/machines.local.yaml"
 end_case
 
 new_case; make_module_copy; client_fixture; system_python_fixture; export QD_TEST_YAML_AVAILABLE=1 MOCK_START_FAIL=1
@@ -1009,7 +1006,7 @@ check 'host failure stops combined installer' test "$RC" -ne 0
 check 'host failure leaves client unstarted' test ! -e "$HOME/.local/bin/moonlight"
 check 'host failure makes zero Moonlight metadata calls' test "$(grep -c 'moonlight-stream/moonlight-qt' "$CASE/log")" -eq 0
 check 'host failure reports partial-completion boundary' contains "$CASE/out" 'Moonlight 客户端未开始'
-check 'host failure generates no example' test ! -e "$MODULE_COPY/machines.example.yaml"
+check 'host failure generates no inventory' test ! -e "$MODULE_COPY/machines.yaml"
 end_case
 
 new_case; make_module_copy; system_python_fixture
@@ -1022,13 +1019,16 @@ check 'unknown option makes no apt request' test ! -s "$CASE/log"
 run_install --help
 check 'combined installer help succeeds without mutation' test "$RC" -eq 0
 check 'combined installer help names direct commands' contains "$CASE/out" 'commands/install-host.sh'
-check 'invalid/help invocations generate no example' test ! -e "$MODULE_COPY/machines.example.yaml"
+check 'combined installer help documents the generated inventory' contains "$CASE/out" '生成/刷新全字段中文清单 machines.yaml'
+check 'combined installer help defers leftover files to manual handling' contains "$CASE/out" '请自行核对后手动处理'
+check 'combined installer help drops the example concept' absent "$CASE/out" 'machines.example.yaml'
+check 'invalid/help invocations generate no inventory' test ! -e "$MODULE_COPY/machines.yaml"
 end_case
 
 new_case; make_module_copy; export MOCK_UID=0; run_install
 check 'combined installer refuses root' test "$RC" -ne 0
 check 'root refusal precedes PyYAML apt' test ! -s "$CASE/log"
-check 'root refusal generates no example' test ! -e "$MODULE_COPY/machines.example.yaml"
+check 'root refusal generates no inventory' test ! -e "$MODULE_COPY/machines.yaml"
 end_case
 
 for entry in install-host.sh install-client.sh doctor.sh uninstall.sh; do
@@ -1043,48 +1043,51 @@ for entry in install.sh commands/install-host.sh commands/install-client.sh comm
     run_from "$CASE/unrelated cwd" "$space_module/$entry" --help
     check "moved entry help works from spaced module path: $entry" test "$RC" -eq 0
 done
-check 'spaced module help generates no example' test ! -e "$space_module/machines.example.yaml"
-# A successful install from an unrelated cwd still writes the module-relative example.
+check 'spaced module help generates no inventory' test ! -e "$space_module/machines.yaml"
+# A successful install from an unrelated cwd still writes the module-relative inventory.
 client_fixture; system_python_fixture; export QD_TEST_YAML_AVAILABLE=1
-write_expected_example
+write_expected_inventory
 run_from "$CASE/unrelated cwd" "$space_module/install.sh" --client-only
 check 'spaced module client-only install from unrelated cwd succeeds' test "$RC" -eq 0
-check 'spaced module example follows module, not cwd' cmp -s "$CASE/expected-example" "$space_module/machines.example.yaml"
-check 'unrelated cwd gains no example' test ! -e "$CASE/unrelated cwd/machines.example.yaml"
+check 'spaced module inventory follows module, not cwd' cmp -s "$CASE/expected-inventory" "$space_module/machines.yaml"
+check 'unrelated cwd gains no inventory' test ! -e "$CASE/unrelated cwd/machines.yaml"
 end_case
 
-# Example publication refuses links/directories/non-writable modules and never
-# touches the actual or legacy inventory next to it.
+# Inventory publication refuses links/directories/non-regular/unwritable targets,
+# preserves the previous bytes and mode, reports the completed install stages
+# separately, and never follows a link into the legacy inventory beside it.
 new_case; make_module_copy; client_fixture; system_python_fixture; export QD_TEST_YAML_AVAILABLE=1
-printf 'machines:\n  keep:\n    ssh: keep-alias\n    tailnet_ip: 100.64.0.9\n' >"$MODULE_COPY/machines.yaml"
-chmod 600 "$MODULE_COPY/machines.yaml"
-cp "$MODULE_COPY/machines.yaml" "$CASE/inventory-before"
-ln -s "$MODULE_COPY/machines.yaml" "$MODULE_COPY/machines.example.yaml"
+printf 'machines:\n  legacy-keep:\n    ssh: legacy-alias\n    tailnet_ip: 100.64.0.8\n' >"$MODULE_COPY/machines.local.yaml"
+chmod 600 "$MODULE_COPY/machines.local.yaml"
+cp "$MODULE_COPY/machines.local.yaml" "$CASE/legacy-before"
+ln -s "$MODULE_COPY/machines.local.yaml" "$MODULE_COPY/machines.yaml"
 run_install --client-only
-check 'symlinked example path is refused' test "$RC" -ne 0
+check 'symlinked inventory path is refused' test "$RC" -ne 0
 check 'symlink refusal names the link' contains "$CASE/out" '符号链接'
-check 'symlink refusal never follows into actual inventory' cmp -s "$CASE/inventory-before" "$MODULE_COPY/machines.yaml"
-check 'symlink refusal keeps actual inventory mode' test "$(stat -c %a "$MODULE_COPY/machines.yaml")" = 600
-check 'symlink refusal leaves the link itself' test -L "$MODULE_COPY/machines.example.yaml"
+check 'symlink refusal never follows into the linked legacy inventory' cmp -s "$CASE/legacy-before" "$MODULE_COPY/machines.local.yaml"
+check 'symlink refusal keeps linked legacy inventory mode' test "$(stat -c %a "$MODULE_COPY/machines.local.yaml")" = 600
+check 'symlink refusal leaves the link itself' test -L "$MODULE_COPY/machines.yaml"
+check 'symlink refusal reports the completed client stage' contains "$CASE/out" 'Moonlight 客户端安装已完成'
 check 'symlink refusal does not claim install completion' absent "$CASE/out" '所选本机安装阶段已完成'
 end_case
 
 new_case; make_module_copy; client_fixture; system_python_fixture; export QD_TEST_YAML_AVAILABLE=1
-mkdir "$MODULE_COPY/machines.example.yaml"
-printf 'preserve directory sentinel\n' >"$MODULE_COPY/machines.example.yaml/sentinel"
+mkdir "$MODULE_COPY/machines.yaml"
+printf 'preserve directory sentinel\n' >"$MODULE_COPY/machines.yaml/sentinel"
 run_install --client-only
-check 'directory example path is refused' test "$RC" -ne 0
+check 'directory inventory path is refused' test "$RC" -ne 0
 check 'directory refusal names the non-regular file' contains "$CASE/out" '不是普通文件'
-check 'directory refusal preserves sentinel contents' contains "$MODULE_COPY/machines.example.yaml/sentinel" 'preserve directory sentinel'
-check 'directory refusal keeps the directory itself' test -d "$MODULE_COPY/machines.example.yaml"
+check 'directory refusal preserves sentinel contents' contains "$MODULE_COPY/machines.yaml/sentinel" 'preserve directory sentinel'
+check 'directory refusal keeps the directory itself' test -d "$MODULE_COPY/machines.yaml"
 end_case
 
 new_case; make_module_copy; client_fixture; system_python_fixture; export QD_TEST_YAML_AVAILABLE=1
 chmod 555 "$MODULE_COPY"
 run_install --client-only
-check 'unwritable module surfaces generation failure' test "$RC" -ne 0
-check 'unwritable module reports the write failure' contains "$CASE/out" '无法写入示例'
-check 'unwritable module creates no example' test ! -e "$MODULE_COPY/machines.example.yaml"
+check 'unwritable module surfaces inventory generation failure' test "$RC" -ne 0
+check 'unwritable module reports the write failure' contains "$CASE/out" '无法写入清单'
+check 'unwritable module reports the completed client stage' contains "$CASE/out" 'Moonlight 客户端安装已完成'
+check 'unwritable module creates no inventory' test ! -e "$MODULE_COPY/machines.yaml"
 chmod 755 "$MODULE_COPY"
 end_case
 
@@ -1092,51 +1095,57 @@ end_case
 # these copies contain a personal inventory: fixture inventories are written here,
 # and nothing is ever read back from the real checkout.
 new_case; make_module_copy 'absent state'; client_fixture; system_python_fixture; export QD_TEST_YAML_AVAILABLE=1
-write_expected_example
+write_expected_inventory
 run_install --client-only
 check 'absent-state install succeeds' test "$RC" -eq 0
-check 'absent-state install generates the example' cmp -s "$CASE/expected-example" "$MODULE_COPY/machines.example.yaml"
-check 'absent-state example mode is 644' test "$(stat -c %a "$MODULE_COPY/machines.example.yaml")" = 644
-check 'absent-state install creates no actual inventory' test ! -e "$MODULE_COPY/machines.yaml"
+check 'absent-state install generates the module inventory' cmp -s "$CASE/expected-inventory" "$MODULE_COPY/machines.yaml"
+check 'absent-state inventory mode is 644' test "$(stat -c %a "$MODULE_COPY/machines.yaml")" = 644
 check 'absent-state install creates no legacy inventory' test ! -e "$MODULE_COPY/machines.local.yaml"
-# Documented flow: copy the freshly generated example to machines.yaml, then let the
-# real connector read it — --list first, then the stream path through the wrapper.
-cp "$MODULE_COPY/machines.example.yaml" "$MODULE_COPY/machines.yaml"
+# Documented flow: edit the installer-generated inventory in place, then let the real
+# connector read it — --list first, then the stream path through the installed wrapper.
+printf 'machines:\n  edited-host:\n    ssh: edited-alias\n    tailnet_ip: 100.64.0.31\n' >"$MODULE_COPY/machines.yaml"
 run_from "$CASE" "$MODULE_COPY/run_server.sh" --list
-check 'generated example passes connector --list' test "$RC" -eq 0
-check 'generated example lists its desktop entry' contains "$CASE/out" 'desktop'
-run_from "$CASE" "$MODULE_COPY/run_server.sh" desktop
-check 'generated example reaches the installed Moonlight wrapper' test "$RC" -eq 0
+check 'edited generated inventory passes connector --list' test "$RC" -eq 0
+check 'edited generated inventory lists the edited name' contains "$CASE/out" 'edited-host'
+run_from "$CASE" "$MODULE_COPY/run_server.sh" edited-host
+check 'edited generated inventory reaches the installed Moonlight wrapper' test "$RC" -eq 0
 check 'installed wrapper received the stream request' contains "$CASE/out" 'fixture only'
 end_case
 
-new_case; make_module_copy 'example present'; client_fixture; system_python_fixture; export QD_TEST_YAML_AVAILABLE=1
-printf '# hand-edited example placeholder\nmachines: {}\n' >"$MODULE_COPY/machines.example.yaml"
-chmod 600 "$MODULE_COPY/machines.example.yaml"
-write_expected_example
+new_case; make_module_copy 'leftovers present'; client_fixture; system_python_fixture; export QD_TEST_YAML_AVAILABLE=1
+printf '# hand-edited leftover\nmachines:\n  leftover-host:\n    ssh: leftover-alias\n    tailnet_ip: 100.64.0.77\n' >"$MODULE_COPY/machines.example.yaml"
+printf 'machines:\n  legacy-keep:\n    ssh: legacy-alias\n    tailnet_ip: 100.64.0.8\n' >"$MODULE_COPY/machines.local.yaml"
+chmod 600 "$MODULE_COPY/machines.example.yaml" "$MODULE_COPY/machines.local.yaml"
+cp "$MODULE_COPY/machines.example.yaml" "$CASE/leftover-before"
+cp "$MODULE_COPY/machines.local.yaml" "$CASE/legacy-before"
+write_expected_inventory
 run_install --client-only
-check 'example-present install succeeds' test "$RC" -eq 0
-check 'example-present install refreshes example bytes' cmp -s "$CASE/expected-example" "$MODULE_COPY/machines.example.yaml"
-check 'example-present refresh restores example mode 644' test "$(stat -c %a "$MODULE_COPY/machines.example.yaml")" = 644
-check 'example-present install creates no actual inventory' test ! -e "$MODULE_COPY/machines.yaml"
-check 'example-present install creates no legacy inventory' test ! -e "$MODULE_COPY/machines.local.yaml"
+check 'leftover-present install succeeds' test "$RC" -eq 0
+check 'leftover-present install generates the module inventory' cmp -s "$CASE/expected-inventory" "$MODULE_COPY/machines.yaml"
+check 'leftover-present refresh restores inventory mode 644' test "$(stat -c %a "$MODULE_COPY/machines.yaml")" = 644
+check 'leftover example file is neither read, rewritten nor removed' cmp -s "$CASE/leftover-before" "$MODULE_COPY/machines.example.yaml"
+check 'leftover example file keeps its mode' test "$(stat -c %a "$MODULE_COPY/machines.example.yaml")" = 600
+check 'legacy inventory is neither read, rewritten nor removed' cmp -s "$CASE/legacy-before" "$MODULE_COPY/machines.local.yaml"
+check 'legacy inventory keeps its mode' test "$(stat -c %a "$MODULE_COPY/machines.local.yaml")" = 600
+check 'leftover data never leaks into the generated inventory' absent "$MODULE_COPY/machines.yaml" 'leftover-host'
 end_case
 
 new_case; make_module_copy 'inventories present'; client_fixture; system_python_fixture; export QD_TEST_YAML_AVAILABLE=1
 printf 'machines:\n  keep:\n    ssh: keep-alias\n    tailnet_ip: 100.64.0.9\n' >"$MODULE_COPY/machines.yaml"
 printf 'machines:\n  legacy-keep:\n    ssh: legacy-alias\n    tailnet_ip: 100.64.0.8\n' >"$MODULE_COPY/machines.local.yaml"
 chmod 600 "$MODULE_COPY/machines.yaml" "$MODULE_COPY/machines.local.yaml"
-cp "$MODULE_COPY/machines.yaml" "$CASE/actual-before"
 cp "$MODULE_COPY/machines.local.yaml" "$CASE/legacy-before"
-write_expected_example
+write_expected_inventory
 run_install --client-only
 check 'inventory-present install succeeds' test "$RC" -eq 0
-check 'inventory-present install generates the example' cmp -s "$CASE/expected-example" "$MODULE_COPY/machines.example.yaml"
-check 'inventory-present preserves actual inventory bytes' cmp -s "$CASE/actual-before" "$MODULE_COPY/machines.yaml"
-check 'inventory-present preserves actual inventory mode' test "$(stat -c %a "$MODULE_COPY/machines.yaml")" = 600
+check 'inventory-present install rewrites the module inventory' cmp -s "$CASE/expected-inventory" "$MODULE_COPY/machines.yaml"
+check 'inventory-present rewrite normalizes inventory mode' test "$(stat -c %a "$MODULE_COPY/machines.yaml")" = 644
+check 'inventory-present keeps the replaced bytes out of the template' absent "$MODULE_COPY/machines.yaml" 'keep-alias'
 check 'inventory-present preserves legacy inventory bytes' cmp -s "$CASE/legacy-before" "$MODULE_COPY/machines.local.yaml"
 check 'inventory-present preserves legacy inventory mode' test "$(stat -c %a "$MODULE_COPY/machines.local.yaml")" = 600
-check 'inventory-present keeps inventory data out of the example' bash -c '! grep -Fq keep-alias "$1"' bash "$MODULE_COPY/machines.example.yaml"
+run_from "$CASE" "$MODULE_COPY/run_server.sh" --list
+check 'rewritten inventory is what the connector reads' test "$RC" -eq 0
+check 'rewritten inventory answers --list with its placeholder entry' contains "$CASE/out" 'desktop'
 end_case
 
 new_case; export MOCK_UID=0; run commands/install-host.sh
@@ -1449,10 +1458,20 @@ end_case
 for script in "$MODULE_DIR"/*.sh "$MODULE_DIR"/commands/*.sh "$MODULE_DIR"/lib/common.sh "$MODULE_DIR"/lib/*.py "$TESTS_DIR"/*.sh "$TESTS_DIR"/*.py; do case "$script" in *.sh) check "syntax: ${script##*/}" bash -n "$script";; *) check "syntax: ${script##*/}" python3 -c 'import ast,sys; ast.parse(open(sys.argv[1], encoding="utf-8").read(), sys.argv[1])' "$script";; esac; done
 check 'scoped diff whitespace' git --no-pager -C "$MODULE_DIR" diff --check -- .
 # Installation in any supported state must not mutate the real checkout: whatever the
-# module root had before the suite (absent or an installed example / configured
-# inventories) must still have the same existence, type, mode, size, and mtime.
-check 'real checkout example state preserved' test "$(checkout_path_state "$MODULE_DIR/machines.example.yaml")" = "$REAL_EXAMPLE_STATE"
-check 'real checkout actual inventory state preserved' test "$(checkout_path_state "$MODULE_DIR/machines.yaml")" = "$REAL_ACTUAL_STATE"
+# module root had before the suite (absent, generated, configured or leftover) must
+# still have the same existence, type, mode, size, and mtime.
+check 'real checkout generated inventory state preserved' test "$(checkout_path_state "$MODULE_DIR/machines.yaml")" = "$REAL_INVENTORY_STATE"
 check 'real checkout legacy inventory state preserved' test "$(checkout_path_state "$MODULE_DIR/machines.local.yaml")" = "$REAL_LEGACY_STATE"
+check 'real checkout leftover example state preserved' test "$(checkout_path_state "$MODULE_DIR/machines.example.yaml")" = "$REAL_STALE_STATE"
+# The removed example concept must not survive as a generated path, an ignore rule,
+# or a copy instruction in the user-facing text.
+check 'no production file names machines.example.yaml' bash -c '! grep -Fq machines.example.yaml "$1" "$2" "$3" "$4"' bash "$MODULE_DIR/install.sh" "$MODULE_DIR/run_server.sh" "$MODULE_DIR/service/run-server.py" "$MODULE_DIR/lib/machines_inventory.py"
+check 'no generator source remains for the example path' test ! -e "$MODULE_DIR/lib/machines_example.py"
+check 'leftover example path is no longer git-ignored' bash -c '! git --no-pager -C "$1" check-ignore -q --no-index machines.example.yaml' bash "$MODULE_DIR"
+check 'generated inventory path stays git-ignored' git --no-pager -C "$MODULE_DIR" check-ignore -q --no-index machines.yaml
+check 'legacy inventory path stays git-ignored' git --no-pager -C "$MODULE_DIR" check-ignore -q --no-index machines.local.yaml
+check 'README documents the generated inventory contract' bash -c 'grep -Fq "每次成功安装都会覆盖你在 \`machines.yaml\` 里填的内容" "$1"' bash "$MODULE_DIR/README.md"
+check 'README defers leftover inventory files to manual handling' bash -c 'grep -Fq "确认无用后手动删除" "$1"' bash "$MODULE_DIR/README.md"
+check 'README drops the copy-from-example step' bash -c '! grep -Fq "cp machines.example.yaml machines.yaml" "$1"' bash "$MODULE_DIR/README.md"
 printf '\nAssertions: passed=%d failed=%d\n' "$PASSED" "$FAILED"
 [ "$FAILED" -eq 0 ]

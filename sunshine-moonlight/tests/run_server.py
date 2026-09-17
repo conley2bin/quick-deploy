@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -78,13 +79,10 @@ class RunServerTests(unittest.TestCase):
         (self.module / "lib").mkdir()
         shutil.copy2(MODULE / "run_server.sh", self.module / "run_server.sh")
         shutil.copy2(MODULE / "service/run-server.py", self.module / "service/run-server.py")
-        shutil.copy2(MODULE / "lib/machines_example.py", self.module / "lib/machines_example.py")
+        shutil.copy2(MODULE / "lib/machines_inventory.py", self.module / "lib/machines_inventory.py")
         self.default = self.module / "machines.yaml"
         self.legacy = self.module / "machines.local.yaml"
-        self.example = self.module / "machines.example.yaml"
-        # The example is not a tracked template: create it with the real generator,
-        # exactly as one successful module-root install would.
-        self.generate_example()
+        self.stale = self.module / "machines.example.yaml"
         self.home = self.root / "fake home"
         self.bin = self.root / "fake bin"
         self.log = self.root / "program.json"
@@ -114,10 +112,11 @@ class RunServerTests(unittest.TestCase):
         path.write_text(content)
         path.chmod(0o755)
 
-    def generate_example(self) -> subprocess.CompletedProcess[str]:
-        """Run the module's real generator from an unrelated cwd."""
+    def generate_inventory(self) -> subprocess.CompletedProcess[str]:
+        """Run the module's real generator from an unrelated cwd, exactly as one
+        successful module-root install leaves the inventory behind."""
         result = subprocess.run(
-            [sys.executable, str(self.module / "lib/machines_example.py")],
+            [sys.executable, str(self.module / "lib/machines_inventory.py")],
             cwd=self.root,
             text=True,
             capture_output=True,
@@ -125,6 +124,16 @@ class RunServerTests(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         return result
+
+    def run_generator(self) -> subprocess.CompletedProcess[str]:
+        """Run the real generator without asserting success (refusal probes)."""
+        return subprocess.run(
+            [sys.executable, str(self.module / "lib/machines_inventory.py")],
+            cwd=self.root,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
 
     def write_default(self, content: str = VALID) -> Path:
         self.default.write_text(textwrap.dedent(content))
@@ -137,7 +146,7 @@ class RunServerTests(unittest.TestCase):
     def inventory_bytes(self) -> dict[str, bytes | None]:
         return {
             path.name: path.read_bytes() if path.exists() else None
-            for path in (self.default, self.legacy, self.example)
+            for path in (self.default, self.legacy, self.stale)
         }
 
     def ssh_bytes(self) -> dict[str, bytes]:
@@ -227,65 +236,81 @@ class RunServerTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("--list", result.stdout)
         self.assertIn("machines.yaml", result.stdout)
-        self.assertIn("cp machines.example.yaml machines.yaml", result.stdout)
         self.assertIn("不探测 Tailscale", result.stdout)
         self.assertNotIn("machines.local.yaml", result.stdout)
+        self.assertNotIn("machines.example.yaml", result.stdout)
+        self.assertNotIn("cp ", result.stdout)
         self.assert_no_program()
 
-    def test_missing_default_guides_manual_copy_and_never_falls_back(self) -> None:
-        # The generated example is present, but it is only a template, never a fallback.
+    def test_fresh_clone_without_generated_inventory_guides_one_successful_install(self) -> None:
+        # A fresh clone has no inventory until one root install succeeds: the connector
+        # must name the install step and never offer to copy anything for the user.
         result = self.invoke("--list")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("清单不存在", result.stderr)
         self.assertIn(str(self.default), result.stderr)
-        self.assertIn(str(self.example), result.stderr)
-        self.assertIn("手动", result.stderr)
-        self.assertIn("cp ", result.stderr)
+        self.assertIn("./install.sh", result.stderr)
+        self.assertIn("直接编辑", result.stderr)
+        self.assertFalse(
+            any(line.strip().startswith("cp ") for line in result.stderr.splitlines()), result.stderr
+        )
         self.assertFalse(self.default.exists())
         self.assertFalse(self.legacy.exists())
-        self.assertIsNotNone(self.inventory_bytes()["machines.example.yaml"])
+        self.assertFalse(self.stale.exists())
         self.assert_no_program()
         self.assert_no_tailscale()
 
-    def test_hyphen_leading_explicit_config_advice_copies_then_loads(self) -> None:
-        # A literal `--` keeps the emitted cp advice executable when the destination
-        # starts with a hyphen; without it cp treats -inventory.yaml as options.
-        copy_cwd = self.root / "copy cwd"
-        copy_cwd.mkdir()
-        target = copy_cwd / "-inventory.yaml"
-        example_before = self.example.read_bytes()
+    def test_absent_default_never_falls_back_to_leftover_legacy_file(self) -> None:
+        # A hand-edited leftover machines.example.yaml must stay invisible: no path,
+        # alias or byte from it may reach the user or any child process.
+        self.stale.write_text(textwrap.dedent(DECOY))
+        stale_before = self.stale.read_bytes()
+        legacy = self.write_legacy()
+        legacy_before = legacy.read_bytes()
+        result = self.invoke("--list")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("清单不存在", result.stderr)
+        self.assertIn(str(self.default), result.stderr)
+        self.assertIn("./install.sh", result.stderr)
+        self.assertNotIn(str(self.stale), result.stderr)
+        self.assertNotIn("decoy-host", result.stdout + result.stderr)
+        self.assertFalse(self.default.exists())
+        self.assertEqual(self.stale.read_bytes(), stale_before)
+        self.assertEqual(legacy.read_bytes(), legacy_before)
+        self.assert_no_program()
+        self.assert_no_tailscale()
 
-        result = self.invoke("--config=-inventory.yaml", "--list", cwd=copy_cwd)
+    def test_hyphen_leading_explicit_config_advice_and_explicit_read(self) -> None:
+        # A literal `--config=PATH` keeps a leading-hyphen path usable as a path, not
+        # as an option; the connector never creates or guesses the file it was given.
+        config_dir = self.root / "custom cwd"
+        config_dir.mkdir()
+        target = config_dir / "-inventory.yaml"
+
+        result = self.invoke("--config=-inventory.yaml", "--list", cwd=config_dir)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("清单不存在", result.stderr)
         self.assertIn("-inventory.yaml", result.stderr)
+        self.assertIn(str(self.default), result.stderr)
+        self.assertFalse(
+            any(line.strip().startswith("cp ") for line in result.stderr.splitlines()), result.stderr
+        )
         self.assertFalse(target.exists())
         self.assertFalse(self.default.exists())
         self.assert_no_program()
         self.assert_no_tailscale()
 
-        commands = [line.strip() for line in result.stderr.splitlines() if line.strip().startswith("cp ")]
-        self.assertEqual(len(commands), 1, result.stderr)
-        self.assertTrue(commands[0].startswith("cp -- "), commands[0])
-
-        # Run the emitted advice verbatim, as a user copying it into a shell would.
-        copied = subprocess.run(
-            ["sh", "-c", commands[0]], cwd=copy_cwd, env=self.env, text=True, capture_output=True, check=False
-        )
-        self.assertEqual(copied.returncode, 0, copied.stderr)
-        self.assertEqual(target.read_bytes(), example_before)
-        self.assertEqual([path.name for path in copy_cwd.iterdir()], ["-inventory.yaml"])
-
-        result = self.invoke("--config=-inventory.yaml", "--list", cwd=copy_cwd)
+        # The same path loads once the user supplies it explicitly.
+        target.write_text(textwrap.dedent(VALID))
+        result = self.invoke("--config=-inventory.yaml", "--list", cwd=config_dir)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout.splitlines(), ["desktop"])
-        result = self.invoke("--config=-inventory.yaml", "--moonlight", "desktop", cwd=copy_cwd)
+        self.assertEqual(result.stdout.splitlines(), ["desktop", "laptop"])
+        result = self.invoke("--config=-inventory.yaml", "--moonlight", "desktop", cwd=config_dir)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.recorded()["argv"][1:], ["stream", "--", "100.64.0.10:47989", "Desktop"])
+        self.assertEqual(self.recorded()["argv"][1:], ["stream", "--", "100.64.0.2:47989", "Desktop"])
 
         self.assertFalse(self.default.exists())
         self.assertFalse(self.legacy.exists())
-        self.assertEqual(self.example.read_bytes(), example_before)
         self.assert_no_tailscale()
 
     def test_legacy_only_inventory_is_never_read_created_or_fallen_back_to(self) -> None:
@@ -312,70 +337,99 @@ class RunServerTests(unittest.TestCase):
         self.assertEqual(legacy.read_bytes(), legacy_before)
         self.assert_no_tailscale()
 
-    def test_both_inventories_present_default_reads_new_file_only(self) -> None:
+    def test_default_module_inventory_coexists_with_legacy_and_leftover(self) -> None:
         legacy = self.write_legacy()
+        self.stale.write_text(textwrap.dedent(DECOY))
         inventory = self.write_default()
         legacy_before = legacy.read_bytes()
         inventory_before = inventory.read_bytes()
+        stale_before = self.stale.read_bytes()
         result = self.invoke("--list")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.splitlines(), ["desktop", "laptop"])
+        self.assertNotIn("decoy-host", result.stdout + result.stderr)
+        self.assertNotIn("legacy-host", result.stdout + result.stderr)
         self.assertEqual(legacy.read_bytes(), legacy_before)
         self.assertEqual(inventory.read_bytes(), inventory_before)
+        self.assertEqual(self.stale.read_bytes(), stale_before)
         result = self.invoke("legacy")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("清单中没有机器", result.stderr)
         self.assert_no_program()
         self.assert_no_tailscale()
 
-    def test_example_template_copy_is_valid_under_strict_schema(self) -> None:
-        shutil.copy2(self.example, self.default)
+    def test_generated_inventory_passes_strict_schema_and_reads_edits(self) -> None:
+        self.generate_inventory()
         result = self.invoke("--list")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.splitlines(), ["desktop"])
         result = self.invoke("--moonlight", "desktop")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.recorded()["argv"][1:], ["stream", "--", "100.64.0.10:47989", "Desktop"])
+        # Editing this file in place is the documented next step after one install.
+        self.write_default()
+        result = self.invoke("--list")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.splitlines(), ["desktop", "laptop"])
+        result = self.invoke("--ssh", "laptop", exit_code=17)
+        self.assertEqual(result.returncode, 17, result.stderr)
+        self.assertEqual(self.recorded()["argv"][1:], ["-p", "2222", "laptop-alias"])
 
-    def test_generator_writes_module_example_regardless_of_cwd(self) -> None:
-        self.example.unlink()
+    def test_generator_writes_module_inventory_regardless_of_cwd(self) -> None:
+        self.assertFalse(self.default.exists())
         unrelated = self.root / "generator cwd"
         unrelated.mkdir()
-        result = subprocess.run(
-            [sys.executable, str(self.module / "lib/machines_example.py")],
-            cwd=unrelated,
-            text=True,
-            capture_output=True,
-            check=False,
-        )
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertTrue(self.example.is_file())
-        self.assertEqual(self.example.stat().st_mode & 0o777, 0o644)
-        self.assertFalse((unrelated / "machines.example.yaml").exists())
-        self.assertFalse(self.default.exists())
-        self.assertFalse(self.legacy.exists())
+        self.generate_inventory()
+        self.assertTrue(self.default.is_file())
+        self.assertEqual(self.default.stat().st_mode & 0o777, 0o644)
+        self.assertFalse((unrelated / "machines.yaml").exists())
+        # Regeneration replaces the module inventory and leaves every other file alone.
+        self.write_legacy()
+        self.stale.write_text("leftover stays\n")
+        legacy_before = self.legacy.read_bytes()
+        stale_before = self.stale.read_bytes()
+        self.write_default()
+        self.generate_inventory()
+        self.assertNotIn("desktop:\n    ssh: conley@100.64.0.2", self.default.read_text(encoding="utf-8"))
+        self.assertEqual(self.legacy.read_bytes(), legacy_before)
+        self.assertEqual(self.stale.read_bytes(), stale_before)
 
-    def test_fresh_clone_without_generated_example_guides_one_successful_install(self) -> None:
-        # A fresh clone has no example until the root installer succeeds once.
-        self.example.unlink()
-        self.assertFalse(self.example.exists())
-        result = self.invoke("--list")
+    def test_generator_refuses_link_and_directory_inventory_targets(self) -> None:
+        self.write_legacy()
+        legacy_before = self.legacy.read_bytes()
+        self.stale.write_text("leftover stays\n")
+        stale_before = self.stale.read_bytes()
+        self.default.symlink_to(self.legacy)
+        result = self.run_generator()
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("清单不存在", result.stderr)
-        self.assertIn(str(self.default), result.stderr)
-        self.assertIn("./install.sh", result.stderr)
-        self.assertIn("尚未生成", result.stderr)
-        # Copying the absent example must not be presented as the actionable step.
-        self.assertFalse(
-            any(line.strip().startswith("cp ") for line in result.stderr.splitlines()), result.stderr
-        )
-        self.assertFalse(self.example.exists())
-        self.assertFalse(self.default.exists())
-        self.assert_no_program()
-        self.assert_no_tailscale()
+        self.assertIn("符号链接", result.stderr)
+        self.assertTrue(self.default.is_symlink())
+        self.assertEqual(self.legacy.read_bytes(), legacy_before)
+        self.default.unlink()
+        self.default.mkdir()
+        (self.default / "sentinel").write_text("preserve directory sentinel\n")
+        result = self.run_generator()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("不是普通文件", result.stderr)
+        self.assertEqual((self.default / "sentinel").read_text(), "preserve directory sentinel\n")
+        (self.default / "sentinel").unlink()
+        self.default.rmdir()
+        # A FIFO is non-regular too: publishing must refuse it without blocking on
+        # an open-for-write of the target.
+        os.mkfifo(self.default)
+        result = self.run_generator()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("不是普通文件", result.stderr)
+        self.assertTrue(stat.S_ISFIFO(self.default.stat().st_mode))
+        self.default.unlink()
+        # A refused publish leaves no temporary residue behind.
+        self.assertEqual(list(self.module.glob(".machines.yaml.*.qdtmp")), [])
+        self.assertEqual(self.legacy.read_bytes(), legacy_before)
+        self.assertEqual(self.stale.read_bytes(), stale_before)
 
-    def test_example_documents_every_field_in_chinese(self) -> None:
-        text = self.example.read_text(encoding="utf-8")
+    def test_generated_inventory_documents_every_field_in_chinese(self) -> None:
+        self.generate_inventory()
+        text = self.default.read_text(encoding="utf-8")
         keys = ("machines", "desktop", "ssh", "tailnet_ip", "moonlight_port", "ssh_port", "note")
         for key in keys:
             match = re.search(rf"^[ \t]*#?[ \t]*{re.escape(key)}:", text, re.M)
@@ -387,6 +441,9 @@ class RunServerTests(unittest.TestCase):
         for marker in ("必填", "可选", "默认"):
             self.assertIn(marker, text)
         self.assertIn("Web UI", text)
+        self.assertNotIn("示例", text)
+        self.assertFalse(self.legacy.exists())
+        self.assertFalse(self.stale.exists())
 
     def test_connector_probes_no_tailscale_and_preserves_ssh_state(self) -> None:
         self.write_default()
