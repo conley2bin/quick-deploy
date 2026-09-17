@@ -253,6 +253,22 @@ class RouteMenuTests(unittest.TestCase):
         self.assertIn(str(self.rules / "direct.yaml"), result.stdout)
         self.assertIn(str(self.script), result.stdout)
 
+    def test_missing_relative_overrides_still_print_absolute_paths(self) -> None:
+        """A relative override that does not exist must not print a relative path."""
+        workdir = self.root / "arbitrary cwd"
+        workdir.mkdir()
+        environment = self.environment()
+        environment["RULES_DIR"] = "./missing rules"
+        environment["CLASH_DIR"] = "missing-state"
+        result = self.run_menu("3\n", "0\n", cwd=workdir, environment=environment)
+        self.assertIn(str(workdir / "missing rules" / "direct.yaml"), result.stdout)
+        self.assertIn(str(workdir / "missing rules" / "proxy.yaml"), result.stdout)
+        self.assertIn(str(workdir / "missing-state" / "profiles.yaml"), result.stdout)
+        self.assertIn("不可用", result.stdout)
+        self.assertIn("已支持的应用 ID", result.stdout)
+        self.assertFalse((workdir / "missing rules").exists())
+        self.assertFalse((workdir / "missing-state").exists())
+
     def test_invalid_choice_returns_to_menu_and_failed_action_sets_exit_status(self) -> None:
         invalid = self.run_menu("bogus\n", "0\n")
         self.assertIn("无效选择", invalid.stdout)
@@ -273,7 +289,6 @@ class RouteMenuTests(unittest.TestCase):
         self.assertEqual(self.backups(), [])
 
     def test_registry_without_merge_or_current_still_offers_discovery_and_ssh(self) -> None:
-        self.write_registry(script="- uid: Script\n  type: script\n  file: Script.js\n")
         self.write_registry(script="- uid: Script\n  type: script\n  file: Script.js\n")
         discovery = self.run_menu("3\n", "0\n")
         self.assertIn("已支持的应用 ID", discovery.stdout)
@@ -455,15 +470,20 @@ class RouteMenuTests(unittest.TestCase):
         self.assertEqual(len(self.backups()), 1)
 
     # ---- restore-last ---------------------------------------------------
-    def make_backup(self, name: str, content: str, mtime: int) -> Path:
+    def make_backup(self, name: str, content: str, mtime: int, mtime_ns: int | None = None) -> Path:
         path = self.profiles / f"{self.script.name}.backup.{name}"
         path.write_text(content, encoding="utf-8")
-        os.utime(path, (mtime, mtime))
+        if mtime_ns is None:
+            os.utime(path, (mtime, mtime))
+        else:
+            os.utime(path, ns=(mtime_ns, mtime_ns))
         return path
 
     def test_restore_selects_newest_valid_regular_backup_only(self) -> None:
+        # Timestamp-only, numeric and random suffixes are all tool-written shapes.
         older = self.make_backup("20250101_010101", "older backup\n", 1_600_000_000)
-        newer = self.make_backup("20250101_010102", "newer backup\n", 1_700_000_000)
+        older_numeric = self.make_backup("20250101_010101.2", "older numeric\n", 1_610_000_000)
+        newer = self.make_backup("20250101_010102.AbC123", "newer backup\n", 1_700_000_000)
         unrelated = self.profiles / "Merge.yaml.backup.20250101_010103.zzz"
         unrelated.write_text("unrelated merge backup\n", encoding="utf-8")
         os.utime(unrelated, (1_900_000_000, 1_900_000_000))
@@ -480,7 +500,8 @@ class RouteMenuTests(unittest.TestCase):
         result = self.run_menu("4\n", "y\n", "0\n")
         self.assertIn(str(newer), result.stdout)
         self.assertEqual(self.script.read_text(), "newer backup\n")
-        self.assertTrue(older.exists() and unrelated.exists() and invalid.exists() and directory.is_dir())
+        self.assertTrue(older.exists() and older_numeric.exists() and unrelated.exists() and invalid.exists()
+                        and directory.is_dir())
         self.assertEqual(self.ssh_config.read_text(), "# existing host\nHost existing.example\n    Port 22\n")
         backups = self.backups()
         current_copy = [path for path in backups if path.read_text() == "// current generated\n"]
@@ -489,12 +510,78 @@ class RouteMenuTests(unittest.TestCase):
         self.assertIn("重载", result.stdout)
         self.assertIn("direct.yaml 与 rules/proxy.yaml 未改动", result.stdout)
 
-    def test_restore_ignores_same_second_ties_and_deterministically_picks_last(self) -> None:
-        first = self.make_backup("20250101_010101", "tie one\n", 1_700_000_000)
-        second = self.make_backup("20250101_010102", "tie two\n", 1_700_000_000)
+    def test_restore_ignores_exact_ties_and_deterministically_picks_last_name(self) -> None:
+        stamp = 1_700_000_000_000_000_000
+        first = self.make_backup("20250101_010101", "tie one\n", 1_700_000_000, stamp)
+        second = self.make_backup("20250101_010102", "tie two\n", 1_700_000_000, stamp)
         self.run_menu("4\n", "y\n", "0\n")
         self.assertEqual(self.script.read_text(), "tie two\n")
         self.assertTrue(first.exists() and second.exists())
+
+    def test_restore_orders_same_second_backups_by_nanoseconds_not_by_name(self) -> None:
+        """`.2` vs `.10` inside one clock second: the name lies, mtime_ns does not."""
+        base = 1_700_000_002_000_000_000
+        older = self.make_backup("20250101_010102.2", "older\n", 1_700_000_002, base + 2)
+        newer = self.make_backup("20250101_010102.10", "newer\n", 1_700_000_002, base + 10)
+        self.run_menu("4\n", "y\n", "0\n")
+        self.assertEqual(self.script.read_text(), "newer\n", "lexicographic suffix order won")
+        self.assertTrue(older.exists() and newer.exists())
+
+    def test_restore_stage_is_exclusive_and_never_follows_a_planted_path(self) -> None:
+        """A `.<Script>.restore.$$` path planted before the run must stay untouched."""
+        backup = self.make_backup("20250101_010101", "restorable\n", 1_700_000_000)
+        self.script.write_text("// current generated\n", encoding="utf-8")
+        sentinel = self.profiles / "planted-target.js"
+        sentinel.write_text("// sentinel\n", encoding="utf-8")
+        record = self.root / "planted-path.txt"
+        wrapper = (
+            'planted="$STAGE_DIR/.Script.js.restore.$$"; '
+            'ln -s "$SENTINEL" "$planted"; printf "%s" "$planted" > "$PLANTED_RECORD"; '
+            'exec bash "$0"'
+        )
+        environment = self.environment()
+        environment["SENTINEL"] = str(sentinel)
+        environment["STAGE_DIR"] = str(self.profiles)
+        environment["PLANTED_RECORD"] = str(record)
+        result = subprocess.run(
+            ["bash", "-c", wrapper, str(ENTRY)], cwd=str(self.root), env=environment,
+            input="4\ny\n0\n", text=True, capture_output=True, check=False, timeout=120,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        planted = Path(record.read_text())
+        # The wrapper's own `$$` survives the exec, so this is exactly the
+        # predictable stage path the pre-mktemp implementation used.
+        self.assertTrue(planted.is_symlink(), "wrapper did not plant the predictable stage name")
+        self.assertRegex(planted.name, r"^\.Script\.js\.restore\.\d+$")
+        self.assertEqual(sentinel.read_text(), "// sentinel\n", "restore wrote through a planted path")
+        self.assertEqual(self.script.read_text(), "restorable\n")
+        self.assertFalse(self.script.is_symlink(), "restore moved the planted symlink over the target")
+        self.assertEqual(sorted(path.name for path in self.profiles.glob(".Script.js.restore.*")),
+                         [planted.name], "an unexpected stage name was used or left behind")
+        self.assertEqual(backup.read_text(), "restorable\n")
+
+    def test_backup_names_keep_the_timestamp_prefix_with_an_exclusive_suffix(self) -> None:
+        (self.profiles / "Sample.js").write_text("sample\n", encoding="utf-8")
+        environment = self.environment()
+        first = subprocess.run(
+            ["bash", "-c", 'source "$1"; unique_backup "$2"', "test", str(ENTRY),
+             str(self.profiles / "Sample.js")],
+            cwd=str(self.root), env=environment, text=True, capture_output=True, check=False, timeout=60,
+        )
+        second = subprocess.run(
+            ["bash", "-c", 'source "$1"; unique_backup "$2"', "test", str(ENTRY),
+             str(self.profiles / "Sample.js")],
+            cwd=str(self.root), env=environment, text=True, capture_output=True, check=False, timeout=60,
+        )
+        names = [Path(first.stdout.strip()).name, Path(second.stdout.strip()).name]
+        self.assertEqual(len(set(names)), 2, names)
+        for name in names:
+            self.assertRegex(name, r"^Sample\.js\.backup\.\d{8}_\d{6}\.[A-Za-z0-9]+$")
+        for name in names:
+            self.assertEqual((self.profiles / name).read_text(), "sample\n")
+        # Older layouts stay selectable: timestamp-only, numeric and random suffixes.
+        for name in ("20250101_010101", "20250101_010101.2", "20250101_010101.AbC123"):
+            self.assertRegex(name, r"^\d{8}_\d{6}(\.[A-Za-z0-9]+)?$")
 
     def test_restore_declined_eof_and_missing_backup_write_nothing(self) -> None:
         backup = self.make_backup("20250101_010101", "restorable\n", 1_700_000_000)
@@ -543,6 +630,143 @@ class RouteMenuTests(unittest.TestCase):
         self.assertIn("没有找到", result.stdout)
         self.assertEqual(self.changed_paths(before, self.snapshot(include_mtime=True)), set())
 
+    # ---- SSH write path -------------------------------------------------
+    def unowned_ssh_config(self, hosts: int = 40) -> str:
+        original = "# existing host\n" + "".join(
+            f"Host host{i}.example\n    Port 22{i:02d}\n" for i in range(hosts)
+        )
+        self.ssh_config.write_text(original, encoding="utf-8")
+        self.ssh_config.chmod(0o644)
+        return original
+
+    def ssh_failure_environment(self) -> dict[str, str]:
+        environment = self.environment()
+        environment["PYTHONDONTWRITEBYTECODE"] = "1"
+        return environment
+
+    def assert_ssh_write_failed_closed(self, before_bytes: bytes, *, backups: int) -> None:
+        self.assertEqual(self.ssh_config.read_bytes(), before_bytes, "original SSH config changed")
+        self.assertEqual(stat.S_IMODE(self.ssh_config.stat().st_mode), 0o644, "original mode changed")
+        leftovers = sorted(
+            path.name for path in self.ssh_config.parent.iterdir()
+            if ".config." in path.name and path.name != self.ssh_config.name
+        )
+        self.assertEqual(leftovers, [], f"candidate temporaries leaked: {leftovers}")
+        self.assertEqual(len(list(self.ssh_config.parent.glob(f"{self.ssh_config.name}.backup.*"))), backups)
+        # The static ssh -G check must not run (and must not be claimed) for a
+        # failed write: the stub only logs when it is actually invoked.
+        self.assertFalse(self.ssh_log.exists(), "ssh -G ran despite a failed write")
+
+    def test_ssh_render_and_commit_failures_never_replace_the_real_config(self) -> None:
+        """cat/commit failures and a directory target must fail before any change."""
+        environment = self.ssh_failure_environment()
+
+        # (a) the copy of the original fails: nothing staged, nothing backed up.
+        original = self.unowned_ssh_config()
+        before = self.ssh_config.read_bytes()
+        failing_cat = self.bin / "cat"
+        failing_cat.write_text(
+            "#!/bin/bash\n"
+            "for a in \"$@\"; do\n"
+            "  if [ \"$a\" = \"${SSH_FAIL_CAT:-}\" ]; then printf 'cat: injected failure\\n' >&2; exit 5; fi\n"
+            "done\n"
+            "exec /bin/cat \"$@\"\n",
+            encoding="utf-8",
+        )
+        failing_cat.chmod(0o755)
+        failed = self.run_menu("2\n", "0\n", expected=1,
+                               environment=dict(environment, SSH_FAIL_CAT=str(self.ssh_config)))
+        self.assertIn("fail 读取", failed.stdout + failed.stderr)
+        self.assertNotIn("pass SSH 配置已原子写入", failed.stdout)
+        self.assertNotIn("pass SSH 解析为", failed.stdout)
+        self.assert_ssh_write_failed_closed(before, backups=0)
+
+        # (b) the commit rename fails: the truthful pre-change backup exists, the
+        # original still holds every unrelated Host block.
+        failing_cat.unlink()
+        failing_mv = self.bin / "mv"
+        failing_mv.write_text("#!/bin/bash\nprintf 'mv: injected failure\\n' >&2\nexit 6\n", encoding="utf-8")
+        failing_mv.chmod(0o755)
+        failed = self.run_menu("2\n", "0\n", expected=1)
+        self.assertIn("fail 写入", failed.stdout + failed.stderr)
+        self.assertNotIn("pass SSH 配置已原子写入", failed.stdout)
+        self.assert_ssh_write_failed_closed(before, backups=1)
+        backup = next(self.ssh_config.parent.glob(f"{self.ssh_config.name}.backup.*"))
+        self.assertEqual(backup.read_bytes(), before, "backup is not a truthful pre-change copy")
+        self.assertIn("Host host39.example", self.ssh_config.read_text())
+        failing_mv.unlink()
+
+        # (c) a directory at the target path fails before chmod/staging.
+        backups_before = sorted(path.name for path in self.ssh_config.parent.glob(f"{self.ssh_config.name}.backup.*"))
+        self.ssh_config.unlink()
+        self.ssh_config.mkdir()
+        self.ssh_config.chmod(0o755)
+        ssh_dir_mode = stat.S_IMODE(self.ssh_config.parent.stat().st_mode)
+        failed = self.run_menu("2\n", "0\n", expected=1)
+        self.assertIn("不是普通文件", failed.stdout + failed.stderr)
+        self.assertNotIn("pass SSH 配置已原子写入", failed.stdout)
+        self.assertTrue(self.ssh_config.is_dir(), "directory target was replaced")
+        self.assertEqual(stat.S_IMODE(self.ssh_config.stat().st_mode), 0o755, "directory target was chmod'ed")
+        self.assertEqual(stat.S_IMODE(self.ssh_config.parent.stat().st_mode), ssh_dir_mode)
+        self.assertEqual(
+            sorted(path.name for path in self.ssh_config.parent.glob(f"{self.ssh_config.name}.backup.*")),
+            backups_before, "directory target produced a backup",
+        )
+
+    def test_ssh_option_creates_a_missing_config_with_mode_600(self) -> None:
+        self.ssh_config.unlink()
+        result = self.run_menu("2\n", "0\n")
+        self.assertIn("pass SSH 配置已原子写入", result.stdout)
+        self.assertTrue(self.ssh_config.is_file())
+        self.assertEqual(stat.S_IMODE(self.ssh_config.stat().st_mode), 0o600)
+        written = self.ssh_config.read_text()
+        self.assertTrue(written.startswith("# >>> tun-fix.sh github ssh >>>\n"))
+        self.assertIn("Host github.com ssh.github.com", written)
+        self.assertNotIn("ProxyCommand", written)
+        self.assertNotIn("ProxyJump", written)
+        self.assertEqual(list(self.ssh_config.parent.glob(f"{self.ssh_config.name}.backup.*")), [])
+        self.assertEqual(sorted(path.name for path in self.ssh_config.parent.iterdir()
+                                if ".config." in path.name and path.name != self.ssh_config.name), [])
+
+    def test_ssh_write_cap_never_commits_a_truncated_config(self) -> None:
+        """A short render (ENOSPC/quota class) must not replace unrelated entries."""
+        original = self.unowned_ssh_config(hosts=60)
+        before = self.ssh_config.read_bytes()
+        environment = self.ssh_failure_environment()
+        # The 2046-byte original fits the 2048-byte cap while the ~2.5 KB render
+        # does not, so the render is guaranteed to be cut short.
+        result = subprocess.run(
+            ["bash", "-c", 'trap "" XFSZ; ulimit -f 2; exec bash "$0"', str(ENTRY)],
+            cwd=str(self.root), env=environment, input="2\n0\n",
+            text=True, capture_output=True, check=False, timeout=120,
+        )
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotIn("pass SSH 配置已原子写入", result.stdout)
+        self.assertIn("fail ", result.stdout + result.stderr)
+        self.assert_ssh_write_failed_closed(before, backups=0)
+        self.assertEqual(self.ssh_config.read_text(), original)
+        self.assertIn("Host host59.example", self.ssh_config.read_text())
+
+    def test_ssh_render_guards_a_failing_or_empty_block_producer(self) -> None:
+        original = self.unowned_ssh_config()
+        before = self.ssh_config.read_bytes()
+        environment = self.ssh_failure_environment()
+        for label, producer in (
+            ("return-3", 'github_ssh_block() { printf "partial" >&2; return 3; }'),
+            ("empty", "github_ssh_block() { :; }"),
+        ):
+            result = subprocess.run(
+                ["bash", "-c", f'source "$1"; {producer}; configure_ssh', "test", str(ENTRY)],
+                cwd=str(self.root), env=environment, text=True, capture_output=True, check=False, timeout=120,
+            )
+            self.assertEqual(result.returncode, 1, f"{label}: {result.stdout}{result.stderr}")
+            self.assertNotIn("pass SSH 配置已原子写入", result.stdout)
+            self.assertEqual(self.ssh_config.read_bytes(), before, label)
+            self.assertEqual(stat.S_IMODE(self.ssh_config.stat().st_mode), 0o644, label)
+            self.assertEqual(sorted(path.name for path in self.ssh_config.parent.iterdir()
+                                    if ".config." in path.name and path.name != self.ssh_config.name), [], label)
+        self.assertEqual(self.ssh_config.read_text(), original)
+
     # ---- SSH isolation --------------------------------------------------
     def test_option_two_only_touches_ssh_config_and_its_backup(self) -> None:
         self.declare_wechat_proxy()
@@ -563,6 +787,9 @@ class RouteMenuTests(unittest.TestCase):
         self.assertNotIn("ProxyJump", self.ssh_config.read_text())
         self.assertIn("ssh.github.com", result.stdout)
         self.assertIn("pass SSH", result.stdout)
+        self.assertEqual(stat.S_IMODE(self.ssh_config.stat().st_mode), 0o600)
+        self.assertEqual(sorted(path.name for path in self.ssh_config.parent.iterdir()
+                                if ".config." in path.name and path.name != self.ssh_config.name), [])
         self.assertEqual(self.script.read_text(), "// Generated by tun-fix.sh earlier revision\n")
         self.assertEqual(self.backups(), [])
 

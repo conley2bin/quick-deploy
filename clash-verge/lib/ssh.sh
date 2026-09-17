@@ -87,9 +87,21 @@ verify_github_ssh_config() {
 }
 
 # 配置 SSH (可选)
+#
+# Why every step below checks its own status: the menu invokes this as
+# `configure_ssh || action_status=$?`, and bash disables errexit for the *entire
+# body* of a function called in a `||` list (or an `if` condition). `set -e`
+# therefore cannot be relied on inside this function, and the write path has to
+# fail closed on its own.
+#
+# The real ~/.ssh/config is only read until the complete new content, its
+# permissions and its backup are ready in same-directory candidates; exactly one
+# rename then replaces the original.
 configure_ssh() {
     local ssh_config="$HOME/.ssh/config"
-    local has_github=0 backup_file="" tmp shadowed
+    local ssh_dir="$HOME/.ssh"
+    local prefix has_github=0 backup_file="" overwrite="" block="" cleaned="" candidate=""
+    local block_bytes cleaned_bytes expected_bytes actual_bytes shadowed
 
     echo ""
     echo "==========================================="
@@ -99,12 +111,18 @@ configure_ssh() {
     echo "DST-PORT,22 不覆盖 443，写入 SSH 配置也不证明 DIRECT 已命中。"
     echo ""
 
-    if [ -f "$ssh_config" ] && grep -qE '^# >>> tun-fix\.sh github ssh >>>|^[[:space:]]*Host[[:space:]].*github\.com' "$ssh_config"; then
+    # A directory (or any other non-regular file) at the target path must fail
+    # before anything is chmod'ed, staged, or replaced.
+    if [ -e "$ssh_config" ] && [ ! -f "$ssh_config" ]; then
+        echo "fail $ssh_config 存在但不是普通文件（目录/设备等），未做任何修改。" >&2
+        return 1
+    fi
+
+    if [ -f "$ssh_config" ] && grep -qE '^# >>> tun-fix\.sh github ssh >>>$|^[[:space:]]*Host[[:space:]].*github\.com' "$ssh_config"; then
         has_github=1
         echo "warning 检测到已有 GitHub SSH 配置"
         grep -A 10 -E '^[[:space:]]*Host[[:space:]].*github\.com' "$ssh_config" || true
         echo -n "是否覆盖本工具管理的块并将新块置顶？[y/N]: "
-        local overwrite
         read -r overwrite || true
         if [[ ! "$overwrite" =~ ^[Yy]$ ]]; then
             echo "已取消 SSH 配置"
@@ -112,27 +130,119 @@ configure_ssh() {
         fi
     fi
 
-    mkdir -p "$HOME/.ssh"
-    chmod 700 "$HOME/.ssh"
-    if [ -f "$ssh_config" ]; then
-        backup_file=$(unique_backup "$ssh_config") || return 1
-        echo "pass 已备份原配置到: $backup_file"
+    if ! mkdir -p -- "$ssh_dir"; then
+        echo "fail 无法创建 $ssh_dir；未改动 $ssh_config。" >&2
+        return 1
     fi
-    if [ "$has_github" -eq 1 ]; then
-        remove_managed_ssh_block "$ssh_config"
+    if ! chmod 700 -- "$ssh_dir"; then
+        echo "fail 无法设置 $ssh_dir 权限；未改动 $ssh_config。" >&2
+        return 1
     fi
 
-    tmp=$(mktemp "${ssh_config}.tmp.XXXXXX") || return 1
-    {
-        github_ssh_block
-        if [ -s "$ssh_config" ]; then
-            echo ""
-            cat "$ssh_config"
+    prefix="$ssh_dir/.$(basename -- "$ssh_config")"
+    if ! block=$(mktemp "$prefix.block.XXXXXX"); then
+        echo "fail 无法在 $ssh_dir 建立候选文件；未改动 $ssh_config。" >&2
+        return 1
+    fi
+    if ! cleaned=$(mktemp "$prefix.cleaned.XXXXXX"); then
+        rm -f -- "$block"
+        echo "fail 无法在 $ssh_dir 建立候选文件；未改动 $ssh_config。" >&2
+        return 1
+    fi
+    if ! candidate=$(mktemp "$prefix.candidate.XXXXXX"); then
+        rm -f -- "$block" "$cleaned"
+        echo "fail 无法在 $ssh_dir 建立候选文件；未改动 $ssh_config。" >&2
+        return 1
+    fi
+
+    if ! github_ssh_block > "$block"; then
+        rm -f -- "$block" "$cleaned" "$candidate"
+        echo "fail 生成 GitHub SSH 配置块失败；未改动 $ssh_config。" >&2
+        return 1
+    fi
+    if [ ! -s "$block" ]; then
+        rm -f -- "$block" "$cleaned" "$candidate"
+        echo "fail GitHub SSH 配置块为空；未改动 $ssh_config。" >&2
+        return 1
+    fi
+
+    # Only the copy is cleaned. The original keeps every byte — including its
+    # unrelated Host blocks — until the single commit below.
+    if [ -f "$ssh_config" ]; then
+        if ! cat -- "$ssh_config" > "$cleaned"; then
+            rm -f -- "$block" "$cleaned" "$candidate"
+            echo "fail 读取 $ssh_config 失败；未改动它。" >&2
+            return 1
         fi
-    } > "$tmp"
-    chmod 600 "$tmp"
-    commit_same_dir_temp "$tmp" "$ssh_config"
-    chmod 600 "$ssh_config"
+        if [ "$has_github" -eq 0 ] && ! cmp -s -- "$ssh_config" "$cleaned"; then
+            rm -f -- "$block" "$cleaned" "$candidate"
+            echo "fail 候选副本与 $ssh_config 不一致；未改动它。" >&2
+            return 1
+        fi
+        if [ "$has_github" -eq 1 ] && ! remove_managed_ssh_block "$cleaned"; then
+            rm -f -- "$block" "$cleaned" "$candidate"
+            echo "fail 清理候选副本中的旧托管块失败；未改动 $ssh_config。" >&2
+            return 1
+        fi
+    fi
+
+    if ! block_bytes=$(wc -c < "$block"); then
+        rm -f -- "$block" "$cleaned" "$candidate"
+        echo "fail 无法读取候选块长度；未改动 $ssh_config。" >&2
+        return 1
+    fi
+    if ! cleaned_bytes=$(wc -c < "$cleaned"); then
+        rm -f -- "$block" "$cleaned" "$candidate"
+        echo "fail 无法读取候选内容长度；未改动 $ssh_config。" >&2
+        return 1
+    fi
+    expected_bytes="$block_bytes"
+    if [ "$cleaned_bytes" -gt 0 ]; then
+        expected_bytes=$(( block_bytes + cleaned_bytes + 1 ))
+    fi
+
+    if ! {
+        cat -- "$block"
+        if [ -s "$cleaned" ]; then
+            printf '\n'
+            cat -- "$cleaned"
+        fi
+    } > "$candidate"; then
+        rm -f -- "$block" "$cleaned" "$candidate"
+        echo "fail 生成候选配置失败；未改动 $ssh_config。" >&2
+        return 1
+    fi
+
+    # A short write (quota, ENOSPC, killed render) must never reach the commit:
+    # only the last command in the group decides the group status, so the
+    # rendered length is the property that status alone cannot prove.
+    if ! actual_bytes=$(wc -c < "$candidate"); then
+        rm -f -- "$block" "$cleaned" "$candidate"
+        echo "fail 无法读取候选配置长度；未改动 $ssh_config。" >&2
+        return 1
+    fi
+    if [ "$actual_bytes" -ne "$expected_bytes" ]; then
+        rm -f -- "$block" "$cleaned" "$candidate"
+        echo "fail 候选配置写入不完整（$actual_bytes/$expected_bytes 字节）；未改动 $ssh_config。" >&2
+        return 1
+    fi
+
+    if [ -f "$ssh_config" ]; then
+        if ! backup_file=$(unique_backup "$ssh_config"); then
+            rm -f -- "$block" "$cleaned" "$candidate"
+            echo "fail 备份 $ssh_config 失败；未改动它。" >&2
+            return 1
+        fi
+        echo "pass 已备份原配置到: $backup_file"
+    fi
+
+    # Exactly one replacement of the original target, carrying content and 0600.
+    if ! commit_same_dir_temp "$candidate" "$ssh_config" 600; then
+        rm -f -- "$block" "$cleaned"
+        echo "fail 写入 $ssh_config 失败；原文件未被替换。" >&2
+        return 1
+    fi
+    rm -f -- "$block" "$cleaned"
     echo "pass SSH 配置已原子写入 ~/.ssh/config 顶部"
 
     shadowed=$(awk '

@@ -101,39 +101,38 @@ show_route_paths() {
 
 # Collision-free, timestamp-prefixed backup next to the target. The
 # YYYYMMDD_HHMMSS prefix plus a unique suffix is the pattern restore-last and the
-# documented backup layout both rely on.
+# documented backup layout both rely on; mktemp reserves the name exclusively so
+# two runs in the same second cannot collide or overwrite.
 unique_backup() {
     local file="$1"
-    local directory base stamp suffix candidate
+    local directory base stamp backup
     directory=$(dirname -- "$file")
     base=$(basename -- "$file")
     stamp=$(date +%Y%m%d_%H%M%S)
-    suffix=1
-    while :; do
-        candidate="$directory/$base.backup.$stamp"
-        if [ "$suffix" -gt 1 ]; then
-            candidate="$candidate.$suffix"
-        fi
-        if [ ! -e "$candidate" ] && [ ! -L "$candidate" ]; then
-            break
-        fi
-        suffix=$((suffix + 1))
-        if [ "$suffix" -gt 1000 ]; then
-            echo "无法为 $file 生成唯一备份名（同一秒内备份过多）" >&2
-            return 1
-        fi
-    done
-    if ! cp -- "$file" "$candidate"; then
-        rm -f -- "$candidate"
+    backup=$(mktemp "$directory/$base.backup.$stamp.XXXXXX") || return 1
+    if ! cp -- "$file" "$backup"; then
+        rm -f -- "$backup"
         return 1
     fi
-    printf '%s\n' "$candidate"
+    printf '%s\n' "$backup"
 }
 
+# Replace `target` with a fully rendered same-directory candidate. An optional
+# mode argument sets the candidate's mode explicitly instead of inheriting the
+# target's, so one rename carries both content and permissions.
+#
+# Callers must check the status: the menu invokes these actions from `||` lists,
+# and bash disables errexit for the entire body of a function called that way.
 commit_same_dir_temp() {
     local temp="$1"
     local target="$2"
-    if [ -e "$target" ] && ! chmod --reference="$target" "$temp"; then
+    local mode="${3:-}"
+    if [ -n "$mode" ]; then
+        if ! chmod -- "$mode" "$temp"; then
+            rm -f -- "$temp"
+            return 1
+        fi
+    elif [ -e "$target" ] && ! chmod --reference="$target" "$temp"; then
         rm -f -- "$temp"
         return 1
     fi
@@ -224,8 +223,8 @@ write_prepared_route_script() {
 # then back up and atomically replace the registered Script. Identical output is
 # a no-op that keeps the target mtime and creates no backup.
 update_route_rules() {
-    prepare_route_target
-    local prepared=$?
+    local prepared=0
+    prepare_route_target || prepared=$?
     if [ "$prepared" -ne 0 ]; then
         return "$prepared"
     fi
@@ -258,10 +257,24 @@ apply_route_rules() {
     cleanup_prepared_route_rules
 }
 
+# Fixed-width nanosecond modification key. Whole-second stat is not enough to
+# order two backups written in the same second, and a filename tie-break alone
+# would rank `.10` below `.2`.
+ns_mtime_key() {
+    local file="$1"
+    local seconds stamp fraction
+    seconds=$(stat -c '%Y' -- "$file") || return 1
+    stamp=$(stat -c '%y' -- "$file") || return 1
+    fraction=${stamp#*.}
+    fraction=${fraction%% *}
+    [ -n "$fraction" ] || fraction=0
+    printf '%s.%09d\n' "$seconds" "$(( 10#$fraction ))"
+}
+
 # Menu option 4: restore the registered Script from its newest exact-target
 # backup. Only regular files with the tool's timestamped name shape qualify.
 restore_last_script() {
-    local script_file target_dir backup="" candidate newest_mtime="" newest_name="" mtime status
+    local script_file target_dir backup="" candidate newest_key="" key status
     local -a matches=()
 
     require_profiles || return 1
@@ -280,11 +293,10 @@ restore_last_script() {
         if ! [[ "${candidate##*.backup.}" =~ $pattern_re ]]; then
             continue
         fi
-        mtime=$(stat -c '%Y' -- "$candidate" 2>/dev/null) || continue
-        if [ -z "$newest_mtime" ] || [ "$mtime" -gt "$newest_mtime" ] \
-            || { [ "$mtime" -eq "$newest_mtime" ] && [[ "$candidate" > "$newest_name" ]]; }; then
-            newest_mtime="$mtime"
-            newest_name="$candidate"
+        key=$(ns_mtime_key "$candidate") || continue
+        if [ -z "$newest_key" ] || [[ "$key" > "$newest_key" ]] \
+            || { [ "$key" = "$newest_key" ] && [[ "$candidate" > "$backup" ]]; }; then
+            newest_key="$key"
             backup="$candidate"
         fi
     done
@@ -309,13 +321,18 @@ restore_last_script() {
     if [ -f "$script_file" ] || [ -L "$script_file" ]; then
         safety=$(unique_backup "$script_file") || return 1
     fi
-    candidate="$target_dir/.$(basename -- "$script_file").restore.$$"
+    # Stage through an exclusively created same-directory name: a predictable
+    # path (for example `.Script.js.restore.$$`) could be pre-planted as a
+    # symlink and would be followed by cp before the rename.
+    if ! candidate=$(mktemp "$target_dir/.${script_file##*/}.restore.XXXXXX"); then
+        echo "无法在 $target_dir 建立恢复候选文件；未改动全局 Script。" >&2
+        return 1
+    fi
     if ! cp -- "$backup" "$candidate"; then
         rm -f -- "$candidate"
         return 1
     fi
     if ! commit_same_dir_temp "$candidate" "$script_file"; then
-        cleanup_prepared_route_rules
         return 1
     fi
     echo "已从备份恢复全局 Script: $backup"

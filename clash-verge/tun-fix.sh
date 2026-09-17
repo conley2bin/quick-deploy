@@ -14,10 +14,29 @@ RULES_READER="$SCRIPT_DIR/lib/rules.py"
 APP_DISCOVERER="$SCRIPT_DIR/lib/discover_apps.py"
 APP_REPORTER="$SCRIPT_DIR/lib/report_apps.py"
 
-# Relative overrides resolve against the invocation directory, so `tun-fix.sh`
-# stays usable from any cwd without hardcoded user paths.
-RULES_DIR="$(CDPATH= cd -- "$RULES_DIR" 2>/dev/null && pwd || printf '%s' "$RULES_DIR")"
-CLASH_DIR="$(CDPATH= cd -- "$CLASH_DIR" 2>/dev/null && pwd || printf '%s' "$CLASH_DIR")"
+# Header paths must be absolute even when a relative override points at a
+# directory that does not exist yet: an existing directory resolves through
+# cd/pwd, a missing one is canonicalized lexically against the invocation cwd.
+absolute_dir() {
+    local requested="$1"
+    local resolved
+    if [ -d "$requested" ]; then
+        resolved=$( CDPATH= cd -- "$requested" && pwd ) || return 1
+    else
+        resolved=$(python3 -c 'import os, sys; print(os.path.abspath(sys.argv[1]))' "$requested") || return 1
+    fi
+    [ -n "$resolved" ] || return 1
+    printf '%s\n' "$resolved"
+}
+
+if ! RULES_DIR=$(absolute_dir "$RULES_DIR"); then
+    echo "无法解析 RULES_DIR 的绝对路径（需要 python3）" >&2
+    exit 1
+fi
+if ! CLASH_DIR=$(absolute_dir "$CLASH_DIR"); then
+    echo "无法解析 CLASH_DIR 的绝对路径（需要 python3）" >&2
+    exit 1
+fi
 PROFILES_YAML="$CLASH_DIR/profiles.yaml"
 
 # shellcheck source=lib/config.sh
@@ -114,8 +133,11 @@ main() {
         action_status=0
         case $action in
             1)
-                # Straight-line call: neither update path disables errexit inside
-                # a helper body, and a non-zero return maps to an explicit error.
+                # Actions are invoked from `||` lists, which disables errexit for
+                # the whole helper body. `set -e` therefore cannot carry a write
+                # failure out of a helper: every helper checks its own statuses
+                # explicitly, and the return value here maps to an error or a
+                # cancel (2) instead of a silent success.
                 update_route_rules || action_status=$?
                 report_action_status "更新失败" "$action_status"
                 ;;
