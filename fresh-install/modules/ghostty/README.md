@@ -74,6 +74,11 @@ sudo apt install --allow-downgrades ghostty=1.3.1~ppa2-noble1
   - `Ctrl+Shift+R` 绑定 Ghostty 原生 `reset`，用于清理异常 SSH 后残留的终端状态
   - 新终端起始目录 `~/Documents`（不存在时回退到 XDG 文档目录，再不行就 `home`）
   - 关闭新窗口工作目录继承；新标签页和分屏仍保留继承
+  - `gtk-single-instance = false`：每个外部启动的 Ghostty 用自己的进程（见下节）
+- `~/.local/share/applications/com.mitchellh.ghostty.desktop`
+  - 由系统模板 `/usr/share/applications/com.mitchellh.ghostty.desktop` 逐行生成，只把两个 `Exec=` 入口改为
+    `--gtk-single-instance=false`、`DBusActivatable=false`；系统文件本身不改
+  - 同目录的 `mimeinfo.cache` 由 `update-desktop-database` 刷新（查找缓存，失败不影响入口生效）
 - `~/.config/ghostty/ghostty-ssh-mouse-reset.zsh`
   - zsh 在 SSH 返回本地提示符前自动清理常见鼠标模式
 - `~/.zshrc`
@@ -82,10 +87,10 @@ sudo apt install --allow-downgrades ghostty=1.3.1~ppa2-noble1
 ### 为什么同时写 `working-directory` 和 `window-inherit-working-directory`
 
 `working-directory` 只决定“没有可继承窗口时”的默认目录。Ghostty 默认开启
-`window-inherit-working-directory = true`，而且它的优先级更高；配合
-`gtk-single-instance=true`，Ctrl+Alt+T 创建的新窗口会继承现有 Ghostty 焦点窗口
-报告的工作目录。实际表现是：只要焦点窗口位于某个项目目录，以后新窗口都会
-黏在该项目目录，即使 `working-directory = ~/Documents` 已正确生效。
+`window-inherit-working-directory = true`，而且它的优先级更高：同一进程内新建窗口
+会继承该进程里焦点窗口报告的工作目录。实际表现是：只要焦点窗口位于某个项目
+目录，该进程里以后新开的窗口都会黏在该项目目录，即使
+`working-directory = ~/Documents` 已正确生效。
 
 模块因此同时写入：
 
@@ -172,16 +177,82 @@ locale 一并换成英文（日期、报错、man 页）。病灶在 fontconfig 
 
 配置采用“幂等重置”语义：重跑会把它恢复为模块的基准内容。内容变化时，脚本先备份为 `config.ghostty.bak.<时间戳>`，再用同目录临时文件和原子 `mv` 替换；写完会回读，并通过 Ghostty 自身解析配置。
 
-本模块不会另写主题文件，也不会改写软件包提供的 desktop 文件，不写用户级 desktop
-override，也不写 `gtk-single-instance` 配置。日常启动的两条路径各自沿用既有行为：
-应用菜单走软件包 desktop 入口，其 `Exec` 显式带 `--gtk-single-instance=true`；
-Ctrl+Alt+T 走本模块写入的无参数包装脚本，交给 Ghostty 自身默认 `detect`（见本机
-`man 1 ghostty`），无 CLI 参数且 `TERM_PROGRAM` 为空时按单实例复用。本模块不做
-“每次外部启动都独立进程”的隔离，也不注入 `GDK_BACKEND`，在 Wayland 会话中继续
-使用原生 Wayland。
+本模块不会另写主题文件，也不改写软件包提供的系统 desktop 文件：关闭单实例只通过
+用户级同 ID 覆盖完成，`/usr/share/applications/com.mitchellh.ghostty.desktop` 保持原样。
+也不注入 `GDK_BACKEND`，在 Wayland 会话中继续使用原生 Wayland。
 
-`install.sh` 里唯一的 `--gtk-single-instance=false` 属于 GUI 冒烟测试：只让那一次探针
-进程独立，避免复用或波及用户已在运行的 Ghostty，不是模块的启动策略。
+### 每个外部启动一个进程（`gtk-single-instance = false`）
+
+本模块把“每个外部启动的 Ghostty 都用自己的进程”作为启动策略，同时在两处落地：
+
+```ini
+# ~/.config/ghostty/config.ghostty
+gtk-single-instance = false
+```
+
+```diff
+# ~/.local/share/applications/com.mitchellh.ghostty.desktop（从系统模板生成）
+-Exec=/usr/bin/ghostty --gtk-single-instance=true
++Exec=/usr/bin/ghostty --gtk-single-instance=false
+-DBusActivatable=true
++DBusActivatable=false
+```
+
+两处都必须写，因为它们各自覆盖不同的启动路径：
+
+| 启动路径 | 谁决定单实例 | 模块的处理 |
+| --- | --- | --- |
+| 应用菜单 / 桌面快捷方式 | 系统 desktop 的 `Exec=` 显式带 `--gtk-single-instance=true`；CLI 参数优先于配置文件 | 用户级覆盖把两个 `Exec=` 入口都改成 `--gtk-single-instance=false` |
+| Ctrl+Alt+T（包装脚本 `exec /usr/bin/ghostty "$@"`） | 没有 CLI 参数，命令行 `--gtk-single-instance` 的默认值 `detect` 只在配置值仍为 `detect` 时才参与判断 | 配置里的 `false` 直接生效，不经过 `detect`，也就不靠 `TERM_PROGRAM` 这类环境事实 |
+
+`DBusActivatable=false` 不是可选项：它为 `true` 时桌面外壳可以走 D-Bus 激活（系统里
+装着 `com.mitchellh.ghostty.service`），那条路径根本不经过 `Exec=`，光改 `Exec=` 里的
+参数会被绕过。实测：配置写 `gtk-single-instance = true` 时，即使带 CLI 参数（`detect`
+本该判为单实例），`ghostty +show-config` 的解析结果仍是 `true`；写成 `false` 则固定为
+独立进程。
+
+隔离范围：**一个外部启动 = 一个进程 = 一个崩溃域**。进程级退出（崩溃、被杀，或该
+进程正常退出）只带走它自己那个窗口，其它窗口继续运行；同一进程内的多个窗口、
+标签页和分屏仍然共享进程生命周期，不承诺彼此隔离。副作用：窗口之间不再共享工作
+目录，每个新窗口按 `working-directory` 启动（见下节）。
+
+确认用户级覆盖确实遮蔽了系统同 ID 入口：
+
+```bash
+desktop_id=com.mitchellh.ghostty.desktop
+{
+  printf '%s\n' "${XDG_DATA_HOME:-$HOME/.local/share}"
+  printf '%s\n' "${XDG_DATA_DIRS:-/usr/local/share:/usr/share}" | tr : '\n'
+} | while IFS= read -r data_dir; do
+  candidate="$data_dir/applications/$desktop_id"
+  if [ -f "$candidate" ]; then
+    printf 'XDG 首个匹配: %s\n' "$candidate"
+    grep -E '^(Exec|DBusActivatable)=' "$candidate"
+    break
+  fi
+done
+```
+
+预期首个匹配是 `~/.local/share/applications/com.mitchellh.ghostty.desktop`，两个 `Exec=` 都
+含 `--gtk-single-instance=false`，且 `DBusActivatable=false`。边界：模块固定写
+`$HOME/.local/share/applications`（与它写 `~/.config/ghostty` 同一约定），不跟随
+`XDG_DATA_HOME` / `XDG_CONFIG_HOME`；机器上若自定义了 `XDG_DATA_HOME`，需要自己把覆盖
+放到该目录，否则系统入口不会被遮蔽。
+
+这个用户级覆盖只接受三种状态，其余一律**拒绝覆盖并明确失败**，不静默降级：
+
+1. 文件不存在：按系统模板生成；
+2. 与当前系统模板生成的基准内容一致：重跑幂等，不重写、不备份；
+3. 与系统模板只差上面那三处启动语义：视为不含用户自有内容，先备份 `.bak.<时间戳>` 再替换。
+
+带用户改动的文件（换了 `Icon=`、加了自有字段、写了别的 `Exec=` 等）会被拒绝，安装脚本会
+打印差异命令和恢复方式（把该文件 `mv` 移开再重跑）。系统模板结构变化导致无法生成时
+同样明确失败：宁可报错，也不写出一个“看起来成功、实际仍复用进程”的覆盖。
+
+`install.sh` 里还有一处 `--gtk-single-instance=false` 属于 GUI 冒烟测试：让那一次探针进程
+独立于用户已在运行的 Ghostty。没有它，单实例模式下新进程会把请求交给已有实例后立即
+退出，存活判定随即误报“提前退出”。模块的日常策略现在同为独立进程，但那里的显式参数
+仍然保留：冒烟测试要能不依赖配置文件是否正确而自己保证探针独立。
 
 ## 默认接管 Ctrl+Alt+T
 
@@ -226,7 +297,7 @@ emulator），不是对 X11 API 的依赖。切到 Wayland 后，只有“按键
 bash tests/run.sh
 ```
 
-预检报告：系统与架构、Ghostty 版本、apt 候选版本、PPA 是否已在源中、配置状态、两种字体、`xterm-ghostty` terminfo、SSH 鼠标自愈 hook、当前默认终端所有者以及计划动作。它不会添加软件源、调用修改状态的 apt 命令、访问 GitHub、下载文件或写入用户目录。
+预检报告：系统与架构、Ghostty 版本、apt 候选版本、PPA 是否已在源中、配置状态、用户级 desktop 覆盖状态（已是基准内容 / 将被替换 / 将被拒绝）、两种字体、`xterm-ghostty` terminfo、SSH 鼠标自愈 hook、当前默认终端所有者以及计划动作。它不会添加软件源、调用修改状态的 apt 命令、访问 GitHub、下载文件或写入用户目录。
 
 ## 安装后的用户验收清单
 
@@ -237,7 +308,8 @@ bash tests/run.sh
 5. 在 Ghostty 中用 fcitx5 输入一段中文。安装脚本的 GUI 冒烟测试只证明 GTK4 的 `libim-fcitx5.so` 已载入进程；最终文本提交仍应人工确认。
 6. 运行 `infocmp xterm-ghostty`，确认本机 terminfo 可读。
 7. 按 Ctrl+Alt+T 确认启动 Ghostty（默认已接管；若用了 `--no-default-terminal` 则跳过此项）；同时从文件管理器测试“在终端中打开”。
-8. SSH 到不认识 `xterm-ghostty` 的远端时，本模块已开启 `ssh-terminfo` 自动处理（见下节）。若需手动处理：
+8. 隔离验证：从应用菜单连开两个窗口，`pgrep -a ghostty` 应看到两个进程；关掉或杀掉其中一个，另一个不受影响。
+9. SSH 到不认识 `xterm-ghostty` 的远端时，本模块已开启 `ssh-terminfo` 自动处理（见下节）。若需手动处理：
 
    ```bash
    infocmp -x xterm-ghostty | ssh HOST -- tic -x -

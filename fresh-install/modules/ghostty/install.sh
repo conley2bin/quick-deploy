@@ -8,7 +8,9 @@
 # GitHub API 给出的 SHA-256 digest。
 #
 # 幂等语义：重跑 = 确保最新版 + 把配置重置为基准内容，并把 Ghostty
-# SSH 鼠标自愈 hook 同步到用户 zsh；旧文件先备份。
+# SSH 鼠标自愈 hook 同步到用户 zsh；旧文件先备份。另外生成用户级 desktop
+# 覆盖，让每个外部启动用自己的进程；该文件含本模块之外的改动时明确失败，
+# 不覆盖也不静默降级。
 # --check 只读，不添加源、不更新 apt、不下载或写入任何文件。
 
 set -euo pipefail
@@ -36,6 +38,10 @@ PPA_FINGERPRINT="0721FDF5FECB88DC6920361657C8EF455CEAE491"
 GITHUB_API="https://api.github.com/repos/mkasberg/ghostty-ubuntu/releases/latest"
 DESKTOP_ID="com.mitchellh.ghostty.desktop"
 DESKTOP_FILE="/usr/share/applications/$DESKTOP_ID"
+# 用户级同 ID 覆盖：XDG 查找用户数据目录先于 /usr/share，同一个 desktop ID
+# 以本文件为准，软件包提供的系统文件保持原样（见 render_desktop_override）。
+USER_DESKTOP_DIR="$HOME/.local/share/applications"
+USER_DESKTOP_FILE="$USER_DESKTOP_DIR/$DESKTOP_ID"
 GHOSTTY_BIN="/usr/bin/ghostty"
 CONFIG_DIR="$HOME/.config/ghostty"
 CONFIG_FILE="$CONFIG_DIR/config.ghostty"
@@ -117,6 +123,8 @@ usage() {
   不要用 sudo 运行本脚本；直接运行 ./install.sh，脚本会在 apt 步骤调用 sudo。
   默认接管 Ctrl+Alt+T（旧的包装脚本会先备份）。重跑会确保最新版，并把
   Ghostty 配置重置为本模块的基准内容；内容变化时会先保存 .bak.<时间戳> 备份。
+  用户级 desktop 覆盖（每个外部启动用独立进程）含本模块之外的改动时，
+  脚本会明确失败而不是覆盖，处理方式见 README 的对应章节。
 EOF
 }
 
@@ -172,7 +180,7 @@ check_supported_system() {
 
 preflight_commands() {
     local command_name
-    for command_name in dpkg apt-cache grep awk cmp cp mv mktemp chmod mkdir date fc-list infocmp; do
+    for command_name in dpkg apt-cache grep awk sed cmp cp mv mktemp chmod mkdir date fc-list infocmp; do
         require_command "$command_name"
     done
 
@@ -418,6 +426,7 @@ show_check() {
         echo "第三方 PPA: 未出现在 apt 源中"
     fi
     echo "配置: $CONFIG_FILE —— $(config_state)"
+    echo "用户级 desktop 覆盖: $USER_DESKTOP_FILE —— $(desktop_override_state)"
     echo "字体:"
     if font_exists "$FONT_FAMILY"; then
         echo "  $FONT_FAMILY: 已安装（将写入配置）"
@@ -828,13 +837,21 @@ render_config() {
     echo "keybind = ctrl+shift+r=reset"
 
     # working-directory 只决定没有可继承窗口时的默认目录。Ghostty 的
-    # window-inherit-working-directory 默认为 true，且优先级更高；配合
-    # gtk-single-instance=true，Ctrl+Alt+T 创建的新窗口会继承现有 Ghostty
-    # 焦点窗口的目录，导致所有新窗口长期黏在某个项目目录。
+    # window-inherit-working-directory 默认为 true，且优先级更高：同一进程内
+    # 新建窗口会继承该进程里焦点窗口的目录，导致新窗口长期黏在某个项目目录。
     # 明确关闭“新窗口继承”，让每个新窗口都从 WORKING_DIRECTORY 启动。
     # tab/split 仍保留上游默认继承，方便在同一项目中继续工作。
     echo "working-directory = $(resolved_working_directory)"
     echo "window-inherit-working-directory = false"
+
+    # 每个外部启动都用独立进程：一个 Ghostty 进程崩溃只带走它自己那个窗口，
+    # 同一进程内的窗口、tab、split 仍共享进程与生命周期。应用菜单那条路径由
+    # 用户级 desktop 覆盖显式传 --gtk-single-instance=false
+    # （见 render_desktop_override）；Ctrl+Alt+T 的包装脚本不带 CLI 参数，走的
+    # 就是这里：命令行 --gtk-single-instance 的默认值 detect 只在配置值仍为
+    # detect 时才生效，显式写 false 后不再参与 detect 判断。
+    echo "# 独立外部启动使用独立进程；内部窗口、tab 和 split 仍可能共享进程。"
+    echo "gtk-single-instance = false"
     [ -n "$SHELL_INTEGRATION_FEATURES" ] && \
         echo "shell-integration-features = $SHELL_INTEGRATION_FEATURES"
 }
@@ -938,6 +955,155 @@ write_atomic_file_keep_mode() {
     backup_file "$target"
     mv -f "$tmp" "$target"
     echo "已写入: $target"
+}
+
+# ============================================
+# 用户级 desktop 覆盖：外部启动不复用已有进程
+# ============================================
+# 软件包的 $DESKTOP_FILE 在两个启动入口把 --gtk-single-instance=true 写死在
+# Exec= 里。CLI 参数优先于配置文件，所以只写 gtk-single-instance = false 还
+# 不够：从应用菜单启动仍会复用已有进程，崩溃时一起被带走。
+#
+# 用户级 desktop 用同一个 ID 覆盖：XDG 按 XDG_DATA_HOME → XDG_DATA_DIRS
+# 顺序查找，~/.local/share/applications 先于 /usr/share/applications 命中，
+# 系统文件不动。覆盖内容 = 系统模板逐行继承，只改三处启动语义：
+#   1. [Desktop Entry] Exec= 的 --gtk-single-instance=true → false
+#   2. [Desktop Action new-window] Exec= 同上
+#   3. DBusActivatable=true → false
+# 第 3 条不是可选：DBusActivatable=true 时桌面外壳可以走 D-Bus 激活
+# （系统里确实装着 com.mitchellh.ghostty.service），那条路径根本不会使用
+# Exec= 里的参数，必须显式关掉才能保证入口按 Exec 启动。
+#
+# Ctrl+Alt+T 走本模块写入的包装脚本（exec /usr/bin/ghostty "$@"），没有 CLI
+# 参数，因此读的是配置文件里的 false。实测：配置写 true 时，即使命令行带
+# 参数（detect 本该判为单实例），解析结果仍是 true——显式配置值不参与
+# detect 判断（ghostty +show-config，本机 1.3.1~ppa2-noble1）。
+#
+# 覆盖范围要说清：一个外部启动一个进程、一个进程一个崩溃域；同一进程内的
+# 窗口、tab、split 仍然同生共死。
+
+# 生成用户级覆盖内容：逐行继承系统模板，只改启动语义。
+# 模板结构与预期不符（认不出 /usr/bin/ghostty 的 Exec=，或仍残留
+# --gtk-single-instance=true、DBusActivatable=true）时退出非零，由调用方明确
+# 失败：宁可报错，也不写一个“看起来成功、实际仍复用进程”的覆盖。
+render_desktop_override() {
+    awk '
+        BEGIN { bin = "Exec=/usr/bin/ghostty" }
+        $0 ~ "^" bin "([[:space:]]|$)" {
+            if (match($0, /--gtk-single-instance=[a-z]+/)) {
+                $0 = substr($0, 1, RSTART - 1) "--gtk-single-instance=false" substr($0, RSTART + RLENGTH)
+            } else {
+                $0 = bin " --gtk-single-instance=false" substr($0, length(bin) + 1)
+            }
+            exec_lines++
+        }
+        /^DBusActivatable=/ { $0 = "DBusActivatable=false" }
+        {
+            if ($0 ~ /--gtk-single-instance=true/ || $0 ~ /^DBusActivatable=true$/) leftover = 1
+            print
+        }
+        END {
+            if (leftover || exec_lines == 0) {
+                print "系统 desktop 模板结构不符合预期：认不出 /usr/bin/ghostty 的 Exec=，或仍残留强制复用已有进程的入口" > "/dev/stderr"
+                exit 1
+            }
+        }
+    ' "$DESKTOP_FILE"
+}
+
+# 现有用户级覆盖是否可以被安全替换。只接受三种状态，其余一律当作用户自有
+# 改动拒绝覆盖：
+#   1. 不存在；
+#   2. 与本次基准内容一致（重跑幂等，write_atomic_file_keep_mode 会跳过）；
+#   3. 与系统模板只差这三处启动语义——把 =false 反向还原成模板里的 =true 后
+#      逐字节相同，说明文件里没有任何模块之外的内容（厂商原样副本、旧版模块
+#      输出、手工改成同一结果都落在这一类）。
+desktop_override_replaceable() {
+    if [ ! -e "$USER_DESKTOP_FILE" ] && [ ! -L "$USER_DESKTOP_FILE" ]; then
+        return 0
+    fi
+    [ -f "$USER_DESKTOP_FILE" ] && [ ! -L "$USER_DESKTOP_FILE" ] || return 1
+    [ -f "$DESKTOP_FILE" ] || return 1
+    sed -e 's|--gtk-single-instance=false|--gtk-single-instance=true|' \
+        -e 's|^DBusActivatable=false$|DBusActivatable=true|' \
+        "$USER_DESKTOP_FILE" | cmp -s - "$DESKTOP_FILE"
+}
+
+desktop_override_state() {
+    # 模板问题优先报：--check 要说清“正式安装会不会成功”，而不是只描述现状。
+    if [ ! -f "$DESKTOP_FILE" ]; then
+        printf '系统模板 %s 缺失，无法生成覆盖\n' "$DESKTOP_FILE"
+    elif ! render_desktop_override >/dev/null 2>&1; then
+        printf '系统模板 %s 结构不符合预期（正式安装将拒绝生成覆盖）\n' "$DESKTOP_FILE"
+    elif [ ! -e "$USER_DESKTOP_FILE" ] && [ ! -L "$USER_DESKTOP_FILE" ]; then
+        printf '不存在（正式安装将按系统模板生成）\n'
+    elif [ -L "$USER_DESKTOP_FILE" ]; then
+        printf '符号链接（正式安装将拒绝覆盖）\n'
+    elif [ ! -f "$USER_DESKTOP_FILE" ]; then
+        printf '存在，但不是普通文件（正式安装将拒绝覆盖）\n'
+    elif desktop_override_replaceable; then
+        if render_desktop_override | cmp -s - "$USER_DESKTOP_FILE"; then
+            printf '已是本次基准内容（两个 Exec 入口 --gtk-single-instance=false，DBusActivatable=false）\n'
+        else
+            printf '与系统模板只差这三处启动语义（正式安装将备份并替换）\n'
+        fi
+    else
+        printf '含本模块之外的内容（正式安装将拒绝覆盖）\n'
+    fi
+}
+
+# 原子写法与配置文件一致：同目录临时文件完整生成、内容变化前先备份、mv 替换。
+install_desktop_override() {
+    local tmp
+
+    [ -f "$DESKTOP_FILE" ] || die "系统桌面入口不存在，无法生成独立进程覆盖: $DESKTOP_FILE"
+
+    if [ -L "$USER_DESKTOP_FILE" ]; then
+        die "$USER_DESKTOP_FILE 是符号链接，拒绝覆盖；外部启动仍会复用已有进程"
+    fi
+    if [ -e "$USER_DESKTOP_FILE" ] && [ ! -f "$USER_DESKTOP_FILE" ]; then
+        die "$USER_DESKTOP_FILE 不是普通文件，拒绝覆盖；外部启动仍会复用已有进程"
+    fi
+    if ! desktop_override_replaceable; then
+        die "用户级桌面覆盖含本模块之外的内容，拒绝覆盖: $USER_DESKTOP_FILE
+  只接受三种状态：不存在、与本次基准内容一致、或与系统模板仅差这三处启动语义。
+  先看差异: diff '$USER_DESKTOP_FILE' '$DESKTOP_FILE'
+  确认差异可以丢弃后，移开该文件再重跑: mv '$USER_DESKTOP_FILE' '$USER_DESKTOP_FILE.manual'"
+    fi
+
+    mkdir -p "$USER_DESKTOP_DIR"
+    tmp="$(mktemp "$USER_DESKTOP_FILE.tmp.XXXXXX")"
+    if ! render_desktop_override > "$tmp"; then
+        rm -f "$tmp"
+        die "系统桌面入口结构不符合预期，拒绝生成独立进程覆盖: $DESKTOP_FILE"
+    fi
+    write_atomic_file_keep_mode "$USER_DESKTOP_FILE" "$tmp" 644
+
+    # 桌面数据库只是查找缓存，刷新失败不影响覆盖是否生效，所以不参与成败
+    # 判定；也不是所有环境都装了 update-desktop-database。
+    if command -v update-desktop-database >/dev/null 2>&1; then
+        update-desktop-database "$USER_DESKTOP_DIR" >/dev/null 2>&1 \
+            || warn "update-desktop-database 未成功；桌面入口仍按文件生效"
+    fi
+}
+
+verify_desktop_override() {
+    local expected expected_execs
+
+    [ -f "$USER_DESKTOP_FILE" ] || die "用户级桌面覆盖写入后不存在: $USER_DESKTOP_FILE"
+    expected="$(render_desktop_override)" || die "系统桌面入口结构不符合预期: $DESKTOP_FILE"
+    [ "$(cat "$USER_DESKTOP_FILE")" = "$expected" ] \
+        || die "用户级桌面覆盖回读内容与系统模板生成的基准内容不一致"
+
+    expected_execs="$(grep -Ec '^Exec=/usr/bin/ghostty' "$DESKTOP_FILE")"
+    [ "$(grep -Fc -- '--gtk-single-instance=false' "$USER_DESKTOP_FILE")" -eq "$expected_execs" ] \
+        || die "用户级桌面覆盖没有让每个 ghostty 启动入口都显式关闭 GTK 单实例"
+    ! grep -Fq -- '--gtk-single-instance=true' "$USER_DESKTOP_FILE" \
+        || die "用户级桌面覆盖仍残留 --gtk-single-instance=true"
+    ! grep -Fxq 'DBusActivatable=true' "$USER_DESKTOP_FILE" \
+        || die "用户级桌面覆盖的 DBusActivatable 仍为 true，D-Bus 激活会绕过 Exec= 参数"
+
+    echo "OK: 用户级 desktop 覆盖已就位（$expected_execs 个 Exec 入口均为 --gtk-single-instance=false，DBusActivatable=false）"
 }
 
 # ============================================
@@ -1154,8 +1320,9 @@ smoke_test() {
     # 登录才设置），会把一次正常安装误判成冒烟失败。
     # 这里的 --gtk-single-instance=false 只服务这一次冒烟：让探针进程独立于
     # 用户已经在运行的 Ghostty。没有它，单实例模式下新进程会把请求交给已有
-    # 实例后立即退出，下面的存活判定随即误报“提前退出”。它不改变任何日常
-    # 外部启动的复用行为，不要移除，也不要把它当成模块的启动策略。
+    # 实例后立即退出，下面的存活判定随即误报“提前退出”。模块的日常策略同样
+    # 是独立进程（见 render_config 与 render_desktop_override），但这里的显式
+    # 参数不能挪走：冒烟测试要独立于配置文件是否正确，自己保证探针独立。
     GTK_IM_MODULE=fcitx QT_IM_MODULE=fcitx XMODIFIERS=@im=fcitx \
         "$GHOSTTY_BIN" --gtk-single-instance=false > /dev/null 2>"$log" &
     pid=$!
@@ -1222,29 +1389,33 @@ main() {
         exit 0
     fi
 
-    section "[1/8] 安装最新版 Ghostty"
+    section "[1/9] 安装最新版 Ghostty"
     install_ghostty
 
     # 字体必须先于写配置：render_config 用 font_exists 决定要不要写
     # font-family 行，顺序反了就会把刚装上的字体漏写。
-    section "[2/8] 确保字体可用"
+    section "[2/9] 确保字体可用"
     ensure_fonts
 
     # 必须在 ensure_fonts 之后：规则只为实际存在的字体生成。
-    section "[3/8] 修复中文 locale 下的等宽字体劫持"
+    section "[3/9] 修复中文 locale 下的等宽字体劫持"
     ensure_zh_mono_fontconfig
 
-    section "[4/8] 写入并验证基准配置"
+    section "[4/9] 写入并验证基准配置"
     write_config
     verify_config
 
-    section "[5/8] 配置 SSH 断开后的鼠标状态自愈"
+    section "[5/9] 配置 SSH 断开后的鼠标状态自愈"
     install_ssh_mouse_hook
 
-    section "[6/8] 验证桌面入口与 terminfo"
+    section "[6/9] 验证系统桌面入口与 terminfo"
     verify_system_integration
 
-    section "[7/8] 默认终端（接管 Ctrl+Alt+T）"
+    section "[7/9] 写入并验证独立进程 desktop 覆盖"
+    install_desktop_override
+    verify_desktop_override
+
+    section "[8/9] 默认终端（接管 Ctrl+Alt+T）"
     if [ "$DEFAULT_TERMINAL" = true ]; then
         set_default_terminal
         verify_default_terminal
@@ -1253,7 +1424,7 @@ main() {
         echo "需要 Ghostty 接管时重跑: ./install.sh --default-terminal"
     fi
 
-    section "[8/8] GUI 冒烟测试"
+    section "[9/9] GUI 冒烟测试"
     smoke_test
 
     echo
@@ -1263,6 +1434,7 @@ main() {
     echo
     echo "版本: $(installed_version)"
     echo "配置: $CONFIG_FILE"
+    echo "外部启动: 每个窗口独立进程（$USER_DESKTOP_FILE）"
     if [ "$DEFAULT_TERMINAL" = true ]; then
         echo "Ctrl+Alt+T: 已通过 $TERMINAL_WRAPPER 接管"
     else

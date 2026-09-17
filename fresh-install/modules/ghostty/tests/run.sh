@@ -1,6 +1,7 @@
 #!/bin/bash
-# Ghostty 模块的离线回归测试：只验证配置渲染、zsh hook 的实际行为与
-# 安装器的幂等/保护语义。所有写入均在临时 HOME 中完成。
+# Ghostty 模块的离线回归测试：只验证配置渲染、用户级 desktop 覆盖的生成/幂等/
+# 拒绝语义、zsh hook 的实际行为与安装器的幂等/保护语义。
+# 所有写入均在临时 HOME 中完成，桌面模板用临时 fixture。
 set -euo pipefail
 
 MODULE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -31,6 +32,14 @@ HOME="$WORK/render-home" bash -c '
     render_config > "$2"
 ' _ "$WORK/functions.sh" "$WORK/config.ghostty"
 grep -Fqx 'keybind = ctrl+shift+r=reset' "$WORK/config.ghostty" || fail "缺少 reset keybind"
+grep -Fqx 'gtk-single-instance = false' "$WORK/config.ghostty" || fail "缺少 gtk-single-instance = false"
+grep -Fqx '# 独立外部启动使用独立进程；内部窗口、tab 和 split 仍可能共享进程。' "$WORK/config.ghostty" \
+    || fail "缺少独立进程注释行"
+# 位置：必须紧邻 shell-integration-features 之前（与线上配置文件逐行一致）
+awk '/^gtk-single-instance = false$/ { g = NR }
+     /^shell-integration-features = / { s = NR }
+     END { exit !(g && s && g + 1 == s) }' "$WORK/config.ghostty" \
+    || fail "gtk-single-instance 必须紧邻 shell-integration-features 之前"
 grep -Fqx 'shell-integration-features = ssh-env,ssh-terminfo' "$WORK/config.ghostty" || fail "SSH shell integration 被移除"
 ! grep -Fq 'mouse-reporting' "$WORK/config.ghostty" || fail "不应全局禁用 mouse-reporting"
 if command -v ghostty >/dev/null 2>&1; then
@@ -39,6 +48,164 @@ if command -v ghostty >/dev/null 2>&1; then
     XDG_CONFIG_HOME="$WORK/xdg" HOME="$WORK/render-home" \
         ghostty +validate-config >"$WORK/ghostty-validate.log" 2>&1 \
         || { cat "$WORK/ghostty-validate.log" >&2; fail "Ghostty 配置校验失败"; }
+fi
+
+# ============================================================
+# 用户级 desktop 覆盖：只改三处启动语义，幂等，拒绝覆盖带用户改动的文件
+# ============================================================
+# fixture 构造与系统模板同构的入口：两个 Exec= 带 --gtk-single-instance=true，
+# DBusActivatable=true。全部读写都在临时 HOME + 临时模板上，不碰真实用户目录。
+cat > "$WORK/vendor.desktop" <<'EOF'
+[Desktop Entry]
+Version=1.0
+Name=Ghostty
+Type=Application
+TryExec=/usr/bin/ghostty
+Exec=/usr/bin/ghostty --gtk-single-instance=true
+Icon=com.mitchellh.ghostty
+Categories=System;TerminalEmulator;
+Actions=new-window;
+DBusActivatable=true
+
+[Desktop Action new-window]
+Name=New Window
+Exec=/usr/bin/ghostty --gtk-single-instance=true
+EOF
+
+# 首次写入 + 策略断言 + 幂等重跑 + --check 状态
+HOME="$WORK/desktop-home" bash -c '
+    set -euo pipefail
+    source "$1"
+    DESKTOP_FILE="$2"
+    USER_DESKTOP_DIR="$HOME/.local/share/applications"
+    USER_DESKTOP_FILE="$USER_DESKTOP_DIR/$DESKTOP_ID"
+    install_desktop_override >/dev/null
+    verify_desktop_override >/dev/null
+    test "$(grep -Fc -- "--gtk-single-instance=false" "$USER_DESKTOP_FILE")" -eq 2
+    ! grep -Fq -- "--gtk-single-instance=true" "$USER_DESKTOP_FILE"
+    ! grep -Fq "DBusActivatable=true" "$USER_DESKTOP_FILE"
+    grep -Fqx "DBusActivatable=false" "$USER_DESKTOP_FILE"
+    test "$(wc -l < "$USER_DESKTOP_FILE")" -eq "$(wc -l < "$DESKTOP_FILE")"
+    grep -Fqx "Name=New Window" "$USER_DESKTOP_FILE"
+    digest=$(sha256sum "$USER_DESKTOP_FILE" | cut -d" " -f1)
+    install_desktop_override > "$HOME/rerun.out"
+    grep -Fq "无变化" "$HOME/rerun.out"
+    test "$digest" = "$(sha256sum "$USER_DESKTOP_FILE" | cut -d" " -f1)"
+    ! compgen -G "$USER_DESKTOP_FILE.bak.*" >/dev/null
+    test "$(desktop_override_state)" = "已是本次基准内容（两个 Exec 入口 --gtk-single-instance=false，DBusActivatable=false）"
+' _ "$WORK/functions.sh" "$WORK/vendor.desktop" || fail "desktop 覆盖首次写入/幂等/状态报告失败"
+
+# 厂商原样副本（无用户自有内容）：先备份再替换，并提示状态
+HOME="$WORK/desktop-vendor-copy" bash -c '
+    set -euo pipefail
+    source "$1"
+    DESKTOP_FILE="$2"
+    USER_DESKTOP_DIR="$HOME/.local/share/applications"
+    USER_DESKTOP_FILE="$USER_DESKTOP_DIR/$DESKTOP_ID"
+    mkdir -p "$USER_DESKTOP_DIR"
+    cp "$DESKTOP_FILE" "$USER_DESKTOP_FILE"
+    test "$(desktop_override_state)" = "与系统模板只差这三处启动语义（正式安装将备份并替换）"
+    install_desktop_override >/dev/null
+    verify_desktop_override >/dev/null
+    test "$(grep -Fc -- "--gtk-single-instance=false" "$USER_DESKTOP_FILE")" -eq 2
+    compgen -G "$USER_DESKTOP_FILE.bak.*" >/dev/null
+    cmp "$USER_DESKTOP_FILE.bak."* "$DESKTOP_FILE"
+' _ "$WORK/functions.sh" "$WORK/vendor.desktop" || fail "desktop 覆盖未按预期替换厂商副本并备份"
+
+# 用户改过的文件：明确拒绝，不改字节、不留备份
+HOME="$WORK/desktop-user-file" bash -c '
+    set -euo pipefail
+    source "$1"
+    DESKTOP_FILE="$2"
+    USER_DESKTOP_DIR="$HOME/.local/share/applications"
+    USER_DESKTOP_FILE="$USER_DESKTOP_DIR/$DESKTOP_ID"
+    mkdir -p "$USER_DESKTOP_DIR"
+    render_desktop_override > "$USER_DESKTOP_FILE"
+    printf "X-User-Custom=1\n" >> "$USER_DESKTOP_FILE"
+    digest=$(sha256sum "$USER_DESKTOP_FILE" | cut -d" " -f1)
+    test "$(desktop_override_state)" = "含本模块之外的内容（正式安装将拒绝覆盖）"
+    ( install_desktop_override ) >/dev/null 2>"$HOME/refuse.err" && exit 1
+    grep -Fq "拒绝覆盖" "$HOME/refuse.err"
+    grep -Fq "X-User-Custom=1" "$USER_DESKTOP_FILE"
+    test "$digest" = "$(sha256sum "$USER_DESKTOP_FILE" | cut -d" " -f1)"
+    ! compgen -G "$USER_DESKTOP_FILE.bak.*" >/dev/null
+' _ "$WORK/functions.sh" "$WORK/vendor.desktop" || fail "desktop 覆盖没有拒绝用户自有改动"
+
+# 目录 / 符号链接：拒绝且不破坏
+HOME="$WORK/desktop-hostile" bash -c '
+    set -euo pipefail
+    source "$1"
+    DESKTOP_FILE="$2"
+    USER_DESKTOP_DIR="$HOME/.local/share/applications"
+    USER_DESKTOP_FILE="$USER_DESKTOP_DIR/$DESKTOP_ID"
+    mkdir -p "$USER_DESKTOP_DIR" "$USER_DESKTOP_FILE"
+    ( install_desktop_override ) >/dev/null 2>"$HOME/dir.err" && exit 1
+    grep -Fq "不是普通文件" "$HOME/dir.err"
+    test -d "$USER_DESKTOP_FILE"
+    rmdir "$USER_DESKTOP_FILE"
+    printf "KEEP\n" > "$HOME/real.desktop"
+    ln -s "$HOME/real.desktop" "$USER_DESKTOP_FILE"
+    ( install_desktop_override ) >/dev/null 2>"$HOME/link.err" && exit 1
+    grep -Fq "符号链接" "$HOME/link.err"
+    test -L "$USER_DESKTOP_FILE"
+    test "$(cat "$HOME/real.desktop")" = KEEP
+' _ "$WORK/functions.sh" "$WORK/vendor.desktop" || fail "desktop 覆盖没有拒绝目录/符号链接"
+
+# 模板结构不符合预期：明确失败，不写文件；裸 Exec= 则补上显式标志
+printf "[Desktop Entry]\nName=Ghostty\nExec=/opt/ghostty --gtk-single-instance=true\nDBusActivatable=true\n" \
+    > "$WORK/vendor-unknown.desktop"
+HOME="$WORK/desktop-bad-template" bash -c '
+    set -euo pipefail
+    source "$1"
+    DESKTOP_FILE="$2"
+    USER_DESKTOP_DIR="$HOME/.local/share/applications"
+    USER_DESKTOP_FILE="$USER_DESKTOP_DIR/$DESKTOP_ID"
+    mkdir -p "$HOME"
+    ( install_desktop_override ) >/dev/null 2>"$HOME/bad.err" && exit 1
+    grep -Fq "系统桌面入口结构不符合预期" "$HOME/bad.err"
+    test ! -e "$USER_DESKTOP_FILE"
+    case "$(desktop_override_state)" in *结构不符合预期*) ;; *) exit 1 ;; esac
+' _ "$WORK/functions.sh" "$WORK/vendor-unknown.desktop" || fail "结构异常的模板没有被拒绝"
+
+printf "[Desktop Entry]\nName=Ghostty\nExec=/usr/bin/ghostty\nDBusActivatable=true\n" > "$WORK/vendor-bare.desktop"
+HOME="$WORK/desktop-bare" bash -c '
+    set -euo pipefail
+    source "$1"
+    DESKTOP_FILE="$2"
+    USER_DESKTOP_DIR="$HOME/.local/share/applications"
+    USER_DESKTOP_FILE="$USER_DESKTOP_DIR/$DESKTOP_ID"
+    mkdir -p "$HOME"
+    install_desktop_override >/dev/null
+    grep -Fqx "Exec=/usr/bin/ghostty --gtk-single-instance=false" "$USER_DESKTOP_FILE"
+    grep -Fqx "DBusActivatable=false" "$USER_DESKTOP_FILE"
+' _ "$WORK/functions.sh" "$WORK/vendor-bare.desktop" || fail "裸 Exec= 模板没有被补上显式标志"
+
+# 模板 Exec= 带后续参数时只改标志值，不丢参数
+printf "[Desktop Entry]\nName=Ghostty\nExec=/usr/bin/ghostty --gtk-single-instance=true %%U\nDBusActivatable=true\n" \
+    > "$WORK/vendor-suffix.desktop"
+HOME="$WORK/desktop-suffix" bash -c '
+    set -euo pipefail
+    source "$1"
+    DESKTOP_FILE="$2"
+    USER_DESKTOP_DIR="$HOME/.local/share/applications"
+    USER_DESKTOP_FILE="$USER_DESKTOP_DIR/$DESKTOP_ID"
+    mkdir -p "$HOME"
+    install_desktop_override >/dev/null
+    grep -Fqx "Exec=/usr/bin/ghostty --gtk-single-instance=false %U" "$USER_DESKTOP_FILE"
+' _ "$WORK/functions.sh" "$WORK/vendor-suffix.desktop" || fail "带参数的 Exec= 没有被正确改写"
+
+# 真实系统模板（装了 ghostty 的机器上）：必须能通过生成与策略校验
+if [ -f /usr/share/applications/com.mitchellh.ghostty.desktop ]; then
+    HOME="$WORK/desktop-real-template" bash -c '
+        set -euo pipefail
+        source "$1"
+        DESKTOP_FILE=/usr/share/applications/com.mitchellh.ghostty.desktop
+        USER_DESKTOP_DIR="$HOME/.local/share/applications"
+        USER_DESKTOP_FILE="$USER_DESKTOP_DIR/$DESKTOP_ID"
+        mkdir -p "$HOME"
+        install_desktop_override >/dev/null
+        verify_desktop_override >/dev/null
+    ' _ "$WORK/functions.sh" || fail "真实系统 desktop 模板无法生成独立进程覆盖"
 fi
 
 if command -v zsh >/dev/null 2>&1; then
@@ -204,4 +371,4 @@ mkdir -p "$GHOSTTY_RESOURCES_DIR"
 python3 "$WORK/pty-check.py" "$HOOK_SOURCE" "$GHOSTTY_RESOURCES_DIR" yes
 python3 "$WORK/pty-check.py" "$HOOK_SOURCE" "$GHOSTTY_RESOURCES_DIR" no
 
-echo "PASS: Ghostty SSH mouse cleanup, reset fallback, syntax, idempotency, and isolation"
+echo "PASS: Ghostty SSH mouse cleanup, reset fallback, syntax, idempotency, isolation, and desktop override"
