@@ -13,6 +13,7 @@ interface Token { type: string; text?: string; lang?: string; href?: string; tok
 interface InlineStyle { applyText: (text: string) => string; stylePrefix: string }
 interface MarkdownRuntime {
   theme: MarkdownTheme;
+  invalidate(): void;
   render(width: number): string[];
   renderToken(token: Token, width: number, next?: string, style?: InlineStyle): string[];
   renderInlineTokens(tokens: Token[], style?: InlineStyle): string;
@@ -35,6 +36,8 @@ export interface AdapterOptions {
   notify: (message: string, error?: boolean) => void;
   button: (text: string) => string;
   recoverTmuxRelease?: () => boolean;
+  /** Milliseconds the copied flash stays visible after a successful write. */
+  flashMs?: number;
 }
 
 export function installAdapter(options: AdapterOptions) {
@@ -52,6 +55,44 @@ export function installAdapter(options: AdapterOptions) {
   let enabled = true;
   let warned = false;
   let copyQueue = Promise.resolve();
+  // Press feedback: reverse-video the actionable span while held, and flash the
+  // copy button after a confirmed write. Rendering owns the visual state; input
+  // events only flip these URLs and invalidate the tracked Markdown instances.
+  const tracked = new Set<WeakRef<MarkdownRuntime>>();
+  let pressedUrl: string | undefined;
+  let flashUrl: string | undefined;
+  let flashTimer: ReturnType<typeof setTimeout> | undefined;
+  let lastTui: FullscreenRuntime | undefined;
+  const emphasize = (text: string) => `\x1b[7m${text}\x1b[27m`;
+  // Our own press effect changes the pressed line. Neutralize exactly those two
+  // SGR codes when gesture-checking frames so feedback does not cancel the click.
+  const unpress = (line: string) => line.replaceAll("\x1b[7m", "").replaceAll("\x1b[27m", "");
+  function invalidateTracked(): void {
+    for (const ref of tracked) {
+      const owner = ref.deref();
+      if (owner) owner.invalidate();
+      else tracked.delete(ref);
+    }
+  }
+  function setPressed(url: string | undefined): void {
+    if (pressedUrl === url) return;
+    pressedUrl = url;
+    invalidateTracked();
+    lastTui?.requestRender();
+  }
+  function flash(url: string): void {
+    flashUrl = url;
+    invalidateTracked();
+    lastTui?.requestRender();
+    if (flashTimer) clearTimeout(flashTimer);
+    flashTimer = setTimeout(() => {
+      flashTimer = undefined;
+      if (flashUrl === url) flashUrl = undefined;
+      if (!enabled) return;
+      invalidateTracked();
+      lastTui?.requestRender();
+    }, options.flashMs ?? 450);
+  }
   const isActive = () => enabled && options.active();
   const currentFrame = (owner: MarkdownRuntime) => {
     const frame = frames.at(-1);
@@ -60,6 +101,7 @@ export function installAdapter(options: AdapterOptions) {
 
   function render(this: MarkdownRuntime, width: number): string[] {
     if (!isActive()) return original.render.call(this, width);
+    tracked.add(new WeakRef(this));
     frames.push({ owner: this, used: new Set() });
     try { return original.render.call(this, width); }
     finally { frames.pop(); }
@@ -94,7 +136,8 @@ export function installAdapter(options: AdapterOptions) {
     frame.used.add(index);
     const entry = frame.entries![index]!;
     const label = width >= 6 ? "[复制]" : width >= 4 ? "Copy" : "C";
-    const button = hyperlink(options.button(label), entry.url);
+    const styled = pressedUrl === entry.url || flashUrl === entry.url ? emphasize(options.button(label)) : options.button(label);
+    const button = hyperlink(styled, entry.url);
     const footer = next && next !== "space" ? lines.length - 2 : lines.length - 1;
     if (footer < 0) return lines;
     const border = width >= visibleWidth(label) + 4 ? this.theme.codeBlockBorder("```") : "";
@@ -110,7 +153,8 @@ export function installAdapter(options: AdapterOptions) {
       const href = value.type === "link" && value.href ? webUrl(value.href) : undefined;
       if (!href) return value;
       const text = this.renderInlineTokens(value.tokens ?? [], style);
-      return { type: "html", raw: hyperlink(this.theme.link(this.theme.underline(text)), href) };
+      const styled = this.theme.link(this.theme.underline(text));
+      return { type: "html", raw: hyperlink(pressedUrl === href ? emphasize(styled) : styled, href) };
     });
     return original.inline.call(this, linked, style);
   }
@@ -124,7 +168,7 @@ export function installAdapter(options: AdapterOptions) {
       copyQueue = copyQueue.then(async () => {
         if (!enabled) return;
         await options.copy(entry.text);
-        if (enabled) options.notify("代码已复制");
+        if (enabled) { options.notify("代码已复制"); flash(entry.url); }
       }).catch((error: unknown) => {
         if (enabled) options.notify(`复制失败：${String(error)}`, true);
       });
@@ -139,11 +183,13 @@ export function installAdapter(options: AdapterOptions) {
 
   function input(this: FullscreenRuntime, data: string) {
     if (!isActive()) return original.input.call(this, data);
+    lastTui = this;
     const event = /^\x1b\[<(\d+);(\d+);(\d+)([Mm])$/u.exec(data);
     const pending = presses.get(this);
     if (!event) {
       presses.delete(this);
       releases.delete(this);
+      setPressed(undefined);
       return original.input.call(this, data);
     }
     const bits = Number(event[1]);
@@ -168,17 +214,21 @@ export function installAdapter(options: AdapterOptions) {
       else releases.delete(this);
     };
     if (pending && !wheel) {
-      if (motion || x !== pending.x || y !== pending.y) pending.moved = true;
+      if (motion || x !== pending.x || y !== pending.y) {
+        pending.moved = true;
+        setPressed(undefined); // dragged off: cancel the visual press immediately
+      }
       if (release) {
         presses.delete(this);
-        if (primary && !pending.moved && valid && pending.url === url && pending.line === line &&
+        if (primary && !pending.moved && valid && pending.url === url && unpress(pending.line) === unpress(line) &&
             pending.width === width && pending.height === height) invoke(pending.url);
         if (pending.moved) releases.delete(this);
         else rememberRelease();
+        setPressed(undefined);
       }
       return { consume: true };
     }
-    if (wheel) presses.delete(this);
+    if (wheel) { presses.delete(this); setPressed(undefined); }
     if (motion || wheel || !valid) releases.delete(this);
     const previousRelease = releases.get(this);
     // Tmux 3.4 discards a press *before key lookup* when modifiers change inside
@@ -189,7 +239,7 @@ export function installAdapter(options: AdapterOptions) {
         previousRelease && performance.now() - previousRelease.at <= 500 &&
         (bits & 28) !== (previousRelease.bits & 28) && previousRelease.width === width &&
         previousRelease.height === height && previousRelease.screen.length === this.previousScreen.length &&
-        previousRelease.screen.every((row, index) => row === this.previousScreen[index])) {
+        previousRelease.screen.every((row, index) => unpress(row) === unpress(this.previousScreen[index]!))) {
       invoke(url!);
       rememberRelease();
       return { consume: true };
@@ -199,6 +249,7 @@ export function installAdapter(options: AdapterOptions) {
     if (!wheel && !motion && !release && primary && valid && actionable) {
       releases.delete(this);
       presses.set(this, { url: url!, x, y, line, width, height, moved: false });
+      setPressed(url);
       return { consume: true };
     }
     // Keep native selection, scrolling and component dispatch. Native fullscreen
@@ -218,6 +269,11 @@ export function installAdapter(options: AdapterOptions) {
     transform,
     dispose() {
       enabled = false;
+      if (flashTimer) clearTimeout(flashTimer);
+      flashTimer = undefined;
+      pressedUrl = undefined;
+      flashUrl = undefined;
+      lastTui = undefined;
       store.clear();
       // Another extension may have wrapped us subsequently. Never overwrite it;
       // a retained wrapper is now inert and delegates to its captured predecessor.

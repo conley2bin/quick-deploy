@@ -37,13 +37,13 @@ function target(tui: TuiAltScreen, prefix: string) {
 function click(terminal: FakeTerminal, point: {x: number; y: number}, bits = 0) {
   terminal.input(sgr(point.x, point.y, bits)); terminal.input(sgr(point.x, point.y, bits, 'm'));
 }
-function fixture(source: string, tmuxRecovery = false) {
+function fixture(source: string, tmuxRecovery = false, flashMs?: number) {
   const terminal = new FakeTerminal();
   const copied: string[] = [], opened: string[] = [], nativeOpened: string[] = [], notices: string[] = [];
   let active = true;
   const adapter = installAdapter({ version: VERSION, active: () => active,
     copy: async text => { copied.push(text); }, open: async url => { opened.push(url); },
-    notify: text => { notices.push(text); }, button: text => text, recoverTmuxRelease: () => tmuxRecovery });
+    notify: text => { notices.push(text); }, button: text => text, recoverTmuxRelease: () => tmuxRecovery, flashMs });
   const component = new AssistantMessageComponent(message(source), false, undefined, "Thinking", 1, [adapter.transform]);
   const tui = new TuiAltScreen(terminal, false, undefined, { openUrl: url => nativeOpened.push(url), copySelection: async () => true });
   tui.addChild(component); tui.start(); tui.renderNow();
@@ -181,5 +181,37 @@ test("native partial-fence trimming does not copy guessed or outdated code", asy
     f.component.updateContent(message('```sh\necho x\n```'), false); f.tui.renderNow();
     click(f.terminal, target(f.tui, 'pi-copy://')); await tick();
     assert.deepEqual(f.copied, ['echo x']);
+  } finally { f.close(); }
+});
+
+test("press reverse-highlights the button, release restores, success flashes briefly", async () => {
+  const f = fixture('```sh\necho x\n```', false, 30);
+  try {
+    const p = target(f.tui, 'pi-copy://');
+    f.terminal.input(sgr(p.x, p.y)); f.tui.renderNow();
+    assert.match(screen(f.tui)[p.y]!, /\x1b\[7m/, 'held press shows reverse video');
+    f.terminal.input(sgr(p.x, p.y, 0, 'm')); await tick(); f.tui.renderNow();
+    assert.deepEqual(f.copied, ['echo x']);
+    assert.match(screen(f.tui)[p.y]!, /\x1b\[7m/, 'successful copy keeps a short flash');
+    await new Promise(resolve => setTimeout(resolve, 80));
+    f.tui.renderNow();
+    assert.doesNotMatch(screen(f.tui)[p.y]!, /\x1b\[7m/, 'flash expires');
+  } finally { f.close(); }
+});
+
+test("Ctrl-press highlights the link, release restores it, drag cancels the effect", async () => {
+  const f = fixture('[link](https://example.com/)');
+  try {
+    const p = target(f.tui, 'https:');
+    f.terminal.input(sgr(p.x, p.y, 16)); f.tui.renderNow();
+    assert.match(screen(f.tui)[p.y]!, /\x1b\[7m/, 'held Ctrl press shows reverse video');
+    f.terminal.input(sgr(p.x, p.y, 16, 'm')); await tick(); f.tui.renderNow();
+    assert.deepEqual(f.opened, ['https://example.com/']);
+    assert.doesNotMatch(screen(f.tui)[p.y]!, /\x1b\[7m/, 'release restores the link');
+    f.terminal.input(sgr(p.x, p.y, 16));
+    f.terminal.input(sgr(p.x + 1, p.y, 48)); f.tui.renderNow();
+    assert.doesNotMatch(screen(f.tui)[p.y]!, /\x1b\[7m/, 'drag clears the press effect');
+    f.terminal.input(sgr(p.x, p.y, 16, 'm')); await tick();
+    assert.equal(f.opened.length, 1, 'drag did not open');
   } finally { f.close(); }
 });
