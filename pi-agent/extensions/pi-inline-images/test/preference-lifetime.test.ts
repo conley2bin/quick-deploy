@@ -9,7 +9,8 @@ import { installedPiRoot } from "./pi-root.ts";
 const installed = process.env.PI_TMUX_IMAGES_ROOT ?? resolve(process.env.HOME!, ".pi/agent/npm/node_modules/pi-tmux-images");
 const replay = resolve("patches/pi-tmux-images-0.2.0/replay-stage-c.sh");
 
-test("observed off survives actual compaction and navigateTree for same call, then explicit on restores one custom owner", () => {
+for (const [textCalls, imageCalls] of [[0, 1], [255, 1], [256, 1], [300, 16]]) {
+test(`observed off survives native compaction/navigation with ${imageCalls} images and ${textCalls} text-only calls`, () => {
   const copy = mkdtempSync(resolve(tmpdir(), "pi-preference-lifetime-"));
   try {
     cpSync(installed, copy, { recursive: true }); execFileSync(replay, ["apply", copy], { stdio: "pipe" });
@@ -17,19 +18,27 @@ test("observed off survives actual compaction and navigateTree for same call, th
     symlinkSync(piRoot, resolve(modules, "@earendil-works/pi-coding-agent"), "dir");
     symlinkSync(resolve(piRoot, "node_modules/@earendil-works/pi-tui"), resolve(modules, "@earendil-works/pi-tui"), "dir");
     symlinkSync(resolve(process.env.HOME!, ".pi/agent/npm/node_modules/sharp"), resolve(modules, "sharp"), "dir");
-    const stdout = execFileSync(process.execPath, ["--import", "tsx", resolve("test/preference-lifetime-harness.mjs"), copy, "png"], {
+    const stdout = execFileSync(process.execPath, ["--import", "tsx", resolve("test/preference-lifetime-harness.mjs"), copy, "png", String(textCalls), String(imageCalls)], {
       cwd: resolve("."), encoding: "utf8",
       env: { ...process.env, PI_HOST_ROOT: piRoot, NODE_PATH: `${resolve(piRoot, "node_modules")}:${resolve(process.env.HOME!, ".pi/agent/npm/node_modules")}` },
     });
     const marker = stdout.lastIndexOf("PREFERENCE_JSON "); assert.ok(marker >= 0, stdout);
     const report = JSON.parse(stdout.slice(marker + "PREFERENCE_JSON ".length));
+    assert.deepEqual(report.historyBeforeOff, { toolRows: imageCalls + textCalls, previews: imageCalls });
+    assert.deepEqual([report.rapid.final.images.native, report.rapid.final.images.customGlyphs], [0, 40 * imageCalls], "all images were visible before OFF");
+    assert.equal(report.rawResultsUnchanged, true, "raw tool results remain identical across toggles and reconstruction");
     assert.equal(report.explicitOff.setting, false);
     assert.deepEqual([report.explicitOff.state.images.native, report.explicitOff.state.images.customGlyphs], [0, 0]);
     assert.equal(report.afterCompactionPreference, false);
     assert.deepEqual([report.compacted.after.images.native, report.compacted.after.images.customGlyphs], [0, 0]);
     assert.equal(report.branchAfterOff.setting, false);
     assert.deepEqual([report.branchAfterOff.state.images.native, report.branchAfterOff.state.images.customGlyphs], [0, 0]);
+    assert.ok(report.compacted.frames.every((frame: { native: number; customGlyphs: number }) => frame.native === 0 && frame.customGlyphs === 0), "OFF applies on every reconstruction frame");
+    assert.equal(report.oneOn.setting, false, "a single-row override does not change the host global setting");
+    assert.deepEqual([report.oneOn.state.images.native, report.oneOn.state.images.customGlyphs], [0, 40], "explicit ON affects only one retained image");
+    assert.deepEqual([report.oneOnRebuilt.images.native, report.oneOnRebuilt.images.customGlyphs], [0, 40], "the independent choices survive another reconstruction");
     assert.equal(report.branchAfterOn.setting, true);
-    assert.deepEqual([report.branchAfterOn.state.images.native, report.branchAfterOn.state.images.customGlyphs, report.branchAfterOn.state.images.withheld], [0, 40, false]);
+    assert.deepEqual([report.branchAfterOn.state.images.native, report.branchAfterOn.state.images.customGlyphs, report.branchAfterOn.state.images.withheld], [0, 40 * imageCalls, false]);
   } finally { rmSync(copy, { recursive: true, force: true }); }
 });
+}

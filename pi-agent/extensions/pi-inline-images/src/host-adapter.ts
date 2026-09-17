@@ -53,6 +53,7 @@ type ToolBinding = {
   wrapper: ToolComponent["setShowImages"];
   active: boolean;
   suppressed: boolean;
+  completedWithoutImages: boolean;
   /** Undefined until a result bitmap is observed or public setShowImages is called. */
   externalDesired: boolean | undefined;
 };
@@ -202,6 +203,8 @@ export class HostImageOwnershipAdapter {
   private preferenceRevision = 0;
   private preferenceScope?: string;
   private readonly rememberedPreferences = new Map<string, boolean>();
+  /** At most 16 call IDs, from the same recent claim set used for display ownership. */
+  private readonly retainedImageCalls = new Set<string>();
   private reconstructionHold?: { reason: string; priorTree: string };
 
   constructor(
@@ -256,11 +259,18 @@ export class HostImageOwnershipAdapter {
     if (this.liveAssistant && (assistantCounts.get(this.liveAssistant.fingerprint) ?? 0) > this.liveAssistant.baseline) this.liveAssistant = undefined;
     this.persistedAssistantCounts.clear();
     for (const [fingerprint, count] of assistantCounts) this.persistedAssistantCounts.set(fingerprint, count);
-    const persistedResults = new Set(messages.map(toolCallId).filter((id): id is string => Boolean(id)));
+    const persistedResults = new Set(messages.filter((message) => role(message) === "toolResult").map(toolCallId).filter((id): id is string => Boolean(id)));
     for (const id of persistedResults) this.liveResults.delete(id);
 
     const expected = expectedComponents(messages, this.liveAssistant?.message);
-    this.prunePreferences(new Set(expected.flatMap((item) => item.kind === "tool" ? [item.toolCallId] : [])));
+    const results = resultImages(messages, this.liveResults);
+    const claims = activeClaims(branch);
+    const completedTextCalls = new Set([...persistedResults, ...this.liveResults.keys()].filter((id) => !results.has(id)));
+    this.preparePreferenceRetention(
+      new Set(expected.flatMap((item) => item.kind === "tool" ? [item.toolCallId] : [])),
+      completedTextCalls,
+      claims,
+    );
     const observed = observedComponents(this.tui);
     if (expected.length !== observed.length || expected.some((item, index) => item.kind !== observed[index]?.kind)) {
       return this.fail(`host component sequence mismatch (${expected.length} expected, ${observed.length} observed)`);
@@ -289,13 +299,11 @@ export class HostImageOwnershipAdapter {
       } else if (wanted.kind === "tool" && found.kind === "tool") {
         currentTools.add(found.component);
         toolRows.set(wanted.toolCallId, found.component);
-        this.bindTool(found.component, wanted.toolCallId);
+        this.bindTool(found.component, wanted.toolCallId, completedTextCalls.has(wanted.toolCallId));
       }
     }
     this.releaseDetached(currentAssistants, currentTools);
 
-    const results = resultImages(messages, this.liveResults);
-    const claims = activeClaims(branch);
     const accepted = new Set<string>();
     const nativeProtocol = this.host.nativeImageProtocol?.();
     for (const [id, row] of toolRows) {
@@ -312,7 +320,7 @@ export class HostImageOwnershipAdapter {
       }
       if (complete && binding.externalDesired === undefined && containsNativeBitmap(row.render(Math.max(1, this.tui.terminal.columns)))) {
         binding.externalDesired = true;
-        this.rememberPreference(id, true);
+        this.rememberBindingPreference(binding);
       }
       if (complete && binding.externalDesired === true) {
         this.suppress(row);
@@ -345,6 +353,7 @@ export class HostImageOwnershipAdapter {
     this.liveAssistant = undefined;
     this.persistedAssistantCounts.clear();
     this.rememberedPreferences.clear();
+    this.retainedImageCalls.clear();
     this.preferenceScope = undefined;
     this.reconstructionHold = undefined;
     this.publish({ version: READ_PREVIEW_COORDINATION_VERSION, ready: false, activeLogicalIds: [], reason: "adapter disposed" });
@@ -363,14 +372,25 @@ export class HostImageOwnershipAdapter {
     if (this.preferenceScope === scope) return;
     this.preferenceScope = scope;
     this.rememberedPreferences.clear();
+    this.retainedImageCalls.clear();
     this.preferenceRevision++;
   }
 
-  private prunePreferences(activeCalls: ReadonlySet<string>): void {
+  private preparePreferenceRetention(
+    activeCalls: ReadonlySet<string>,
+    completedTextCalls: ReadonlySet<string>,
+    claims: ReadonlyMap<string, ReadonlyMap<number, string>>,
+  ): void {
+    this.retainedImageCalls.clear();
+    for (const callId of claims.keys()) if (activeCalls.has(callId)) this.retainedImageCalls.add(callId);
     let changed = false;
-    for (const callId of this.rememberedPreferences.keys()) if (!activeCalls.has(callId)) {
-      this.rememberedPreferences.delete(callId);
-      changed = true;
+    for (const callId of this.rememberedPreferences.keys()) {
+      // Image results can precede their custom entry. Keep those choices in the
+      // unpinned FIFO; only a completed result with no images is irrelevant.
+      if (!activeCalls.has(callId) || (completedTextCalls.has(callId) && !this.retainedImageCalls.has(callId))) {
+        this.rememberedPreferences.delete(callId);
+        changed = true;
+      }
     }
     if (changed) this.preferenceRevision++;
   }
@@ -378,11 +398,17 @@ export class HostImageOwnershipAdapter {
   private rememberPreference(callId: string, show: boolean): void {
     this.rememberedPreferences.delete(callId);
     this.rememberedPreferences.set(callId, show);
-    while (this.rememberedPreferences.size > MAX_REMEMBERED_PREFERENCES) {
-      const oldest = this.rememberedPreferences.keys().next().value as string | undefined;
-      if (!oldest) break;
-      this.rememberedPreferences.delete(oldest);
+    // At most 16 entries can be pinned; the remainder is a FIFO for pending/unclaimed images.
+    for (const id of this.rememberedPreferences.keys()) {
+      if (this.rememberedPreferences.size <= MAX_REMEMBERED_PREFERENCES) break;
+      if (!this.retainedImageCalls.has(id)) this.rememberedPreferences.delete(id);
     }
+  }
+
+  private rememberBindingPreference(binding: ToolBinding): void {
+    if (binding.externalDesired === undefined) return;
+    if (!binding.completedWithoutImages || this.retainedImageCalls.has(binding.toolCallId)) this.rememberPreference(binding.toolCallId, binding.externalDesired);
+    else this.rememberedPreferences.delete(binding.toolCallId);
   }
 
   private bindAssistant(component: AssistantComponent, expected: Extract<Expected, { kind: "assistant" }>): void {
@@ -410,8 +436,15 @@ export class HostImageOwnershipAdapter {
     this.assistants.set(component, binding);
   }
 
-  private bindTool(component: ToolComponent, id: string): void {
-    if (this.tools.has(component)) return;
+  private bindTool(component: ToolComponent, id: string, completedWithoutImages: boolean): void {
+    const existing = this.tools.get(component);
+    if (existing) {
+      existing.completedWithoutImages = completedWithoutImages;
+      // Promote a newly claimed image's observed choice, or retire a text result.
+      // Other pending choices keep their explicit-choice FIFO order across renders.
+      if (completedWithoutImages || this.retainedImageCalls.has(id)) this.rememberBindingPreference(existing);
+      return;
+    }
     const original = component.setShowImages;
     const binding: ToolBinding = {
       component,
@@ -420,13 +453,14 @@ export class HostImageOwnershipAdapter {
       wrapper: original,
       active: true,
       suppressed: false,
+      completedWithoutImages,
       externalDesired: this.rememberedPreferences.get(id),
     };
     binding.wrapper = (show) => {
       if (!binding.active) return binding.original.call(component, show);
       const changed = binding.externalDesired !== show;
       binding.externalDesired = show;
-      this.rememberPreference(binding.toolCallId, show);
+      this.rememberBindingPreference(binding);
       binding.original.call(component, binding.suppressed ? false : show);
       if (changed) {
         this.preferenceRevision++;

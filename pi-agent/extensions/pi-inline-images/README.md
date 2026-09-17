@@ -129,10 +129,14 @@ a custom-withheld notice. User attachment previews bypass tool-row arbitration.
 The adapter treats pending native image preference as unknown, observes it only
 from a rendered result or public `setShowImages` call, and transfers authorization
 on external off/on and clear without blindly enabling images. Observed per-call
-choices are retained separately from disposable component bindings (bounded to 256,
-pruned when calls leave the branch, and cleared on session identity change), so
-compaction/tree reconstruction preserves a known choice without leaking call-ID
-reuse into another session. Native protocol capability is separate: when Pi reports `images:null` (ordinary tmux), no native
+choices are retained separately from disposable component bindings (at most 256,
+pruned when calls leave the branch, and cleared on session identity change). The
+at-most-16 current custom image calls are pinned within that budget; completed
+text-only callbacks cannot displace them. Remaining slots form an explicit-choice
+FIFO for pending tools and unclaimed image results, including the interval before
+an asynchronous custom preview arrives. Compaction/tree reconstruction therefore
+preserves a retained image's known choice without leaking call-ID reuse into another
+session. Native protocol capability is separate: when Pi reports `images:null` (ordinary tmux), no native
 bitmap can compete, so the ready custom owner is authorized unless an explicit
 public off choice was observed; the latent host flag is never rewritten. Capability
 changes are part of the reconciliation signature. Assistant component `render` is

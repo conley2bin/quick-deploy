@@ -302,3 +302,119 @@ test("an externally disabled native row is never blindly re-enabled", async () =
   assert.equal(hasNativeImage(readRow), false);
   adapter.dispose();
 });
+
+// Inspect only this extension's bookkeeping to prove the hard budget, never host-private fields.
+function preferenceState(adapter: HostImageOwnershipAdapter) {
+  return adapter as unknown as {
+    rememberedPreferences: Map<string, boolean>;
+    retainedImageCalls: Set<string>;
+  };
+}
+
+for (const delivery of ["persisted", "live"] as const) {
+  test(`pending OFF survives ${delivery} image result before a custom claim and component reconstruction`, async () => {
+    const host = await hostComponents(); host.setNativeProtocol(null);
+    const message = assistantMessage("pending-gap", [{ id: "pending-image", name: "read" }]);
+    const result = toolResult("result", "pending-image");
+    const initial = [messageEntry("assistant", message)];
+    const row = host.tool("read", "pending-image");
+    const children: object[] = [host.assistant(message), row];
+    const { adapter, events } = adapterFixture(children, () => null);
+    assert.equal(adapter.reconcile(initial, initial), true);
+    row.setShowImages(false);
+    row.updateResult(result.message);
+    const completed = [...initial, result];
+    if (delivery === "live") adapter.observeMessage("end", result.message);
+    const delivered = delivery === "live" ? initial : completed;
+    assert.equal(adapter.reconcile(delivered, delivered), true);
+
+    // A temporary public-tree mismatch drops component bindings during that gap.
+    children.push(host.tool("read", "unmapped"));
+    assert.equal(adapter.reconcile(delivered, delivered), false);
+    const rebuilt = host.tool("read", "pending-image"); rebuilt.updateResult(result.message);
+    children.splice(0, children.length, host.assistant(message), rebuilt);
+    assert.equal(adapter.reconcile(completed, completed), true);
+    adapter.suspend("result-only reconstruction");
+    const next = host.tool("read", "pending-image"); next.updateResult(result.message);
+    children.splice(0, children.length, host.assistant(message), next);
+    const claimed = [...completed, preview("pending-preview", "pending-image")];
+    assert.equal(adapter.reconcile(claimed, claimed), true);
+    assert.deepEqual(events.at(-1)?.activeLogicalIds, [], "native-null fallback still respects the pending OFF after the claim arrives");
+    next.setShowImages(true);
+    assert.equal(adapter.reconcile(claimed, claimed), true);
+    assert.deepEqual(events.at(-1)?.activeLogicalIds, ["pending-preview"]);
+    adapter.dispose(); host.setNativeProtocol("kitty");
+  });
+}
+
+test("sixteen retained image choices are pinned within a 256-choice FIFO under text and pending pressure", async () => {
+  const host = await hostComponents(); host.setNativeProtocol(null);
+  const images = Array.from({ length: 16 }, (_, i) => `image-${i}`);
+  const pending = Array.from({ length: 300 }, (_, i) => `pending-${i}`);
+  const texts = Array.from({ length: 300 }, (_, i) => `text-${i}`);
+  const ids = [...images, ...pending, ...texts];
+  const message = assistantMessage("pressure", ids.map((id) => ({ id, name: "read" })));
+  const results = [
+    ...images.map((id) => toolResult(`result-${id}`, id)),
+    ...texts.map((id) => messageEntry(`result-${id}`, { role: "toolResult", toolCallId: id, toolName: "read", content: [{ type: "text", text: "text-only" }], isError: false, timestamp: 0 })),
+  ];
+  const entries = [messageEntry("assistant", message), ...results, ...images.map((id) => preview(`preview-${id}`, id))];
+  const rows = new Map(ids.map((id) => [id, host.tool("read", id)]));
+  for (const entry of results) {
+    const result = entry.message as { toolCallId: string };
+    rows.get(result.toolCallId)!.updateResult(result);
+  }
+  const children: object[] = [host.assistant(message), ...rows.values()];
+  const { adapter, events } = adapterFixture(children, () => null);
+  assert.equal(adapter.reconcile(entries, entries, "pressure-session"), true);
+  for (const row of rows.values()) row.setShowImages(false);
+  const state = preferenceState(adapter);
+  assert.equal(state.retainedImageCalls.size, 16);
+  assert.equal(state.rememberedPreferences.size, 256);
+  for (const id of images) assert.equal(state.rememberedPreferences.get(id), false);
+  assert.deepEqual([...state.rememberedPreferences.keys()].filter((id) => id.startsWith("pending-")), pending.slice(60), "unpinned choices use the remaining 240 FIFO slots");
+  assert.ok(texts.every((id) => !state.rememberedPreferences.has(id)), "completed text-only callbacks are never admitted");
+
+  rows.get("pending-0")!.setShowImages(true);
+  assert.equal(adapter.reconcile(entries, entries, "pressure-session"), true);
+  assert.deepEqual([...state.rememberedPreferences.keys()].filter((id) => id.startsWith("pending-")), [...pending.slice(61), "pending-0"], "reconciliation cannot reorder explicit pending choices or resurrect evicted entries");
+  assert.equal(state.rememberedPreferences.size, 256);
+  assert.deepEqual(events.at(-1)?.activeLogicalIds, []);
+
+  adapter.suspend("compaction");
+  const rebuilt = new Map(ids.map((id) => [id, host.tool("read", id)]));
+  for (const entry of results) {
+    const result = entry.message as { toolCallId: string }; rebuilt.get(result.toolCallId)!.updateResult(result);
+  }
+  children.splice(0, children.length, host.assistant(message), ...rebuilt.values());
+  assert.equal(adapter.reconcile(entries, entries, "pressure-session"), true);
+  assert.deepEqual(events.at(-1)?.activeLogicalIds, []);
+  rebuilt.get("image-0")!.setShowImages(true);
+  assert.equal(adapter.reconcile(entries, entries, "pressure-session"), true);
+  assert.deepEqual(events.at(-1)?.activeLogicalIds, ["preview-image-0"]);
+
+  // Pending calls that complete with text release their FIFO slots.
+  const textCompletions = pending.map((id) => messageEntry(`result-${id}`, { role: "toolResult", toolCallId: id, content: [{ type: "text", text: "done" }] }));
+  const finished = [...entries, ...textCompletions];
+  assert.equal(adapter.reconcile(finished, finished, "pressure-session"), true);
+  assert.equal(state.rememberedPreferences.size, 16);
+  // Branch removal prunes both choices and pins. Reusing IDs cannot recover the old OFF.
+  children.length = 0;
+  assert.equal(adapter.reconcile([], [], "pressure-session"), true);
+  assert.equal(state.rememberedPreferences.size, 0); assert.equal(state.retainedImageCalls.size, 0);
+  children.push(host.assistant(message), ...rows.values());
+  assert.equal(adapter.reconcile(entries, entries, "pressure-session"), true);
+  assert.equal(events.at(-1)?.activeLogicalIds.length, 16);
+  for (const row of rows.values()) row.setShowImages(false);
+  adapter.suspend("session switch");
+  children.splice(0, children.length, host.assistant(message), ...rebuilt.values());
+  assert.equal(adapter.reconcile(entries, entries, "another-session"), true);
+  assert.equal(state.rememberedPreferences.size, 0);
+  assert.equal(events.at(-1)?.activeLogicalIds.length, 16);
+  for (const row of rebuilt.values()) row.setShowImages(false);
+  adapter.dispose();
+  assert.equal(state.rememberedPreferences.size, 0); assert.equal(state.retainedImageCalls.size, 0);
+  rebuilt.get("image-0")!.setShowImages(false);
+  assert.equal(state.rememberedPreferences.size, 0, "disposed public wrappers cannot revive old choices");
+  host.setNativeProtocol("kitty");
+});

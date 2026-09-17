@@ -62,11 +62,12 @@ await runner.emit({type:'session_start',reason:'startup'});paint();await settle(
 
 const sharp=(await imp(base+'/node_modules/sharp/dist/index.cjs')).default;
 const formats=process.argv[3]?[process.argv[3]]:['png'];
+const textCalls=Number(process.argv[4]??0);const imageCalls=Number(process.argv[5]??1);
 const history=[];
-for(const format of formats){
+for(const [imageIndex,format] of Array.from({length:imageCalls},()=>formats).flat().entries()){
  const mime='image/'+format;
  const bytes=await sharp({create:{width:100,height:80,channels:4,background:{r:123,g:42,b:200,alpha:0.7}}}).toFormat(format).toBuffer();
- const name='rapid-'+format;const call=assistant([name]);
+ const name='rapid-'+format+(imageIndex?'-'+imageIndex:'');const call=assistant([name]);
  await event({type:'message_start',message:assistant()});
  await event({type:'message_update',message:call,assistantMessageEvent:{type:'toolcall_end',contentIndex:0,toolCall:call.content[0],partial:call}});
  await event({type:'message_end',message:call});
@@ -84,6 +85,15 @@ for(let i=0;i<3;i++){
  await event({type:'message_end',message:assistant([],text)});
 }await settle();
 report.rapid={history,final:snapshot(),frames};
+// Pi's image-setting callback visits every historical tool row in transcript order.
+// Completed text-only reads must not evict the choices of the retained image calls.
+for(let i=0;i<textCalls;i++){
+ const id='text-read-'+i;sessionManager.appendMessage(assistant([id]));
+ sessionManager.appendMessage({role:'toolResult',toolCallId:id,toolName:'read',content:[{type:'text',text:'ordinary text file '+i}],isError:false,timestamp:0});
+}
+mode.rebuildChatFromMessages();await runner.emit({type:'session_tree'});await settle();
+report.historyBeforeOff={toolRows:mode.chatContainer.children.filter(r=>r instanceof ToolExecutionComponent).length,previews:sessionManager.getBranch().filter(e=>e.type==='custom'&&e.customType==='pi-tmux-images.preview').length};
+const originalResults=JSON.stringify(sessionManager.getBranch().filter(e=>e.type==='message'&&e.message.role==='toolResult'));
 settingsManager.setShowImages(false);for(const row of mode.chatContainer.children)if(row instanceof ToolExecutionComponent)row.setShowImages(false);await settle();report.explicitOff={setting:settingsManager.getShowImages(),state:snapshot()};
 const beforeCompaction=snapshot();const firstCompactionFrame=frames.length;
 const firstKept=sessionManager.buildContextEntries().find(e=>e.type==='message' && e.message.role==='assistant' && e.message.content.some(c=>c.type==='toolCall' && c.id==='rapid-png'));
@@ -95,8 +105,13 @@ await mode.handleEvent({type:'compaction_end',reason:'manual',result:{summary:'F
 report.afterCompactionPreference=settingsManager.getShowImages();
 // Reassert off, then navigate to the retained tool result through actual native branch handling.
 for(const row of mode.chatContainer.children)if(row instanceof ToolExecutionComponent)row.setShowImages(false);await settle();
-const resultEntry=sessionManager.getBranch().find(e=>e.type==='message' && e.message.role==='toolResult');
+const resultEntry=sessionManager.getBranch().findLast(e=>e.type==='message' && e.message.role==='toolResult' && e.message.content.some(c=>c.type==='image'));
 await session.navigateTree(resultEntry.id);mode.rebuildChatFromMessages();await settle();report.branchAfterOff={setting:settingsManager.getShowImages(),state:snapshot()};
+// Turn on one retained image only: other calls must keep their own OFF choice.
+mode.chatContainer.children.find(row=>row instanceof ToolExecutionComponent).setShowImages(true);await settle();
+report.oneOn={setting:settingsManager.getShowImages(),state:snapshot()};
+await session.navigateTree(resultEntry.id);mode.rebuildChatFromMessages();await settle();report.oneOnRebuilt=snapshot();
 settingsManager.setShowImages(true);for(const row of mode.chatContainer.children)if(row instanceof ToolExecutionComponent)row.setShowImages(true);await settle();report.branchAfterOn={setting:settingsManager.getShowImages(),state:snapshot()};
+report.rawResultsUnchanged=originalResults===JSON.stringify(sessionManager.getTree().flatMap(function visit(node){return [node.entry,...node.children.flatMap(visit)];}).filter(e=>e.type==='message'&&e.message.role==='toolResult'));
 await runner.emit({type:'session_shutdown'});await settle();
 console.log('PREFERENCE_JSON '+JSON.stringify(report));
