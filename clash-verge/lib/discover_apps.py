@@ -63,6 +63,9 @@ SPECS: dict[str, AppSpec] = {
         ("spark-store",), (("main", "bin/spark-store", True),), 2,
     ),
 }
+GENERIC_RUNTIME_BASENAMES = {
+    "aria2c", "bash", "dash", "node", "nodejs", "python", "python3", "sh", "wine", "wineserver",
+}
 
 
 @dataclass(frozen=True)
@@ -253,6 +256,9 @@ def resolve_app(
     invalid_reasons: list[str] = []
     for root in sorted(roots):
         role_paths = roots[root]
+        manifest_paths = {
+            path for package in spec.packages for path in evidence.package_files.get(package, ())
+        }
         discovered: list[DiscoveredExecutable] = []
         failure: str | None = None
         for role, _relative, required in spec.programs:
@@ -270,6 +276,12 @@ def resolve_app(
                     continue
                 if not identity.elf:
                     failure = f"{root}: {role} is a wrapper or non-native executable"
+                    continue
+                if resolved not in manifest_paths:
+                    failure = f"{root}: {role} target lacks package-manifest identity evidence"
+                    continue
+                if Path(resolved).name in GENERIC_RUNTIME_BASENAMES:
+                    failure = f"{root}: {role} resolves to a shared runtime"
                     continue
                 if not (resolved == root or resolved.startswith(root + "/")):
                     failure = f"{root}: {role} resolves outside its package installation"
@@ -303,7 +315,10 @@ def resolve_app(
         reason = "; ".join(sorted(set(invalid_reasons))) or "no complete native installation"
         unsupported = any(
             marker in reason
-            for marker in ("wrapper or non-native", "resolves outside", "cannot be represented")
+            for marker in (
+                "wrapper or non-native", "resolves outside", "cannot be represented",
+                "target lacks package-manifest", "shared runtime",
+            )
         )
         return DiscoveryResult(
             spec.app_id, spec.name, "unsupported" if unsupported else "missing", (),

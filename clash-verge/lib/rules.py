@@ -76,6 +76,17 @@ def safe_file(value: Any, context: str) -> str:
     return value
 
 
+def valid_rule_field(value: str) -> bool:
+    return bool(value) and value == value.strip() and "," not in value and not any(
+        ord(character) < 32 or ord(character) == 127 for character in value
+    )
+
+
+def require_policy_target(path: Path, line: int, target: str) -> None:
+    if not valid_rule_field(target):
+        fail(path, line, "policy target must be a literal non-empty field without commas or control characters")
+
+
 def valid_domain(value: str) -> bool:
     return bool(DOMAIN_RE.fullmatch(value.rstrip(".")))
 
@@ -122,6 +133,7 @@ def parse_rule(path: Path, line: int, text: str, source: Path, phase: str) -> Ru
         if len(parts) != 3:
             fail(path, line, f"{rule_type} requires one payload and one policy target")
         payload, target = parts[1], parts[2]
+        require_policy_target(path, line, target)
         if rule_type == "PROCESS-NAME" and not PROCESS_NAME_RE.fullmatch(payload):
             fail(path, line, "PROCESS-NAME must be one literal executable basename without path, whitespace, or wildcards")
         if rule_type == "PROCESS-PATH":
@@ -132,6 +144,7 @@ def parse_rule(path: Path, line: int, text: str, source: Path, phase: str) -> Ru
     if len(parts) != 3 + option_count:
         fail(path, line, f"{rule_type} requires one payload, one policy target, and optional final no-resolve")
     payload, target = parts[1], parts[2]
+    require_policy_target(path, line, target)
     if rule_type in {"DOMAIN", "DOMAIN-SUFFIX"} and not valid_domain(payload):
         fail(path, line, f"{rule_type} payload must be a domain name")
     if rule_type == "DOMAIN-KEYWORD" and not KEYWORD_RE.fullmatch(payload):
@@ -167,6 +180,8 @@ def parse_app_entry(
     if not isinstance(app_node, yaml.nodes.ScalarNode) or app_node.tag != "tag:yaml.org,2002:str":
         fail(path, app_node.start_mark.line + 1, "app must be a canonical app ID string")
     app_id = app_node.value
+    if not valid_rule_field(app_id):
+        fail(path, app_node.start_mark.line + 1, "app must be a literal canonical ID without commas or control characters")
     if app_id not in discover_apps.SPECS:
         fail(path, app_node.start_mark.line + 1,
              f"unsupported app {app_id!r}; supported: {', '.join(discover_apps.supported_ids())}")
@@ -176,8 +191,9 @@ def parse_app_entry(
         target_node = fields["target"]
         if not isinstance(target_node, yaml.nodes.ScalarNode) or target_node.tag != "tag:yaml.org,2002:str":
             fail(path, target_node.start_mark.line + 1, "proxy app target must be a non-empty proxy group name")
-        target = target_node.value.strip()
-        if not target or target != target_node.value or target.upper() in RESERVED_POLICIES:
+        target = target_node.value
+        require_policy_target(path, target_node.start_mark.line + 1, target)
+        if target.upper() in RESERVED_POLICIES:
             fail(path, target_node.start_mark.line + 1,
                  "proxy app target must name a subscription proxy group, not a built-in policy")
     text = f"APP,{app_id},{target}"
@@ -287,10 +303,7 @@ def resolve_app_rules(
                      f"app {result.app_id!r} cannot resolve PROCESS-PATH rules ({result.status}){detail}")
             for executable in result.executables:
                 text = f"PROCESS-PATH,{executable.path},{rule.target}"
-                expanded[phase].append(Rule(
-                    text, text, ("PROCESS-PATH", executable.path), rule.target,
-                    rule.source, rule.line, rule.phase,
-                ))
+                expanded[phase].append(parse_rule(rule.source, rule.line, text, rule.source, rule.phase))
     validate(expanded)
     return expanded
 
@@ -644,6 +657,28 @@ def check_yaml(path: Path) -> None:
         raise SourceError(f"{path}: invalid YAML: {error}") from error
 
 
+def snapshot_rules(rules: dict[str, list[Rule]]) -> str:
+    return json.dumps({phase: [rule.text for rule in rules[phase]] for phase in ("pre", "post")})
+
+
+def load_snapshot_rules(path: Path) -> dict[str, list[Rule]]:
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as error:
+        raise SourceError(f"{path}: invalid prepared rule snapshot: {error}") from error
+    if not isinstance(document, dict) or set(document) != {"pre", "post"}:
+        raise SourceError(f"{path}: prepared rule snapshot must contain pre and post lists")
+    restored: dict[str, list[Rule]] = {"pre": [], "post": []}
+    for phase in ("pre", "post"):
+        entries = document[phase]
+        if not isinstance(entries, list) or not all(isinstance(entry, str) for entry in entries):
+            raise SourceError(f"{path}: prepared {phase} rules must be strings")
+        for line, text in enumerate(entries, start=1):
+            restored[phase].append(parse_rule(path, line, text, path, phase))
+    validate(restored)
+    return restored
+
+
 def parsed_sources(direct: Path, proxy: Path) -> dict[str, list[Rule]]:
     direct_rules, proxy_rules = load_source(direct, "DIRECT"), load_source(proxy, "PROXY")
     rules = {phase: direct_rules[phase] + proxy_rules[phase] for phase in ("pre", "post")}
@@ -660,15 +695,19 @@ def main() -> int:
     parser.add_argument("--policy-target", default="DIRECT")
     parser.add_argument("--connection-host", default="litellm.dex-gem.ai")
     parser.add_argument("--connection-address")
+    parser.add_argument("--prepared-script", type=Path)
+    parser.add_argument("--prepared-rules", type=Path)
     actions = parser.add_mutually_exclusive_group(required=True)
     actions.add_argument("--check", action="store_true")
     actions.add_argument("--render", action="store_true")
+    actions.add_argument("--prepare", action="store_true")
     actions.add_argument("--migration-check", action="store_true")
     actions.add_argument(
         "--registry-query",
         choices=("merge-target", "script-target", "current-name", "current-file", "current-option", "remote-merge-targets"),
     )
     actions.add_argument("--verify-runtime", action="store_true")
+    actions.add_argument("--verify-prepared", type=Path)
     actions.add_argument("--policy-host")
     actions.add_argument("--yaml-check", type=Path)
     actions.add_argument("--sniffer-enabled", action="store_true")
@@ -699,10 +738,21 @@ def main() -> int:
             if result is not None:
                 print(result)
             return 0
+        if args.verify_prepared:
+            return 0 if verify_runtime_rules(load_snapshot_rules(args.verify_prepared), sys.stdin) else 1
         if not args.direct or not args.proxy:
             parser.error("source actions require --direct and --proxy")
         rules = parsed_sources(args.direct, args.proxy)
-        if args.migration_check:
+        if args.prepare:
+            if not args.registry:
+                parser.error("--prepare requires --registry")
+            if not args.prepared_script or not args.prepared_rules:
+                parser.error("--prepare requires --prepared-script and --prepared-rules")
+            resolved = resolve_app_rules(rules)
+            migration_check(args.registry, resolved)
+            args.prepared_script.write_text(render(resolved), encoding="utf-8")
+            args.prepared_rules.write_text(snapshot_rules(resolved), encoding="utf-8")
+        elif args.migration_check:
             if not args.registry:
                 parser.error("--migration-check requires --registry")
             migration_check(args.registry, rules)

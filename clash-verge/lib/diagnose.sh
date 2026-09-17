@@ -30,10 +30,11 @@ verify_route_rules() {
         return 1
     fi
 
-    if ! printf '%s' "$rules_json" | python3 "$RULES_READER" \
-        --direct "$RULES_DIR/direct.yaml" \
-        --proxy "$RULES_DIR/proxy.yaml" \
-        --verify-runtime; then
+    local verify_args=(--direct "$RULES_DIR/direct.yaml" --proxy "$RULES_DIR/proxy.yaml" --verify-runtime)
+    if [ -n "${PREPARED_ROUTE_RULES:-}" ]; then
+        verify_args=(--verify-prepared "$PREPARED_ROUTE_RULES")
+    fi
+    if ! printf '%s' "$rules_json" | python3 "$RULES_READER" "${verify_args[@]}"; then
         echo "fail 活跃规则与来源定义的 pre/post 语义不一致。"
         return 1
     fi

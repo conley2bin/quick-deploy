@@ -82,11 +82,11 @@ class DiscoveryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             temp = Path(temporary)
             root = temp / "wechat"
-            real = elf(root / "current" / "wechat")
+            real = elf(root / "current" / "wechat-real")
             launcher = root / "wechat"
             launcher.parent.mkdir(parents=True, exist_ok=True)
             launcher.symlink_to(real)
-            result = self.resolve("wechat", {"wechat": [str(launcher)]})
+            result = self.resolve("wechat", {"wechat": [str(launcher), str(real)]})
             self.assertEqual(result.status, "resolved")
             self.assertEqual(result.executables[0].path, str(real))
 
@@ -106,7 +106,15 @@ class DiscoveryTests(unittest.TestCase):
             shared_launcher.symlink_to(shared)
             result = self.resolve("wemeet", {"wemeet": [str(shared_launcher)]})
             self.assertEqual(result.status, "unsupported")
-            self.assertIn("resolves outside", result.reason or "")
+            self.assertIn("target lacks package-manifest", result.reason or "")
+
+            in_root = temp / "usr"
+            runtime = elf(in_root / "bin" / "node")
+            app_link = in_root / "bin" / "wemeetapp"
+            app_link.symlink_to(runtime)
+            result = self.resolve("wemeet", {"wemeet": [str(app_link), str(runtime)]})
+            self.assertEqual(result.status, "unsupported")
+            self.assertIn("shared runtime", result.reason or "")
 
     def test_missing_or_nonexecutable_required_helper_blocks_baidu(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
