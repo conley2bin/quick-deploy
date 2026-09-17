@@ -645,10 +645,10 @@ test("installer is executable, idempotent, exact-link skip, and preserves foreig
   const d = temp(), source = join(d, "source"), home = join(d, "home");
   mkdirSync(source, { recursive: true });
   writeFileSync(join(source, "index.ts"), "");
-  const installer = join(ROOT, "fresh-install/modules/tmux/install-pi-tmux-window-status.sh"), env = { ...process.env, QUICK_DEPLOY_PI_TMUX_WINDOW_STATUS_SOURCE: source, QUICK_DEPLOY_PI_HOME: join(home, ".pi", "agent") };
+  const installer = join(ROOT, "pi-agent/extensions/pi-tmux-window-status/install.sh"), env = { ...process.env, PI_TMUX_WINDOW_STATUS_SOURCE: source, PI_CODING_AGENT_DIR: join(home, ".pi", "agent") };
   assert.equal(spawnSync("bash", [installer], { env }).status, 0);
   assert.equal(spawnSync("bash", [installer], { env }).status, 0);
-  const target = join(env.QUICK_DEPLOY_PI_HOME, "extensions", "pi-tmux-window-status");
+  const target = join(env.PI_CODING_AGENT_DIR, "extensions", "pi-tmux-window-status");
   assert.equal(readlinkSync(target), source, "second run leaves the exact managed link in place");
   rmSync(target);
   mkdirSync(target);
@@ -661,9 +661,9 @@ test("installer migrates a known legacy managed old link to the new managed link
   const d = temp(), source = join(d, "source"), home = join(d, "home");
   mkdirSync(source, { recursive: true });
   writeFileSync(join(source, "index.ts"), "");
-  const env = { ...process.env, QUICK_DEPLOY_PI_TMUX_WINDOW_STATUS_SOURCE: source, QUICK_DEPLOY_PI_HOME: join(home, ".pi", "agent") };
-  const installer = join(ROOT, "fresh-install/modules/tmux/install-pi-tmux-window-status.sh");
-  const extensions = join(env.QUICK_DEPLOY_PI_HOME, "extensions"), legacy = join(extensions, "quick-deploy-tmux-status"), target = join(extensions, "pi-tmux-window-status");
+  const env = { ...process.env, PI_TMUX_WINDOW_STATUS_SOURCE: source, PI_CODING_AGENT_DIR: join(home, ".pi", "agent") };
+  const installer = join(ROOT, "pi-agent/extensions/pi-tmux-window-status/install.sh");
+  const extensions = join(env.PI_CODING_AGENT_DIR, "extensions"), legacy = join(extensions, "quick-deploy-tmux-status"), target = join(extensions, "pi-tmux-window-status");
   const oldCheckout = join(d, "old-checkout", "pi-agent", "extensions", "quick-deploy-tmux-status");
   mkdirSync(oldCheckout, { recursive: true });
   mkdirSync(extensions, { recursive: true });
@@ -680,23 +680,23 @@ test("installer refuses a foreign legacy path without mutation", () => {
   const d = temp(), source = join(d, "source"), home = join(d, "home");
   mkdirSync(source, { recursive: true });
   writeFileSync(join(source, "index.ts"), "");
-  const env = { ...process.env, QUICK_DEPLOY_PI_TMUX_WINDOW_STATUS_SOURCE: source, QUICK_DEPLOY_PI_HOME: join(home, ".pi", "agent") };
-  const installer = join(ROOT, "fresh-install/modules/tmux/install-pi-tmux-window-status.sh");
-  const legacy = join(env.QUICK_DEPLOY_PI_HOME, "extensions", "quick-deploy-tmux-status");
+  const env = { ...process.env, PI_TMUX_WINDOW_STATUS_SOURCE: source, PI_CODING_AGENT_DIR: join(home, ".pi", "agent") };
+  const installer = join(ROOT, "pi-agent/extensions/pi-tmux-window-status/install.sh");
+  const legacy = join(env.PI_CODING_AGENT_DIR, "extensions", "quick-deploy-tmux-status");
   mkdirSync(legacy, { recursive: true });
   writeFileSync(join(legacy, "keep"), "yes");
   assert.notEqual(spawnSync("bash", [installer], { env }).status, 0, "foreign legacy path fails");
   assert.equal(readFileSync(join(legacy, "keep"), "utf8"), "yes", "foreign legacy content untouched");
-  assert.equal(existsSync(join(env.QUICK_DEPLOY_PI_HOME, "extensions", "pi-tmux-window-status")), false, "no new link is created on foreign conflict");
+  assert.equal(existsSync(join(env.PI_CODING_AGENT_DIR, "extensions", "pi-tmux-window-status")), false, "no new link is created on foreign conflict");
 });
 
 test("installer fails without mutation when both old and new exist and one side is foreign", () => {
   const d = temp(), source = join(d, "source"), home = join(d, "home");
   mkdirSync(source, { recursive: true });
   writeFileSync(join(source, "index.ts"), "");
-  const env = { ...process.env, QUICK_DEPLOY_PI_TMUX_WINDOW_STATUS_SOURCE: source, QUICK_DEPLOY_PI_HOME: join(home, ".pi", "agent") };
-  const installer = join(ROOT, "fresh-install/modules/tmux/install-pi-tmux-window-status.sh");
-  const extensions = join(env.QUICK_DEPLOY_PI_HOME, "extensions"), legacy = join(extensions, "quick-deploy-tmux-status"), target = join(extensions, "pi-tmux-window-status");
+  const env = { ...process.env, PI_TMUX_WINDOW_STATUS_SOURCE: source, PI_CODING_AGENT_DIR: join(home, ".pi", "agent") };
+  const installer = join(ROOT, "pi-agent/extensions/pi-tmux-window-status/install.sh");
+  const extensions = join(env.PI_CODING_AGENT_DIR, "extensions"), legacy = join(extensions, "quick-deploy-tmux-status"), target = join(extensions, "pi-tmux-window-status");
   mkdirSync(extensions, { recursive: true });
   symlinkSync(source, target);
   mkdirSync(legacy, { recursive: true });
@@ -710,9 +710,9 @@ test("installer proceeds when both old and new are known managed links", () => {
   const d = temp(), source = join(d, "source"), home = join(d, "home");
   mkdirSync(source, { recursive: true });
   writeFileSync(join(source, "index.ts"), "");
-  const env = { ...process.env, QUICK_DEPLOY_PI_TMUX_WINDOW_STATUS_SOURCE: source, QUICK_DEPLOY_PI_HOME: join(home, ".pi", "agent") };
-  const installer = join(ROOT, "fresh-install/modules/tmux/install-pi-tmux-window-status.sh");
-  const extensions = join(env.QUICK_DEPLOY_PI_HOME, "extensions"), legacy = join(extensions, "quick-deploy-tmux-status"), target = join(extensions, "pi-tmux-window-status");
+  const env = { ...process.env, PI_TMUX_WINDOW_STATUS_SOURCE: source, PI_CODING_AGENT_DIR: join(home, ".pi", "agent") };
+  const installer = join(ROOT, "pi-agent/extensions/pi-tmux-window-status/install.sh");
+  const extensions = join(env.PI_CODING_AGENT_DIR, "extensions"), legacy = join(extensions, "quick-deploy-tmux-status"), target = join(extensions, "pi-tmux-window-status");
   const oldCheckout = join(d, "old-checkout", "pi-agent", "extensions", "quick-deploy-tmux-status");
   mkdirSync(oldCheckout, { recursive: true });
   mkdirSync(extensions, { recursive: true });
@@ -731,9 +731,9 @@ test("installer repairs a stale new-link target left by a checkout move", () => 
   const d = temp(), source = join(d, "source"), home = join(d, "home");
   mkdirSync(source, { recursive: true });
   writeFileSync(join(source, "index.ts"), "");
-  const env = { ...process.env, QUICK_DEPLOY_PI_TMUX_WINDOW_STATUS_SOURCE: source, QUICK_DEPLOY_PI_HOME: join(home, ".pi", "agent") };
-  const installer = join(ROOT, "fresh-install/modules/tmux/install-pi-tmux-window-status.sh");
-  const extensions = join(env.QUICK_DEPLOY_PI_HOME, "extensions"), target = join(extensions, "pi-tmux-window-status");
+  const env = { ...process.env, PI_TMUX_WINDOW_STATUS_SOURCE: source, PI_CODING_AGENT_DIR: join(home, ".pi", "agent") };
+  const installer = join(ROOT, "pi-agent/extensions/pi-tmux-window-status/install.sh");
+  const extensions = join(env.PI_CODING_AGENT_DIR, "extensions"), target = join(extensions, "pi-tmux-window-status");
   const movedCheckout = join(d, "moved-checkout", "pi-agent", "extensions", "pi-tmux-window-status");
   mkdirSync(extensions, { recursive: true });
   symlinkSync(movedCheckout, target);
@@ -746,9 +746,9 @@ test("installer repairs a stale new-link target left by a checkout move", () => 
 
 test("installer resolves the tracked source independently of the working directory", () => {
   const d = temp(), home = join(d, "home");
-  const env = { ...process.env, QUICK_DEPLOY_PI_HOME: join(home, ".pi", "agent") };
-  const installer = join(ROOT, "fresh-install/modules/tmux/install-pi-tmux-window-status.sh");
-  const target = join(env.QUICK_DEPLOY_PI_HOME, "extensions", "pi-tmux-window-status");
+  const env = { ...process.env, PI_CODING_AGENT_DIR: join(home, ".pi", "agent") };
+  const installer = join(ROOT, "pi-agent/extensions/pi-tmux-window-status/install.sh");
+  const target = join(env.PI_CODING_AGENT_DIR, "extensions", "pi-tmux-window-status");
   const repoSource = join(ROOT, "pi-agent/extensions/pi-tmux-window-status");
   assert.equal(spawnSync("bash", [installer], { env, cwd: d }).status, 0, "default source resolution must not depend on the caller's cwd");
   assert.equal(resolve(readlinkSync(target)), repoSource, "default source resolves to the tracked extension");

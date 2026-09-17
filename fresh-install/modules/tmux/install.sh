@@ -16,7 +16,7 @@
 # 幂等语义：重跑 = 确保 apt 包已装、已有克隆用 git pull --ff-only 更新到最新，
 # tmux/Pi 扩展链接指向本仓库；替换任何既有 ~/.tmux.conf / ~/.tmux.conf.local /
 # ~/.tmux 目录前先做时间戳备份，未知 Pi 扩展路径则拒绝替换。
-# install-pi-tmux-window-status.sh 只管理唯一的 Pi 扩展链接：精确新目标跳过；
+# Pi 扩展安装器只管理唯一的 Pi 扩展链接：精确新目标跳过；
 # 已知旧链接 quick-deploy-tmux-status 视为 legacy 迁移（备份后重建新链接）；
 # 未知旧/新路径冲突一律不改动并失败。
 #
@@ -108,7 +108,9 @@ else
 fi
 
 echo -e "\n${YELLOW}[5/5] 安装 Pi→tmux breathing status extension...${NC}"
-"$SCRIPT_DIR/install-pi-tmux-window-status.sh"
+PI_EXT_INSTALLER="$SCRIPT_DIR/../../../pi-agent/extensions/pi-tmux-window-status/install.sh"
+[ -f "$PI_EXT_INSTALLER" ] || die "Pi 扩展安装器缺失: $PI_EXT_INSTALLER（仓库不完整？）"
+"$PI_EXT_INSTALLER"
 
 echo -e "\n${GREEN}=== 安装完成 ===${NC}"
 echo -e "\n使用要点："

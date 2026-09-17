@@ -16,10 +16,10 @@ This Pi 0.84.3 extension exposes **logical Pi work** and root model/provider ava
 
 ## Deployment
 
-Run the independent installer:
+Run the extension-local installer (also invoked by `fresh-install/modules/tmux/install.sh`):
 
 ```bash
-bash fresh-install/modules/tmux/install-pi-tmux-window-status.sh
+bash pi-agent/extensions/pi-tmux-window-status/install.sh
 ```
 
 It creates exactly one managed link:
@@ -29,7 +29,7 @@ It creates exactly one managed link:
   → <checkout>/pi-agent/extensions/pi-tmux-window-status
 ```
 
-An exact link is skipped. A stale symlink at the new path whose target suffix is recognizably `pi-agent/extensions/pi-tmux-window-status` (for example after a checkout move) is backed up and replaced. The legacy name `~/.pi/agent/extensions/quick-deploy-tmux-status` is still recognized: when it is a known managed link to this repo's old extension path, it is treated as a legacy install and migrated — backed up with a timestamp and then replaced by the new link. Unknown files, directories, and foreign symlinks at either path are left untouched and cause a failure; if both old and new paths exist, the installer proceeds only when both are known managed links and otherwise fails without mutating anything. The installer accepts `QUICK_DEPLOY_PI_TMUX_WINDOW_STATUS_SOURCE`, `QUICK_DEPLOY_PI_HOME`, `QUICK_DEPLOY_PI_TMUX_WINDOW_STATUS_TARGET`, and `QUICK_DEPLOY_PI_TMUX_WINDOW_STATUS_LEGACY_TARGET` for isolated tests.
+An exact link is skipped. A stale symlink at the new path whose target suffix is recognizably `pi-agent/extensions/pi-tmux-window-status` (for example after a checkout move) is backed up and replaced. The legacy name `~/.pi/agent/extensions/quick-deploy-tmux-status` is still recognized: when it is a known managed link to this repo's old extension path, it is treated as a legacy install and migrated — backed up with a timestamp and then replaced by the new link. Unknown files, directories, and foreign symlinks at either path are left untouched and cause a failure; if both old and new paths exist, the installer proceeds only when both are known managed links and otherwise fails without mutating anything. The installer accepts `PI_TMUX_WINDOW_STATUS_SOURCE`, `PI_CODING_AGENT_DIR`, `PI_TMUX_WINDOW_STATUS_TARGET`, and `PI_TMUX_WINDOW_STATUS_LEGACY_TARGET` for isolated tests.
 
 **Runtime contract is intentionally unchanged by this rename.** tmux window options remain `@quick_deploy_pi_*` and the private lease directory remains `quick-deploy/pi-tmux-status`; only the managed symlink name changed. This keeps already-running Pi processes and outstanding leases working and creates no duplicate runtime state.
 

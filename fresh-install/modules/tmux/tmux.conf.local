@@ -33,13 +33,13 @@ set -as terminal-features ',xterm-ghostty:extkeys'
 # pane 内应用，即使应用没有主动请求 modifyOtherKeys。
 set -g extended-keys always
 # 精简 Oh my tmux! 状态栏：左侧只显示 session 名，移除系统 uptime；右侧
-# 移除电池/电源信息，并把用户名、主机名与时间、日期放在同一分段中。session
-# 与右侧时间同为浅灰字、深灰底、无文字属性。
+# 移除电池/电源信息与时间、日期，只留用户名与主机名。session 与右侧同为
+# 浅灰字、深灰底、无文字属性。
 tmux_conf_theme_status_left=" ❐ #S "
 tmux_conf_theme_status_left_fg="#8a8a8a"
 tmux_conf_theme_status_left_bg="#080808"
 tmux_conf_theme_status_left_attr="none"
-tmux_conf_theme_status_right=" #{prefix}#{mouse}#{pairing}#{synchronized} %R · %d %b · #{username}#{root}@#{hostname} "
+tmux_conf_theme_status_right=" #{prefix}#{mouse}#{pairing}#{synchronized} #{username}#{root}@#{hostname} "
 tmux_conf_theme_status_right_fg="$tmux_conf_theme_colour_12"
 tmux_conf_theme_status_right_bg="$tmux_conf_theme_colour_15"
 tmux_conf_theme_status_right_attr="none"
