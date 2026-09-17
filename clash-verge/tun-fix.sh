@@ -1,87 +1,140 @@
 #!/bin/bash
-# Clash Verge local configuration maintenance dispatcher.
+# Clash Verge local routing maintenance dispatcher.
+#
+# Bare invocation opens one flat menu. `rules check/render/apply` and
+# `apps discover` stay available as automation entrypoints.
 
 set -e
+set -o pipefail
 
 SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 RULES_DIR="${RULES_DIR:-$SCRIPT_DIR/rules}"
+CLASH_DIR="${CLASH_DIR:-$HOME/.local/share/io.github.clash-verge-rev.clash-verge-rev}"
 RULES_READER="$SCRIPT_DIR/lib/rules.py"
 APP_DISCOVERER="$SCRIPT_DIR/lib/discover_apps.py"
-CLASH_DIR="${CLASH_DIR:-$HOME/.local/share/io.github.clash-verge-rev.clash-verge-rev}"
+APP_REPORTER="$SCRIPT_DIR/lib/report_apps.py"
+
+# Relative overrides resolve against the invocation directory, so `tun-fix.sh`
+# stays usable from any cwd without hardcoded user paths.
+RULES_DIR="$(CDPATH= cd -- "$RULES_DIR" 2>/dev/null && pwd || printf '%s' "$RULES_DIR")"
+CLASH_DIR="$(CDPATH= cd -- "$CLASH_DIR" 2>/dev/null && pwd || printf '%s' "$CLASH_DIR")"
 PROFILES_YAML="$CLASH_DIR/profiles.yaml"
-MIHOMO_SOCKET="${MIHOMO_SOCKET:-/tmp/verge/verge-mihomo.sock}"
 
 # shellcheck source=lib/config.sh
 source "$SCRIPT_DIR/lib/config.sh"
-# shellcheck source=lib/diagnose.sh
-source "$SCRIPT_DIR/lib/diagnose.sh"
 # shellcheck source=lib/ssh.sh
 source "$SCRIPT_DIR/lib/ssh.sh"
 
 show_menu() {
     echo ""
     echo "=========================================="
-    echo "  Clash Verge 优化工具 - 主菜单"
+    echo "  Clash Verge 本地路由维护"
     echo "=========================================="
     echo ""
-    echo "  1. 一键优化 Clash 配置 (推荐)"
-    echo "  2. 配置 SSH for GitHub (可选)"
-    echo "  3. 查看会读取/修改的配置文件"
-    echo "  4. 备份管理"
+    show_route_paths
+    echo ""
+    echo "  1. 更新直连/代理规则（默认，回车执行）"
+    echo "  2. 配置 GitHub SSH"
+    echo "  3. 查看本机应用识别结果"
+    echo "  4. 恢复上次规则（已登记全局 Script）"
     echo "  0. 退出"
     echo ""
     echo "=========================================="
-    echo -n "请选择 [0-4]: "
+    echo -n "请选择 [0-4，回车=1]: "
 }
-
 
 usage() {
     cat <<'EOF'
 用法:
-  ./tun-fix.sh                 打开完整维护菜单（会修改 Merge/DNS/TUN/SSH）
-  ./tun-fix.sh rules check     校验 rules/direct.yaml 和 rules/proxy.yaml
-  ./tun-fix.sh rules render    将自包含全局 Script.js 输出到 stdout，不读取 Verge 配置
-  ./tun-fix.sh rules apply     只生成并替换已登记的全局 Script.js；随后在 Verge 中重载
+  ./tun-fix.sh                 打开菜单：更新规则 / GitHub SSH / 应用识别 / 恢复上次规则
+  ./tun-fix.sh rules check     校验 rules/direct.yaml 和 rules/proxy.yaml 语法
+  ./tun-fix.sh rules render    将解析后的全局 Script.js 输出到 stdout，不写任何文件
+  ./tun-fix.sh rules apply     更新已登记的全局 Script.js（含应用发现；不改 Merge/SSH）
   ./tun-fix.sh apps discover [ID ...]
                                     只读盘点已支持应用；不启动应用或改动 Clash
   ./tun-fix.sh --help          显示本帮助
+
+菜单是日常入口：回车等价于选项 1。更新只写已登记的全局 Script 及其同目录备份；
+订阅、Merge、DNS、TUN、运行 YAML 和 ~/.ssh 都不会被这条路径改动。
+生成成功后需在 Verge 中手动重载/重新生成配置。
 EOF
 }
 
-# 主程序
+# Option 3: read-only host discovery formatted for humans. Unresolved apps are
+# reported as text, not as a failed action: display never counts as a failure and
+# never writes or activates anything.
+show_app_discovery() {
+    local report
+    report=$(python3 "$APP_DISCOVERER" 2>/dev/null || true)
+    if [ -z "$report" ]; then
+        echo "应用识别失败：无法运行 $APP_DISCOVERER" >&2
+        return 1
+    fi
+    printf '%s\n' "$report" | python3 "$APP_REPORTER"
+}
+
 main() {
-    require_profiles
-    MERGE_CONFIG=$(get_merge_config)
-    PROFILE_NAME=$(get_profile_name)
-
     echo ""
-    echo "当前订阅: $PROFILE_NAME"
-    echo "Merge 配置: $(basename "$MERGE_CONFIG")"
-
+    echo "Clash Verge 本地路由维护"
+    echo "读取来源: $RULES_DIR/direct.yaml, $RULES_DIR/proxy.yaml"
+    echo ""
+    local choice status=0 action=0 action_status=0
     while true; do
         show_menu
-        read -r choice
-
+        if ! read -r choice; then
+            # EOF is a clean exit, not a blank/default update request.
+            echo ""
+            echo "输入结束，退出。"
+            return "$status"
+        fi
         case $choice in
+            "")
+                action=1
+                ;;
             1)
-                optimize_all "$MERGE_CONFIG"
+                action=1
                 ;;
             2)
-                configure_ssh
+                action=2
                 ;;
             3)
-                show_config_paths
+                action=3
                 ;;
             4)
-                backup_menu
+                action=4
                 ;;
             0)
-                exit 0
+                exit "$status"
                 ;;
             *)
-                echo "无效选择"
+                echo "无效选择: $choice（可用: 1 2 3 4 0）"
+                continue
                 ;;
         esac
+        action_status=0
+        case $action in
+            1)
+                # Straight-line call: neither update path disables errexit inside
+                # a helper body, and a non-zero return maps to an explicit error.
+                update_route_rules || action_status=$?
+                report_action_status "更新失败" "$action_status"
+                ;;
+            2)
+                configure_ssh || action_status=$?
+                report_action_status "GitHub SSH 配置未完成" "$action_status"
+                ;;
+            3)
+                show_app_discovery || action_status=$?
+                report_action_status "应用识别失败" "$action_status"
+                ;;
+            4)
+                restore_last_script || action_status=$?
+                report_action_status "恢复未完成" "$action_status"
+                ;;
+        esac
+        if [ "$action_status" -ne 0 ] && [ "$action_status" -ne 2 ]; then
+            status=1
+        fi
     done
 }
 
