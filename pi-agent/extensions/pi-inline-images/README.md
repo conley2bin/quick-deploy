@@ -32,6 +32,12 @@ info/exclude`. It refuses unknown target files/directories/links and does not ed
 `settings.json`, tracked `.gitignore`, Pi core, or the existing image package.
 Repeated runs are idempotent. Run `/reload` yourself afterward.
 
+The companion [guarded read-preview replay](patches/pi-tmux-images-0.2.0/README.md)
+was accepted and deployed locally with the image repairs. It keeps the existing
+`pi-tmux-images@0.2.0` package as the sole automatic read-preview and `/image`
+owner. The source symlink and patched package are on-disk state; an already-running
+Pi process needs the next operator-controlled reload or restart to activate them.
+
 ## Behavior
 
 - Parses finalized assistant Markdown with a position-aware remark/mdast tree plus
@@ -210,5 +216,5 @@ preservation, parser/reference/table behavior, cancelled-switch behavior, immuta
 cached resources, and isolated installer ownership.
 
 For a later independent pixel check, use a disposable private Ghostty/tmux setup;
-do not run the fixture against an active desktop. This Stage 2 source validation
-performs no GUI action.
+do not run the fixture against an active desktop. The captured-output checks
+above perform no GUI action.
