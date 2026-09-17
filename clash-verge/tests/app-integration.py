@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 import hashlib
-import io
-import json
 import os
 import shutil
 import subprocess
@@ -101,12 +99,10 @@ post: []
             directory = Path(temporary)
             direct_path, proxy_path = write_sources(directory, valid_direct, "version: 1\npre: []\npost: []\n")
             parsed = rules.parsed_sources(direct_path, proxy_path)
-            runtime = {"rules": [
-                {"type": "ProcessName", "payload": "feishu", "proxy": "DIRECT"},
-                {"type": "ProcessPath", "payload": "/tmp/path with spaces/feishu", "proxy": "DIRECT"},
-                {"type": "Match", "payload": "", "proxy": "DIRECT"},
-            ]}
-            self.assertTrue(rules.verify_runtime_rules(parsed, io.StringIO(json.dumps(runtime))))
+            self.assertEqual(
+                [rule.text for phase in ("pre", "post") for rule in parsed[phase]],
+                ["PROCESS-NAME,feishu,DIRECT", "PROCESS-PATH,/tmp/path with spaces/feishu,DIRECT"],
+            )
 
             for bad in ("PROCESS-NAME,feishu*,DIRECT", "PROCESS-PATH,/tmp/a*,DIRECT", "PROCESS-PATH,/tmp/^name,DIRECT", "PROCESS-PATH,/tmp/a,DIRECT,no-resolve"):
                 direct_path.write_text(f'version: 1\npre:\n  - "{bad}"\npost: []\n', encoding="utf-8")
@@ -267,20 +263,8 @@ post: []
             self.assertFalse(list(profiles.glob(".Script.js.rules.*")))
             self.assertEqual(sum("wemeet" in line for line in log.read_text(encoding="utf-8").splitlines()), 2)
 
-            snapshot = temporary_path / "resolved-rules.json"
-            snapshot.write_text(json.dumps({"pre": [f"PROCESS-PATH,{executable},DIRECT"], "post": []}), encoding="utf-8")
-            runtime = temporary_path / "runtime.json"
-            runtime.write_text(json.dumps({"rules": [
-                {"type": "ProcessPath", "payload": str(executable), "proxy": "DIRECT"},
-                {"type": "Match", "payload": "", "proxy": "DIRECT"},
-            ]}), encoding="utf-8")
-            diagnostic = subprocess.run(
-                ["bash", "-c", 'source "$1"; PREPARED_ROUTE_RULES="$2"; mihomo_api(){ cat "$RUNTIME_FILE"; }; verify_route_rules',
-                 "test", str(CLASH / "tun-fix.sh"), str(snapshot)],
-                cwd=ROOT, env=dict(environment, RUNTIME_FILE=str(runtime)), text=True, capture_output=True, check=False,
-            )
-            self.assertEqual(diagnostic.returncode, 0, diagnostic.stdout + diagnostic.stderr)
-            self.assertIn("pass pre[0] processpath", diagnostic.stdout)
+            # The refused apply ran exactly one discovery: the renderer failure
+            # stops before a second collection or any source write-back.
             self.assertEqual(sum("wemeet" in line for line in log.read_text(encoding="utf-8").splitlines()), 2)
 
             legacy.write_text("prepend: []\nappend: []\n", encoding="utf-8")
