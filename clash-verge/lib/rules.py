@@ -9,7 +9,9 @@ import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
+
+import discover_apps
 
 try:
     import yaml
@@ -44,9 +46,12 @@ class Rule:
 DOMAIN_RE = re.compile(r"^(?=.{1,253}$)(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)(?:\.(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?))*$")
 KEYWORD_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 COUNTRY_RE = re.compile(r"^[A-Za-z]{2}$")
+PROCESS_NAME_RE = re.compile(r"^[A-Za-z0-9._+-]+$")
+PROCESS_PATH_FORBIDDEN = set("*?[]^$()|{}")
 RESERVED_POLICIES = {"DIRECT", "REJECT", "REJECT-DROP", "PASS", "GLOBAL", "MATCH"}
 SUPPORTED_TYPES = {
-    "DOMAIN", "DOMAIN-SUFFIX", "DOMAIN-KEYWORD", "DST-PORT", "GEOIP", "IP-CIDR", "IP-CIDR6"
+    "DOMAIN", "DOMAIN-SUFFIX", "DOMAIN-KEYWORD", "DST-PORT", "GEOIP", "IP-CIDR", "IP-CIDR6",
+    "PROCESS-NAME", "PROCESS-PATH",
 }
 NO_RESOLVE_TYPES = {"GEOIP", "IP-CIDR", "IP-CIDR6"}
 LEGACY_GITHUB_RULE = "DOMAIN,ssh.github.com,DIRECT"
@@ -113,6 +118,17 @@ def parse_rule(path: Path, line: int, text: str, source: Path, phase: str) -> Ru
         parts[-1] = "no-resolve"
         if rule_type not in NO_RESOLVE_TYPES:
             fail(path, line, f"no-resolve is not supported for {rule_type}")
+    if rule_type in {"PROCESS-NAME", "PROCESS-PATH"}:
+        if len(parts) != 3:
+            fail(path, line, f"{rule_type} requires one payload and one policy target")
+        payload, target = parts[1], parts[2]
+        if rule_type == "PROCESS-NAME" and not PROCESS_NAME_RE.fullmatch(payload):
+            fail(path, line, "PROCESS-NAME must be one literal executable basename without path, whitespace, or wildcards")
+        if rule_type == "PROCESS-PATH":
+            if not discover_apps.safe_process_path(payload) or any(character in PROCESS_PATH_FORBIDDEN for character in payload):
+                fail(path, line, "PROCESS-PATH must be an absolute one-line literal path without commas, control characters, or wildcards")
+        canonical = ",".join(parts)
+        return Rule(canonical, canonical, (rule_type, payload), target, source, line, phase)
     if len(parts) != 3 + option_count:
         fail(path, line, f"{rule_type} requires one payload, one policy target, and optional final no-resolve")
     payload, target = parts[1], parts[2]
@@ -130,6 +146,42 @@ def parse_rule(path: Path, line: int, text: str, source: Path, phase: str) -> Ru
         fail(path, line, "IP-CIDR6 payload must be a valid IPv6 CIDR")
     canonical = ",".join(parts)
     return Rule(canonical, canonical, (rule_type, payload), target, source, line, phase)
+
+
+def parse_app_entry(
+    path: Path, entry: yaml.nodes.MappingNode, source: Path, phase: str, expected_target: str,
+) -> Rule:
+    fields: dict[str, yaml.nodes.Node] = {}
+    for key_node, value_node in entry.value:
+        key = scalar_key(key_node, path)
+        if key in fields:
+            fail(path, key_node.start_mark.line + 1, f"duplicate app field {key!r}")
+        fields[key] = value_node
+    allowed = {"app"} if expected_target == "DIRECT" else {"app", "target"}
+    unknown, missing = set(fields) - allowed, allowed - set(fields)
+    if unknown:
+        fail(path, entry.start_mark.line + 1, f"unknown app field(s): {', '.join(sorted(unknown))}")
+    if missing:
+        fail(path, entry.start_mark.line + 1, f"missing app field(s): {', '.join(sorted(missing))}")
+    app_node = fields["app"]
+    if not isinstance(app_node, yaml.nodes.ScalarNode) or app_node.tag != "tag:yaml.org,2002:str":
+        fail(path, app_node.start_mark.line + 1, "app must be a canonical app ID string")
+    app_id = app_node.value
+    if app_id not in discover_apps.SPECS:
+        fail(path, app_node.start_mark.line + 1,
+             f"unsupported app {app_id!r}; supported: {', '.join(discover_apps.supported_ids())}")
+    if expected_target == "DIRECT":
+        target = "DIRECT"
+    else:
+        target_node = fields["target"]
+        if not isinstance(target_node, yaml.nodes.ScalarNode) or target_node.tag != "tag:yaml.org,2002:str":
+            fail(path, target_node.start_mark.line + 1, "proxy app target must be a non-empty proxy group name")
+        target = target_node.value.strip()
+        if not target or target != target_node.value or target.upper() in RESERVED_POLICIES:
+            fail(path, target_node.start_mark.line + 1,
+                 "proxy app target must name a subscription proxy group, not a built-in policy")
+    text = f"APP,{app_id},{target}"
+    return Rule(text, text, ("APP", app_id), target, source, entry.start_mark.line + 1, phase)
 
 
 def scalar_key(node: yaml.nodes.Node, path: Path) -> str:
@@ -170,9 +222,13 @@ def load_source(path: Path, expected_target: str) -> dict[str, list[Rule]]:
         if not isinstance(entries, yaml.nodes.SequenceNode):
             fail(path, entries.start_mark.line + 1, f"{phase} must be a YAML list")
         for entry in entries.value:
-            if not isinstance(entry, yaml.nodes.ScalarNode) or entry.tag != "tag:yaml.org,2002:str":
-                fail(path, entry.start_mark.line + 1, f"{phase} entries must be quoted rule strings")
-            rule = parse_rule(path, entry.start_mark.line + 1, entry.value, path, phase)
+            if isinstance(entry, yaml.nodes.ScalarNode) and entry.tag == "tag:yaml.org,2002:str":
+                rule = parse_rule(path, entry.start_mark.line + 1, entry.value, path, phase)
+            elif isinstance(entry, yaml.nodes.MappingNode):
+                rule = parse_app_entry(path, entry, path, phase, expected_target)
+            else:
+                fail(path, entry.start_mark.line + 1,
+                     f"{phase} entries must be quoted rule strings or app mappings")
             if expected_target == "DIRECT":
                 if rule.target.upper() != "DIRECT":
                     fail(path, rule.line, f"direct rules must target DIRECT, got {rule.target!r}")
@@ -201,6 +257,42 @@ def domains_overlap(left_kind: str, left: str, right_kind: str, right: str) -> b
     if right_kind == "DOMAIN":
         return right == left or right.endswith("." + left)
     return left == right or left.endswith("." + right) or right.endswith("." + left)
+
+
+def resolve_app_rules(
+    rules: dict[str, list[Rule]],
+    discover: Callable[[list[str]], tuple[discover_apps.DiscoveryResult, ...]] = discover_apps.discover_host,
+) -> dict[str, list[Rule]]:
+    """Expand app declarations from one discovery snapshot at their authored positions."""
+    app_ids: list[str] = []
+    for phase in ("pre", "post"):
+        for rule in rules[phase]:
+            if rule.selector[0] == "APP" and rule.selector[1] not in app_ids:
+                app_ids.append(rule.selector[1])
+    if not app_ids:
+        return rules
+    results = {result.app_id: result for result in discover(app_ids)}
+    expanded: dict[str, list[Rule]] = {"pre": [], "post": []}
+    for phase in ("pre", "post"):
+        for rule in rules[phase]:
+            if rule.selector[0] != "APP":
+                expanded[phase].append(rule)
+                continue
+            result = results.get(rule.selector[1])
+            if result is None:
+                fail(rule.source, rule.line, f"app {rule.selector[1]!r} produced no discovery result")
+            if result.status != "resolved":
+                detail = f": {result.reason}" if result.reason else ""
+                fail(rule.source, rule.line,
+                     f"app {result.app_id!r} cannot resolve PROCESS-PATH rules ({result.status}){detail}")
+            for executable in result.executables:
+                text = f"PROCESS-PATH,{executable.path},{rule.target}"
+                expanded[phase].append(Rule(
+                    text, text, ("PROCESS-PATH", executable.path), rule.target,
+                    rule.source, rule.line, rule.phase,
+                ))
+    validate(expanded)
+    return expanded
 
 
 def validate(rules: dict[str, list[Rule]]) -> None:
@@ -616,9 +708,9 @@ def main() -> int:
             migration_check(args.registry, rules)
             print("no bound local Rules duplicates")
         elif args.render:
-            print(render(rules), end="")
+            print(render(resolve_app_rules(rules)), end="")
         elif args.verify_runtime:
-            return 0 if verify_runtime_rules(rules, sys.stdin) else 1
+            return 0 if verify_runtime_rules(resolve_app_rules(rules), sys.stdin) else 1
         elif args.policy_host:
             match = policy_host_match(rules, args.policy_host, args.policy_target)
             if match is None:
@@ -626,7 +718,16 @@ def main() -> int:
                 return 2
             print("\t".join(match))
         else:
-            print(f"route sources valid: {sum(len(value) for value in rules.values())} rule(s)")
+            app_count = sum(
+                1 for phase in ("pre", "post") for rule in rules[phase] if rule.selector[0] == "APP"
+            )
+            if app_count:
+                print(
+                    f"route sources valid: {sum(len(value) for value in rules.values())} entry(s); "
+                    "app paths are resolved only by rules render/apply"
+                )
+            else:
+                print(f"route sources valid: {sum(len(value) for value in rules.values())} rule(s)")
     except SourceError as error:
         print(f"route source error: {error}", file=sys.stderr)
         return 1

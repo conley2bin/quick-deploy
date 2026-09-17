@@ -6,6 +6,7 @@ set -e
 SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 RULES_DIR="${RULES_DIR:-$SCRIPT_DIR/rules}"
 RULES_READER="$SCRIPT_DIR/lib/rules.py"
+APP_DISCOVERER="$SCRIPT_DIR/lib/discover_apps.py"
 CLASH_DIR="${CLASH_DIR:-$HOME/.local/share/io.github.clash-verge-rev.clash-verge-rev}"
 PROFILES_YAML="$CLASH_DIR/profiles.yaml"
 MIHOMO_SOCKET="${MIHOMO_SOCKET:-/tmp/verge/verge-mihomo.sock}"
@@ -41,6 +42,8 @@ usage() {
   ./tun-fix.sh rules check     校验 rules/direct.yaml 和 rules/proxy.yaml
   ./tun-fix.sh rules render    将自包含全局 Script.js 输出到 stdout，不读取 Verge 配置
   ./tun-fix.sh rules apply     只生成并替换已登记的全局 Script.js；随后在 Verge 中重载
+  ./tun-fix.sh apps discover [ID ...]
+                                    只读盘点已支持应用；不启动应用或改动 Clash
   ./tun-fix.sh --help          显示本帮助
 EOF
 }
@@ -89,6 +92,12 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
                 check) check_route_sources ;;
                 render) render_route_script ;;
                 apply) apply_route_rules ;;
+                *) usage; exit 2 ;;
+            esac
+            ;;
+        apps)
+            case "${2:-}" in
+                discover) shift 2; python3 "$APP_DISCOVERER" "$@" ;;
                 *) usage; exit 2 ;;
             esac
             ;;

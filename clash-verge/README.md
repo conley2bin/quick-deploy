@@ -24,27 +24,44 @@ rules/direct.yaml   # 只能写 DIRECT 目标
 rules/proxy.yaml    # 只能写当前订阅已有的代理组目标；不写节点
 ```
 
-两者都使用严格的 `version: 1`、`pre: [...]`、`post: [...]` YAML 结构。规则是完整的 Mihomo 规则字符串，含明确的策略目标；例如 `"DOMAIN,example.com,DIRECT"` 或 `"DOMAIN,example.com,Proxy"`。解析器使用 [PyYAML](lib/requirements.txt)，而不是用 shell 文本匹配猜 YAML；在可编辑环境中先安装 `python3 -m pip install -r clash-verge/lib/requirements.txt`（系统包 `python3-yaml` 也可以）。
+两者都使用严格的 `version: 1`、`pre: [...]`、`post: [...]` YAML 结构。列表可混用完整 Mihomo 规则字符串和五个受支持应用的声明。解析器使用 [PyYAML](lib/requirements.txt)，而不是用 shell 文本匹配猜 YAML；在可编辑环境中先安装 `python3 -m pip install -r clash-verge/lib/requirements.txt`（系统包 `python3-yaml` 也可以）。
+
+```yaml
+# direct.yaml：DIRECT 由文件推断，路径在 render/apply 时才发现
+pre:
+  - app: baidunetdisk
+  - "DOMAIN,example.com,DIRECT"
+
+# proxy.yaml：必须明确给出当前订阅已有的组名
+post:
+  - app: wemeet
+    target: Proxy
+```
+
+合法应用 ID 仅有 `baidunetdisk`（百度网盘）、`wemeet`（腾讯会议）、`feishu`（飞书）、`wechat`（微信）和 `spark-store`（星火应用商店）。声明没有路径、命令或任意名称字段；未知 ID、缺失/多余字段和内置策略名作为 proxy `target` 都会被拒绝。
 
 ```bash
-# 以下两项不读取 Clash Verge 的 profiles registry，因此可在任意 cwd 预检
+# check 只校验便携的 YAML/策略语法；app 路径只在 render/apply 解析
 ./clash-verge/tun-fix.sh rules check
 ./clash-verge/tun-fix.sh rules render > /tmp/Script.js
+
+# 只读盘点安装证据、主程序/助手路径和未解决状态；不会启动应用
+./clash-verge/tun-fix.sh apps discover [ID ...]
 
 # 仅替换 profiles.yaml 中已登记的全局 Script.js；不改 Merge、DNS、TUN、SSH、
 # 订阅级扩展、运行时 YAML，也不重载核心。
 ./clash-verge/tun-fix.sh rules apply
 ```
 
-`apply` 先校验来源及已绑定的订阅级 Rules 扩展，再渲染候选 Script，并检查已登记的全局 Script 目标。首次从旧的订阅级规则迁移时，它会列出精确的 `路径:行号:规则`，包括历史 `DOMAIN,ssh.github.com,DIRECT`；请只手动删掉列出的本地扩展条目后重试。它绝不改写订阅或扩展文件。删除 YAML 规则只会停止**本生成器**注入该规则；独立订阅规则仍会保留其自身行为。
+`apply` 先校验来源及已绑定的订阅级 Rules 扩展，再将同一次发现结果渲染为候选 Script；任何声明的应用若缺失、歧义、包装器/共享运行时或不可表示路径，候选、备份和已登记 Script 都不会被替换。首次从旧的订阅级规则迁移时，它会列出精确的 `路径:行号:规则`，包括历史 `DOMAIN,ssh.github.com,DIRECT`；请只手动删掉列出的本地扩展条目后重试。它绝不改写订阅或扩展文件。删除 YAML 规则只会停止**本生成器**注入该规则；独立订阅规则仍会保留其自身行为。
 
 未登记、歧义或不安全的 Script 目标会报错而不会写一个 Verge 永远不会加载的孤儿文件。已有非本工具脚本会要求确认并建立唯一备份。完成后在 Verge GUI 中重载当前订阅/配置。`clash-verge.yaml` 是 Verge 生成的运行时输出，不能手改，也不是这些 YAML 的来源。若之后配置的订阅级 Merge 或 Script 重写 `config.rules`，它们在该全局 Script 之后运行，能够覆盖这份输出；此流程不会替代那种后续扩展。
 
-Mihomo 是**首条命中**，不会因为 `DOMAIN` 比 `DOMAIN-SUFFIX` 更具体而自动获胜。`pre` 的顺序为 `direct.pre`、`proxy.pre`，并移到订阅规则前；相同的订阅条目按完整规范化规则串去重并提升。订阅原有规则在第一个 `MATCH` 前保持原序；缺失的 `direct.post`、`proxy.post` 插入在该 `MATCH` 前，已有的相同 `post` 条目保留原位置。这样 `post` 是订阅规则的补充，不会覆盖订阅已有例外。生成器拒绝不存在的代理组、缺少 `MATCH`、未知 YAML 字段、同一选择器相反目标，以及同一阶段具有相反目标的可证明域名重叠（`DOMAIN`/`DOMAIN-SUFFIX`、后缀嵌套）。它不会猜测规则特异性或重排订阅。
+Mihomo 是**首条命中**，不会因为 `DOMAIN` 比 `DOMAIN-SUFFIX` 更具体而自动获胜。`pre` 的顺序为 `direct.pre`、`proxy.pre`，并移到订阅规则前；相同的订阅条目按完整规范化规则串去重并提升。应用声明在它们原来的列表位置连续展开为一个或多个 `PROCESS-PATH`，不会因为它们是进程规则而自动前移。订阅原有规则在第一个 `MATCH` 前保持原序；缺失的 `direct.post`、`proxy.post` 插入在该 `MATCH` 前，已有的相同 `post` 条目保留原位置。这样 `post` 是订阅规则的补充，不会覆盖订阅已有例外。生成器拒绝不存在的代理组、缺少 `MATCH`、未知 YAML 字段、同一选择器相反目标，以及同一阶段具有相反目标的可证明域名重叠（`DOMAIN`/`DOMAIN-SUFFIX`、后缀嵌套）。解析后的应用路径与手写 `PROCESS-PATH` 的相同 payload/相反 target 也会拒绝；它不会猜测规则特异性或重排订阅。
 
-支持的可编辑 matcher 是 `DOMAIN`、`DOMAIN-SUFFIX`、`DOMAIN-KEYWORD`、`DST-PORT`、`GEOIP`、`IP-CIDR` 和 `IP-CIDR6`。`PROCESS-NAME`、`PROCESS-PATH` 等进程 matcher 当前仍不支持。`IP-CIDR` 可使用 IPv4 或 IPv6 CIDR；端口必须是单一 1–65535 值或升序范围；`no-resolve` 只允许作为 `GEOIP`、`IP-CIDR` 或 `IP-CIDR6` 的最后一个选项。`rules check` 会在任何写入前拒绝未知 matcher、错误 payload/arity、错误选项和内置策略名作为 proxy 目标。
+支持的可编辑 matcher 是 `DOMAIN`、`DOMAIN-SUFFIX`、`DOMAIN-KEYWORD`、`DST-PORT`、`GEOIP`、`IP-CIDR`、`IP-CIDR6`、`PROCESS-NAME` 和 `PROCESS-PATH`。`PROCESS-NAME` 是可移植的字面可执行文件**基名**（例如 `PROCESS-NAME,feishu,DIRECT`）：它不比较目录，所以同名但无关的程序也可能命中；它不是应用声明发现失败时的回退。`PROCESS-PATH` 是带空格也有效的绝对、字面路径；逗号、控制字符、通配符、正则和 `no-resolve` 都会被拒绝，避免 Mihomo 逗号字段误解析。应用发现只支持受证据支持的原生 Linux Debian 包：读取固定包 ID/清单、指定 desktop metadata 和相关 `/proc` `comm`/`exe`，不扫描磁盘、不运行应用、不读私有数据。Baidu 的 GUI 与 `netdisk_service` 都会展开；共享 `node`、`python`、`aria2c`、shell 或 Wine host 不会被归属给应用。Flatpak、AppImage、Wine、RPM 和任意桌面包装器形式会明确显示为未解决/不支持，而不会猜测。安装或升级后需重新 `rules apply` 才能把新路径写入生成 Script；发现路径不证明旧 Script 已重载，也不证明某个连接已路由。
 
-完整优化的通用活跃规则诊断从两个 YAML 来源生成期望：`direct.pre`、`proxy.pre` 必须按该顺序成为 `/rules` 的精确前缀，`post` 只要求以正确目标出现在 `MATCH` 前，允许订阅已有同规则保留在更早位置。本定义允许本地 proxy 规则，不再使用“所有 DIRECT 必须位于首条 proxy 前”的旧屏障。`/rules` 只暴露 matcher、payload 和目标，通常不暴露 `no-resolve` 等完整文本选项；这些选项由来源检查和渲染验证，不能声称已由 `/rules` 证明。LiteLLM TLS-SNI、TUN 路由、Fake-IP 生成块和 GitHub SSH 是机制不同的专用检查；假设的策略不存在时会明确 `skip`，不会冒充通用路由证明。
+完整优化的通用活跃规则诊断从两个 YAML 来源生成期望：`direct.pre`、`proxy.pre` 必须按该顺序成为 `/rules` 的精确前缀，`post` 只要求以正确目标出现在 `MATCH` 前，允许订阅已有同规则保留在更早位置。本定义允许本地 proxy 和展开的 process 规则，不再使用“所有 DIRECT 必须位于首条 proxy 前”的旧屏障。`/rules` 只暴露 matcher、payload 和目标，通常不暴露 `no-resolve` 等完整文本选项；这些选项由来源检查和渲染验证，不能声称已由 `/rules` 证明。它显示的是**当前运行核心**的规则，而发现命令描述当前安装；升级后未重新 apply/reload 时两者可不同。进程匹配还要求流量进入 Mihomo、运行在 rule 模式，且 `find-process-mode` 不是 `off`（`strict`/`always` 的可用性取决于权限和核心）。发现路径和 `/rules` 条目均不能代替对新建连接实际命中/出站的核对。LiteLLM TLS-SNI、TUN 路由、Fake-IP 生成块和 GitHub SSH 是机制不同的专用检查；假设的策略不存在时会明确 `skip`，不会冒充通用路由证明。
 
 迁移说明：旧脚本中六条 `forceTop` 规则现在在 `direct.pre`；其余原有本地 DIRECT 规则都在 `direct.post`。每条匹配器、目标和 `no-resolve` 选项均保留。宽泛补充规则现在会让位于订阅中即使没有完全相同字符串的更早例外；这是为消除旧版“全部 prepend”遮蔽订阅例外的有意语义变化。
 
