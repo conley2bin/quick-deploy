@@ -56,6 +56,10 @@ cd ~/quick-deploy/sunshine-moonlight
 3. Moonlight 在 B 显示 PIN。到 A 的 Web UI **PIN** 页面，核对待配对客户端名称与来源地址，选择对应请求，**输入 B 显示的 PIN**。
 4. 配对完成后，在 Moonlight 选择 **Desktop**。
 
+上面的手动流程仍然有效；第 3 节的 `./run_server.sh <名称>` 也内置了同一流程：本机未与目标 Sunshine 配对时，脚本会生成随机 4 位 PIN，打印目标主机、A 的 Web UI 地址（`https://<A 的 Tailnet IPv4>:<基准端口+1>`）和编号步骤，自动运行 Moonlight `pair`，并在配对进程返回后重新查询一次配对状态，确认已配对才启动 Desktop 串流。两种方式都由你在 A 的 Web UI PIN 页面输入 PIN：脚本不自动打开浏览器，也不操作远端。
+
+**Sunshine 网页（Web UI）的定位**：它是 Sunshine 服务自带的网页管理/配对界面，监听 `https://<A 的 Tailnet IPv4>:<基准端口+1>`，不是需要另外安装的软件。A 必须安装并运行 Sunshine 服务本体；网页只在首次设置管理员凭据、确认 PIN 配对和修改配置时需要。配对/配置完成后日常可以不打开网页，但不能单独删除网页而仍保留完整串流控制：网页由服务本体提供，删除或停用服务就失去被控端。反向连接时两台各自维护自己的 Sunshine 服务与网页。
+
 反向连接时，在新的 B 添加新的 A，并到新 A 的 Sunshine Web UI 完成配对。**配对归各台 Sunshine 主机分别管理，一次配对不代表反方向已配对**；两台也分别设置自己的 Sunshine 管理员凭据。
 
 Web UI 只绑定 A 的 Tailnet IPv4；远端 `localhost:47990` 不是它的监听地址。若使用 SSH 隧道，转发目标必须是 A 的 Tailnet IPv4 和实际 Web UI 端口。
@@ -80,7 +84,7 @@ $EDITOR machines.yaml
 
 需要区分职责：主机安装器与 `./commands/doctor.sh --host` 仍会只读查询**本机** Tailscale 状态和 `tailscale0` 上已分配的 Tailnet IPv4，用于确认 Sunshine 的绑定与服务启动条件（见「重启、等待网络与熄屏」）；这属于被控主机的本机网络就绪检查，不生成、不读取也不维护远端机器清单。
 
-在 **Moonlight 中独立完成配对** 后，以名称启动 Desktop 串流：
+以名称连接 Desktop（未配对时会先在本机终端给出 PIN 与步骤，配对确认后才串流）：
 
 ```bash
 ./run_server.sh desktop              # 默认 Moonlight Desktop
@@ -88,7 +92,13 @@ $EDITOR machines.yaml
 ./run_server.sh --config /path/to/inventory.yaml desktop
 ```
 
-连接器实际执行固定的 Moonlight Qt 命令：`~/.local/bin/moonlight stream -- <Tailnet IPv4>:<基准端口> Desktop`。它不会自动配对、不会把 Moonlight 返回 0 解释成“已连接”，也不会远程安装、启动 Sunshine 或改写远端配置。Moonlight 仍是桌面 GUI，须从拥有正常图形会话的本机用户运行；未配对或运行时错误可能显示对话框后退出。
+连接器先运行 `~/.local/bin/moonlight list -- <Tailnet IPv4>:<基准端口>` 查询配对状态，再决定动作：
+
+1. **已配对**：直接执行固定的 `~/.local/bin/moonlight stream -- <Tailnet IPv4>:<基准端口> Desktop`。
+2. **明确未配对**（Moonlight 输出已知的未配对诊断）：用系统安全随机数生成 4 位 PIN，打印目标主机、`https://<Tailnet IPv4>:<基准端口+1>`、PIN 与编号步骤（远端 Sunshine 网页输入 PIN；本机 Moonlight 自动配对），随后运行 `~/.local/bin/moonlight pair --pin <PIN> -- <Tailnet IPv4>:<基准端口>`。配对进程返回后**重新查询一次** list，只有确认已配对才进入串流。
+3. **无法确认**（网络失败、未知或其它诊断）：打印有界的 Moonlight 诊断和目标 Web UI 地址后以非零状态退出；不会静默开始配对，也不会串流。
+
+PIN 只打印在终端，不写入 `machines.yaml`、配置或任何文件，也不传给浏览器；脚本不自动打开浏览器、不远程安装/启动 Sunshine、不改写远端配置。`pair` 与 `stream` 都是 Moonlight GUI，须从拥有正常图形会话的本机用户运行；配对失败对话框可能在手动关闭后返回 0，因此退出码不能证明配对成功——本脚本只以重新查询的配对状态为准，也从不把串流进程返回 0 当作“已连接”。
 
 SSH 是另一个明确动作，只打开交互式登录并沿用现有 SSH config、密钥/agent 与 known_hosts：
 
@@ -190,6 +200,10 @@ Doctor 只读；退出 1 表示必需条件不满足。它检查包、实际服�
 | 日志提示 `configuration directory changed` | 运行时配置来源与安装选择不一致。核对用户服务环境中的 `XDG_CONFIG_HOME`/`CONFIGURATION_DIRECTORY`，恢复安装时的目录；不要用另一套配置绕过检查。 |
 | 提示配置路径/override 冲突 | 统一 shell 与用户管理器的配置来源；核对自定义 service/drop-in。仅接受本流程原样生成的 retry 文件及有效策略，修改过或外来的文件会保留并拒绝操作。 |
 | 提示 `origin_web_ui_allowed=pc` | 该设置只允许本机来源。若同意 Tailnet Web UI 访问，手动改为 `lan` 后重跑；不需要 `wan`。 |
+| 连接器提示未配对并给出 PIN | 按编号步骤在 A 的 Web UI **PIN** 页面输入该 PIN；脚本会在配对返回后重新确认，确认已配对才启动串流。PIN 只在本机终端显示，不要在其它地方留存。 |
+| 连接器提示“无法确认配对状态” | A 离线、Sunshine 服务未运行或 Tailnet 不可达时会出现；按提示核对后重跑，脚本不会静默配对或串流。 |
+| 连接器提示“配对未完成” | 配对窗口的退出码不能证明配对成功；在 A 的 Web UI 核对是否还有待配对请求，修正后重跑脚本（会重新检测并重新给出 PIN）。 |
+| 主机返回 `Error 404` 或应用列表没有 `Desktop` | Sunshine 已连接但应用列表没有 `Desktop`，或 Moonlight 缓存了旧应用列表。登录目标主机的 Sunshine Web UI → Applications/应用，添加或恢复 `Desktop`；修改 `apps.json` 后重启 Sunshine，再关闭并重新打开本机 Moonlight（必要时删除并重新添加该主机）刷新应用列表。连接器会在发送串流请求前检查应用列表，缺少 `Desktop` 时先在终端提示。 |
 | 黑屏或 `Couldn't find monitor` | 检查输出选择、驱动和活动 scanout。KMS 在 DPMS 关闭或无头时可能丢失可捕获 framebuffer；并非所有这类错误都由熄屏引起。 |
 | GNOME 锁屏后 portal 断开 | GNOME 46 会终止门户捕获，先解锁，必要时重新授权。KMS/X11 的锁屏和熄屏表现须在目标机器确认。 |
 | 键鼠无效 | 检查 `/dev/uinput`、包内 udev 规则和活动会话 ACL；节点缺失不是组权限问题。`/dev/uhid` 主要关系到手柄。 |

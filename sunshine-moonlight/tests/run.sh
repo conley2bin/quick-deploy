@@ -191,7 +191,14 @@ client_fixture() {
 [ "${1:-}" = --appimage-extract ] || exit 1
 [ "${MOCK_EXTRACT_FAIL:-0}" = 0 ] || exit 1
 mkdir -p squashfs-root/usr/bin
-printf '#!/bin/sh\nprintf "fixture only\\n"\n' >squashfs-root/usr/bin/moonlight
+cat >squashfs-root/usr/bin/moonlight <<'MOONLIGHT'
+#!/bin/sh
+case "${1:-}" in
+list) printf 'Desktop\n' ;;
+stream) printf 'fixture only\n' ;;
+*) exit 1 ;;
+esac
+MOONLIGHT
 chmod +x squashfs-root/usr/bin/moonlight
 ln -s usr/bin/moonlight squashfs-root/AppRun
 printf '[Desktop Entry]\nType=Application\nName=Moonlight\nExec=moonlight\nIcon=moonlight\n' >squashfs-root/com.moonlight_stream.Moonlight.desktop

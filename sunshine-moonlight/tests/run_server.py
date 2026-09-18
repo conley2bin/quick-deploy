@@ -2,6 +2,8 @@
 """Subprocess tests for the inventory connector; no network, GUI, or service calls."""
 from __future__ import annotations
 
+import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -15,7 +17,11 @@ import textwrap
 import unittest
 
 MODULE = Path(__file__).resolve().parents[1]
+# Loading the connector module directly must never leave bytecode cache in the
+# source tree; the same boundary is used by tests/binding.py.
+sys.dont_write_bytecode = True
 CJK = re.compile(r"[\u4e00-\u9fff]")
+PIN = re.compile(r"^本机 PIN: (\d{4})$", re.M)
 
 FAKE_PROGRAM = """#!/usr/bin/python3
 import json
@@ -24,6 +30,86 @@ import sys
 from pathlib import Path
 Path(os.environ['FAKE_LOG']).write_text(json.dumps({'argv': sys.argv, 'stdin': sys.stdin.read()}))
 raise SystemExit(int(os.environ.get('FAKE_EXIT', '0')))
+"""
+
+# The Moonlight fake is a state machine: `list` reports the stored pair state, a
+# successful `pair` records it, and the log keeps the full ordered invocation trail
+# so tests can prove which action ran, in what order, with which argv and environment.
+FAKE_MOONLIGHT = """#!/usr/bin/python3
+import json
+import os
+import sys
+from pathlib import Path
+
+def setting(name, default=''):
+    return os.environ.get(name, default)
+
+def read_state():
+    path = Path(os.environ['FAKE_STATE'])
+    return json.loads(path.read_text()) if path.exists() else {}
+
+argv = sys.argv[1:]
+record = {
+    'argv': sys.argv,
+    'stdin': sys.stdin.read(),
+    'lc_all': os.environ.get('LC_ALL'),
+}
+with Path(os.environ['FAKE_LOG']).open('a', encoding='utf-8') as handle:
+    handle.write(json.dumps(record) + '\\n')
+
+action = argv[0] if argv else ''
+if action == 'list':
+    state = read_state()
+    sequence = [item for item in setting('FAKE_LIST_SEQUENCE').split(',') if item]
+    if sequence:
+        # Later list calls can be made to fail even after a successful pair, which
+        # models the host/network disappearing between pair and confirmation.
+        forced = sequence[min(state.get('list_calls', 0), len(sequence) - 1)]
+        state['list_calls'] = state.get('list_calls', 0) + 1
+        Path(os.environ['FAKE_STATE']).write_text(json.dumps(state))
+    else:
+        forced = setting('FAKE_LIST_MODE')
+    paired = state.get('paired', setting('FAKE_INITIAL_PAIRED', '1') == '1')
+    if forced == 'stdout-unknown':
+        print('QPA/display diagnostic on stdout')
+        raise SystemExit(255)
+    if forced == 'unpaired-zero':
+        print('Computer 100.64.0.2 has not been paired. Please open Moonlight to pair before retrieving games list.', file=sys.stderr)
+        print('Desktop')
+        raise SystemExit(0)
+    if forced in ('network', 'ambiguous', 'nonzero'):
+        if forced == 'network':
+            print('Failed to connect to 100.64.0.2', file=sys.stderr)
+        elif forced == 'ambiguous':
+            print('moonlight: unexpected diagnostic', file=sys.stderr)
+        raise SystemExit(255)
+    if not paired:
+        if forced == 'unpaired-zh':
+            print('电脑 100.64.0.2 未配对，请在请求游戏列表前使用 Moonlight 配对。', file=sys.stderr)
+        else:
+            print('Computer 目标 has not been paired. Please open Moonlight to pair before retrieving games list.', file=sys.stderr)
+        raise SystemExit(255)
+    if paired:
+        if setting('FAKE_NO_DESKTOP') == '1':
+            print('Steam Big Picture')
+        else:
+            print('Desktop')
+    raise SystemExit(0)
+if action == 'pair':
+    print('FAKE PAIR STARTED', file=sys.stderr)
+    if setting('FAKE_PAIR_EFFECT', 'pair') == 'pair':
+        state = read_state()
+        state['paired'] = True
+        Path(os.environ['FAKE_STATE']).write_text(json.dumps(state))
+    raise SystemExit(int(setting('FAKE_PAIR_EXIT', '0')))
+if action == 'stream':
+    raise SystemExit(int(setting('FAKE_STREAM_EXIT', setting('FAKE_EXIT', '0'))))
+raise SystemExit(int(setting('FAKE_EXIT', '0')))
+"""
+
+# The connector must never hand the PIN to a browser or any other helper program.
+FAKE_BROWSER = """#!/bin/sh
+printf 'browser launched\\n' >> "$FAKE_BROWSER_LOG"
 """
 
 FAKE_TAILSCALE = """#!/usr/bin/python3
@@ -86,6 +172,8 @@ class RunServerTests(unittest.TestCase):
         self.home = self.root / "fake home"
         self.bin = self.root / "fake bin"
         self.log = self.root / "program.json"
+        self.state = self.root / "fake state.json"
+        self.browser_log = self.root / "browser.log"
         self.tailscale_log = self.root / "tailscale.log"
         self.home.mkdir()
         self.bin.mkdir()
@@ -94,10 +182,14 @@ class RunServerTests(unittest.TestCase):
             HOME=str(self.home),
             PATH=f"{self.bin}:{os.environ['PATH']}",
             FAKE_LOG=str(self.log),
+            FAKE_STATE=str(self.state),
+            FAKE_BROWSER_LOG=str(self.browser_log),
             FAKE_TAILSCALE_LOG=str(self.tailscale_log),
         )
-        self.write_program(self.home / ".local/bin/moonlight")
+        self.write_program(self.home / ".local/bin/moonlight", FAKE_MOONLIGHT)
         self.write_program(self.bin / "ssh")
+        for browser in ("xdg-open", "sensible-browser"):
+            self.write_program(self.bin / browser, FAKE_BROWSER)
         self.write_program(self.bin / "tailscale", FAKE_TAILSCALE)
         ssh_dir = self.home / ".ssh"
         ssh_dir.mkdir()
@@ -152,9 +244,9 @@ class RunServerTests(unittest.TestCase):
     def ssh_bytes(self) -> dict[str, bytes]:
         return {path.name: path.read_bytes() for path in sorted((self.home / ".ssh").iterdir())}
 
-    def invoke(self, *args: str, cwd: Path | None = None, stdin: str = "", exit_code: int = 0) -> subprocess.CompletedProcess[str]:
+    def invoke(self, *args: str, cwd: Path | None = None, stdin: str = "", exit_code: int = 0, extra_env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
         self.log.unlink(missing_ok=True)
-        env = dict(self.env, FAKE_EXIT=str(exit_code))
+        env = dict(self.env, FAKE_EXIT=str(exit_code), **(extra_env or {}))
         return subprocess.run(
             [str(self.module / "run_server.sh"), *args],
             cwd=cwd or self.root,
@@ -165,8 +257,29 @@ class RunServerTests(unittest.TestCase):
             check=False,
         )
 
+    def records(self) -> list[dict[str, object]]:
+        return [json.loads(line) for line in self.log.read_text().splitlines() if line.strip()]
+
     def recorded(self) -> dict[str, object]:
-        return json.loads(self.log.read_text())
+        return self.records()[-1]
+
+    def actions(self) -> list[str]:
+        return [str(record["argv"][1]) for record in self.records()]
+
+    def module_snapshot(self) -> dict[str, str]:
+        """Path -> digest of every file in the module copy, used to prove the
+        connector never writes pairing state (or anything else) beside the code."""
+        return {
+            str(path.relative_to(self.module)): hashlib.sha256(path.read_bytes()).hexdigest()
+            for path in sorted(self.module.rglob("*"))
+            if path.is_file()
+        }
+
+    def assert_no_browser(self) -> None:
+        self.assertFalse(
+            self.browser_log.exists(),
+            self.browser_log.read_text() if self.browser_log.exists() else "",
+        )
 
     def assert_no_program(self) -> None:
         self.assertFalse(self.log.exists(), self.log.read_text() if self.log.exists() else "")
@@ -534,6 +647,226 @@ machines:
                 result = self.invoke("desktop")
                 self.assertNotEqual(result.returncode, 0, result.stderr)
                 self.assert_no_program()
+
+    def test_already_paired_host_streams_without_pair_or_pin(self) -> None:
+        self.write_default()
+        result = self.invoke("desktop", stdin="stream stdin\n", exit_code=23)
+        self.assertEqual(result.returncode, 23, result.stderr)
+        self.assertEqual(self.actions(), ["list", "stream"])
+        self.assertEqual(self.records()[0]["argv"][1:], ["list", "--", "100.64.0.2:47989"])
+        self.assertEqual(self.records()[-1]["argv"][1:], ["stream", "--", "100.64.0.2:47989", "Desktop"])
+        self.assertEqual(self.records()[-1]["stdin"], "stream stdin\n")
+        self.assertNotIn("PIN", result.stdout + result.stderr)
+        self.assert_no_browser()
+        self.assert_no_tailscale()
+
+    def test_paired_host_without_desktop_prints_application_repair_steps(self) -> None:
+        self.write_default()
+        result = self.invoke("desktop", extra_env={"FAKE_NO_DESKTOP": "1"})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.actions(), ["list"])
+        self.assertIn("应用列表没有 Desktop", result.stderr)
+        self.assertIn("Applications", result.stderr)
+        self.assertNotIn("pair", result.stderr)
+        self.assert_no_browser()
+        self.assert_no_tailscale()
+
+    def test_unpaired_confirmation_without_desktop_never_streams(self) -> None:
+        self.write_default()
+        result = self.invoke(
+            "desktop",
+            extra_env={"FAKE_INITIAL_PAIRED": "0", "FAKE_NO_DESKTOP": "1"},
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.actions(), ["list", "pair", "list"])
+        self.assertIn("应用列表没有 Desktop", result.stderr)
+        self.assert_no_browser()
+        self.assert_no_tailscale()
+
+    def test_pre_stream_query_never_consumes_stdin(self) -> None:
+        # The classification query gets /dev/null; only the final stream exec inherits
+        # the caller's stdin, preserving the historical stream contract exactly.
+        self.write_default()
+        result = self.invoke("desktop", stdin="stream stdin\n", exit_code=23)
+        self.assertEqual(result.returncode, 23, result.stderr)
+        self.assertEqual(self.records()[0]["stdin"], "")
+        self.assertEqual(self.records()[-1]["stdin"], "stream stdin\n")
+
+    def test_unpaired_host_prints_pin_url_steps_then_pairs_confirms_and_streams(self) -> None:
+        inventory = self.write_default()
+        before = inventory.read_bytes()
+        module_before = self.module_snapshot()
+        result = self.invoke("desktop", extra_env={"FAKE_INITIAL_PAIRED": "0"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.actions(), ["list", "pair", "list", "stream"])
+        self.assertEqual(self.records()[0]["argv"][1:], ["list", "--", "100.64.0.2:47989"])
+
+        match = PIN.search(result.stderr)
+        self.assertIsNotNone(match, result.stderr)
+        pin = match.group(1)
+        self.assertRegex(pin, r"^\d{4}$")
+        # Exact Qt6.1 grammar: pair host is positional after `--`, --pin carries the PIN.
+        self.assertEqual(self.records()[1]["argv"][1:], ["pair", "--pin", pin, "--", "100.64.0.2:47989"])
+        # The confirmation list is a fresh query after pair, before stream.
+        self.assertEqual(self.records()[2]["argv"][1:], ["list", "--", "100.64.0.2:47989"])
+        self.assertEqual(self.records()[3]["argv"][1:], ["stream", "--", "100.64.0.2:47989", "Desktop"])
+
+        # Terminal guidance: target, Web UI (base+1), PIN, numbered remote/local steps.
+        self.assertIn("100.64.0.2:47989", result.stderr)
+        self.assertIn("https://100.64.0.2:47990", result.stderr)
+        for marker in ("本机 PIN:", "远端 Sunshine 网页操作", "本机 Moonlight 操作", "  1.", "  2.", "  3.", "  4.", "  5."):
+            self.assertIn(marker, result.stderr)
+        # Guidance precedes the pair child, so the user reads the steps before the GUI opens.
+        self.assertLess(result.stderr.index("本机 PIN:"), result.stderr.index("FAKE PAIR STARTED"))
+        self.assertIn("配对已确认", result.stderr)
+
+        # The PIN stays terminal-only: no inventory mutation, no new module files.
+        self.assertEqual(inventory.read_bytes(), before)
+        self.assertEqual(self.module_snapshot(), module_before)
+        self.assert_no_browser()
+        self.assert_no_tailscale()
+
+    def test_unpaired_custom_port_uses_base_port_and_base_plus_one_web_ui(self) -> None:
+        self.write_default()
+        result = self.invoke("laptop", extra_env={"FAKE_INITIAL_PAIRED": "0"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.actions(), ["list", "pair", "list", "stream"])
+        self.assertEqual(self.records()[0]["argv"][1:], ["list", "--", "100.64.0.3:48000"])
+        self.assertEqual(self.records()[1]["argv"][4:], ["--", "100.64.0.3:48000"])
+        self.assertEqual(self.records()[3]["argv"][1:], ["stream", "--", "100.64.0.3:48000", "Desktop"])
+        self.assertIn("https://100.64.0.3:48001", result.stderr)
+
+    def test_pair_without_confirmed_state_never_streams(self) -> None:
+        # A Qt GUI pairing failure dialog exits 0 after dismissal: exit status alone
+        # must never be treated as success, and no stream may start on a failed confirm.
+        for label, pair_exit in (("dismissed with exit 0", "0"), ("pair error exit 9", "9")):
+            with self.subTest(case=label):
+                self.write_default()
+                result = self.invoke(
+                    "desktop",
+                    extra_env={
+                        "FAKE_INITIAL_PAIRED": "0",
+                        "FAKE_PAIR_EFFECT": "none",
+                        "FAKE_PAIR_EXIT": pair_exit,
+                    },
+                )
+                self.assertNotEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(self.actions(), ["list", "pair", "list"])
+                self.assertIn("配对未完成", result.stderr)
+                self.assertIn(f"配对进程退出码: {pair_exit}", result.stderr)
+                self.assertIn("不能证明配对成功", result.stderr)
+                self.assert_no_browser()
+
+    def test_confirmation_list_is_the_pair_success_oracle(self) -> None:
+        # Conversely, a nonzero pair exit alone must not veto a host the fresh list
+        # reports as paired: the confirmation query is the authoritative signal.
+        self.write_default()
+        result = self.invoke("desktop", extra_env={"FAKE_INITIAL_PAIRED": "0", "FAKE_PAIR_EXIT": "9"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.actions(), ["list", "pair", "list", "stream"])
+
+    def test_zero_exit_with_unpaired_text_does_not_trigger_pair(self) -> None:
+        self.write_default()
+        result = self.invoke("desktop", extra_env={"FAKE_LIST_MODE": "unpaired-zero"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.actions(), ["list", "stream"])
+        self.assertNotIn("pair", result.stderr)
+
+    def test_unclassified_list_results_stop_before_pair_and_stream(self) -> None:
+        cases = (
+            ("network", "Failed to connect to 100.64.0.2"),
+            ("ambiguous", "moonlight: unexpected diagnostic"),
+            ("stdout-unknown", "QPA/display diagnostic on stdout"),
+            ("nonzero", None),
+        )
+        for mode, diagnostic in cases:
+            with self.subTest(mode=mode):
+                self.write_default()
+                result = self.invoke("desktop", extra_env={"FAKE_LIST_MODE": mode})
+                self.assertNotEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(self.actions(), ["list"])
+                self.assertIn("配对状态检查失败", result.stderr)
+                self.assertIn("未开始配对，也未启动串流", result.stderr)
+                self.assertIn("https://100.64.0.2:47990", result.stderr)
+                if diagnostic is None:
+                    self.assertNotIn("诊断输出", result.stderr)
+                else:
+                    self.assertIn(diagnostic, result.stderr)
+                self.assertNotIn("~/.local/bin/moonlight pair", result.stderr)
+                self.assert_no_browser()
+
+    def test_known_chinese_unpaired_diagnostic_is_classified(self) -> None:
+        # Moonlight translates the unpaired sentence from the configured language; the
+        # connector accepts the exact upstream zh_CN wording as a known diagnostic.
+        self.write_default()
+        result = self.invoke("desktop", extra_env={"FAKE_LIST_MODE": "unpaired-zh", "FAKE_INITIAL_PAIRED": "0"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.actions(), ["list", "pair", "list", "stream"])
+
+    def test_classification_query_is_locale_pinned_but_pair_and_stream_do_not_change_environment(self) -> None:
+        self.write_default()
+        result = self.invoke("desktop", extra_env={"FAKE_INITIAL_PAIRED": "0"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        records = self.records()
+        self.assertEqual(records[0]["lc_all"], "C")
+        self.assertEqual(records[1]["lc_all"], os.environ.get("LC_ALL"))
+        self.assertEqual(records[3]["lc_all"], os.environ.get("LC_ALL"))
+
+    def test_generated_pin_is_always_four_digits(self) -> None:
+        self.write_default()
+        for _ in range(4):
+            result = self.invoke(
+                "desktop",
+                extra_env={"FAKE_INITIAL_PAIRED": "0", "FAKE_PAIR_EFFECT": "none"},
+            )
+            match = PIN.search(result.stderr)
+            self.assertIsNotNone(match, result.stderr)
+            self.assertRegex(match.group(1), r"^\d{4}$")
+
+    def test_confirmation_list_failure_after_pair_never_streams(self) -> None:
+        # The pair action can return while the host becomes unreachable again; an
+        # unreadable confirmation must stop before stream, not stream on a guess.
+        self.write_default()
+        result = self.invoke(
+            "desktop",
+            extra_env={"FAKE_INITIAL_PAIRED": "0", "FAKE_LIST_SEQUENCE": "unpaired,network"},
+        )
+        self.assertNotEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.actions(), ["list", "pair", "list"])
+        self.assertIn("配对后确认失败", result.stderr)
+        self.assertIn("配对是否生效无法验证", result.stderr)
+        self.assertIn("Failed to connect to 100.64.0.2", result.stderr)
+
+    def test_missing_moonlight_wrapper_reports_missing_program(self) -> None:
+        (self.home / ".local/bin/moonlight").unlink()
+        self.write_default()
+        result = self.invoke("desktop")
+        self.assertEqual(result.returncode, 127, result.stderr)
+        self.assertIn("找不到本地可执行文件", result.stderr)
+        self.assert_no_program()
+
+class PinTests(unittest.TestCase):
+    """Direct CSPRNG shape checks; no processes, files, or environment fixtures."""
+
+    def test_generate_pin_formats_the_secure_draw_without_statistical_assumptions(self) -> None:
+        spec = importlib.util.spec_from_file_location("run_server_connector", MODULE / "service/run-server.py")
+        connector = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(connector)
+        draws = iter((0, 7, 42, 9999))
+        original = connector.secrets.randbelow
+
+        def fake_randbelow(upper: int) -> int:
+            self.assertEqual(upper, 10000)
+            return next(draws)
+
+        connector.secrets.randbelow = fake_randbelow
+        try:
+            self.assertEqual(
+                [connector.generate_pin() for _ in range(4)],
+                ["0000", "0007", "0042", "9999"],
+            )
+        finally:
+            connector.secrets.randbelow = original
 
 
 if __name__ == "__main__":
