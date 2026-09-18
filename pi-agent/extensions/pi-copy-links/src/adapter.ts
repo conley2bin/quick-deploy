@@ -25,7 +25,7 @@ interface FullscreenRuntime extends TUI {
   openUrl?: (url: string) => void;
   handleViewportInput(data: string): { consume?: boolean; data?: string } | undefined;
 }
-interface Frame { owner: MarkdownRuntime; blocks?: ReturnType<typeof codeBlocks>; entries?: CopyEntry[]; used: Set<number>; streaming?: boolean }
+interface Frame { owner: MarkdownRuntime; used: Set<number>; tracking: boolean; blocks?: ReturnType<typeof codeBlocks>; entries?: CopyEntry[]; streaming?: boolean }
 interface Press { url: string; x: number; y: number; line: string; width: number; height: number; moved: boolean }
 interface Release { bits: number; at: number; screen: string[]; width: number; height: number }
 export interface AdapterOptions {
@@ -58,7 +58,21 @@ export function installAdapter(options: AdapterOptions) {
   // Press feedback: reverse-video the actionable span while held, and flash the
   // copy button after a confirmed write. Rendering owns the visual state; input
   // events only flip these URLs and invalidate the tracked Markdown instances.
+  //
+  // Registration is not free bookkeeping: every WeakRef both lands in this Set
+  // and registers its target in V8's kept-objects list, which only drains at
+  // event-loop turn boundaries. V8 caps a Set at 2^24 entries and throws
+  // "RangeError: Set maximum size exceeded" past it, so registering on every
+  // render call kills the process with an uncaughtException thrown out of
+  // render() after sustained streaming. Register once per instance, so the
+  // collection stays bounded by the live Markdown instances.
   const tracked = new Set<WeakRef<MarkdownRuntime>>();
+  const registered = new WeakMap<MarkdownRuntime, WeakRef<MarkdownRuntime>>();
+  const RECOVERY_ATTEMPTS = 8;
+  const RECOVERY_DELAY_MS = 1000;
+  let trackingDisabled = false;
+  let recoveryAttempt = 0;
+  let recoveryTimer: ReturnType<typeof setTimeout> | undefined;
   let pressedUrl: string | undefined;
   let flashUrl: string | undefined;
   let flashTimer: ReturnType<typeof setTimeout> | undefined;
@@ -67,29 +81,68 @@ export function installAdapter(options: AdapterOptions) {
   // Our own press effect changes the pressed line. Neutralize exactly those two
   // SGR codes when gesture-checking frames so feedback does not cancel the click.
   const unpress = (line: string) => line.replaceAll("\x1b[7m", "").replaceAll("\x1b[27m", "");
-  function invalidateTracked(): void {
+  function refreshTracked(): void {
     for (const ref of tracked) {
       const owner = ref.deref();
       if (owner) owner.invalidate();
       else tracked.delete(ref);
     }
   }
+  /** Register once per live instance. False means the feature is suspended for now. */
+  function register(owner: MarkdownRuntime): boolean {
+    if (trackingDisabled) return false;
+    if (registered.has(owner)) return true;
+    let ref: WeakRef<MarkdownRuntime>;
+    try { ref = new WeakRef(owner); }
+    catch (error) {
+      // Exhaustion is process-wide and this runs while the TUI renders, so stop
+      // decorating instead of throwing: suspend the feature and probe for
+      // recovery on a later event-loop turn, when V8 has cleared its bookkeeping.
+      suspend(error instanceof Error ? error.message : String(error));
+      return false;
+    }
+    registered.set(owner, ref);
+    tracked.add(ref);
+    return true;
+  }
+  /** Disable the feature and arm a bounded recovery probe for a later event-loop turn. */
+  function suspend(reason: string): void {
+    if (trackingDisabled) return;
+    trackingDisabled = true;
+    if (recoveryTimer) clearTimeout(recoveryTimer);
+    recoveryTimer = undefined;
+    if (!enabled) return;
+    if (++recoveryAttempt > RECOVERY_ATTEMPTS) {
+      options.notify(`pi-copy-links 已停用：无法登记 Markdown 实例（${reason}）；请重启 Pi`, true);
+      return;
+    }
+    recoveryTimer = setTimeout(() => {
+      recoveryTimer = undefined;
+      if (!enabled) return;
+      try { new WeakRef({}); }
+      catch { suspend(reason); return; }
+      recoveryAttempt = 0;
+      trackingDisabled = false;
+      refreshTracked();
+      lastTui?.requestRender();
+    }, RECOVERY_DELAY_MS);
+  }
   function setPressed(url: string | undefined): void {
     if (pressedUrl === url) return;
     pressedUrl = url;
-    invalidateTracked();
+    refreshTracked();
     lastTui?.requestRender();
   }
   function flash(url: string): void {
     flashUrl = url;
-    invalidateTracked();
+    refreshTracked();
     lastTui?.requestRender();
     if (flashTimer) clearTimeout(flashTimer);
     flashTimer = setTimeout(() => {
       flashTimer = undefined;
       if (flashUrl === url) flashUrl = undefined;
       if (!enabled) return;
-      invalidateTracked();
+      refreshTracked();
       lastTui?.requestRender();
     }, options.flashMs ?? 450);
   }
@@ -101,15 +154,20 @@ export function installAdapter(options: AdapterOptions) {
 
   function render(this: MarkdownRuntime, width: number): string[] {
     if (!isActive()) return original.render.call(this, width);
-    tracked.add(new WeakRef(this));
-    frames.push({ owner: this, used: new Set() });
-    try { return original.render.call(this, width); }
-    finally { frames.pop(); }
+    // Keep one frame per render so the pop always matches the push, even when
+    // registration fails: an unregistered frame carries no blocks and therefore
+    // degrades to the untouched native rendering.
+    const frame: Frame = { owner: this, used: new Set(), tracking: false };
+    frames.push(frame);
+    try {
+      frame.tracking = register(this);
+      return original.render.call(this, width);
+    } finally { frames.pop(); }
   }
 
   function transform(source: string, context: MarkdownTransformContext): string {
     const frame = frames.at(-1);
-    if (isActive() && frame && context.messageType === "assistant") {
+    if (frame?.tracking && context.messageType === "assistant") {
       frame.blocks = codeBlocks(source);
       frame.streaming = context.isStreaming;
       frame.entries = store.set(frame.owner, frame.blocks.map((block) => block.value));
@@ -271,6 +329,8 @@ export function installAdapter(options: AdapterOptions) {
       enabled = false;
       if (flashTimer) clearTimeout(flashTimer);
       flashTimer = undefined;
+      if (recoveryTimer) clearTimeout(recoveryTimer);
+      recoveryTimer = undefined;
       pressedUrl = undefined;
       flashUrl = undefined;
       lastTui = undefined;

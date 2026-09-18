@@ -4,6 +4,24 @@ import { AssistantMessageComponent, getMarkdownTheme, initTheme, VERSION } from 
 import { getCapabilities, getOsc8LinkAtColumn, Markdown, setCapabilities, stripTerminalSequences, TuiAltScreen, visibleWidth, type Terminal } from "@earendil-works/pi-tui";
 import { installAdapter } from "../src/adapter.ts";
 
+// Count WeakRef constructions for every adapter installed below. V8 both caps a
+// Set at 2^24 entries and registers each WeakRef's target in a kept-objects list
+// that drains only at event-loop turn boundaries, so sustaining those
+// constructions from a render hook crashed Pi with
+// "RangeError: Set maximum size exceeded" thrown out of render().
+let weakRefCount = 0;
+let weakRefCalls = 0;
+const realWeakRef = WeakRef;
+let weakRefFails = false;
+globalThis.WeakRef = new Proxy(realWeakRef, {
+  construct(target, args: [object]) {
+    weakRefCalls += 1;
+    if (weakRefFails) throw new RangeError("Set maximum size exceeded");
+    weakRefCount += 1;
+    return Reflect.construct(target, args);
+  },
+}) as typeof WeakRef;
+
 initTheme("dark", false);
 
 class FakeTerminal implements Terminal {
@@ -70,6 +88,57 @@ test("native assistant buttons copy exact code, including nested tabs and no vis
       assert.equal(visibleWidth(screen(f.tui)[button.y]!), f.terminal.columns);
     } finally { f.close(); }
   }
+});
+
+test("rendering an instance any number of times allocates at most one WeakRef", () => {
+  // Regression: the hook used to run `tracked.add(new WeakRef(this))` on every
+  // render call. V8 caps a Set at 2^24 entries, so sustained streaming killed the
+  // process with "RangeError: Set maximum size exceeded" thrown out of render().
+  const f = fixture('```sh\necho first\n```\n\nprose\n\n```sh\necho second\n```');
+  try {
+    const mounted = weakRefCount;
+    for (let pass = 0; pass < 100_000; pass++) f.tui.renderNow();
+    assert.equal(weakRefCount, mounted, "100k renders of one mounted instance allocate no WeakRef");
+    f.tui.scrollToTop(); f.terminal.columns = 40;
+    for (let pass = 0; pass < 50; pass++) f.tui.renderNow();
+    assert.equal(weakRefCount, mounted, "scroll and resize re-render without allocating");
+    f.component.invalidate();
+    f.tui.renderNow();
+    // Pi rebuilds the component's Markdown children inside updateContent, so one
+    // invalidated message legitimately yields one registration per content block —
+    // never one per render.
+    const rebuilt = weakRefCount - mounted;
+    assert.ok(rebuilt > 0 && rebuilt <= 3, `invalidation rebuilds at most one ref per content block, got ${rebuilt}`);
+    for (let pass = 0; pass < 50; pass++) f.tui.renderNow();
+    assert.equal(weakRefCount, mounted + rebuilt, "the rebuilt instances then stop allocating");
+    const point = target(f.tui, 'pi-copy://');
+    f.terminal.input(sgr(point.x, point.y)); f.tui.renderNow();
+    assert.equal(weakRefCount, mounted + rebuilt, "press feedback allocates no WeakRef");
+    assert.equal(target(f.tui, 'pi-copy://').url, point.url, "buttons stay tied to their blocks after 100k renders");
+  } finally { f.close(); }
+});
+
+test("exhausted V8 WeakRef capacity degrades to plain Markdown instead of crashing", async (t) => {
+  // The process-wide 2^24 ceiling is not ours, but crossing it inside a render
+  // hook used to kill Pi with an uncaughtException. It has to degrade instead.
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const f = fixture('```sh\necho x\n```');
+  const buttons = () => /pi-copy:\/\//.test(screen(f.tui).join("\n"));
+  try {
+    weakRefFails = true;
+    const before = weakRefCalls;
+    f.component.invalidate();
+    assert.doesNotThrow(() => f.tui.renderNow(), "a render survives a WeakRef construction failure");
+    assert.ok(weakRefCalls > before, "the exhausted construction was attempted");
+    assert.equal(buttons(), false, "the feature degrades to plain Markdown");
+    weakRefFails = false;
+    t.mock.timers.tick(1000);
+    f.component.invalidate();
+    f.tui.renderNow();
+    assert.equal(buttons(), true, "the feature recovers once the construction succeeds again");
+    click(f.terminal, target(f.tui, 'pi-copy://')); await tick();
+    assert.deepEqual(f.copied, ['echo x'], "the recovered button still copies the exact block");
+  } finally { weakRefFails = false; f.close(); }
 });
 
 test("Ctrl-click opens original wrapped Markdown URL; normal click and drag do not", async () => {
