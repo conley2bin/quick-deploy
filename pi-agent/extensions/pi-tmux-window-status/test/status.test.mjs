@@ -3,11 +3,11 @@ import { afterEach, test } from "node:test";
 import { existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, readlinkSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { HEARTBEAT_MS, LEASE_TTL_MS, acquireAnimatorLock, aggregateLogicalState, leasePath, projectAsyncStatus, publishLease, readLease, releaseAnimatorLock, seedAttentionWatermarksFromSnapshot, windowLeaseStates } from "../state.mjs";
-import { animatorSpawnNeeded, childFromStartedPayload, childStillRunning, classifyModelUnavailable, defaultAsyncRoot, isRetryExhaustedAbort, mergedChildSnapshot, monitorNeeded, nestedProjectionFromChildren, nestedPublisherDisabled, nextLastAssistantErrorMatched, nextModelErrorState, readNestedRegistryProjection, restoredChildren, sessionIdOf, validateNestedRoute } from "../index.ts";
-import { ERROR_BG, ERROR_FG, ERROR_MS, FRAME_BLUE, FRAME_COUNT, FRAME_MS, FRAMES, GRAY_RANGE, MAX_CONSECUTIVE_FAILURES, PERIOD_MS, activeWindows, frameAt, isDirectExecution, leaseWindowStates, listClients, runAnimator, sweepWindows, windowOptionArgs } from "../animator.mjs";
+import { CANCEL_SENTINEL, RECOVERY_ARMED_OPTION, animatorSpawnNeeded, childFromStartedPayload, childStillRunning, classifyModelUnavailable, defaultAsyncRoot, isManualEscapePress, isRetryExhaustedAbort, mergedChildSnapshot, monitorNeeded, nestedProjectionFromChildren, nestedPublisherDisabled, nextLastAssistantErrorMatched, nextModelErrorState, readNestedRegistryProjection, recoveryTerminalInput, restoredChildren, sessionIdOf, validateNestedRoute } from "../index.ts";
+import { ANIMATOR_URGENT_SIGNAL, ERROR_BG, ERROR_FG, ERROR_MS, FRAME_BLUE, FRAME_COUNT, FRAME_MS, FRAMES, GRAY_RANGE, MAX_CONSECUTIVE_FAILURES, PERIOD_MS, activeWindows, frameAt, isDirectExecution, leaseWindowStates, listClients, listRecoveryArmedPanes, paneRecoveryOptionArgs, requestAnimatorTick, runAnimator, sweepWindows, windowOptionArgs } from "../animator.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT = resolve(HERE, "../../../..");
@@ -16,6 +16,7 @@ const temp = () => { const d = mkdtempSync(join(tmpdir(), "pi-tmux-status-")); t
 afterEach(() => { while (trash.length) rmSync(trash.pop(), { recursive: true, force: true }); });
 const withoutTmuxEnvironment = (source = process.env) => Object.fromEntries(Object.entries(source).filter(([key]) => key !== "TMUX" && !key.startsWith("TMUX_")));
 const isolatedTmux = (args, options = {}) => { const { env = process.env, ...rest } = options; return execFileSync("tmux", args, { ...rest, env: withoutTmuxEnvironment(env) }); };
+const inertUrgent = () => () => {};
 const styledCells = (value) => {
   const line = String(value).split("\n")[0];
   const cells = [], style = { fg: undefined, bg: undefined };
@@ -39,6 +40,64 @@ const styledCells = (value) => {
 };
 const ident = (socket = "/tmp/tmux-status") => ({ socketPath: socket, windowId: "@8", paneId: "%9" });
 const real = (runId = "root", lastActivityAt = 100, state = "running", steps = []) => ({ runId, state, lastUpdate: lastActivityAt, steps });
+const waitFor = async (read, expected, timeoutMs = 1_500) => {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (read() === expected) return;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  assert.equal(read(), expected);
+};
+let harnessSequence = 0;
+async function statusHarness(label) {
+  const runtime = temp(), work = temp(), socket = join(work, "server.sock");
+  const tmux = (args, options = {}) => isolatedTmux(args, options);
+  tmux(["-S", socket, "-f", join(process.env.HOME, ".tmux.conf"), "new-session", "-d", "-s", label]);
+  const paneId = tmux(["-S", socket, "display-message", "-p", "#{pane_id}"], { encoding: "utf8" }).trim();
+  const handlers = {}, sent = [];
+  let terminalInput, terminalInputUnsubscribed = 0, currentSignal;
+  const ctx = {
+    mode: "tui",
+    ui: { onTerminalInput: (handler) => { terminalInput = handler; return () => { terminalInputUnsubscribed += 1; }; } },
+    get signal() { return currentSignal; },
+    isIdle: () => true,
+    hasPendingMessages: () => false,
+    sessionManager: { getSessionFile: () => `/home/tester/.pi/agent/sessions/sanitized/${label}.jsonl` },
+  };
+  const pi = {
+    on: (name, fn) => { (handlers[name] ||= []).push(fn); },
+    events: { on: () => () => {} },
+    sendUserMessage: (content) => sent.push(content),
+  };
+  const fire = (name, ...args) => (handlers[name] || []).map((fn) => fn(...args));
+  const env = { QUICK_DEPLOY_PI_TMUX_WINDOW_STATUS_RUNTIME: runtime, TMUX_PANE: paneId, TMUX: `${socket},0,0` };
+  const origEnv = { ...process.env };
+  Object.assign(process.env, env);
+  try {
+    const mod = await import(`../index.ts?status-harness-${label}-${++harnessSequence}`);
+    mod.default(pi);
+    fire("session_start", {}, ctx);
+  } catch (error) {
+    Object.keys(process.env).forEach((key) => { if (!(key in origEnv)) delete process.env[key]; });
+    Object.assign(process.env, origEnv);
+    tmux(["-S", socket, "kill-server"]);
+    throw error;
+  }
+  return {
+    handlers, sent, ctx, fire,
+    get terminalInput() { return terminalInput; },
+    setSignal(signal) { currentSignal = signal; },
+    errorOption: () => tmux(["-S", socket, "show-options", "-wqv", "@quick_deploy_pi_error"], { encoding: "utf8" }).trim(),
+    paneArmed: () => tmux(["-S", socket, "show-options", "-pqv", "-t", paneId, RECOVERY_ARMED_OPTION], { encoding: "utf8" }).trim(),
+    async cleanup() {
+      fire("session_shutdown", {}, ctx);
+      assert.equal(terminalInputUnsubscribed, 1, "session shutdown releases the raw input listener");
+      Object.keys(process.env).forEach((key) => { if (!(key in origEnv)) delete process.env[key]; });
+      Object.assign(process.env, origEnv);
+      try { tmux(["-S", socket, "kill-server"]); } catch {}
+    },
+  };
+}
 
 test("24-frame breathing palette starts at idle baseline and hits symmetric perceptual ranges", () => {
   assert.equal(FRAMES.length, FRAME_COUNT);
@@ -79,6 +138,51 @@ test("nested child publishers are disabled while root publishers remain enabled"
   assert.equal(nestedPublisherDisabled({ PI_SUBAGENT_DEPTH: "1" }), true);
   assert.equal(nestedPublisherDisabled({ PI_SUBAGENT_DEPTH: "0" }), false);
   assert.equal(nestedPublisherDisabled({}), false);
+});
+
+test("manual Esc detection accepts terminal press encodings without matching releases or modifiers", () => {
+  for (const data of ["\x1b", "\x1b[27u", "\x1b[27;1u", "\x1b[27;1:1u", "\x1b[27;1:2u", "\x1b[27;65u", "\x1b[27;1;27~"]) {
+    assert.equal(isManualEscapePress(data), true, JSON.stringify(data));
+  }
+  for (const data of ["\x1b[27;1:3u", "\x1b[27;3u", "\x1b[27;3;27~", "\x1b[A", "x"]) {
+    assert.equal(isManualEscapePress(data), false, JSON.stringify(data));
+  }
+});
+
+test("terminal cancellation consumes only the sentinel and leaves raw Esc as passthrough fallback", () => {
+  let cancellations = 0;
+  assert.deepEqual(recoveryTerminalInput(CANCEL_SENTINEL, () => { cancellations += 1; }), { consume: true });
+  assert.equal(recoveryTerminalInput("\x1b", () => { cancellations += 1; }), undefined);
+  assert.equal(recoveryTerminalInput("x", () => { cancellations += 1; }), undefined);
+  assert.equal(cancellations, 2);
+});
+
+test("installed fullscreen search consumes real Esc only after the private sentinel cancels recovery", async () => {
+  const npmRoot = execFileSync("npm", ["root", "-g"], { encoding: "utf8" }).trim();
+  const piPackage = join(npmRoot, "@earendil-works/pi-coding-agent");
+  const tuiRoot = join(piPackage, "node_modules/@earendil-works/pi-tui/dist");
+  const [{ TuiAltScreen }, { StdinBuffer }] = await Promise.all([
+    import(pathToFileURL(join(tuiRoot, "tui-alt-screen.js")).href),
+    import(pathToFileURL(join(tuiRoot, "stdin-buffer.js")).href),
+  ]);
+  const terminal = { columns: 80, rows: 24, write() {}, hideCursor() {}, showCursor() {}, start() {}, stop() {}, setTitle() {}, setProgress() {} };
+  const tui = new TuiAltScreen(terminal, false);
+  tui.requestRender = () => {};
+  const seen = [];
+  let cancellations = 0;
+  tui.addInputListener((data) => { seen.push(data); return recoveryTerminalInput(data, () => { cancellations += 1; }); });
+  tui.toggleSearch();
+  assert.equal(tui.activeSearch?.overlay?.isFocused(), true, "installed fullscreen search owns Esc before extension listeners");
+
+  const buffer = new StdinBuffer({ escapeTimeout: 1 });
+  buffer.on("data", (data) => tui.handleTerminalInput(data));
+  buffer.process(CANCEL_SENTINEL + "\x1b");
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  buffer.destroy();
+
+  assert.equal(cancellations, 1, "sentinel reaches and cancels through the actual installed listener chain");
+  assert.deepEqual(seen, [CANCEL_SENTINEL], "the earlier viewport listener consumes the real search-closing Esc");
+  assert.equal(tui.activeSearch, undefined, "the same first real Esc still closes fullscreen search");
 });
 
 test("model/provider unavailable classifier accepts provider failures and rejects non-availability errors", () => {
@@ -382,6 +486,7 @@ test("multiple owners aggregate active/error leases with backcompat and expiry",
   const states = windowLeaseStates(root, 2);
   assert.deepEqual([...states.error], ["@8"], "error wins over active owners in the same window");
   assert.deepEqual([...states.active], ["@10"], "legacy lease without state remains active for rolling compatibility");
+  assert.deepEqual([...states.errorPanes], ["%10"], "pane routing ownership comes only from live error leases");
   assert.deepEqual([...activeWindows(root, 2)], ["@10"]);
   const lease = readLease(leasePath(i, "error", env), 2);
   assert.equal(lease.state, "error");
@@ -390,7 +495,10 @@ test("multiple owners aggregate active/error leases with backcompat and expiry",
   const mixed = leaseWindowStates(root, 3);
   assert.deepEqual([...mixed.error], ["@8"]);
   assert.deepEqual([...mixed.active], ["@9", "@10"]);
-  assert.equal(windowLeaseStates(root, LEASE_TTL_MS + 2).error.size, 0);
+  assert.deepEqual([...mixed.errorPanes], ["%10"]);
+  const expired = windowLeaseStates(root, LEASE_TTL_MS + 2);
+  assert.equal(expired.error.size, 0);
+  assert.equal(expired.errorPanes.size, 0, "expired publisher cannot retain pane authorization");
 });
 
 test("animator respawn guard treats signal-killed child as exited and spawns a replacement", () => {
@@ -463,18 +571,30 @@ test("process-owned animator lock uses atomic hard-link, cleans up temp, and rej
   releaseAnimatorLock(eexLock, "winner");
 });
 
+test("urgent animator request targets the validated lock owner with safe SIGWINCH", () => {
+  const runtime = temp(), env = { QUICK_DEPLOY_PI_TMUX_WINDOW_STATUS_RUNTIME: runtime }, i = ident("/tmp/urgent-socket"), root = join(runtime, "quick-deploy", "pi-tmux-status", Buffer.from(i.socketPath).toString("base64url"));
+  mkdirSync(root, { recursive: true });
+  writeFileSync(join(root, "animator.lock"), JSON.stringify({ pid: 4321, token: "owner" }));
+  const calls = [];
+  assert.equal(requestAnimatorTick(i, env, (pid, signal) => { calls.push({ pid, signal }); }), true);
+  assert.deepEqual(calls, [{ pid: 4321, signal: ANIMATOR_URGENT_SIGNAL }]);
+  writeFileSync(join(root, "animator.lock"), JSON.stringify({ pid: 0, token: "bad" }));
+  assert.equal(requestAnimatorTick(i, env, () => { throw new Error("must not signal"); }), false);
+  assert.equal(ANIMATOR_URGENT_SIGNAL, "SIGWINCH", "older animators ignore the urgent signal instead of being terminated");
+});
+
 test("animator gives up after consecutive failed frames and releases the lock", () => {
   const runtime = temp(), env = { QUICK_DEPLOY_PI_TMUX_WINDOW_STATUS_RUNTIME: runtime }, i = ident("/tmp/socket"), root = join(runtime, "quick-deploy", "pi-tmux-status", Buffer.from(i.socketPath).toString("base64url"));
   publishLease(i, "a", "active", 100, env);
   const exec = () => { const e = new Error("no server running"); e.status = 1; throw e; };
   const delays = [];
-  const a = runAnimator({ socketPath: i.socketPath, root, now: () => 0, wallNow: () => 100, intervalMs: FRAME_MS, errorIntervalMs: ERROR_MS, exec, schedule: (_fn, delay) => { delays.push(delay); return { unref() {} }; }, cancel: () => {} });
+  const a = runAnimator({ socketPath: i.socketPath, root, now: () => 0, wallNow: () => 100, intervalMs: FRAME_MS, errorIntervalMs: ERROR_MS, exec, schedule: (_fn, delay) => { delays.push(delay); return { unref() {} }; }, cancel: () => {}, subscribeUrgent: inertUrgent });
   assert.ok(a.started);
   assert.equal(acquireAnimatorLock(join(root, "animator.lock")).owner, false, "lock is held while retrying");
   assert.equal(delays.at(-1), ERROR_MS, "failed frame retries at the slow reconciliation cadence");
   for (let n = 1; n < MAX_CONSECUTIVE_FAILURES; n++) a.tick();
   assert.equal(existsSync(join(root, "animator.lock")), false, "lock file is removed after MAX_CONSECUTIVE_FAILURES failed frames");
-  const recovered = runAnimator({ socketPath: i.socketPath, root, now: () => 0, wallNow: () => 100, intervalMs: FRAME_MS, errorIntervalMs: ERROR_MS, exec, schedule: (_fn, delay) => { delays.push(delay); return { unref() {} }; }, cancel: () => {} });
+  const recovered = runAnimator({ socketPath: i.socketPath, root, now: () => 0, wallNow: () => 100, intervalMs: FRAME_MS, errorIntervalMs: ERROR_MS, exec, schedule: (_fn, delay) => { delays.push(delay); return { unref() {} }; }, cancel: () => {}, subscribeUrgent: inertUrgent });
   assert.ok(recovered.started, "a fresh animator can acquire the lock and retry right away");
 });
 
@@ -483,7 +603,7 @@ test("animator counts only consecutive failures: one success resets the give-up 
   publishLease(i, "a", "active", 100, env);
   let failing = true;
   const exec = () => { if (failing) { const e = new Error("no server running"); e.status = 1; throw e; } return ""; };
-  const a = runAnimator({ socketPath: i.socketPath, root, now: () => 0, wallNow: () => 100, intervalMs: FRAME_MS, errorIntervalMs: ERROR_MS, exec, schedule: () => ({ unref() {} }), cancel: () => {} });
+  const a = runAnimator({ socketPath: i.socketPath, root, now: () => 0, wallNow: () => 100, intervalMs: FRAME_MS, errorIntervalMs: ERROR_MS, exec, schedule: () => ({ unref() {} }), cancel: () => {}, subscribeUrgent: inertUrgent });
   assert.ok(a.started);
   failing = false; a.tick();
   failing = true;
@@ -497,9 +617,9 @@ test("animator batches active/error transitions, cadences, resets, and cached cl
   const runtime = temp(), env = { QUICK_DEPLOY_PI_TMUX_WINDOW_STATUS_RUNTIME: runtime }, i = ident("/tmp/socket"), root = join(runtime, "quick-deploy", "pi-tmux-status", Buffer.from(i.socketPath).toString("base64url"));
   publishLease(i, "a", "active", 100, env);
   const calls = [], delays = [];
-  let mono = 0, wall = 100, listCount = 0;
+  let mono = 0, wall = 100, listCount = 0, urgentHandler, urgentUnsubscribed = 0;
   const exec = (_tmux, args) => { calls.push(args); if (args.includes("list-clients")) { listCount++; if (listCount === 2) { const e = new Error("stale"); e.status = 1; throw e; } return "c1\nc2\n"; } if (args.includes("list-windows")) return "@8\n@9\n"; return ""; };
-  const a = runAnimator({ socketPath: i.socketPath, root, now: () => mono, wallNow: () => wall, intervalMs: FRAME_MS, errorIntervalMs: ERROR_MS, exec, schedule: (_fn, delay) => { delays.push(delay); return { unref() {} }; }, cancel: () => {} });
+  const a = runAnimator({ socketPath: i.socketPath, root, now: () => mono, wallNow: () => wall, intervalMs: FRAME_MS, errorIntervalMs: ERROR_MS, exec, schedule: (_fn, delay) => { delays.push(delay); return { unref() {} }; }, cancel: () => {}, subscribeUrgent: (handler) => { urgentHandler = handler; return () => { urgentUnsubscribed += 1; }; } });
   assert.ok(a.started);
   let frameBatches = calls.filter((args) => args.includes("set-option"));
   assert.ok(frameBatches.at(-1).includes(FRAMES[0]));
@@ -513,6 +633,8 @@ test("animator batches active/error transitions, cadences, resets, and cached cl
   wall = 600; a.tick();
   assert.equal(delays.at(-1), ERROR_MS, "error-only uses slow reconciliation cadence");
   assert.ok(calls.at(-1).includes("@quick_deploy_pi_error"));
+  assert.ok(calls.at(-1).includes(RECOVERY_ARMED_OPTION));
+  assert.ok(calls.at(-1).includes("-pq"), "error frame atomically publishes pane ownership");
   assert.ok(calls.at(-1).includes("1"));
   publishLease({ ...i, windowId: "@9" }, "b", "active", 700, env);
   wall = 700; a.tick();
@@ -523,9 +645,65 @@ test("animator batches active/error transitions, cadences, resets, and cached cl
   assert.equal(listCount, 2, "stale zero-client refresh is tolerated for one update");
   publishLease(i, "a", false, 1300, env);
   publishLease({ ...i, windowId: "@9" }, "b", false, 1300, env);
-  wall = 1300; a.tick();
+  wall = 1300; urgentHandler();
   assert.ok(calls.some((args) => args.includes("-uw") && args.includes("@quick_deploy_pi_error")));
+  assert.ok(calls.some((args) => args.includes("-upq") && args.includes(RECOVERY_ARMED_OPTION)), "same animator clears stale pane ownership");
+  assert.equal(urgentUnsubscribed, 1, "stop removes the urgent signal listener");
   assert.equal(acquireAnimatorLock(join(root, "animator.lock")).owner, true);
+});
+
+test("partial tmux batch failure retains attempted window and pane cleanup responsibility", async () => {
+  const runtime = temp(), work = temp(), socket = join(work, "server.sock"), env = { QUICK_DEPLOY_PI_TMUX_WINDOW_STATUS_RUNTIME: runtime };
+  const tmuxEnv = withoutTmuxEnvironment({ ...process.env, ...env });
+  const tmux = (args, options = {}) => execFileSync("tmux", args, { env: tmuxEnv, ...options });
+  tmux(["-S", socket, "-f", "/dev/null", "new-session", "-d", "-s", "partial-batch"]);
+  const paneB = tmux(["-S", socket, "display-message", "-p", "#{pane_id}"], { encoding: "utf8" }).trim();
+  const windowB = tmux(["-S", socket, "display-message", "-p", "#{window_id}"], { encoding: "utf8" }).trim();
+  const [paneA, windowA] = tmux(["-S", socket, "new-window", "-dP", "-F", "#{pane_id}|#{window_id}", "-t", "partial-batch:"], { encoding: "utf8" }).trim().split("|");
+  const first = { socketPath: socket, windowId: windowA, paneId: paneA }, second = { socketPath: socket, windowId: windowB, paneId: paneB };
+  let wall = Date.now(), animator, client;
+  publishLease(second, "root-b", "error", wall, env);
+  const marker = (pane) => tmux(["-S", socket, "show-options", "-pqv", "-t", pane, RECOVERY_ARMED_OPTION], { encoding: "utf8" }).trim();
+  const red = (window) => tmux(["-S", socket, "show-options", "-wqv", "-t", window, "@quick_deploy_pi_error"], { encoding: "utf8" }).trim();
+  try {
+    client = spawn("tmux", ["-C", "-S", socket, "attach-session", "-t", "partial-batch"], { env: tmuxEnv, stdio: ["pipe", "ignore", "ignore"] });
+    await waitFor(() => { try { return tmux(["-S", socket, "list-clients", "-F", "#{client_name}"], { encoding: "utf8" }).trim() ? "attached" : ""; } catch { return ""; } }, "attached");
+    const root = join(runtime, "quick-deploy", "pi-tmux-status", Buffer.from(socket).toString("base64url"));
+    animator = runAnimator({ socketPath: socket, root, wallNow: () => wall, schedule: () => ({ unref() {} }), cancel: () => {}, subscribeUrgent: inertUrgent });
+    assert.equal(animator.started, true);
+    assert.equal(marker(paneB), "1");
+
+    publishLease(first, "root-a", "error", wall, env);
+    const clientExited = new Promise((resolve) => client.once("exit", resolve));
+    client.kill("SIGTERM");
+    await clientExited;
+    const originalError = console.error; console.error = () => {};
+    try { animator.tick(); } finally { console.error = originalError; }
+    assert.equal(marker(paneA), "1", "marker command applied before trailing stale-client refresh failed");
+    assert.equal(red(windowA), "1", "new window target was also partially applied");
+    assert.equal(marker(paneB), "1");
+
+    publishLease(first, "root-a", false, wall, env);
+    wall += 1_100;
+    animator.tick();
+    assert.equal(marker(paneA), "", "successful retry clears attempted A pane after its lease removal");
+    assert.equal(red(windowA), "", "successful retry clears attempted A window");
+    assert.equal(marker(paneB), "1", "live B ownership survives cleanup");
+    assert.equal(red(windowB), "1");
+    animator.tick();
+    assert.equal(marker(paneA), "", "repeated reconciliation cannot strand A");
+    animator.stop();
+    assert.equal(marker(paneA), "");
+    assert.equal(marker(paneB), "", "stop clears the remaining pane responsibility set");
+    assert.equal(red(windowA), "");
+    assert.equal(red(windowB), "", "stop clears the remaining window responsibility set");
+  } finally {
+    if (client?.exitCode === null) client.kill("SIGKILL");
+    animator?.stop?.();
+    publishLease(first, "root-a", false, Date.now(), env);
+    publishLease(second, "root-b", false, Date.now(), env);
+    try { tmux(["-S", socket, "kill-server"]); } catch {}
+  }
 });
 
 test("auto-continue classifier additions cover terminated, weekly quota, mixed and cloudflare errors", () => {
@@ -540,62 +718,136 @@ test("auto-continue classifier additions cover terminated, weekly quota, mixed a
   assert.equal(classifyModelUnavailable(assistantError("the task terminated normally")), false);
 });
 
-test("auto-continue schedules on idle model error, respects cancel/cap/throttle, and never clears red", async () => {
-  const runtime = temp(), work = temp(), socket = join(work, "server.sock");
-  const tmux = (args, options = {}) => isolatedTmux(args, options);
-  tmux(["-S", socket, "-f", join(process.env.HOME, ".tmux.conf"), "new-session", "-d", "-s", "auto-continue"]);
-  const windowId = tmux(["-S", socket, "display-message", "-p", "#{window_id}"], { encoding: "utf8" }).trim();
-  const paneId = tmux(["-S", socket, "display-message", "-p", "#{pane_id}"], { encoding: "utf8" }).trim();
-  const handlers = {};
-  const sent = [];
-  let idle = true, pending = false;
-  const ctx = { isIdle: () => idle, hasPendingMessages: () => pending, sessionManager: { getSessionFile: () => "/home/tester/.pi/agent/sessions/sanitized/session.jsonl" } };
-  const pi = {
-    on: (name, fn) => { (handlers[name] ||= []).push(fn); },
-    events: { on: () => () => {} },
-    sendUserMessage: (content) => sent.push(content),
-  };
-  const env = { QUICK_DEPLOY_PI_TMUX_WINDOW_STATUS_RUNTIME: runtime, TMUX_PANE: paneId, TMUX: `${socket},0,0` };
-  const origEnv = { ...process.env };
-  Object.assign(process.env, env);
+test("sentinel cancellation invalidates delayed events from one run while a distinct run auto-continues", async () => {
+  const h = await statusHarness("delayed-cancel");
+  const firstRun = new AbortController(), secondRun = new AbortController(), thirdRun = new AbortController();
+  const errMsg = { role: "assistant", stopReason: "error", errorMessage: "stream_read_error" };
   try {
-    const mod = await import("../index.ts?auto-continue-test");
-    mod.default(pi);
-    const fire = (name, ...args) => { for (const fn of handlers[name] || []) fn(...args); };
-    const errMsg = { role: "assistant", stopReason: "error", errorMessage: "stream_read_error" };
-    fire("message_end", { message: errMsg });
-    assert.deepEqual(sent, [], "no continue before settle");
-    idle = true; pending = false;
-    fire("agent_settled", {}, ctx);
-    await new Promise((r) => setTimeout(r, 350));
-    assert.deepEqual(sent, ["continue"], "debounced continue sent once on idle model error");
-    const bg = tmux(["-S", socket, "show-options", "-wqv", "@quick_deploy_pi_error"], { encoding: "utf8" }).trim();
-    assert.equal(bg, "1", "auto-continue keeps red error latch");
-    // input cancels pending continue
-    fire("message_end", { message: errMsg });
-    idle = true; pending = false;
-    fire("agent_settled", {}, ctx);
-    fire("input", { text: "user typed" });
-    await new Promise((r) => setTimeout(r, 350));
-    assert.equal(sent.length, 1, "input during debounce cancels");
-    // agent_start cancels
-    fire("message_end", { message: errMsg });
-    idle = true; pending = false;
-    fire("agent_settled", {}, ctx);
-    fire("agent_start", {}, ctx);
-    await new Promise((r) => setTimeout(r, 350));
-    assert.equal(sent.length, 1, "agent_start during debounce cancels");
-    // success resets streak and clears red
-    fire("message_end", { message: { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "ok" }] } });
-    idle = true;
-    fire("agent_settled", {}, ctx);
-    await new Promise((r) => setTimeout(r, 350));
-    assert.equal(sent.length, 1, "success does not auto-continue");
+    h.setSignal(firstRun.signal);
+    h.fire("agent_start", {}, h.ctx);
+    h.fire("message_update", { message: errMsg }, h.ctx);
+    await waitFor(h.paneArmed, "1");
+    await waitFor(h.errorOption, "1");
+
+    let releaseDelayed;
+    const delayedGate = new Promise((resolve) => { releaseDelayed = resolve; });
+    const delayedDispatch = (async () => {
+      await delayedGate;
+      h.handlers.message_update[0]({ message: errMsg }, h.ctx);
+      return h.handlers.message_end[0]({ message: errMsg }, h.ctx);
+    })();
+
+    assert.deepEqual(h.terminalInput(CANCEL_SENTINEL), { consume: true }, "only the private sentinel is consumed");
+    firstRun.abort();
+    await waitFor(h.paneArmed, "");
+    releaseDelayed();
+    await delayedDispatch;
+    h.fire("agent_settled", {}, h.ctx);
+    await new Promise((resolve) => setTimeout(resolve, 350));
+    assert.deepEqual(h.sent, [], "same-signal delayed message_end cannot re-arm or send");
+    assert.equal(h.paneArmed(), "");
+    await waitFor(h.errorOption, "");
+
+    h.setSignal(secondRun.signal);
+    h.fire("agent_start", {}, h.ctx);
+    h.fire("message_end", { message: errMsg }, h.ctx);
+    await waitFor(h.paneArmed, "1");
+    h.fire("agent_settled", {}, h.ctx);
+    await new Promise((resolve) => setTimeout(resolve, 350));
+    assert.deepEqual(h.sent, ["continue"], "distinct uncancelled run follows normal auto-continue");
+    await waitFor(h.errorOption, "1");
+
+    assert.deepEqual(h.terminalInput(CANCEL_SENTINEL), { consume: true });
+    h.setSignal(thirdRun.signal);
+    h.fire("agent_start", {}, h.ctx);
+    h.fire("message_end", { message: errMsg }, h.ctx);
+    h.fire("agent_settled", {}, h.ctx);
+    await new Promise((resolve) => setTimeout(resolve, 350));
+    assert.deepEqual(h.sent, ["continue"], "Esc does not reset the existing 30 s send throttle");
   } finally {
-    Object.keys(process.env).forEach((k) => { if (!(k in origEnv)) delete process.env[k]; });
-    Object.assign(process.env, origEnv);
-    for (const fn of handlers["session_shutdown"] || []) fn({ type: "session_shutdown" }, ctx);
-    tmux(["-S", socket, "kill-server"]);
+    await h.cleanup();
+  }
+});
+
+test("input and agent_start cancel pending continue while success clears error ownership", async () => {
+  const h = await statusHarness("existing-cancellations");
+  const run1 = new AbortController(), run2 = new AbortController(), run3 = new AbortController();
+  const errMsg = { role: "assistant", stopReason: "error", errorMessage: "stream_read_error" };
+  try {
+    h.setSignal(run1.signal);
+    h.fire("agent_start", {}, h.ctx);
+    h.fire("message_end", { message: errMsg }, h.ctx);
+    h.fire("agent_settled", {}, h.ctx);
+    h.fire("input", { text: "user typed" }, h.ctx);
+    await new Promise((resolve) => setTimeout(resolve, 350));
+    assert.deepEqual(h.sent, [], "submitted input cancels the debounce before any send");
+    assert.equal(h.paneArmed(), "1", "ordinary input cancellation preserves the existing red latch");
+
+    h.setSignal(run2.signal);
+    h.fire("agent_start", {}, h.ctx);
+    h.fire("message_end", { message: errMsg }, h.ctx);
+    h.fire("agent_settled", {}, h.ctx);
+    h.setSignal(run3.signal);
+    h.fire("agent_start", {}, h.ctx);
+    h.fire("message_end", { message: { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "ok" }] } }, h.ctx);
+    h.fire("agent_settled", {}, h.ctx);
+    await new Promise((resolve) => setTimeout(resolve, 350));
+    assert.deepEqual(h.sent, [], "agent_start cancels the old timer even after the new run succeeds and settles before its deadline");
+    assert.equal(h.paneArmed(), "", "new-run success clears pane recovery ownership");
+    await waitFor(h.errorOption, "");
+  } finally {
+    await h.cleanup();
+  }
+});
+
+test("native search prompt lifetime cancels only on armed close and preserves unarmed behavior", async () => {
+  const npmRoot = execFileSync("npm", ["root", "-g"], { encoding: "utf8" }).trim();
+  const stdinBufferUrl = pathToFileURL(join(npmRoot, "@earendil-works/pi-coding-agent/node_modules/@earendil-works/pi-tui/dist/stdin-buffer.js")).href;
+  const extensionUrl = pathToFileURL(join(ROOT, "pi-agent/extensions/pi-tmux-window-status/index.ts")).href;
+  const cases = [
+    { label: "vi-forward", mode: "vi", keyHex: "2f", scenario: "armed-close" },
+    { label: "vi-backward", mode: "vi", keyHex: "3f", scenario: "armed-close" },
+    { label: "emacs-forward", mode: "emacs", keyHex: "13", scenario: "armed-close" },
+    { label: "emacs-backward", mode: "emacs", keyHex: "12", scenario: "armed-close" },
+    { label: "emacs-forward-enter", mode: "emacs", keyHex: "13", scenario: "armed-enter" },
+    { label: "emacs-backward-enter", mode: "emacs", keyHex: "12", scenario: "armed-enter" },
+    { label: "emacs-forward-no-close", mode: "emacs", keyHex: "13", scenario: "no-close" },
+    { label: "emacs-backward-no-close", mode: "emacs", keyHex: "12", scenario: "no-close" },
+    { label: "emacs-forward-arm-open", mode: "emacs", keyHex: "13", scenario: "arm-while-open" },
+    { label: "emacs-backward-arm-open", mode: "emacs", keyHex: "12", scenario: "arm-while-open" },
+  ];
+  for (const item of cases) {
+    const runtime = temp(), work = temp(), socket = join(work, "server.sock"), resultPath = join(work, "result.json");
+    const fixture = join(work, "extension-fixture.mjs"), injector = join(work, "prompt-inject.py");
+    writeFileSync(fixture, `import extension from ${JSON.stringify(extensionUrl)};\nimport { StdinBuffer } from ${JSON.stringify(stdinBufferUrl)};\nimport { execFileSync } from "node:child_process";\nimport { writeFileSync } from "node:fs";\nconst resultPath = process.argv[2];\nconst handlers = {}, sent = [], unarmedInputs = []; let terminalInput; const run = new AbortController();\nconst ctx = { mode: "tui", ui: { onTerminalInput(fn) { terminalInput = fn; return () => {}; } }, get signal() { return run.signal; }, isIdle: () => true, hasPendingMessages: () => false, sessionManager: { getSessionFile: () => "/tmp/search-prompt-session.jsonl" } };\nconst pi = { on(name, fn) { (handlers[name] ||= []).push(fn); }, events: { on: () => () => {} }, sendUserMessage(value) { sent.push(value); } };\nconst fire = (name, ...args) => { for (const fn of handlers[name] || []) fn(...args); };\nextension(pi); fire("session_start", {}, ctx);\nlet armed = false; const buffer = new StdinBuffer({ escapeTimeout: 1 });\nconst report = () => { const state = execFileSync("tmux", ["display-message", "-p", "-t", process.env.TMUX_PANE, "#{@quick_deploy_pi_recovery_armed}|#{@quick_deploy_pi_error}"], { encoding: "utf8" }).trim(); writeFileSync(resultPath, JSON.stringify({ sent, state, unarmedInputs })); fire("session_shutdown", {}, ctx); setTimeout(() => process.exit(0), 20); };\nbuffer.on("data", (data) => { if (!armed && data === "A") { armed = true; fire("agent_start", {}, ctx); fire("message_end", { message: { role: "assistant", stopReason: "error", errorMessage: "stream_read_error" } }, ctx); fire("agent_settled", {}, ctx); setTimeout(report, 600); return; } if (!armed) { unarmedInputs.push(Buffer.from(data).toString("hex")); return; } terminalInput?.(data); });\nprocess.stdin.setRawMode(true); process.stdin.resume(); process.stdin.on("data", (chunk) => buffer.process(chunk)); process.stdout.write("WAIT\\r\\n");\n`);
+    writeFileSync(injector, `import fcntl, json, os, pty, select, struct, subprocess, sys, termios, time\nsocket, session, pane, mode, key_hex, scenario, result_path = sys.argv[1:]\nenv = os.environ.copy(); env.pop("TMUX", None); env.pop("TMUX_PANE", None)\nbase = ["tmux", "-S", socket]\ndef tx(*args, check=True): return subprocess.run(base + list(args), check=check, capture_output=True, text=True, env=env)\ndef wait_armed():\n    deadline = time.time() + 0.24\n    while time.time() < deadline:\n        state = tx("display-message", "-p", "-t", pane, "#{@quick_deploy_pi_recovery_armed}|#{@quick_deploy_pi_error}").stdout.strip()\n        if state == "1|1": return state\n        time.sleep(0.005)\n    raise AssertionError("recovery did not arm before debounce")\npid, fd = pty.fork()\nif pid == 0:\n    os.environ.clear(); os.environ.update(env); os.environ["TERM"] = "xterm-256color"\n    os.execvp("tmux", base + ["attach-session", "-t", session])\ntry:\n    fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 100, 0, 0))\n    deadline = time.time() + 3\n    while time.time() < deadline and not tx("list-clients", "-t", session, check=False).stdout.strip(): time.sleep(0.02)\n    tx("set-option", "-w", "-t", pane, "mode-keys", mode); tx("select-pane", "-t", pane)\n    unarmed_mode = before_mode = prompt_mode = pane_in_mode = pre_close_state = ""\n    close_key = b"\\r" if scenario == "armed-enter" else b"\\x1b"\n    if scenario in ("armed-close", "armed-enter"):\n        tx("copy-mode", "-t", pane); time.sleep(0.02); os.write(fd, bytes.fromhex(key_hex)); time.sleep(0.05); os.write(fd, close_key); time.sleep(0.05)\n        unarmed_mode = tx("display-message", "-p", "-t", pane, "#{pane_in_mode}").stdout.strip(); tx("send-keys", "-X", "cancel", "-t", pane)\n        tx("send-keys", "-l", "-t", pane, "A"); wait_armed()\n        tx("copy-mode", "-t", pane); time.sleep(0.02); before_mode = tx("display-message", "-p", "-t", pane, "#{pane_in_mode}").stdout.strip()\n        os.write(fd, bytes.fromhex(key_hex)); time.sleep(0.10); prompt_mode = tx("display-message", "-p", "-t", pane, "#{pane_in_mode}").stdout.strip()\n        pre_close_state = tx("display-message", "-p", "-t", pane, "#{@quick_deploy_pi_recovery_armed}|#{@quick_deploy_pi_error}").stdout.strip()\n        os.write(fd, close_key); time.sleep(0.05); pane_in_mode = tx("display-message", "-p", "-t", pane, "#{pane_in_mode}").stdout.strip()\n    elif scenario == "no-close":\n        tx("send-keys", "-l", "-t", pane, "A"); wait_armed()\n        tx("copy-mode", "-t", pane); time.sleep(0.02); before_mode = tx("display-message", "-p", "-t", pane, "#{pane_in_mode}").stdout.strip()\n        os.write(fd, bytes.fromhex(key_hex)); time.sleep(0.10); prompt_mode = tx("display-message", "-p", "-t", pane, "#{pane_in_mode}").stdout.strip()\n        pre_close_state = tx("display-message", "-p", "-t", pane, "#{@quick_deploy_pi_recovery_armed}|#{@quick_deploy_pi_error}").stdout.strip(); pane_in_mode = prompt_mode\n    elif scenario == "arm-while-open":\n        tx("copy-mode", "-t", pane); time.sleep(0.02); before_mode = tx("display-message", "-p", "-t", pane, "#{pane_in_mode}").stdout.strip()\n        os.write(fd, bytes.fromhex(key_hex)); time.sleep(0.05); prompt_mode = tx("display-message", "-p", "-t", pane, "#{pane_in_mode}").stdout.strip()\n        tx("set-buffer", "-b", "__test_arm_trigger", "A"); tx("paste-buffer", "-d", "-b", "__test_arm_trigger", "-t", pane); wait_armed()\n        pre_close_state = tx("display-message", "-p", "-t", pane, "#{@quick_deploy_pi_recovery_armed}|#{@quick_deploy_pi_error}").stdout.strip()\n        os.write(fd, b"\\x1b"); time.sleep(0.05); pane_in_mode = tx("display-message", "-p", "-t", pane, "#{pane_in_mode}").stdout.strip()\n    else: raise AssertionError("unknown scenario")\n    deadline = time.time() + 3\n    while time.time() < deadline and not os.path.exists(result_path): time.sleep(0.02)\n    if not os.path.exists(result_path): raise AssertionError("extension result missing")\n    result = json.load(open(result_path, encoding="utf8")); result.update({"scenario": scenario, "unarmedMode": unarmed_mode, "beforeMode": before_mode, "promptMode": prompt_mode, "preCloseState": pre_close_state, "paneInMode": pane_in_mode}); print(json.dumps(result))\nfinally:\n    tx("detach-client", "-s", session, check=False)\n    try: os.waitpid(pid, 0)\n    except ChildProcessError: pass\n`);
+    const tmux = (args, options = {}) => isolatedTmux(args, options);
+    const env = { ...process.env, QUICK_DEPLOY_PI_TMUX_WINDOW_STATUS_RUNTIME: runtime };
+    tmux(["-S", socket, "-f", join(process.env.HOME, ".tmux.conf"), "new-session", "-d", "-s", item.label, `${process.execPath} --experimental-strip-types '${fixture}' '${resultPath}'`], { env });
+    tmux(["-S", socket, "set-option", "-w", "-t", item.label, "remain-on-exit", "on"], { env });
+    const paneId = tmux(["-S", socket, "display-message", "-p", "-t", item.label, "#{pane_id}"], { encoding: "utf8", env }).trim();
+    try {
+      const output = execFileSync("python3", [injector, socket, item.label, paneId, item.mode, item.keyHex, item.scenario, resultPath], { encoding: "utf8", env: withoutTmuxEnvironment(env), timeout: 10_000 });
+      const result = JSON.parse(output.trim());
+      if (["armed-close", "armed-enter"].includes(item.scenario)) assert.equal(result.unarmedMode, "1", `${item.label}: unarmed prompt close preserves copy-mode`);
+      assert.deepEqual(result.unarmedInputs, [], `${item.label}: unarmed prompt emits no pane bytes`);
+      assert.equal(result.beforeMode, "1", `${item.label}: test entered copy-mode`);
+      assert.equal(result.promptMode, "1", `${item.label}: native search prompt stays open in copy-mode`);
+      assert.equal(result.preCloseState, "1|1", `${item.label}: recovery is still armed immediately before any close key`);
+      assert.equal(result.paneInMode, "1", `${item.label}: prompt lifecycle preserves copy-mode: ${JSON.stringify(result)}`);
+      if (item.scenario === "no-close") {
+        assert.deepEqual(result.sent, ["continue"], `${item.label}: opening alone does not cancel the real timer`);
+        assert.equal(result.state, "1|1", `${item.label}: no-close leaves recovery armed`);
+      } else {
+        assert.deepEqual(result.sent, [], `${item.label}: first prompt-closing Esc cancels the real 250 ms timer`);
+        assert.equal(result.state, "|", `${item.label}: prompt close clears extension error and animator marker`);
+      }
+      const buffers = spawnSync("tmux", ["-S", socket, "list-buffers", "-F", "#{buffer_name}"], { encoding: "utf8", env: withoutTmuxEnvironment(env) }).stdout || "";
+      assert.doesNotMatch(buffers, /__quick_deploy_pi_cancel_/, `${item.label}: transient sentinel buffer is deleted`);
+    } finally {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      try { tmux(["-S", socket, "kill-server"], { env }); } catch {}
+    }
   }
 });
 
@@ -623,6 +875,107 @@ test("detached animator process remains alive for later 42ms frames and exits af
   } finally {
     if (animator.exitCode === null) animator.kill("SIGKILL");
     tmux(["-S", socket, "kill-server"]);
+  }
+});
+
+test("urgent animator tick clears the last error without repaint and preserves another root error", async () => {
+  const runtime = temp(), work = temp(), socket = join(work, "server.sock");
+  const tmux = (args, options = {}) => isolatedTmux(args, options);
+  tmux(["-S", socket, "-f", join(process.env.HOME, ".tmux.conf"), "new-session", "-d", "-s", "urgent-error"]);
+  const windowId = tmux(["-S", socket, "display-message", "-p", "#{window_id}"], { encoding: "utf8" }).trim();
+  const paneId = tmux(["-S", socket, "display-message", "-p", "#{pane_id}"], { encoding: "utf8" }).trim();
+  const first = { socketPath: socket, windowId, paneId }, second = { ...first, paneId: "%other" };
+  const env = { QUICK_DEPLOY_PI_TMUX_WINDOW_STATUS_RUNTIME: runtime };
+  publishLease(first, "root-a", "error", Date.now(), env);
+  publishLease(second, "root-b", "error", Date.now(), env);
+  const animator = spawn(process.execPath, [join(ROOT, "pi-agent/extensions/pi-tmux-window-status/animator.mjs"), socket], { env: { ...withoutTmuxEnvironment(), ...env }, stdio: "ignore" });
+  const errorOption = () => tmux(["-S", socket, "show-options", "-wqv", "@quick_deploy_pi_error"], { encoding: "utf8" }).trim();
+  const paneArmed = () => tmux(["-S", socket, "show-options", "-pqv", "-t", paneId, RECOVERY_ARMED_OPTION], { encoding: "utf8" }).trim();
+  try {
+    await waitFor(errorOption, "1");
+    await waitFor(paneArmed, "1");
+    publishLease(first, "root-a", false, Date.now(), env);
+    assert.equal(requestAnimatorTick(first, env), true, "request reaches the shared lock owner");
+    await waitFor(paneArmed, "");
+    assert.equal(errorOption(), "1", "another root error preserves aggregate red while this pane loses authorization");
+
+    publishLease(second, "root-b", false, Date.now(), env);
+    assert.equal(requestAnimatorTick(second, env), true);
+    await waitFor(errorOption, "", 500);
+    await new Promise((resolve) => setTimeout(resolve, ERROR_MS + 150));
+    assert.equal(errorOption(), "", "no stale frame repaints red after more than one error interval");
+    const exited = await Promise.race([
+      animator.exitCode !== null ? Promise.resolve(true) : new Promise((resolve) => animator.once("exit", () => resolve(true))),
+      new Promise((resolve) => setTimeout(() => resolve(false), 500)),
+    ]);
+    assert.equal(exited, true, "animator exits after urgent reconciliation removes the last lease");
+  } finally {
+    if (animator.exitCode === null) animator.kill("SIGKILL");
+    tmux(["-S", socket, "kill-server"]);
+  }
+});
+
+test("animator startup sweep clears stale pane markers and derives current owner from leases", () => {
+  const runtime = temp(), work = temp(), socket = join(work, "server.sock"), env = { QUICK_DEPLOY_PI_TMUX_WINDOW_STATUS_RUNTIME: runtime };
+  const tmux = (args, options = {}) => isolatedTmux(args, options);
+  tmux(["-S", socket, "-f", "/dev/null", "new-session", "-d", "-s", "pane-sweep"]);
+  const ownerPane = tmux(["-S", socket, "display-message", "-p", "#{pane_id}"], { encoding: "utf8" }).trim();
+  const stalePane = tmux(["-S", socket, "split-window", "-dP", "-F", "#{pane_id}", "-t", "pane-sweep"], { encoding: "utf8" }).trim();
+  const windowId = tmux(["-S", socket, "display-message", "-p", "#{window_id}"], { encoding: "utf8" }).trim();
+  const i = { socketPath: socket, windowId, paneId: ownerPane };
+  const marker = (pane) => tmux(["-S", socket, "show-options", "-pqv", "-t", pane, RECOVERY_ARMED_OPTION], { encoding: "utf8" }).trim();
+  const root = join(runtime, "quick-deploy", "pi-tmux-status", Buffer.from(socket).toString("base64url"));
+  tmux(["-S", socket, "set-option", "-p", "-t", ownerPane, RECOVERY_ARMED_OPTION, "1"]);
+  tmux(["-S", socket, "set-option", "-p", "-t", stalePane, RECOVERY_ARMED_OPTION, "1"]);
+  publishLease(i, "live-owner", "error", Date.now(), env);
+  let animator;
+  try {
+    assert.deepEqual([...listRecoveryArmedPanes("tmux", socket)].sort(), [ownerPane, stalePane].sort());
+    animator = runAnimator({ socketPath: socket, root, schedule: () => ({ unref() {} }), cancel: () => {}, subscribeUrgent: inertUrgent });
+    assert.equal(animator.started, true);
+    assert.equal(marker(ownerPane), "1", "live error lease retains marker");
+    assert.equal(marker(stalePane), "", "startup sweep clears marker without a live error lease");
+    publishLease(i, "live-owner", false, Date.now(), env);
+    animator.tick();
+    assert.equal(marker(ownerPane), "", "lease removal clears prior owner marker");
+  } finally {
+    animator?.stop?.();
+    tmux(["-S", socket, "kill-server"]);
+  }
+});
+
+test("crashed publisher lease expiry clears reused pane marker while sibling keeps window red", async () => {
+  const runtime = temp(), work = temp(), socket = join(work, "server.sock"), session = "ttl-reuse";
+  const tmux = (args, options = {}) => isolatedTmux(args, options);
+  tmux(["-S", socket, "-f", join(process.env.HOME, ".tmux.conf"), "new-session", "-d", "-s", session]);
+  const paneA = tmux(["-S", socket, "display-message", "-p", "#{pane_id}"], { encoding: "utf8" }).trim();
+  const paneB = tmux(["-S", socket, "split-window", "-dP", "-F", "#{pane_id}", "-t", session], { encoding: "utf8" }).trim();
+  const windowId = tmux(["-S", socket, "display-message", "-p", "#{window_id}"], { encoding: "utf8" }).trim();
+  const stateUrl = pathToFileURL(join(ROOT, "pi-agent/extensions/pi-tmux-window-status/state.mjs")).href;
+  const publisher = join(work, "publisher.mjs"), receiver = join(work, "read-burst.py"), injector = join(work, "inject-root.py");
+  writeFileSync(publisher, `import { publishLease } from ${JSON.stringify(stateUrl)};\nconst [socketPath, windowId, paneId, ownerId, runtime] = process.argv.slice(2);\nconst identity = { socketPath, windowId, paneId };\nconst env = { ...process.env, QUICK_DEPLOY_PI_TMUX_WINDOW_STATUS_RUNTIME: runtime };\nconst beat = () => publishLease(identity, ownerId, "error", Date.now(), env);\nbeat(); setInterval(beat, 1000);\n`);
+  writeFileSync(receiver, `import os, select, sys, time, tty\ntty.setraw(sys.stdin.fileno())\ndata = b""\ndeadline = time.time() + 15\nwhile time.time() < deadline:\n    ready, _, _ = select.select([sys.stdin.fileno()], [], [], 0.05 if data else 0.2)\n    if not ready:\n        if data: break\n        continue\n    chunk = os.read(sys.stdin.fileno(), 65536)\n    if not chunk: break\n    data += chunk\nsys.stdout.write("INPUT=" + data.hex() + "\\r\\n"); sys.stdout.flush(); time.sleep(0.5)\n`);
+  writeFileSync(injector, `import fcntl, os, pty, select, struct, subprocess, sys, termios, time\nsocket, session, pane = sys.argv[1:]\nenv = os.environ.copy(); env.pop("TMUX", None); env.pop("TMUX_PANE", None)\nbase = ["tmux", "-S", socket]\ndef tx(*args, check=True): return subprocess.run(base + list(args), check=check, capture_output=True, text=True, env=env)\npid, fd = pty.fork()\nif pid == 0:\n    os.environ.clear(); os.environ.update(env); os.environ["TERM"] = "xterm-256color"\n    os.execvp("tmux", base + ["attach-session", "-t", session])\ntry:\n    fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 100, 0, 0))\n    deadline = time.time() + 3\n    while time.time() < deadline and not tx("list-clients", "-t", session, check=False).stdout.strip(): time.sleep(0.05)\n    tx("select-pane", "-t", pane); time.sleep(0.1)\n    while select.select([fd], [], [], 0)[0]:\n        try: os.read(fd, 65536)\n        except OSError: break\n    os.write(fd, b"\\x1b")\n    deadline = time.time() + 2\n    while time.time() < deadline:\n        out = tx("capture-pane", "-p", "-t", pane).stdout.replace("\\r", "")\n        found = [line for line in out.splitlines() if line.startswith("INPUT=")]\n        if found: print(found[0]); break\n        time.sleep(0.02)\nfinally:\n    tx("detach-client", "-s", session, check=False)\n    try: os.waitpid(pid, 0)\n    except ChildProcessError: pass\n`);
+  const publisherCommand = (pane, owner) => `${process.execPath} '${publisher}' '${socket}' '${windowId}' '${pane}' '${owner}' '${runtime}'`;
+  tmux(["-S", socket, "respawn-pane", "-k", "-t", paneA, publisherCommand(paneA, "publisher-a")]);
+  tmux(["-S", socket, "respawn-pane", "-k", "-t", paneB, publisherCommand(paneB, "publisher-b")]);
+  const animator = spawn(process.execPath, [join(ROOT, "pi-agent/extensions/pi-tmux-window-status/animator.mjs"), socket], { env: { ...withoutTmuxEnvironment(), QUICK_DEPLOY_PI_TMUX_WINDOW_STATUS_RUNTIME: runtime }, stdio: "ignore" });
+  const marker = (pane) => tmux(["-S", socket, "show-options", "-pqv", "-t", pane, RECOVERY_ARMED_OPTION], { encoding: "utf8" }).trim();
+  const red = () => tmux(["-S", socket, "show-options", "-wqv", "@quick_deploy_pi_error"], { encoding: "utf8" }).trim();
+  try {
+    await waitFor(() => marker(paneA), "1");
+    await waitFor(() => marker(paneB), "1");
+    await waitFor(red, "1");
+    tmux(["-S", socket, "respawn-pane", "-k", "-t", paneA, `python3 '${receiver}'`]);
+    await new Promise((resolve) => setTimeout(resolve, LEASE_TTL_MS + 1_200));
+    await waitFor(() => marker(paneA), "", 2_000);
+    assert.equal(marker(paneB), "1", "live sibling retains its derived marker");
+    assert.equal(red(), "1", "live sibling keeps aggregate window red");
+    const routed = execFileSync("python3", [injector, socket, session, paneA], { encoding: "utf8", env: withoutTmuxEnvironment() }).trim();
+    assert.equal(routed, "INPUT=1b", "reused expired pane receives ordinary Esc without stale sentinel");
+  } finally {
+    if (animator.exitCode === null) animator.kill("SIGKILL");
+    try { tmux(["-S", socket, "kill-server"]); } catch {}
   }
 });
 
@@ -846,6 +1199,18 @@ test("isolated gpakosz load evaluates actual deployed formats across idle and tw
   const stripStyles = (s) => String(s).replace(/#\[[^\]]*\]/g, "");
   tmux(["-S", socket, "-f", join(process.env.HOME, ".tmux.conf"), "new-session", "-d", "-s", "q"]);
   try {
+    for (const table of ["root", "copy-mode", "copy-mode-vi"]) {
+      const binding = tmux(["-S", socket, "list-keys", "-T", table, "Escape"], { encoding: "utf8" });
+      assert.match(binding, /@quick_deploy_pi_recovery_armed.*@quick_deploy_pi_error/, `${table} retains pane ownership plus aggregate red gating`);
+      assert.match(binding, /send-keys -H 1b 5b 39 39 37 3b 31 7e/, `${table} prepends the private cancellation sentinel`);
+      if (table !== "root") assert.match(binding, /send-keys -X cancel/, `${table} exits copy-mode before routing`);
+    }
+    for (const [table, key, search] of [["copy-mode", "C-r", "search-backward"], ["copy-mode", "C-s", "search-forward"], ["copy-mode-vi", "/", "search-forward"], ["copy-mode-vi", "?", "search-backward"]]) {
+      const binding = tmux(["-S", socket, "list-keys", "-T", table, key], { encoding: "utf8" });
+      assert.match(binding, new RegExp(`command-prompt.*send-keys -X ${search}`), `${table} ${key} preserves search direction`);
+      if (table === "copy-mode") { assert.doesNotMatch(binding, /command-prompt -i/, `${key} deliberately uses a blocking submit-on-close prompt`); assert.match(binding, /-I "#{pane_search_string}"/, `${key} preserves the previous search as initial input`); }
+      assert.match(binding, /paste-buffer -d -b .*quick_deploy_pi_cancel/, `${table} ${key} emits sentinel only after prompt closure`);
+    }
     const idle = tmux(["-S", socket, "show-options", "-gqv", "window-status-format"], { encoding: "utf8" });
     const current = tmux(["-S", socket, "show-options", "-gqv", "window-status-current-format"], { encoding: "utf8" });
     const evalf = (f) => tmux(["-S", socket, "display-message", "-p", f], { encoding: "utf8" });

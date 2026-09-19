@@ -5,6 +5,7 @@ import { randomUUID } from "node:crypto";
 
 export const LEASE_TTL_MS = 6_000;
 export const HEARTBEAT_MS = 2_000;
+export const RECOVERY_ARMED_OPTION = "@quick_deploy_pi_recovery_armed";
 const TERMINAL = new Set(["complete", "completed", "failed", "paused", "stopped", "rejected"]);
 
 /** Runtime contract: tmux window options stay @quick_deploy_pi_* and the private lease directory stays quick-deploy/pi-tmux-status (deliberately unchanged by the extension rename) so no duplicate runtime state is created. */
@@ -195,19 +196,19 @@ export function acquireAnimatorLock(lockPath, token = randomUUID(), pid = proces
 }
 
 export function windowLeaseStates(root, now = Date.now()) {
-  const active = new Set(), error = new Set();
+  const active = new Set(), error = new Set(), errorPanes = new Set();
   const dir = join(root, "leases");
   try {
     for (const file of readdirSync(dir)) {
       if (!file.endsWith(".json")) continue;
       const lease = readLease(join(dir, file), now);
       if (!lease) continue;
-      if (lease.state === "error") error.add(lease.windowId);
+      if (lease.state === "error") { error.add(lease.windowId); errorPanes.add(lease.paneId); }
       else active.add(lease.windowId);
     }
   } catch {}
   for (const id of error) active.delete(id);
-  return { active, error };
+  return { active, error, errorPanes };
 }
 
 export function releaseAnimatorLock(lockPath, token, read = readFileSync, remove = rmSync) {

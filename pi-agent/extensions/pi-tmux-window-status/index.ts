@@ -5,6 +5,8 @@ import * as os from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { aggregateLogicalState, HEARTBEAT_MS, publishLease, seedAttentionWatermarksFromSnapshot } from "./state.mjs";
+export { RECOVERY_ARMED_OPTION } from "./state.mjs";
+import { requestAnimatorTick } from "./animator.mjs";
 const STARTED = "subagent:async-started", COMPLETE = "subagent:async-complete", CONTROL = "subagent:control-event";
 const HERE = dirname(fileURLToPath(import.meta.url)), ANIMATOR = join(HERE, "animator.mjs");
 type Identity = { socketPath: string; windowId: string; paneId: string };
@@ -30,6 +32,25 @@ const CONFLICT_RATELIMIT = /too many concurrent requests/i;
 // Pi 自动重试耗尽后的收尾消息（retryAttempt>0）；用户主动 Esc 是 "Operation aborted"
 // （retryAttempt=0），两者必须区分：前者是被分类错误的事实尾巴，后者是用户意图。
 const RETRY_EXHAUSTED_ABORT = /^aborted after \d+ retry attempts?$/i;
+export const CANCEL_SENTINEL = "\x1b[997;1~";
+
+// Raw TUI listeners see legacy bytes plus Kitty CSI-u press/repeat/release events.
+export function isManualEscapePress(data: string) {
+  if (data === "\x1b") return true;
+  const kitty = data.match(/^\x1b\[27(?::(\d*))?(?::(\d+))?(?:;(\d+))?(?::(\d+))?u$/);
+  if (kitty) {
+    const modifier = (Number.parseInt(kitty[3] || "1", 10) - 1) & ~(64 | 128);
+    return modifier === 0 && Number.parseInt(kitty[4] || "1", 10) !== 3;
+  }
+  const modifyOtherKeys = data.match(/^\x1b\[27;(\d+);27~$/);
+  return modifyOtherKeys?.[1] === "1";
+}
+
+export function recoveryTerminalInput(data: string, cancel: () => void) {
+  if (data === CANCEL_SENTINEL) { cancel(); return { consume: true }; }
+  if (isManualEscapePress(data)) cancel();
+  return undefined;
+}
 
 export function classifyModelUnavailable(message: unknown) {
   const msg = object(message);
@@ -89,7 +110,8 @@ export default function piTmuxWindowStatus(pi: ExtensionAPI) {
   if (nestedPublisherDisabled()) return;
   let tmux: Identity; try { tmux = identity(); } catch (error) { console.error(error instanceof Error ? error.message : String(error)); return; }
   let mainActive = false, modelError = false, rootSessionId: string | undefined, beat: ReturnType<typeof setInterval> | undefined, animator: ReturnType<typeof spawn> | undefined, previousLeaseState: false | "active" | "error" = false;
-  let lastAssistantErrorMatched = false, continueTimer: ReturnType<typeof setTimeout> | undefined, lastContinueSentAt = 0, autoContinueCount = 0;
+  let lastAssistantErrorMatched = false, continueTimer: ReturnType<typeof setTimeout> | undefined, lastContinueSentAt = 0, autoContinueCount = 0, terminalInputUnsubscribe: (() => void) | undefined, activeRunSignal: AbortSignal | undefined;
+  const cancelledRunSignals = new WeakSet<AbortSignal>();
   const AUTO_CONTINUE_MAX = 10, AUTO_CONTINUE_MIN_INTERVAL_MS = 30_000, AUTO_CONTINUE_DEBOUNCE_MS = 250;
   const owner = `${process.pid}:${tmux.paneId}`, children = new Map<string, Child>(), watchers = new Map<string, FSWatcher>(), routeWatchers = new Map<string, FSWatcher>(), attention = new Map<string, number>();
   const snapshots = () => new Map([...children].map(([id, c]) => { const snapshot = mergedChildSnapshot(c, readStatus(c.asyncDir)); seedAttentionWatermarksFromSnapshot(snapshot, attention); return [id, snapshot]; }));
@@ -112,20 +134,33 @@ export default function piTmuxWindowStatus(pi: ExtensionAPI) {
   const control = (value: unknown) => { const event = object(object(value)?.event); if (event?.type !== "needs_attention" || typeof event.runId !== "string") return; const nested = event.runId; let attributed = false; for (const child of children.values()) { const snapshot = mergedChildSnapshot(child, readStatus(child.asyncDir)); if (snapshot && containsRun(snapshot, nested)) { attention.set(nested, Date.now()); attributed = true; } } if (!attributed) console.error(`pi-tmux-window-status: needs_attention '${nested}' was not attributable to a known async status`); sync(); };
   const restore = () => { if (!rootSessionId) return; for (const child of restoredChildren(defaultAsyncRoot(), rootSessionId)) { children.set(child.id, child); watchChild(child.id); watchNestedRoute(child.id); } sync(); };
   const captureSession = (ctx: { sessionManager?: SessionManager }) => { rootSessionId ||= sessionIdOf(ctx.sessionManager); if (!rootSessionId) console.error("pi-tmux-window-status: root Pi session identity is unavailable"); };
-  const updateModelError = (eventType: string, message?: unknown) => { const next = nextModelErrorState(modelError, eventType, message); if (next !== modelError) { modelError = next; sync(); } };
+  const urgentAnimatorTick = () => { requestAnimatorTick(tmux); };
+  const updateModelError = (eventType: string, message?: unknown) => { const next = nextModelErrorState(modelError, eventType, message); if (next !== modelError) { modelError = next; sync(); urgentAnimatorTick(); } };
   const cancelContinue = () => { if (continueTimer) { clearTimeout(continueTimer); continueTimer = undefined; } };
+  const signalFor = (ctx?: { signal?: AbortSignal }) => ctx?.signal || activeRunSignal;
+  const eventFromCancelledRun = (ctx?: { signal?: AbortSignal }) => { const signal = signalFor(ctx); return Boolean(signal && cancelledRunSignals.has(signal)); };
+  const cancelErroredAutoContinue = (signal?: AbortSignal) => {
+    if (!modelError && !lastAssistantErrorMatched && !continueTimer) return false;
+    if (signal) cancelledRunSignals.add(signal);
+    cancelContinue();
+    modelError = false;
+    lastAssistantErrorMatched = false;
+    sync();
+    urgentAnimatorTick();
+    return true;
+  };
   const sendContinue = () => { continueTimer = undefined; lastContinueSentAt = Date.now(); autoContinueCount += 1; pi.sendUserMessage("continue"); };
   const scheduleContinue = (delay: number) => { cancelContinue(); continueTimer = setTimeout(() => { if (mainActive) { continueTimer = undefined; return; } const idle = lastCtx?.isIdle?.() ?? false; const pending = lastCtx?.hasPendingMessages?.() ?? false; if (!idle || pending) { continueTimer = undefined; return; } const elapsed = Date.now() - lastContinueSentAt; if (elapsed < AUTO_CONTINUE_MIN_INTERVAL_MS) { scheduleContinue(AUTO_CONTINUE_MIN_INTERVAL_MS - elapsed); return; } if (autoContinueCount >= AUTO_CONTINUE_MAX) { continueTimer = undefined; return; } sendContinue(); }, delay); };
   const maybeAutoContinue = (ctx: { isIdle?: () => boolean; hasPendingMessages?: () => boolean }) => { lastCtx = ctx; if (!modelError || !lastAssistantErrorMatched || autoContinueCount >= AUTO_CONTINUE_MAX) return; if (!ctx.isIdle?.() || ctx.hasPendingMessages?.()) return; scheduleContinue(AUTO_CONTINUE_DEBOUNCE_MS); };
   let lastCtx: { isIdle?: () => boolean; hasPendingMessages?: () => boolean } | undefined;
   const resetFailureStreak = () => { autoContinueCount = 0; };
   const unsub = [pi.events.on(STARTED, started), pi.events.on(COMPLETE, complete), pi.events.on(CONTROL, control)];
-  pi.on("session_start", (_event, ctx) => { captureSession(ctx); restore(); });
-  pi.on("agent_start", (_event, ctx) => { captureSession(ctx); mainActive = true; cancelContinue(); restore(); sync(); });
+  pi.on("session_start", (_event, ctx) => { captureSession(ctx); terminalInputUnsubscribe?.(); terminalInputUnsubscribe = undefined; if (ctx.mode === "tui") terminalInputUnsubscribe = ctx.ui.onTerminalInput((data) => recoveryTerminalInput(data, () => cancelErroredAutoContinue(signalFor(ctx)))); restore(); });
+  pi.on("agent_start", (_event, ctx) => { captureSession(ctx); activeRunSignal = ctx.signal; mainActive = true; cancelContinue(); restore(); sync(); });
   pi.on("agent_settled", (_event, ctx) => { mainActive = false; sync(); maybeAutoContinue(ctx); });
   pi.on("input", () => { cancelContinue(); });
-  pi.on("message_update", (...args: unknown[]) => updateModelError("message_update", unwrapAssistantMessage(eventMessage(args)) || eventMessage(args)));
-  pi.on("message_end", (...args: unknown[]) => { const msg = eventMessage(args); const matched = classifyModelUnavailable(msg); lastAssistantErrorMatched = nextLastAssistantErrorMatched(lastAssistantErrorMatched, msg); updateModelError("message_end", msg); if (!matched && object(msg)?.role === "assistant" && object(msg)?.stopReason !== "error" && object(msg)?.stopReason !== "aborted") resetFailureStreak(); });
+  pi.on("message_update", (event, ctx) => { if (eventFromCancelledRun(ctx)) return; const msg = unwrapAssistantMessage(eventMessage([event])) || eventMessage([event]); updateModelError("message_update", msg); });
+  pi.on("message_end", (event, ctx) => { if (eventFromCancelledRun(ctx)) return; const msg = eventMessage([event]); const matched = classifyModelUnavailable(msg); lastAssistantErrorMatched = nextLastAssistantErrorMatched(lastAssistantErrorMatched, msg); updateModelError("message_end", msg); if (!matched && object(msg)?.role === "assistant" && object(msg)?.stopReason !== "error" && object(msg)?.stopReason !== "aborted") resetFailureStreak(); });
   pi.on("model_select", () => { resetFailureStreak(); updateModelError("model_select"); });
-  pi.on("session_shutdown", () => { const hadError = previousLeaseState === "error" || modelError; mainActive = false; modelError = false; lastAssistantErrorMatched = false; cancelContinue(); children.clear(); if (beat) clearInterval(beat); for (const watcher of watchers.values()) watcher.close(); watchers.clear(); for (const watcher of routeWatchers.values()) watcher.close(); routeWatchers.clear(); publishLease(tmux, owner, false); if (hadError) kick(true); for (const unsubscribe of unsub) if (typeof unsubscribe === "function") unsubscribe(); });
+  pi.on("session_shutdown", () => { const hadError = previousLeaseState === "error" || modelError; mainActive = false; modelError = false; lastAssistantErrorMatched = false; cancelContinue(); terminalInputUnsubscribe?.(); terminalInputUnsubscribe = undefined; children.clear(); if (beat) clearInterval(beat); for (const watcher of watchers.values()) watcher.close(); watchers.clear(); for (const watcher of routeWatchers.values()) watcher.close(); routeWatchers.clear(); publishLease(tmux, owner, false); if (hadError) { kick(true); urgentAnimatorTick(); } for (const unsubscribe of unsub) if (typeof unsubscribe === "function") unsubscribe(); });
 }

@@ -33,7 +33,7 @@
 
 - 单一事实源：改 `~/.tmux.conf.local` 就是改仓库文件（`<前缀> e` 打开的也是它），改完 `<前缀> r` 生效、`git commit` 入库；已链接的机器只靠 `git pull` 即可接收更新。
 - 注意：gpakosz 每次加载配置都会用 `cut -c3- "$TMUX_CONF_LOCAL" | sh -s printf probe` 探测本文件是否旧式脚本格式——注释行剥掉前两个字符（`# `）后会**被 shell 真实执行**，因此注释里不要写 `> < ; | & $() 反引号` 等元字符（历史上的 `（CSI > 4 ; 2 m）` 曾在服务器工作目录生成空文件 `4`）；需要表达时用全角 `＞ ；` 代替。
-- 基线只记真实改动（目前是鼠标模式、状态栏左键释放切换 window、禁用状态栏区域滚轮切换 window、copy-mode 字母键退出并原样输入、精简状态栏、选中 window 两端蓝色竖条、取消 `Ctrl+a` 第二前缀、`Ctrl+Alt+←/→` 切换 window、`Ctrl+Alt+=/+` 新建 window）；全部可用选项查上游模板 `~/.tmux/.tmux.conf.local`。该文件本质是 tmux 配置片段，可直接写 `set -g ...`；若某行被主配置覆盖，按上游说明在行尾加 `#!important`。
+- 基线只记真实改动（目前是鼠标模式、状态栏左键释放切换 window、禁用状态栏区域滚轮切换 window、copy-mode 字母键退出并原样输入、pane-owned Pi error Esc sentinel 路由、精简状态栏、选中 window 两端蓝色竖条、取消 `Ctrl+a` 第二前缀、`Ctrl+Alt+←/→` 切换 window、`Ctrl+Alt+=/+` 新建 window）；全部可用选项查上游模板 `~/.tmux/.tmux.conf.local`。该文件本质是 tmux 配置片段，可直接写 `set -g ...`；若某行被主配置覆盖，按上游说明在行尾加 `#!important`。
 
 Pi suspend guard 与 breathing status 都不是本模块的源码：它们分别在 `pi-agent/extensions/pi-suspend-guard/` 和 `pi-agent/extensions/pi-tmux-window-status/`，本模块只负责链接安装。
 
@@ -55,20 +55,21 @@ Pi suspend guard 与 breathing status 都不是本模块的源码：它们分别
 ./tests/run.sh
 ```
 
-测试使用独立 tmux socket 和临时目录，真实验证状态栏鼠标释放切换，以及 emacs、vi 两张 copy-mode 键表退出后向 pane 投递原字符；不会改动当前 tmux server。
+测试使用独立 tmux socket 和临时目录，真实验证状态栏鼠标释放切换、emacs/vi 两张 copy-mode 键表的字母原样输入，以及两 pane 红色 window 中 root/copy-mode Esc 只有在当前 pane 持有 recovery marker 时才投递 sentinel + Esc；未 armed pane 的 root 只收到普通 Esc，copy-mode 则零注入。不会改动当前 tmux server。
 
 ## Pi 扩展自动发现
 
-Pi 只在启动时扫描 `~/.pi/agent/extensions/` 下的目录，不会扫描本仓库——仓库里的 `pi-agent/extensions/pi-tmux-window-status` 必须通过受管符号链接暴露到 `~/.pi/agent/extensions/` 才会被加载。安装/更新扩展后需要**重启 Pi 或执行 `/reload`** 才生效；tmux 只须 `<前缀> r` 重载样式。
+Pi 只在启动时扫描 `~/.pi/agent/extensions/` 下的目录，不会扫描本仓库——仓库里的 `pi-agent/extensions/pi-tmux-window-status` 必须通过受管符号链接暴露到 `~/.pi/agent/extensions/` 才会被加载。安装/更新扩展后需要**重启 Pi 或执行 `/reload`** 才生效；tmux 还须 `<前缀> r` 重载状态格式与 Esc 键位。
 
 该扩展链接不受 conley 的 pi-agent fork 追踪；扩展安装器将路径写入本机仓库的 `.git/info/exclude`，因此 Git 不拥有该链接，`git pull` 与重跑安装互不干扰。
 
 ## 使用要点
 
 - 前缀键仅保留默认 `Ctrl+b`；Oh my tmux! 默认新增的第二前缀 `Ctrl+a` 已取消。
+- Pi 的模型或供应商错误把 window 标红并准备自动发送 `continue` 后，animator 会从 live error lease 的 pane ID 派生私有 recovery marker，并在同一个 tmux command batch 中更新 pane marker 与聚合 window 红色；lease 过期、publisher 崩溃、pane 复用及 animator 启动 sweep 都会清除 stale marker。Batch 并非事务，因此 animator 在调用 tmux 前先保留 prior + attempted targets 的清理责任，只有整批成功才缩回 live 集合，尾部 client refresh 失败不会遗留前面已写入的 marker。owning pane 的手动 `Esc` 由 tmux 先投递取消 sentinel、再投递真实 Esc，因此 fullscreen 搜索即使吞掉真实 Esc，也不会漏掉取消意图；扩展立即撤销本 run 的错误与待发送 `continue`，同一 run 的延迟 error 事件不能重新 armed。其他 pane 即使共享红色 window 也没有 marker，不会收到 sentinel。同一 window 若还有其他 Pi root 保持 error lease，聚合标签仍保持红色。
 - `<前缀> e` 打开 `.tmux.conf.local`，`<前缀> r` 重载配置。
 - 状态栏左侧只显示 session 名，与右侧同为浅灰字、深灰底；右侧移除电池与时间、日期，只留 `用户名@主机名`。未选中 window 空闲时为 `#bcbcbc` 灰白块、深色字；bell 保留黄色前景和 `!` 标记；last/activity 不改变背景。选中 window 在色块左右末端各放两个整格实心 `#0077aa` 蓝色竖条（`██`；fg/bg 同设蓝，字体留缝隙也不漏底色），与 error 红底走正交视觉通道，竖条永不呼吸、永不变色。Pi 根回合或其异步子代理运行时，相应 window 背景以约 1s 周期在灰色路径上呼吸；模型/供应商可用性错误时显示稳定红底白字，后续语义输出或成功结束会清除。扩展语义与自动续跑细节见 `pi-agent/extensions/pi-tmux-window-status/README.md`。
-- `<前缀> m` 切换鼠标模式；状态栏 window 标签在鼠标左键释放时切换，因此单击和快速连续点击都会落到释放位置对应的 window。状态栏区域的滚轮不再切换 window；普通 pane 中鼠标滚轮每格滚动 1 行。`<前缀> -` / `<前缀> _` 分屏；`<前缀> h/j/k/l` 在窗格间移动。应用主动开启 mouse reporting 时，滚轮仍交给应用自身处理。鼠标拖选复制后停留在 copy-mode、不跳回 pane 底部；按 `Esc` 只退出，按任意英文字母则退出并把该字母原样输入 pane，大小写保持不变且不会自动回车。
+- `<前缀> m` 切换鼠标模式；状态栏 window 标签在鼠标左键释放时切换，因此单击和快速连续点击都会落到释放位置对应的 window。状态栏区域的滚轮不再切换 window；普通 pane 中鼠标滚轮每格滚动 1 行。`<前缀> -` / `<前缀> _` 分屏；`<前缀> h/j/k/l` 在窗格间移动。应用主动开启 mouse reporting 时，滚轮仍交给应用自身处理。鼠标拖选复制后停留在 copy-mode、不跳回 pane 底部；`Esc` 通常只退出 copy-mode，只有当前 pane 同时持有 recovery marker 且 window 聚合状态为红色时，才在退出后投递 sentinel + 真实 Esc；按任意英文字母则退出并把该字母原样输入 pane，大小写保持不变且不会自动回车。Tmux 搜索 prompt 先于这些键表消费按键：vi `/`、`?` 保留原生 submit-on-close 搜索；emacs `C-s`、`C-r` 因 `-i` 在 prompt 打开时就释放 queue，明确改为保留方向、初值和文案的 submit-on-close 搜索，以获得可靠 close edge。Tmux 3.4 无法区分 Esc 取消与 Enter 接受，所以 armed 状态下两种关闭都会取消自动恢复；未 armed 时 pane 零注入。
 - `Ctrl+Alt+←/→` **不需要前缀**，直接切换上一个/下一个 window（底部状态栏的标签）。绑定落在 root 表：`C-M-Left=previous-window`、`C-M-Right=next-window`。Ghostty 模块显式 unbind 这两个键，确保按键进入 pty；gpakosz 检测到 `TERM_PROGRAM=ghostty` 后自动开启 extended-keys，tmux 才能识别组合键。
 - `Ctrl+Alt+=` / `Ctrl+Alt++` **不需要前缀**，提示输入名称后在当前 pane 的目录新建 window；直接回车则让 tmux 按运行程序自动命名。Ghostty 模块为两者显式发送 CSI-u 序列，tmux 分别绑定 `C-M-=` / `C-M-+`，避免符号键修饰信息在终端编码中丢失。
 - 内置 TPM 插件支持：在 `.tmux.conf.local` 里写 `set -g @plugin ...`，`<前缀> I` 安装，`<前缀> u` 更新，`<前缀> M-u` 卸载。

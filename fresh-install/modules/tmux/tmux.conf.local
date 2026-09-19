@@ -101,6 +101,31 @@ bind -T copy-mode-vi WheelDownPane send-keys -X -N 1 scroll-down
 bind -T copy-mode    MouseDragEnd1Pane send-keys -X copy-selection-no-clear \; send-keys -X clear-selection
 bind -T copy-mode-vi MouseDragEnd1Pane send-keys -X copy-selection-no-clear \; send-keys -X clear-selection
 
+# animator 从 live error leases 同时派生 pane 的 recovery_armed 与 window error；
+# 两者同时成立才把私有 CSI 997 ； 1 ~
+# sentinel 放在真实 Esc 前面。扩展消费 sentinel 并取消 timer，真实 Esc 仍交给
+# Pi；即使 fullscreen 搜索先吞掉真实 Esc，取消意图也已送达。root 表覆盖普通
+# 输入；copy-mode 先退出再走相同路由。未 armed 的 pane 绝不收到 sentinel，
+# 且 copy-mode 维持原来的只退出、不向 pane 注入任何字节。
+bind -T root Escape if-shell -F '#{&&:#{@quick_deploy_pi_recovery_armed},#{@quick_deploy_pi_error}}' 'send-keys -H 1b 5b 39 39 37 3b 31 7e; send-keys Escape' 'send-keys Escape' #!important
+bind -T copy-mode Escape if-shell -F '#{&&:#{@quick_deploy_pi_recovery_armed},#{@quick_deploy_pi_error}}' 'send-keys -X cancel; send-keys -H 1b 5b 39 39 37 3b 31 7e; send-keys Escape' 'send-keys -X cancel' #!important
+bind -T copy-mode-vi Escape if-shell -F '#{&&:#{@quick_deploy_pi_recovery_armed},#{@quick_deploy_pi_error}}' 'send-keys -X cancel; send-keys -H 1b 5b 39 39 37 3b 31 7e; send-keys Escape' 'send-keys -X cancel' #!important
+
+# copy-mode 搜索 prompt 先于全部 key table。Vi 的 / 与 ? 原本就是 submit 后
+# 搜索，直接保留。Emacs 的 -i incremental prompt 会在打开时立刻释放 command
+# queue，无法提供真正的 close edge；C-s 与 C-r 因此窄化为原生 submit-on-close
+# 搜索，仍保留方向、初值与 prompt 文案。四条命令都在 prompt 结束后检查 live
+# marker；armed 时只补发 sentinel，不补发真实 Esc。send-keys 会被仍活跃的
+# copy-mode 消费，所以用按 client/pane 命名的临时 buffer 直接 paste 到 pane
+# 并立刻删除，保持 copy-mode。tmux 3.4 没有 cancel-only callback，也无法区分
+# Esc dismiss 与 Enter accept；armed prompt 以任一方式关闭都会取消自动恢复。
+# 未 armed 时 if-shell 无动作且 pane 零注入；Emacs 的明确行为变化仅是由实时
+# incremental 改为 Enter 提交搜索。
+bind -T copy-mode C-r command-prompt -I '#{pane_search_string}' -T search -p '(search up)' { send-keys -X search-backward "%%" } \; if-shell -F '#{&&:#{@quick_deploy_pi_recovery_armed},#{@quick_deploy_pi_error}}' { run-shell -C 'set-buffer -b "__quick_deploy_pi_cancel_#{client_pid}_#{pane_id}" "\e[997;1~" ; paste-buffer -d -b "__quick_deploy_pi_cancel_#{client_pid}_#{pane_id}" -t "#{pane_id}"' } #!important
+bind -T copy-mode C-s command-prompt -I '#{pane_search_string}' -T search -p '(search down)' { send-keys -X search-forward "%%" } \; if-shell -F '#{&&:#{@quick_deploy_pi_recovery_armed},#{@quick_deploy_pi_error}}' { run-shell -C 'set-buffer -b "__quick_deploy_pi_cancel_#{client_pid}_#{pane_id}" "\e[997;1~" ; paste-buffer -d -b "__quick_deploy_pi_cancel_#{client_pid}_#{pane_id}" -t "#{pane_id}"' } #!important
+bind -T copy-mode-vi / command-prompt -T search -p '(search down)' { send-keys -X search-forward "%%" } \; if-shell -F '#{&&:#{@quick_deploy_pi_recovery_armed},#{@quick_deploy_pi_error}}' { run-shell -C 'set-buffer -b "__quick_deploy_pi_cancel_#{client_pid}_#{pane_id}" "\e[997;1~" ; paste-buffer -d -b "__quick_deploy_pi_cancel_#{client_pid}_#{pane_id}" -t "#{pane_id}"' } #!important
+bind -T copy-mode-vi ? command-prompt -T search -p '(search up)' { send-keys -X search-backward "%%" } \; if-shell -F '#{&&:#{@quick_deploy_pi_recovery_armed},#{@quick_deploy_pi_error}}' { run-shell -C 'set-buffer -b "__quick_deploy_pi_cancel_#{client_pid}_#{pane_id}" "\e[997;1~" ; paste-buffer -d -b "__quick_deploy_pi_cancel_#{client_pid}_#{pane_id}" -t "#{pane_id}"' } #!important
+
 # 滚轮带入 copy-mode 后，直接按任意英文字母即可回到实时 pane，并把刚按下
 # 的字母原样送给 pane，不附加回车。小写与 Shift 大写分别绑定，emacs 和 vi
 # 两张 copy-mode 键表保持一致。run-shell 内的反斜杠用于让子 tmux 保存两步
