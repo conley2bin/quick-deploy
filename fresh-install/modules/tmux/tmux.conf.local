@@ -7,6 +7,10 @@
 # 开启鼠标模式：点击切窗格、拖边框调大小、滚轮翻历史
 set -g mouse on
 
+# 允许 DCS 透传到外层 Ghostty，使可见 pane 的 Kitty graphics 正常显示。
+# 选 on 不选 all，隐藏 pane 不转发。
+set -g allow-passthrough on
+
 # 状态栏 window 标签在左键释放时切换。释放事件代表一个完成的点击，并且
 # 不会像按下事件那样被二击或三击分类替换。只在释放时按鼠标目标切换，
 # 每个完整点击恰好执行一次。important 保证该语义在 Oh my tmux! 重建默认

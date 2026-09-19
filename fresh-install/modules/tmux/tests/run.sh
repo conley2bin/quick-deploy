@@ -1,5 +1,5 @@
 #!/bin/bash
-# 隔离验证 tmux 本地基线的输入路由，不触碰真实 tmux server。
+# 隔离验证 tmux 本地基线与输入路由，不触碰真实 tmux server。
 set -euo pipefail
 
 MODULE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -32,6 +32,8 @@ tx -f /dev/null new-session -d -s "$SESSION"
 tx source-file "$CONF"
 
 [ "$(tx show-options -gv mouse)" = on ] || fail "mouse 未开启"
+passthrough="$(tx show-options -Apv -t "$SESSION" allow-passthrough)"
+[ "$passthrough" = on ] || fail "allow-passthrough 有效值不是 on: $passthrough"
 if tx list-keys -T root MouseDown1Status >/dev/null 2>&1; then
     fail "MouseDown1Status 仍有绑定"
 fi
@@ -346,4 +348,4 @@ PY
 python3 "$WORK/mouse-check.py" "$SOCKET" click "$ONE_ID" "$TWO_ID" \
     || fail "状态栏左键释放切换行为失败"
 
-echo "PASS: tmux 状态栏点击、copy-mode 输入与 pane-owned Esc sentinel 路由"
+echo "PASS: tmux passthrough、状态栏点击、copy-mode 输入与 pane-owned Esc sentinel 路由"
