@@ -11,6 +11,17 @@ set -g mouse on
 # 选 on 不选 all，隐藏 pane 不转发。
 set -g allow-passthrough on
 
+# 复制时 tmux 会发出 OSC 52，把选中内容交给外层终端写入系统剪贴板。
+# 取值 on 还会处理 pane 应用与内层 tmux 发来的 OSC 52：按允许集合过滤并
+# 去重选择器、把载荷解码后重新编码，再发给具备 Ms 能力且正在显示该 window
+# 的已连接客户端。这是 Ghostty 里跑本地 tmux、再从 pane 内 SSH 到远端 tmux
+# 这条路径必需的：external 会直接丢弃应用发来的序列，远端复制到不了本地终端。
+# 代价：pane 应用可以改写 tmux 自己的 buffer 并向终端发起剪贴板写入；OSC 52
+# 查询只能读到那个 tmux buffer，读不到本机系统剪贴板。终端侧 Ghostty 仍拒绝
+# 读取，终端层面的系统剪贴板查询依旧被挡住。是否真的发送取决于客户端侧的
+# 有效 Ms（terminfo、配置的 terminal-features 或 tmux 运行时识别）。
+set -s set-clipboard on
+
 # 状态栏 window 标签在左键释放时切换。释放事件代表一个完成的点击，并且
 # 不会像按下事件那样被二击或三击分类替换。只在释放时按鼠标目标切换，
 # 每个完整点击恰好执行一次。important 保证该语义在 Oh my tmux! 重建默认

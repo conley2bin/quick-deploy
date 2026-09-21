@@ -14,24 +14,75 @@ fail() { echo "FAIL: $*" >&2; exit 1; }
 
 bash -n "$INSTALLER" || fail "install.sh 语法错误"
 bash -n "${BASH_SOURCE[0]}" || fail "测试脚本语法错误"
-if ! command -v zsh >/dev/null 2>&1; then
-    echo "SKIP: 未安装 zsh，无法执行 Ghostty zsh hook 回归测试"
-    exit 0
+# zsh 只影响 hook 语法、hook 行为与 PTY 三部分；其余测试（配置渲染、
+# 显示会话矩阵、desktop 覆盖、安装器 helper、terminfo 验证）不依赖 zsh，
+# 必须继续跑，不能被一道提前 exit 挡住。
+HAVE_ZSH=false
+if command -v zsh >/dev/null 2>&1; then
+    HAVE_ZSH=true
+    zsh -n "$HOOK_SOURCE" || fail "zsh hook 语法错误"
+else
+    echo "SKIP: 未安装 zsh，跳过 zsh hook 语法、hook 行为与 PTY 测试（其余测试继续）"
 fi
-zsh -n "$HOOK_SOURCE" || fail "zsh hook 语法错误"
 
 # 只取安装器函数定义，避免测试触发 main/apt/GUI。
 sed '/^main "\$@"$/,$d' "$INSTALLER" > "$WORK/functions.sh"
 
 # 配置必须保留 SSH 能力，同时提供不依赖 shell 的 reset 兜底；不要用
 # mouse-reporting=false 牺牲 tmux 的鼠标功能。
-HOME="$WORK/render-home" bash -c '
+# 显示会话环境矩阵：基准与 headless 用 env -u 真正清掉三个变量（“定义为空”
+# 与“未定义”不是一回事，渲染若读它们会得到不同结果）；Wayland/X11 只设
+# 自己那一组变量。四份渲染必须逐字节一致：这只证明配置渲染不按显示服务器
+# 分叉，不证明任何剪贴板后端的实际行为。
+render_variant() {
+    local out="$1"
+    shift
+    env -u XDG_SESSION_TYPE -u WAYLAND_DISPLAY -u DISPLAY HOME="$WORK/render-home" "$@" \
+        bash -c '
+            source "$1"
+            font_exists() { return 0; }
+            resolved_working_directory() { printf "home\\n"; }
+            render_config
+        ' _ "$WORK/functions.sh" > "$out"
+}
+render_variant "$WORK/config.ghostty"
+grep -Fqx 'keybind = ctrl+shift+r=reset' "$WORK/config.ghostty" || fail "缺少 reset keybind"
+# 剪贴板策略：OSC 52 写允许、读拒绝。写入是远端 tmux 复制到达本机剪贴板的
+# 入口；读取只服务于把本机剪贴板回传给终端里的程序，本模块不需要，
+# 拒绝读取也暴露面最小。
+grep -Fqx 'clipboard-write = allow' "$WORK/config.ghostty" || fail "缺少 clipboard-write = allow"
+grep -Fqx 'clipboard-read = deny' "$WORK/config.ghostty" || fail "缺少 clipboard-read = deny"
+render_variant "$WORK/config.headless.ghostty"
+render_variant "$WORK/config.wayland.ghostty" XDG_SESSION_TYPE=wayland WAYLAND_DISPLAY=wayland-0
+render_variant "$WORK/config.x11.ghostty" XDG_SESSION_TYPE=x11 DISPLAY=:0
+cmp -s "$WORK/config.ghostty" "$WORK/config.headless.ghostty" \
+    || fail "无显示会话变量时渲染结果与基准不一致"
+cmp -s "$WORK/config.ghostty" "$WORK/config.wayland.ghostty" \
+    || fail "Wayland 会话下渲染结果与基准不一致"
+cmp -s "$WORK/config.ghostty" "$WORK/config.x11.ghostty" \
+    || fail "X11 会话下渲染结果与基准不一致"
+
+
+# write_config 幂等语义：首次写入基准内容（含剪贴板策略），重跑不重写、
+# 不备份、字节不变。
+HOME="$WORK/config-home" bash -c '
+    set -euo pipefail
     source "$1"
     font_exists() { return 0; }
     resolved_working_directory() { printf "home\\n"; }
-    render_config > "$2"
-' _ "$WORK/functions.sh" "$WORK/config.ghostty"
-grep -Fqx 'keybind = ctrl+shift+r=reset' "$WORK/config.ghostty" || fail "缺少 reset keybind"
+    CONFIG_DIR="$HOME/.config/ghostty"
+    CONFIG_FILE="$CONFIG_DIR/config.ghostty"
+    mkdir -p "$HOME"
+    write_config > "$HOME/first.out"
+    grep -Fq "已写入" "$HOME/first.out"
+    grep -Fqx "clipboard-write = allow" "$CONFIG_FILE"
+    grep -Fqx "clipboard-read = deny" "$CONFIG_FILE"
+    digest=$(sha256sum "$CONFIG_FILE" | cut -d" " -f1)
+    write_config > "$HOME/second.out"
+    grep -Fq "配置文件无变化" "$HOME/second.out"
+    test "$digest" = "$(sha256sum "$CONFIG_FILE" | cut -d" " -f1)"
+    ! compgen -G "$CONFIG_FILE.bak.*" >/dev/null
+' _ "$WORK/functions.sh" || fail "配置写入的幂等语义失败"
 grep -Fqx 'gtk-single-instance = false' "$WORK/config.ghostty" || fail "缺少 gtk-single-instance = false"
 grep -Fqx '# 独立外部启动使用独立进程；内部窗口、tab 和 split 仍可能共享进程。' "$WORK/config.ghostty" \
     || fail "缺少独立进程注释行"
@@ -208,6 +259,44 @@ if [ -f /usr/share/applications/com.mitchellh.ghostty.desktop ]; then
     ' _ "$WORK/functions.sh" || fail "真实系统 desktop 模板无法生成独立进程覆盖"
 fi
 
+# ============================================================
+# 安装后 terminfo 验证：xterm-ghostty 必须含 Ms（OSC 52）
+# ============================================================
+# verify_system_integration 还要求 GHOSTTY_BIN 可执行与系统 desktop 入口，
+# 两者用临时 fixture；infocmp 用函数 stub 分别模拟“含 Ms”与“不含 Ms”。
+printf '#!/bin/sh\necho "Ghostty 1.3.1-test"\n' > "$WORK/fake-ghostty"
+chmod +x "$WORK/fake-ghostty"
+
+HOME="$WORK/verify-home" bash -c '
+    set -euo pipefail
+    source "$1"
+    GHOSTTY_BIN="$2"
+    DESKTOP_FILE="$3"
+    mkdir -p "$HOME"
+    infocmp() {
+        # 可用性检查不带 -x；只有 Ms 探针会带 -x -1。
+        case "$1" in
+            -x) printf "\tMs=\\E]52;%%p1%%s;%%p2%%s\\007,\n" ;;
+        esac
+        return 0
+    }
+    verify_system_integration > "$HOME/ok.out"
+    grep -Fq "含 Ms" "$HOME/ok.out"
+' _ "$WORK/functions.sh" "$WORK/fake-ghostty" "$WORK/vendor.desktop" \
+    || fail "terminfo 含 Ms 时安装后验证未通过"
+
+HOME="$WORK/verify-fail-home" bash -c '
+    set -euo pipefail
+    source "$1"
+    GHOSTTY_BIN="$2"
+    DESKTOP_FILE="$3"
+    mkdir -p "$HOME"
+    infocmp() { return 0; }
+    ( verify_system_integration ) >/dev/null 2>"$HOME/fail.err" && exit 1
+    grep -Fq "缺少 Ms" "$HOME/fail.err"
+' _ "$WORK/functions.sh" "$WORK/fake-ghostty" "$WORK/vendor.desktop" \
+    || fail "terminfo 缺 Ms 时安装后验证未明确失败"
+
 if command -v zsh >/dev/null 2>&1; then
     mkdir -p "$WORK/ghostty-resources"
     HOME="$WORK/matcher-home" GHOSTTY_RESOURCES_DIR="$WORK/ghostty-resources" \
@@ -231,49 +320,66 @@ if command -v zsh >/dev/null 2>&1; then
         ' _ "$HOOK_SOURCE" || fail "zsh ssh 命令识别失败"
 fi
 
-# 安装器 helper 的隔离 HOME 测试：首次写入、重复运行不备份，漂移先备份，
-# .zshrc 的其它行/权限保留，符号链接拒绝改写。
-HOME="$WORK/install-home" bash -c '
-    set -euo pipefail
-    source "$1"
-    SSH_MOUSE_HOOK_SOURCE="$2"
-    SSH_MOUSE_HOOK_CONFIG="$HOME/.config/ghostty/$SSH_MOUSE_HOOK_FILENAME"
-    mkdir -p "$HOME"
-    printf "export KEEP_ME=1\\n" > "$HOME/.zshrc"
-    chmod 600 "$HOME/.zshrc"
-    install_ssh_mouse_hook >/dev/null
-    test -f "$SSH_MOUSE_HOOK_CONFIG"
-    grep -Fqx "export KEEP_ME=1" "$HOME/.zshrc"
-    grep -Fqx "$ZSHRC_BLOCK_BEGIN" "$HOME/.zshrc"
-    test "$(stat -c %a "$HOME/.zshrc")" = 600
-    digest=$(sha256sum "$HOME/.zshrc" | cut -d" " -f1)
-    install_ssh_mouse_hook >/dev/null
-    test "$digest" = "$(sha256sum "$HOME/.zshrc" | cut -d" " -f1)"
-    test "$(grep -Fc "$ZSHRC_BLOCK_BEGIN" "$HOME/.zshrc")" -eq 1
-    printf "\\n# drift\\n" >> "$SSH_MOUSE_HOOK_CONFIG"
-    install_ssh_mouse_hook >/dev/null
-    cmp "$SSH_MOUSE_HOOK_SOURCE" "$SSH_MOUSE_HOOK_CONFIG"
-    compgen -G "$SSH_MOUSE_HOOK_CONFIG.bak.*" >/dev/null
-    rm -rf "$SSH_MOUSE_HOOK_CONFIG"
-    mkdir "$SSH_MOUSE_HOOK_CONFIG"
-    install_ssh_mouse_hook >/dev/null 2>"$HOME/directory.err"
-    test -d "$SSH_MOUSE_HOOK_CONFIG"
-    grep -Fq "不是普通文件" "$HOME/directory.err"
-    rm -rf "$SSH_MOUSE_HOOK_CONFIG"
-    printf "%s\\nKEEP" "$ZSHRC_BLOCK_BEGIN" > "$HOME/.zshrc"
-    digest=$(sha256sum "$HOME/.zshrc" | cut -d" " -f1)
-    install_ssh_mouse_hook >/dev/null 2>"$HOME/marker.err"
-    test "$digest" = "$(sha256sum "$HOME/.zshrc" | cut -d" " -f1)"
-    grep -Fq "标记不成对" "$HOME/marker.err"
-    real="$HOME/real-zshrc"
-    printf "KEEP\\n" > "$real"
-    rm -f "$HOME/.zshrc"
-    ln -s "$real" "$HOME/.zshrc"
-    install_ssh_mouse_hook >/dev/null 2>"$HOME/symlink.err"
-    test -L "$HOME/.zshrc"
-    test "$(cat "$real")" = KEEP
-    grep -Fq "符号链接" "$HOME/symlink.err"
-' _ "$WORK/functions.sh" "$HOOK_SOURCE"
+# 首次写入/重复运行/漂移备份这类断言依赖安装器真的装了 hook，而安装器
+# 在没有 zsh 时会干净跳过；因此这一段只在 zsh 可用时跑，无 zsh 时改测
+# “跳过且不动用户文件”。
+if [ "$HAVE_ZSH" = true ]; then
+    # 安装器 helper 的隔离 HOME 测试：首次写入、重复运行不备份，漂移先备份，
+    # .zshrc 的其它行/权限保留，符号链接拒绝改写。
+    HOME="$WORK/install-home" bash -c '
+        set -euo pipefail
+        source "$1"
+        SSH_MOUSE_HOOK_SOURCE="$2"
+        SSH_MOUSE_HOOK_CONFIG="$HOME/.config/ghostty/$SSH_MOUSE_HOOK_FILENAME"
+        mkdir -p "$HOME"
+        printf "export KEEP_ME=1\\n" > "$HOME/.zshrc"
+        chmod 600 "$HOME/.zshrc"
+        install_ssh_mouse_hook >/dev/null
+        test -f "$SSH_MOUSE_HOOK_CONFIG"
+        grep -Fqx "export KEEP_ME=1" "$HOME/.zshrc"
+        grep -Fqx "$ZSHRC_BLOCK_BEGIN" "$HOME/.zshrc"
+        test "$(stat -c %a "$HOME/.zshrc")" = 600
+        digest=$(sha256sum "$HOME/.zshrc" | cut -d" " -f1)
+        install_ssh_mouse_hook >/dev/null
+        test "$digest" = "$(sha256sum "$HOME/.zshrc" | cut -d" " -f1)"
+        test "$(grep -Fc "$ZSHRC_BLOCK_BEGIN" "$HOME/.zshrc")" -eq 1
+        printf "\\n# drift\\n" >> "$SSH_MOUSE_HOOK_CONFIG"
+        install_ssh_mouse_hook >/dev/null
+        cmp "$SSH_MOUSE_HOOK_SOURCE" "$SSH_MOUSE_HOOK_CONFIG"
+        compgen -G "$SSH_MOUSE_HOOK_CONFIG.bak.*" >/dev/null
+        rm -rf "$SSH_MOUSE_HOOK_CONFIG"
+        mkdir "$SSH_MOUSE_HOOK_CONFIG"
+        install_ssh_mouse_hook >/dev/null 2>"$HOME/directory.err"
+        test -d "$SSH_MOUSE_HOOK_CONFIG"
+        grep -Fq "不是普通文件" "$HOME/directory.err"
+        rm -rf "$SSH_MOUSE_HOOK_CONFIG"
+        printf "%s\\nKEEP" "$ZSHRC_BLOCK_BEGIN" > "$HOME/.zshrc"
+        digest=$(sha256sum "$HOME/.zshrc" | cut -d" " -f1)
+        install_ssh_mouse_hook >/dev/null 2>"$HOME/marker.err"
+        test "$digest" = "$(sha256sum "$HOME/.zshrc" | cut -d" " -f1)"
+        grep -Fq "标记不成对" "$HOME/marker.err"
+        real="$HOME/real-zshrc"
+        printf "KEEP\\n" > "$real"
+        rm -f "$HOME/.zshrc"
+        ln -s "$real" "$HOME/.zshrc"
+        install_ssh_mouse_hook >/dev/null 2>"$HOME/symlink.err"
+        test -L "$HOME/.zshrc"
+        test "$(cat "$real")" = KEEP
+        grep -Fq "符号链接" "$HOME/symlink.err"
+    ' _ "$WORK/functions.sh" "$HOOK_SOURCE"
+else
+    HOME="$WORK/nozsh-home" bash -c '
+        set -euo pipefail
+        source "$1"
+        SSH_MOUSE_HOOK_SOURCE="$2"
+        SSH_MOUSE_HOOK_CONFIG="$HOME/.config/ghostty/$SSH_MOUSE_HOOK_FILENAME"
+        mkdir -p "$HOME"
+        printf "KEEP\n" > "$HOME/.zshrc"
+        install_ssh_mouse_hook >"$HOME/skip.out" 2>&1
+        test ! -e "$SSH_MOUSE_HOOK_CONFIG"
+        test "$(cat "$HOME/.zshrc")" = KEEP
+    ' _ "$WORK/functions.sh" "$HOOK_SOURCE" || fail "无 zsh 时安装器没有干净跳过 hook"
+fi
 
 # 用 pty 驱动交互式 zsh，验证：Ghostty 守卫、ssh 命令返回后的 DECRST、
 # 退出码不被 hook 改写，以及普通命令不产生复位。
@@ -368,7 +474,13 @@ finally:
 PY
 GHOSTTY_RESOURCES_DIR="$WORK/ghostty-resources"
 mkdir -p "$GHOSTTY_RESOURCES_DIR"
-python3 "$WORK/pty-check.py" "$HOOK_SOURCE" "$GHOSTTY_RESOURCES_DIR" yes
-python3 "$WORK/pty-check.py" "$HOOK_SOURCE" "$GHOSTTY_RESOURCES_DIR" no
+if [ "$HAVE_ZSH" = true ]; then
+    python3 "$WORK/pty-check.py" "$HOOK_SOURCE" "$GHOSTTY_RESOURCES_DIR" yes
+    python3 "$WORK/pty-check.py" "$HOOK_SOURCE" "$GHOSTTY_RESOURCES_DIR" no
+fi
 
-echo "PASS: Ghostty SSH mouse cleanup, reset fallback, syntax, idempotency, isolation, and desktop override"
+if [ "$HAVE_ZSH" = true ]; then
+    echo "PASS: Ghostty SSH mouse cleanup, reset fallback, syntax, idempotency, isolation, write-only OSC 52 clipboard policy, terminfo Ms verification, and desktop override"
+else
+    echo "PASS (zsh 未安装，hook 行为与 PTY 部分已跳过): Ghostty syntax, idempotency, isolation, write-only OSC 52 clipboard policy, terminfo Ms verification, and desktop override"
+fi
