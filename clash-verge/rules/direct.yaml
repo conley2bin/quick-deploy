@@ -5,6 +5,10 @@ version: 1
 pre:
   - "DOMAIN,ssh.github.com,DIRECT"
   - "DST-PORT,22,DIRECT"
+  # Tailscale control/log/DERP domains plus the tailnet CGNAT and ULA peer ranges.
+  - "DOMAIN-SUFFIX,tailscale.com,DIRECT"
+  - "IP-CIDR,100.64.0.0/10,DIRECT,no-resolve"
+  - "IP-CIDR6,fd7a:115c:a1e0::/48,DIRECT,no-resolve"
   - "DOMAIN-SUFFIX,dex-gem.ai,DIRECT"
   - "DOMAIN-SUFFIX,feishu.cn,DIRECT"
   - "DOMAIN-SUFFIX,feishucdn.com,DIRECT"

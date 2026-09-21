@@ -89,6 +89,15 @@ proxy 目标写成内置策略（`DIRECT`/`REJECT`/…）、同一选择器相�
 `PROCESS-NAME` 是字面可执行文件**基名**，同名但无关的程序也会命中，它不是应用发现
 失败时的回退。
 
+### 默认直连：Tailscale
+
+`direct.yaml` 的 `pre` 在 `DST-PORT,22` 之后固定带一组 Tailscale 直连：
+`DOMAIN-SUFFIX,tailscale.com,DIRECT` 覆盖控制面/日志/DERP 服务域名，
+`IP-CIDR,100.64.0.0/10` 与 `IP-CIDR6,fd7a:115c:a1e0::/48` 覆盖 tailnet 的 CGNAT 与
+ULA 对端地址。这组规则只说明规则表会把之后的连接判给 `DIRECT`，不是「当前 SSH 或中继
+流量已经直连」的运行证据：重载前已建立的连接可能继续沿用旧出口，要重连或看实际
+socket/路由才能确认；自建 DERP 域名不在覆盖范围内。
+
 ### 迁移：清掉旧的订阅级重复规则
 
 如果之前用订阅级 Rules 扩展手工加过同一条本地规则（例如
