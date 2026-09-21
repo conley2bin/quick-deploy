@@ -412,6 +412,16 @@ xdg_terminal_state() {
     fi
 }
 
+# xterm-ghostty 记录是否带 Ms（OSC 52 剪贴板）能力。
+# Ms 是扩展能力，infocmp 必须加 -x 才会打印；行首用 [[:space:]] 而不是
+# sed 的 \t，BSD 与 GNU 的差异不值得让这条检查依赖 sed 实现。
+# 不用 grep -q：它一命中就退出，infocmp 可能因 SIGPIPE 非零退出，而本脚本
+# 开了 pipefail，会把“确实有 Ms”误判成失败；grep >/dev/null 会读完输入。
+xterm_ghostty_has_ms() {
+    infocmp -x -1 xterm-ghostty 2>/dev/null \
+        | grep '^[[:space:]]*Ms=' >/dev/null
+}
+
 show_check() {
     local candidate="无"
     candidate="$(apt_candidate)"
@@ -463,6 +473,11 @@ show_check() {
     fi
     if infocmp xterm-ghostty >/dev/null 2>&1; then
         echo "terminfo: xterm-ghostty 已可用"
+        if xterm_ghostty_has_ms; then
+            echo "OSC 52: xterm-ghostty terminfo 含 Ms（远端 tmux 复制回本机依赖它）"
+        else
+            echo "OSC 52: xterm-ghostty terminfo 不含 Ms（远端 tmux 需靠运行时识别或配置特性才有 Ms）"
+        fi
     else
         echo "terminfo: xterm-ghostty 不可用（安装的系统级 .deb 应补齐）"
     fi
@@ -835,6 +850,18 @@ render_config() {
     # prompt 发出针对常见鼠标协议的 DECRST；Ctrl+Shift+R 是所有 shell
     # 和非交互式 SSH 启动方式都能使用的 Ghostty 原生 reset 兜底。
     echo "keybind = ctrl+shift+r=reset"
+
+    # 剪贴板策略：允许 OSC 52 写入，拒绝 OSC 52 读取。
+    # 写入是远端复制路径的关键一环：远端 tmux 复制后发出的 OSC 52 经
+    # SSH 到达本机 Ghostty，由它落到本机系统剪贴板。写入端是终端本身，
+    # 不需要远端有 Wayland / X11 会话或任何剪贴板工具，也与本机跑在
+    # Wayland 还是 X11 无关。
+    # 拒绝读取：读取会让终端里的程序把本机剪贴板内容取走。日常粘贴是
+    # Ghostty 自己的本地动作（Ctrl+Shift+V、右键或 Shift+Insert），由
+    # 终端直接把剪贴板内容写进 pty，不经过 OSC 52 读取，因此 deny 不
+    # 影响用户触发的粘贴；远端只需要用户按一次这个粘贴键。
+    echo "clipboard-write = allow"
+    echo "clipboard-read = deny"
 
     # working-directory 只决定没有可继承窗口时的默认目录。Ghostty 的
     # window-inherit-working-directory 默认为 true，且优先级更高：同一进程内
@@ -1290,6 +1317,13 @@ verify_system_integration() {
 
     infocmp xterm-ghostty >/dev/null 2>&1 || die "安装后仍找不到 xterm-ghostty terminfo"
     echo "OK: xterm-ghostty terminfo 已可用"
+
+    # 远端 tmux 靠客户端 terminfo 的 Ms 决定要不要发 OSC 52；缺了它，
+    # “远端复制回本机剪贴板”这条路径会静默失效，所以和记录缺失一样
+    # 明确失败，而不是只留一行提示。
+    xterm_ghostty_has_ms \
+        || die "xterm-ghostty terminfo 缺少 Ms（OSC 52）能力；远端 tmux 复制回本机在正常路径下将不可用"
+    echo "OK: xterm-ghostty terminfo 含 Ms（OSC 52）"
 
 }
 

@@ -72,6 +72,7 @@ sudo apt install --allow-downgrades ghostty=1.3.1~ppa2-noble1
   - 显式解除 `Ctrl+Alt+←/→` 的 Ghostty split 绑定，把按键交给 tmux 切 window
   - 为 `Ctrl+Alt+=/+` 显式发送 CSI-u 序列，交给 tmux 新建 window
   - `Ctrl+Shift+R` 绑定 Ghostty 原生 `reset`，用于清理异常 SSH 后残留的终端状态
+  - `clipboard-write = allow` / `clipboard-read = deny`：允许 OSC 52 写入（远端 tmux 复制回本机剪贴板的入口），拒绝 OSC 52 读取（见下节）
   - 新终端起始目录 `~/Documents`（不存在时回退到 XDG 文档目录，再不行就 `home`）
   - 关闭新窗口工作目录继承；新标签页和分屏仍保留继承
   - `gtk-single-instance = false`：每个外部启动的 Ghostty 用自己的进程（见下节）
@@ -120,6 +121,21 @@ keybind = ctrl+alt+arrow_right=unbind
 
 这不是改绑 Ghostty 标签页；Ghostty 标签页继续使用上游默认的 `Ctrl+Tab` /
 `Ctrl+Shift+Tab`。代价是 Ghostty 自己的 split 不再能用这两个键切换。
+
+### OSC 52 剪贴板：只写不读
+
+配置显式写两行：
+
+```ini
+clipboard-write = allow
+clipboard-read = deny
+```
+
+- **写允许**：终端里的程序（包括 SSH 远端 tmux 发来的、由本地 tmux 重发的序列）可以发 OSC 52 把内容写进本机系统剪贴板。这是 `fresh-install/modules/tmux` 那条“远端 tmux 复制 → 本机剪贴板”路径的终点：序列经 SSH 与本地 tmux 到达 Ghostty，再由 Ghostty 用**它当前平台的剪贴板后端**（Wayland/X11/macOS 等由 Ghostty 自己选择）落下。因此远端与路径中间的机器都不需要 Wayland/X11 会话或剪贴板工具。
+- **读拒绝**：OSC 52 读取会让终端里的程序把本机剪贴板内容取走。Ghostty 默认值是 `ask`（弹窗询问），本模块改为无条件拒绝：终端内程序永远读不到本机剪贴板。
+- **日常粘贴不受影响**：`Ctrl+Shift+V`、鼠标右键、`Shift+Insert` 是 Ghostty 自己的本地动作，由终端直接把剪贴板内容写进 pty，不经过 OSC 52 读取；`Ctrl+Shift+C` 复制同样走 Ghostty 的本地选区。远端只需要用户按一次粘贴键。
+- 策略与显示服务器、系统版本无关：脚本里没有任何按 Wayland/X11 或 Ubuntu 版本分叉的剪贴板逻辑。回归测试在 Wayland、X11、无会话变量三种环境下断言渲染结果逐字节相同——这只证明**配置渲染不分叉**，不证明任何剪贴板后端的实际行为（后者需要真实图形会话）。
+- 本模块不写 `terminal-features` 之类的终端能力声明，也不强制声明 `Ms`；远端 tmux 能不能发 OSC 52 取决于它客户端侧的有效 `Ms`（可能来自 terminfo、配置的特性或 tmux 的运行时识别，见 `fresh-install/modules/tmux/README.md` 剪贴板一节）。本模块能做的是保证本机 `xterm-ghostty` 记录确实带 `Ms`：`--check` 会报告它，正式安装的验证阶段缺 `Ms` 会明确失败。
 
 ## 字体
 
@@ -297,7 +313,7 @@ emulator），不是对 X11 API 的依赖。切到 Wayland 后，只有“按键
 bash tests/run.sh
 ```
 
-预检报告：系统与架构、Ghostty 版本、apt 候选版本、PPA 是否已在源中、配置状态、用户级 desktop 覆盖状态（已是基准内容 / 将被替换 / 将被拒绝）、两种字体、`xterm-ghostty` terminfo、SSH 鼠标自愈 hook、当前默认终端所有者以及计划动作。它不会添加软件源、调用修改状态的 apt 命令、访问 GitHub、下载文件或写入用户目录。
+预检报告：系统与架构、Ghostty 版本、apt 候选版本、PPA 是否已在源中、配置状态、用户级 desktop 覆盖状态（已是基准内容 / 将被替换 / 将被拒绝）、两种字体、`xterm-ghostty` terminfo（含 OSC 52 所需的 `Ms` 能力是否在场）、SSH 鼠标自愈 hook、当前默认终端所有者以及计划动作。它不会添加软件源、调用修改状态的 apt 命令、访问 GitHub、下载文件或写入用户目录。
 
 ## 安装后的用户验收清单
 
@@ -339,6 +355,13 @@ Ghostty 是本地程序，负责画窗口、渲染字体、调 GPU；远端只�
 本模块默认写入 `shell-integration-features = ssh-env,ssh-terminfo`，Ghostty 会在 SSH 时
 自动用 `infocmp` + `tic` 把记录装到远端的 `~/.terminfo`（**不需要 sudo**，也不影响
 其它用户）。上游默认是关闭的（`no-ssh-env,no-ssh-terminfo`），这里刻意开启。
+
+`xterm-ghostty` 的 terminfo 带 `Ms`（OSC 52 剪贴板）能力，这是终端侧“远端复制回本机”
+能成立的一个前提；本模块的安装验证会检查它（缺 `Ms` 明确失败，`--check` 也会报告）。
+但注意 `ssh-terminfo` 并不是嵌套路径的一环：它只在 Ghostty 的 SSH 包装真正生效时把
+`xterm-ghostty` 记录装到远端（直接在 Ghostty 集成 shell 里发起 ssh，或显式 `ghostty +ssh`）；
+**本地 tmux pane 里起的嵌套 shell 不会继承那个包装**。嵌套路径上远端 tmux 依赖的是它
+客户端侧的有效 `Ms`，来源见 `fresh-install/modules/tmux/README.md` 剪贴板一节。
 
 安全网：官方文档声明两项同时开启时，安装失败会**自动回退到** `xterm-256color`，
 不会把人卡在花屏状态。前提是远端有 `infocmp` 与 `tic`（ncurses 自带）；
