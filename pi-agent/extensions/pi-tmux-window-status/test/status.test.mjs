@@ -205,6 +205,7 @@ test("model/provider unavailable classifier accepts provider failures and reject
     "OpenAI API error (520)",
     "LiteLLMCompletionStreamingIterator missing completed_response adapter signature",
     "permission_error: concurrent request limit reached",
+    "gateway_concurrency_limit: Concurrency limit exceeded for account, please retry later",
     "OpenAI API error (402): your 余额 is 不足; please top up",
     "OpenAI API error (400): invalid model id 'gpt-x'",
   ]) assert.equal(classifyModelUnavailable(assistantError(message)), true, message);
@@ -716,6 +717,65 @@ test("auto-continue classifier additions cover terminated, weekly quota, mixed a
     "Error: 502 {\"status\":502,\"error_code\":502,\"retryable\":true,\"retry_after\":60,\"cloudflare_error\":true}",
   ]) assert.equal(classifyModelUnavailable(assistantError(message)), true, message);
   assert.equal(classifyModelUnavailable(assistantError("the task terminated normally")), false);
+});
+
+test("gateway account concurrency-limit classifier accepts the exact provider failure and near-miss variants", () => {
+  const assistantError = (errorMessage) => ({ role: "assistant", stopReason: "error", errorMessage });
+  const gatewayText = "Concurrency limit exceeded for account, please retry later";
+  const gateway = `gateway_concurrency_limit: ${gatewayText}`;
+  for (const message of [
+    gateway,
+    `Error: ${gateway}`,
+    `{"error":{"code":"gateway_concurrency_limit","message":"${gatewayText}"}}`,
+    gatewayText,
+    `gateway concurrency limit: Concurrency limit exceeded for accounts, please retry later`,
+    `400 ${gateway}`,
+  ]) assert.equal(classifyModelUnavailable(assistantError(message)), true, message);
+  for (const message of [
+    assistantError("concurrency limit exceeded, task queue full"),
+    assistantError("asyncio: concurrency limit exceeded, 8 tasks already running"),
+    assistantError("concurrency limit exceeded for parallel import slots in my_app.py"),
+    assistantError(`Operation aborted: ${gateway}`),
+    { role: "tool", stopReason: "error", errorMessage: gateway },
+    { role: "assistant", stopReason: "aborted", errorMessage: gateway },
+    { role: "assistant", stopReason: "stop", errorMessage: gateway },
+  ]) assert.equal(classifyModelUnavailable(message), false, JSON.stringify(message));
+  assert.equal(nextLastAssistantErrorMatched(false, assistantError(gateway)), true, "real gateway failure arms the continue gate");
+  assert.equal(nextLastAssistantErrorMatched(true, assistantError("concurrency limit exceeded, task queue full")), false, "local concurrency wording neither arms nor preserves the gate");
+});
+
+test("real gateway concurrency error auto-continues once while local concurrency wording does not", async () => {
+  const h = await statusHarness("gateway-concurrency");
+  const run = new AbortController();
+  const gateway = "gateway_concurrency_limit: Concurrency limit exceeded for account, please retry later";
+  const local = "asyncio: concurrency limit exceeded, 8 tasks already running";
+  try {
+    // 同一个 harness 内的 A/B：负例必须先证明该 harness 确实具备发送能力，否则「没发送」可能只是时序假象。
+    h.setSignal(run.signal);
+    h.fire("agent_start", {}, h.ctx);
+    h.fire("message_update", { message: { role: "assistant", stopReason: "error", errorMessage: local } }, h.ctx);
+    h.fire("message_end", { message: { role: "assistant", stopReason: "error", errorMessage: local } }, h.ctx);
+    h.fire("agent_settled", {}, h.ctx);
+    await new Promise((resolve) => setTimeout(resolve, 350));
+    assert.deepEqual(h.sent, [], "local program concurrency wording schedules no continue");
+    assert.equal(h.paneArmed(), "", "local program concurrency wording publishes no error lease");
+
+    const run2 = new AbortController();
+    h.setSignal(run2.signal);
+    h.fire("agent_start", {}, h.ctx);
+    h.fire("message_update", { message: { role: "assistant", stopReason: "error", errorMessage: gateway } }, h.ctx);
+    await waitFor(h.paneArmed, "1");
+    await waitFor(h.errorOption, "1");
+    h.fire("message_end", { message: { role: "assistant", stopReason: "error", errorMessage: gateway } }, h.ctx);
+    h.fire("agent_settled", {}, h.ctx);
+    await waitFor(() => h.sent.length, 1);
+    assert.deepEqual(h.sent, ["continue"], "the screenshot error sends the user continue");
+    h.fire("agent_settled", {}, h.ctx);
+    await new Promise((resolve) => setTimeout(resolve, 350));
+    assert.deepEqual(h.sent, ["continue"], "a repeated settle stays inside the 30 s send throttle");
+  } finally {
+    await h.cleanup();
+  }
 });
 
 test("sentinel cancellation invalidates delayed events from one run while a distinct run auto-continues", async () => {

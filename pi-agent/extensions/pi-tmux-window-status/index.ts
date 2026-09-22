@@ -25,8 +25,12 @@ const POSITIVE_TRANSPORT = /(^|\bError:\s*)terminated\s*$|network failure|fetch 
 const POSITIVE_5XX = /\b5\d\d\b|\b520\b|\b524\b|\b529\b/i;
 const POSITIVE_ADAPTER = /LiteLLMCompletionStreamingIterator|completed_response/i;
 const POSITIVE_CONCURRENCY = /(permission[_ ]?error.*concurrent|concurrent request limit)/i;
+// 供应商网关的账号级并发上限，截图原文 "gateway_concurrency_limit: Concurrency limit exceeded for account,
+// please retry later"。必须同时命中网关错误码或 "for account" 归属短语：裸的 "concurrency limit
+// exceeded" 也会出现在用户代码/本地程序的并发错误里，那种错误不是供应商可用性问题，不该自动 continue。
+const POSITIVE_GATEWAY_CONCURRENCY = /gateway[_ -]?concurrency[_ -]?limit|concurrency limit exceeded for accounts?\b/i;
 const POSITIVE_PROVIDER = /(service unavailable|provider (unavailable|error)|backend unavailable|upstream (unavailable|error))/i;
-const POSITIVE_ANY = new RegExp([POSITIVE_QUOTA.source, POSITIVE_AUTH.source, POSITIVE_MODEL.source, POSITIVE_RATE.source, POSITIVE_TIMEOUT.source, POSITIVE_TRANSPORT.source, POSITIVE_5XX.source, POSITIVE_ADAPTER.source, POSITIVE_CONCURRENCY.source, POSITIVE_PROVIDER.source].join("|"), "i");
+const POSITIVE_ANY = new RegExp([POSITIVE_QUOTA.source, POSITIVE_AUTH.source, POSITIVE_MODEL.source, POSITIVE_RATE.source, POSITIVE_TIMEOUT.source, POSITIVE_TRANSPORT.source, POSITIVE_5XX.source, POSITIVE_ADAPTER.source, POSITIVE_CONCURRENCY.source, POSITIVE_GATEWAY_CONCURRENCY.source, POSITIVE_PROVIDER.source].join("|"), "i");
 const ORDINARY_BAD_REQUEST = /(\b400\b|bad request|invalid request|schema|validation(?! failed))/i;
 const CONFLICT_RATELIMIT = /too many concurrent requests/i;
 // Pi 自动重试耗尽后的收尾消息（retryAttempt>0）；用户主动 Esc 是 "Operation aborted"
@@ -62,6 +66,7 @@ export function classifyModelUnavailable(message: unknown) {
     if (POSITIVE_MODEL.test(error)) return true;
     if (POSITIVE_QUOTA.test(error)) return true;
     if (POSITIVE_AUTH.test(error)) return true;
+    if (POSITIVE_GATEWAY_CONCURRENCY.test(error)) return true;
     return false;
   }
   return POSITIVE_ANY.test(error);
