@@ -28,9 +28,12 @@ class Clock implements TransportScheduler {
 class Sink extends EventEmitter implements TransportSink {
   readonly writes: Buffer[] = [];
   readonly returns: boolean[] = [];
+  readonly visibility: boolean[] = [];
+  visible = true;
   writableNeedDrain = false;
   write(value: Buffer): boolean {
     this.writes.push(Buffer.from(value));
+    this.visibility.push(this.visible);
     const accepted = this.returns.shift() ?? true;
     if (!accepted) this.writableNeedDrain = true;
     return accepted;
@@ -85,17 +88,50 @@ test("viewer-aware preparation is pending until a compatible visible receiver an
   await settle(terminal.setViewer(viewer("viewer-a")), clock);
   assert.equal(sink.writes.length, 1, "a failed snapshot cannot prune a served viewer identity");
   await terminal.setViewer(viewer("viewer-a", false, "no client is viewing this window"));await settle(terminal.setViewer(viewer("viewer-a")), clock);
-  assert.equal(sink.writes.length, 1, "same attached viewer hide/show retains sent state");
+  assert.equal(sink.writes.length, 1, "an upload confirmed by an intervening snapshot stays deduplicated across later hide/show");
 
   await settle(terminal.setViewer({ ready: true, epoch: "viewer-a+b", reason: "", attached: ["viewer-a", "viewer-b"], receivers: ["viewer-a", "viewer-b"] }), clock);
   assert.equal(sink.writes.length, 2, "one unseen attached viewer receives a complete re-upload");
   await terminal.setViewer({ ready: false, epoch: "viewer-b-hidden", reason: "no client is viewing this window", attached: ["viewer-a", "viewer-b"], receivers: [] });
   await settle(terminal.setViewer({ ready: true, epoch: "viewer-b-only", reason: "", attached: ["viewer-a", "viewer-b"], receivers: ["viewer-b"] }), clock);
-  assert.equal(sink.writes.length, 2, "a served attached viewer changing windows is not resent pixels");
+  assert.equal(sink.writes.length, 3, "a receiver added since the preceding snapshot is conservatively retried after a known hide");
   await settle(terminal.setViewer({ ready: true, epoch: "viewer-b-reconnected", reason: "", attached: ["viewer-a", "viewer-b-new"], receivers: ["viewer-b-new"] }), clock);
-  assert.equal(sink.writes.length, 3, "a reconnected identity receives pixels");
+  assert.equal(sink.writes.length, 4, "a reconnected identity receives pixels");
   await terminal.setViewer(viewer("mixed", false, "an incompatible client is viewing this window"));await terminal.prepare("two", image("second"));
-  assert.equal(sink.writes.length, 3, "incompatible visible viewer remains pending with zero PNG traffic");
+  assert.equal(sink.writes.length, 4, "incompatible visible viewer remains pending with zero PNG traffic");
+  await settle(terminal.clear(true), clock);
+});
+
+test("a known hidden transition revokes only a just-accepted stale upload", async () => {
+  const { clock, sink, terminal } = runtime();
+  await settle(terminal.setViewer(viewer("viewer-a")), clock);
+  await settle(terminal.prepare("stable", image("stable")), clock);
+  await settle(terminal.setViewer({ ready: true, epoch: "viewer-a-stable", reason: "", attached: ["viewer-a"], receivers: ["viewer-a"] }), clock);
+  sink.visible = false;
+  await settle(terminal.prepare("raced", image("raced")), clock);
+  assert.deepEqual(sink.visibility, [true, false], "the second upload is accepted while the cached viewer snapshot is stale");
+  assert.ok(terminal.render("raced", 20).length > 0, "the extension reproduces the blank-grid failure mode before recovery");
+
+  await terminal.setViewer({ ready: false, epoch: "hidden-a", reason: "pane hidden", attached: ["viewer-a"], receivers: [] });
+  sink.visible = true;
+  await settle(terminal.setViewer(viewer("viewer-a")), clock);
+  assert.deepEqual(sink.visibility, [true, false, true], "returning visibility reuploads the recent optimistic resource");
+  assert.ok(terminal.render("raced", 20).length > 0);
+  await settle(terminal.clear(true), clock);
+});
+
+test("unknown viewer snapshots do not consume the known visibility boundary", async () => {
+  const { clock, sink, terminal } = runtime();
+  await settle(terminal.setViewer(viewer("viewer-a")), clock);
+  await settle(terminal.prepare("stable", image("stable")), clock);
+  await settle(terminal.setViewer({ ready: true, epoch: "viewer-a-ready-2", reason: "", attached: ["viewer-a"], receivers: ["viewer-a"] }), clock);
+  sink.visible = false;
+  await settle(terminal.prepare("raced", image("raced")), clock);
+  await terminal.setViewer({ ready: false, epoch: "snapshot-error", reason: "tmux client snapshot failed", attached: undefined, receivers: [] });
+  await terminal.setViewer({ ready: false, epoch: "hidden-a", reason: "pane hidden", attached: ["viewer-a"], receivers: [] });
+  sink.visible = true;
+  await settle(terminal.setViewer(viewer("viewer-a")), clock);
+  assert.deepEqual(sink.visibility, [true, false, true], "a failed snapshot cannot hide the later known hide boundary");
   await settle(terminal.clear(true), clock);
 });
 

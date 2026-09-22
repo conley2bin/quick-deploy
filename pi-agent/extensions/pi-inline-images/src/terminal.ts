@@ -36,6 +36,8 @@ type StoredImage = {
   placements: Map<string, PreparedPlacement>;
   cell: CellSize;
   sent: Set<string>;
+  /** Poll snapshot sequence at which each receiver's upload was accepted. */
+  sentSnapshot: Map<string, number>;
   terminalResource: boolean;
   releasing: boolean;
   uploading?: Promise<void>;
@@ -104,6 +106,7 @@ export class TerminalImages {
   private viewerReady = true;
   private viewerEpoch = "legacy";
   private viewerRevision = 0;
+  private viewerSnapshot = 0;
   private viewerReason = "";
   private viewerReceivers: readonly string[] = [];
 
@@ -155,6 +158,12 @@ export class TerminalImages {
   }
 
   async setViewer(snapshot: ViewerState): Promise<void> {
+    const previousSnapshot = this.viewerSnapshot;
+    // Failed/unknown snapshots carry no attachment set and cannot establish a
+    // visibility boundary. Keep them out of the sequence so a later known
+    // hidden snapshot can still revoke an upload accepted after the last known
+    // ready state.
+    if (snapshot.attached !== undefined) this.viewerSnapshot++;
     const changed = snapshot.epoch !== this.viewerEpoch || snapshot.ready !== this.viewerReady;
     this.viewerReady = snapshot.ready;
     this.viewerEpoch = snapshot.epoch;
@@ -164,7 +173,28 @@ export class TerminalImages {
 
     if (snapshot.attached) {
       const attached = new Set(snapshot.attached);
-      for (const image of this.images.values()) for (const identity of image.sent) if (!attached.has(identity)) image.sent.delete(identity);
+      for (const image of this.images.values()) {
+        for (const identity of image.sent) {
+          if (!attached.has(identity)) {
+            image.sent.delete(identity);
+            image.sentSnapshot.delete(identity);
+          }
+        }
+        // A known not-ready snapshot can arrive after a write that used the
+        // previous snapshot. Revoke only those recent optimistic sent marks;
+        // older marks predate this visibility interval and retain attachment
+        // deduplication. Unknown/failed snapshots have attached=undefined and
+        // deliberately cannot make this inference.
+        if (changed && !snapshot.ready) {
+          for (const identity of image.sent) {
+            const sentAt = image.sentSnapshot.get(identity);
+            if (sentAt !== undefined && sentAt >= previousSnapshot) {
+              image.sent.delete(identity);
+              image.sentSnapshot.delete(identity);
+            }
+          }
+        }
+      }
     }
     if (changed) {
       for (const logicalId of this.images.keys()) {
@@ -219,6 +249,7 @@ export class TerminalImages {
       placements,
       cell,
       sent: new Set(),
+      sentSnapshot: new Map(),
       terminalResource: false,
       releasing: false,
     };
@@ -238,7 +269,8 @@ export class TerminalImages {
       const epoch = this.viewerEpoch;
       const revision = this.viewerRevision;
       const targets = receivers.filter((identity) => !image.sent.has(identity));
-      const operation = this.upload(logicalId, image, epoch, revision, targets, catalog, wireBytes);
+      const snapshot = this.viewerSnapshot;
+      const operation = this.upload(logicalId, image, epoch, revision, snapshot, targets, catalog, wireBytes);
       image.uploading = operation;
       try {
         await operation;
@@ -255,6 +287,7 @@ export class TerminalImages {
     image: StoredImage,
     epoch: string,
     revision: number,
+    snapshot: number,
     targets: readonly string[],
     catalog?: string,
     wireBytes?: number,
@@ -275,7 +308,10 @@ export class TerminalImages {
       if (this.images.get(logicalId) !== image || image.releasing) return;
       if (this.viewerManaged && (!this.viewerReady || this.viewerEpoch !== epoch || this.viewerRevision !== revision
         || targets.some((identity) => !this.viewerReceivers.includes(identity)))) return;
-      for (const identity of targets) image.sent.add(identity);
+      for (const identity of targets) {
+        image.sent.add(identity);
+        image.sentSnapshot.set(identity, snapshot);
+      }
     } catch (error) {
       if (error instanceof TransportError && error.code === "cancelled") return;
       if (this.images.get(logicalId) === image) image.error = error instanceof Error ? error.message : String(error);
@@ -396,6 +432,7 @@ export class TerminalImages {
     this.residentPngBytes[owner] -= image.image.png.length;
     image.placements.clear();
     image.sent.clear();
+    image.sentSnapshot.clear();
     this.usedIds.delete(image.id);
   }
 
