@@ -34,6 +34,18 @@ export default function copyLinksExtension(pi: ExtensionAPI): void {
         open: openWebUrl,
         button: (text) => ctx.ui.theme.fg("accent", text),
         recoverTmuxRelease: () => mouse?.enabled === true && mouse.warnings.length === 0,
+        requestRender: () => { tui?.invalidate(); tui?.requestRender(); },
+        quiesce: () => {
+          if (!tui) return false;
+          const fullscreen = tui.mode === "fullscreen";
+          tui.invalidate();
+          (tui as TUI & { renderNow(force?: boolean): void }).renderNow(true);
+          if (!fullscreen) return true;
+          const screen = (tui as TUI & { previousScreen?: unknown }).previousScreen;
+          return Array.isArray(screen) && screen.every(
+            (row) => typeof row === "string" && !row.includes("pi-copy://"),
+          );
+        },
         notify: (message, error) => ctx.ui.notify(message, error ? "error" : "info"),
       });
       failure = undefined;
