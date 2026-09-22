@@ -6,6 +6,7 @@ import {
   TuiAltScreen, visibleWidth, type Terminal,
 } from "@earendil-works/pi-tui";
 import { installAdapter, SUPPORTED_PI } from "../src/adapter.ts";
+import type { OpenLifetime } from "../src/browser.ts";
 
 // Count WeakRef constructions for every adapter installed below. V8 both caps a
 // Set at 2^24 entries and registers each WeakRef's target in a kept-objects list
@@ -102,6 +103,8 @@ function click(terminal: FakeTerminal, point: {x: number; y: number}, bits = 0) 
 interface FixtureOptions {
   quiesce?: "success" | "failure" | "throw";
   copy?: (text: string) => Promise<void>;
+  open?: (href: string, cwd: string, lifetime: OpenLifetime) => Promise<void>;
+  cwd?: string;
   copySelection?: (text: string) => Promise<boolean>;
   installer?: typeof installAdapter;
 }
@@ -114,6 +117,8 @@ function fixture(
 ) {
   const terminal = new FakeTerminal();
   const copied: string[] = [], opened: string[] = [], nativeOpened: string[] = [], notices: string[] = [], errorNotices: string[] = [];
+  const openRequests: Array<{ href: string; cwd: string; lifetime: OpenLifetime }> = [];
+  let currentCwd = fixtureOptions.cwd ?? "/fixture";
   let active = true;
   let renderRequests = 0;
   let tui: TuiAltScreen;
@@ -122,7 +127,11 @@ function fixture(
       if (fixtureOptions.copy) return fixtureOptions.copy(text);
       if (copyFailure) throw copyFailure;
       copied.push(text);
-    }, open: async url => { opened.push(url); },
+    }, cwd: () => currentCwd, open: async (href, cwd, lifetime) => {
+      openRequests.push({ href, cwd, lifetime });
+      if (fixtureOptions.open) await fixtureOptions.open(href, cwd, lifetime);
+      else opened.push(href);
+    },
     notify: (text, error) => { notices.push(text); if (error) errorNotices.push(text); }, button: text => text,
     recoverTmuxRelease: () => tmuxRecovery, requestRender: () => { renderRequests += 1; },
     quiesce: () => {
@@ -139,8 +148,9 @@ function fixture(
     copySelection: fixtureOptions.copySelection ?? (async () => true),
   });
   tui.addChild(component); tui.start(); tui.renderNow();
-  return { terminal, component, tui, copied, opened, nativeOpened, notices, errorNotices, adapter,
+  return { terminal, component, tui, copied, opened, openRequests, nativeOpened, notices, errorNotices, adapter,
     get renderRequests() { return renderRequests; },
+    setCwd(value: string) { currentCwd = value; },
     setActive(value: boolean) { active = value; component.invalidate(); tui.renderNow(); },
     close() { const result = adapter.dispose(); tui.stop(); return result; } };
 }
@@ -188,8 +198,10 @@ test("Pi 0.86.1 parser changes keep source blocks and reference URLs aligned", a
   const outer = "https://outer.example/path?x=3&y=four#outer";
   const f = fixture(`[outer [inner][inside]][outside]\n\n[inside]: ${inner}\n[outside]: ${outer}`);
   try {
-    click(f.terminal, target(f.tui, inner), 16); await tick();
-    click(f.terminal, target(f.tui, outer), 16); await tick();
+    const links = targets(f.tui, 'pi-copy://');
+    assert.equal(links.length, 2);
+    click(f.terminal, links[0]!, 16); await tick();
+    click(f.terminal, links[1]!, 16); await tick();
     assert.deepEqual(f.opened, [inner, outer]);
     assert.deepEqual(f.nativeOpened, []);
   } finally { f.close(); }
@@ -477,7 +489,7 @@ test("dead owner churn is pruned during registration", () => {
     return result;
   } as typeof Set.prototype.add;
   const adapter = installAdapter({ version: VERSION, active: () => true,
-    copy: async () => {}, open: async () => {}, notify: () => {}, button: text => text });
+    copy: async () => {}, cwd: () => '/fixture', open: async () => {}, notify: () => {}, button: text => text });
   try {
     for (let index = 0; index < 10_000; index++) {
       const markdown = new Markdown(`owner ${index}`, 0, 0, getMarkdownTheme(), undefined, {
@@ -542,12 +554,192 @@ test("recovery succeeds after failed later-turn probes and disposal cancels a pe
   weakRefAlwaysFails = false;
 });
 
+test("local links use live activation cwd once and bind the accepted request across awaits", async () => {
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  const f = fixture("[FILE](out.svg)", false, undefined, undefined, {
+    cwd: "/cwd/A",
+    open: async () => { await gate; },
+  });
+  try {
+    const link = target(f.tui, "pi-copy://");
+    f.setCwd("/cwd/B");
+    click(f.terminal, link, 16);
+    await tick();
+    assert.equal(f.openRequests.length, 1);
+    assert.deepEqual({ href: f.openRequests[0]!.href, cwd: f.openRequests[0]!.cwd }, {
+      href: "out.svg", cwd: "/cwd/B",
+    });
+    f.setCwd("/cwd/C");
+    assert.equal(f.openRequests[0]!.cwd, "/cwd/B", "accepted request never rereads ctx.cwd");
+    release();
+    await tick();
+  } finally { release?.(); f.close(); }
+});
+
+test("local-link selection stays native and Ctrl must be present on both press and release", async () => {
+  const selected: string[] = [];
+  const f = fixture("[LOCAL](out.svg) trailing", false, undefined, undefined, {
+    copySelection: async (text) => { selected.push(text); return true; },
+  });
+  try {
+    const link = target(f.tui, "pi-copy://");
+    f.terminal.input(sgr(link.x, link.y));
+    f.terminal.input(sgr(link.x + 3, link.y, 32));
+    f.terminal.input(sgr(link.x + 3, link.y, 0, "m"));
+    await tick();
+    assert.equal(selected.length, 1, "ordinary drag completes through Pi selection");
+    assert.deepEqual(f.openRequests, []);
+
+    f.terminal.input(sgr(link.x, link.y, 16));
+    f.terminal.input(sgr(link.x, link.y, 0, "m"));
+    await tick();
+    assert.deepEqual(f.openRequests, [], "unmodified release cannot authorize a Ctrl press");
+    click(f.terminal, link, 20);
+    click(f.terminal, link, 24);
+    click(f.terminal, link, 144);
+    await tick();
+    assert.deepEqual(f.openRequests, [], "Shift/Alt/extended combinations are not aliases for Ctrl+left");
+  } finally { f.close(); }
+});
+
+test("nested, reference and table links bind by exact token evidence without table allocation churn", async () => {
+  const source = "**[A](a.svg)** [B][b]\n\n| link |\n|---|\n| [C](c.json) |\n\n[b]: b.3mf";
+  const before = weakRefCount;
+  const f = fixture(source);
+  try {
+    const links = targets(f.tui, "pi-copy://");
+    assert.equal(links.length, 3);
+    for (const link of links) { click(f.terminal, link, 16); await tick(); }
+    assert.deepEqual(f.opened, ["a.svg", "b.3mf", "c.json"]);
+    const urls = links.map((link) => link.url);
+    for (let pass = 0; pass < 20; pass++) f.tui.renderNow();
+    assert.deepEqual(targets(f.tui, "pi-copy://").map((link) => link.url), urls);
+    assert.ok(weakRefCount - before <= 4, "table measurement does not allocate duplicate owners/actions per render");
+  } finally { f.close(); }
+});
+
+test("explicit and reference web links open source semantics while autolinks require parser agreement", async () => {
+  const semantic = "https://example.com/?a=1&b=2";
+  for (const source of [
+    "[PLAIN](https://example.com/?a=1&b=2)",
+    "[ENTITY](https://example.com/?a=1&amp;b=2)",
+    "[REFERENCE][web]\n\n[web]: https://example.com/?a=1&amp;b=2",
+  ]) {
+    const f = fixture(source);
+    try {
+      click(f.terminal, target(f.tui, "pi-copy://"), 16);
+      await tick();
+      assert.deepEqual(f.opened, [semantic], source);
+      assert.deepEqual(f.errorNotices, []);
+    } finally { f.close(); }
+  }
+
+  const agreed = fixture("https://example.com/?a=1&b=2");
+  try {
+    click(agreed.terminal, target(agreed.tui, "pi-copy://"), 16);
+    await tick();
+    assert.deepEqual(agreed.opened, [semantic]);
+  } finally { agreed.close(); }
+
+  const disagreed = fixture("https://example.com/?a=1&amp;b=2");
+  try {
+    click(disagreed.terminal, target(disagreed.tui, "pi-copy://"), 16);
+    await tick();
+    assert.deepEqual(disagreed.openRequests, [], "bare autolink parser disagreement never opens native amp;b semantics");
+    assert.equal(disagreed.errorNotices.length, 1);
+    assert.match(disagreed.errorNotices[0]!, /网页自动链接源文与 Pi 解析不一致/);
+  } finally { disagreed.close(); }
+});
+
+test("web semantic routing fails closed when private action registration is unavailable", async () => {
+  const capabilities = getCapabilities();
+  setCapabilities({ ...capabilities, hyperlinks: true });
+  weakRefFailureCalls.add(weakRefCalls + 1);
+  const f = fixture("[ENTITY](https://example.com/?a=1&amp;b=2)");
+  try {
+    const native = target(f.tui, "https:");
+    click(f.terminal, native, 16);
+    await tick();
+    assert.deepEqual(f.openRequests, []);
+    assert.deepEqual(f.nativeOpened, [], "the wrong native amp;b spelling never reaches Pi's opener");
+  } finally { f.close(); setCapabilities(capabilities); }
+});
+
+test("local parser disagreement produces a private diagnostic; percent-encoded equivalent opens", async () => {
+  for (const source of ["[TAB](<a\tb.svg>)", "[ENTITY](a&amp;b.svg)"]) {
+    const f = fixture(source);
+    try {
+      click(f.terminal, target(f.tui, "pi-copy://"), 16);
+      await tick();
+      assert.deepEqual(f.openRequests, []);
+      assert.equal(f.errorNotices.length, 1);
+      assert.match(f.errorNotices[0]!, /解析不一致/);
+    } finally { f.close(); }
+  }
+  const encoded = fixture("[ENTITY](a%26b.svg)");
+  try {
+    click(encoded.terminal, target(encoded.tui, "pi-copy://"), 16);
+    await tick();
+    assert.deepEqual(encoded.opened, ["a%26b.svg"]);
+  } finally { encoded.close(); }
+});
+
+test("empty and unsupported schemes are private diagnostics with zero open calls", async () => {
+  for (const source of ["[EMPTY]()", "[MAIL](mailto:user@example.com)", "[COMMAND](command:workbench.action.closeWindow)"]) {
+    const f = fixture(source);
+    try {
+      click(f.terminal, target(f.tui, "pi-copy://"), 16);
+      await tick();
+      assert.deepEqual(f.openRequests, []);
+      assert.equal(f.errorNotices.length, 1);
+    } finally { f.close(); }
+  }
+});
+
+test("generation retirement aborts pending open preparation and suppresses stale feedback", async () => {
+  let observed: OpenLifetime | undefined;
+  let release!: () => void;
+  const pending = new Promise<void>((resolve) => { release = resolve; });
+  const f = fixture("[LOCAL](out.svg)", false, undefined, undefined, {
+    open: async (_href, _cwd, lifetime) => {
+      observed = lifetime;
+      await pending;
+      throw new Error("late failure");
+    },
+  });
+  let closed = false;
+  try {
+    click(f.terminal, target(f.tui, "pi-copy://"), 16);
+    await tick();
+    assert.ok(observed);
+    f.close();
+    closed = true;
+    assert.equal(observed!.signal.aborted, true);
+    release();
+    await tick();
+    assert.deepEqual(f.errorNotices, [], "retired generation emits no late open error");
+  } finally { release?.(); if (!closed) f.close(); }
+});
+
+test("link-only failed disposal retains private-URI containment", async () => {
+  const f = fixture("[LOCAL](out.svg)", false, undefined, undefined, { quiesce: "failure" });
+  const link = target(f.tui, "pi-copy://");
+  try {
+    assert.deepEqual(f.adapter.dispose(), { quiesced: false, passive: true });
+    click(f.terminal, link, 16);
+    await tick();
+    assert.deepEqual(f.openRequests, []);
+    assert.deepEqual(f.nativeOpened, []);
+  } finally { f.tui.stop(); }
+});
+
 test("Ctrl-click opens original wrapped Markdown URL; normal click and drag do not", async () => {
   const capabilities = getCapabilities(); setCapabilities({ ...capabilities, hyperlinks: false });
   const url = 'https://example.com/path?a=1&b=2#fragment';
   const f = fixture(`[中文 ${'wrapped link '.repeat(12)}](${url})`);
   try {
-    const point = target(f.tui, 'https:');
+    const point = target(f.tui, 'pi-copy://');
     click(f.terminal, point); await tick(); assert.deepEqual(f.opened, []); assert.deepEqual(f.nativeOpened, []);
     click(f.terminal, point, 16); await tick(); assert.deepEqual(f.opened, [url]);
     f.terminal.input(sgr(point.x, point.y, 16));
@@ -600,7 +792,7 @@ test("overlay routing uses exact geometry/capture ownership and preserves transc
     f.tui.renderNow();
     assert.equal(focusedOverlay.isFocused(), true);
     const bounds = focusedOverlay.getBounds()!;
-    const transcriptPoint = targetUrl(f.tui, transcript);
+    const transcriptPoint = targets(f.tui, 'pi-copy://')[0]!;
     assert.ok(
       transcriptPoint.x < bounds.col || transcriptPoint.x >= bounds.col + bounds.width ||
       transcriptPoint.y < bounds.row || transcriptPoint.y >= bounds.row + bounds.height,
@@ -733,7 +925,7 @@ test("temporary opener filters are reentrant and never clobber a synchronous rep
       ...baselineDescriptor, value: reentrantNative,
     });
     adapter = installAdapter({
-      version: VERSION, active: () => true, copy: async () => {}, open: async () => {},
+      version: VERSION, active: () => true, copy: async () => {}, cwd: () => '/fixture', open: async () => {},
       notify: () => {}, button: text => text,
     });
     tui = new TuiAltScreen(terminal, false, undefined, { openUrl: originalOpener });
@@ -851,7 +1043,7 @@ test("minimal passive guard transactionally filters stale URIs through hostile a
         configurable: true, enumerable: true, writable: true, value: sink,
       });
       cleanup = installAdapter({
-        version: VERSION, active: () => true, copy: async () => {}, open: async () => {},
+        version: VERSION, active: () => true, copy: async () => {}, cwd: () => '/fixture', open: async () => {},
         notify: () => {}, button: text => text,
         quiesce: () => {
           f.component.invalidate();
@@ -1054,7 +1246,7 @@ test("failed quiescence retains one private-URL guard across reload and failed r
         set: () => {},
       });
       assert.throws(() => installAdapter({
-        version: VERSION, active: () => true, copy: async () => {}, open: async () => {},
+        version: VERSION, active: () => true, copy: async () => {}, cwd: () => '/fixture', open: async () => {},
         notify: () => {}, button: text => text,
       }), /原子安装失败/);
       assert.equal(runtimeMethods()[3], passiveMethod, "failed replacement rolls back to the guard");
@@ -1070,7 +1262,7 @@ test("failed quiescence retains one private-URL guard across reload and failed r
     try {
       let quiesceCalls = 0;
       replacement = installAdapter({
-        version: VERSION, active: () => true, copy: async () => {}, open: async () => {},
+        version: VERSION, active: () => true, copy: async () => {}, cwd: () => '/fixture', open: async () => {},
         notify: () => {}, button: text => text,
         quiesce: () => {
           quiesceCalls += 1;
@@ -1144,7 +1336,7 @@ test("unverified Pi versions refuse adaptation before any prototype changes", ()
   assert.deepEqual(SUPPORTED_PI, ["0.85.1", "0.86.1"]);
   const originals = runtimeMethods();
   assert.throws(() => installAdapter({ version: '9.9.9', active: () => true,
-    copy: async () => {}, open: async () => {}, notify: () => {}, button: s => s }),
+    copy: async () => {}, cwd: () => '/fixture', open: async () => {}, notify: () => {}, button: s => s }),
   /不支持 Pi 9\.9\.9；已验证版本：0\.85\.1、0\.86\.1；未修改渲染器/);
   assert.deepEqual(runtimeMethods(), originals);
 });
@@ -1157,7 +1349,7 @@ test("each missing private runtime method is diagnosed before any hook is instal
     try {
       Object.defineProperty(missing.owner, missing.key, { ...descriptor, value: undefined });
       assert.throws(() => installAdapter({ version: VERSION, active: () => true,
-        copy: async () => {}, open: async () => {}, notify: () => {}, button: s => s }),
+        copy: async () => {}, cwd: () => '/fixture', open: async () => {}, notify: () => {}, button: s => s }),
       new RegExp(`缺少运行时方法 ${missing.name.replaceAll(".", "\\.")}`));
       assert.deepEqual(runtimeMethods(), originals.map((method, index) =>
         runtimeSurfaces[index] === missing ? undefined : method), missing.name);
@@ -1176,7 +1368,7 @@ test("non-writable hook preflight leaves every runtime descriptor untouched", ()
     Object.defineProperty(surface.owner, surface.key, { ...descriptor, writable: false });
     const transactionDescriptors = runtimeDescriptors();
     assert.throws(() => installAdapter({ version: VERSION, active: () => true,
-      copy: async () => {}, open: async () => {}, notify: () => {}, button: text => text }),
+      copy: async () => {}, cwd: () => '/fixture', open: async () => {}, notify: () => {}, button: text => text }),
     /运行时方法不可写 Markdown\.renderInlineTokens/);
     assert.deepEqual(runtimeMethods(), baseline);
     assert.deepEqual(runtimeDescriptors(), transactionDescriptors);
@@ -1199,7 +1391,7 @@ test("throwing and no-op setters roll back all hooks and emit no private action 
       Object.defineProperty(surface.owner, surface.key, transactionDescriptor);
       const transactionDescriptors = runtimeDescriptors();
       assert.throws(() => installAdapter({ version: VERSION, active: () => true,
-        copy: async () => {}, open: async () => {}, notify: () => {}, button: text => text }),
+        copy: async () => {}, cwd: () => '/fixture', open: async () => {}, notify: () => {}, button: text => text }),
       /原子安装失败/);
       assert.deepEqual(runtimeMethods(), baselineMethods, mode);
       assert.deepEqual(runtimeDescriptors(), transactionDescriptors, mode);
@@ -1220,22 +1412,29 @@ test("throwing and no-op setters roll back all hooks and emit no private action 
 });
 
 
-test("tmux lost-press recovery requires a recent modifier transition, stable screen and no drag", async () => {
+test("tmux lost-press recovery requires the same action cell, a recent modifier transition, stable screen and no drag", async () => {
   const f = fixture('[link](https://example.com/)', true);
   try {
-    let point = target(f.tui, 'https:');
+    let point = target(f.tui, 'pi-copy://');
     f.terminal.input(sgr(point.x, point.y, 16, 'm')); await tick();
     assert.deepEqual(f.opened, [], 'arbitrary orphan release is not a click');
+
+    const blank = { x: f.terminal.columns - 2, y: 0 };
+    assert.equal(getOsc8LinkAtColumn(screen(f.tui)[blank.y] ?? "", blank.x), undefined);
+    click(f.terminal, blank);
+    f.terminal.input(sgr(point.x, point.y, 16, 'm')); await tick();
+    assert.deepEqual(f.opened, [], 'an ordinary release on another cell cannot authorize the link orphan release');
+
     click(f.terminal, point); await tick();
     f.terminal.input(sgr(point.x, point.y, 16, 'm')); await tick();
-    assert.deepEqual(f.opened, ['https://example.com/'], 'known tmux modifier-transition loss is recovered');
+    assert.deepEqual(f.opened, ['https://example.com/'], 'the exact same-action modifier-transition loss is recovered');
     click(f.terminal, point); await tick();
     f.terminal.input(sgr(point.x + 1, point.y, 48));
     f.terminal.input(sgr(point.x, point.y, 16, 'm')); await tick();
     assert.equal(f.opened.length, 1, 'drag cancels recovery even if it returns to the same link');
     click(f.terminal, point); await tick();
     f.component.updateContent(message('inserted row\n\n[link](https://example.com/)')); f.tui.renderNow();
-    point = target(f.tui, 'https:');
+    point = target(f.tui, 'pi-copy://');
     f.terminal.input(sgr(point.x, point.y, 16, 'm')); await tick();
     assert.equal(f.opened.length, 1, 'changed viewport cannot recover a missing press');
   } finally { f.close(); }
@@ -1278,6 +1477,76 @@ test("rejected clipboard writes report an error without a success flash", async 
     assert.deepEqual(f.errorNotices, f.notices);
     assert.doesNotMatch(screen(f.tui)[p.y]!, /\x1b\[7m/, "failure never shows the success flash");
   } finally { f.close(); }
+});
+
+test("finalizer poison blocks the next queued clipboard action after the first endpoint rejects", async () => {
+  const RealFinalizationRegistry = globalThis.FinalizationRegistry;
+  const registries: Array<{
+    callback: (holdings: unknown) => void;
+    records: Array<{ holdings: unknown; token?: object }>;
+  }> = [];
+  class CapturingFinalizationRegistry {
+    callback: (holdings: unknown) => void;
+    records: Array<{ holdings: unknown; token?: object }> = [];
+    constructor(callback: (holdings: unknown) => void) {
+      this.callback = callback;
+      registries.push(this);
+    }
+    register(_target: object, holdings: unknown, token?: object) {
+      this.records.push({ holdings, token });
+    }
+    unregister(token: object) {
+      const before = this.records.length;
+      this.records = this.records.filter((record) => record.token !== token);
+      return this.records.length !== before;
+    }
+  }
+  globalThis.FinalizationRegistry = CapturingFinalizationRegistry as unknown as typeof FinalizationRegistry;
+
+  let rejectFirst!: (error: Error) => void;
+  const first = new Promise<void>((_resolve, reject) => { rejectFirst = reject; });
+  const copies: string[] = [];
+  let f: ReturnType<typeof fixture> | undefined;
+  try {
+    f = fixture("```sh\nx\n```", false, undefined, undefined, {
+      copy: async (text) => {
+        copies.push(text);
+        if (copies.length === 1) await first;
+      },
+    });
+    const button = target(f.tui, "pi-copy://");
+    click(f.terminal, button);
+    click(f.terminal, button);
+    await tick();
+    assert.deepEqual(copies, ["x"], "the second accepted click is queued behind the first endpoint");
+
+    const generationRegistry = registries.find((registry) => registry.records.some((record) =>
+      typeof record.holdings === "object" && record.holdings !== null &&
+      typeof (record.holdings as { deref?: unknown }).deref === "function"));
+    const ownerRecord = generationRegistry?.records.find((record) =>
+      typeof record.holdings === "object" && record.holdings !== null &&
+      typeof (record.holdings as { deref?: unknown }).deref === "function");
+    assert.ok(generationRegistry && ownerRecord, "captured the generation owner finalizer");
+
+    const originalDelete = Set.prototype.delete;
+    Set.prototype.delete = function(this: Set<unknown>, value: unknown) {
+      if (value === ownerRecord.holdings) throw new RangeError("finalizer Set.delete failed");
+      return originalDelete.call(this, value);
+    } as typeof Set.prototype.delete;
+    try { generationRegistry.callback(ownerRecord.holdings); }
+    finally { Set.prototype.delete = originalDelete; }
+
+    rejectFirst(new Error("endpoint failed"));
+    await tick();
+    await tick();
+    await tick();
+    assert.deepEqual(copies, ["x"], "a poisoned generation never starts the queued clipboard write");
+    assert.deepEqual(f.notices, [], "poisoned-generation rejection and queued completion emit no current feedback");
+  } finally {
+    rejectFirst?.(new Error("test cleanup"));
+    f?.close();
+    globalThis.FinalizationRegistry = RealFinalizationRegistry;
+  }
 });
 
 test("stale clipboard rejection is silent while a fresh generation remains globally ordered", async (t) => {
@@ -1411,7 +1680,7 @@ test("process-wide clipboard queue preserves final-click order across adapter an
 test("Ctrl-press highlights the link, release restores it, drag cancels the effect", async () => {
   const f = fixture('[link](https://example.com/)');
   try {
-    const p = target(f.tui, 'https:');
+    const p = target(f.tui, 'pi-copy://');
     f.terminal.input(sgr(p.x, p.y, 16)); f.tui.renderNow();
     assert.match(screen(f.tui)[p.y]!, /\x1b\[7m/, 'held Ctrl press shows reverse video');
     f.terminal.input(sgr(p.x, p.y, 16, 'm')); await tick(); f.tui.renderNow();

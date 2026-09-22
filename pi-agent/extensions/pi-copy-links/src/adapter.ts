@@ -1,12 +1,15 @@
+import { isAbsolute } from "node:path";
 import type { MarkdownTransformContext } from "@earendil-works/pi-coding-agent";
 import {
   getOsc8LinkAtColumn, hyperlink, Markdown, TuiAltScreen, visibleWidth,
   type MarkdownTheme, type TUI,
 } from "@earendil-works/pi-tui";
-import { webUrl } from "./browser.ts";
+import { webUrl, type OpenLifetime } from "./browser.ts";
+import { hasUriScheme, isLocalHref } from "./links.ts";
 import {
-  alignCodeBlocks, codeSyntax, CopyStore, sourceCodeBlocks,
-  type CleanupIssue, type CodeContainer, type CopySlot, type RenderedCodeBlock, type SourceCodeBlock,
+  ActionStore, alignCodeBlocks, codeSyntax, sourceAutolinkDestination, sourceCodeBlocks, sourceLinkEvidence,
+  type Action, type ActionEntry, type ActionSlot, type CleanupIssue, type CodeContainer,
+  type RenderedCodeBlock, type SourceCodeBlock, type SourceLinkEvidence,
 } from "./source.ts";
 
 // Pi has no public code-block renderer or pre-viewport mouse hook in these releases.
@@ -45,6 +48,14 @@ interface FullscreenRuntime extends TUI {
   handleViewportInput: NativeInput;
 }
 type FramePhase = "collect" | "decorate" | "native";
+interface LinkCollection {
+  readonly raw: string;
+  readonly href: string;
+  count: number;
+  decorated: number;
+  action?: Readonly<Action>;
+  entry?: ActionEntry;
+}
 interface Frame {
   owner: MarkdownRuntime;
   tracking: boolean;
@@ -55,8 +66,11 @@ interface Frame {
   decorationInvalid: boolean;
   containers: CodeContainer[];
   sources: SourceCodeBlock[];
+  sourceLinks: SourceLinkEvidence;
   native: RenderedCodeBlock[];
-  entries: CopySlot[];
+  codeEntries: ActionSlot[];
+  links: Map<string, LinkCollection>;
+  linkKeys: string[];
   codeCursor: number;
 }
 interface OverlaySnapshot {
@@ -68,6 +82,8 @@ interface OverlaySnapshot {
 }
 interface Press {
   url: string;
+  actionKind: Action["kind"] | "expired";
+  modifiers: number;
   x: number;
   y: number;
   line: string;
@@ -76,7 +92,20 @@ interface Press {
   overlays: OverlaySnapshot[];
   moved: boolean;
 }
-interface Release { bits: number; at: number; screen: string[]; width: number; height: number }
+interface Release {
+  bits: number;
+  at: number;
+  screen: string[];
+  width: number;
+  height: number;
+  x: number;
+  y: number;
+  url?: string;
+  privateAction: boolean;
+  actionKind?: Action["kind"] | "expired";
+  overlayOwned: boolean;
+  overlays: OverlaySnapshot[];
+}
 interface HookCapture {
   name: string;
   owner: object;
@@ -106,7 +135,8 @@ interface ClipboardQueueState { tail: Promise<void> }
 type GuardedInput = NativeInput & { [INPUT_GUARD]?: InputGuardMetadata };
 type FilteredOpener = NativeOpener & { [OPEN_URL_FILTER]?: OpenUrlFilterMetadata };
 interface BookkeepingGeneration {
-  store: CopyStore;
+  store: ActionStore;
+  controller: AbortController;
   tracked: Set<WeakRef<MarkdownRuntime>>;
   registered: WeakMap<MarkdownRuntime, WeakRef<MarkdownRuntime>>;
   cleanup: FinalizationRegistry<WeakRef<MarkdownRuntime>>;
@@ -116,7 +146,8 @@ export interface AdapterOptions {
   version: string;
   active: () => boolean;
   copy: (text: string) => Promise<void>;
-  open: (url: string) => Promise<void>;
+  cwd: () => string;
+  open: (href: string, cwd: string, lifetime: OpenLifetime) => Promise<void>;
   notify: (message: string, error?: boolean) => void;
   button: (text: string) => string;
   recoverTmuxRelease?: () => boolean;
@@ -476,11 +507,12 @@ export function installAdapter(options: AdapterOptions) {
   }
 
   function createGeneration(): BookkeepingGeneration {
-    let store: CopyStore | undefined;
+    let store: ActionStore | undefined;
     try {
-      store = new CopyStore();
+      store = new ActionStore();
       const candidate: BookkeepingGeneration = {
         store,
+        controller: new AbortController(),
         tracked: new Set<WeakRef<MarkdownRuntime>>(),
         registered: new WeakMap<MarkdownRuntime, WeakRef<MarkdownRuntime>>(),
         cleanup: undefined as unknown as FinalizationRegistry<WeakRef<MarkdownRuntime>>,
@@ -491,7 +523,7 @@ export function installAdapter(options: AdapterOptions) {
       });
       return candidate;
     } catch (error) {
-      try { store?.retire(); } catch { /* CopyStore.retire is specified noexcept. */ }
+      try { store?.retire(); } catch { /* ActionStore.retire is specified noexcept. */ }
       throw error;
     }
   }
@@ -518,6 +550,7 @@ export function installAdapter(options: AdapterOptions) {
 
   function retireGeneration(current: BookkeepingGeneration): CleanupIssue[] {
     const issues: CleanupIssue[] = [];
+    attempt(issues, "generation.abort", () => { current.controller.abort(); });
     attempt(issues, "store.retire", () => { issues.push(...current.store.retire()); });
     try {
       for (const ref of current.tracked) {
@@ -539,7 +572,7 @@ export function installAdapter(options: AdapterOptions) {
   function pruneGeneration(current: BookkeepingGeneration): void {
     const issues: CleanupIssue[] = [];
     if (current.poison !== undefined) throw current.poison;
-    if (!current.store.isTrusted()) throw new Error("CopyStore generation is untrusted");
+    if (!current.store.isTrusted()) throw new Error("ActionStore generation is untrusted");
     try {
       for (const ref of current.tracked) {
         let owner: MarkdownRuntime | undefined;
@@ -573,7 +606,7 @@ export function installAdapter(options: AdapterOptions) {
       if (!candidate.tracked.has(ref)) throw new Error("tracked Set.add did not commit");
       candidate.cleanup.register(target, ref, ref);
       candidate.store.probe();
-      if (!candidate.store.isTrusted()) throw new Error("CopyStore probe poisoned its generation");
+      if (!candidate.store.isTrusted()) throw new Error("ActionStore probe poisoned its generation");
     } catch (error) { primary = error; }
     if (ref) {
       attempt(cleanupIssues, "probe.finalizer.unregister", () => {
@@ -747,6 +780,9 @@ export function installAdapter(options: AdapterOptions) {
     frame.phase = phase;
     frame.containers = [];
     frame.codeCursor = 0;
+    if (phase === "decorate") {
+      for (const link of frame.links.values()) link.decorated = 0;
+    }
   };
   const sameRendered = (left: RenderedCodeBlock, right: RenderedCodeBlock) =>
     left.text === right.text && left.lang === right.lang && left.raw === right.raw &&
@@ -770,8 +806,11 @@ export function installAdapter(options: AdapterOptions) {
       decorationInvalid: false,
       containers: [],
       sources: [],
+      sourceLinks: { destinations: new Map(), explicitAutolinks: new Set(), plainTextSpans: [] },
       native: [],
-      entries: [],
+      codeEntries: [],
+      links: new Map(),
+      linkKeys: [],
       codeCursor: 0,
     };
     frames.push(frame);
@@ -786,21 +825,29 @@ export function installAdapter(options: AdapterOptions) {
         }
         const alignment = alignCodeBlocks(frame.sources, frame.native);
         if (alignment.ambiguous) warnMismatch(frame.streaming);
-        const texts = alignment.sourceIndexes.map((sourceIndex) =>
-          sourceIndex === undefined ? undefined : frame.sources[sourceIndex]!.value);
-        if (texts.some((text) => text !== undefined)) {
-          frame.entries = current.store.set(frame.owner, texts);
-          if (frame.entries.some((entry) => entry !== undefined)) privateUriIssued = true;
-        }
-        else {
+        const codeActions: Array<Readonly<Action> | undefined> = alignment.sourceIndexes.map((sourceIndex) =>
+          sourceIndex === undefined ? undefined : { kind: "copy", text: frame.sources[sourceIndex]!.value });
+        const linkActions = frame.linkKeys.map((key) => frame.links.get(key)?.action);
+        const actions = [...codeActions, ...linkActions];
+        if (actions.some((action) => action !== undefined)) {
+          const entries = current.store.set(frame.owner, actions);
+          frame.codeEntries = entries.slice(0, codeActions.length);
+          for (const [index, key] of frame.linkKeys.entries()) {
+            const link = frame.links.get(key);
+            if (link) link.entry = entries[codeActions.length + index];
+          }
+          if (entries.some((entry) => entry !== undefined)) privateUriIssued = true;
+        } else {
           const issues = deleteOwnerActions(current, frame.owner);
           if (issues.length) throw failureWithCleanup(new Error("owner action cleanup failed"), issues);
-          frame.entries = texts.map(() => undefined);
+          frame.codeEntries = codeActions.map(() => undefined);
         }
         resetPass(frame, "decorate");
         this.invalidate();
         const decorated = original.render.call(this, width);
-        if (frame.failed || frame.decorationInvalid || trackingDisabled || frame.codeCursor !== frame.native.length) {
+        const linksComplete = [...frame.links.values()].every((link) => link.decorated === link.count);
+        if (frame.failed || frame.decorationInvalid || trackingDisabled ||
+            frame.codeCursor !== frame.native.length || !linksComplete) {
           const issues = deleteOwnerActions(current, frame.owner);
           if (issues.length) suspend(failureWithCleanup(new Error("drift action cleanup failed"), issues));
           warnMismatch(frame.streaming);
@@ -821,9 +868,12 @@ export function installAdapter(options: AdapterOptions) {
     if (frame?.tracking && frame.phase === "collect" && context.messageType === "assistant") {
       frame.assistant = true;
       frame.streaming = context.isStreaming;
-      try { frame.sources = sourceCodeBlocks(source); }
-      catch (error) {
+      try {
+        frame.sources = sourceCodeBlocks(source);
+        frame.sourceLinks = sourceLinkEvidence(source);
+      } catch (error) {
         frame.sources = [];
+        frame.sourceLinks = { destinations: new Map(), explicitAutolinks: new Set(), plainTextSpans: [] };
         frame.failed = true;
         suspend(error);
       }
@@ -865,7 +915,7 @@ export function installAdapter(options: AdapterOptions) {
       frame.decorationInvalid = true;
       return lines;
     }
-    const entry = frame.entries[index];
+    const entry = frame.codeEntries[index];
     if (!entry) return lines;
     try {
       const label = width >= 6 ? "[复制]" : width >= 4 ? "Copy" : "C";
@@ -883,18 +933,96 @@ export function installAdapter(options: AdapterOptions) {
     return lines;
   }
 
+  function linkKey(raw: string, href: string): string {
+    return JSON.stringify([raw, href]);
+  }
+
+  function actionForLink(frame: Frame, raw: string, href: string): Readonly<Action> {
+    const destinations = frame.sourceLinks.destinations.get(raw);
+    if (destinations) {
+      if (destinations.size !== 1) {
+        return { kind: "diagnostic", message: "链接源文对应多个语义目标，已拒绝猜测" };
+      }
+      const semantic = destinations.values().next().value as string;
+      if (!semantic) return { kind: "diagnostic", message: "链接目标为空，未执行任何打开操作" };
+
+      const sourceWeb = webUrl(semantic);
+      if (sourceWeb) {
+        if (frame.sourceLinks.explicitAutolinks.has(raw)) {
+          const nativeWeb = webUrl(href);
+          if (!nativeWeb || nativeWeb !== sourceWeb) {
+            return {
+              kind: "diagnostic",
+              message: `网页自动链接源文与 Pi 解析不一致，已拒绝打开（显示：${href}；源文：${semantic}）`,
+            };
+          }
+        }
+        return { kind: "open", href: sourceWeb };
+      }
+
+      if (isLocalHref(semantic)) {
+        if (semantic === href) return { kind: "open", href: semantic };
+        return {
+          kind: "diagnostic",
+          message: `本地链接源文与 Pi 解析不一致，已拒绝打开（显示：${href || "空目标"}；源文：${semantic}）`,
+        };
+      }
+      const scheme = hasUriScheme(semantic) ? semantic.slice(0, semantic.indexOf(":")) : "未知";
+      return { kind: "diagnostic", message: `不支持 URI scheme：${scheme}` };
+    }
+
+    const sourceAutolink = sourceAutolinkDestination(frame.sourceLinks, raw);
+    if (sourceAutolink !== undefined) {
+      const sourceWeb = webUrl(sourceAutolink);
+      const nativeWeb = webUrl(href);
+      if (sourceWeb && nativeWeb && sourceWeb === nativeWeb) return { kind: "open", href: sourceWeb };
+      return {
+        kind: "diagnostic",
+        message: `网页自动链接源文与 Pi 解析不一致，已拒绝打开（显示：${href || "空目标"}；源文：${sourceAutolink}）`,
+      };
+    }
+
+    return { kind: "diagnostic", message: "链接缺少唯一可验证的源文语义，已拒绝打开" };
+  }
+
   function inline(this: MarkdownRuntime, tokens: Token[], style?: InlineStyle): string {
     const frame = currentFrame(this);
-    if (!enabled || !frame || frame.phase !== "decorate" || !frame.assistant || frame.failed) {
+    if (!enabled || !frame || frame.phase === "native" || !frame.assistant || frame.failed) {
       return original.inline.call(this, tokens, style);
     }
     try {
+      if (frame.phase === "collect") {
+        for (const value of tokens) {
+          if (value.type !== "link") continue;
+          const raw = value.raw ?? "";
+          const href = value.href ?? "";
+          const key = linkKey(raw, href);
+          const collected = frame.links.get(key);
+          if (collected) collected.count += 1;
+          else {
+            frame.links.set(key, {
+              raw, href, count: 1, decorated: 0,
+              action: actionForLink(frame, raw, href),
+            });
+            frame.linkKeys.push(key);
+          }
+        }
+        return original.inline.call(this, tokens, style);
+      }
+
       const linked = tokens.map((value) => {
-        const href = value.type === "link" && value.href ? webUrl(value.href) : undefined;
-        if (!href) return value;
+        if (value.type !== "link") return value;
+        const key = linkKey(value.raw ?? "", value.href ?? "");
+        const collected = frame.links.get(key);
+        if (!collected || collected.decorated >= collected.count || !collected.entry) {
+          frame.decorationInvalid = true;
+          return value;
+        }
+        collected.decorated += 1;
         const text = this.renderInlineTokens(value.tokens ?? [], style);
         const styled = this.theme.link(this.theme.underline(text));
-        return { type: "html", raw: hyperlink(pressedUrl === href ? emphasize(styled) : styled, href) };
+        const shown = pressedUrl === collected.entry.url ? emphasize(styled) : styled;
+        return { type: "html", raw: hyperlink(shown, collected.entry.url) };
       });
       return original.inline.call(this, linked, style);
     } catch (error) {
@@ -904,49 +1032,89 @@ export function installAdapter(options: AdapterOptions) {
     }
   }
 
+  function generationIsLive(current: BookkeepingGeneration): boolean {
+    return enabled && generation === current && current.poison === undefined &&
+      !current.controller.signal.aborted && current.store.isTrusted();
+  }
+
+  function requireGenerationLive(current: BookkeepingGeneration): boolean {
+    if (generationIsLive(current)) return true;
+    if (enabled && generation === current) {
+      const reason = current.poison ?? (current.controller.signal.aborted ?
+        current.controller.signal.reason ?? new Error("bookkeeping generation aborted") :
+        new Error("ActionStore generation is untrusted"));
+      suspend(reason);
+    }
+    return false;
+  }
+
+  function currentPrivateAction(url: string): { current?: BookkeepingGeneration; entry?: ActionEntry; kind: Action["kind"] | "expired" } {
+    const current = generation;
+    if (!current || !requireGenerationLive(current) || !current.store.owns(url)) {
+      return { current, kind: "expired" };
+    }
+    const lookup = current.store.lookup(url);
+    if (lookup.error !== undefined) {
+      suspend(lookup.error);
+      return { current, kind: "expired" };
+    }
+    if (!requireGenerationLive(current)) return { current, kind: "expired" };
+    return { current, entry: lookup.entry, kind: lookup.entry?.action.kind ?? "expired" };
+  }
+
+  function lifetimeFor(current: BookkeepingGeneration): OpenLifetime {
+    return Object.freeze({
+      signal: current.controller.signal,
+      isCurrent: () => generationIsLive(current),
+    });
+  }
+
   function invoke(url: string): void {
     if (url.startsWith("pi-copy://")) {
-      const current = generation;
-      if (!current || current.poison !== undefined || !current.store.owns(url)) {
-        if (current?.poison !== undefined) suspend(current.poison);
-        try { options.notify("代码块动作已失效，请刷新显示后重试", true); } catch { /* best effort */ }
+      const resolved = currentPrivateAction(url);
+      const { current, entry } = resolved;
+      if (!current || !entry) {
+        if (current && !generationIsLive(current)) return;
+        try { options.notify("动作已失效，请刷新显示后重试", true); } catch { /* best effort */ }
         return;
       }
-      const lookup = current.store.lookup(url);
-      if (lookup.error !== undefined) {
-        suspend(lookup.error);
-        try { options.notify("代码块动作已失效，请刷新显示后重试", true); } catch { /* best effort */ }
+      if (!requireGenerationLive(current)) return;
+      if (entry.action.kind === "diagnostic") {
+        if (!requireGenerationLive(current)) return;
+        try { options.notify(entry.action.message, true); } catch { /* best effort */ }
         return;
       }
-      const entry = lookup.entry;
-      if (!entry) {
-        try { options.notify("代码块已失效，请刷新显示后重试", true); } catch { /* best effort */ }
-        return;
-      }
-      void enqueueClipboard(async () => {
-        if (!enabled || generation !== current || !current.store.isTrusted()) return;
-        await options.copy(entry.text);
-        if (enabled && generation === current && current.store.isTrusted()) {
+      if (entry.action.kind === "copy") {
+        const text = entry.action.text;
+        void enqueueClipboard(async () => {
+          if (!requireGenerationLive(current)) return;
+          await options.copy(text);
+          if (!requireGenerationLive(current)) return;
           try { options.notify("代码已复制"); } catch { /* best effort */ }
           flash(entry.url);
-        }
-      }).catch((error: unknown) => {
-        if (enabled && generation === current && current.store.isTrusted()) {
+        }).catch((error: unknown) => {
+          if (!requireGenerationLive(current)) return;
           try { options.notify(`复制失败：${String(error)}`, true); } catch { /* best effort */ }
-        }
+        });
+        return;
+      }
+      let cwd: string;
+      try {
+        cwd = options.cwd();
+        if (!isAbsolute(cwd)) throw new Error("Pi 会话工作目录不是绝对路径");
+      } catch (error) {
+        if (!requireGenerationLive(current)) return;
+        try { options.notify(`打开链接失败：${String(error)}`, true); } catch { /* best effort */ }
+        return;
+      }
+      if (!requireGenerationLive(current)) return;
+      const lifetime = lifetimeFor(current);
+      void options.open(entry.action.href, cwd, lifetime).catch((error: unknown) => {
+        if (!requireGenerationLive(current)) return;
+        try { options.notify(`打开链接失败：${String(error)}`, true); } catch { /* best effort */ }
       });
       return;
     }
-    const target = webUrl(url);
-    if (!target) {
-      try { options.notify("只打开 HTTP(S) 网页链接", true); } catch { /* best effort */ }
-      return;
-    }
-    void options.open(target).catch((error: unknown) => {
-      if (enabled) {
-        try { options.notify(`打开链接失败：${String(error)}`, true); } catch { /* best effort */ }
-      }
-    });
   }
 
   function input(this: FullscreenRuntime, data: string) {
@@ -977,10 +1145,25 @@ export function installAdapter(options: AdapterOptions) {
     const line = screenValid ? this.previousScreen[y] ?? "" : "";
     const url = getOsc8LinkAtColumn(line, x);
     const privateAction = url?.startsWith("pi-copy://") === true;
-    const actionable = url && (bits & 12) === 0 && (privateAction || ((bits & 16) !== 0 && webUrl(url)));
+    const actionKind = !url || !privateAction ? undefined : currentPrivateAction(url).kind;
+    const modifiers = bits & 28;
+    const authorized = actionKind === "copy" ? (bits & 12) === 0 :
+      actionKind !== undefined && bits === 16;
+    const actionable = Boolean(url && primary && authorized);
     const rememberRelease = () => {
       if (valid && primary && release && !motion) releases.set(this, {
-        bits, at: performance.now(), screen: [...this.previousScreen], width, height,
+        bits,
+        at: performance.now(),
+        screen: [...this.previousScreen],
+        width,
+        height,
+        x,
+        y,
+        ...(url === undefined ? {} : { url }),
+        privateAction,
+        ...(actionKind === undefined ? {} : { actionKind }),
+        overlayOwned,
+        overlays: overlaySnapshot(this),
       });
       else releases.delete(this);
     };
@@ -991,9 +1174,12 @@ export function installAdapter(options: AdapterOptions) {
       }
       if (release) {
         presses.delete(this);
-        if (primary && !pending.moved && valid && pending.url === url &&
-            sameOverlaySnapshot(this, pending.overlays) && unpress(pending.line) === unpress(line) &&
-            pending.width === width && pending.height === height) invoke(pending.url);
+        const releaseAuthorized = pending.actionKind === "copy" ? (bits & 12) === 0 : bits === 16;
+        if (primary && releaseAuthorized && modifiers === pending.modifiers && !pending.moved && valid &&
+            pending.url === url && sameOverlaySnapshot(this, pending.overlays) &&
+            unpress(pending.line) === unpress(line) && pending.width === width && pending.height === height) {
+          invoke(pending.url);
+        }
         if (pending.moved) releases.delete(this);
         else rememberRelease();
         setPressed(undefined);
@@ -1003,9 +1189,12 @@ export function installAdapter(options: AdapterOptions) {
     if (wheel) { presses.delete(this); setPressed(undefined); }
     if (motion || wheel || !valid) releases.delete(this);
     const previousRelease = releases.get(this);
-    if (release && primary && !motion && actionable && valid && options.recoverTmuxRelease?.() &&
+    if (release && bits === 16 && !motion && actionable && valid && options.recoverTmuxRelease?.() &&
         previousRelease && performance.now() - previousRelease.at <= 500 &&
-        (bits & 28) !== (previousRelease.bits & 28) && previousRelease.width === width &&
+        (previousRelease.bits & 28) === 0 && previousRelease.x === x && previousRelease.y === y &&
+        previousRelease.url === url && previousRelease.privateAction === privateAction &&
+        previousRelease.actionKind === actionKind && previousRelease.overlayOwned === overlayOwned &&
+        sameOverlaySnapshot(this, previousRelease.overlays) && previousRelease.width === width &&
         previousRelease.height === height && previousRelease.screen.length === this.previousScreen.length &&
         previousRelease.screen.every((row, index) => unpress(row) === unpress(this.previousScreen[index]!))) {
       invoke(url!);
@@ -1017,7 +1206,8 @@ export function installAdapter(options: AdapterOptions) {
     if (!wheel && !motion && !release && primary && valid && actionable) {
       releases.delete(this);
       presses.set(this, {
-        url: url!, x, y, line, width, height, overlays: overlaySnapshot(this), moved: false,
+        url: url!, actionKind: actionKind!, modifiers, x, y, line, width, height,
+        overlays: overlaySnapshot(this), moved: false,
       });
       setPressed(url);
       return { consume: true };

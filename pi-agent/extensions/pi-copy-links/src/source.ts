@@ -51,12 +51,85 @@ interface TreeNode {
   type: string;
   children?: TreeNode[];
   value?: string;
+  url?: string;
+  identifier?: string;
   lang?: string | null;
   meta?: string | null;
   position?: {
     start: { offset?: number };
     end: { offset?: number };
   };
+}
+
+export interface SourceLinkEvidence {
+  /** Pi-normalized native raw token spelling -> possible remark semantic hrefs. */
+  readonly destinations: ReadonlyMap<string, ReadonlySet<string>>;
+  /** Angle-bracket autolinks require native/source semantic agreement. */
+  readonly explicitAutolinks: ReadonlySet<string>;
+  /** Plain source text spans that can prove a native bare HTTP(S) autolink. */
+  readonly plainTextSpans: readonly string[];
+}
+
+function normalizedMarkdownSpan(value: string): string {
+  return value.replace(/\r\n?/gu, "\n").replace(/\t/gu, "   ");
+}
+
+/** Collect source-exact link semantics before Pi normalizes Markdown for Marked. */
+export function sourceLinkEvidence(markdown: string): SourceLinkEvidence {
+  const root = parser.parse(markdown) as unknown as TreeNode;
+  const definitions = new Map<string, string>();
+  const destinations = new Map<string, Set<string>>();
+  const explicitAutolinks = new Set<string>();
+  const plainTextSpans: string[] = [];
+  const collectDefinitions = (node: TreeNode): void => {
+    if (node.type === "definition" && node.identifier !== undefined && node.url !== undefined &&
+        !definitions.has(node.identifier)) definitions.set(node.identifier, node.url);
+    for (const child of node.children ?? []) collectDefinitions(child);
+  };
+  const collectLinks = (node: TreeNode, insideLink = false): void => {
+    const link = node.type === "link" || node.type === "linkReference";
+    if (link) {
+      const startOffset = node.position?.start.offset;
+      const endOffset = node.position?.end.offset;
+      if (startOffset === undefined || endOffset === undefined) {
+        throw new Error("remark link node has no source span");
+      }
+      const destination = node.type === "link" ? node.url :
+        node.identifier === undefined ? undefined : definitions.get(node.identifier);
+      if (destination !== undefined) {
+        const raw = normalizedMarkdownSpan(markdown.slice(startOffset, endOffset));
+        const values = destinations.get(raw) ?? new Set<string>();
+        values.add(destination);
+        destinations.set(raw, values);
+        if (node.type === "link" && raw.startsWith("<") && raw.endsWith(">")) {
+          explicitAutolinks.add(raw);
+        }
+      }
+    } else if (!insideLink && node.type === "text") {
+      const startOffset = node.position?.start.offset;
+      const endOffset = node.position?.end.offset;
+      if (startOffset === undefined || endOffset === undefined) {
+        throw new Error("remark text node has no source span");
+      }
+      plainTextSpans.push(normalizedMarkdownSpan(markdown.slice(startOffset, endOffset)));
+    }
+    for (const child of node.children ?? []) collectLinks(child, insideLink || link);
+  };
+  collectDefinitions(root);
+  collectLinks(root);
+  return { destinations, explicitAutolinks, plainTextSpans };
+}
+
+/** Derive remark's semantic spelling only for a native URL proven to occur in plain source text. */
+export function sourceAutolinkDestination(evidence: SourceLinkEvidence, raw: string): string | undefined {
+  if (!evidence.plainTextSpans.some((span) => span.includes(raw))) return undefined;
+  const root = parser.parse(raw) as unknown as TreeNode;
+  const paragraph = root.children?.length === 1 ? root.children[0] : undefined;
+  const text = paragraph?.type === "paragraph" && paragraph.children?.length === 1 ? paragraph.children[0] : undefined;
+  if (text?.type !== "text" || typeof text.value !== "string") return undefined;
+  const startOffset = text.position?.start.offset;
+  const endOffset = text.position?.end.offset;
+  return startOffset === 0 && endOffset === raw.length ? text.value : undefined;
 }
 
 function canonicalInfo(value: string): string {
@@ -228,12 +301,31 @@ export function alignCodeBlocks(
   };
 }
 
-export interface CopyEntry { url: string; text: string }
-export type CopySlot = CopyEntry | undefined;
+export type Action =
+  | { kind: "copy"; text: string }
+  | { kind: "open"; href: string }
+  | { kind: "diagnostic"; message: string };
+
+export interface ActionEntry {
+  readonly url: string;
+  readonly action: Readonly<Action>;
+}
+export type ActionSlot = ActionEntry | undefined;
 
 interface OwnerRecord {
-  texts: Array<string | undefined>;
-  slots: CopySlot[];
+  actions: Array<Readonly<Action> | undefined>;
+  slots: ActionSlot[];
+}
+
+function sameAction(
+  left: Readonly<Action> | undefined,
+  right: Readonly<Action> | undefined,
+): boolean {
+  if (left === undefined || right === undefined) return left === right;
+  if (left.kind !== right.kind) return false;
+  if (left.kind === "copy" && right.kind === "copy") return left.text === right.text;
+  if (left.kind === "open" && right.kind === "open") return left.href === right.href;
+  return left.kind === "diagnostic" && right.kind === "diagnostic" && left.message === right.message;
 }
 
 export interface CleanupIssue {
@@ -241,8 +333,8 @@ export interface CleanupIssue {
   error: unknown;
 }
 
-export interface CopyLookup {
-  entry?: CopyEntry;
+export interface ActionLookup {
+  entry?: ActionEntry;
   error?: unknown;
 }
 
@@ -267,13 +359,13 @@ function aggregateFailure(primary: unknown, issues: readonly CleanupIssue[]): Er
 }
 
 /** A mounted Markdown owns its entries; each instance is one disposable namespace generation. */
-export class CopyStore {
+export class ActionStore {
   readonly prefix = createCopyPrefix();
   private sequence = 0;
   private trusted = true;
   private poisonReason: unknown;
   private owners = new WeakMap<object, OwnerRecord>();
-  private entries = new Map<string, WeakRef<CopyEntry>>();
+  private entries = new Map<string, WeakRef<ActionEntry>>();
   private cleanup = new FinalizationRegistry<string>((url) => {
     try { this.entries.delete(url); }
     catch (error) {
@@ -284,41 +376,57 @@ export class CopyStore {
 
   isTrusted(): boolean { return this.trusted; }
 
-  set(owner: object, texts: readonly (string | undefined)[]): CopySlot[] {
-    if (!this.trusted) throw new Error("CopyStore generation is retired", { cause: this.poisonReason });
-    const requested = [...texts];
+  set(owner: object, actions: readonly (Readonly<Action> | undefined)[]): ActionSlot[] {
+    if (!this.trusted) throw new Error("ActionStore generation is retired", { cause: this.poisonReason });
+    const requested = actions.map((action) => action === undefined ? undefined : Object.freeze({ ...action }));
     let previous: OwnerRecord | undefined;
-    const slots: CopySlot[] = [];
-    const created: Array<{ entry: CopyEntry; ref: WeakRef<CopyEntry> }> = [];
+    const slots: ActionSlot[] = [];
+    const created: Array<{ entry: ActionEntry; ref: WeakRef<ActionEntry> }> = [];
     const inserted: string[] = [];
     let nextSequence = this.sequence;
     let record: OwnerRecord | undefined;
     try {
       previous = this.owners.get(owner);
-      if (previous && previous.texts.length === requested.length &&
-          previous.texts.every((text, index) => text === requested[index])) {
+      if (previous && previous.actions.length === requested.length &&
+          previous.actions.every((action, index) => sameAction(action, requested[index]))) {
         return previous.slots;
       }
-      for (const text of requested) {
-        if (text === undefined) {
+      for (const action of requested) {
+        if (action === undefined) {
           slots.push(undefined);
           continue;
         }
-        const entry = { url: `${this.prefix}${++nextSequence}`, text };
+        const entry: ActionEntry = Object.freeze({ url: `${this.prefix}${++nextSequence}`, action });
         const ref = new WeakRef(entry);
         created.push({ entry, ref });
         this.cleanup.register(entry, entry.url, entry);
         slots.push(entry);
       }
-      record = { texts: requested, slots };
+      record = { actions: requested, slots };
       for (const { entry, ref } of created) {
         inserted.push(entry.url);
         this.entries.set(entry.url, ref);
-        if (this.entries.get(entry.url) !== ref) throw new Error("CopyStore Map.set did not commit");
+        if (this.entries.get(entry.url) !== ref) throw new Error("ActionStore Map.set did not commit");
       }
       this.owners.set(owner, record);
-      if (this.owners.get(owner) !== record) throw new Error("CopyStore WeakMap.set did not commit");
+      if (this.owners.get(owner) !== record) throw new Error("ActionStore WeakMap.set did not commit");
       this.sequence = nextSequence;
+
+      // A successful replacement must synchronously retire the superseded URIs.
+      // A prior screen row may still reference them, but lookup can no longer execute them.
+      const supersededIssues: CleanupIssue[] = [];
+      for (const entry of previous?.slots ?? []) {
+        if (!entry) continue;
+        attemptCleanup(supersededIssues, `superseded.entries.delete(${entry.url})`, () => {
+          if (!this.entries.delete(entry.url)) throw new Error("Map.delete did not remove the superseded action");
+        });
+        attemptCleanup(supersededIssues, `superseded.finalizer.unregister(${entry.url})`, () => {
+          if (!this.cleanup.unregister(entry)) throw new Error("FinalizationRegistry.unregister returned false");
+        });
+      }
+      if (supersededIssues.length) {
+        throw aggregateFailure(new Error("ActionStore superseded owner cleanup failed"), supersededIssues);
+      }
       return slots;
     } catch (primary) {
       this.trusted = false;
@@ -357,7 +465,7 @@ export class CopyStore {
     });
     if (issues.length) {
       this.trusted = false;
-      this.poisonReason = aggregateFailure(new Error("CopyStore owner cleanup failed"), issues);
+      this.poisonReason = aggregateFailure(new Error("ActionStore owner cleanup failed"), issues);
     }
     return issues;
   }
@@ -368,25 +476,25 @@ export class CopyStore {
     const issues: CleanupIssue[] = [];
     attemptCleanup(issues, "entries.clear", () => { this.entries.clear(); });
     attemptCleanup(issues, "owners.reset", () => { this.owners = new WeakMap(); });
-    if (issues.length) this.poisonReason = aggregateFailure(this.poisonReason ?? new Error("CopyStore retired"), issues);
+    if (issues.length) this.poisonReason = aggregateFailure(this.poisonReason ?? new Error("ActionStore retired"), issues);
     return issues;
   }
 
   /** Exercise real entry containers; cleanup failure makes the probe fail. */
   probe(): void {
-    if (!this.trusted) throw new Error("CopyStore generation is retired", { cause: this.poisonReason });
+    if (!this.trusted) throw new Error("ActionStore generation is retired", { cause: this.poisonReason });
     const owner = {};
     let primary: unknown;
-    try { this.set(owner, [""]); }
+    try { this.set(owner, [{ kind: "copy", text: "" }]); }
     catch (error) { primary = error; }
     const issues = this.delete(owner);
     if (primary !== undefined || issues.length) {
-      throw aggregateFailure(primary ?? new Error("CopyStore probe cleanup failed"), issues);
+      throw aggregateFailure(primary ?? new Error("ActionStore probe cleanup failed"), issues);
     }
   }
 
-  lookup(url: string): CopyLookup {
-    if (!this.trusted) return { error: this.poisonReason ?? new Error("CopyStore generation is retired") };
+  lookup(url: string): ActionLookup {
+    if (!this.trusted) return { error: this.poisonReason ?? new Error("ActionStore generation is retired") };
     try { return { entry: this.entries.get(url)?.deref() }; }
     catch (error) {
       this.trusted = false;
@@ -395,7 +503,7 @@ export class CopyStore {
     }
   }
 
-  get(url: string): CopyEntry | undefined { return this.lookup(url).entry; }
+  get(url: string): ActionEntry | undefined { return this.lookup(url).entry; }
   owns(url: string): boolean { return url.startsWith(this.prefix); }
   clear(): void { this.retire(); }
 }

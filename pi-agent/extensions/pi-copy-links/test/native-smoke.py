@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Finite native Pi CLI/PTY smoke test. Does not touch desktop clipboard/browser.
+"""Finite native Pi CLI/PTY smoke test. Does not touch desktop clipboard/browser/VS Code.
 
 Usage: python3 test/native-smoke.py [--osc52 | --tmux] [--regular-start] [--artifacts DIRECTORY]
-The default captures wl-copy stdin and xdg-open argv using isolated executables.
+The default captures wl-copy stdin plus xdg-settings, Chrome and Code argv using isolated executables.
 --osc52 decodes the native terminal clipboard write from the private PTY.
 --tmux sends real client mouse events through an owned pi-agent tmux window.
 All evidence is retained; no model requests or user session changes are made.
@@ -48,7 +48,15 @@ agent = root / 'agent'
 }))
 code = 'target:\n\tprintf "%s\\n" "中文  spaces"  '
 url = 'https://example.com/copy-links?a=1&b=two#fragment'
-text = 'Native copy test\n\n- ```make\n  ' + code.replace('\n', '\n  ') + '\n  ```\n\n[OPEN_LINK](' + url + ')'
+for name, content in [('model sample.3mf', '3mf'), ('diagram.svg', '<svg/>'), ('data.json', '{\n  "ok": true\n}')]:
+    (root / name).write_text(content)
+(root / 'sample-dir').mkdir()
+text = ('Native copy test\n\n- ```make\n  ' + code.replace('\n', '\n  ') + '\n  ```\n\n'
+        '[WEB_LINK](' + url + ')\n\n'
+        '[MODEL_3MF](model%20sample.3mf)\n\n'
+        '[DIAGRAM_SVG](diagram.svg)\n\n'
+        '[DATA_JSON](data.json#L2)\n\n'
+        '[SAMPLE_DIR](sample-dir)')
 now = '2026-01-01T00:00:00.000Z'
 usage = {k: 0 for k in ['input', 'output', 'cacheRead', 'cacheWrite', 'totalTokens']}
 usage['cost'] = {k: 0 for k in ['input', 'output', 'cacheRead', 'cacheWrite', 'total']}
@@ -64,12 +72,26 @@ session = root / 'session.jsonl'
 session.write_text(''.join(json.dumps(entry, ensure_ascii=False) + '\n' for entry in entries))
 private_bin = root / 'bin'
 private_bin.mkdir()
-for command, payload in [('wl-copy', "{'text': sys.stdin.read()}"), ('xdg-open', "{'argv': sys.argv[1:]}")]:
+script = private_bin / 'wl-copy'
+script.write_text('#!/usr/bin/env python3\nimport json, os, sys\n'
+                  "with open(os.environ['PI_COPY_LINKS_TEST_DIR'] + '/wl-copy.jsonl', 'a') as f:\n"
+                  "    f.write(json.dumps({'text': sys.stdin.read()}, ensure_ascii=False) + '\\n')\n")
+script.chmod(0o755)
+for command in ['google-chrome-stable', 'code', 'xdg-open']:
     script = private_bin / command
     script.write_text('#!/usr/bin/env python3\nimport json, os, sys\n'
                       f"with open(os.environ['PI_COPY_LINKS_TEST_DIR'] + '/{command}.jsonl', 'a') as f:\n"
-                      f"    f.write(json.dumps({payload}, ensure_ascii=False) + '\\n')\n")
+                      "    f.write(json.dumps({'argv': sys.argv[1:]}, ensure_ascii=False) + '\\n')\n"
+                      + ("sys.exit(97)\n" if command == 'xdg-open' else ""))
     script.chmod(0o755)
+script = private_bin / 'xdg-settings'
+script.write_text('#!/usr/bin/env python3\nimport json, os, sys\n'
+                  "with open(os.environ['PI_COPY_LINKS_TEST_DIR'] + '/xdg-settings.jsonl', 'a') as f:\n"
+                  "    f.write(json.dumps({'argv': sys.argv[1:]}) + '\\n')\n"
+                  "if sys.argv[1:] == ['get', 'default-web-browser']:\n    print('google-chrome.desktop')\n"
+                  "elif sys.argv[1:] == ['check', 'default-web-browser', 'google-chrome.desktop']:\n    print('yes')\n"
+                  "else:\n    sys.exit(2)\n")
+script.chmod(0o755)
 env = dict(os.environ, PI_CODING_AGENT_DIR=str(agent), PI_COPY_LINKS_TEST_DIR=str(root),
            PI_OFFLINE='1', PI_SKIP_VERSION_CHECK='1', TERM='xterm-256color', TERM_PROGRAM='',
            PATH=str(private_bin) + os.pathsep + os.environ['PATH'], DISPLAY='',
@@ -157,6 +179,12 @@ def snapshot(name):
     (artifacts / (name + '.json')).write_text(json.dumps(value, ensure_ascii=False, indent=2))
     return value
 
+def target_by_label(value, label):
+    rows = [y for y, line in enumerate(value['lines']) if label in line]
+    matches = [target for target in value['targets'] if target['y'] in rows]
+    assert len(matches) == 1, (label, rows, matches, value['lines'])
+    return matches[0]
+
 def mouse_sequence(target, modifiers=0, edge='M'):
     x, y = target['x'] + 1, target['y'] + 1
     if pane:
@@ -180,7 +208,7 @@ def clipboard():
 exited = False
 try:
     if options.regular_start:
-        wait_for(lambda: 'pi-copy-links 已加载'.encode() in wire, 'regular-mode activation notice')
+        wait_for(lambda: '已加载'.encode() in wire, 'regular-mode activation notice')
         send('/settings\r')
         send('tui mode')
         send('\r')
@@ -191,19 +219,35 @@ try:
     wait_for(lambda: '[复制]'.encode() in wire, 'native copy button')
     first = snapshot('initial')
     assert first['mode'] == 'fullscreen', first
-    button = next(t for t in first['targets'] if t['url'].startswith('pi-copy://'))
-    link = next(t for t in first['targets'] if t['url'] == url)
+    button = target_by_label(first, '[复制]')
+    link = target_by_label(first, 'WEB_LINK')
     click(button)
     wait_for(lambda: len(clipboard()) == 1, 'clipboard delivery')
     assert clipboard() == [code], repr(clipboard())
     button_copies = [clipboard()[-1]]
     after_copy = snapshot('after-copy')
-    link = next(t for t in after_copy['targets'] if t['url'] == url)
+    link = target_by_label(after_copy, 'WEB_LINK')
     click(link)
-    assert records('xdg-open') == [], 'unmodified click opened a browser'
+    assert records('google-chrome-stable') == [], 'unmodified click opened a browser'
     click(link, 16)
-    wait_for(lambda: len(records('xdg-open')) == 1, 'Ctrl-click browser handoff')
-    assert records('xdg-open') == [{'argv': [url]}]
+    wait_for(lambda: len(records('google-chrome-stable')) == 1, 'Ctrl-click browser handoff')
+    assert records('google-chrome-stable') == [{'argv': ['--new-window', url]}]
+    assert records('xdg-settings') == [
+        {'argv': ['get', 'default-web-browser']},
+        {'argv': ['check', 'default-web-browser', 'google-chrome.desktop']},
+    ]
+    local_expectations = [
+        ('MODEL_3MF', ['--new-window', '--', str(root / 'model sample.3mf')]),
+        ('DIAGRAM_SVG', ['--new-window', '--', str(root / 'diagram.svg')]),
+        ('DATA_JSON', ['--new-window', '--goto', '--', str(root / 'data.json') + ':2']),
+        ('SAMPLE_DIR', ['--new-window', '--', str(root / 'sample-dir')]),
+    ]
+    for label, expected in local_expectations:
+        click(target_by_label(after_copy, label), 16)
+        wait_for(lambda: len(records('code')) >= local_expectations.index((label, expected)) + 1,
+                 'Ctrl-click Code handoff ' + label)
+        assert records('code')[-1] == {'argv': expected}
+    assert records('xdg-open') == [], 'forbidden xdg-open fallback ran'
     # Exercise tmux's lost-press modifier transition while dragging away and back.
     # Forwarded motion must prevent the release-recovery path from opening a URL.
     click(link)
@@ -211,7 +255,7 @@ try:
     send(mouse_sequence(link, 16) + mouse_sequence(away, 48) +
          mouse_sequence(link, 48) + mouse_sequence(link, 16, 'm'))
     drain(0.2)
-    assert records('xdg-open') == [{'argv': [url]}], 'Ctrl-drag opened a browser'
+    assert records('google-chrome-stable') == [{'argv': ['--new-window', url]}], 'Ctrl-drag opened a browser'
     # Native double-click/selection can itself write OPEN_LINK to the clipboard.
     # Compare each button's new write, rather than mistaking native selection for
     # a duplicate or failed code-copy operation.
@@ -220,10 +264,9 @@ try:
     wait_for(lambda: b'Reloaded' in wire, 'real /reload')
     drain(0.3)
     restored = snapshot('reloaded')
-    buttons = [t for t in restored['targets'] if t['url'].startswith('pi-copy://')]
-    assert len(buttons) == 1, buttons
-    assert buttons[0]['url'] != button['url'], 'reload reused old action registry'
-    click(buttons[0])
+    button_after_reload = target_by_label(restored, '[复制]')
+    assert button_after_reload['url'] != button['url'], 'reload reused old action registry'
+    click(button_after_reload)
     wait_for(lambda: len(clipboard()) > len(before_reload), 'copy after /reload')
     assert clipboard() == before_reload + [code]
     button_copies.append(clipboard()[-1])
@@ -231,7 +274,7 @@ try:
     drain(0.3)
     narrow = snapshot('narrow')
     before_narrow = clipboard()
-    click(next(t for t in narrow['targets'] if t['url'].startswith('pi-copy://')))
+    click(target_by_label(narrow, '[复制]'))
     wait_for(lambda: len(clipboard()) > len(before_narrow), 'copy after narrow resize')
     assert clipboard() == before_narrow + [code]
     button_copies.append(clipboard()[-1])
@@ -252,7 +295,9 @@ try:
     result = {'result': 'passed', 'transport': 'OSC52' if options.osc52 else 'tmux → wl-copy stdin' if options.tmux else 'wl-copy stdin',
               'regularToFullscreen': options.regular_start,
               'buttonCopies': button_copies, 'clipboardWrites': clipboard(),
-              'browser': records('xdg-open'), 'scratch': str(root)}
+              'browser': records('google-chrome-stable'), 'code': records('code'),
+              'browserDetection': records('xdg-settings'), 'forbiddenXdgOpen': records('xdg-open'),
+              'scratch': str(root)}
     (artifacts / 'result.json').write_text(json.dumps(result, ensure_ascii=False, indent=2))
     print(json.dumps(result, ensure_ascii=False))
 finally:

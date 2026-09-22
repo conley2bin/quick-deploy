@@ -1,10 +1,11 @@
 # pi-copy-links
 
-给 Pi **fullscreen 模式**的助手回复增加两项操作：
+给 Pi **fullscreen 模式**的助手 Markdown 增加两类受控操作：
 
-- 代码块右下角 **[复制]**：左键点击，将该块的代码原文送到剪贴板。保留代码自身的缩进、Tab、空行和行尾空格；不带围栏、Pi 额外的缩进、右侧补空格或屏幕自动折行。
-- 网页链接：**Ctrl + 鼠标左键**，调用操作系统的默认浏览器。支持 Markdown 链接文字、裸 HTTP(S) 地址和折行后的链接；普通点击不会由扩展打开网页。
-- 按下按钮或 Ctrl 按下链接时目标会反色高亮，松开即恢复；拖走会立即取消高亮且不触发动作。复制成功后按钮短暂闪烁确认。
+- 代码块右下角 **[复制]**：左键复制逻辑源文，保留代码自身的缩进、Tab、空行和行尾空格；不复制围栏、Pi 显示缩进、右侧补空格或屏幕折行。
+- Markdown 链接：仅 **Ctrl + 鼠标左键**激活。HTTP(S) 在默认 Chrome 的显式新窗口打开；已存在的本地文件或目录在 VS Code 的显式新窗口打开。普通点击和拖选继续交给 Pi。
+
+按下可执行目标时会反色，拖走、失焦、弹窗、滚动、尺寸变化或修饰键不匹配都会取消。每次激活都允许创建一个新应用窗口。
 
 ## 安装和启用
 
@@ -14,55 +15,94 @@
 bash pi-agent/extensions/pi-copy-links/install.sh
 ```
 
-也已自动纳入 `pi-agent/install.sh` 的扩展发现流程。安装器将整个源码目录软链接到 `~/.pi/agent/extensions/pi-copy-links`；可通过 `PI_CODING_AGENT_DIR` 指定其他 Pi home。依赖保留在源码目录，遇到外部文件、外部链接或 Git 已跟踪的目标会拒绝覆盖。安装器不修改 `settings.json`。
+安装器把整个源码目录软链接到 `~/.pi/agent/extensions/pi-copy-links`，也已纳入 `pi-agent/install.sh` 的扩展发现流程。可用 `PI_CODING_AGENT_DIR` 指定其他 Pi home。安装器不修改 `settings.json`、Pi bundle 或桌面关联。
 
-在 Pi 空闲时：
-
-1. 执行 `/reload`。
-2. 打开 `/settings`，把 **TUI mode** 设为 **fullscreen**；Pi 会即时切换并保存选择。
-3. 执行 `/copy-links` 可以查看启用状态。
-
-也可以仅本次启动使用：
+在 Pi 空闲时执行 `/reload`，再从 `/settings` 把 **TUI mode** 设为 **fullscreen**。`/copy-links` 显示当前状态。也可单次启动：
 
 ```bash
 pi --tui-mode fullscreen
 ```
 
-**为什么需要 fullscreen？** 普通模式把历史滚动交给终端/tmux，Pi 无法知道滚动后点击的是哪个历史代码块。fullscreen 由 Pi 管理视口，按钮才能随历史滚动、窗口缩放保持正确位置。扩展不劫持普通模式的鼠标，也不会自动切换你的会话。不要在 tmux copy-mode 中点击；先退出 copy-mode，让鼠标事件回到 Pi。
+普通模式把历史滚动交给终端/tmux，Pi 无法可靠命中滚动后的历史内容，因此扩展不在普通模式接管鼠标。tmux copy-mode 也会接管鼠标；点击前应先退出。
 
-## 边界
+## 链接目标
 
-- 当前精确适配 **Pi 0.85.1 和 0.86.1**。其他版本会在修改任何渲染器方法前明确拒绝；已验证版本若缺少 `Markdown.render`、`renderToken`、`renderInlineTokens` 或 `TuiAltScreen.handleViewportInput`，诊断会指出具体缺失方法。升级 Pi 后需重新验证适配，不能只扩大版本白名单。
-- 复制的是 Markdown 块代码，不是行内反引号或工具调用的折叠预览。列表和引用里的块代码也支持。每次缓存失效先收集完整的原生 code-token 序列，再用源文位置、容器路径、围栏 raw 结构、语言和归一化显示文本做单调一对一对齐。前向扫描求每个 token 最早可行源节点，反向扫描求最晚可行源节点；两者一致才显示按钮，因此只需 O(token 数) 辅助内存和线性指针遍历。解析器分歧造成歧义时会省略按钮并警告，不按“第一个相似块”猜测。流式输出期间只复制已唯一对应的代码；未完成围栏造成解析不一致时暂不显示按钮。
-- 不自动修剪代码本身的空格，因为 Python、Makefile、YAML、续行命令需要保留有效空白。围栏语法所需的最后一个换行不算代码内容。
-- 通常要求鼠标按下和松开落在同一按钮/链接、画面未变且没有拖动；拖动、失焦、弹窗、滚动或尺寸改变会取消此次点击。tmux 3.4 在快速切换 Ctrl 修饰键时可能丢弃按下事件；扩展只在近期修饰键切换、画面未变且没有移动事件时补认松开，不接受任意单独的松开事件。
-- 扩展只在首次渲染某个 Markdown 实例时登记一次弱引用，并设置远低于 V8 2^24 Set 极限的硬上限。任何 WeakRef/Set/Map/WeakMap/FinalizationRegistry 主操作或回滚/清理失败都会先原子摘除整个登记代际，再尽力执行所有 noexcept 清理；旧代际和随机 URI 前缀永久退役，其迟到 finalizer 只能访问旧 Map，不能删除新动作。恢复会新建不同前缀并同时探测 owner 登记、CopyStore 提交和探针清理；只有全部成功的新代际才启用。连续 8 次失败只通知一次，卸载取消待执行探针。
+扩展只处理助手消息中真实的 Markdown `link` token，包括显式链接、引用链接和 Pi 原生 HTTP(S) autolink。它不从裸文件路径文字、代码 span、代码块、图片或任意 OSC 8 文件 URL 推断目标。
 
-- 剪贴板使用 Pi 自带的 `copyToClipboard`：本地优先系统剪贴板工具，SSH 等环境可能走 OSC 52，实际落入客户端剪贴板取决于终端/tmux 是否允许。Pi 0.86.1 在已有图形会话但系统工具缺失或无权访问时会明确拒绝，而不再用无法验证的 OSC 52 假报成功；扩展会显示当前登记代际的错误且不闪烁复制成功。剪贴板写入不可中止，因此用 `Symbol.for` 保存在进程全局的串行队列跨越动作代际、适配器替换和 `/reload` 后的模块实例：旧写入结算后新写入才开始，避免旧结果最后覆盖新点击；已退役代际的迟到失败不再弹通知或改变高亮。真正永久挂起的剪贴板端点也会阻塞后续写入，这是维持“最后点击最终生效”顺序所必需的边界。扩展不修改这些权限。
-- 浏览器在 **Pi 进程所在机器**打开。SSH 到远端时不承诺打开本地浏览器；部分终端会自行接管 Ctrl+点击 OSC 8 链接并在客户端打开。扩展仅允许 HTTP(S)，不通过链接执行 shell 命令或打开任意 URI 协议。
-- Linux 需有 `xdg-open` 和默认浏览器，macOS 使用 `open`，Windows 使用 `rundll32.exe`。操作系统启动器返回失败会显示错误。
+### 网页
 
-## 实现与维护
+接受绝对 `http://` 和 `https://` URL；查询参数和 fragment 原样作为浏览器数据，不解释为编辑器行号。空格、控制字符或无效 URL 会明确失败。
 
-Pi 0.85.1/0.86.1 的公开 Markdown transformer 只用于识别助手消息、取得归一化前的源文，原样返回内容，不改会话和模型上下文。`remark-parse` 的代码节点提供逻辑代码内容；不能用 Pi 的显示 token 复制，因为 Pi 已把 Tab 展开成空格。
+Linux 每次网页激活都会：
 
-这两个版本虽有公开的 `MouseRegion`/`handleMouse` 组件 API，但它只能包裹扩展自己拥有的组件，不能给 Pi 已有的助手 Markdown 代码块增加按钮；而且 fullscreen 的原生 OSC 8 打开器先于未捕获的组件 click 生效。要保留普通选择、滚动、失焦/键盘取消和 tmux 丢失按下事件的窄恢复，仍需在原生 Markdown 渲染与视口输入处分层集成。
+1. 以自有的 `spawn` 子进程、`shell: false`、2.5 秒硬 wall-clock deadline 和有界 stdout/stderr 执行 `xdg-settings get default-web-browser`；deadline/abort/输出溢出会先独立结算调用，再向 detached 进程组发送 SIGTERM，并在 200 ms 内升级 SIGKILL；leader 的 `exit` 只记录状态，不代表 ownership 完成；只有 child `close` 或两个输出流都关闭后才正常结算，因此继承管道的 descendants 会继续受到 deadline 约束；
+2. 要求结果是单个合法 desktop ID；
+3. 执行 `xdg-settings check default-web-browser <id>` 并要求 `yes`；
+4. 只接受当前白名单 `google-chrome.desktop`；
+5. 执行 `google-chrome-stable --new-window URL`。
 
-因此 `src/adapter.ts` 集中保管一个**可撤销的内存适配**：装饰 `Markdown.render/renderToken/renderInlineTokens`，在代码块结束行右对齐按钮；通过 `TuiAltScreen.handleViewportInput` 和实际合成后的屏幕行命中目标。四个原始属性描述符会先全部捕获和预检，再作为一个事务安装；每次写入后核对 wrapper 身份，任一不可写属性、抛错 setter 或静默 no-op setter 都会使四项完整回滚后再报错。卸载先停用装饰、退役动作、失效已登记组件，再强制 `renderNow(true)`；只有合成后的 fullscreen 屏幕确认不含 `pi-copy://` 才恢复输入 hook。刷新或校验失败且仍持有 prototype 时，会把完整活动闭包替换成一个只保留原生输入方法、冻结描述符和静默义务的最小被动过滤器；选择、滚轮、弹窗和普通链接全部交还 Pi，只阻止 `pi-copy://` 到达原生 opener。后续重载会吸收并替换而不是套叠该过滤器，前任适配器闭包可被回收；若后装的外部 wrapper 已取得 prototype，则不覆盖它，原活动闭包作为其必要 delegate 进入同样的惰性状态。
+不会读取 `BROWSER`，不会解析 desktop entry 的 `Exec`，不会搜索替代浏览器，也不会调用 `xdg-open`、`gio open` 或失败后的备用启动器。其他默认浏览器和非 Linux 平台在这个版本中明确失败。
 
-代码按钮采用“原生收集 pass → 线性唯一对齐与新代际动作提交 → 装饰 pass”。第二个 pass 的 token 序列还必须与第一个 pass 完全相同；否则退役动作代际并做第三个纯原生 pass，避免半装饰输出。输入 hook 只截获已验证的扩展点击；所有其余鼠标事件仍进入 Pi 原生 `handleViewportInput`，因此滚轮、弹窗命中和跨按钮文本选择保留原生状态机。普通 URL 的原生打开权限来自本次事件是否命中 `renderedOverlayLayouts`，或是否沿已有 overlay `mouseCapture/mousePressTarget` 路径派发，而不是全局 `hasOverlay()`；小弹窗之外的 transcript 链接仍只响应 Ctrl+左键。调用原生处理前会捕获 `openUrl` 的精确 own descriptor/缺失状态和可观察前任值，但绝不调用任意 accessor setter：可配置 own accessor/data descriptor 直接替换为临时 own data descriptor，缺失的 own property 以 data descriptor 遮蔽继承 accessor，非配置但可写的 own data property 只改 value。只有确认取得属性所有权后才进入原生分发；非配置 accessor 或其他不能由 descriptor 精确回滚的形状会直接消费事件，绝不让私有 URI 走未过滤路径。嵌套调用会解开本扩展自己的前任过滤器；`finally` 仅在属性描述符和函数身份仍归当前过滤器时，用 `Object.defineProperty` 恢复精确前态或删除临时 own property，因此不会触发前任 setter，也不会覆盖原生处理期间同步安装的外部 opener。任何状态下 `pi-copy://` 都不会到达原生 opener。它不改磁盘上的 Pi/npm 文件、不替换编辑器，也不改变图片能力设置。
+### 本地文件和目录
 
-按钮只保存随机的进程内 URI，代码内容不写入 URI 或临时文件。内容引用随对应 Markdown 组件存活，切换会话/重载时清除；普通文本选择和滚轮继续交给 Pi。
+相对路径在**经过验证的 Ctrl+左键松开时**读取一次当前 Pi `ctx.cwd`，随后整次异步打开都使用这个快照。渲染时目录、扩展源码目录和 `process.cwd()` 都不参与解析。
 
-### tmux 鼠标透传
+| Markdown href | 含义 |
+|---|---|
+| `out.svg`、`src/file.ts`、`./out.svg`、`../out.svg` | 相对激活时 `ctx.cwd` 的 POSIX 路径 |
+| `/absolute/path` | 绝对路径 |
+| `file:///absolute/path`、`file://localhost/absolute/path` | 本地 file URL |
+| `./file.ts:12`、`src/file.ts:12:3`、`/tmp/file.ts:12` | 路径 + 行/列 |
+| `file.ts#L12`、`src/file.ts#L12C3`、`file:///tmp/file.ts#L12` | fragment 行/列 |
 
-tmux 默认键表可能吞掉 Ctrl+左键按下。`src/tmux.ts` 仅给**尚未绑定**的 Ctrl 鼠标键及 `SecondClick1Pane` 添加转发规则，规则要求目标 pane 带有本扩展的私有标记且应用已请求鼠标事件。已有绑定一律不覆盖；有冲突时 `/copy-links` 会明确提示。
+解析顺序是：先识别 URI 命名空间，再识别**字面**位置选择器，最后仅 percent-decode 一次。因此：
 
-pane 标记在会话关闭/重载时按归属清除或恢复。带条件的共享绑定和对应回执保留在该 tmux server 内，没有标记时不生效，server 退出即消失；不在“最后一个会话退出”时删除共享绑定，以免与另一 Pi 启动竞争。扩展不写 `.tmux.conf`，不改变 tmux 的 `mouse` 设置，也不接管其他 pane 的点击。
+- `name%3A12` 和 `name%23L12` 是包含字面 `:`、`#` 的文件名；
+- `%2520` 指向包含字面 `%20` 的文件名；`+` 始终是 `+`；
+- 本地 raw `?query`（包括空 `?`）被拒绝，文件名中的 `?` 必须写 `%3F`；
+- `file:///tmp/name:12` 的冒号属于 pathname；file URL 导航必须用 `#L12`；
+- `README.md:12`、`name:12` 是 scheme-shaped 歧义，必须改成 `./README.md:12` 或 `README.md#L12`；不会按文件是否存在猜测；
+- 同时出现 `:line` 和 `#Lline`、章节 fragment、空 fragment、fragment-only、行范围、零/负数/符号、溢出位置都会失败；
+- 行列范围为 `1..2_147_483_647`；
+- 拒绝畸形 percent escape、无效 UTF-8、NUL、C0/C1 控制字符和编码 `/`；
+- `file://other-host/path`、`file:relative`、`file:/path`、`//host/path` 被拒绝；
+- `mailto:`、`vscode:`、`command:`、`javascript:`、`data:` 和自定义 scheme 不会重解释为文件；
+- 不展开 shell、环境变量、glob 或 `~`；反斜杠不是 POSIX 路径分隔符，file URL 中会拒绝它。
 
-快速换修饰键丢按下的原因可见 [tmux 3.4 `server_client_check_mouse`](https://github.com/tmux/tmux/blob/3.4/server-client.c)：多击计时期间按钮字节不匹配时，事件仍为 `NOTYPE`，在键表查询前已被丢弃，单加绑定无法解决。恢复逻辑保留了拖动取消和视口变化校验。
+激活时使用 `stat` 跟随 symlink。只接受现有普通文件和目录；明确拒绝缺失/无权限/悬空 symlink、FIFO、socket 和设备节点。目录不能带行列。传给 Code 的绝对路径保留解析所得拼写，不做 `realpath`、项目根限制或 inode 固定。
 
-升级时重点核对：上述四个方法，以及 fullscreen 的 `previousScreen`、`previousScreenWidth/Height`、`openUrl`、`renderedOverlayLayouts`、`overlayStack`、`mouseCapture/mousePressTarget` 和 `containsComponent`。不要仅扩大版本白名单。
+启动参数固定为：
+
+```text
+code --new-window -- /absolute/path
+code --new-window --goto -- /absolute/path:12:3
+```
+
+带位置时仅接受普通文件。由于当前 Code CLI 的 `--goto` operand 不能安全表达含字面冒号的 POSIX 路径，这一组合会明确失败；不带位置的冒号路径仍可打开。启动环境复制当前桌面环境，但删除 `VSCODE_IPC_HOOK_CLI`，避免被远端 CLI socket 重定向。不会使用 `--reuse-window`。
+
+Chrome 和 Code 都通过参数数组、`shell: false`、`stdio: "ignore"`、detached 子进程启动。监听器安装、abort 脱钩和 `unref()` 全部成功后才完成应用所有权交接；任何 spawn 后的同步 handoff 失败都会先移除全部 observer，再立即 TERM+KILL 尚属扩展的 detached 进程组，避免“报错但仍打开”或 pin 住 Pi。完成交接后，代际 abort 只移除 observer，不会 kill 已接受的应用。可观测的 executable lookup、权限和非零退出会在动作仍有效时报告。成功只表示显式新窗口请求已被接受，不宣称窗口已绘制或位于指定 workspace。
+
+### 源文分歧
+
+Pi 在 lexing 前把 Tab 展开成三个空格，native href 还可能保留 character-reference 拼写。扩展同时用 remark 读取源文 link/linkReference span（引用采用第一条 definition），把 raw span 按 Pi 的 Tab/换行规则归一化后与 native `[raw, href]` 证据核对。
+
+所有显式链接先绑定其唯一的 remark 语义目标，再分类为 web/local/unsupported。因此 `[web](https://example.com/?a=1&amp;b=2)` 打开的是语义 URL `...?a=1&b=2`，不会误开 query key `amp;b`；引用链接遵循同一规则。angle/bare HTTP(S) autolink 只有在原始文本证据存在且 remark/native 的规范化网页语义一致时才可打开，分歧会生成诊断。
+
+本地链接仍额外要求唯一源文语义与 native href 一致。Tab/三个空格碰撞或 `a&amp;b.svg` 一类本地分歧会生成私有诊断动作；Ctrl+点击只解释拒绝原因，不猜文件名。Percent-encoded 等价写法是可靠表示。
+
+## 兼容和生命周期边界
+
+- 精确支持 **Pi 0.85.1 和 0.86.1**。其他版本会在改写任何 prototype 前拒绝；已验证版本若缺少 `Markdown.render`、`renderToken`、`renderInlineTokens` 或 `TuiAltScreen.handleViewportInput` 会指出具体方法。
+- 一个 mounted Markdown 拥有其全部 copy/open/diagnostic action。所有动作都使用同一随机 `pi-copy://<nonce>/<sequence>` 内存命名空间；URI 不包含路径、命令或代码内容。
+- 缓存 miss 采用原生收集 pass、一次联合 action commit、装饰 pass；链接以 exact `[raw, href]` key 和计数绑定，不用递归 cursor，因此 table 的测量/输出双渲染不会错位或多分配。代码块仍用源位置、容器路径、围栏结构、语言/meta 和逻辑文本做线性最早/最晚唯一对齐。若私有 action 登记不可用，transcript 中看似仍有的 native HTTP 链接也保持不可执行；不会退回 Marked href 绕过源文语义核对。
+- 动作按字段比较，未变 rerender 复用 URI。owner batch 变化时同步删除并 unregister 被替代条目；任何 allocation、Map/WeakMap/WeakRef/finalizer、commit 或 cleanup 异常都会先摘除整个代际，再尽力清理并用全新 prefix 恢复。
+- 每代有一个 `AbortController`，且异步工作的唯一 liveness 判据同时要求 adapter enabled、仍是 current generation、无 poison、signal 未 abort、store trusted。队列中的 clipboard 写入在真正开始前及所有成功/失败反馈前都重查；当前代际一旦 poisoned 会先 suspend/retire，不能继续执行已排队副作用。退役先从 current generation 摘除，再 abort 浏览器探测/文件检查并静默迟到反馈。已经完成 handoff 的 Chrome/Code 只移除 observer，不会被 kill，窗口可以独立于 Pi 存活。
+- Clipboard 仍使用进程级 `Symbol.for` 串行队列，跨代际、adapter 和 `/reload` 保证最后点击的写入顺序；打开动作不进入该队列。
+- 普通 local/private link 点击和拖选走 Pi 原生 viewport 状态机，但临时 opener filter 永远挡住所有 `pi-copy://`。只有 stored action kind 决定手势：copy 保留原行为；open/diagnostic/expired 必须是准确 Ctrl+左键，press/release 都满足且无 Shift/Alt/扩展按钮别名。
+- Overlay URL 只由准确 geometry 或 overlay-owned capture 授权。卸载先退役 action、失效 owner、强制同步 composed frame；仅证明 fullscreen 中无私有 URI 后才恢复 input hook。失败则保留单层最小被动 guard；后续实例吸收它，不保留前任闭包，也不覆盖后装 foreign wrapper。
+- tmux 只给未绑定的 Ctrl 鼠标键和 `SecondClick1Pane` 增加 pane-marker 条件透传；不改 `.tmux.conf`、`mouse` 设置或别的 pane。窄 lost-press 恢复要求前一次普通 release 与 orphan Ctrl release 命中完全相同的 cell、私有 URI/action kind，并保持屏幕、尺寸、overlay ownership/snapshot 和无 motion；任意空白 cell 的 release 不能授权别处链接。
+
+显式 `--new-window` 避免扩展主动复用其他 GNOME workspace 的窗口，但 Wayland 下最终 placement 属于 Mutter。真实 GNOME 验收必须作为有界、用户可见的手工步骤：在其他 workspace 已有 Chrome/Code 窗口时，从 Pi workspace 分别 Ctrl+点击网页、文件和目录，观察新窗口是否仍落在当前 workspace。若 compositor 行为不满足预期，需要单独的 GNOME Shell companion；本扩展不虚构 workspace 控制权。
 
 ## 验证
 
@@ -70,19 +110,13 @@ pane 标记在会话关闭/重载时按归属清除或恢复。带条件的共�
 cd pi-agent/extensions/pi-copy-links
 npm ci --ignore-scripts
 npm run check
-```
 
-测试从 `PATH` 定位已安装的 Pi，并只在忽略的 `node_modules` 中建立测试软链接；包装启动器可用 `PI_TEST_CORE` 指定包根目录。Pi 0.86.1 回归覆盖 Marked 18.0.11 边界、隐藏 Tab/可见空格碰撞、合法重复块与歧义省略；四 hook 原子回滚；主操作和二次回滚失败；提交后抛错的 finalizer 与退役前缀隔离；滚轮、跨私有 URI 选择、宽 8 小弹窗内外 URL、overlay capture/release 和无弹窗 Ctrl-only 策略；嵌套 opener 过滤、同步外部替换、可配置 no-op/抛错 accessor、三种 commit-then-refuse accessor 形状、own-property 缺失恢复和不可配置描述符的拒绝分发；成功/失败同步静默、重载点击窗口、替换安装失败、重复重载的单层最小过滤器、强制 GC 闭包回收和外部 wrapper 归属；跨代际及跨适配器的剪贴板顺序、失败后队列恢复和永久挂起边界；恢复构造/探针/清理失败；finalizer 回调 delete 失败；以及 5000 个重复块的 10000 次前后向匹配上界和禁止密集矩阵分配。
-
-原生 CLI/PTY 冒烟测试（Linux，另需 Python 3；后两项需 tmux）：
-
-```bash
 python3 test/native-smoke.py
 python3 test/native-smoke.py --osc52
 python3 test/native-smoke.py --tmux
 python3 test/native-smoke.py --tmux --regular-start
 ```
 
-这些测试使用临时 Pi profile 和离线 fixture，不调用模型、不改用户会话。前两项分别检查真实 CLI 交给 `wl-copy` 的原文、OSC 52 解码内容；浏览器检查 `xdg-open` 收到的完整 URL 参数，不启动桌面浏览器。tmux 测试通过真实 attachment client 注入鼠标事件，覆盖快速换修饰键、拖动取消、重载与缩放；使用 `pi-agent` server 中按项目命名的独立窗口，不操作用户默认 server，结束后保留项目 anchor。
+单元/集成测试覆盖代码源文、typed action failure atomicity、poisoned-generation clipboard queue、live cwd snapshot、Markdown recursion/table/reference、显式 web entity/reference 语义与 autolink disagreement、完整目标语法、symlink/type/existence、browser default 检测、硬 subprocess deadline 与 TERM/KILL 升级、transactional unref handoff、Chrome/Code argv、async retirement、selection/overlay/opener descriptor/tmux exact-target recovery/reload/quiescence。Native smoke 使用临时 Pi profile、真实 CLI/PTY 和 recorder executables：`wl-copy`、`xdg-settings`、`google-chrome-stable`、`code`；`xdg-open` 是失败 tripwire。它创建真实临时 `.3mf`、`.svg`、`.json` 和目录，只按显示 label 选择目标，不假定每个 `pi-copy://` 都是复制按钮。自动测试不会启动物理 Chrome/Code，也不会修改物理剪贴板。
 
-卸载：先确认 `~/.pi/agent/extensions/pi-copy-links` 是本扩展的软链接，再删除该链接并 `/reload`。源码及依赖目录可保留。
+卸载前确认 `~/.pi/agent/extensions/pi-copy-links` 是本扩展 symlink，删除后 `/reload`。源码和依赖可保留。
