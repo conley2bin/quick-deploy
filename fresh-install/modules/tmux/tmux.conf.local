@@ -8,8 +8,12 @@
 set -g mouse on
 
 # 允许 DCS 透传到外层 Ghostty，使可见 pane 的 Kitty graphics 正常显示。
-# 选 on 不选 all，隐藏 pane 不转发。
-set -g allow-passthrough on
+#
+# 当前关闭：Ghostty 1.3.1（GTK/Wayland，OpenGL 渲染器）在 tmux + Kitty graphics
+# 流量下会走到 GTK 的 Gdk: Error flushing display 致命路径并直接关掉窗口，
+# 上游讨论见 ghostty-org/ghostty#11909。上游修复后可改回 on（选 on 不选 all，
+# 隐藏 pane 不转发）。
+set -g allow-passthrough off
 
 # 复制时 tmux 会发出 OSC 52，把选中内容交给外层终端写入系统剪贴板。
 # 取值 on 还会处理 pane 应用与内层 tmux 发来的 OSC 52：按允许集合过滤并
