@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Source-exact code copy buttons and Ctrl-click web links in Pi fullscreen",
+  "description": "Source-exact code copy buttons and Ctrl-click web/file routing in Pi fullscreen",
   "pi": { "extensions": ["./index.ts"] },
   "scripts": {
     "test": "node test/setup-pi.mjs && node --import tsx --test test/*.test.ts",

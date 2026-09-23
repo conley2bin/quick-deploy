@@ -1,11 +1,11 @@
 import { copyToClipboard, VERSION, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { TUI } from "@earendil-works/pi-tui";
 import { installAdapter } from "./src/adapter.ts";
-import { openWebUrl } from "./src/browser.ts";
+import { openTarget } from "./src/links.ts";
 import { enableTmuxMouse } from "./src/tmux.ts";
 
 const WIDGET = "pi-copy-links:bridge";
-const HELP = "在 /settings 将 TUI mode 设为 fullscreen：代码块右下角左键复制，Ctrl+左键打开网页。普通模式的历史滚动由终端接管，不支持这些复制按钮。";
+const HELP = "在 /settings 将 TUI mode 设为 fullscreen：代码块右下角左键复制，Markdown 网页/文件链接用 Ctrl+左键在 Chrome/VS Code 新窗口打开。普通模式的历史滚动由终端接管，不支持这些操作。";
 
 export default function copyLinksExtension(pi: ExtensionAPI): void {
   let adapter: ReturnType<typeof installAdapter> | undefined;
@@ -31,9 +31,22 @@ export default function copyLinksExtension(pi: ExtensionAPI): void {
         version: VERSION,
         active: () => tui?.mode === "fullscreen",
         copy: copyToClipboard,
-        open: openWebUrl,
+        cwd: () => ctx.cwd,
+        open: openTarget,
         button: (text) => ctx.ui.theme.fg("accent", text),
         recoverTmuxRelease: () => mouse?.enabled === true && mouse.warnings.length === 0,
+        requestRender: () => { tui?.invalidate(); tui?.requestRender(); },
+        quiesce: () => {
+          if (!tui) return false;
+          const fullscreen = tui.mode === "fullscreen";
+          tui.invalidate();
+          (tui as TUI & { renderNow(force?: boolean): void }).renderNow(true);
+          if (!fullscreen) return true;
+          const screen = (tui as TUI & { previousScreen?: unknown }).previousScreen;
+          return Array.isArray(screen) && screen.every(
+            (row) => typeof row === "string" && !row.includes("pi-copy://"),
+          );
+        },
         notify: (message, error) => ctx.ui.notify(message, error ? "error" : "info"),
       });
       failure = undefined;
@@ -52,10 +65,10 @@ export default function copyLinksExtension(pi: ExtensionAPI): void {
   });
 
   pi.registerCommand("copy-links", {
-    description: "查看代码复制按钮和 Ctrl+单击链接的启用状态",
+    description: "查看代码复制和 Ctrl+单击网页/文件链接的启用状态",
     handler: async (_args, ctx) => {
       const state = failure ?? (adapter && tui?.mode === "fullscreen" ?
-        "已启用：点击 [复制] 获取原始代码；Ctrl+左键打开 HTTP(S) 网页。" : HELP);
+        "已启用：点击 [复制] 获取原始代码；Ctrl+左键在新窗口打开 HTTP(S) 网页或现有本地目标。" : HELP);
       ctx.ui.notify([state, mouseWarning].filter(Boolean).join("\n"), failure ? "error" : mouseWarning ? "warning" : "info");
     },
   });

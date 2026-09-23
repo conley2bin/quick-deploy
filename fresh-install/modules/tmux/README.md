@@ -33,7 +33,7 @@
 
 - 单一事实源：改 `~/.tmux.conf.local` 就是改仓库文件（`<前缀> e` 打开的也是它）；保存只更新基线文件，运行中的 tmux server 仍需 `<前缀> r` 重载；`git commit` 入库后，已链接的机器只靠 `git pull` 即可接收更新。
 - 注意：gpakosz 每次加载配置都会用 `cut -c3- "$TMUX_CONF_LOCAL" | sh -s printf probe` 探测本文件是否旧式脚本格式——注释行剥掉前两个字符（`# `）后会**被 shell 真实执行**，因此注释里不要写 `> < ; | & $() 反引号` 等元字符（历史上的 `（CSI > 4 ; 2 m）` 曾在服务器工作目录生成空文件 `4`）；需要表达时用全角 `＞ ；` 代替。
-- 基线只记真实改动（目前是鼠标模式、可见 pane 的 DCS 透传 `allow-passthrough on`、`set -s set-clipboard on`（原生 OSC 52，见下节）、状态栏左键释放切换 window、禁用状态栏区域滚轮切换 window、copy-mode 字母键退出并原样输入、pane-owned Pi error Esc sentinel 路由、精简状态栏、选中 window 两端蓝色竖条、取消 `Ctrl+a` 第二前缀、`Ctrl+Alt+←/→` 切换 window、`Ctrl+Alt+=/+` 新建 window）；全部可用选项查上游模板 `~/.tmux/.tmux.conf.local`。该文件本质是 tmux 配置片段，可直接写 `set -g ...`；若某行被主配置覆盖，按上游说明在行尾加 `#!important`。
+- 基线只记真实改动（目前是鼠标模式、DCS 透传 `allow-passthrough all`（机制与代价见下节）、`set -s set-clipboard on`（原生 OSC 52，见下节）、状态栏左键释放切换 window、禁用状态栏区域滚轮切换 window、copy-mode 字母键退出并原样输入、pane-owned Pi error Esc sentinel 路由、精简状态栏、选中 window 两端蓝色竖条、取消 `Ctrl+a` 第二前缀、`Ctrl+Alt+←/→` 切换 window、`Ctrl+Alt+=/+` 新建 window）；全部可用选项查上游模板 `~/.tmux/.tmux.conf.local`。该文件本质是 tmux 配置片段，可直接写 `set -g ...`；若某行被主配置覆盖，按上游说明在行尾加 `#!important`。
 
 仓库编辑、`git pull` 和本模块测试都不会向当前用户的 tmux server 写选项。已安装上述链接的机器，运行中 server 在重载后读取新基线；尚未启动的 server 在下次启动时读取。
 
@@ -124,7 +124,7 @@ copy-mode 表里的绑定只有在可选项 `tmux_conf_copy_to_os_clipboard` 显
 ./tests/run.sh
 ```
 
-测试使用 $WORK 内的独立 tmux socket（`-S`，不留 `/tmp/tmux-<uid>/` 节点）和临时目录，source 仓库基线后用 `show-options -Apv -t` 精确断言目标 pane 的有效 `allow-passthrough` 值为 `on`；随后真实验证状态栏鼠标释放切换、emacs/vi 两张 copy-mode 键表的字母原样输入，以及两 pane 红色 window 中 root/copy-mode Esc 只有在当前 pane 持有 recovery marker 时才投递 sentinel + Esc。未 armed pane 的 root 只收到普通 Esc，copy-mode 则零注入。不会改动当前 tmux server。
+测试使用 $WORK 内的独立 tmux socket（`-S`，不留 `/tmp/tmux-<uid>/` 节点）和临时目录，source 仓库基线后用 `show-options -Apv -t` 精确断言目标 pane 的有效 `allow-passthrough` 值为 `all`；随后真实验证状态栏鼠标释放切换、emacs/vi 两张 copy-mode 键表的字母原样输入，以及两 pane 红色 window 中 root/copy-mode Esc 只有在当前 pane 持有 recovery marker 时才投递 sentinel + Esc。未 armed pane 的 root 只收到普通 Esc，copy-mode 则零注入。不会改动当前 tmux server。
 
 OSC 52 部分用 `tic` 编译两份只差 `Ms` 能力的 terminfo，让两个 PTY 客户端同时显示同一个 pane 做对照（拖动故意由**不带 Ms** 的客户端发起，证明 tmux 按接收方能力分发）；每个阶段用全新 socket 启动独立 server，客户端进程有界收尾（超时强杀，不无期限 waitpid）：
 
@@ -143,7 +143,7 @@ Pi 只在启动时扫描 `~/.pi/agent/extensions/` 下的目录，不会扫描�
 
 - 前缀键仅保留默认 `Ctrl+b`；Oh my tmux! 默认新增的第二前缀 `Ctrl+a` 已取消。
 - 复制到本机系统剪贴板走原生 OSC 52：远端 tmux 里拖选/复制后，序列经 SSH 由本地 tmux 解析后重发（选择器会过滤/去重，载荷解码后重新编码），再由 Ghostty 用本机平台的剪贴板后端写入（`set -s set-clipboard on` 让本地 tmux 也会转发应用/内层 tmux 发来的序列）。远端不需要图形会话或剪贴板工具；尺寸上限、后台 window、发给哪些客户端等边界见上文剪贴板一节。
-- `allow-passthrough on` 允许可见 pane 把 tmux DCS passthrough 发给外层 Ghostty，因此 pane 内应用的 Kitty graphics 命令不再被 tmux 挡住。这里刻意选 `on` 而不是 `all`，隐藏 pane 不转发。
+- `allow-passthrough all` 允许 pane 把 tmux DCS passthrough 发给外层 Ghostty，因此 pane 内应用的 Kitty graphics 命令不再被 tmux 挡住。刻意选 `all` 而不是 `on`：`on` 在每个 DCS 派发时刻（tmux 3.4 `input.c` 的 `input_dcs_dispatch`）还要过两道瞬态门——某个 client 当前显示的 window 必须就是这个 window（`screen_write_set_client_cb` 的 `curw->window` 比较），且 pane 没有 `PANE_REDRAW`/`PANE_DROP` 待重绘、client 没有 deferred redraw（命中时回调返回 -1，整条 rawstring 写出被跳过）；一次图片事务由多条独立的 tmux DCS 分段拼成一次写入，命中这些事件循环轮询之间的瞬态时，落在瞬态里的分段会被 tmux 静默丢弃，外层终端拿到不完整的多段上传：占位符已经画在屏幕上，图像数据却到不了（表现为 Ghostty 侧的 missing image for virtual placement 与 kitty_gfx 警告，而不是可恢复的重试）。`all` 把这两道门短路为「该 client 的 session 含有这个 window 且 client 就绪（attached 且未 suspended）」，事务不再因瞬态丢分段；隐藏 pane 的主动图像上传仍然由 pi-inline-images 的 viewer monitor 抑制——没有就绪的兼容观看者就不上传，所以 `all` 并不会把常规图像流量引到隐藏 pane。代价必须明确：`all` 会转发隐藏 pane 的任意 DCS，不只是图像命令；它只写给就绪且属于该 session 的 client，不是给 detached 或未来 client 的离线队列；依赖隐藏 pane 做 DCS 隔离的会话不应套用本基线。
 - Pi 的模型或供应商错误把 window 标红并准备自动发送 `continue` 后，animator 会从 live error lease 的 pane ID 派生私有 recovery marker，并在同一个 tmux command batch 中更新 pane marker 与聚合 window 红色；lease 过期、publisher 崩溃、pane 复用及 animator 启动 sweep 都会清除 stale marker。Batch 并非事务，因此 animator 在调用 tmux 前先保留 prior + attempted targets 的清理责任，只有整批成功才缩回 live 集合，尾部 client refresh 失败不会遗留前面已写入的 marker。owning pane 的手动 `Esc` 由 tmux 先投递取消 sentinel、再投递真实 Esc，因此 fullscreen 搜索即使吞掉真实 Esc，也不会漏掉取消意图；扩展立即撤销本 run 的错误与待发送 `continue`，同一 run 的延迟 error 事件不能重新 armed。其他 pane 即使共享红色 window 也没有 marker，不会收到 sentinel。同一 window 若还有其他 Pi root 保持 error lease，聚合标签仍保持红色。
 - `<前缀> e` 打开 `.tmux.conf.local`；保存后按 `<前缀> r`，运行中的 server 才会读取新基线。
 - 状态栏左侧只显示 session 名，与右侧同为浅灰字、深灰底；右侧移除电池与时间、日期，只留 `用户名@主机名`。未选中 window 空闲时为 `#bcbcbc` 灰白块、深色字；bell 保留黄色前景和 `!` 标记；last/activity 不改变背景。选中 window 在色块左右末端各放两个整格实心 `#0077aa` 蓝色竖条（`██`；fg/bg 同设蓝，字体留缝隙也不漏底色），与 error 红底走正交视觉通道，竖条永不呼吸、永不变色。Pi 根回合或其异步子代理运行时，相应 window 背景以约 1s 周期在灰色路径上呼吸；模型/供应商可用性错误时显示稳定红底白字，后续语义输出或成功结束会清除。扩展语义与自动续跑细节见 `pi-agent/extensions/pi-tmux-window-status/README.md`。

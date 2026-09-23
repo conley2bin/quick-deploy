@@ -109,12 +109,19 @@ inactive pane remains visible in an unzoomed window; a zoomed window exposes onl
 its active pane. No viewer, failed/unknown snapshot, suspended viewer, or
 incompatible visible client keeps PNG bytes pending with zero upload. Each resource
 tracks the bounded identities it has served separately from current visibility. A
-hidden viewer returning with the same attachment identity does not re-upload;
-detach/reconnect creates an unseen identity and receives a complete upload.
-Meaningful preparation/viewer changes coalesce one public TUI
-invalidate/requestRender wakeup through a nonvisual widget; stable polls do not
-repaint or upload, and ordinary live updates (streaming assistant tokens, a new
-live row) only coalesce a diff render without invalidating historical components.
+known not-ready snapshot revokes only sent marks created since the preceding
+known snapshot, so an upload accepted during a visibility race is retried when
+that receiver returns; failed/unknown snapshots neither prune sent identities
+nor advance this known visibility boundary. Older served identities retain
+deduplication. A hide-and-return that completes between polls remains inherently
+unobservable under tmux `allow-passthrough on` because there is no terminal
+acknowledgement; use an explicit rehydrate/reload or choose the broader `all`
+policy deliberately if that residual window is unacceptable.
+A reconnected identity receives a complete upload. Meaningful preparation/viewer
+changes coalesce one public TUI invalidate/requestRender wakeup through a
+nonvisual widget; stable polls do not repaint or upload, and ordinary live updates
+(streaming assistant tokens, a new live row) only coalesce a diff render without
+invalidating historical components.
 
 The old-read replay may display a local source original instead of Pi's resized
 model attachment only when public execution evidence proves the selected tool is

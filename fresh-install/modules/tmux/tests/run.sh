@@ -37,27 +37,42 @@ tx source-file "$CONF"
 
 [ "$(tx show-options -gv mouse)" = on ] || fail "mouse 未开启"
 passthrough="$(tx show-options -Apv -t "$SESSION" allow-passthrough)"
-[ "$passthrough" = on ] || fail "allow-passthrough 有效值不是 on: $passthrough"
-if tx list-keys -T root MouseDown1Status >/dev/null 2>&1; then
-    fail "MouseDown1Status 仍有绑定"
-fi
-up_binding="$(tx list-keys -T root MouseUp1Status 2>/dev/null || true)"
+[ "$passthrough" = all ] || fail "allow-passthrough 有效值不是 all: $passthrough"
+# tmux accepts a key argument but may emit no filtered row (including for an
+# existing binding) on newer versions; inspect the complete table and select
+# the key column instead. A server/query failure remains a test failure.
+root_binding_for() {
+    local key="$1" output
+    if ! output="$(tx list-keys -T root 2>/dev/null)"; then
+        fail "无法读取 root key table"
+    fi
+    awk -v key="$key" '$4 == key' <<<"$output"
+}
+down_binding="$(root_binding_for MouseDown1Status)"
+[ -z "$down_binding" ] || fail "MouseDown1Status 仍有绑定: $down_binding"
+up_binding="$(root_binding_for MouseUp1Status)"
 case "$up_binding" in
     *"select-window -t ="*) ;;
-    *) fail "MouseUp1Status 未按鼠标目标切换 window" ;;
+    *) fail "MouseUp1Status 未按鼠标目标切换 window: $up_binding" ;;
 esac
 for key in WheelUpStatus WheelDownStatus; do
-    if tx list-keys -T root "$key" >/dev/null 2>&1; then
-        fail "$key 仍绑定为状态栏切换 window"
-    fi
+    binding="$(root_binding_for "$key")"
+    [ -z "$binding" ] || fail "$key 仍绑定为状态栏切换 window: $binding"
 done
 
 # 两张 copy-mode 表的 52 个大小写字母都必须保存同一条两步命令列表。
 lower='a b c d e f g h i j k l m n o p q r s t u v w x y z'
 upper='A B C D E F G H I J K L M N O P Q R S T U V W X Y Z'
+table_binding_for() {
+    local table="$1" key="$2" output
+    if ! output="$(tx list-keys -T "$table" 2>/dev/null)"; then
+        fail "无法读取 $table key table"
+    fi
+    awk -v key="$key" '$4 == key' <<<"$output"
+}
 for table in copy-mode copy-mode-vi; do
     for key in $lower $upper; do
-        binding="$(tx list-keys -T "$table" "$key" 2>/dev/null || true)"
+        binding="$(table_binding_for "$table" "$key")"
         case "$binding" in
             *"send-keys -X cancel \\; send-keys -l $key") ;;
             *) fail "$table 的 $key 未绑定为退出后原样输入: $binding" ;;
@@ -70,7 +85,7 @@ done
 # copy-selection-and-cancel 下也会发生，只有绑定文本与行为断言合起来才能
 # 把行为归因到这条自定义绑定。
 for table in copy-mode copy-mode-vi; do
-    binding="$(tx list-keys -T "$table" MouseDragEnd1Pane 2>/dev/null | tr -s ' ' || true)"
+    binding="$(table_binding_for "$table" MouseDragEnd1Pane | tr -s ' ')"
     [ "$binding" = "bind-key -T $table MouseDragEnd1Pane send-keys -X copy-selection-no-clear \\; send-keys -X clear-selection" ] \
         || fail "$table 的 MouseDragEnd1Pane 不是完整的自定义绑定: [$binding]"
 done
@@ -467,17 +482,17 @@ if infocmp -x -A "$WORK/terminfo" qp-osc52-noms 2>/dev/null \
     fail "不带 Ms 的对照 terminfo 意外包含 Ms"
 fi
 
-# 拖动覆盖整行标记文本，释放列取文本末尾之后。鼠标选区在 tmux 内部按
-# mode-keys 收尾（window_copy_get_selection：emacs 丢右下角字符并去掉行尾
-# 换行，vi 保留右下角字符与行尾换行），所以复制整行时两种键表的字节不同：
-# emacs 得到标记本身，vi 得到标记加一个换行。预期字节按模式分别算出，
-# 断言仍然逐字节精确对比，而不是用 $(...) 去尾换行后的字符串比较。
+# 选择范围刻意停在行尾前的一个保护字符：tmux 的 emacs 键表把鼠标终点
+# 当作排他的，vi 键表把它当作包含的。保护字符把两种模式的差异固定成
+# 一个可见字节，避免把版本相关的“是否附带行尾换行”误当成 OSC 52 行为。
+# 两种键表仍各自运行真实拖选，并逐字节断言预期内容。
 CLIP_MARKER="osc52-payload-$$-$RANDOM"
+CLIP_GUARD="X"
 CLIP_ROW=5
-CLIP_END_COL=$((4 + ${#CLIP_MARKER}))
+CLIP_END_COL=$((1 + ${#CLIP_MARKER}))
 clip_hex_of() { python3 -c 'import sys; sys.stdout.write(sys.argv[1].encode().hex())' "$1"; }
 CLIP_EXPECTED_HEX_EMACS="$(clip_hex_of "$CLIP_MARKER")"
-CLIP_EXPECTED_HEX_VI="${CLIP_EXPECTED_HEX_EMACS}0a"
+CLIP_EXPECTED_HEX_VI="${CLIP_EXPECTED_HEX_EMACS}$(clip_hex_of "$CLIP_GUARD")"
 # 边界 1 实际发出的选择器由 check_clip_mode 断言为空并记在这里；边界 2 的
 # 输入直接复用它，两段在真实接口上对接，而不是各自写死一个常量。
 CLIP_COPY_FLAGS=""
@@ -631,7 +646,7 @@ check_clip_mode() {
         || fail "$mode 模式：set-clipboard 有效值不是 on"
     txc set-option -w -t "$CLIP_SESSION" mode-keys "$mode"
     txc respawn-pane -k -t "$CLIP_SESSION" \
-        "printf '\n\n\n\n%s\n' '$CLIP_MARKER'; sleep 300"
+        "printf '\n\n\n\n%s%s\n' '$CLIP_MARKER' '$CLIP_GUARD'; sleep 300"
     sleep 0.3
     if ! result="$(python3 "$WORK/osc52-check.py" "$CLIP_SOCKET" "$WORK/terminfo" \
         "$CLIP_SESSION" "$CLIP_MARKER" "$CLIP_ROW" 1 "$CLIP_END_COL" noms)"; then
