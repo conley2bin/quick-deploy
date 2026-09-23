@@ -1,0 +1,1 @@
+This project adapts the Kitty Unicode placeholder protocol structure and tmux passthrough approach from pi-sprite (MIT), Copyright Alex Furrier. The adapted implementation is independently maintained here.
