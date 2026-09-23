@@ -37,7 +37,7 @@ tx source-file "$CONF"
 
 [ "$(tx show-options -gv mouse)" = on ] || fail "mouse 未开启"
 passthrough="$(tx show-options -Apv -t "$SESSION" allow-passthrough)"
-[ "$passthrough" = on ] || fail "allow-passthrough 有效值不是 on: $passthrough"
+[ "$passthrough" = all ] || fail "allow-passthrough 有效值不是 all: $passthrough"
 if tx list-keys -T root MouseDown1Status >/dev/null 2>&1; then
     fail "MouseDown1Status 仍有绑定"
 fi
