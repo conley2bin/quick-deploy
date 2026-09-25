@@ -47,6 +47,17 @@ render_variant() {
 }
 render_variant "$WORK/config.ghostty"
 grep -Fqx 'keybind = ctrl+shift+r=reset' "$WORK/config.ghostty" || fail "缺少 reset keybind"
+# 鼠标上报下用户的两条键：普通拖选被 Pi/tmux 接管，必须 Shift+拖选才能产生
+# Ghostty 本地选区，再由 Ctrl+Shift+C 复制、Ctrl+Shift+V 粘贴。三条均显式
+# 写入：never 还禁止程序用 XTSHIFTESCAPE 抢走 Shift，行为不随上游默认漂移。
+grep -Fqx 'mouse-shift-capture = never' "$WORK/config.ghostty" || fail "缺少 mouse-shift-capture = never"
+grep -Fqx 'keybind = ctrl+shift+c=copy_to_clipboard:mixed' "$WORK/config.ghostty" \
+    || fail "缺少 ctrl+shift+c 复制绑定"
+grep -Fqx 'keybind = ctrl+shift+v=paste_from_clipboard' "$WORK/config.ghostty" \
+    || fail "缺少 ctrl+shift+v 粘贴绑定"
+# 只有 never 能保证程序不能通过 XTSHIFTESCAPE 改写这条本地选择路径。
+! grep -Eq '^mouse-shift-capture[[:space:]]*=[[:space:]]*(true|false|always)[[:space:]]*$' "$WORK/config.ghostty" \
+    || fail "mouse-shift-capture 必须固定为 never"
 # 剪贴板策略：OSC 52 写允许、读拒绝。写入是远端 tmux 复制到达本机剪贴板的
 # 入口；读取只服务于把本机剪贴板回传给终端里的程序，本模块不需要，
 # 拒绝读取也暴露面最小。
@@ -63,8 +74,8 @@ cmp -s "$WORK/config.ghostty" "$WORK/config.x11.ghostty" \
     || fail "X11 会话下渲染结果与基准不一致"
 
 
-# write_config 幂等语义：首次写入基准内容（含剪贴板策略），重跑不重写、
-# 不备份、字节不变。
+# write_config 幂等语义：首次写入基准内容（含剪贴板策略与鼠标/按键绑定），
+# 重跑不重写、不备份、字节不变。
 HOME="$WORK/config-home" bash -c '
     set -euo pipefail
     source "$1"
@@ -77,6 +88,9 @@ HOME="$WORK/config-home" bash -c '
     grep -Fq "已写入" "$HOME/first.out"
     grep -Fqx "clipboard-write = allow" "$CONFIG_FILE"
     grep -Fqx "clipboard-read = deny" "$CONFIG_FILE"
+    grep -Fqx "mouse-shift-capture = never" "$CONFIG_FILE"
+    grep -Fqx "keybind = ctrl+shift+c=copy_to_clipboard:mixed" "$CONFIG_FILE"
+    grep -Fqx "keybind = ctrl+shift+v=paste_from_clipboard" "$CONFIG_FILE"
     digest=$(sha256sum "$CONFIG_FILE" | cut -d" " -f1)
     write_config > "$HOME/second.out"
     grep -Fq "配置文件无变化" "$HOME/second.out"

@@ -851,6 +851,25 @@ render_config() {
     # 和非交互式 SSH 启动方式都能使用的 Ghostty 原生 reset 兜底。
     echo "keybind = ctrl+shift+r=reset"
 
+    # 鼠标拖选的所有权：Pi 全屏、tmux `mouse on` 都会申请鼠标上报，此时
+    # 普通拖选被程序接管（Pi 自己画选区并在释放时复制），Ghostty 没有本地
+    # 选区，Ctrl+Shift+C 就无可复制。never 的文档语义是「按住 Shift 的鼠标
+    # 事件永远不按鼠标协议上报，而是扩展终端本地选区」，也就是把 Shift+拖选
+    # 稳定留给 Ghostty；与上游默认 false 不同，程序不能再用 XTSHIFTESCAPE
+    # 覆盖它。注意：这保障的是 Shift+拖选，不是普通拖选——程序申请了鼠标
+    # 上报时，普通拖选仍属于程序。
+    echo "mouse-shift-capture = never"
+
+    # 用户实际使用的两条键，同样不依赖上游默认绑定：
+    #   Ctrl+Shift+C 把 Ghostty 本地选区写进本机系统剪贴板。mixed 同时提供
+    #     纯文本与带样式两种格式（上游文档：selected text in both plain and
+    #     styled formats），粘到纯文本目标时仍是纯文本。
+    #   Ctrl+Shift+V 把本机剪贴板内容直接写进 pty；SSH 场景下内容作为输入
+    #     送到远端，不需要远端有剪贴板工具。
+    # 两者都由本机 Ghostty 执行，只作用于本机剪贴板与本地选区。
+    echo "keybind = ctrl+shift+c=copy_to_clipboard:mixed"
+    echo "keybind = ctrl+shift+v=paste_from_clipboard"
+
     # 剪贴板策略：允许 OSC 52 写入，拒绝 OSC 52 读取。
     # 写入是远端复制路径的关键一环：远端 tmux 复制后发出的 OSC 52 经
     # SSH 到达本机 Ghostty，由它落到本机系统剪贴板。写入端是终端本身，
