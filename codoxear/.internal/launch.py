@@ -9,47 +9,6 @@ HELPER_DIR = Path(__file__).resolve().parent.parent
 ENV_FILE = HELPER_DIR / ".env"
 VENV_BIN = HELPER_DIR / ".runtime" / "venv" / "bin"
 
-# Pi 0.86.1 的 Ctrl+V 按进程环境挑剪贴板后端：图片探测在 WAYLAND_DISPLAY
-# 非空或 XDG_SESSION_TYPE=wayland 时先等 wl-paste 1s；文本读取只在
-# WAYLAND_DISPLAY 非空时先等 wl-paste 5s，然后才回退 xclip。SSH 会话里的
-# 这套 Wayland 事实可能已经失效（DISPLAY 可用，
-# WAYLAND_DISPLAY 指向的 socket 取不到选区）。PIOX_CLIPBOARD_BACKEND=x11 让
-# 用户在 .env 里显式选择 X11 后端；只换算 pi 子进程环境，codex/server 不变。
-CLIPBOARD_BACKEND_VAR = "PIOX_CLIPBOARD_BACKEND"
-CLIPBOARD_BACKEND_AUTO = "auto"
-CLIPBOARD_BACKEND_X11 = "x11"
-
-
-def apply_clipboard_backend(command: str, env: dict[str, str]) -> dict[str, str]:
-    """返回 `command` 子进程要用的环境。
-
-    留空或 auto 原样返回；x11 是仅为 pi 提供的显式选择：要求 DISPLAY 非空，
-    并隐藏 Wayland 会话（移除 WAYLAND_DISPLAY，把 XDG_SESSION_TYPE 设为 x11），
-    让 Pi 及其继承环境的后代把当前图形会话视为 X11，使图片与文本 Ctrl+V
-    直接走 xclip。非法值或缺 DISPLAY 在任何进程
-    启动前明确失败，不静默降级回默认后端。
-    """
-    if command != "pi":
-        return env
-
-    choice = env.get(CLIPBOARD_BACKEND_VAR, "").strip()
-    if not choice or choice == CLIPBOARD_BACKEND_AUTO:
-        return env
-    if choice != CLIPBOARD_BACKEND_X11:
-        raise RuntimeError(
-            f"{CLIPBOARD_BACKEND_VAR} 只支持 {CLIPBOARD_BACKEND_AUTO} 或 {CLIPBOARD_BACKEND_X11}"
-            f"（留空即 {CLIPBOARD_BACKEND_AUTO}）；当前值: {choice!r}"
-        )
-    if not env.get("DISPLAY", "").strip():
-        raise RuntimeError(
-            f"{CLIPBOARD_BACKEND_VAR}={CLIPBOARD_BACKEND_X11} 需要非空的 DISPLAY（供 xclip 使用）"
-        )
-
-    env = dict(env)
-    env.pop("WAYLAND_DISPLAY", None)
-    env["XDG_SESSION_TYPE"] = "x11"
-    return env
-
 
 def parse_env(path: Path) -> dict[str, str]:
     if not path.is_file():
@@ -176,7 +135,6 @@ def main() -> None:
         os.chdir(HELPER_DIR)
         exec_program("codoxear-server", [], env)
     if command in {"codex", "pi"}:
-        env = apply_clipboard_backend(command, env)
         if command == "pi":
             env["CODEX_WEB_AGENT_BACKEND"] = "pi"
         exec_program("codoxear-broker", ["--", *sys.argv[2:]], env)
