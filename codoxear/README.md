@@ -19,6 +19,7 @@ run_server.sh
 .internal/       # 两个入口调用的内部实现，不直接运行
 .runtime/        # upstream checkout、独立 venv、安装状态；Git 忽略
 .env             # 本机配置；Git 忽略
+tests/           # .internal/launch.py 的隔离单元测试
 ```
 
 `.internal/` 包含远程 main 同步、安装、dotenv 加载、server/broker 启动和 shell rc 更新逻辑。它不是第三组用户命令。
@@ -122,6 +123,54 @@ CODEX_WEB_DEFAULT_AGENT_BACKEND=pi
 ```
 
 当前 shell 已设置的环境变量优先于 `.env`。`CODEX_HOME` 和 `PI_HOME` 会在启动前展开 `~`。
+helper 自己新增的选项（非上游模板）：下一节的 `PIOX_CLIPBOARD_BACKEND`。
+
+## Pi 的 `Ctrl+V`：`PIOX_CLIPBOARD_BACKEND=x11`
+
+SSH 到远端后 `piox` 进入 Pi 全屏，`Ctrl+V` 由 Pi 进程读取**远端主机**的剪贴板；
+`Ctrl+Shift+V` 则由本机 Ghostty 把**本机**剪贴板写进 pty。两者归属不同主机，
+这里只调整前者的后端。
+
+Pi 0.86.1 按进程环境选择后端（已对照安装的 `@earendil-works/pi-coding-agent@0.86.1`
+源码）：图片粘贴在 `WAYLAND_DISPLAY` 非空或 `XDG_SESSION_TYPE=wayland` 时先等
+`wl-paste --list-types` 1 秒；文本粘贴只在 `WAYLAND_DISPLAY` 非空时先等
+`wl-paste` 5 秒，失败后才回退 `xclip`。本机两个条件同时成立，所以实测会依次等待约 1 秒和 5 秒。
+在 GNOME/XWayland 的 SSH 会话里，`wl-paste` 可能拿不到选区（已实测 `--list-types`
+与文本读取均超过 7 秒不返回，而 `xclip` 立即返回），于是每次 `Ctrl+V` 都要等满
+这段超时。在 `.env` 中显式选择 X11 后端：
+
+```dotenv
+PIOX_CLIPBOARD_BACKEND=x11
+```
+
+launcher 读到该值时，**只从 `piox` 入口**做三件事：要求 `DISPLAY` 非空；移除
+`WAYLAND_DISPLAY`；把 `XDG_SESSION_TYPE` 设为 `x11`。这样图片与文本 `Ctrl+V`
+都直接走 `xclip`，不再有 Wayland 等待。`codox` 与 Web server 不受影响。
+
+- 留空或不写等于 `auto`：环境原样传递，行为与没有这个配置完全相同。
+- 其它值（如 `wayland`、拼写错误）：`piox` 在启动任何进程前明确失败并打印当前值，
+  不静默回到默认后端。
+- `x11` 要求 `DISPLAY` 非空；缺失时同样明确失败。要恢复默认行为就删掉这一行。
+- 当前 shell 的环境变量优先于 `.env`，可临时覆盖。
+- 只影响新启动的 `piox`；已在运行的 Pi 不受影响，需重启后才生效。
+
+边界：
+
+- 这个选项选择 Pi 的剪贴板后端，不改变复制/粘贴的归属：`Ctrl+V` 仍是 Pi 在远端读剪贴板，`Ctrl+Shift+V` 仍是 Ghostty 在本机粘贴。
+- 环境变化会由 `codoxear-broker` 传给 Pi，并继续被 Pi 启动的 shell 命令、扩展子进程和其它普通后代继承；因此 Wayland-only 工具可能不可用，GUI 工具可能改走 XWayland。需要原生 Wayland 的单条命令应显式补回真实的 `WAYLAND_DISPLAY` 与 `XDG_SESSION_TYPE=wayland`。真正只改变 Pi 剪贴板模块需要 Pi 上游提供专用后端开关，本 launcher 无法从父进程环境做到。
+- 需要主机上真的存在可用的 X11/XWayland 显示；`DISPLAY` 失效时文本粘贴会失败，
+  而不是悄悄走回 Wayland。
+- 文本路径已被实测（XWayland 上 `xclip -selection clipboard -out` 立即返回）；
+  图片路径改由 `xclip` 的 `TARGETS` 探测决定，能否拿到图片取决于 X11/XWayland
+  剪贴板桥暴露哪些目标，本仓库没有实测结论。
+- Pi 自己的鼠标释放复制（`copyToClipboard`）也会因此优先用 `xclip`，与该选项
+  是同一个后端选择的两面。
+
+隔离单元测试（不读真实 `.env`，不启动 broker/server）：
+
+```bash
+python3 tests/test_launch_clipboard.py
+```
 
 ## HTTPS
 
