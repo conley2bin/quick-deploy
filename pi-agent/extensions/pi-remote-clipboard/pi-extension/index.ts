@@ -17,16 +17,36 @@ const COPY_SINK_KEY = Symbol.for("pi-remote-clipboard:copy-sink");
 
 type CopySink = (text: string) => Promise<boolean>;
 
-/** tmux 场景按“当前输入 client 的祖先链”判定；非 tmux 用 SSH 环境变量。 */
+/** tmux 场景按“当前 session 中最近活动的 client”的祖先链判定；非 tmux 用 SSH 环境变量。
+ * 不用 display-message 的 client_pid：多 client 同 session 时它解析到别的 client。 */
 async function isRemoteClient(): Promise<boolean> {
   const pane = process.env.TMUX_PANE;
   if (process.env.TMUX && pane) {
     try {
-      const { stdout } = await execFileAsync(
-        "tmux", ["display-message", "-p", "-t", pane, "#{client_pid}"],
+      const sessionOut = await execFileAsync(
+        "tmux", ["display-message", "-p", "-t", pane, "#{session_name}"],
         { timeout: 1000, encoding: "utf8" },
       );
-      let pid = Number.parseInt(stdout.trim(), 10);
+      const session = sessionOut.stdout.trim();
+      if (!session) return false;
+      const listOut = await execFileAsync(
+        "tmux", ["list-clients", "-t", session, "-F", "#{client_pid} #{client_activity}"],
+        { timeout: 1000, encoding: "utf8" },
+      );
+      let bestPid = -1;
+      let bestActivity = -1;
+      for (const line of listOut.stdout.split("\n")) {
+        const parts = line.trim().split(/\s+/);
+        if (parts.length < 2) continue;
+        const pid = Number.parseInt(parts[0], 10);
+        const activity = Number.parseInt(parts[1], 10);
+        if (Number.isFinite(pid) && Number.isFinite(activity) && activity > bestActivity) {
+          bestActivity = activity;
+          bestPid = pid;
+        }
+      }
+      if (bestPid <= 0) return false;
+      let pid = bestPid;
       for (let depth = 0; depth < 16 && pid > 1; depth += 1) {
         let stat: string;
         try {

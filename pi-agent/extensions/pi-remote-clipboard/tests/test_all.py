@@ -92,28 +92,58 @@ class SshDetectTests(unittest.TestCase):
              mock.patch.object(ssh_detect, "_process_is_ssh_descendant", return_value=True):
             self.assertTrue(ssh_detect.is_ssh_terminal())
 
-    def test_tmux_uses_client_ancestors(self) -> None:
+    def test_tmux_uses_most_active_client_ancestors(self) -> None:
         env = {"TMUX": "/tmp/tmux-1000/default,1,1", "TMUX_PANE": "%5"}
+        outputs = {
+            ("display-message",): "quick-deploy\n",
+            ("list-clients",): "100 50\n200 90\n",
+        }
+        def fake_tmux(args, timeout=2):
+            return outputs.get((args[0],))
         with mock.patch.dict(os.environ, env, clear=True), \
-             mock.patch("subprocess.run") as run_mock, \
+             mock.patch.object(ssh_detect, "_tmux", side_effect=fake_tmux), \
              mock.patch.object(ssh_detect, "_process_is_ssh_descendant", return_value=True) as anc:
-            run_mock.return_value.stdout = "12345\n"
             self.assertTrue(ssh_detect.is_ssh_terminal())
-            anc.assert_called_with(12345)
+            anc.assert_called_with(200)
 
-    def test_tmux_no_client_pid(self) -> None:
+    def test_ancestors_parse_comm_with_spaces(self) -> None:
+        # tmux client 的进程名是 "tmux: client"（带空格），split() 会切错字段
+        import tempfile
+        fake_stat = "2686911 (tmux: client) S 2684393 2686911 2684393 0 -1 4194304 100 0 0 0"
+        with tempfile.NamedTemporaryFile("w", delete=False) as f:
+            f.write(fake_stat)
+            path = f.name
+        real_open = open
+        try:
+            with mock.patch("builtins.open", side_effect=lambda p, *a, **k: real_open(path, *a, **k) if str(p).endswith("/stat") and "2686911" in str(p) else (_ for _ in ()).throw(FileNotFoundError(str(p)))):
+                ancestors = ssh_detect._ancestors(2686911)
+        finally:
+            os.unlink(path)
+        self.assertEqual(ancestors, ["tmux: client"])
+
+    def test_tmux_most_active_client_not_ssh(self) -> None:
         env = {"TMUX": "/tmp/tmux-1000/default,1,1", "TMUX_PANE": "%5"}
+        outputs = {
+            ("display-message",): "quick-deploy\n",
+            ("list-clients",): "100 50\n200 90\n",
+        }
+        def fake_tmux(args, timeout=2):
+            return outputs.get((args[0],))
         with mock.patch.dict(os.environ, env, clear=True), \
-             mock.patch("subprocess.run") as run_mock:
-            run_mock.return_value.stdout = "\n"
+             mock.patch.object(ssh_detect, "_tmux", side_effect=fake_tmux), \
+             mock.patch.object(ssh_detect, "_process_is_ssh_descendant", return_value=False):
             self.assertFalse(ssh_detect.is_ssh_terminal())
 
-    def test_tmux_client_not_ssh(self) -> None:
+    def test_tmux_no_clients_is_local(self) -> None:
         env = {"TMUX": "/tmp/tmux-1000/default,1,1", "TMUX_PANE": "%5"}
+        def fake_tmux(args, timeout=2):
+            if args[0] == "display-message":
+                return "quick-deploy\n"
+            if args[0] == "list-clients":
+                return ""
+            return None
         with mock.patch.dict(os.environ, env, clear=True), \
-             mock.patch("subprocess.run") as run_mock, \
-             mock.patch.object(ssh_detect, "_process_is_ssh_descendant", return_value=False):
-            run_mock.return_value.stdout = "999\n"
+             mock.patch.object(ssh_detect, "_tmux", side_effect=fake_tmux):
             self.assertFalse(ssh_detect.is_ssh_terminal())
 
 
