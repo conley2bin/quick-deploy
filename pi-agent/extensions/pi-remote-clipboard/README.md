@@ -16,7 +16,7 @@
 ## 安装
 
 ```bash
-bash fresh-install/modules/pi-remote-clipboard/install.sh
+bash pi-agent/extensions/pi-remote-clipboard/install.sh
 ```
 
 安装器会：
@@ -92,7 +92,7 @@ piox
 ## 测试
 
 ```bash
-python3 fresh-install/modules/pi-remote-clipboard/tests/test_all.py
+python3 pi-agent/extensions/pi-remote-clipboard/tests/test_all.py
 ```
 
 隔离测试不启动真实 provider、不读真实剪贴板、不启动 SSH。
