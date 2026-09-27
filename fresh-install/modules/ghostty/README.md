@@ -72,6 +72,8 @@ sudo apt install --allow-downgrades ghostty=1.3.1~ppa2-noble1
   - 显式解除 `Ctrl+Alt+←/→` 的 Ghostty split 绑定，把按键交给 tmux 切 window
   - 为 `Ctrl+Alt+=/+` 显式发送 CSI-u 序列，交给 tmux 新建 window
   - `Ctrl+Shift+R` 绑定 Ghostty 原生 `reset`，用于清理异常 SSH 后残留的终端状态
+  - `mouse-shift-capture = never`：鼠标上报的程序（Pi 全屏、tmux `mouse on`）里用 **Shift+拖选** 产生 Ghostty 本地选区，并禁止程序用 `XTSHIFTESCAPE` 抢走 Shift（见“鼠标上报下的复制”一节）
+  - `Ctrl+Shift+C` 绑定 `copy_to_clipboard:mixed`，`Ctrl+Shift+V` 绑定 `paste_from_clipboard`：本机复制/粘贴的两条键，显式写入，不依赖上游默认绑定（见“鼠标上报下的复制”一节）
   - `clipboard-write = allow` / `clipboard-read = deny`：允许 OSC 52 写入（远端 tmux 复制回本机剪贴板的入口），拒绝 OSC 52 读取（见下节）
   - 新终端起始目录 `~/Documents`（不存在时回退到 XDG 文档目录，再不行就 `home`）
   - 关闭新窗口工作目录继承；新标签页和分屏仍保留继承
@@ -136,6 +138,42 @@ clipboard-read = deny
 - **日常粘贴不受影响**：`Ctrl+Shift+V`、鼠标右键、`Shift+Insert` 是 Ghostty 自己的本地动作，由终端直接把剪贴板内容写进 pty，不经过 OSC 52 读取；`Ctrl+Shift+C` 复制同样走 Ghostty 的本地选区。远端只需要用户按一次粘贴键。
 - 策略与显示服务器、系统版本无关：脚本里没有任何按 Wayland/X11 或 Ubuntu 版本分叉的剪贴板逻辑。回归测试在 Wayland、X11、无会话变量三种环境下断言渲染结果逐字节相同——这只证明**配置渲染不分叉**，不证明任何剪贴板后端的实际行为（后者需要真实图形会话）。
 - 本模块不写 `terminal-features` 之类的终端能力声明，也不强制声明 `Ms`；远端 tmux 能不能发 OSC 52 取决于它客户端侧的有效 `Ms`（可能来自 terminfo、配置的特性或 tmux 的运行时识别，见 `fresh-install/modules/tmux/README.md` 剪贴板一节）。本模块能做的是保证本机 `xterm-ghostty` 记录确实带 `Ms`：`--check` 会报告它，正式安装的验证阶段缺 `Ms` 会明确失败。
+
+### 鼠标上报下的复制：先 Shift+拖选，再 Ctrl+Shift+C
+
+在 Pi 全屏或 tmux `mouse on` 里，普通拖选会被申请了鼠标上报的程序接管
+（Pi 自己画选区并在释放时复制，tmux 进 copy-mode）。此刻 Ghostty 没有本地选区，
+`Ctrl+Shift+C` 无内容可复制，看起来像“快捷键失效”。本模块显式写死三行，
+把用户实际使用的两条键与选择所有权固定下来：
+
+```ini
+mouse-shift-capture = never
+keybind = ctrl+shift+c=copy_to_clipboard:mixed
+keybind = ctrl+shift+v=paste_from_clipboard
+```
+
+| 动作 | 谁执行 | 结果 |
+| --- | --- | --- |
+| `Shift+拖选` | Ghostty | 按住 Shift 的鼠标事件永远不按鼠标协议上报给程序，而是扩展 Ghostty 本地选区 |
+| `Ctrl+Shift+C` | Ghostty | 把本地选区写进**本机**系统剪贴板；`mixed` 同时提供纯文本与带样式两种格式（无选区时不做任何事） |
+| `Ctrl+Shift+V` | Ghostty | 把**本机**剪贴板内容直接写进 pty；SSH 场景下内容作为输入送到远端，不需要远端有剪贴板工具 |
+
+选择与复制全在本机 Ghostty 内完成，与远端有没有 Wayland/X11、有没有
+`wl-copy`/`xclip` 无关；这也是 SSH 场景下这两条键仍然可用的原因。
+
+两条键都显式写入，不依赖上游默认绑定：本文件由模块重置维护，即使将来上游
+改了默认绑定或默认 `mouse-shift-capture`，这里的行为不变。这里刻意选 `never`
+而不是上游默认 `false`：两者通常都把 Shift 留给 Ghostty，但 `false` 可被程序用
+`XTSHIFTESCAPE` 覆盖；`never` 才能保证用户始终有 Shift+拖选这条本地选择路径。
+
+边界：
+
+- 程序申请了鼠标上报时，**普通拖选属于程序**；只有按住 Shift 的那次拖选才会
+  产生 Ghostty 本地选区，`Ctrl+Shift+C` 复制的也是这个选区。
+- 没有程序申请鼠标上报时（例如普通 shell 提示符），普通拖选本来就是
+  Ghostty 选区，`Ctrl+Shift+C` 直接可用。
+- `never` 会让终端内程序永远收不到 Shift+鼠标组合；这是为稳定保留本地复制
+  手势付出的明确代价。本机当前的 Pi/tmux 工作流不依赖该组合。
 
 ## 字体
 
@@ -330,6 +368,8 @@ bash tests/run.sh
    ```bash
    infocmp -x xterm-ghostty | ssh HOST -- tic -x -
    ```
+
+10. SSH 进远端并进入 Pi 全屏（或 tmux `mouse on`）后，验证“鼠标上报下的复制”一节的两条键：普通拖选被程序接管；按住 **Shift** 拖选产生 Ghostty 本地选区，再按 `Ctrl+Shift+C`；`Ctrl+Shift+V` 应把本机剪贴板内容粘贴进去。
 
 GUI 冒烟测试只在 `DISPLAY` 或 `WAYLAND_DISPLAY` 存在时运行。它不使用 xdotool、XTEST、libXtst 或任何合成键鼠事件；测试依据是进程持续存活、stderr 未出现错误，以及 `/proc/<pid>/maps` 中出现 fcitx5 GTK4 immodule。
 
