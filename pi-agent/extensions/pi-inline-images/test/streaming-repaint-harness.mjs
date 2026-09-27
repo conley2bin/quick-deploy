@@ -85,6 +85,8 @@ const assistant = (text, calls = []) => ({
 
 const mode = Object.create(InteractiveMode.prototype);
 Object.assign(mode, {
+  // Mirrors the Pi >=0.86 class field the constructor would initialize.
+  entriesRenderedByBoundaryCompaction: new Set(),
   runtimeHost: { session }, isInitialized: true, pendingTools: new Map(), chatContainer: new piTui.Container(),
   footer: { invalidate() {} }, hideThinkingBlock: false, hiddenThinkingLabel: "Thinking...", outputPad: 1,
   toolOutputExpanded: false,
