@@ -32,7 +32,7 @@ SSH_CONFIG_BLOCK_BEGIN="# >>> fresh-install pi-remote-clipboard >>>"
 SSH_CONFIG_BLOCK_END="# <<< fresh-install pi-remote-clipboard <<<"
 
 # 需要自动 remote forwarding 的主机列表（空格分隔）
-SSH_HOSTS="conley-company conley-Y9000p"
+SSH_HOSTS="conley-company conley"
 # provider 在本机的监听端口；forwarding 在远端开的端口必须与它错开，
 # 否则反向方向的连接会在对端抢占 provider 的监听口。
 PROVIDER_PORT="37843"
@@ -135,7 +135,7 @@ else
     echo "      RemoteForward 127.0.0.1:$REMOTE_FORWARD_PORT 127.0.0.1:$PROVIDER_PORT"
     echo "  $SSH_CONFIG_BLOCK_END"
     echo ""
-    echo "  效果：ssh conley-company / ssh conley-Y9000p 自动带 remote forwarding，"
+    echo "  效果：ssh conley-company / ssh conley 自动带 remote forwarding，"
     echo "  远端 Pi 能回头请求本机剪贴板，无需记新命令。"
     echo ""
 
