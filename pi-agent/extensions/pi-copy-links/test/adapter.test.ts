@@ -1333,11 +1333,11 @@ test("dispose never clobbers a later input wrapper", () => {
 });
 
 test("unverified Pi versions refuse adaptation before any prototype changes", () => {
-  assert.deepEqual(SUPPORTED_PI, ["0.85.1", "0.86.1"]);
+  assert.deepEqual(SUPPORTED_PI, ["0.85.1", "0.86.1", "0.87.1"]);
   const originals = runtimeMethods();
   assert.throws(() => installAdapter({ version: '9.9.9', active: () => true,
     copy: async () => {}, cwd: () => '/fixture', open: async () => {}, notify: () => {}, button: s => s }),
-  /不支持 Pi 9\.9\.9；已验证版本：0\.85\.1、0\.86\.1；未修改渲染器/);
+  /不支持 Pi 9\.9\.9；已验证版本：0\.85\.1、0\.86\.1、0\.87\.1；未修改渲染器/);
   assert.deepEqual(runtimeMethods(), originals);
 });
 

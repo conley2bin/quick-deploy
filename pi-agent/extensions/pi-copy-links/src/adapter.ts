@@ -14,7 +14,7 @@ import {
 
 // Pi has no public code-block renderer or pre-viewport mouse hook in these releases.
 // Keep the exact private surface here, reject unknown versions and restore on unload.
-export const SUPPORTED_PI = ["0.85.1", "0.86.1"] as const;
+export const SUPPORTED_PI = ["0.85.1", "0.86.1", "0.87.1"] as const;
 interface Token { type: string; text?: string; lang?: string; href?: string; tokens?: Token[]; raw?: string }
 interface InlineStyle { applyText: (text: string) => string; stylePrefix: string }
 interface MarkdownRuntime {
