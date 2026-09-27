@@ -26,14 +26,30 @@ EXT_FOR_MIME = {
 }
 
 
-def request_clipboard(port: int = DEFAULT_PORT) -> dict[str, Any]:
+def _send(payload: dict[str, Any], port: int) -> dict[str, Any]:
+    line_bytes = json.dumps(payload, ensure_ascii=False).encode("utf-8") + b"\n"
     with socket.create_connection(("127.0.0.1", port), timeout=REQUEST_TIMEOUT_S) as sock:
-        sock.sendall(b'{"action":"read"}\n')
+        sock.sendall(line_bytes)
         f = sock.makefile("rb")
-        line = f.readline(64 * 1024)
+        line = f.readline(64 * 1024 * 1024)
     if not line:
         return {"kind": "error", "message": "提供者无响应"}
     return json.loads(line.decode("utf-8"))
+
+
+def request_clipboard(port: int = DEFAULT_PORT) -> dict[str, Any]:
+    return _send({"action": "read"}, port)
+
+
+def push_text(text: str, port: int = DEFAULT_PORT) -> dict[str, Any]:
+    return _send({"action": "write", "kind": "text", "text": text}, port)
+
+
+def push_image(data: bytes, mime: str, port: int = DEFAULT_PORT) -> dict[str, Any]:
+    return _send(
+        {"action": "write", "kind": "image", "mime": mime, "b64": base64.b64encode(data).decode("ascii")},
+        port,
+    )
 
 
 def handle_response(payload: dict[str, Any]) -> tuple[str | None, str | None]:

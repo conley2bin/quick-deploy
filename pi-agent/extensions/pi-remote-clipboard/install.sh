@@ -11,12 +11,14 @@ PROVIDER_SRC="$SCRIPT_DIR/src/provider.py"
 REQUESTER_SRC="$SCRIPT_DIR/src/requester.py"
 SSH_DETECT_SRC="$SCRIPT_DIR/src/ssh_detect.py"
 CTRLV_SRC="$SCRIPT_DIR/src/ctrlv.py"
+PUSH_SRC="$SCRIPT_DIR/src/push.py"
 
 PROVIDER_DIR="$HOME/.local/lib/pi-remote-clipboard"
 PROVIDER_BIN="$PROVIDER_DIR/provider.py"
 REQUESTER_BIN="$PROVIDER_DIR/requester.py"
 SSH_DETECT_BIN="$PROVIDER_DIR/ssh_detect.py"
 CTRLV_BIN="$PROVIDER_DIR/ctrlv.py"
+PUSH_BIN="$PROVIDER_DIR/push.py"
 
 SYSTEMD_USER_DIR="$HOME/.config/systemd/user"
 SERVICE_FILE="$SYSTEMD_USER_DIR/$MODULE_NAME.service"
@@ -50,7 +52,8 @@ cp "$PROVIDER_SRC" "$PROVIDER_BIN"
 cp "$REQUESTER_SRC" "$REQUESTER_BIN"
 cp "$SSH_DETECT_SRC" "$SSH_DETECT_BIN"
 cp "$CTRLV_SRC" "$CTRLV_BIN"
-chmod 755 "$PROVIDER_BIN" "$REQUESTER_BIN" "$SSH_DETECT_BIN" "$CTRLV_BIN"
+cp "$PUSH_SRC" "$PUSH_BIN"
+chmod 755 "$PROVIDER_BIN" "$REQUESTER_BIN" "$SSH_DETECT_BIN" "$CTRLV_BIN" "$PUSH_BIN"
 
 # ---------- systemd user service ----------
 mkdir -p "$SYSTEMD_USER_DIR"
@@ -71,7 +74,11 @@ WantedBy=default.target
 EOF
 
 systemctl --user daemon-reload
-systemctl --user enable --now "$MODULE_NAME.service" || warn "provider 启动失败；可稍后手动 systemctl --user start $MODULE_NAME"
+if systemctl --user is-active --quiet "$MODULE_NAME.service"; then
+    systemctl --user restart "$MODULE_NAME.service"
+else
+    systemctl --user enable --now "$MODULE_NAME.service" || warn "provider 启动失败；可稍后手动 systemctl --user start $MODULE_NAME"
+fi
 
 # ---------- Pi 扩展 ----------
 if [ -d "$PI_EXT_SRC" ]; then

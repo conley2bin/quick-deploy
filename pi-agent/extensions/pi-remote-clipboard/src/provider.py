@@ -31,9 +31,10 @@ IMAGE_MIME_ORDER = ["image/png", "image/jpeg", "image/webp", "image/gif"]
 TEXT_MIME_CANDIDATES = ["text/plain;charset=utf-8", "text/plain", "text", "UTF8_STRING", "STRING"]
 
 
-def _run(argv: list[str], timeout: float = READ_TIMEOUT_S) -> subprocess.CompletedProcess[bytes]:
+def _run(argv: list[str], timeout: float = READ_TIMEOUT_S, input_bytes: bytes | None = None) -> subprocess.CompletedProcess[bytes]:
     return subprocess.run(
         argv,
+        input=input_bytes,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         timeout=timeout,
@@ -89,6 +90,61 @@ def read_text() -> str | None:
     return text if text else None
 
 
+def _write_text(text: str) -> None:
+    if _is_wayland():
+        result = _run(["wl-copy"], input_bytes=text.encode("utf-8"))
+    elif os.environ.get("DISPLAY"):
+        result = _run(["xclip", "-selection", "clipboard", "-i"], input_bytes=text.encode("utf-8"))
+    else:
+        raise RuntimeError("本机没有可用的显示会话（WAYLAND_DISPLAY/DISPLAY 均缺失）")
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.decode("utf-8", "replace").strip() or "剪贴板写入失败")
+
+
+def _write_image(mime: str, data: bytes) -> None:
+    if _is_wayland():
+        result = _run(["wl-copy", "--type", mime], input_bytes=data)
+    elif os.environ.get("DISPLAY"):
+        result = _run(["xclip", "-selection", "clipboard", "-t", mime], input_bytes=data)
+    else:
+        raise RuntimeError("本机没有可用的显示会话（WAYLAND_DISPLAY/DISPLAY 均缺失）")
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.decode("utf-8", "replace").strip() or "剪贴板写入失败")
+
+
+def write_clipboard(request: dict[str, Any]) -> dict[str, Any]:
+    kind = request.get("kind")
+    if kind == "text":
+        text = request.get("text")
+        if not isinstance(text, str) or not text:
+            return {"kind": "error", "message": "write: 缺少 text"}
+        if len(text.encode("utf-8")) > MAX_TEXT_BYTES:
+            return {"kind": "error", "message": f"文本超过 {MAX_TEXT_BYTES} 字节上限"}
+        try:
+            _write_text(text)
+        except Exception as exc:  # noqa: BLE001
+            return {"kind": "error", "message": str(exc)}
+        return {"kind": "ok"}
+    if kind == "image":
+        mime = request.get("mime", "")
+        if not isinstance(mime, str) or not mime.startswith("image/"):
+            return {"kind": "error", "message": f"write: 不支持的 MIME: {mime}"}
+        try:
+            data = base64.b64decode(request.get("b64", ""), validate=True)
+        except Exception:  # noqa: BLE001
+            return {"kind": "error", "message": "write: base64 解码失败"}
+        if not data:
+            return {"kind": "error", "message": "write: 图片内容为空"}
+        if len(data) > MAX_IMAGE_BYTES:
+            return {"kind": "error", "message": f"图片超过 {MAX_IMAGE_BYTES} 字节上限"}
+        try:
+            _write_image(mime, data)
+        except Exception as exc:  # noqa: BLE001
+            return {"kind": "error", "message": str(exc)}
+        return {"kind": "ok"}
+    return {"kind": "error", "message": f"write: 未知 kind: {kind}"}
+
+
 def read_clipboard() -> dict[str, Any]:
     types = list_types()
     if not types:
@@ -114,14 +170,17 @@ def read_clipboard() -> dict[str, Any]:
 class Handler(socketserver.StreamRequestHandler):
     def handle(self) -> None:
         try:
-            raw = self.rfile.readline(64 * 1024)
+            raw = self.rfile.readline(64 * 1024 * 1024)
             if not raw:
                 return
             request = json.loads(raw.decode("utf-8"))
-            if request.get("action") != "read":
+            action = request.get("action")
+            if action == "read":
+                self._send(read_clipboard())
+            elif action == "write":
+                self._send(write_clipboard(request))
+            else:
                 self._send({"kind": "error", "message": "未知 action"})
-                return
-            self._send(read_clipboard())
         except Exception as exc:  # noqa: BLE001
             self._send({"kind": "error", "message": str(exc)})
 

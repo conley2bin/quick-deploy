@@ -1,6 +1,7 @@
 import { copyToClipboard, VERSION, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { TUI } from "@earendil-works/pi-tui";
 import { installAdapter } from "./src/adapter.ts";
+import { remoteCopySink } from "./src/remote-copy.ts";
 import { openTarget } from "./src/links.ts";
 import { enableTmuxMouse } from "./src/tmux.ts";
 
@@ -30,7 +31,11 @@ export default function copyLinksExtension(pi: ExtensionAPI): void {
       adapter = installAdapter({
         version: VERSION,
         active: () => tui?.mode === "fullscreen",
-        copy: copyToClipboard,
+        copy: async (text) => {
+          const sink = remoteCopySink();
+          if (sink && (await sink(text))) return;
+          await copyToClipboard(text);
+        },
         cwd: () => ctx.cwd,
         open: openTarget,
         button: (text) => ctx.ui.theme.fg("accent", text),
