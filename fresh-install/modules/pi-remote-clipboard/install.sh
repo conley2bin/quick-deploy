@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # pi-remote-clipboard 安装脚本
-# 每台机器都安装同一份：本机 provider + Pi 扩展 + SSH remote forwarding 函数。
+# 每台机器都安装同一份：本机 provider + Pi 扩展 + SSH config remote forwarding。
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
@@ -25,8 +25,13 @@ PI_HOME="${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}"
 PI_EXT_DIR="$PI_HOME/extensions/$MODULE_NAME"
 PI_EXT_SRC="$SCRIPT_DIR/pi-extension"
 
-ZSHRC_BLOCK_BEGIN="# >>> fresh-install pi-remote-clipboard >>>"
-ZSHRC_BLOCK_END="# <<< fresh-install pi-remote-clipboard <<<"
+SSH_CONFIG="$HOME/.ssh/config"
+SSH_CONFIG_BLOCK_BEGIN="# >>> fresh-install pi-remote-clipboard >>>"
+SSH_CONFIG_BLOCK_END="# <<< fresh-install pi-remote-clipboard <<<"
+
+# 需要自动 remote forwarding 的主机列表（空格分隔）
+SSH_HOSTS="conley-company conley-Y9000p"
+REMOTE_FORWARD_PORT="37843"
 
 die() { echo "pi-remote-clipboard: $*" >&2; exit 1; }
 warn() { echo "pi-remote-clipboard: 警告: $*" >&2; }
@@ -81,35 +86,49 @@ else
     warn "Pi 扩展源码目录不存在，跳过扩展安装: $PI_EXT_SRC"
 fi
 
-# ---------- .zshrc SSH remote forwarding 函数 ----------
-ZSHRC="$HOME/.zshrc"
-if [ -f "$ZSHRC" ] && [ ! -L "$ZSHRC" ]; then
-    if grep -Fqx "$ZSHRC_BLOCK_BEGIN" "$ZSHRC" 2>/dev/null; then
-        echo "pi-remote-clipboard: .zshrc 已有托管块，跳过"
-    else
-        tmp="$(mktemp "$ZSHRC.tmp.XXXXXX")"
-        cat "$ZSHRC" > "$tmp"
-        printf '\n' >> "$tmp"
-        cat >> "$tmp" <<'HOOK'
-# >>> fresh-install pi-remote-clipboard >>>
-# ssh-clipboard：普通 ssh 的包装，额外带 remote forwarding，
-# 让远端 Pi 的 Ctrl+V 能回头请求本机剪贴板。
-# 用法：ssh-clipboard <host> [其他 ssh 参数...]
-ssh-clipboard() {
-    ssh -R 127.0.0.1:37843:127.0.0.1:37843 "$@"
-}
-# <<< fresh-install pi-remote-clipboard <<<
-HOOK
-        chmod --reference="$ZSHRC" "$tmp"
-        mv "$tmp" "$ZSHRC"
-        echo "pi-remote-clipboard: .zshrc 已注册 ssh-clipboard 函数"
-    fi
-elif [ -L "$ZSHRC" ]; then
-    warn ".zshrc 是符号链接，跳过注册；请手动添加 ssh-clipboard 函数"
+# ---------- SSH config remote forwarding ----------
+# 让指定主机的 ssh 连接自动带 -R，不需要用户记新命令。
+mkdir -p "$(dirname "$SSH_CONFIG")"
+
+if [ -f "$SSH_CONFIG" ] && grep -Fqx "$SSH_CONFIG_BLOCK_BEGIN" "$SSH_CONFIG" 2>/dev/null; then
+    echo "pi-remote-clipboard: SSH config 已有托管块，跳过"
 else
-    warn ".zshrc 不存在，跳过注册；请手动添加 ssh-clipboard 函数"
+    echo ""
+    echo "pi-remote-clipboard: 将写入 SSH config（$SSH_CONFIG）："
+    echo ""
+    echo "  $SSH_CONFIG_BLOCK_BEGIN"
+    echo "  Host $SSH_HOSTS"
+    echo "      RemoteForward 127.0.0.1:$REMOTE_FORWARD_PORT 127.0.0.1:$REMOTE_FORWARD_PORT"
+    echo "  $SSH_CONFIG_BLOCK_END"
+    echo ""
+    echo "  效果：ssh conley-company / ssh conley-Y9000p 自动带 remote forwarding，"
+    echo "  远端 Pi 的 Ctrl+V 能回头请求本机剪贴板，无需记新命令。"
+    echo ""
+
+    tmp="$(mktemp "$SSH_CONFIG.tmp.XXXXXX")"
+    if [ -f "$SSH_CONFIG" ]; then
+        cat "$SSH_CONFIG" > "$tmp"
+        printf '\n' >> "$tmp"
+    fi
+    cat >> "$tmp" <<EOF
+$SSH_CONFIG_BLOCK_BEGIN
+Host $SSH_HOSTS
+    RemoteForward 127.0.0.1:$REMOTE_FORWARD_PORT 127.0.0.1:$REMOTE_FORWARD_PORT
+$SSH_CONFIG_BLOCK_END
+EOF
+    if [ -f "$SSH_CONFIG" ]; then
+        chmod --reference="$SSH_CONFIG" "$tmp"
+    else
+        chmod 600 "$tmp"
+    fi
+    mv "$tmp" "$SSH_CONFIG"
+    echo "pi-remote-clipboard: SSH config 已更新"
 fi
 
 echo "pi-remote-clipboard: 安装完成"
 echo "  provider: systemctl --user status $MODULE_NAME"
 echo "  测试: python3 $SCRIPT_DIR/tests/test_all.py"
+echo ""
+echo "使用："
+echo "  ssh conley-company   # 自动带 remote forwarding"
+echo "  piox                  # 远端 Pi 的 Ctrl+V 自动走桥"
