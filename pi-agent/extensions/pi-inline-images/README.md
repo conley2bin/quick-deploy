@@ -7,7 +7,12 @@ model context retain the original Markdown bytes.
 
 ## Requirements
 
-- Pi `0.85.1` (`@earendil-works/pi-coding-agent` / `pi-tui` host peers)
+- Pi `>=0.85.1` (`@earendil-works/pi-coding-agent` / `pi-tui` host peers). `0.85.1` is the
+  fully verified reference release. Other releases are admitted through a runtime capability
+  probe: the adapter tries to adapt, and only an observed contract failure (missing or
+  throwing entry projector, ambiguous component contract, irreversible method override,
+  failed suppression postcondition) degrades the affected preview to a notice naming the
+  concrete reason and the Pi version.
 - Node `>=22.19`
 - Ghostty, Kitty, or WezTerm with Kitty graphics support
 - Under tmux, the originating pane's effective `allow-passthrough` must be `on`
@@ -133,10 +138,20 @@ block/file metadata. Extension wrappers such as ShellGate have no per-read backe
 stamp, so their actual received pixels remain authoritative and are rendered as
 received without an original-resolution notice.
 
-For Pi **0.85.1**, a host-version guard reconciles persisted branch messages with
-public live message events and the public TUI/Container component sequence. Only a
-positively associated tool row with complete recent custom-block coverage hands
-display ownership to the full-resolution custom preview. Streaming assistant tails
+The host adapter negotiates capabilities at runtime instead of gating on a version string:
+any Pi release is attempted, and the release number appears only in failure diagnostics. Each
+reconcile validates the observable contract before mutating anything—the entry projector is
+callable and returns arrays, every recognized component matches exactly one row contract and
+accepts a reversible method override (writable data property on an extensible instance), and
+tool-call identities are unique—then re-verifies the structural mapping of persisted branch
+messages and public live message events against the public TUI/Container component sequence.
+Suppressing a native bitmap is verified by a postcondition render before the custom owner is
+authorized, so a no-op or throwing host setter revokes authorization instead of stacking two
+bitmaps; a host exception at any point restores every owned override independently
+(prototype-inherited methods are restored by removing the own override, not by shadowing it)
+and publishes `ready:false` with the concrete reason and Pi version. Only a positively
+associated tool row with complete recent custom-block coverage hands display ownership to the
+full-resolution custom preview. Streaming assistant tails
 preserve the already-bound prefix; ambiguous mappings keep native display and show
 a custom-withheld notice. User attachment previews bypass tool-row arbitration.
 The adapter treats pending native image preference as unknown, observes it only

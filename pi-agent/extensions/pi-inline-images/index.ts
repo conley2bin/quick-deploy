@@ -34,8 +34,15 @@ export default function piInlineImages(pi: ExtensionAPI) {
   let reconciliationSignature: string | undefined;
   let treeReconcileQueued = false;
   const reconcileHost = () => {
-    if (tui && hostContext) return host.reconcile(hostContext.sessionManager.buildContextEntries(), hostContext.sessionManager.getBranch(), hostContext.sessionManager.getSessionId());
-    return false;
+    try {
+      if (tui && hostContext) return host.reconcile(hostContext.sessionManager.buildContextEntries(), hostContext.sessionManager.getBranch(), hostContext.sessionManager.getSessionId());
+      return false;
+    } catch (error) {
+      // Host access outside the adapter's own guards (session manager, tree traversal) fails
+      // closed too: revoke authorization with the concrete reason, retry on the next event.
+      host.suspend(`host access failed: ${error instanceof Error ? error.message : String(error)}`.slice(0, 480), false);
+      return false;
+    }
   };
   const currentReconciliationSignature = () => hostContext
     ? host.reconciliationSignature(hostContext.sessionManager.buildContextEntries(), hostContext.sessionManager.getBranch(), hostContext.sessionManager.getSessionId())
@@ -45,12 +52,22 @@ export default function piInlineImages(pi: ExtensionAPI) {
    * rendering streaming text, so a reconcile here must never reset renderer state.
    */
   const scheduleTreeReconcile = () => {
-    const observed = currentReconciliationSignature();
+    let observed: string;
+    try {
+      observed = currentReconciliationSignature();
+    } catch {
+      return; // host tree access failed; the next widget render retries
+    }
     if (treeReconcileQueued || observed === reconciliationSignature) return;
     treeReconcileQueued = true;
     queueMicrotask(() => {
       treeReconcileQueued = false;
-      const current = currentReconciliationSignature();
+      let current: string;
+      try {
+        current = currentReconciliationSignature();
+      } catch {
+        return;
+      }
       if (current === reconciliationSignature) return;
       reconciliationSignature = current;
       wake(false);
@@ -73,8 +90,12 @@ export default function piInlineImages(pi: ExtensionAPI) {
       repaintQueued = false;
       const forceRepaint = forceRepaintQueued;
       forceRepaintQueued = false;
-      reconcileHost();
-      reconciliationSignature = currentReconciliationSignature();
+      try {
+        reconcileHost();
+        reconciliationSignature = currentReconciliationSignature();
+      } catch {
+        // reconcileHost already failed closed via suspend; the stale signature retries on the next event.
+      }
       if (forceRepaint) {
         tui?.invalidate();
         tui?.requestRender(true);

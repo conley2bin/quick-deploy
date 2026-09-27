@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import test from "node:test";
-import { HostImageOwnershipAdapter, type ReadPreviewCoordination } from "../src/host-adapter.ts";
+import { HostImageOwnershipAdapter, type HostAdapterApi, type HostSessionEntry, type ReadPreviewCoordination } from "../src/host-adapter.ts";
 import { ImageSession } from "../src/session.ts";
 import { TerminalImages } from "../src/terminal.ts";
 import { installedPiRoot } from "./pi-root.ts";
@@ -52,14 +52,23 @@ async function hostComponents() {
   };
 }
 
-function adapterFixture(children: object[], nativeImageProtocol?: () => "kitty" | "iterm2" | null) {
+function adapterFixture(
+  children: object[],
+  nativeImageProtocol?: () => "kitty" | "iterm2" | null,
+  hostOverride?: { version?: string; sessionEntryToContextMessages?: HostAdapterApi["sessionEntryToContextMessages"] },
+) {
   const terminal = new TerminalImages(() => 1, () => ({ widthPx: 8, heightPx: 16 }), { write: () => true }, { TERM_PROGRAM: "ghostty" }, true, { transportLimits: { minIntervalMs: 0 } });
   const session = new ImageSession(terminal);
   const events: ReadPreviewCoordination[] = [];
   const adapter = new HostImageOwnershipAdapter(
     session,
     (event) => events.push(event),
-    { version: "0.85.1", sessionEntryToContextMessages: (entry) => entry.message ? [entry.message] : [], nativeImageProtocol },
+    {
+      version: hostOverride?.version ?? "0.85.1",
+      sessionEntryToContextMessages: hostOverride?.sessionEntryToContextMessages
+        ?? ((entry: HostSessionEntry) => entry.message ? [entry.message] : []),
+      nativeImageProtocol,
+    },
   );
   const tui = { children, terminal: { columns: 80 }, render: () => [], invalidate() {}, requestRender() {} };
   adapter.setTui(tui as never);
@@ -417,4 +426,174 @@ test("sixteen retained image choices are pinned within a 256-choice FIFO under t
   rebuilt.get("image-0")!.setShowImages(false);
   assert.equal(state.rememberedPreferences.size, 0, "disposed public wrappers cannot revive old choices");
   host.setNativeProtocol("kitty");
+});
+
+test("an unknown Pi version is admitted when the runtime contract holds", async () => {
+  const host = await hostComponents();
+  const assistant = assistantMessage("assistant-unknown-host", [{ id: "read-one", name: "read" }]);
+  const assistantRow = host.assistant(assistant);
+  const readRow = host.tool("read", "read-one");
+  readRow.updateResult((toolResult("result-one", "read-one") as { message: object }).message);
+  assert.equal(hasNativeImage(readRow), true);
+  const entries = [messageEntry("assistant-entry", assistant), toolResult("result-entry", "read-one"), preview("preview-one", "read-one")];
+  const { adapter, events } = adapterFixture([assistantRow, readRow], undefined, { version: "9.9.9-unverified" });
+  assert.equal(adapter.reconcile(entries as never, entries as never), true, "admission is capability-based, not version-based");
+  assert.equal(hasNativeImage(readRow), false);
+  assert.deepEqual(events.at(-1), { version: 1, ready: true, activeLogicalIds: ["preview-one"] });
+  adapter.dispose();
+});
+
+test("a host without sessionEntryToContextMessages fails closed with the missing capability and version", () => {
+  const terminal = new TerminalImages(() => 1, () => ({ widthPx: 8, heightPx: 16 }), { write: () => true }, { TERM_PROGRAM: "ghostty" }, true, { transportLimits: { minIntervalMs: 0 } });
+  const events: ReadPreviewCoordination[] = [];
+  const adapter = new HostImageOwnershipAdapter(
+    new ImageSession(terminal),
+    (event) => events.push(event),
+    { version: "0.86.1", sessionEntryToContextMessages: undefined as never },
+  );
+  adapter.setTui({ children: [], terminal: { columns: 80 }, render: () => [], invalidate() {}, requestRender() {} } as never);
+  assert.equal(adapter.reconcile([], []), false);
+  assert.equal(events.at(-1)?.ready, false);
+  assert.match(events.at(-1)?.reason ?? "", /sessionEntryToContextMessages/);
+  assert.match(events.at(-1)?.reason ?? "", /0\.86\.1/);
+  adapter.dispose();
+});
+
+test("a throwing session entry projector fails closed with the concrete error instead of crashing", async () => {
+  const host = await hostComponents();
+  const assistant = assistantMessage("assistant-throw", [{ id: "read-one", name: "read" }]);
+  const entries = [messageEntry("assistant-entry", assistant), toolResult("result-entry", "read-one")];
+  const { adapter, events } = adapterFixture([host.assistant(assistant), host.tool("read", "read-one")], undefined, {
+    version: "0.86.1",
+    sessionEntryToContextMessages: () => { throw new Error("entry shape drifted"); },
+  });
+  assert.equal(adapter.reconcile(entries as never, entries as never), false);
+  assert.equal(events.at(-1)?.ready, false);
+  assert.match(events.at(-1)?.reason ?? "", /entry shape drifted/);
+  assert.match(events.at(-1)?.reason ?? "", /0\.86\.1/);
+  adapter.dispose();
+});
+
+test("a projector returning a non-array fails closed instead of corrupting the expected sequence", async () => {
+  const host = await hostComponents();
+  const assistant = assistantMessage("assistant-nonarray", []);
+  const entries = [messageEntry("assistant-entry", assistant)];
+  const { adapter, events } = adapterFixture([host.assistant(assistant)], undefined, {
+    version: "0.86.1",
+    sessionEntryToContextMessages: () => ({}) as never,
+  });
+  assert.equal(adapter.reconcile(entries as never, entries as never), false);
+  assert.match(events.at(-1)?.reason ?? "", /non-array/);
+  adapter.dispose();
+});
+
+test("a no-op setShowImages blocks custom authorization instead of stacking bitmaps", () => {
+  const assistant = assistantMessage("assistant-noop", [{ id: "read-one", name: "read" }]);
+  const fakeAssistant = { render: () => ["assistant"], setHideThinkingBlock() {}, setHiddenThinkingLabel() {} };
+  const fakeTool = {
+    render: () => ["\x1b_G native bitmap"],
+    setShowImages: (_show: boolean) => { /* the host ignores the toggle */ },
+    setImageWidthCells: (_width: number) => {},
+  };
+  const entries = [messageEntry("assistant-entry", assistant), toolResult("result-entry", "read-one"), preview("preview-one", "read-one")];
+  const { adapter, events } = adapterFixture([fakeAssistant, fakeTool], undefined, { version: "9.9.9" });
+  assert.equal(adapter.reconcile(entries as never, entries as never), false);
+  assert.equal(events.at(-1)?.ready, false);
+  assert.match(events.at(-1)?.reason ?? "", /did not remove the native bitmap/);
+  adapter.dispose();
+});
+
+test("a tool row render failure after a ready reconcile revokes readiness", async () => {
+  const host = await hostComponents();
+  const assistant = assistantMessage("assistant-late-throw", [{ id: "read-one", name: "read" }]);
+  const assistantRow = host.assistant(assistant);
+  const readRow = host.tool("read", "read-one");
+  readRow.setShowImages(false); // off before binding: preference stays unobserved, no native bitmap in render
+  const resultEntry = toolResult("result-entry", "read-one");
+  readRow.updateResult((resultEntry as { message: object }).message);
+  const entries = [messageEntry("assistant-entry", assistant), resultEntry, preview("preview-one", "read-one")];
+  const { adapter, events } = adapterFixture([assistantRow, readRow]);
+  assert.equal(adapter.reconcile(entries as never, entries as never), true);
+  assert.deepEqual(events.at(-1), { version: 1, ready: true, activeLogicalIds: [] });
+
+  (readRow as unknown as { render: () => string[] }).render = () => { throw new Error("render exploded"); };
+  assert.equal(adapter.reconcile(entries as never, entries as never), false, "a host render failure after success revokes the prior ready state");
+  assert.equal(events.at(-1)?.ready, false);
+  assert.match(events.at(-1)?.reason ?? "", /render exploded/);
+  adapter.dispose();
+});
+
+test("a component matching both row contracts fails closed as ambiguous", () => {
+  const assistant = assistantMessage("assistant-ambiguous", [{ id: "read-one", name: "read" }]);
+  const both = {
+    render: () => ["row"],
+    setHideThinkingBlock() {}, setHiddenThinkingLabel() {},
+    setShowImages(_show: boolean) {}, setImageWidthCells(_width: number) {},
+  };
+  const entries = [messageEntry("assistant-entry", assistant), toolResult("result-entry", "read-one"), preview("preview-one", "read-one")];
+  const { adapter, events } = adapterFixture([both]);
+  assert.equal(adapter.reconcile(entries as never, entries as never), false);
+  assert.match(events.at(-1)?.reason ?? "", /both the assistant and tool contracts/);
+  adapter.dispose();
+});
+
+test("duplicate tool call ids fail closed instead of collapsing onto one row", async () => {
+  const host = await hostComponents();
+  const assistant = assistantMessage("assistant-dup", [{ id: "read-one", name: "read" }, { id: "read-one", name: "read" }]);
+  const assistantRow = host.assistant(assistant);
+  const first = host.tool("read", "read-one");
+  const second = host.tool("read", "read-one");
+  const resultEntry = toolResult("result-entry", "read-one");
+  first.updateResult((resultEntry as { message: object }).message);
+  second.updateResult((resultEntry as { message: object }).message);
+  const entries = [messageEntry("assistant-entry", assistant), resultEntry, preview("preview-one", "read-one")];
+  const { adapter, events } = adapterFixture([assistantRow, first, second]);
+  assert.equal(adapter.reconcile(entries as never, entries as never), false);
+  assert.match(events.at(-1)?.reason ?? "", /duplicate tool call id/);
+  adapter.dispose();
+});
+
+test("a non-extensible component instance fails closed before any override is installed", () => {
+  const assistant = assistantMessage("assistant-frozen", []);
+  const proto = {
+    render() { return ["assistant"]; },
+    setHideThinkingBlock() {}, setHiddenThinkingLabel() {},
+  };
+  const frozen: object = Object.preventExtensions(Object.create(proto) as object);
+  const entries = [messageEntry("assistant-entry", assistant)];
+  const { adapter, events } = adapterFixture([frozen]);
+  assert.equal(adapter.reconcile(entries as never, entries as never), false);
+  assert.match(events.at(-1)?.reason ?? "", /not extensible/);
+  assert.equal(Object.prototype.hasOwnProperty.call(frozen, "render"), false, "no partial override was installed");
+  adapter.dispose();
+});
+
+test("an accessor render property is rejected as irreversible before wrapping", () => {
+  const assistant = assistantMessage("assistant-accessor", []);
+  const accessor: Record<string, unknown> = {
+    setHideThinkingBlock() {}, setHiddenThinkingLabel() {},
+  };
+  Object.defineProperty(accessor, "render", { get: () => () => ["assistant"], configurable: true });
+  const entries = [messageEntry("assistant-entry", assistant)];
+  const { adapter, events } = adapterFixture([accessor]);
+  assert.equal(adapter.reconcile(entries as never, entries as never), false);
+  assert.match(events.at(-1)?.reason ?? "", /accessor/);
+  adapter.dispose();
+});
+
+test("dispose restores the exact property state of prototype-inherited methods", async () => {
+  const host = await hostComponents();
+  const assistant = assistantMessage("assistant-restore", [{ id: "read-one", name: "read" }]);
+  const assistantRow = host.assistant(assistant);
+  const readRow = host.tool("read", "read-one");
+  readRow.updateResult((toolResult("result", "read-one") as { message: object }).message);
+  const entries = [messageEntry("assistant-entry", assistant), toolResult("result-entry", "read-one"), preview("preview-one", "read-one")];
+  const { adapter } = adapterFixture([assistantRow, readRow]);
+  assert.equal(adapter.reconcile(entries as never, entries as never), true);
+  assert.equal(Object.prototype.hasOwnProperty.call(readRow, "setShowImages"), true, "wrapper is installed as an own override");
+  adapter.dispose();
+  assert.equal(Object.prototype.hasOwnProperty.call(readRow, "setShowImages"), false, "inherited setter is revealed, not shadowed");
+  assert.equal(Object.prototype.hasOwnProperty.call(assistantRow, "render"), false, "inherited render is revealed, not shadowed");
+  readRow.setShowImages(false);
+  assert.equal(hasNativeImage(readRow), false, "the restored setter still controls the native bitmap");
 });

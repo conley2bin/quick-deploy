@@ -5,7 +5,6 @@ import type { ImageSession } from "./session.ts";
 export const READ_PREVIEW_ENTRIES_CHANGED = "pi-inline-images:read-preview-entries-changed";
 export const READ_PREVIEW_COORDINATION = "pi-inline-images:read-preview-coordination";
 export const READ_PREVIEW_COORDINATION_VERSION = 1;
-const SUPPORTED_HOST_VERSION = "0.85.1";
 const ENTRY_TYPE = "pi-tmux-images.preview";
 const CLEAR_TYPE = "pi-tmux-images.clear";
 const PLACEHOLDER = "\u{10EEEE}";
@@ -36,7 +35,8 @@ type Expected =
   | { kind: "tool"; toolCallId: string; toolName: string };
 type Observed =
   | { kind: "assistant"; component: AssistantComponent }
-  | { kind: "tool"; component: ToolComponent };
+  | { kind: "tool"; component: ToolComponent }
+  | { kind: "ambiguous"; component: Component };
 type AssistantBinding = {
   component: AssistantComponent;
   message: object;
@@ -44,6 +44,8 @@ type AssistantBinding = {
   live: boolean;
   original: AssistantComponent["render"];
   wrapper: AssistantComponent["render"];
+  /** Whether the wrapped method was an own property; prototype methods are restored by deleting the override. */
+  hadOwnMethod: boolean;
   active: boolean;
 };
 type ToolBinding = {
@@ -51,6 +53,8 @@ type ToolBinding = {
   toolCallId: string;
   original: ToolComponent["setShowImages"];
   wrapper: ToolComponent["setShowImages"];
+  /** Whether the wrapped method was an own property; prototype methods are restored by deleting the override. */
+  hadOwnMethod: boolean;
   active: boolean;
   suppressed: boolean;
   completedWithoutImages: boolean;
@@ -82,8 +86,12 @@ function observedComponents(root: TUI): Observed[] {
   const visit = (value: unknown) => {
     if (!value || typeof value !== "object" || seen.has(value as object)) return;
     seen.add(value as object);
-    if (isAssistantComponent(value)) observed.push({ kind: "assistant", component: value });
-    else if (isToolComponent(value)) observed.push({ kind: "tool", component: value });
+    const assistant = isAssistantComponent(value);
+    const tool = isToolComponent(value);
+    // A component matching both contracts cannot be associated unambiguously.
+    if (assistant && tool) observed.push({ kind: "ambiguous", component: value });
+    else if (assistant) observed.push({ kind: "assistant", component: value });
+    else if (tool) observed.push({ kind: "tool", component: value });
     const children = (value as { children?: unknown }).children;
     if (Array.isArray(children)) for (const child of children) visit(child);
   };
@@ -91,7 +99,38 @@ function observedComponents(root: TUI): Observed[] {
   return observed;
 }
 function contextMessages(entries: readonly HostSessionEntry[], host: HostAdapterApi): unknown[] {
-  return entries.flatMap((entry) => entry.type === "custom" ? [] : host.sessionEntryToContextMessages(entry));
+  return entries.flatMap((entry) => {
+    if (entry.type === "custom") return [];
+    const messages = host.sessionEntryToContextMessages(entry);
+    if (!Array.isArray(messages)) {
+      throw new Error(`sessionEntryToContextMessages returned a non-array for entry type "${entry.type}"`);
+    }
+    return messages;
+  });
+}
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+/** A method can be wrapped reversibly only as a writable data property on an extensible instance. */
+function reversibleMethod(component: object, key: string): string | undefined {
+  const own = Object.getOwnPropertyDescriptor(component, key);
+  if (own) {
+    if (typeof own.value !== "function") return `"${key}" is an accessor or non-function own property, not a reversible method`;
+    if (own.writable !== true) return `own "${key}" is not writable`;
+    return undefined;
+  }
+  let proto: object | null = Object.getPrototypeOf(component);
+  while (proto) {
+    const inherited = Object.getOwnPropertyDescriptor(proto, key);
+    if (inherited) {
+      if (typeof inherited.value !== "function") return `inherited "${key}" is an accessor or non-function property, not a reversible method`;
+      if (inherited.writable !== true) return `inherited "${key}" is not writable, so an own override cannot be assigned`;
+      break;
+    }
+    proto = Object.getPrototypeOf(proto);
+  }
+  if (!Object.isExtensible(component)) return `instance is not extensible, so an own "${key}" override cannot be installed`;
+  return undefined;
 }
 function role(value: unknown): string | undefined {
   return value && typeof value === "object" && typeof (value as { role?: unknown }).role === "string"
@@ -190,13 +229,23 @@ function reconciliationDataSignature(entries: readonly HostSessionEntry[], liveA
   return hash.digest("hex");
 }
 
-/** Host-0.85.1 adapter over public component identity, traversal, render, and image-toggle methods. */
+/**
+ * Host adapter over public component identity, traversal, render, and image-toggle methods.
+ * Admission is capability-based, never version-based: any Pi release is attempted; missing
+ * capabilities, ambiguous component contracts, irreversible method overrides, and failed
+ * postconditions fail closed with the concrete reason. The host version appears in
+ * diagnostics only. Structural checks (sequence, identity, coverage) re-verify the mapping
+ * on every reconcile, so semantic drift on an untested release degrades to a notice rather
+ * than a mis-assigned bitmap.
+ */
 export class HostImageOwnershipAdapter {
   private tui?: TUI;
   private readonly assistants = new Map<AssistantComponent, AssistantBinding>();
   private readonly tools = new Map<ToolComponent, ToolBinding>();
   private readonly componentIds = new WeakMap<object, number>();
   private nextComponentId = 1;
+  private hostProbed = false;
+  private hostRejection?: string;
   private liveAssistant?: { message: object; fingerprint: string; baseline: number };
   private readonly persistedAssistantCounts = new Map<string, number>();
   private readonly liveResults = new Map<string, object>();
@@ -231,7 +280,9 @@ export class HostImageOwnershipAdapter {
   reconciliationSignature(renderEntries: readonly HostSessionEntry[], branch: readonly HostSessionEntry[], sessionScope = "default"): string {
     const tree = this.publicTreeSignature();
     const data = reconciliationDataSignature(branch, this.liveAssistant?.message, this.liveResults);
-    return `${tree}|${data}|scope:${sessionScope}|pref:${this.preferenceRevision}|native:${this.host.nativeImageProtocol?.() ?? "unknown"}|render:${renderEntries.length}`;
+    // Absent probe method ("unknown") and a present null capability ("null") are distinct states.
+    const native = this.host.nativeImageProtocol ? String(this.host.nativeImageProtocol()) : "unknown";
+    return `${tree}|${data}|scope:${sessionScope}|pref:${this.preferenceRevision}|native:${native}|render:${renderEntries.length}`;
   }
 
   publicTreeSignature(): string {
@@ -241,7 +292,9 @@ export class HostImageOwnershipAdapter {
   }
 
   reconcile(renderEntries: readonly HostSessionEntry[], branch: readonly HostSessionEntry[], sessionScope = "default"): boolean {
-    if (this.host.version !== SUPPORTED_HOST_VERSION || !this.tui) return this.fail(`unsupported Pi host ${this.host.version}`);
+    if (!this.tui) return this.fail("host TUI is not mounted");
+    const rejection = this.probeHost();
+    if (rejection) return this.fail(rejection);
     this.setPreferenceScope(sessionScope);
     if (this.reconstructionHold) {
       if (this.publicTreeSignature() === this.reconstructionHold.priorTree) {
@@ -250,7 +303,12 @@ export class HostImageOwnershipAdapter {
       }
       this.reconstructionHold = undefined;
     }
-    const messages = contextMessages(renderEntries, this.host);
+    let messages: unknown[];
+    try {
+      messages = contextMessages(renderEntries, this.host);
+    } catch (error) {
+      return this.fail(`session entry projection failed: ${errorMessage(error)}`);
+    }
     const assistantCounts = new Map<string, number>();
     for (const message of messages) if (role(message) === "assistant") {
       const fingerprint = assistantFingerprint(message as object);
@@ -272,6 +330,9 @@ export class HostImageOwnershipAdapter {
       claims,
     );
     const observed = observedComponents(this.tui);
+    if (observed.some((item) => item.kind === "ambiguous")) {
+      return this.fail("a host component matches both the assistant and tool contracts; association is ambiguous");
+    }
     if (expected.length !== observed.length || expected.some((item, index) => item.kind !== observed[index]?.kind)) {
       return this.fail(`host component sequence mismatch (${expected.length} expected, ${observed.length} observed)`);
     }
@@ -295,17 +356,28 @@ export class HostImageOwnershipAdapter {
       const found = observed[index]!;
       if (wanted.kind === "assistant" && found.kind === "assistant") {
         currentAssistants.add(found.component);
-        this.bindAssistant(found.component, wanted);
+        const failure = this.bindAssistant(found.component, wanted);
+        if (failure) return this.fail(failure);
       } else if (wanted.kind === "tool" && found.kind === "tool") {
         currentTools.add(found.component);
+        if (toolRows.has(wanted.toolCallId)) {
+          return this.fail(`duplicate tool call id "${wanted.toolCallId}" in the host component sequence; association is ambiguous`);
+        }
         toolRows.set(wanted.toolCallId, found.component);
-        this.bindTool(found.component, wanted.toolCallId, completedTextCalls.has(wanted.toolCallId));
+        const failure = this.bindTool(found.component, wanted.toolCallId, completedTextCalls.has(wanted.toolCallId));
+        if (failure) return this.fail(failure);
       }
     }
     this.releaseDetached(currentAssistants, currentTools);
 
     const accepted = new Set<string>();
-    const nativeProtocol = this.host.nativeImageProtocol?.();
+    let nativeProtocol: "kitty" | "iterm2" | null | undefined;
+    try {
+      nativeProtocol = this.host.nativeImageProtocol?.();
+    } catch (error) {
+      return this.fail(`native image capability probe failed: ${errorMessage(error)}`);
+    }
+    const width = Math.max(1, this.tui.terminal.columns);
     for (const [id, row] of toolRows) {
       const result = results.get(id);
       const claimed = claims.get(id);
@@ -314,27 +386,44 @@ export class HostImageOwnershipAdapter {
       const binding = this.tools.get(row)!;
       if (complete && binding.externalDesired !== false && nativeProtocol === null) {
         // Native protocol absence is capability, not user intent: keep the latent row flag untouched.
-        this.release(row);
+        const failure = this.release(row);
+        if (failure) return this.fail(failure);
         for (const logicalId of claimed!.values()) accepted.add(logicalId);
         continue;
       }
-      if (complete && binding.externalDesired === undefined && containsNativeBitmap(row.render(Math.max(1, this.tui.terminal.columns)))) {
-        binding.externalDesired = true;
-        this.rememberBindingPreference(binding);
+      if (complete && binding.externalDesired === undefined) {
+        let nativeVisible: boolean;
+        try {
+          nativeVisible = containsNativeBitmap(row.render(width));
+        } catch (error) {
+          return this.fail(`tool row render failed while observing the native image preference: ${errorMessage(error)}`);
+        }
+        if (nativeVisible) {
+          binding.externalDesired = true;
+          this.rememberBindingPreference(binding);
+        }
       }
       if (complete && binding.externalDesired === true) {
-        this.suppress(row);
+        const failure = this.suppress(row, width);
+        if (failure) return this.fail(failure);
         for (const logicalId of claimed!.values()) accepted.add(logicalId);
-      } else this.release(row);
+      } else {
+        const failure = this.release(row);
+        if (failure) return this.fail(failure);
+      }
     }
     this.publish({ version: READ_PREVIEW_COORDINATION_VERSION, ready: true, activeLogicalIds: [...accepted].sort() });
     return true;
   }
 
   suspend(reason: string, waitForNewGeneration = true): void {
-    const priorTree = this.publicTreeSignature();
-    for (const binding of this.tools.values()) this.restoreTool(binding);
-    for (const binding of this.assistants.values()) this.restoreAssistant(binding);
+    let priorTree = "unavailable";
+    try {
+      priorTree = this.publicTreeSignature();
+    } catch {
+      // A broken tree must not block suspension; the hold simply clears on the next differing signature.
+    }
+    this.restoreAllBindings();
     this.tools.clear();
     this.assistants.clear();
     this.liveResults.clear();
@@ -345,8 +434,7 @@ export class HostImageOwnershipAdapter {
   }
 
   dispose(): void {
-    for (const binding of this.tools.values()) this.restoreTool(binding);
-    for (const binding of this.assistants.values()) this.restoreAssistant(binding);
+    this.restoreAllBindings();
     this.tools.clear();
     this.assistants.clear();
     this.liveResults.clear();
@@ -411,14 +499,32 @@ export class HostImageOwnershipAdapter {
     else this.rememberedPreferences.delete(binding.toolCallId);
   }
 
-  private bindAssistant(component: AssistantComponent, expected: Extract<Expected, { kind: "assistant" }>): void {
+  /**
+   * Admission probe: the required host surface must exist and be callable. Unknown releases
+   * are attempted, not rejected; per-reconcile structural checks remain the semantic gate.
+   * Cached because the host identity cannot change within one adapter lifetime.
+   */
+  private probeHost(): string | undefined {
+    if (this.hostProbed) return this.hostRejection;
+    this.hostProbed = true;
+    if (typeof this.host.sessionEntryToContextMessages !== "function") {
+      this.hostRejection = "sessionEntryToContextMessages is not a function";
+    } else if (this.host.nativeImageProtocol !== undefined && typeof this.host.nativeImageProtocol !== "function") {
+      this.hostRejection = "nativeImageProtocol is present but not a function";
+    }
+    return this.hostRejection;
+  }
+
+  private bindAssistant(component: AssistantComponent, expected: Extract<Expected, { kind: "assistant" }>): string | undefined {
     const prior = this.assistants.get(component);
     if (prior) {
       prior.message = expected.message;
       prior.fingerprint = expected.fingerprint;
       prior.live = expected.live;
-      return;
+      return undefined;
     }
+    const irreversible = reversibleMethod(component, "render");
+    if (irreversible) return `assistant component "render" cannot be wrapped reversibly: ${irreversible}`;
     const original = component.render;
     const binding: AssistantBinding = {
       component,
@@ -427,6 +533,7 @@ export class HostImageOwnershipAdapter {
       live: expected.live,
       original,
       wrapper: original,
+      hadOwnMethod: Object.prototype.hasOwnProperty.call(component, "render"),
       active: true,
     };
     binding.wrapper = (width) => binding.active
@@ -434,23 +541,27 @@ export class HostImageOwnershipAdapter {
       : binding.original.call(component, width);
     component.render = binding.wrapper;
     this.assistants.set(component, binding);
+    return undefined;
   }
 
-  private bindTool(component: ToolComponent, id: string, completedWithoutImages: boolean): void {
+  private bindTool(component: ToolComponent, id: string, completedWithoutImages: boolean): string | undefined {
     const existing = this.tools.get(component);
     if (existing) {
       existing.completedWithoutImages = completedWithoutImages;
       // Promote a newly claimed image's observed choice, or retire a text result.
       // Other pending choices keep their explicit-choice FIFO order across renders.
       if (completedWithoutImages || this.retainedImageCalls.has(id)) this.rememberBindingPreference(existing);
-      return;
+      return undefined;
     }
+    const irreversible = reversibleMethod(component, "setShowImages");
+    if (irreversible) return `tool component "setShowImages" cannot be wrapped reversibly: ${irreversible}`;
     const original = component.setShowImages;
     const binding: ToolBinding = {
       component,
       toolCallId: id,
       original,
       wrapper: original,
+      hadOwnMethod: Object.prototype.hasOwnProperty.call(component, "setShowImages"),
       active: true,
       suppressed: false,
       completedWithoutImages,
@@ -469,51 +580,96 @@ export class HostImageOwnershipAdapter {
     };
     component.setShowImages = binding.wrapper;
     this.tools.set(component, binding);
+    return undefined;
   }
 
-  private suppress(component: ToolComponent): void {
+  /**
+   * Suppress the native bitmap and verify the postcondition before authorizing the custom
+   * owner: a no-op or throwing setter must never yield a duplicated or silently stacked display.
+   */
+  private suppress(component: ToolComponent, width: number): string | undefined {
     const binding = this.tools.get(component);
-    if (!binding || binding.suppressed || binding.externalDesired !== true) return;
+    if (!binding || binding.suppressed || binding.externalDesired !== true) return undefined;
     binding.suppressed = true;
-    binding.original.call(component, false);
+    try {
+      binding.original.call(component, false);
+    } catch (error) {
+      return `setShowImages(false) failed: ${errorMessage(error)}`;
+    }
+    try {
+      if (containsNativeBitmap(component.render(width))) {
+        return "setShowImages(false) did not remove the native bitmap; refusing to authorize the custom owner on top of it";
+      }
+    } catch (error) {
+      return `tool row render failed after setShowImages(false): ${errorMessage(error)}`;
+    }
+    return undefined;
   }
 
-  private release(component: ToolComponent): void {
+  private release(component: ToolComponent): string | undefined {
     const binding = this.tools.get(component);
-    if (!binding || !binding.suppressed) return;
+    if (!binding || !binding.suppressed) return undefined;
     binding.suppressed = false;
-    if (binding.externalDesired !== undefined) binding.original.call(component, binding.externalDesired);
+    if (binding.externalDesired === undefined) return undefined;
+    try {
+      binding.original.call(component, binding.externalDesired);
+    } catch (error) {
+      return `setShowImages(${binding.externalDesired}) failed while restoring native display: ${errorMessage(error)}`;
+    }
+    return undefined;
+  }
+
+  /** Restore every binding independently: one broken row must not block the others. */
+  private restoreAllBindings(): number {
+    let unrestored = 0;
+    for (const binding of this.tools.values()) {
+      try { this.restoreTool(binding); } catch { unrestored++; }
+    }
+    for (const binding of this.assistants.values()) {
+      try { this.restoreAssistant(binding); } catch { unrestored++; }
+    }
+    return unrestored;
   }
 
   private fail(reason: string): false {
-    for (const binding of this.tools.values()) this.restoreTool(binding);
-    for (const binding of this.assistants.values()) this.restoreAssistant(binding);
+    const unrestored = this.restoreAllBindings();
     this.tools.clear();
     this.assistants.clear();
-    this.publish({ version: READ_PREVIEW_COORDINATION_VERSION, ready: false, activeLogicalIds: [], reason });
+    const detail = `${reason} [Pi ${this.host.version}]`;
+    this.publish({
+      version: READ_PREVIEW_COORDINATION_VERSION,
+      ready: false,
+      activeLogicalIds: [],
+      reason: unrestored ? `${detail}; ${unrestored} bound component(s) could not be restored` : detail,
+    });
     return false;
   }
 
   private releaseDetached(assistants: ReadonlySet<AssistantComponent>, tools: ReadonlySet<ToolComponent>): void {
+    // Detached rows are no longer displayed; restoration here is best-effort per binding.
     for (const [component, binding] of this.assistants) if (!assistants.has(component)) {
-      this.restoreAssistant(binding);
+      try { this.restoreAssistant(binding); } catch { /* keep releasing the rest */ }
       this.assistants.delete(component);
     }
     for (const [component, binding] of this.tools) if (!tools.has(component)) {
-      this.restoreTool(binding);
+      try { this.restoreTool(binding); } catch { /* keep releasing the rest */ }
       this.tools.delete(component);
     }
   }
 
   private restoreAssistant(binding: AssistantBinding): void {
     binding.active = false;
-    if (binding.component.render === binding.wrapper) binding.component.render = binding.original;
+    if (binding.component.render !== binding.wrapper) return; // another owner replaced it; do not stomp
+    if (binding.hadOwnMethod) binding.component.render = binding.original;
+    else delete (binding.component as Partial<AssistantComponent>).render; // reveal the inherited method again
   }
 
   private restoreTool(binding: ToolBinding): void {
     if (binding.suppressed && binding.externalDesired !== undefined) binding.original.call(binding.component, binding.externalDesired);
     binding.suppressed = false;
     binding.active = false;
-    if (binding.component.setShowImages === binding.wrapper) binding.component.setShowImages = binding.original;
+    if (binding.component.setShowImages !== binding.wrapper) return; // another owner replaced it; do not stomp
+    if (binding.hadOwnMethod) binding.component.setShowImages = binding.original;
+    else delete (binding.component as Partial<ToolComponent>).setShowImages; // reveal the inherited method again
   }
 }
