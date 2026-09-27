@@ -1,4 +1,4 @@
-import { VERSION, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { InteractiveMode, VERSION, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { TuiAltScreen } from "@earendil-works/pi-tui";
 import { execFile } from "node:child_process";
 import { readFile } from "node:fs/promises";
@@ -94,6 +94,31 @@ export default function piRemoteClipboard(pi: ExtensionAPI): void {
   if (!SUPPORTED_PI.includes(VERSION)) return;
 
   let restoreCopy: (() => void) | undefined;
+  let restorePaste: (() => void) | undefined;
+
+  interface PasteHost {
+    editor?: { insertTextAtCursor?: (text: string) => void };
+    ui?: { requestRender?: () => void };
+  }
+
+  /** 读取对端剪贴板并插入当前编辑器。返回 false 表示应当回退原生路径。 */
+  async function pasteFromBridge(host: PasteHost): Promise<"inserted" | "empty" | "local" | "error"> {
+    try {
+      const { stdout } = await execFileAsync("python3", [CTRLV_BIN], {
+        timeout: TIMEOUT_MS,
+        encoding: "utf8",
+      });
+      const text = stdout.trim();
+      if (text.length === 0) return "empty";
+      host.editor?.insertTextAtCursor?.(text);
+      host.ui?.requestRender?.();
+      return "inserted";
+    } catch (error: unknown) {
+      const code = (error as { code?: number }).code;
+      if (code === 2) return "local";
+      return "error";
+    }
+  }
 
   const handleRemotePaste = async (ctx: ExtensionContext): Promise<void> => {
     try {
@@ -101,12 +126,11 @@ export default function piRemoteClipboard(pi: ExtensionAPI): void {
         timeout: TIMEOUT_MS,
         encoding: "utf8",
       });
-      const text = stdout.trim();
-      if (text.length === 0) {
+      if (stdout.trim().length === 0) {
         ctx.ui.notify("对端剪贴板为空", "info");
         return;
       }
-      ctx.ui.pasteToEditor(text);
+      ctx.ui.pasteToEditor(stdout);
     } catch (error: unknown) {
       const code = (error as { code?: number }).code;
       if (code === 2) {
@@ -171,6 +195,30 @@ export default function piRemoteClipboard(pi: ExtensionAPI): void {
       }
     };
 
+    // 粘贴方向分流：Ctrl+V 按键不变，包住 Pi 的粘贴入口。
+    // SSH 客户端在观看时走红桥（文本直接插入，图片落临时文件插路径）；
+    // 本地会话原样调用原生 handleClipboardPaste（图片优先语义不变）。
+    const modeProto = InteractiveMode.prototype as unknown as {
+      handleClipboardPaste?: (this: PasteHost) => Promise<void>;
+    };
+    if (typeof modeProto.handleClipboardPaste === "function") {
+      const originalPaste = modeProto.handleClipboardPaste;
+      modeProto.handleClipboardPaste = async function (this: PasteHost): Promise<void> {
+        if (!(await isRemoteClient())) {
+          return originalPaste.call(this);
+        }
+        const outcome = await pasteFromBridge(this);
+        if (outcome === "local") {
+          return originalPaste.call(this);
+        }
+      };
+      restorePaste = () => {
+        if (modeProto.handleClipboardPaste !== undefined && modeProto.handleClipboardPaste !== originalPaste) {
+          modeProto.handleClipboardPaste = originalPaste;
+        }
+      };
+    }
+
     // 供 pi-copy-links 等扩展在点击时调用：返回 true 表示已写往对端。
     const sink: CopySink = copyToClientIfRemote;
     (globalThis as Record<symbol, unknown>)[COPY_SINK_KEY] = sink;
@@ -179,6 +227,8 @@ export default function piRemoteClipboard(pi: ExtensionAPI): void {
   pi.on("session_shutdown", () => {
     restoreCopy?.();
     restoreCopy = undefined;
+    restorePaste?.();
+    restorePaste = undefined;
     const globals = globalThis as Record<symbol, unknown>;
     if (globals[COPY_SINK_KEY] === copyToClientIfRemote) {
       delete globals[COPY_SINK_KEY];
