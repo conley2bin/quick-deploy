@@ -39,14 +39,16 @@ piox
 ### SSH Pi
 
 ```bash
-ssh-clipboard conley-company
+ssh conley-company
 piox
 ```
 
-`Ctrl+V` 时：
+`Ctrl+V` 保持 Pi 原生行为（本地剪贴板）。
+
+按 **`Ctrl+Alt+V`** 时：
 
 1. Pi 检测到当前输入来自 SSH 终端；
-2. 通过 remote forwarding 向 Y9000P（或发起端）请求剪贴板；
+2. 通过 remote forwarding 向发起端请求剪贴板；
 3. 文本直接插入；图片保存为 `/tmp/pi-remote-clipboard-<uuid>.<ext>` 并插入路径。
 
 ### 判定规则
