@@ -31,12 +31,29 @@ SSH_CONFIG="$HOME/.ssh/config"
 SSH_CONFIG_BLOCK_BEGIN="# >>> fresh-install pi-remote-clipboard >>>"
 SSH_CONFIG_BLOCK_END="# <<< fresh-install pi-remote-clipboard <<<"
 
-# 需要自动 remote forwarding 的主机列表（空格分隔）
-SSH_HOSTS="conley-company conley"
-# provider 在本机的监听端口；forwarding 在远端开的端口必须与它错开，
-# 否则反向方向的连接会在对端抢占 provider 的监听口。
+# 需要自动 remote forwarding 的主机列表（空格分隔）。
+# 仓库不携带任何设备名：优先取 PI_REMOTE_CLIPBOARD_HOSTS 环境变量；
+# 否则安装时从本机 ~/.ssh/config 的既有 Host 条目自动发现（跳过通配符与公共代码托管站点）。
 PROVIDER_PORT="37843"
 REMOTE_FORWARD_PORT="37844"
+
+# 从用户自己的 SSH config 发现登录型主机别名；跳过本模块托管块，避免自引用。
+detect_ssh_hosts() {
+    [ -f "$SSH_CONFIG" ] || return 0
+    awk -v begin="$SSH_CONFIG_BLOCK_BEGIN" -v end="$SSH_CONFIG_BLOCK_END" '
+        $0 == begin { inblock = 1; next }
+        $0 == end   { inblock = 0; next }
+        inblock { next }
+        /^[[:space:]]*#/ { next }
+        /^[[:space:]]*Host[[:space:]]/ {
+            for (i = 2; i <= NF; i++) {
+                if ($i ~ /[*?!]/) continue
+                if ($i ~ /^(github\.com|gitlab|gitlab\.com|bitbucket\.org|ssh\.github\.com)$/) continue
+                if (!seen[$i]++) print $i
+            }
+        }
+    ' "$SSH_CONFIG" | paste -sd' ' -
+}
 
 die() { echo "pi-remote-clipboard: $*" >&2; exit 1; }
 warn() { echo "pi-remote-clipboard: 警告: $*" >&2; }
@@ -97,8 +114,16 @@ else
 fi
 
 # ---------- SSH config remote forwarding ----------
-# 让指定主机的 ssh 连接自动带 -R，不需要用户记新命令。
+# 让登录型主机的 ssh 连接自动带 -R，不需要用户记新命令。
 mkdir -p "$(dirname "$SSH_CONFIG")"
+
+SSH_HOSTS="${PI_REMOTE_CLIPBOARD_HOSTS:-$(detect_ssh_hosts)}"
+if [ -z "${SSH_HOSTS// }" ]; then
+    warn "未能从 $SSH_CONFIG 发现主机别名，跳过 remote forwarding 配置"
+    warn "可设置 PI_REMOTE_CLIPBOARD_HOSTS 后重跑，例如："
+    warn "  PI_REMOTE_CLIPBOARD_HOSTS='主机A 主机B' bash $0"
+else
+    echo "pi-remote-clipboard: 本次纳入 remote forwarding 的主机: $SSH_HOSTS"
 
 if [ -f "$SSH_CONFIG" ] && grep -Fqx "$SSH_CONFIG_BLOCK_BEGIN" "$SSH_CONFIG" 2>/dev/null; then
     # 已有托管块：检查内容是否过期，过期则原地替换
@@ -135,7 +160,7 @@ else
     echo "      RemoteForward 127.0.0.1:$REMOTE_FORWARD_PORT 127.0.0.1:$PROVIDER_PORT"
     echo "  $SSH_CONFIG_BLOCK_END"
     echo ""
-    echo "  效果：ssh conley-company / ssh conley 自动带 remote forwarding，"
+    echo "  效果：ssh 到这些主机时自动带 remote forwarding，"
     echo "  远端 Pi 能回头请求本机剪贴板，无需记新命令。"
     echo ""
 
@@ -158,12 +183,13 @@ EOF
     mv "$tmp" "$SSH_CONFIG"
     echo "pi-remote-clipboard: SSH config 已更新"
 fi
+fi
 
 echo "pi-remote-clipboard: 安装完成"
 echo "  provider: systemctl --user status $MODULE_NAME"
 echo "  测试: python3 $SCRIPT_DIR/tests/test_all.py"
 echo ""
 echo "使用："
-echo "  ssh conley-company   # 自动带 remote forwarding"
-echo "  piox                  # 远端 Pi 中 Ctrl+Alt+V 粘贴对端剪贴板"
-echo "                        Ctrl+V 保持原生（本地剪贴板）"
+echo "  ssh <任一登录主机>   # 自动带 remote forwarding"
+echo "  piox                  # 远端 Pi 中 Ctrl+V 按输入来源自动分流"
+echo "                        Ctrl+Alt+V 强制粘贴对端剪贴板"

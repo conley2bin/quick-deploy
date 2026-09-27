@@ -48,7 +48,7 @@ piox
 ### SSH Pi
 
 ```bash
-ssh conley-company
+ssh <远端主机>
 piox
 ```
 
