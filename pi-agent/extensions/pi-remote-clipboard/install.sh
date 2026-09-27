@@ -31,7 +31,10 @@ SSH_CONFIG_BLOCK_END="# <<< fresh-install pi-remote-clipboard <<<"
 
 # 需要自动 remote forwarding 的主机列表（空格分隔）
 SSH_HOSTS="conley-company conley-Y9000p"
-REMOTE_FORWARD_PORT="37843"
+# provider 在本机的监听端口；forwarding 在远端开的端口必须与它错开，
+# 否则反向方向的连接会在对端抢占 provider 的监听口。
+PROVIDER_PORT="37843"
+REMOTE_FORWARD_PORT="37844"
 
 die() { echo "pi-remote-clipboard: $*" >&2; exit 1; }
 warn() { echo "pi-remote-clipboard: 警告: $*" >&2; }
@@ -91,18 +94,42 @@ fi
 mkdir -p "$(dirname "$SSH_CONFIG")"
 
 if [ -f "$SSH_CONFIG" ] && grep -Fqx "$SSH_CONFIG_BLOCK_BEGIN" "$SSH_CONFIG" 2>/dev/null; then
-    echo "pi-remote-clipboard: SSH config 已有托管块，跳过"
+    # 已有托管块：检查内容是否过期，过期则原地替换
+    desired="$SSH_CONFIG_BLOCK_BEGIN
+Host $SSH_HOSTS
+    RemoteForward 127.0.0.1:$REMOTE_FORWARD_PORT 127.0.0.1:$PROVIDER_PORT
+$SSH_CONFIG_BLOCK_END"
+    current="$(awk -v b="$SSH_CONFIG_BLOCK_BEGIN" -v e="$SSH_CONFIG_BLOCK_END" '
+        $0==b {inblock=1} inblock {printf "%s\n", $0; if ($0==e) inblock=0}
+    ' "$SSH_CONFIG")"
+    if [ "$current" = "$desired" ]; then
+        echo "pi-remote-clipboard: SSH config 托管块已是最新，跳过"
+    else
+        echo ""
+        echo "pi-remote-clipboard: SSH config 托管块将更新为（$SSH_CONFIG）："
+        echo ""
+        echo "$desired" | sed 's/^/  /'
+        echo ""
+        tmp="$(mktemp "$SSH_CONFIG.tmp.XXXXXX")"
+        awk -v b="$SSH_CONFIG_BLOCK_BEGIN" -v e="$SSH_CONFIG_BLOCK_END" '
+            $0==b {inblock=1; next} $0==e {inblock=0; next} !inblock {print}
+        ' "$SSH_CONFIG" > "$tmp"
+        printf '\n%s\n' "$desired" >> "$tmp"
+        chmod --reference="$SSH_CONFIG" "$tmp"
+        mv "$tmp" "$SSH_CONFIG"
+        echo "pi-remote-clipboard: SSH config 已更新"
+    fi
 else
     echo ""
     echo "pi-remote-clipboard: 将写入 SSH config（$SSH_CONFIG）："
     echo ""
     echo "  $SSH_CONFIG_BLOCK_BEGIN"
     echo "  Host $SSH_HOSTS"
-    echo "      RemoteForward 127.0.0.1:$REMOTE_FORWARD_PORT 127.0.0.1:$REMOTE_FORWARD_PORT"
+    echo "      RemoteForward 127.0.0.1:$REMOTE_FORWARD_PORT 127.0.0.1:$PROVIDER_PORT"
     echo "  $SSH_CONFIG_BLOCK_END"
     echo ""
     echo "  效果：ssh conley-company / ssh conley-Y9000p 自动带 remote forwarding，"
-    echo "  远端 Pi 的 Ctrl+V 能回头请求本机剪贴板，无需记新命令。"
+    echo "  远端 Pi 能回头请求本机剪贴板，无需记新命令。"
     echo ""
 
     tmp="$(mktemp "$SSH_CONFIG.tmp.XXXXXX")"
@@ -113,7 +140,7 @@ else
     cat >> "$tmp" <<EOF
 $SSH_CONFIG_BLOCK_BEGIN
 Host $SSH_HOSTS
-    RemoteForward 127.0.0.1:$REMOTE_FORWARD_PORT 127.0.0.1:$REMOTE_FORWARD_PORT
+    RemoteForward 127.0.0.1:$REMOTE_FORWARD_PORT 127.0.0.1:$PROVIDER_PORT
 $SSH_CONFIG_BLOCK_END
 EOF
     if [ -f "$SSH_CONFIG" ]; then
