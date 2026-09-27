@@ -48,6 +48,7 @@ detect_ssh_hosts() {
         /^[[:space:]]*Host[[:space:]]/ {
             for (i = 2; i <= NF; i++) {
                 if ($i ~ /[*?!]/) continue
+                if ($i ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) continue
                 if ($i ~ /^(github\.com|gitlab|gitlab\.com|bitbucket\.org|ssh\.github\.com)$/) continue
                 if (!seen[$i]++) print $i
             }
