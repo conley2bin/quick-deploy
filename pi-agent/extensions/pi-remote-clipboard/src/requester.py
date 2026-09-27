@@ -13,7 +13,7 @@ import tempfile
 import uuid
 from typing import Any
 
-DEFAULT_PORT = int(os.environ.get("PI_REMOTE_CLIPBOARD_REMOTE_PORT", "37843"))
+DEFAULT_PORT = int(os.environ.get("PI_REMOTE_CLIPBOARD_REMOTE_PORT", "37844"))
 REQUEST_TIMEOUT_S = float(os.environ.get("PI_REMOTE_CLIPBOARD_REQUEST_TIMEOUT", "5"))
 MAX_IMAGE_BYTES = int(os.environ.get("PI_REMOTE_CLIPBOARD_MAX_IMAGE_BYTES", str(32 * 1024 * 1024)))
 MAX_TEXT_BYTES = int(os.environ.get("PI_REMOTE_CLIPBOARD_MAX_TEXT_BYTES", str(1024 * 1024)))
