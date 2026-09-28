@@ -211,7 +211,19 @@ GTK 剪贴板读取。`Ctrl+V`、`Ctrl+C`、Ghostty 的 `Ctrl+Shift+C`、OSC 52
                                             # 附着已有 tmux/Pi session，不新起 Pi
 ```
 
-第二条命令的 `-e` 后面原样传给 Ghostty；tmux 中选到原有 Pi window 即可。
+第二条命令的 `-e` 后面原样传给 Ghostty。若已有 tmux session 同时被其他
+客户端观看，直接切换它的窗口会影响那些客户端。此时先创建与原 session 共享
+窗口、但各自独立选窗的 tmux grouped session，再在新 session 选中 Pi window，
+从 `ghostty-pi` 附着新 session；无需启动第二个 Pi 进程。例如：
+
+```bash
+tmux new-session -d -s quick-deploy_pi-paste -t quick-deploy_pi-agent
+tmux list-windows -t quick-deploy_pi-paste  # 找到现有 Pi window 的 index
+tmux select-window -t quick-deploy_pi-paste:3  # 示例：将 3 换成找到的 index
+~/.local/bin/ghostty-pi -e tmux attach-session -t quick-deploy_pi-paste
+```
+
+仅在 grouped session 尚不存在时执行 `new-session`；重开专用窗口时只需最后一行。
 不要加 `tmux attach -d`，它会断开其他正在观看该 session 的客户端。这个入口
 是**窗口级**而不是程序检测：切到同一窗口的 shell/tmux 其他 pane 时，
 `Ctrl+Shift+V` 仍发送原始 Ctrl+V，**不会**执行 Ghostty 的文本粘贴；需要
