@@ -107,11 +107,11 @@ awk '/^gtk-single-instance = false$/ { g = NR }
     || fail "gtk-single-instance 必须紧邻 shell-integration-features 之前"
 grep -Fqx 'shell-integration-features = ssh-env,ssh-terminfo' "$WORK/config.ghostty" || fail "SSH shell integration 被移除"
 ! grep -Fq 'mouse-reporting' "$WORK/config.ghostty" || fail "不应全局禁用 mouse-reporting"
-if command -v ghostty >/dev/null 2>&1; then
+if [ -x /usr/bin/ghostty ]; then
     mkdir -p "$WORK/xdg/ghostty"
     cp "$WORK/config.ghostty" "$WORK/xdg/ghostty/config.ghostty"
     XDG_CONFIG_HOME="$WORK/xdg" HOME="$WORK/render-home" \
-        ghostty +validate-config >"$WORK/ghostty-validate.log" 2>&1 \
+        /usr/bin/ghostty +validate-config >"$WORK/ghostty-validate.log" 2>&1 \
         || { cat "$WORK/ghostty-validate.log" >&2; fail "Ghostty 配置校验失败"; }
 fi
 
@@ -147,6 +147,7 @@ HOME="$WORK/desktop-home" bash -c '
     install_desktop_override >/dev/null
     verify_desktop_override >/dev/null
     test "$(grep -Fc -- "--gtk-single-instance=false" "$USER_DESKTOP_FILE")" -eq 2
+    test "$(grep -Fc "Exec=$USER_GHOSTTY_LAUNCHER " "$USER_DESKTOP_FILE")" -eq 2
     ! grep -Fq -- "--gtk-single-instance=true" "$USER_DESKTOP_FILE"
     ! grep -Fq "DBusActivatable=true" "$USER_DESKTOP_FILE"
     grep -Fqx "DBusActivatable=false" "$USER_DESKTOP_FILE"
@@ -157,7 +158,7 @@ HOME="$WORK/desktop-home" bash -c '
     grep -Fq "无变化" "$HOME/rerun.out"
     test "$digest" = "$(sha256sum "$USER_DESKTOP_FILE" | cut -d" " -f1)"
     ! compgen -G "$USER_DESKTOP_FILE.bak.*" >/dev/null
-    test "$(desktop_override_state)" = "已是本次基准内容（两个 Exec 入口 --gtk-single-instance=false，DBusActivatable=false）"
+    test "$(desktop_override_state)" = "已是本次基准内容（两个 Exec 均使用 Wayland 启动器、独立进程）"
 ' _ "$WORK/functions.sh" "$WORK/vendor.desktop" || fail "desktop 覆盖首次写入/幂等/状态报告失败"
 
 # 厂商原样副本（无用户自有内容）：先备份再替换，并提示状态
@@ -169,13 +170,31 @@ HOME="$WORK/desktop-vendor-copy" bash -c '
     USER_DESKTOP_FILE="$USER_DESKTOP_DIR/$DESKTOP_ID"
     mkdir -p "$USER_DESKTOP_DIR"
     cp "$DESKTOP_FILE" "$USER_DESKTOP_FILE"
-    test "$(desktop_override_state)" = "与系统模板只差这三处启动语义（正式安装将备份并替换）"
+    test "$(desktop_override_state)" = "旧模块基准或等价厂商副本（正式安装将备份并迁移到 Wayland 启动器）"
     install_desktop_override >/dev/null
     verify_desktop_override >/dev/null
     test "$(grep -Fc -- "--gtk-single-instance=false" "$USER_DESKTOP_FILE")" -eq 2
     compgen -G "$USER_DESKTOP_FILE.bak.*" >/dev/null
     cmp "$USER_DESKTOP_FILE.bak."* "$DESKTOP_FILE"
 ' _ "$WORK/functions.sh" "$WORK/vendor.desktop" || fail "desktop 覆盖未按预期替换厂商副本并备份"
+
+# 旧 install.sh 的基准 Exec=/usr/bin/ghostty 与当前独立 opt-in 桌面文件
+# 都是已知的模块输出，允许直接升级，不要求人工先禁用防护。
+HOME="$WORK/desktop-legacy" bash -c '
+    set -euo pipefail
+    source "$1"
+    DESKTOP_FILE="$2"
+    USER_DESKTOP_DIR="$HOME/.local/share/applications"
+    USER_DESKTOP_FILE="$USER_DESKTOP_DIR/$DESKTOP_ID"
+    mkdir -p "$USER_DESKTOP_DIR"
+    render_desktop_override "$GHOSTTY_BIN" > "$USER_DESKTOP_FILE"
+    cp "$USER_DESKTOP_FILE" "$HOME/old.desktop"
+    test "$(desktop_override_state)" = "旧模块基准或等价厂商副本（正式安装将备份并迁移到 Wayland 启动器）"
+    install_desktop_override >/dev/null
+    verify_desktop_override >/dev/null
+    cmp "$HOME/old.desktop" "$USER_DESKTOP_FILE.bak."*
+    grep -Fqx "Exec=$USER_GHOSTTY_LAUNCHER --gtk-single-instance=false" "$USER_DESKTOP_FILE"
+' _ "$WORK/functions.sh" "$WORK/vendor.desktop" || fail "旧模块 desktop 未无损升级"
 
 # 用户改过的文件：明确拒绝，不改字节、不留备份
 HOME="$WORK/desktop-user-file" bash -c '
@@ -241,7 +260,7 @@ HOME="$WORK/desktop-bare" bash -c '
     USER_DESKTOP_FILE="$USER_DESKTOP_DIR/$DESKTOP_ID"
     mkdir -p "$HOME"
     install_desktop_override >/dev/null
-    grep -Fqx "Exec=/usr/bin/ghostty --gtk-single-instance=false" "$USER_DESKTOP_FILE"
+    grep -Fqx "Exec=$USER_GHOSTTY_LAUNCHER --gtk-single-instance=false" "$USER_DESKTOP_FILE"
     grep -Fqx "DBusActivatable=false" "$USER_DESKTOP_FILE"
 ' _ "$WORK/functions.sh" "$WORK/vendor-bare.desktop" || fail "裸 Exec= 模板没有被补上显式标志"
 
@@ -256,7 +275,7 @@ HOME="$WORK/desktop-suffix" bash -c '
     USER_DESKTOP_FILE="$USER_DESKTOP_DIR/$DESKTOP_ID"
     mkdir -p "$HOME"
     install_desktop_override >/dev/null
-    grep -Fqx "Exec=/usr/bin/ghostty --gtk-single-instance=false %U" "$USER_DESKTOP_FILE"
+    grep -Fqx "Exec=$USER_GHOSTTY_LAUNCHER --gtk-single-instance=false %U" "$USER_DESKTOP_FILE"
 ' _ "$WORK/functions.sh" "$WORK/vendor-suffix.desktop" || fail "带参数的 Exec= 没有被正确改写"
 
 # 真实系统模板（装了 ghostty 的机器上）：必须能通过生成与策略校验
@@ -495,53 +514,90 @@ fi
 
 bash "$MODULE_DIR/tests/wayland-backpressure.sh"
 
-# Opt-in launcher install/rollback: entirely fake HOME, but real vendor desktop
-# template. The original module remains the source of truth for the baseline.
-if [ -f /usr/share/applications/com.mitchellh.ghostty.desktop ] && command -v cc >/dev/null 2>&1; then
-    wayland_home="$WORK/wayland-home"
-    mkdir -p "$wayland_home/.local/share/applications" "$wayland_home/.local/bin"
-    HOME="$wayland_home" bash -c '
+# setup.sh must have exactly one Ghostty installation route. Test the installer
+# functions in fake HOME; no apt, GSettings, or actual GUI modifications.
+grep -Fq '"modules/ghostty/install.sh|安装配置 Ghostty 终端|tolerate"' \
+    "$MODULE_DIR/../../setup.sh" || fail 'setup.sh 未调用唯一 Ghostty 安装器'
+if command -v cc >/dev/null 2>&1; then
+    HOME="$WORK/wayland-fresh" bash -c '
+        set -euo pipefail
         source "$1"
-        render_desktop_override > "$HOME/.local/share/applications/com.mitchellh.ghostty.desktop"
-    ' _ "$WORK/functions.sh"
-    cat > "$wayland_home/.local/bin/x-terminal-emulator" <<'WRAPPER'
-#!/bin/bash
-# 由 fresh-install/modules/ghostty/install.sh 生成：让 GNOME 的 Ctrl+Alt+T 启动 Ghostty
-exec /usr/bin/ghostty "$@"
-WRAPPER
-    HOME="$wayland_home" bash "$MODULE_DIR/wayland-backpressure.sh" --enable > "$WORK/wayland-enable.log"
-    HOME="$wayland_home" bash "$MODULE_DIR/wayland-backpressure.sh" --check > "$WORK/wayland-check.log"
-    grep -Fq '已启用' "$WORK/wayland-check.log" || fail 'Wayland 启用状态检查失败'
-    grep -Fq "Exec=$wayland_home/.local/bin/ghostty --gtk-single-instance=false" \
-        "$wayland_home/.local/share/applications/com.mitchellh.ghostty.desktop" \
-        || fail '桌面入口未使用有界背压启动器'
-    grep -Fq 'exec "$HOME/.local/bin/ghostty" "$@"' "$wayland_home/.local/bin/x-terminal-emulator" \
-        || fail 'Ctrl+Alt+T 未使用有界背压启动器'
-    mv "$wayland_home/.local/lib/ghostty/libwayland-backpressure.so" "$wayland_home/temporarily-missing.so"
-    if HOME="$wayland_home" WAYLAND_DISPLAY=wayland-0 "$wayland_home/.local/bin/ghostty" +version \
-        > "$WORK/missing-shim.out" 2>&1; then
-        fail '缺失 shim 时启动器静默绕过修复'
-    fi
-    grep -Fq 'shim missing' "$WORK/missing-shim.out" || fail '缺失 shim 未明确报告'
-    mv "$wayland_home/temporarily-missing.so" "$wayland_home/.local/lib/ghostty/libwayland-backpressure.so"
-    printf 'X-User-Custom=keep\n' >> "$wayland_home/.local/share/applications/com.mitchellh.ghostty.desktop"
-    if HOME="$wayland_home" bash "$MODULE_DIR/wayland-backpressure.sh" --disable \
-        > "$WORK/refused-disable.out" 2>&1; then
-        fail '禁用时覆盖用户自定义 desktop'
-    fi
-    grep -Fq 'X-User-Custom=keep' "$wayland_home/.local/share/applications/com.mitchellh.ghostty.desktop" \
-        || fail '禁用时丢失用户自定义 desktop'
-    sed -i '/^X-User-Custom=keep$/d' "$wayland_home/.local/share/applications/com.mitchellh.ghostty.desktop"
-    HOME="$wayland_home" bash "$MODULE_DIR/wayland-backpressure.sh" --disable > "$WORK/wayland-disable.log"
-    HOME="$wayland_home" bash -c '
+        BACKPRESSURE_SOURCE="$2"
+        DESKTOP_FILE="$3"
+        mkdir -p "$HOME"
+        install_backpressure > "$HOME/first.log"
+        verify_backpressure >/dev/null
+        mkdir -p "$USER_DESKTOP_DIR"
+        install_desktop_override >/dev/null
+        verify_desktop_override >/dev/null
+        render_terminal_wrapper > "$HOME/terminal-wrapper"
+        grep -Fqx '\''exec "$HOME/.local/bin/ghostty" "$@"'\'' "$HOME/terminal-wrapper"
+        test "$(backpressure_state)" = "已是当前基准（原生 Wayland，有界 EAGAIN 重试）"
+        digest=$(sha256sum "$BACKPRESSURE_LIBRARY" | cut -d" " -f1)
+        install_backpressure > "$HOME/second.log"
+        grep -Fq "无变化" "$HOME/second.log"
+        test "$digest" = "$(sha256sum "$BACKPRESSURE_LIBRARY" | cut -d" " -f1)"
+        ! compgen -G "$BACKPRESSURE_LIBRARY.bak.*" >/dev/null
+        ! compgen -G "$USER_GHOSTTY_LAUNCHER.bak.*" >/dev/null
+        mv "$BACKPRESSURE_LIBRARY" "$HOME/missing.so"
+        if HOME="$HOME" WAYLAND_DISPLAY=wayland-0 "$USER_GHOSTTY_LAUNCHER" +version >"$HOME/missing.log" 2>&1; then exit 1; fi
+        grep -Fq "shim missing" "$HOME/missing.log"
+        mv "$HOME/missing.so" "$BACKPRESSURE_LIBRARY"
+    ' _ "$WORK/functions.sh" "$MODULE_DIR/wayland-backpressure.c" "$WORK/vendor.desktop" \
+        || fail '全新安装未构建/验证/幂等托管受保护入口'
+
+    # Existing one-off install: the old launcher and already protected desktop
+    # migrate in place, while its library/check copy remain byte-identical.
+    HOME="$WORK/wayland-legacy" bash -c '
+        set -euo pipefail
         source "$1"
-        cmp -s "$HOME/.local/share/applications/com.mitchellh.ghostty.desktop" <(render_desktop_override)
-    ' _ "$WORK/functions.sh" || fail '禁用后没有恢复模块 desktop 基准'
-    ! test -e "$wayland_home/.local/bin/ghostty" || fail '禁用后遗留启动器'
+        BACKPRESSURE_SOURCE="$2"
+        DESKTOP_FILE="$3"
+        mkdir -p "$(dirname "$USER_GHOSTTY_LAUNCHER")" "$USER_DESKTOP_DIR"
+        render_legacy_backpressure_launcher > "$USER_GHOSTTY_LAUNCHER"
+        chmod 755 "$USER_GHOSTTY_LAUNCHER"
+        render_desktop_override > "$USER_DESKTOP_FILE"
+        cp "$USER_GHOSTTY_LAUNCHER" "$HOME/legacy.launcher"
+        test "$(backpressure_state)" = "旧独立脚本的托管启动器（正式安装将原位迁移）"
+        install_backpressure >/dev/null
+        install_desktop_override > "$HOME/desktop.log"
+        verify_backpressure >/dev/null
+        verify_desktop_override >/dev/null
+        cmp "$HOME/legacy.launcher" "$USER_GHOSTTY_LAUNCHER.bak."*
+        grep -Fq "无变化" "$HOME/desktop.log"
+    ' _ "$WORK/functions.sh" "$MODULE_DIR/wayland-backpressure.c" "$WORK/vendor.desktop" \
+        || fail '已启用旧独立脚本的安装未被无损迁移'
+
+    HOME="$WORK/wayland-custom" bash -c '
+        set -euo pipefail
+        source "$1"
+        BACKPRESSURE_SOURCE="$2"
+        mkdir -p "$(dirname "$USER_GHOSTTY_LAUNCHER")"
+        printf "KEEP\n" > "$USER_GHOSTTY_LAUNCHER"
+        ( install_backpressure ) > "$HOME/refuse.log" 2>&1 && exit 1
+        grep -Fq "拒绝覆盖" "$HOME/refuse.log"
+        test "$(cat "$USER_GHOSTTY_LAUNCHER")" = KEEP
+        test ! -e "$BACKPRESSURE_LIBRARY"
+    ' _ "$WORK/functions.sh" "$MODULE_DIR/wayland-backpressure.c" \
+        || fail '自定义启动器未被保护'
+
+    printf '#!/bin/sh\nexit 9\n' > "$WORK/cc"
+    chmod +x "$WORK/cc"
+    HOME="$WORK/wayland-compile-failure" PATH="$WORK:$PATH" bash -c '
+        set -euo pipefail
+        source "$1"
+        BACKPRESSURE_SOURCE="$2"
+        mkdir -p "$HOME"
+        ( install_backpressure ) > "$HOME/compile.log" 2>&1 && exit 1
+        grep -Fq "编译失败" "$HOME/compile.log"
+        test ! -e "$USER_GHOSTTY_LAUNCHER"
+        test ! -e "$BACKPRESSURE_LIBRARY"
+    ' _ "$WORK/functions.sh" "$MODULE_DIR/wayland-backpressure.c" \
+        || fail '编译失败后写入了未保护的启动器'
 fi
 
 if [ "$HAVE_ZSH" = true ]; then
-    echo "PASS: Ghostty SSH mouse cleanup, reset fallback, syntax, idempotency, isolation, write-only OSC 52 clipboard policy, terminfo Ms verification, desktop override, and opt-in Wayland backpressure"
+    echo "PASS: Ghostty single-installer Wayland backpressure, desktop migration, font/clipboard/SSH integration"
 else
-    echo "PASS (zsh 未安装，hook 行为与 PTY 部分已跳过): Ghostty syntax, idempotency, isolation, write-only OSC 52 clipboard policy, terminfo Ms verification, and desktop override"
+    echo "PASS (zsh 未安装，hook 行为与 PTY 部分已跳过): Ghostty single-installer Wayland backpressure, desktop migration, font/clipboard integration"
 fi

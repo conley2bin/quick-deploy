@@ -78,9 +78,13 @@ sudo apt install --allow-downgrades ghostty=1.3.1~ppa2-noble1
   - 新终端起始目录 `~/Documents`（不存在时回退到 XDG 文档目录，再不行就 `home`）
   - 关闭新窗口工作目录继承；新标签页和分屏仍保留继承
   - `gtk-single-instance = false`：每个外部启动的 Ghostty 用自己的进程（见下节）
+- `~/.local/lib/ghostty/libwayland-backpressure.so` 与 `~/.config/ghostty/wayland-backpressure/enabled.library`
+  - 从模块内 C 源码编译的用户级库及逐字节校验副本；只在新启动的原生 Wayland Ghostty 生效
+- `~/.local/bin/ghostty`
+  - 唯一受保护的用户级启动器；图形菜单、Ctrl+Alt+T 和交互式 PATH 都指向它
 - `~/.local/share/applications/com.mitchellh.ghostty.desktop`
-  - 由系统模板 `/usr/share/applications/com.mitchellh.ghostty.desktop` 逐行生成，只把两个 `Exec=` 入口改为
-    `--gtk-single-instance=false`、`DBusActivatable=false`；系统文件本身不改
+  - 由系统模板 `/usr/share/applications/com.mitchellh.ghostty.desktop` 逐行生成，把两个 `Exec=` 改为
+    用户级启动器与 `--gtk-single-instance=false`，并写 `DBusActivatable=false`；系统文件本身不改
   - 同目录的 `mimeinfo.cache` 由 `update-desktop-database` 刷新（查找缓存，失败不影响入口生效）
 - `~/.config/ghostty/ghostty-ssh-mouse-reset.zsh`
   - zsh 在 SSH 返回本地提示符前自动清理常见鼠标模式
@@ -247,7 +251,7 @@ gtk-single-instance = false
 ```diff
 # ~/.local/share/applications/com.mitchellh.ghostty.desktop（从系统模板生成）
 -Exec=/usr/bin/ghostty --gtk-single-instance=true
-+Exec=/usr/bin/ghostty --gtk-single-instance=false
++Exec=/home/<用户名>/.local/bin/ghostty --gtk-single-instance=false
 -DBusActivatable=true
 +DBusActivatable=false
 ```
@@ -256,8 +260,8 @@ gtk-single-instance = false
 
 | 启动路径 | 谁决定单实例 | 模块的处理 |
 | --- | --- | --- |
-| 应用菜单 / 桌面快捷方式 | 系统 desktop 的 `Exec=` 显式带 `--gtk-single-instance=true`；CLI 参数优先于配置文件 | 用户级覆盖把两个 `Exec=` 入口都改成 `--gtk-single-instance=false` |
-| Ctrl+Alt+T（包装脚本 `exec /usr/bin/ghostty "$@"`） | 没有 CLI 参数，命令行 `--gtk-single-instance` 的默认值 `detect` 只在配置值仍为 `detect` 时才参与判断 | 配置里的 `false` 直接生效，不经过 `detect`，也就不靠 `TERM_PROGRAM` 这类环境事实 |
+| 应用菜单 / 桌面快捷方式 | 系统 desktop 的 `Exec=` 显式带 `--gtk-single-instance=true`；CLI 参数优先于配置文件 | 用户级覆盖把两个 `Exec=` 改为受保护的启动器并传 `--gtk-single-instance=false` |
+| Ctrl+Alt+T（包装脚本转到 `~/.local/bin/ghostty`） | 没有 CLI 参数，命令行 `--gtk-single-instance` 的默认值 `detect` 只在配置值仍为 `detect` 时才参与判断 | 配置里的 `false` 直接生效，不经过 `detect`，也就不靠 `TERM_PROGRAM` 这类环境事实 |
 
 `DBusActivatable=false` 不是可选项：它为 `true` 时桌面外壳可以走 D-Bus 激活（系统里
 装着 `com.mitchellh.ghostty.service`），那条路径根本不经过 `Exec=`，光改 `Exec=` 里的
@@ -288,16 +292,16 @@ done
 ```
 
 预期首个匹配是 `~/.local/share/applications/com.mitchellh.ghostty.desktop`，两个 `Exec=` 都
-含 `--gtk-single-instance=false`，且 `DBusActivatable=false`。边界：模块固定写
+指向 `~/.local/bin/ghostty` 且含 `--gtk-single-instance=false`，并有 `DBusActivatable=false`。边界：模块固定写
 `$HOME/.local/share/applications`（与它写 `~/.config/ghostty` 同一约定），不跟随
 `XDG_DATA_HOME` / `XDG_CONFIG_HOME`；机器上若自定义了 `XDG_DATA_HOME`，需要自己把覆盖
 放到该目录，否则系统入口不会被遮蔽。
 
-这个用户级覆盖只接受三种状态，其余一律**拒绝覆盖并明确失败**，不静默降级：
+这个用户级覆盖只接受可识别的托管状态，其余一律**拒绝覆盖并明确失败**，不静默降级：
 
 1. 文件不存在：按系统模板生成；
-2. 与当前系统模板生成的基准内容一致：重跑幂等，不重写、不备份；
-3. 与系统模板只差上面那三处启动语义：视为不含用户自有内容，先备份 `.bak.<时间戳>` 再替换。
+2. 与新基准内容一致：重跑幂等，不重写、不备份；
+3. 与旧 `install.sh` 的 `/usr/bin/ghostty --gtk-single-instance=false` 基准、此前独立修复脚本生成的新基准，或与厂商模板仅有旧独立进程差异的副本一致：保留备份，迁移到统一启动器。
 
 带用户改动的文件（换了 `Icon=`、加了自有字段、写了别的 `Exec=` 等）会被拒绝，安装脚本会
 打印差异命令和恢复方式（把该文件 `mv` 移开再重跑）。系统模板结构变化导致无法生成时
@@ -312,7 +316,7 @@ done
 
 默认运行**会接管 Ctrl+Alt+T**。写入：
 
-- `~/.local/bin/x-terminal-emulator`：执行 `/usr/bin/ghostty "$@"`，供 GNOME 的 `gsd-media-keys` 通过 PATH 启动；
+- `~/.local/bin/x-terminal-emulator`：执行 `"$HOME/.local/bin/ghostty" "$@"`，供 GNOME 的 `gsd-media-keys` 通过 PATH 启动；
 - `~/.config/xdg-terminals.list`：内容为 `com.mitchellh.ghostty.desktop`，供遵守 `xdg-terminal-exec` 的程序使用。
 
 不想接管时显式关闭：
@@ -338,50 +342,50 @@ emulator），不是对 X11 API 的依赖。切到 Wayland 后，只有“按键
 > `GDK_BACKEND=x11 ghostty` 强制走 XWayland 验证，那是排障手段，不是本模块
 > 写入的配置。
 
-## 原生 Wayland：GTK 遇发送背压直接退出的可选防护
+## 原生 Wayland：GTK 发送背压修复随唯一安装脚本交付
 
 在 Ubuntu 24.04 的 GTK 4.14.5 中，`gdk/wayland/gdkeventsource.c` 把
 `wl_display_flush()` 的任何负返回都记录为 `Error flushing display`，随后
 `_exit(1)`。其中 `EAGAIN`（日志常显示“资源暂时不可用”）是非阻塞 Wayland
-套接字暂时写不进去，libwayland 的正常处理应等待 fd 可写并重试。终端进程因此
-退出时 tmux/Pi 往往仍活着；会话附着时的重绘可以使背压显现，但仅凭日志不能
-断言是文字、图片、Ghostty 渲染或 compositor 的哪一个动作先占满了套接字。
-[GTK 4.14.5 源码](https://github.com/GNOME/gtk/blob/4.14.5/gdk/wayland/gdkeventsource.c#L83-L89)、
+套接字暂时写不进去，按 libwayland 的约定应等 fd 可写后重试。tmux 附着时的
+画面重绘可能让背压显现，但现有事故日志无法区分文字、图片与 compositor
+处理速度各自的贡献。[GTK 4.14.5 源码](https://github.com/GNOME/gtk/blob/4.14.5/gdk/wayland/gdkeventsource.c#L83-L89)、
 [libwayland 1.22 源码](https://github.com/wayland-mirror/wayland/blob/1.22.0/src/connection.c#L289-L317)。
 
-本机可**选择**启用 `wayland-backpressure.sh`，不更改显示后端，不修改系统
-GTK/Ghostty 二进制，不影响正在运行的窗口：
+**只运行本模块的 `install.sh`**；`fresh-install/setup.sh` 已按固定顺序调用它，
+无需第二次手工启用：
 
 ```bash
-cd ~/quick-deploy/fresh-install/modules/ghostty
-bash tests/wayland-backpressure.sh  # 私有 socketpair，真实 libwayland，不碰桌面
-./wayland-backpressure.sh --enable
-./wayland-backpressure.sh --check
+bash fresh-install/setup.sh                 # 一键安装时自动包含修复
+# 或只重跑此模块：
+bash fresh-install/modules/ghostty/install.sh
+bash fresh-install/modules/ghostty/install.sh --check  # 只读状态
 ```
 
-它把一个用户级 C 小库装到 `~/.local/lib/ghostty/`，并仅将本模块已生成的
-Ghostty 菜单入口、Ctrl+Alt+T 入口和 `~/.local/bin/ghostty` 命令指向用户级
-包装脚本。脚本仅在 `WAYLAND_DISPLAY` 存在时给新 Ghostty 进程加载此库，
-**不设置 `GDK_BACKEND`**。在 libwayland 发送请求的 `sendmsg` 边界，
-只有登记过的 Wayland 套接字遇到 `EAGAIN` 才最多等待 10 秒可写并重试；
-其他 socket、`EPIPE` 等错误原样传递。只在 GTK 的 `wl_display_flush` 外层
-重试是不够的：libwayland 可能已在填满内部 4096 字节环时锁存 EAGAIN。
-私有实验通过了这个分支的阴性对照、延迟 300ms 后恢复的 600 条有序
-Wayland 消息、SCM_RIGHTS fd 完整性、持续阻塞超时和晚于普通 `sendmsg`
-才加载 Wayland 的子进程。真实 GUI 冒烟验证了 GTK 与 libwayland 的符号
-确实进入该库；尚未重现真实事故的完整负载，不能许诺杜绝所有闪退。
+`install.sh` 若发现缺少编译器，会通过 apt 安装 `build-essential`；编译失败
+会显式中止 Ghostty 模块，不生成看似成功却没有保护的桌面入口。它将 C 源码
+编译到用户级 `~/.local/lib/ghostty/`，保留逐字节校验副本；两个桌面 Exec、
+Ctrl+Alt+T 和交互式 `ghostty` 命令统一由用户级启动器进入。
+启动器仅在 `WAYLAND_DISPLAY` 存在时加载该库，**不设置 `GDK_BACKEND`**，
+不修改系统 GTK/Ghostty 二进制，也不影响此前已运行的进程。
 
-失败必须可见：库丢失或与已装版本不符时包装脚本拒绝启动，不悄悄回退
-到没有保护的 Ghostty；超过 10 秒持续堵塞、Wayland 连接真的断开、
-或非 EAGAIN 的故障仍会失败，并留下 `ghostty-wayland-backpressure:`
-日志。`LD_PRELOAD` 会被终端里启动的程序继承，但拦截发送仅作用于该进程
-内自己登记的 Wayland fd；子程序先网络发送、后加载 Wayland 的路径也已测试。
-不通过菜单/包装脚本而直接执行 `/usr/bin/ghostty` 会绕过防护。
+库在 libwayland 实际发送的 `sendmsg` 边界，只对已登记的 Wayland 套接字
+的 `EAGAIN` 等待可写并重试，最多 10 秒；其他 socket、`EPIPE` 等错误
+按原样传递。只在 GTK 的 `wl_display_flush` 外层重试不够：libwayland
+可能已在填满其内部 4096 字节环时锁存错误。私有 socketpair 测试覆盖了
+这一分支的阴性对照、延迟 300ms 后恢复的 600 条有序请求、SCM_RIGHTS
+fd 完整性、持续阻塞超时和子进程晚加载 Wayland。真实 GUI 冒烟验证
+GTK/libwayland 符号进入库；事故原始负载没有复现，不能许诺消除所有退出。
 
-回滚时先执行 `./wayland-backpressure.sh --disable`；它只会在三个启动文件
-仍与启用时逐字节一致时恢复原模块基准，有用户改动就拒绝覆盖。
-**重跑 `install.sh` 之前也先禁用，再安装，之后按需重新启用**；
-`install.sh` 对非基准 desktop 的拒绝是有意的，它不会静默撤销防护。
+库缺失或与校验副本不符时启动器会明确拒绝启动，不静默回退；持续超过
+10 秒的堵塞或实际连接断开仍会失败。`LD_PRELOAD` 由终端子程序继承，
+拦截只针对每个进程自己登记的 Wayland fd。显式执行系统路径
+`/usr/bin/ghostty` 会绕过受保护的用户入口。
+
+历史迁移：此前若运行了短暂提供的独立 `wayland-backpressure.sh`，直接
+重跑 **本** `install.sh` 就会识别原有用户 desktop 和启动器并原位接管，
+保留原文件备份；无须先禁用或清理。今后重装、升级和配置重置均只调用
+`install.sh`。
 
 ## `--check` 是只读预检
 
@@ -396,7 +400,7 @@ Wayland 消息、SCM_RIGHTS fd 完整性、持续阻塞超时和晚于普通 `se
 bash tests/run.sh
 ```
 
-预检报告：系统与架构、Ghostty 版本、apt 候选版本、PPA 是否已在源中、配置状态、用户级 desktop 覆盖状态（已是基准内容 / 将被替换 / 将被拒绝）、两种字体、`xterm-ghostty` terminfo（含 OSC 52 所需的 `Ms` 能力是否在场）、SSH 鼠标自愈 hook、当前默认终端所有者以及计划动作。它不会添加软件源、调用修改状态的 apt 命令、访问 GitHub、下载文件或写入用户目录。
+预检报告：系统与架构、Ghostty 版本、apt 候选版本、PPA 是否已在源中、配置状态、C 编译器与 Wayland 背压库/启动器状态、用户级 desktop 覆盖状态（已是基准内容 / 将被替换 / 将被拒绝）、两种字体、`xterm-ghostty` terminfo（含 OSC 52 所需的 `Ms` 能力是否在场）、SSH 鼠标自愈 hook、当前默认终端所有者以及计划动作。它不会添加软件源、调用修改状态的 apt 命令、访问 GitHub、下载文件或写入用户目录。
 
 ## 安装后的用户验收清单
 
@@ -416,13 +420,13 @@ bash tests/run.sh
 
 10. SSH 进远端并进入 Pi 全屏（或 tmux `mouse on`）后，验证“鼠标上报下的复制”一节的两条键：普通拖选被程序接管；按住 **Shift** 拖选产生 Ghostty 本地选区，再按 `Ctrl+Shift+C`；`Ctrl+Shift+V` 应把本机剪贴板内容粘贴进去。
 
-GUI 冒烟测试只在 `DISPLAY` 或 `WAYLAND_DISPLAY` 存在时运行。它不使用 xdotool、XTEST、libXtst 或任何合成键鼠事件；测试依据是进程持续存活、stderr 未出现错误，以及 `/proc/<pid>/maps` 中出现 fcitx5 GTK4 immodule。
+GUI 冒烟测试只在 `DISPLAY` 或 `WAYLAND_DISPLAY` 存在时运行。它不使用 xdotool、XTEST、libXtst 或任何合成键鼠事件；测试依据是从受保护启动器启动的进程持续存活、stderr 未出现错误，以及 `/proc/<pid>/maps` 中出现 fcitx5 GTK4 immodule（在 Wayland 下还要出现背压库）。
 
 判定 stderr 时只认行首的错误级别前缀（`^(err|error)`）。不能拿整行里的
 "error" 字样判死：GTK 4.14 解析系统主题 CSS 时会打
 `warning(glib): ... Theme parser error: ...`，它前缀是 warning、与 Ghostty 无关，
-误杀它会把一次成功安装报成失败。配置解析另由 `ghostty +validate-config`
-单独把关。
+误杀它会把一次成功安装报成失败。配置解析另由系统二进制
+`/usr/bin/ghostty +validate-config` 单独把关；它不依赖用户启动器。
 
 ## SSH 与 terminfo
 

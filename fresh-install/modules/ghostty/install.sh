@@ -43,6 +43,10 @@ DESKTOP_FILE="/usr/share/applications/$DESKTOP_ID"
 USER_DESKTOP_DIR="$HOME/.local/share/applications"
 USER_DESKTOP_FILE="$USER_DESKTOP_DIR/$DESKTOP_ID"
 GHOSTTY_BIN="/usr/bin/ghostty"
+USER_GHOSTTY_LAUNCHER="$HOME/.local/bin/ghostty"
+BACKPRESSURE_SOURCE="$SCRIPT_DIR/wayland-backpressure.c"
+BACKPRESSURE_LIBRARY="$HOME/.local/lib/ghostty/libwayland-backpressure.so"
+BACKPRESSURE_STATE="$HOME/.config/ghostty/wayland-backpressure"
 CONFIG_DIR="$HOME/.config/ghostty"
 CONFIG_FILE="$CONFIG_DIR/config.ghostty"
 LOCAL_BIN_DIR="$HOME/.local/bin"
@@ -393,8 +397,10 @@ config_state() {
 wrapper_state() {
     if [ ! -e "$TERMINAL_WRAPPER" ] && [ ! -L "$TERMINAL_WRAPPER" ]; then
         printf '未设置\n'
+    elif [ -f "$TERMINAL_WRAPPER" ] && grep -Fq 'exec "$HOME/.local/bin/ghostty" "$@"' "$TERMINAL_WRAPPER" 2>/dev/null; then
+        printf '已指向受保护的 Ghostty 启动器\n'
     elif [ -f "$TERMINAL_WRAPPER" ] && grep -Fq 'exec /usr/bin/ghostty "$@"' "$TERMINAL_WRAPPER" 2>/dev/null; then
-        printf '已指向 Ghostty\n'
+        printf '旧版直连 Ghostty（正式安装将迁移）\n'
     elif grep -qi 'kitty' "$TERMINAL_WRAPPER" 2>/dev/null; then
         printf '当前由 kitty 接管（仅使用 --default-terminal 时才会备份并替换）\n'
     else
@@ -436,6 +442,7 @@ show_check() {
         echo "第三方 PPA: 未出现在 apt 源中"
     fi
     echo "配置: $CONFIG_FILE —— $(config_state)"
+    echo "Wayland 背压修复: $(backpressure_state)"
     echo "用户级 desktop 覆盖: $USER_DESKTOP_FILE —— $(desktop_override_state)"
     echo "字体:"
     if font_exists "$FONT_FAMILY"; then
@@ -497,12 +504,17 @@ show_check() {
             # 预检必须说出实际会发生的事：已是最新时主流程会短路跳过安装，
             # 写成「先走 PPA」就是误导。
             if ghostty_already_current; then
-                echo "计划: 已是当前 apt 源可得的最新版，将跳过安装，仅重置配置与校验"
+                echo "计划: Ghostty 已是最新版，将跳过包安装；仍会构建 Wayland 背压库并校验启动入口"
             else
                 echo "计划: 先走 PPA；若 Launchpad 不可达或安装失败，再走严格匹配 $ARCH + Ubuntu $UBUNTU_VERSION 的 GitHub .deb"
             fi
             ;;
     esac
+    if command -v cc >/dev/null 2>&1; then
+        echo "编译器: cc 已就绪，将构建用户级 Wayland 修复库"
+    else
+        echo "编译器: 未找到 cc，正式安装将通过 apt 安装 build-essential"
+    fi
     if [ "$DEFAULT_TERMINAL" = true ]; then
         echo "默认终端计划: 将备份并写入 x-terminal-emulator 与 xdg-terminals.list"
     else
@@ -933,13 +945,13 @@ verify_config() {
     echo "OK: 配置文件回读与基准内容一致"
 
     validate_log="$(mktemp /tmp/ghostty-config-validate.XXXXXX)"
-    help_output="$(ghostty --help 2>&1 || true)"
+    help_output="$("$GHOSTTY_BIN" --help 2>&1 || true)"
     if grep -Fq '+validate-config' <<< "$help_output"; then
-        ghostty +validate-config >"$validate_log" 2>&1 || rc=$?
-        VALIDATE_ACTION="ghostty +validate-config"
+        "$GHOSTTY_BIN" +validate-config >"$validate_log" 2>&1 || rc=$?
+        VALIDATE_ACTION="$GHOSTTY_BIN +validate-config"
     else
-        ghostty +show-config >"$validate_log" 2>&1 || rc=$?
-        VALIDATE_ACTION="ghostty +show-config"
+        "$GHOSTTY_BIN" +show-config >"$validate_log" 2>&1 || rc=$?
+        VALIDATE_ACTION="$GHOSTTY_BIN +show-config"
     fi
     if [ "$rc" -ne 0 ]; then
         cat "$validate_log" >&2
@@ -1004,6 +1016,102 @@ write_atomic_file_keep_mode() {
 }
 
 # ============================================
+# Ghostty 原生 Wayland 发送背压修复：仅一个安装入口
+# ============================================
+# GTK 4.14.5 在 wl_display_flush() 遇 EAGAIN 时调用 _exit(1)。库在更低的
+# sendmsg 边界等待短时可写，防止 libwayland 的 4096B 环在 marshal 阶段先锁存
+# EAGAIN。只编译用户级库；系统 GTK/Ghostty 二进制与显示后端均不变。
+ensure_backpressure_compiler() {
+    if command -v cc >/dev/null 2>&1; then return 0; fi
+    echo "缺少 C 编译器，安装 Wayland 背压修复所需的 build-essential …"
+    wait_for_apt_lock 600 || die "APT 锁等待超时，无法安装 build-essential"
+    "$SUDO_CMD" apt-get install -y build-essential \
+        || die "build-essential 安装失败，拒绝安装不受保护的 Ghostty 启动入口"
+    command -v cc >/dev/null 2>&1 || die "build-essential 已安装，但仍未找到 cc"
+}
+
+render_backpressure_launcher() {
+    cat <<'EOF'
+#!/bin/sh
+# 由 fresh-install/modules/ghostty/install.sh 生成与维护。
+if [ -n "${WAYLAND_DISPLAY:-}" ]; then
+    shim="$HOME/.local/lib/ghostty/libwayland-backpressure.so"
+    [ -r "$shim" ] || { printf 'Ghostty Wayland backpressure shim missing: %s\n' "$shim" >&2; exit 1; }
+    cmp -s "$shim" "$HOME/.config/ghostty/wayland-backpressure/enabled.library" || {
+        printf 'Ghostty Wayland backpressure shim changed or state missing: %s\n' "$shim" >&2; exit 1;
+    }
+    LD_PRELOAD="$shim${LD_PRELOAD:+:$LD_PRELOAD}"
+    export LD_PRELOAD
+fi
+exec /usr/bin/ghostty "$@"
+EOF
+}
+
+# 2026-09-28 短暂启用过独立脚本，只有与旧脚本的精确输出一致才迁移；
+# 其余已有 ~/.local/bin/ghostty 是用户内容，明确拒绝覆盖。
+render_legacy_backpressure_launcher() {
+    render_backpressure_launcher | sed \
+        's|^# 由 fresh-install/modules/ghostty/install.sh 生成与维护。$|# 由 quick-deploy Ghostty Wayland EAGAIN workaround 管理。|'
+}
+
+backpressure_state() {
+    if [ ! -e "$USER_GHOSTTY_LAUNCHER" ] && [ ! -e "$BACKPRESSURE_LIBRARY" ]; then
+        echo "未安装（正式安装将构建库并生成启动器）"
+    elif [ -f "$USER_GHOSTTY_LAUNCHER" ] && [ -f "$BACKPRESSURE_LIBRARY" ] &&
+         [ -f "$BACKPRESSURE_STATE/enabled.library" ] &&
+         cmp -s "$BACKPRESSURE_LIBRARY" "$BACKPRESSURE_STATE/enabled.library" &&
+         cmp -s "$USER_GHOSTTY_LAUNCHER" <(render_backpressure_launcher); then
+        echo "已是当前基准（原生 Wayland，有界 EAGAIN 重试）"
+    elif [ -f "$USER_GHOSTTY_LAUNCHER" ] &&
+         cmp -s "$USER_GHOSTTY_LAUNCHER" <(render_legacy_backpressure_launcher); then
+        echo "旧独立脚本的托管启动器（正式安装将原位迁移）"
+    else
+        echo "存在非基准文件（正式安装将拒绝覆盖）"
+    fi
+}
+
+install_backpressure() (
+    set -e
+    [ -f "$BACKPRESSURE_SOURCE" ] || die "Wayland 背压修复源码缺失: $BACKPRESSURE_SOURCE"
+    [ "$HOME" = "${HOME// /}" ] || die "HOME 含空格，desktop Exec 无法安全呈现"
+    [ ! -L "$USER_GHOSTTY_LAUNCHER" ] || die "Ghostty 启动器是符号链接，拒绝覆盖"
+    if [ -e "$USER_GHOSTTY_LAUNCHER" ]; then
+        [ -f "$USER_GHOSTTY_LAUNCHER" ] || die "Ghostty 启动器不是普通文件，拒绝覆盖"
+        if ! cmp -s "$USER_GHOSTTY_LAUNCHER" <(render_backpressure_launcher) &&
+           ! cmp -s "$USER_GHOSTTY_LAUNCHER" <(render_legacy_backpressure_launcher); then
+            die "用户已有自定义 Ghostty 启动器，拒绝覆盖: $USER_GHOSTTY_LAUNCHER"
+        fi
+    fi
+    [ ! -L "$BACKPRESSURE_LIBRARY" ] || die "Wayland 背压库是符号链接，拒绝覆盖"
+    [ ! -e "$BACKPRESSURE_LIBRARY" ] || [ -f "$BACKPRESSURE_LIBRARY" ] \
+        || die "Wayland 背压库不是普通文件，拒绝覆盖"
+    [ ! -L "$BACKPRESSURE_STATE" ] || die "Wayland 背压状态目录是符号链接，拒绝写入"
+    [ ! -e "$BACKPRESSURE_STATE" ] || [ -d "$BACKPRESSURE_STATE" ] \
+        || die "Wayland 背压状态路径不是目录，拒绝写入"
+    ensure_backpressure_compiler
+    local scratch
+    scratch="$(mktemp -d /tmp/ghostty-wayland-backpressure.XXXXXX)"
+    trap 'rm -rf -- "$scratch"' EXIT
+    cc -shared -fPIC -O2 -Wall -Wextra -Werror -o "$scratch/library.so" "$BACKPRESSURE_SOURCE" -ldl -pthread \
+        || die "Wayland 背压库编译失败，拒绝安装未受保护的入口"
+    mkdir -p "$(dirname "$BACKPRESSURE_LIBRARY")" "$BACKPRESSURE_STATE"
+    write_atomic_file_from_source "$BACKPRESSURE_STATE/enabled.library" "$scratch/library.so" 644
+    write_atomic_file_from_source "$BACKPRESSURE_LIBRARY" "$scratch/library.so" 644
+    write_atomic_text "$USER_GHOSTTY_LAUNCHER" "$(render_backpressure_launcher)"$'\n' 755
+)
+
+verify_backpressure() {
+    [ -f "$BACKPRESSURE_LIBRARY" ] && [ -f "$BACKPRESSURE_STATE/enabled.library" ] \
+        || die "Wayland 背压库或校验副本缺失"
+    cmp -s "$BACKPRESSURE_LIBRARY" "$BACKPRESSURE_STATE/enabled.library" \
+        || die "Wayland 背压库与校验副本不一致"
+    [ -x "$USER_GHOSTTY_LAUNCHER" ] &&
+        cmp -s "$USER_GHOSTTY_LAUNCHER" <(render_backpressure_launcher) \
+        || die "Ghostty 启动器未完整加载 Wayland 修复库"
+    echo "OK: 原生 Wayland 背压修复库与启动器已托管（新启动的窗口生效）"
+}
+
+# ============================================
 # 用户级 desktop 覆盖：外部启动不复用已有进程
 # ============================================
 # 软件包的 $DESKTOP_FILE 在两个启动入口把 --gtk-single-instance=true 写死在
@@ -1012,16 +1120,17 @@ write_atomic_file_keep_mode() {
 #
 # 用户级 desktop 用同一个 ID 覆盖：XDG 按 XDG_DATA_HOME → XDG_DATA_DIRS
 # 顺序查找，~/.local/share/applications 先于 /usr/share/applications 命中，
-# 系统文件不动。覆盖内容 = 系统模板逐行继承，只改三处启动语义：
-#   1. [Desktop Entry] Exec= 的 --gtk-single-instance=true → false
-#   2. [Desktop Action new-window] Exec= 同上
-#   3. DBusActivatable=true → false
-# 第 3 条不是可选：DBusActivatable=true 时桌面外壳可以走 D-Bus 激活
+# 系统文件不动。覆盖内容 = 系统模板逐行继承，只改启动语义：
+#   1. 两个 Exec= 从 /usr/bin/ghostty 改为托管的用户级 Wayland 启动器，
+#      同时把 --gtk-single-instance=true 改为 false；
+#   2. DBusActivatable=true → false，保证桌面不绕过 Exec=。
+# DBusActivatable=false 不可省：true 时桌面外壳可以走 D-Bus 激活
 # （系统里确实装着 com.mitchellh.ghostty.service），那条路径根本不会使用
 # Exec= 里的参数，必须显式关掉才能保证入口按 Exec 启动。
 #
-# Ctrl+Alt+T 走本模块写入的包装脚本（exec /usr/bin/ghostty "$@"），没有 CLI
-# 参数，因此读的是配置文件里的 false。实测：配置写 true 时，即使命令行带
+# Ctrl+Alt+T 走本模块写入的包装脚本（exec "$HOME/.local/bin/ghostty" "$@"），
+# 最终通过同一个托管启动器，没有 CLI 参数，因此读的是配置文件里的 false。
+# 实测：配置写 true 时，即使命令行带
 # 参数（detect 本该判为单实例），解析结果仍是 true——显式配置值不参与
 # detect 判断（ghostty +show-config，本机 1.3.1~ppa2-noble1）。
 #
@@ -1033,7 +1142,8 @@ write_atomic_file_keep_mode() {
 # --gtk-single-instance=true、DBusActivatable=true）时退出非零，由调用方明确
 # 失败：宁可报错，也不写一个“看起来成功、实际仍复用进程”的覆盖。
 render_desktop_override() {
-    awk '
+    local launcher="${1:-$USER_GHOSTTY_LAUNCHER}"
+    awk -v launcher="$launcher" '
         BEGIN { bin = "Exec=/usr/bin/ghostty" }
         $0 ~ "^" bin "([[:space:]]|$)" {
             if (match($0, /--gtk-single-instance=[a-z]+/)) {
@@ -1041,6 +1151,7 @@ render_desktop_override() {
             } else {
                 $0 = bin " --gtk-single-instance=false" substr($0, length(bin) + 1)
             }
+            $0 = "Exec=" launcher substr($0, length(bin) + 1)
             exec_lines++
         }
         /^DBusActivatable=/ { $0 = "DBusActivatable=false" }
@@ -1057,19 +1168,18 @@ render_desktop_override() {
     ' "$DESKTOP_FILE"
 }
 
-# 现有用户级覆盖是否可以被安全替换。只接受三种状态，其余一律当作用户自有
-# 改动拒绝覆盖：
-#   1. 不存在；
-#   2. 与本次基准内容一致（重跑幂等，write_atomic_file_keep_mode 会跳过）；
-#   3. 与系统模板只差这三处启动语义——把 =false 反向还原成模板里的 =true 后
-#      逐字节相同，说明文件里没有任何模块之外的内容（厂商原样副本、旧版模块
-#      输出、手工改成同一结果都落在这一类）。
+# 现有用户级覆盖只接受不存在、新基准、旧模块独立进程基准、与厂商
+# 模板等价的旧副本；每一种都要逐字节证实，用户自有改动一律拒绝。
 desktop_override_replaceable() {
     if [ ! -e "$USER_DESKTOP_FILE" ] && [ ! -L "$USER_DESKTOP_FILE" ]; then
         return 0
     fi
     [ -f "$USER_DESKTOP_FILE" ] && [ ! -L "$USER_DESKTOP_FILE" ] || return 1
     [ -f "$DESKTOP_FILE" ] || return 1
+    # 本次基准、此前 install.sh 的独立进程基准、厂商模板的旧等价副本：
+    # 仅这些完全可验证的来源可自动迁移；其它内容视为用户自有改动。
+    render_desktop_override | cmp -s - "$USER_DESKTOP_FILE" && return 0
+    render_desktop_override "$GHOSTTY_BIN" | cmp -s - "$USER_DESKTOP_FILE" && return 0
     sed -e 's|--gtk-single-instance=false|--gtk-single-instance=true|' \
         -e 's|^DBusActivatable=false$|DBusActivatable=true|' \
         "$USER_DESKTOP_FILE" | cmp -s - "$DESKTOP_FILE"
@@ -1089,9 +1199,9 @@ desktop_override_state() {
         printf '存在，但不是普通文件（正式安装将拒绝覆盖）\n'
     elif desktop_override_replaceable; then
         if render_desktop_override | cmp -s - "$USER_DESKTOP_FILE"; then
-            printf '已是本次基准内容（两个 Exec 入口 --gtk-single-instance=false，DBusActivatable=false）\n'
+            printf '已是本次基准内容（两个 Exec 均使用 Wayland 启动器、独立进程）\n'
         else
-            printf '与系统模板只差这三处启动语义（正式安装将备份并替换）\n'
+            printf '旧模块基准或等价厂商副本（正式安装将备份并迁移到 Wayland 启动器）\n'
         fi
     else
         printf '含本模块之外的内容（正式安装将拒绝覆盖）\n'
@@ -1112,7 +1222,7 @@ install_desktop_override() {
     fi
     if ! desktop_override_replaceable; then
         die "用户级桌面覆盖含本模块之外的内容，拒绝覆盖: $USER_DESKTOP_FILE
-  只接受三种状态：不存在、与本次基准内容一致、或与系统模板仅差这三处启动语义。
+  只接受不存在、新基准、旧模块基准或等价的厂商副本。
   先看差异: diff '$USER_DESKTOP_FILE' '$DESKTOP_FILE'
   确认差异可以丢弃后，移开该文件再重跑: mv '$USER_DESKTOP_FILE' '$USER_DESKTOP_FILE.manual'"
     fi
@@ -1142,8 +1252,8 @@ verify_desktop_override() {
         || die "用户级桌面覆盖回读内容与系统模板生成的基准内容不一致"
 
     expected_execs="$(grep -Ec '^Exec=/usr/bin/ghostty' "$DESKTOP_FILE")"
-    [ "$(grep -Fc -- '--gtk-single-instance=false' "$USER_DESKTOP_FILE")" -eq "$expected_execs" ] \
-        || die "用户级桌面覆盖没有让每个 ghostty 启动入口都显式关闭 GTK 单实例"
+    [ "$(grep -Ec "^Exec=$USER_GHOSTTY_LAUNCHER --gtk-single-instance=false" "$USER_DESKTOP_FILE")" -eq "$expected_execs" ] \
+        || die "用户级桌面覆盖没有让每个 ghostty 入口使用 Wayland 启动器与独立进程"
     ! grep -Fq -- '--gtk-single-instance=true' "$USER_DESKTOP_FILE" \
         || die "用户级桌面覆盖仍残留 --gtk-single-instance=true"
     ! grep -Fxq 'DBusActivatable=true' "$USER_DESKTOP_FILE" \
@@ -1286,12 +1396,17 @@ ssh_mouse_hook_state() {
     fi
 }
 
+render_terminal_wrapper() {
+    cat <<'EOF'
+#!/bin/bash
+# 由 fresh-install/modules/ghostty/install.sh 生成：让 GNOME 的 Ctrl+Alt+T 启动 Ghostty
+exec "$HOME/.local/bin/ghostty" "$@"
+EOF
+}
+
 set_default_terminal() {
     local wrapper_content terminal_list_content
-    wrapper_content='#!/bin/bash
-# 由 fresh-install/modules/ghostty/install.sh 生成：让 GNOME 的 Ctrl+Alt+T 启动 Ghostty
-exec /usr/bin/ghostty "$@"
-'
+    wrapper_content="$(render_terminal_wrapper)"$'\n'
     terminal_list_content="$DESKTOP_ID
 "
 
@@ -1347,8 +1462,8 @@ verify_system_integration() {
 }
 
 verify_default_terminal() {
-    grep -Fq 'exec /usr/bin/ghostty "$@"' "$TERMINAL_WRAPPER" \
-        || die "$TERMINAL_WRAPPER 未正确指向 Ghostty"
+    grep -Fq 'exec "$HOME/.local/bin/ghostty" "$@"' "$TERMINAL_WRAPPER" \
+        || die "$TERMINAL_WRAPPER 未正确指向受保护的 Ghostty"
     grep -qx "$DESKTOP_ID" "$XDG_TERMINALS_FILE" \
         || die "$XDG_TERMINALS_FILE 未正确指向 $DESKTOP_ID"
     if command -v gsettings >/dev/null 2>&1; then
@@ -1377,7 +1492,7 @@ smoke_test() {
     # 是独立进程（见 render_config 与 render_desktop_override），但这里的显式
     # 参数不能挪走：冒烟测试要独立于配置文件是否正确，自己保证探针独立。
     GTK_IM_MODULE=fcitx QT_IM_MODULE=fcitx XMODIFIERS=@im=fcitx \
-        "$GHOSTTY_BIN" --gtk-single-instance=false > /dev/null 2>"$log" &
+        "$USER_GHOSTTY_LAUNCHER" --gtk-single-instance=false > /dev/null 2>"$log" &
     pid=$!
     sleep 3
 
@@ -1403,6 +1518,13 @@ smoke_test() {
         die "Ghostty 启动日志中出现错误级别行（err/error），请检查上面日志"
     fi
     echo "OK: Ghostty 持续存活，stderr 未发现错误级别日志"
+    if [ -n "${WAYLAND_DISPLAY:-}" ] && ! grep -Fq "$BACKPRESSURE_LIBRARY" "/proc/$pid/maps" 2>/dev/null; then
+        kill "$pid" 2>/dev/null || true
+        wait "$pid" 2>/dev/null || true
+        cat "$log" >&2
+        rm -f "$log"
+        die "Ghostty 在 Wayland 下启动但未加载背压库，启动器可能被绕过"
+    fi
     # 良性警告（如 GTK 主题解析）不影响成败，但提示一下，不静默吞掉。
     if grep -Eqi 'theme parser error|hsl\(\) argument' "$log"; then
         warn "stderr 含 GTK 主题解析警告（GTK 4.14 解析系统主题的 CSS），与 Ghostty 无关，不影响使用。"
@@ -1442,33 +1564,37 @@ main() {
         exit 0
     fi
 
-    section "[1/9] 安装最新版 Ghostty"
+    section "[1/10] 安装最新版 Ghostty"
     install_ghostty
+
+    section "[2/10] 构建并托管原生 Wayland 背压修复"
+    install_backpressure
+    verify_backpressure
 
     # 字体必须先于写配置：render_config 用 font_exists 决定要不要写
     # font-family 行，顺序反了就会把刚装上的字体漏写。
-    section "[2/9] 确保字体可用"
+    section "[3/10] 确保字体可用"
     ensure_fonts
 
     # 必须在 ensure_fonts 之后：规则只为实际存在的字体生成。
-    section "[3/9] 修复中文 locale 下的等宽字体劫持"
+    section "[4/10] 修复中文 locale 下的等宽字体劫持"
     ensure_zh_mono_fontconfig
 
-    section "[4/9] 写入并验证基准配置"
+    section "[5/10] 写入并验证基准配置"
     write_config
     verify_config
 
-    section "[5/9] 配置 SSH 断开后的鼠标状态自愈"
+    section "[6/10] 配置 SSH 断开后的鼠标状态自愈"
     install_ssh_mouse_hook
 
-    section "[6/9] 验证系统桌面入口与 terminfo"
+    section "[7/10] 验证系统桌面入口与 terminfo"
     verify_system_integration
 
-    section "[7/9] 写入并验证独立进程 desktop 覆盖"
+    section "[8/10] 写入并验证独立进程 desktop 覆盖"
     install_desktop_override
     verify_desktop_override
 
-    section "[8/9] 默认终端（接管 Ctrl+Alt+T）"
+    section "[9/10] 默认终端（接管 Ctrl+Alt+T）"
     if [ "$DEFAULT_TERMINAL" = true ]; then
         set_default_terminal
         verify_default_terminal
@@ -1477,7 +1603,7 @@ main() {
         echo "需要 Ghostty 接管时重跑: ./install.sh --default-terminal"
     fi
 
-    section "[9/9] GUI 冒烟测试"
+    section "[10/10] GUI 冒烟测试"
     smoke_test
 
     echo
@@ -1487,6 +1613,7 @@ main() {
     echo
     echo "版本: $(installed_version)"
     echo "配置: $CONFIG_FILE"
+    echo "Wayland 修复启动器: $USER_GHOSTTY_LAUNCHER"
     echo "外部启动: 每个窗口独立进程（$USER_DESKTOP_FILE）"
     if [ "$DEFAULT_TERMINAL" = true ]; then
         echo "Ctrl+Alt+T: 已通过 $TERMINAL_WRAPPER 接管"

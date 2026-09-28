@@ -12,8 +12,9 @@
 #   6. Ghostty 终端 —— 第三方社区包（上游不发布官方 Linux 二进制）。
 #      优先走 PPA（PGP 签名链），失败退回校验过 SHA-256 的 GitHub .deb；
 #      与第 5 步一样失败只提示不中止（新机器无代理时可能连不上）。
-#      系统级安装、需要 sudo；默认接管 Ctrl+Alt+T（--no-default-terminal
-#      可关），随时可单独重跑 modules/ghostty/install.sh
+#      系统级安装、需要 sudo；同一 install.sh 构建并安装用户级原生 Wayland
+#      背压修复库和所有启动入口，不需第二次启用。默认接管 Ctrl+Alt+T
+#      （--no-default-terminal 可关），可单独重跑 modules/ghostty/install.sh
 #   7. tmux 与 gpakosz/.tmux 配置 —— tmux 本体走 apt 很可靠，但配置仓库
 #      要从 GitHub 克隆，与第 5、6 步一样失败只提示不中止，
 #      网络就绪后随时可单独重跑 modules/tmux/install.sh
@@ -76,7 +77,7 @@ for ENTRY in "${STEPS[@]}"; do
     if [ "$RC" -eq 0 ]; then
         echo -e "\n${GREEN}✓ [${INDEX}/${TOTAL}] ${NAME} —— 完成${NC}"
     elif [ "$LEVEL" = "tolerate" ]; then
-        echo -e "\n${YELLOW}△ [${INDEX}/${TOTAL}] ${NAME} —— 未安装成功（多为当时无代理访问 GitHub）${NC}"
+        echo -e "\n${YELLOW}△ [${INDEX}/${TOTAL}] ${NAME} —— 此步骤未成功；原因见上方输出${NC}"
         TOLERATE_FAILED+=("$SCRIPT")
     else
         echo -e "\n${RED}✗ [${INDEX}/${TOTAL}] ${NAME} —— 失败 (退出码 ${RC})${NC}"
@@ -91,7 +92,7 @@ echo -e "${GREEN}   全部 ${TOTAL} 步完成   ${NC}"
 echo -e "${GREEN}========================================${NC}"
 
 if [ "${#TOLERATE_FAILED[@]}" -gt 0 ]; then
-    echo -e "\n${YELLOW}提示：以下步骤未安装成功，网络就绪（如配好 Clash Verge 代理）后补跑：${NC}"
+    echo -e "\n${YELLOW}提示：以下步骤未安装成功，按上方错误修复后补跑：${NC}"
     for SCRIPT in "${TOLERATE_FAILED[@]}"; do
         echo -e "  ${GREEN}$SCRIPT_DIR/$SCRIPT${NC}"
     done

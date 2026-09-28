@@ -31,7 +31,7 @@ bash fresh-install/setup.sh
 | 3 | zsh 与 Oh My Zsh | 中止 |
 | 4 | Fcitx5 中文输入法 | 中止 |
 | 5 | 维基百科拼音词库 | 提示后继续 |
-| 6 | Ghostty | 提示后继续 |
+| 6 | Ghostty（含原生 Wayland 背压修复，单一 `install.sh`） | 提示后继续 |
 | 7 | tmux 与 Oh my tmux! | 提示后继续 |
 
 所有步骤都按可重跑方式实现。必需步骤失败时，修复原因后重新执行 `setup.sh`；可容忍步骤失败时，也可单独执行对应模块。
@@ -48,7 +48,7 @@ bash fresh-install/modules/ghostty/install.sh
 bash fresh-install/modules/tmux/install.sh
 ```
 
-各模块自行定位仓库共享库，不依赖从哪个工作目录启动。Ghostty 和 tmux 的参数、持久配置及恢复语义见各自目录中的 `README.md`。
+各模块自行定位仓库共享库，不依赖从哪个工作目录启动。Ghostty 的库编译、启动器和桌面集成都由 `modules/ghostty/install.sh` 一次完成；没有额外的启用脚本。Ghostty 和 tmux 的参数、持久配置及恢复语义见各自目录中的 `README.md`。
 
 ## 共享实现
 
