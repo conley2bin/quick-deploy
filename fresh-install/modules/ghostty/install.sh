@@ -50,9 +50,8 @@ BACKPRESSURE_STATE="$HOME/.config/ghostty/wayland-backpressure"
 CONFIG_DIR="$HOME/.config/ghostty"
 CONFIG_FILE="$CONFIG_DIR/config.ghostty"
 LOCAL_BIN_DIR="$HOME/.local/bin"
-# SSH 异常断开后清理残留鼠标上报模式的 zsh hook。源文件跟随模块版本，
-# 安装时复制到用户目录；不直接 source 仓库路径，避免 checkout 移动后失效。
-SSH_MOUSE_HOOK_SOURCE="$SCRIPT_DIR/ssh-mouse-reset.zsh"
+# SSH 异常断开后清理残留鼠标上报模式的 zsh hook。源码内嵌在
+# render_ssh_mouse_hook，安装时写入用户目录；不会引用仓库运行时路径。
 SSH_MOUSE_HOOK_FILENAME="ghostty-ssh-mouse-reset.zsh"
 SSH_MOUSE_HOOK_CONFIG="$HOME/.config/ghostty/$SSH_MOUSE_HOOK_FILENAME"
 ZSHRC_BLOCK_BEGIN="# >>> fresh-install ghostty: ssh 鼠标复位 hook >>>"
@@ -183,10 +182,8 @@ check_supported_system() {
 }
 
 preflight_commands() {
-    # setup.sh 打包的是整个模块，不只是 install.sh。运行时 zsh hook 与
-    # Wayland 库源码都是必需资源；缺失时在任何安装写入前拒绝，不能让
-    # setup.sh 报告 Ghostty 成功、实际上却漏掉一个功能。
-    [ -f "$SSH_MOUSE_HOOK_SOURCE" ] || die "Ghostty 模块不完整，缺少运行时 zsh hook: $SSH_MOUSE_HOOK_SOURCE"
+    # zsh 运行时 hook 在本文件中渲染；库需要独立 C 源码。
+    # 打包漏掉源码必须在任何写入前拒绝，不能报告一个不完整的成功。
     [ -f "$BACKPRESSURE_SOURCE" ] || die "Ghostty 模块不完整，缺少 Wayland 修复源码: $BACKPRESSURE_SOURCE"
     local command_name
     for command_name in dpkg apt-cache grep awk sed cmp cp mv mktemp chmod mkdir date fc-list infocmp; do
@@ -1276,6 +1273,141 @@ verify_desktop_override() {
 # 送进本地 zsh，显示为 0;列;行M/m。hook 只在交互式 ssh 命令回到 prompt
 # 时清理，既保留活动中的 tmux/TUI 鼠标功能，也不碰其它键盘/终端模式。
 
+# zsh 代码只有这一个仓库来源；install.sh 写出运行时 hook。
+render_ssh_mouse_hook() {
+    cat <<'ZSH_MOUSE_HOOK'
+# SSH mouse-state cleanup for Ghostty's local zsh.
+# Installed and maintained by fresh-install/modules/ghostty/install.sh.
+#
+# A remote TUI can leave DEC mouse-tracking modes enabled when an SSH channel
+# dies before the TUI sends its cleanup sequence.  Ghostty cannot associate
+# terminal modes with an SSH process, so the surviving shell clears the common
+# modes when an interactive ssh command returns to its prompt.
+
+# This file may be sourced from a shared zsh startup file, including on remote
+# hosts. Keep it inert unless Ghostty supplied its child-shell resource path.
+[[ -o interactive ]] || return 0
+# Ghostty exports this resource path to its child shell. tmux may replace
+# TERM_PROGRAM with `tmux`, so the resource path is the stable marker.
+[[ -n ${GHOSTTY_RESOURCES_DIR:-} && -d ${GHOSTTY_RESOURCES_DIR:-} ]] || return 0
+if (( ! ${+_quick_deploy_ghostty_ssh_mouse_loaded} )); then
+    typeset -g _quick_deploy_ghostty_ssh_mouse_loaded=1
+    typeset -gi _quick_deploy_ghostty_ssh_mouse_pending=0
+fi
+
+_quick_deploy_ghostty_ssh_is_assignment() {
+    [[ "$1" =~ '^[[:alpha:]_][[:alnum:]_]*=' ]]
+}
+
+_quick_deploy_ghostty_ssh_preexec() {
+    _quick_deploy_ghostty_ssh_mouse_pending=0
+    local command="${1##[[:space:]]#}"
+    local -a words
+    setopt localoptions noglob
+    words=("${(@z)command}")
+
+    local i=1 word
+    while (( i <= ${#words} )); do
+        word="${words[i]}"
+
+        case "$word" in
+            ';'|'&&'|'||'|'|'|'&')
+                return 0
+                ;;
+        esac
+
+        if _quick_deploy_ghostty_ssh_is_assignment "$word"; then
+            i=$((i + 1))
+            continue
+        fi
+
+        case "$word" in
+            command|builtin|noglob)
+                i=$((i + 1))
+                continue
+                ;;
+            env)
+                i=$((i + 1))
+                while (( i <= ${#words} )); do
+                    word="${words[i]}"
+                    case "$word" in
+                        --|'')
+                            i=$((i + 1))
+                            break
+                            ;;
+                        -u|--unset|-C|--chdir)
+                            i=$((i + 2))
+                            ;;
+                        -*|[[:alpha:]_][[:alnum:]_]*=*)
+                            i=$((i + 1))
+                            ;;
+                        *)
+                            break
+                            ;;
+                    esac
+                done
+                continue
+                ;;
+            sudo)
+                i=$((i + 1))
+                while (( i <= ${#words} )); do
+                    word="${words[i]}"
+                    case "$word" in
+                        --|'')
+                            i=$((i + 1))
+                            break
+                            ;;
+                        -u|-g|-C|-R|-r|-t|-p|-h|--user|--group|--chdir|--role|--type|--prompt|--host|--close-from)
+                            i=$((i + 2))
+                            ;;
+                        -*|[[:alpha:]_][[:alnum:]_]*=*)
+                            i=$((i + 1))
+                            ;;
+                        *)
+                            break
+                            ;;
+                    esac
+                done
+                continue
+                ;;
+        esac
+
+        if [[ "${word##*/}" == ssh ]]; then
+            _quick_deploy_ghostty_ssh_mouse_pending=1
+        fi
+        return 0
+    done
+
+    return 0
+}
+
+_quick_deploy_ghostty_ssh_precmd() {
+    local _quick_deploy_status=$?
+    if (( _quick_deploy_ghostty_ssh_mouse_pending )); then
+        _quick_deploy_ghostty_ssh_mouse_pending=0
+
+        # tmux parses pane output and continues to own its outer mouse mode.
+        # GNU screen's ownership is not assumed, so skip it conservatively.
+        if [[ -z ${STY:-} && -t 1 && ${TERM:-} != dumb ]]; then
+            # 1000/1001/1002/1003 cover click, highlight, button-event, and
+            # any-event tracking. 1005/1006/1015/1016 cover common encodings.
+            # Do not reset bracketed paste, focus reporting, or keyboard modes.
+            printf '\033[?1000l\033[?1001l\033[?1002l\033[?1003l\033[?1005l\033[?1006l\033[?1015l\033[?1016l' || :
+        fi
+    fi
+    return $_quick_deploy_status
+}
+
+# The hook must be loaded after the shell's normal setup; it only registers
+# functions and never changes the active terminal until an ssh command returns.
+# add-zsh-hook de-duplicates entries, so re-sourcing .zshrc can restore the
+# registration if another startup file rebuilt the hook arrays.
+autoload -Uz add-zsh-hook
+add-zsh-hook preexec _quick_deploy_ghostty_ssh_preexec
+add-zsh-hook precmd _quick_deploy_ghostty_ssh_precmd
+ZSH_MOUSE_HOOK
+}
+
 render_zshrc_hook_block() {
     cat <<EOF
 $ZSHRC_BLOCK_BEGIN
@@ -1341,9 +1473,6 @@ install_ssh_mouse_hook() {
         warn "未找到 zsh，跳过 SSH 鼠标自愈 hook（Ctrl+Shift+R 仍可手动复位）"
         return 0
     fi
-    [ -f "$SSH_MOUSE_HOOK_SOURCE" ] \
-        || die "Ghostty 模块不完整，无法安装 SSH 鼠标自愈 hook: $SSH_MOUSE_HOOK_SOURCE"
-
     if [ -L "$SSH_MOUSE_HOOK_CONFIG" ]; then
         warn "$SSH_MOUSE_HOOK_CONFIG 是符号链接，拒绝覆盖；SSH 鼠标自愈 hook 未启用"
         warn "  手动恢复: Ctrl+Shift+R，或运行 reset"
@@ -1354,7 +1483,7 @@ install_ssh_mouse_hook() {
         warn "  手动恢复: Ctrl+Shift+R，或运行 reset"
         return 0
     fi
-    write_atomic_file_from_source "$SSH_MOUSE_HOOK_CONFIG" "$SSH_MOUSE_HOOK_SOURCE" 644
+    write_atomic_text "$SSH_MOUSE_HOOK_CONFIG" "$(render_ssh_mouse_hook)"$'\n' 644
     ensure_zshrc_hook_block
     if [ ! -f "$SSH_MOUSE_HOOK_CONFIG" ] || ! zsh -n "$SSH_MOUSE_HOOK_CONFIG"; then
         die "SSH 鼠标自愈 hook 写入后校验失败: $SSH_MOUSE_HOOK_CONFIG"
@@ -1371,15 +1500,11 @@ ssh_mouse_hook_state() {
         echo "  zsh hook: 跳过（未安装 zsh）"
         return 0
     fi
-    if [ ! -f "$SSH_MOUSE_HOOK_SOURCE" ]; then
-        echo "  zsh hook: 模块资源缺失（--check 与正式安装均会失败）"
-        return 0
-    fi
     if [ -L "$SSH_MOUSE_HOOK_CONFIG" ]; then
         echo "  hook 文件: $SSH_MOUSE_HOOK_CONFIG —— 符号链接（正式安装将拒绝覆盖）"
     elif [ -e "$SSH_MOUSE_HOOK_CONFIG" ] && [ ! -f "$SSH_MOUSE_HOOK_CONFIG" ]; then
         echo "  hook 文件: $SSH_MOUSE_HOOK_CONFIG —— 不是普通文件（正式安装将跳过）"
-    elif [ -f "$SSH_MOUSE_HOOK_CONFIG" ] && cmp -s "$SSH_MOUSE_HOOK_SOURCE" "$SSH_MOUSE_HOOK_CONFIG"; then
+    elif [ -f "$SSH_MOUSE_HOOK_CONFIG" ] && cmp -s "$SSH_MOUSE_HOOK_CONFIG" <(render_ssh_mouse_hook); then
         echo "  hook 文件: $SSH_MOUSE_HOOK_CONFIG —— 已是当前基准"
     elif [ -f "$SSH_MOUSE_HOOK_CONFIG" ]; then
         echo "  hook 文件: $SSH_MOUSE_HOOK_CONFIG —— 已存在但内容漂移（正式安装将备份）"

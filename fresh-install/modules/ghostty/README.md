@@ -397,7 +397,7 @@ GTK/libwayland 符号进入库；事故原始负载没有复现，不能许诺�
 离线回归测试（不安装软件、不联网、不改真实 HOME）：
 
 ```bash
-bash tests/run.sh
+bash ../../tests/ghostty/run.sh
 ```
 
 预检报告：系统与架构、Ghostty 版本、apt 候选版本、PPA 是否已在源中、配置状态、C 编译器与 Wayland 背压库/启动器状态、用户级 desktop 覆盖状态（已是基准内容 / 将被替换 / 将被拒绝）、两种字体、`xterm-ghostty` terminfo（含 OSC 52 所需的 `Ms` 能力是否在场）、SSH 鼠标自愈 hook、当前默认终端所有者以及计划动作。它不会添加软件源、调用修改状态的 apt 命令、访问 GitHub、下载文件或写入用户目录。
@@ -470,14 +470,13 @@ Ghostty 是本地程序，负责画窗口、渲染字体、调 GPU；远端只�
 当前本地 shell。zsh 的行编辑器消费报文前缀后，数字尾部就会显示在提示符中。
 这与 `ssh-env` / `ssh-terminfo` 无关：那两个特性只处理环境变量和 terminfo，继续保留。
 
-仓库里的 `ssh-mouse-reset.zsh` 是 **zsh 运行时 hook 的源码**，不是第二个安装脚本：
-`setup.sh` 只运行 `modules/ghostty/install.sh`，后者把 hook 复制到
+Ghostty 模块目录里只有 **`install.sh` 一个 shell 源文件**。其中的
+`render_ssh_mouse_hook` 直接包含 zsh hook 源码；安装时生成
 `~/.config/ghostty/ghostty-ssh-mouse-reset.zsh`，并让 `.zshrc` 在每个交互式
-shell 启动时加载它。SSH 返回提示符是安装结束后才发生的事件，安装脚本本身不会
-常驻；即使把这段 zsh 源码内嵌在 Bash 安装脚本里，安装时仍需生成同一个
-运行时文件。分开放便于用 `zsh -n` 和交互式 PTY 直接验证 hook。打包必须包含
-整个 Ghostty 模块目录；若漏掉 hook 或 Wayland C 源码，`install.sh --check`
-和正式安装现在都会在任何写入前明确失败。
+shell 启动时加载它。安装器退出以后，SSH 返回提示符时仍需这个本机运行时
+文件。测试脚本位于模块外的 `fresh-install/tests/ghostty/`，会渲染 hook 并用
+`zsh -n` / 交互式 PTY 验证。打包这个模块只需 `install.sh` 与非 shell 的
+`wayland-backpressure.c`；C 源码缺失时 `--check` 与安装都会在写入前失败。
 
 本模块采用两层处理：
 
@@ -501,6 +500,6 @@ source）。hook 文件内容变化时重跑会先保存 `.bak.<时间戳>` 并�
 [#6679](https://github.com/ghostty-org/ghostty/discussions/6679)；上游建议的恢复动作
 也是 `reset`。
 
-如果只把 `install.sh` 单独拷出而没有同目录的
-`ssh-mouse-reset.zsh`，安装器会跳过自动 hook 并保留 `Ctrl+Shift+R` / `reset` 手动
-恢复路径。
+模块源码不再需要单独的 `.zsh` 文件；运行时的 hook 由安装器直接生成。
+单独拷出 `install.sh` 却漏掉 `wayland-backpressure.c` 会被预检拒绝，
+不会报告一个缺少 Wayland 修复的成功安装。

@@ -4,16 +4,36 @@
 # 所有写入均在临时 HOME 中完成，桌面模板用临时 fixture。
 set -euo pipefail
 
-MODULE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+MODULE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../modules/ghostty" && pwd)"
 INSTALLER="$MODULE_DIR/install.sh"
-HOOK_SOURCE="$MODULE_DIR/ssh-mouse-reset.zsh"
 WORK="$(mktemp -d /tmp/ghostty-module-test.XXXXXX)"
+HOOK_SOURCE="$WORK/ghostty-ssh-mouse-reset.zsh"
 trap 'rm -rf "$WORK"' EXIT
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
 bash -n "$INSTALLER" || fail "install.sh 语法错误"
 bash -n "${BASH_SOURCE[0]}" || fail "测试脚本语法错误"
+mapfile -t module_shell_files < <(find "$MODULE_DIR" -type f \
+    \( -name '*.sh' -o -name '*.bash' -o -name '*.zsh' \) | sort)
+[ "${#module_shell_files[@]}" -eq 1 ] && [ "${module_shell_files[0]}" = "$INSTALLER" ] \
+    || fail "Ghostty 模块不止 install.sh 一个 shell 源文件"
+# 只取安装器函数定义，避免测试触发 main/apt/GUI；运行时 hook 从唯一
+# shell 源文件渲染，不再依赖仓库中的第二个 .zsh 源文件。
+sed '/^main "\$@"$/,$d' "$INSTALLER" > "$WORK/functions.sh"
+HOME="$WORK/render-hook-home" bash -c 'source "$1"; render_ssh_mouse_hook' _ "$WORK/functions.sh" > "$HOOK_SOURCE"
+# 真正打包的模块副本只含 install.sh + C 源码：没有独立 .zsh/.sh 资源。
+# 源码渲染应与原模块等同，并在 --check/正式安装共用的预检下完整。
+mkdir -p "$WORK/packaged-module"
+cp "$INSTALLER" "$MODULE_DIR/wayland-backpressure.c" "$WORK/packaged-module/"
+sed '/^main "\$@"$/,$d' "$WORK/packaged-module/install.sh" > "$WORK/packaged-module/functions.sh"
+HOME="$WORK/packaged-home" bash -c '
+    source "$1"
+    CHECK_ONLY=true
+    preflight_commands
+    render_ssh_mouse_hook
+' _ "$WORK/packaged-module/functions.sh" > "$WORK/packaged-hook.zsh"
+cmp -s "$HOOK_SOURCE" "$WORK/packaged-hook.zsh" || fail "精简打包丢失 hook 源码"
 # zsh 只影响 hook 语法、hook 行为与 PTY 三部分；其余测试（配置渲染、
 # 显示会话矩阵、desktop 覆盖、安装器 helper、terminfo 验证）不依赖 zsh，
 # 必须继续跑，不能被一道提前 exit 挡住。
@@ -25,28 +45,20 @@ else
     echo "SKIP: 未安装 zsh，跳过 zsh hook 语法、hook 行为与 PTY 测试（其余测试继续）"
 fi
 
-# 只取安装器函数定义，避免测试触发 main/apt/GUI。
-sed '/^main "\$@"$/,$d' "$INSTALLER" > "$WORK/functions.sh"
-
-# setup.sh 打包不能只拷 install.sh 而漏掉运行时 hook/C 源码。
-# --check 与正式安装共享早期门控；缺资源必须明确失败而不是跳过。
+# setup.sh 打包只需模块内的 install.sh 与 C 源码。运行时 hook 由
+# install.sh 生成；--check 与正式安装只需拒绝缺失的 C 源码。
 HOME="$WORK/module-bundle" bash -c '
     set -euo pipefail
     source "$1"
     CHECK_ONLY=true
-    SSH_MOUSE_HOOK_SOURCE="$2"
-    BACKPRESSURE_SOURCE="$3"
+    BACKPRESSURE_SOURCE="$2"
     mkdir -p "$HOME"
     preflight_commands
-    SSH_MOUSE_HOOK_SOURCE="$HOME/missing-hook.zsh"
-    ( preflight_commands ) > "$HOME/hook.err" 2>&1 && exit 1
-    grep -Fq "模块不完整，缺少运行时 zsh hook" "$HOME/hook.err"
-    SSH_MOUSE_HOOK_SOURCE="$2"
     BACKPRESSURE_SOURCE="$HOME/missing-backpressure.c"
     ( preflight_commands ) > "$HOME/backpressure.err" 2>&1 && exit 1
     grep -Fq "模块不完整，缺少 Wayland 修复源码" "$HOME/backpressure.err"
     test ! -e "$HOME/.config/ghostty/config.ghostty"
-' _ "$WORK/functions.sh" "$HOOK_SOURCE" "$MODULE_DIR/wayland-backpressure.c" \
+' _ "$WORK/functions.sh" "$MODULE_DIR/wayland-backpressure.c" \
     || fail "模块资源缺失未在安装写入前显式拒绝"
 
 # 配置必须保留 SSH 能力，同时提供不依赖 shell 的 reset 兜底；不要用
@@ -383,7 +395,6 @@ if [ "$HAVE_ZSH" = true ]; then
     HOME="$WORK/install-home" bash -c '
         set -euo pipefail
         source "$1"
-        SSH_MOUSE_HOOK_SOURCE="$2"
         SSH_MOUSE_HOOK_CONFIG="$HOME/.config/ghostty/$SSH_MOUSE_HOOK_FILENAME"
         mkdir -p "$HOME"
         printf "export KEEP_ME=1\\n" > "$HOME/.zshrc"
@@ -399,7 +410,8 @@ if [ "$HAVE_ZSH" = true ]; then
         test "$(grep -Fc "$ZSHRC_BLOCK_BEGIN" "$HOME/.zshrc")" -eq 1
         printf "\\n# drift\\n" >> "$SSH_MOUSE_HOOK_CONFIG"
         install_ssh_mouse_hook >/dev/null
-        cmp "$SSH_MOUSE_HOOK_SOURCE" "$SSH_MOUSE_HOOK_CONFIG"
+        cmp "$2" "$SSH_MOUSE_HOOK_CONFIG"
+        cmp -s "$SSH_MOUSE_HOOK_CONFIG" <(render_ssh_mouse_hook)
         compgen -G "$SSH_MOUSE_HOOK_CONFIG.bak.*" >/dev/null
         rm -rf "$SSH_MOUSE_HOOK_CONFIG"
         mkdir "$SSH_MOUSE_HOOK_CONFIG"
@@ -425,14 +437,13 @@ else
     HOME="$WORK/nozsh-home" bash -c '
         set -euo pipefail
         source "$1"
-        SSH_MOUSE_HOOK_SOURCE="$2"
         SSH_MOUSE_HOOK_CONFIG="$HOME/.config/ghostty/$SSH_MOUSE_HOOK_FILENAME"
         mkdir -p "$HOME"
         printf "KEEP\n" > "$HOME/.zshrc"
         install_ssh_mouse_hook >"$HOME/skip.out" 2>&1
         test ! -e "$SSH_MOUSE_HOOK_CONFIG"
         test "$(cat "$HOME/.zshrc")" = KEEP
-    ' _ "$WORK/functions.sh" "$HOOK_SOURCE" || fail "无 zsh 时安装器没有干净跳过 hook"
+    ' _ "$WORK/functions.sh" || fail "无 zsh 时安装器没有干净跳过 hook"
 fi
 
 # 用 pty 驱动交互式 zsh，验证：Ghostty 守卫、ssh 命令返回后的 DECRST、
@@ -533,7 +544,7 @@ if [ "$HAVE_ZSH" = true ]; then
     python3 "$WORK/pty-check.py" "$HOOK_SOURCE" "$GHOSTTY_RESOURCES_DIR" no
 fi
 
-bash "$MODULE_DIR/tests/wayland-backpressure.sh"
+bash "$(dirname "${BASH_SOURCE[0]}")/wayland-backpressure.sh"
 
 # setup.sh must have exactly one Ghostty installation route. Test the installer
 # functions in fake HOME; no apt, GSettings, or actual GUI modifications.

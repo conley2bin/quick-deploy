@@ -48,7 +48,7 @@ bash fresh-install/modules/ghostty/install.sh
 bash fresh-install/modules/tmux/install.sh
 ```
 
-各模块自行定位仓库共享库，不依赖从哪个工作目录启动。Ghostty 的库编译、启动器和桌面集成都由 `modules/ghostty/install.sh` 一次完成；没有额外的启用脚本。Ghostty 和 tmux 的参数、持久配置及恢复语义见各自目录中的 `README.md`。
+各模块自行定位仓库共享库，不依赖从哪个工作目录启动。Ghostty 模块只保留 `modules/ghostty/install.sh` 一个 shell 源文件；zsh 运行时 hook 从它生成，Wayland C 源码与它一起打包，测试放在 `fresh-install/tests/ghostty/`。Ghostty 的库编译、启动器和桌面集成都由该安装入口一次完成。Ghostty 和 tmux 的参数、持久配置及恢复语义见各自目录中的 `README.md`。
 
 ## 共享实现
 

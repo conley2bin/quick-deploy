@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Real installed libwayland; private socketpairs, no compositor or GUI.
 set -euo pipefail
-MODULE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+TEST_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+MODULE="$(cd "$TEST_DIR/../../modules/ghostty" && pwd)"
 WORK="$(mktemp -d /tmp/ghostty-wl-backpressure-test.XXXXXX)"
 trap 'rm -rf -- "$WORK"' EXIT
 command -v cc >/dev/null || { echo 'SKIP: no C compiler for Wayland backpressure test'; exit 0; }
@@ -9,9 +10,9 @@ command -v cc >/dev/null || { echo 'SKIP: no C compiler for Wayland backpressure
     || { echo 'SKIP: libwayland-client.so.0 absent'; exit 0; }
 cc -shared -fPIC -O2 -Wall -Wextra -Werror -DMAX_WAIT_MS=500 \
     -o "$WORK/libwayland-backpressure.so" "$MODULE/wayland-backpressure.c" -ldl -pthread
-cc -O2 -Wall -Wextra -Werror -o "$WORK/test" "$MODULE/tests/wayland-backpressure.c" \
+cc -O2 -Wall -Wextra -Werror -o "$WORK/test" "$TEST_DIR/wayland-backpressure.c" \
     -Wl,-l:libwayland-client.so.0 -ldl -pthread
-cc -O2 -Wall -Wextra -Werror -o "$WORK/late-load" "$MODULE/tests/wayland-late-load.c" -ldl
+cc -O2 -Wall -Wextra -Werror -o "$WORK/late-load" "$TEST_DIR/wayland-late-load.c" -ldl
 LD_PRELOAD="$WORK/libwayland-backpressure.so" "$WORK/late-load" > "$WORK/late-load.out"
 grep -Fqx 'late-loaded Wayland connection works after unrelated sendmsg' "$WORK/late-load.out"
 "$WORK/test" >"$WORK/baseline" 2>&1
