@@ -188,8 +188,16 @@ def request(peer):
     peer.alive(deadline)
     action = data.get("action")
     if action == "open-web":
-        if set(data) != {"version", "phase", "prepareDeadlineMs", "action", "url"} or not isinstance(data["url"], str):
-            fail("invalid_request", "open-web requires only a string url")
+        required = {"version", "phase", "prepareDeadlineMs", "action", "url"}
+        if (not required <= set(data) or not set(data) <= required | {"backendHost"} or
+                not isinstance(data["url"], str)):
+            fail("invalid_request", "open-web requires a string url and optional localhost backendHost")
+        _, bind_host, _ = web_target(data["url"])
+        if bind_host == "localhost":
+            if data.get("backendHost") not in ("127.0.0.1", "::1"):
+                fail("invalid_request", "localhost requires numeric 127.0.0.1 or ::1 backendHost")
+        elif "backendHost" in data:
+            fail("invalid_request", "backendHost is only valid for localhost URLs")
     elif action == "open-file":
         if not {"version", "phase", "prepareDeadlineMs", "action", "path", "kind"} <= set(data) or not set(data) <= {"version", "phase", "prepareDeadlineMs", "action", "path", "kind", "line", "column"}:
             fail("invalid_request", "open-file requires path, kind, and optional line/column")
@@ -229,7 +237,7 @@ def web_target(raw):
         fail("unsupported_target", "browser-normalized host spelling is unsupported")
     canonical_host = host.lower().removesuffix(".")
     if canonical_host == "localhost":
-        bind_host = "localhost"  # No IPv4-only success until both client families can be owned.
+        bind_host = "localhost"
     else:
         try:
             ip = ipaddress.ip_address(host)
@@ -378,8 +386,12 @@ def listeners():
     return found
 
 
+def bind_hosts(bind_host):
+    return ("127.0.0.1", "::1") if bind_host == "localhost" else (bind_host,)
+
+
 def covers_host(listener_host, bind_host):
-    if bind_host == "localhost" or listener_host == bind_host or listener_host in ("*", "0.0.0.0", "::"):
+    if listener_host == bind_host or listener_host in ("*", "0.0.0.0", "::"):
         return True
     try:
         listener = ipaddress.ip_address(listener_host)
@@ -390,13 +402,25 @@ def covers_host(listener_host, bind_host):
 
 
 def port_occupied(bind_host, port):
-    return any(number == port and covers_host(host, bind_host) for host, number, _ in listeners())
+    targets = bind_hosts(bind_host)
+    return any(number == port and any(covers_host(host, target) for target in targets)
+               for host, number, _ in listeners())
 
 
-def owns_listener(bind_host, port, pid):
-    relevant = [(host, pids) for host, number, pids in listeners()
-                if number == port and covers_host(host, bind_host)]
-    return (any(host == bind_host and pid in pids for host, pids in relevant) and
+def foreign_listener(bind_host, port, pid):
+    targets = bind_hosts(bind_host)
+    return any(number == port and pid not in pids and
+               any(covers_host(host, target) for target in targets)
+               for host, number, pids in listeners())
+
+
+def owns_listeners(bind_host, port, pid):
+    # One inventory must attest BOTH exact client families to the same master.
+    found = listeners()
+    targets = bind_hosts(bind_host)
+    relevant = [(host, pids) for host, number, pids in found
+                if number == port and any(covers_host(host, target) for target in targets)]
+    return (all(any(host == target and pid in pids for host, pids in relevant) for target in targets) and
             all(pid in pids for _, pids in relevant))
 
 
@@ -416,15 +440,18 @@ def load_record(path, directory, endpoint, identity):
         data = json.loads(path.read_text())
     except (OSError, ValueError) as error:
         fail("invalid_state", f"unreadable tunnel record: {error}")
-    if isinstance(data, dict) and data.get("version") == 1:
-        fail("tunnel_unverified", "old unpinned tunnel record must be retired before reuse")
+    schema = 3 if endpoint["host"] == "localhost" else 2
+    if isinstance(data, dict) and type(data.get("version")) is int and data["version"] < schema:
+        fail("tunnel_unverified", "old tunnel record cannot attest this endpoint and backend")
     if (not isinstance(data, dict) or set(data) != {"version", "endpoint", "identity", "local_port", "socket", "pid"} or
-            data["version"] != 2 or data["endpoint"] != endpoint or data["identity"] != identity or
+            type(data["version"]) is not int or data["version"] != schema or
+            data["endpoint"] != endpoint or data["identity"] != identity or
             type(data["local_port"]) is not int or not 1 <= data["local_port"] <= 65535 or
             type(data["pid"]) is not int or data["pid"] <= 0 or
             not isinstance(data["socket"], str) or Path(data["socket"]).parent != directory or
             not SOCKET_NAME_RE.fullmatch(Path(data["socket"]).name)):
-        fail("invalid_state", "tunnel record does not match the exact owned endpoint/SSH identity")
+        fail("tunnel_unverified" if schema == 3 else "invalid_state",
+             "tunnel record does not match the exact owned endpoint/backend/SSH identity")
     return data
 
 
@@ -464,9 +491,10 @@ def can_bind_preferred(bind_host, port):
     return True
 
 
-def forward_spec(bind_host, local_port, remote_port):
-    address = f"[{bind_host}]" if ":" in bind_host else bind_host
-    return f"{address}:{local_port}:{address}:{remote_port}"
+def forward_spec(bind_host, local_port, remote_host, remote_port):
+    source = f"[{bind_host}]" if ":" in bind_host else bind_host
+    destination = f"[{remote_host}]" if ":" in remote_host else remote_host
+    return f"{source}:{local_port}:{destination}:{remote_port}"
 
 
 def port_conflict(bind_host, port):
@@ -475,26 +503,44 @@ def port_conflict(bind_host, port):
                           "remove the conflicting listener and retry the original URL")
 
 
-def owned_forward(directory, bind_host, remote_port, identity):
+def verified_record(directory, bind_host, port, backend_host, identity, expected_pid=None):
+    endpoint = {"host": bind_host, "port": port}
+    if bind_host == "localhost":
+        endpoint["backendHost"] = backend_host
+    data = load_record(record_path(directory, bind_host, port), directory, endpoint, identity)
+    if data is None:
+        fail("tunnel_unverified", "owned SSH forward record disappeared")
+    if data["local_port"] != port:
+        port_conflict(bind_host, port)
+    pid = master_pid(Path(data["socket"]), identity)
+    if (pid is None or pid != data["pid"] or (expected_pid is not None and pid != expected_pid) or
+            not owns_listeners(bind_host, port, pid)):
+        fail("tunnel_unverified", "SSH master does not own every recorded exact loopback listener")
+    return pid
+
+
+def cannot_bind(bind_host, port):
+    return port < 1024 and not all(can_bind_preferred(host, port) for host in bind_hosts(bind_host))
+
+
+def owned_forward(directory, bind_host, remote_port, backend_host, identity):
     endpoint = {"host": bind_host, "port": remote_port}
+    if bind_host == "localhost":
+        endpoint["backendHost"] = backend_host
     path = record_path(directory, bind_host, remote_port)
     data = load_record(path, directory, endpoint, identity)
     if data:
         sock = Path(data["socket"])
         pid = master_pid(sock, identity)
         if pid is not None:
-            if data["local_port"] != remote_port:
-                port_conflict(bind_host, remote_port)
-            if pid != data["pid"] or not owns_listener(bind_host, remote_port, pid):
-                fail("tunnel_unverified", "live SSH master does not own its recorded exact loopback listener")
-            return True
+            verified_record(directory, bind_host, remote_port, backend_host, identity, pid)
+            return True, pid
         stale_socket(sock)
         path.unlink()
 
-    # A listener covering this exact client IP (including wildcard/mapped
+    # A listener covering either exact client family (including wildcard/mapped
     # bindings) conflicts. Never make an alternate browser origin.
-    if (port_occupied(bind_host, remote_port) or
-            (remote_port < 1024 and not can_bind_preferred(bind_host, remote_port))):
+    if port_occupied(bind_host, remote_port) or cannot_bind(bind_host, remote_port):
         port_conflict(bind_host, remote_port)
     sock = directory / ("m-" + os.urandom(12).hex() + ".sock")
     checked(["ssh", "-M", "-S", str(sock), "-fN", "-o", "ClearAllForwardings=yes",
@@ -509,19 +555,21 @@ def owned_forward(directory, bind_host, remote_port, identity):
         args = mux_args(sock, "forward", identity)
         args[args.index("-p"):args.index("-p")] = [
             "-o", "ExitOnForwardFailure=yes", "-L",
-            forward_spec(bind_host, remote_port, remote_port)]
+            forward_spec(bind_host, remote_port, backend_host, remote_port)]
         status, text = run(args, timeout=8)
         if status:
-            if (port_occupied(bind_host, remote_port) or
-                    (remote_port < 1024 and not can_bind_preferred(bind_host, remote_port))):
+            occupied = (foreign_listener(bind_host, remote_port, pid) if bind_host == "localhost"
+                        else port_occupied(bind_host, remote_port))
+            if occupied or cannot_bind(bind_host, remote_port):
                 port_conflict(bind_host, remote_port)
-            fail("ssh_forward_failed", f"SSH forward exited {status}: {text or 'no diagnostic'}")
-        if master_pid(sock, identity) != pid or not owns_listener(bind_host, remote_port, pid):
-            fail("tunnel_unverified", "SSH forward returned success without an owned exact-port loopback listener")
-        data = {"version": 2, "endpoint": endpoint, "identity": identity,
+            fail("tunnel_unverified" if bind_host == "localhost" else "ssh_forward_failed",
+                 f"SSH forward exited {status}: {text or 'no diagnostic'}")
+        if master_pid(sock, identity) != pid or not owns_listeners(bind_host, remote_port, pid):
+            fail("tunnel_unverified", "SSH forward returned success without every owned exact-port loopback listener")
+        data = {"version": 3 if bind_host == "localhost" else 2, "endpoint": endpoint, "identity": identity,
                 "local_port": remote_port, "socket": str(sock), "pid": pid}
         save_record(path, data)
-        return False
+        return False, pid
     except BaseException:
         try:
             run(mux_args(sock, "exit", identity), timeout=6)
@@ -537,16 +585,14 @@ def owned_forward(directory, bind_host, remote_port, identity):
         raise
 
 
-def prepare_web(raw, runtime, peer, deadline):
+def prepare_web(data, runtime, peer, deadline):
+    raw = data["url"]
     _, bind_host, remote_port = web_target(raw)
-    if bind_host == "localhost":
-        if port_occupied(bind_host, remote_port):
-            port_conflict(bind_host, remote_port)
-        fail("unsupported_target", "localhost requires dual-stack, hostname-preserving forwarding; "
-                                   "this is not available until the next stage")
+    ticket = None
     if bind_host is None:
         tunnel = None
     else:
+        backend_host = data["backendHost"] if bind_host == "localhost" else bind_host
         directory, lock_fd = private_state(runtime)
         try:
             while True:
@@ -558,12 +604,13 @@ def prepare_web(raw, runtime, peer, deadline):
                     time.sleep(min(0.05, max(0, deadline - time.monotonic())))
             peer.alive(deadline)
             identity = ssh_identity()
-            reused = owned_forward(directory, bind_host, remote_port, identity)
+            reused, pid = owned_forward(directory, bind_host, remote_port, backend_host, identity)
+            ticket = (directory, bind_host, remote_port, backend_host, identity, pid)
         finally:
             os.close(lock_fd)
-        tunnel = {"remoteHost": bind_host, "remotePort": remote_port,
+        tunnel = {"remoteHost": backend_host, "remotePort": remote_port,
                   "localPort": remote_port, "reused": reused}
-    return {"ok": True, "action": "open-web", "openedUrl": raw, "tunnel": tunnel}
+    return {"ok": True, "action": "open-web", "openedUrl": raw, "tunnel": tunnel}, ticket
 
 
 def file_target(data):
@@ -599,14 +646,16 @@ def main():
         peer = Peer()
         data, deadline = request(peer)
         # Validate the exact target before touching GUI or transport state.
-        if data["action"] == "open-web":
-            web_target(data["url"])
-        else:
+        if data["action"] == "open-file":
             file_target(data)
         peer.alive(deadline)
         gui, runtime = gui_environment()
         peer.alive(deadline)
-        response = prepare_web(data["url"], runtime, peer, deadline) if data["action"] == "open-web" else file_command(data)[1]
+        response, ticket = (prepare_web(data, runtime, peer, deadline) if data["action"] == "open-web"
+                            else (file_command(data)[1], None))
+        peer.alive(deadline)
+        if ticket is not None:
+            verified_record(*ticket)
         peer.alive(deadline)
         nonce = os.urandom(16).hex()
         emit({"version": 2, "phase": "prepared", "nonce": nonce, **response})
@@ -620,6 +669,9 @@ def main():
         # duplicate messages or an already disconnected transport.
         peer.alive(deadline)
         if data["action"] == "open-web":
+            if ticket is not None:
+                verified_record(*ticket)
+            peer.alive(deadline)
             checked(["xdg-open", response["openedUrl"]], "browser_failed", env=gui, timeout=12)
         else:
             checked(file_command(data)[0], "code_failed", env=gui, timeout=12)

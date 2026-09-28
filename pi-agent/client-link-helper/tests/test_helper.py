@@ -122,25 +122,38 @@ elif name == "ssh":
             match = re.fullmatch(r"(\[[^]]+\]|[^:]+):(\d+):(\[[^]]+\]|[^:]+):(\d+)", spec)
             assert match, spec
             local, localport, remote, remoteport = match.groups()
-            assert local.strip("[]") == remote.strip("[]")
+            local, remote = local.strip("[]"), remote.strip("[]")
+            assert local in ("127.0.0.1", "::1", "::ffff:7f00:1", "localhost")
+            assert remote in ("127.0.0.1", "::1", "::ffff:7f00:1")
+            assert (local == "localhost" or local == remote), spec
             port = int(localport)
+            families = ("127.0.0.1", "::1") if local == "localhost" else (local,)
             if state.get("race_port") == port:
                 state.pop("race_port")
-                state["listeners"].append({"host": local.strip("[]"), "port": port, "pid": 999})
+                state["listeners"].append({"host": state.get("race_host", families[0]), "port": port, "pid": 999})
                 save()
                 print("mux_client_forward: Port forwarding failed", file=sys.stderr)
                 sys.exit(255)
             if state.get("forward_fail"):
                 print("mux_client_forward: permission denied", file=sys.stderr)
                 sys.exit(255)
+            if state.get("forward_partial_failure"):
+                state["listeners"].append({"host": families[0], "port": port, "pid": master["pid"]})
+                save()
+                print("mux_client_forward: Port forwarding failed after one bind", file=sys.stderr)
+                sys.exit(255)
             if any(item["port"] == port and item["host"] in
-                   (local.strip("[]"), "*", "0.0.0.0", "::") for item in state["listeners"]):
+                   (*families, "*", "0.0.0.0", "::") for item in state["listeners"]):
                 print("mux_client_forward: Port forwarding failed", file=sys.stderr)
                 sys.exit(255)
             if state.get("forward_no_listener"):
                 sys.exit(0)
-            state["listeners"].append({"host": local.strip("[]"), "port": port,
-                                       "pid": master["pid"], "remote_port": int(remoteport)})
+            for family in families:
+                if state.get("forward_omit_family") == family:
+                    continue
+                state["listeners"].append({"host": family, "port": port,
+                                           "pid": 999 if state.get("forward_wrong_pid_family") == family else master["pid"],
+                                           "remote_host": remote, "remote_port": int(remoteport)})
             save()
         elif op == "exit":
             master["alive"] = False
@@ -245,8 +258,9 @@ class HelperCase(unittest.TestCase):
             return process.returncode, first
         return self.finish(process, first)
 
-    def web(self, url):
-        return self.invoke({"action": "open-web", "url": url})
+    def web(self, url, *, backend_host=None):
+        return self.invoke({"action": "open-web", "url": url,
+                            **({"backendHost": backend_host} if backend_host is not None else {})})
 
     def test_exact_origin_is_opened_and_reused_only_with_verified_record(self):
         original = "http://127.0.0.1:8743/a%2Fb?q=a%2Bb&x=1#frag%20raw"
@@ -555,7 +569,7 @@ class HelperCase(unittest.TestCase):
         self.assertEqual(result["tunnel"]["remoteHost"], "::1")
         self.assertIn("[::1]:8743:[::1]:8743", self.calls("ssh", "forward")[-1]["args"])
 
-    def test_mapped_ip_preserves_source_host_and_localhost_does_not_launch(self):
+    def test_mapped_ip_and_external_url_keep_prior_routing(self):
         mapped_url = "http://[::ffff:7f00:1]:8743/mapped"
         status, mapped = self.web(mapped_url)
         self.assertEqual(status, 0, mapped)
@@ -563,17 +577,62 @@ class HelperCase(unittest.TestCase):
         self.assertEqual(mapped["tunnel"]["remoteHost"], "::ffff:7f00:1")
         self.assertIn("[::ffff:7f00:1]:8743:[::ffff:7f00:1]:8743",
                       self.calls("ssh", "forward")[-1]["args"])
-        before = len(self.calls("xdg-open"))
-        status, result = self.web("https://localhost:8744/a?#")
-        self.assertEqual((status, result["error"]["code"]), (1, "unsupported_target"))
-        self.assertIn("dual-stack", result["error"]["message"])
-        self.assertEqual(len(self.calls("xdg-open")), before)
-        self.assertFalse(self.calls("code"))
         status, result = self.web("http://example.org/a?q=2#x")
         self.assertEqual(status, 0)
         self.assertIsNone(result["tunnel"])
         self.assertEqual(result["openedUrl"], "http://example.org/a?q=2#x")
         self.assertEqual(len(self.calls("ssh", "-M")), 1)
+
+    def test_company_chosen_backend_binds_both_exact_client_families_and_preserves_url(self):
+        for url, backend, port in [
+            ("http://localhost:8744/a%2Fb?q=1#v4", "127.0.0.1", 8744),
+            ("https://localhost:8745/a%2Fb?q=one%2Btwo#frag%20x", "::1", 8745),
+        ]:
+            with self.subTest(backend=backend):
+                process = self.start({"action": "open-web", "url": url, "backendHost": backend})
+                prepared = json.loads(process.stdout.readline())
+                self.assertEqual(prepared["phase"], "prepared", prepared)
+                self.assertEqual(prepared["openedUrl"], url)
+                self.assertEqual(prepared["tunnel"], {"remoteHost": backend, "remotePort": port,
+                                                       "localPort": port, "reused": False})
+                record = self.runtime / "pi-client-link-helper"
+                records = [json.loads(item.read_text()) for item in record.glob("e-*.json")]
+                matching = [item for item in records if item["endpoint"]["port"] == port]
+                self.assertEqual(len(matching), 1)
+                self.assertEqual(matching[0]["version"], 3)
+                self.assertEqual(matching[0]["endpoint"], {"host": "localhost", "port": port,
+                                                            "backendHost": backend})
+                state = json.loads(self.state_path.read_text())
+                exact = [item for item in state["listeners"] if item["port"] == port]
+                self.assertEqual({item["host"] for item in exact}, {"127.0.0.1", "::1"})
+                self.assertEqual({item["pid"] for item in exact}, {matching[0]["pid"]})
+                self.assertEqual({item["remote_host"] for item in exact}, {backend})
+                self.assertFalse(any(call["args"] == [url] for call in self.calls("xdg-open")))
+                status, result = self.finish(process, prepared)
+                self.assertEqual(status, 0, result)
+                self.assertEqual(result["openedUrl"], url)
+                self.assertEqual(result["tunnel"], prepared["tunnel"])
+                self.assertEqual(self.calls("xdg-open")[-1]["args"], [url])
+                expected = f"localhost:{port}:{'[' + backend + ']' if ':' in backend else backend}:{port}"
+                self.assertIn(expected, self.calls("ssh", "forward")[-1]["args"])
+        self.assertEqual(len(self.calls("ssh", "-M")), 2)
+
+    def test_localhost_backend_missing_or_other_targets_with_backend_fail_before_gui(self):
+        for url, field in [
+            ("https://localhost:8744/a?#", {}),
+            ("http://localhost:8744/", {"backendHost": None}),
+            ("http://localhost:8744/", {"backendHost": "localhost"}),
+            ("http://localhost:8744/", {"backendHost": "127.0.0.2"}),
+            ("http://localhost:8744/", {"backendHost": "[::1]"}),
+            ("http://localhost:8744/", {"backendHost": 4}),
+            ("http://127.0.0.1:8744/", {"backendHost": "127.0.0.1"}),
+            ("http://[::1]:8744/", {"backendHost": "::1"}),
+            ("https://example.org/", {"backendHost": "127.0.0.1"}),
+        ]:
+            with self.subTest(url=url, field=field):
+                status, result = self.invoke({"action": "open-web", "url": url, **field})
+                self.assertEqual((status, result["error"]["code"]), (1, "invalid_request"))
+        self.assertEqual(self.logs(), [])
 
     def test_explicit_ip_can_own_port_occupied_only_on_other_loopback_family(self):
         self.state["listeners"] = [{"host": "::1", "port": 8743, "pid": 999}]
@@ -592,16 +651,84 @@ class HelperCase(unittest.TestCase):
         self.assertFalse(self.calls("ssh", "-M"))
         self.assertFalse(self.calls("xdg-open"))
 
-    def test_localhost_any_family_collision_is_port_conflict(self):
-        for host in ("127.0.0.1", "::1"):
+    def test_localhost_any_covered_family_collision_is_port_conflict(self):
+        for host in ("127.0.0.1", "::1", "::ffff:7f00:1", "0.0.0.0", "::"):
             with self.subTest(host=host):
                 self.state["listeners"] = [{"host": host, "port": 8795, "pid": 999}]
                 self.save()
-                status, result = self.web("http://localhost:8795/start")
+                status, result = self.web("http://localhost:8795/start", backend_host="::1")
                 self.assertEqual((status, result["error"]["code"]), (1, "port_conflict"))
         self.assertFalse(self.calls("xdg-open"))
         self.assertFalse(self.calls("ssh", "-M"))
         self.assertFalse(self.calls("code"))
+
+    def test_localhost_partial_forward_wrong_pid_and_race_close_only_new_master(self):
+        cases = [({"forward_omit_family": "::1"}, "tunnel_unverified"),
+                 ({"forward_wrong_pid_family": "127.0.0.1"}, "tunnel_unverified"),
+                 ({"forward_partial_failure": True}, "tunnel_unverified"),
+                 ({"forward_no_listener": True}, "tunnel_unverified"),
+                 ({"race_port": 8744, "race_host": "::1"}, "port_conflict")]
+        for mutation, code in cases:
+            with self.subTest(mutation=mutation):
+                self.state = {"next_pid": 4001, "masters": {}, "listeners": [], **mutation}
+                self.save()
+                before_exit = len(self.calls("ssh", "exit"))
+                before_forward = len(self.calls("ssh", "forward"))
+                status, result = self.web("https://localhost:8744/a", backend_host="127.0.0.1")
+                self.assertEqual((status, result["error"]["code"]), (1, code), result)
+                self.assertEqual(len(self.calls("ssh", "forward")), before_forward + 1)
+                self.assertEqual(len(self.calls("ssh", "exit")), before_exit + 1)
+                state = json.loads(self.state_path.read_text())
+                self.assertTrue(all(not item["alive"] for item in state["masters"].values()))
+                self.assertFalse(list((self.runtime / "pi-client-link-helper").glob("e-*.json")))
+                self.assertFalse(self.calls("xdg-open"))
+                if "race_port" in mutation:
+                    self.assertEqual(state["listeners"], [{"host": "::1", "port": 8744, "pid": 999}])
+        self.assertFalse(self.calls("code"))
+
+    def test_localhost_backend_or_stale_record_mismatch_never_reuses_or_closes_existing_master(self):
+        url = "https://localhost:8745/first"
+        status, first = self.web(url, backend_host="127.0.0.1")
+        self.assertEqual(status, 0, first)
+        record = next((self.runtime / "pi-client-link-helper").glob("e-*.json"))
+        original = json.loads(record.read_text())
+        for mutation in [None, {"version": 2}, {"endpoint": {**original["endpoint"], "backendHost": "::1"}},
+                         {"endpoint": {"host": "localhost", "port": 8746, "backendHost": "127.0.0.1"}}]:
+            with self.subTest(mutation=mutation):
+                record.write_text(json.dumps({**original, **mutation}) if mutation else json.dumps(original))
+                backend = "::1" if mutation is None else "127.0.0.1"
+                status, result = self.web("https://localhost:8745/again", backend_host=backend)
+                self.assertEqual((status, result["error"]["code"]), (1, "tunnel_unverified"))
+        record.write_text(json.dumps(original))
+        self.assertEqual(self.web("https://localhost:8745/reused", backend_host="127.0.0.1")[1]["tunnel"]["reused"], True)
+        self.assertEqual(len(self.calls("ssh", "-M")), 1)
+        self.assertEqual(len(self.calls("ssh", "forward")), 1)
+        self.assertFalse(self.calls("ssh", "exit"))
+        self.assertEqual(len(self.calls("xdg-open")), 2)
+
+    def test_localhost_precommit_cancel_and_listener_loss_never_launch(self):
+        request = {"action": "open-web", "url": "https://localhost:8745/a?x=1#f", "backendHost": "::1"}
+        process = self.start(request)
+        prepared = json.loads(process.stdout.readline())
+        self.assertEqual(prepared["phase"], "prepared", prepared)
+        self.assertFalse(self.calls("xdg-open"))
+        process.stdin.close()
+        aborted = json.loads(process.stdout.readline())
+        self.assertEqual(aborted["error"]["code"], "request_aborted")
+        self.assertNotEqual(process.wait(timeout=5), 0)
+        process.stdout.close(); process.stderr.close()
+        self.assertFalse(self.calls("xdg-open"))
+        process = self.start(request)
+        prepared = json.loads(process.stdout.readline())
+        self.assertTrue(prepared["tunnel"]["reused"])
+        state = json.loads(self.state_path.read_text())
+        state["listeners"] = [item for item in state["listeners"] if item["host"] != "::1"]
+        self.state = state
+        self.save()
+        status, result = self.finish(process, prepared)
+        self.assertEqual((status, result["error"]["code"]), (1, "tunnel_unverified"))
+        self.assertFalse(self.calls("xdg-open"))
+        self.assertFalse(self.calls("ssh", "exit"))
 
     def test_browser_normalized_loopback_cannot_open_local_decoy(self):
         self.state["listeners"] = [{"host": "127.0.0.1", "port": 8795, "pid": 999}]
