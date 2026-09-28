@@ -100,7 +100,8 @@ Pi 在 lexing 前把 Tab 展开成三个空格，native href 还可能保留 cha
 - Clipboard 仍使用进程级 `Symbol.for` 串行队列，跨代际、adapter 和 `/reload` 保证最后点击的写入顺序；打开动作不进入该队列。
 - 普通 local/private link 点击和拖选走 Pi 原生 viewport 状态机，但临时 opener filter 永远挡住所有 `pi-copy://`。只有 stored action kind 决定手势：copy 保留原行为；open/diagnostic/expired 必须是准确 Ctrl+左键，press/release 都满足且无 Shift/Alt/扩展按钮别名。
 - Overlay URL 只由准确 geometry 或 overlay-owned capture 授权。卸载先退役 action、失效 owner、强制同步 composed frame；仅证明 fullscreen 中无私有 URI 后才恢复 input hook。失败则保留单层最小被动 guard；后续实例吸收它，不保留前任闭包，也不覆盖后装 foreign wrapper。
-- tmux 只给未绑定的 Ctrl 鼠标键和 `SecondClick1Pane` 增加 pane-marker 条件透传；不改 `.tmux.conf`、`mouse` 设置或别的 pane。窄 lost-press 恢复要求前一次普通 release 与 orphan Ctrl release 命中完全相同的 cell、私有 URI/action kind，并保持屏幕、尺寸、overlay ownership/snapshot 和无 motion；任意空白 cell 的 release 不能授权别处链接。
+- tmux 3.4 的受管鼠标绑定在每个原始 SGR 事件前发送 `CSI 998;<client_pid>~`。仅在 `MouseDown1Pane` 等于已验证的 stock `select-pane -t = ; send-keys -M` 时接管它：先按原顺序选 pane，再对本扩展 pane 注入 marker、原样执行 `send-keys -M`；不带本扩展 owner 的 pane 仍依次执行 stock 的 `select-pane -t =` 和 `send-keys -M` 命令；真实双-pane 鼠标透传尚待单独验收。原本无绑定的 `MouseUp1Pane` 加入同样条件透传。旧版 Ctrl 绑定只在当前命令和记录的 receipt 完全一致、且属于已知旧版命令时升级；自定义/版本不符的绑定保留并在 `/copy-links` 告警。不改 `.tmux.conf`、`mouse` 设置或其他 pane。卸载只恢复 pane 所有权；共享绑定保持无主惰性状态，重载凭 receipt 复用。
+- 每个按下/松开都带相同 client PID 才能触发动作；窄 lost-press 恢复也要求先前普通 release 与 orphan Ctrl release 的 PID、cell、私有 URI/action kind 相同，并保持屏幕、尺寸、overlay ownership/snapshot 和无 motion。tmux Ctrl+点击缺失或畸形 marker 时报告错误，不打开链接；非 tmux 输入继续使用原有本机操作。PID 目前仅向打开回调传递，尚未解析 SSH 对端或改用客户端浏览器。当前打开回调**仍在 Pi 主机**运行：不要把本步骤误认为远端打开或自动端口转发。
 
 显式 `--new-window` 避免扩展主动复用其他 GNOME workspace 的窗口，但 Wayland 下最终 placement 属于 Mutter。真实 GNOME 验收必须作为有界、用户可见的手工步骤：在其他 workspace 已有 Chrome/Code 窗口时，从 Pi workspace 分别 Ctrl+点击网页、文件和目录，观察新窗口是否仍落在当前 workspace。若 compositor 行为不满足预期，需要单独的 GNOME Shell companion；本扩展不虚构 workspace 控制权。
 

@@ -37,7 +37,10 @@ export default function copyLinksExtension(pi: ExtensionAPI): void {
           await copyToClipboard(text);
         },
         cwd: () => ctx.cwd,
-        open: openTarget,
+        requireTmuxOrigin: Boolean(process.env.TMUX),
+        // Origin is frozen at verified release. Client routing is a later change;
+        // this checkpoint retains the existing Pi-host opener as its consumer.
+        open: (href, cwd, lifetime, _origin) => openTarget(href, cwd, lifetime),
         button: (text) => ctx.ui.theme.fg("accent", text),
         recoverTmuxRelease: () => mouse?.enabled === true && mouse.warnings.length === 0,
         requestRender: () => { tui?.invalidate(); tui?.requestRender(); },
@@ -57,7 +60,7 @@ export default function copyLinksExtension(pi: ExtensionAPI): void {
       failure = undefined;
       try {
         mouse = await enableTmuxMouse();
-        if (mouse.warnings.length) mouseWarning = `tmux 已有自定义绑定，未覆盖：${mouse.warnings.join(", ")}；Ctrl+点击可能被拦截`;
+        if (mouse.warnings.length) mouseWarning = `tmux 鼠标绑定缺少来源标记，未覆盖非受管绑定：${mouse.warnings.join(", ")}；缺标记的 Ctrl+点击会拒绝打开`;
       } catch (error) { mouseWarning = `tmux Ctrl+鼠标透传未就绪：${String(error)}`; }
       if (mouseWarning) ctx.ui.notify(mouseWarning, "warning");
       tui?.invalidate();

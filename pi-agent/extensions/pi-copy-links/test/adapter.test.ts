@@ -5,7 +5,7 @@ import {
   getCapabilities, getOsc8LinkAtColumn, hyperlink, Markdown, setCapabilities, stripTerminalSequences,
   TuiAltScreen, visibleWidth, type Terminal,
 } from "@earendil-works/pi-tui";
-import { installAdapter, SUPPORTED_PI } from "../src/adapter.ts";
+import { installAdapter, SUPPORTED_PI, type OpenOrigin } from "../src/adapter.ts";
 import type { OpenLifetime } from "../src/browser.ts";
 
 // Count WeakRef constructions for every adapter installed below. V8 both caps a
@@ -53,6 +53,14 @@ function message(text: string) {
 }
 const tick = () => new Promise<void>(resolve => setImmediate(resolve));
 function sgr(x: number, y: number, bits = 0, edge = 'M') { return `\x1b[<${bits};${x + 1};${y + 1}${edge}`; }
+function tagged(terminal: FakeTerminal, clientPid: number | string, data: string) {
+  terminal.input(`\x1b[998;${clientPid}~`);
+  terminal.input(data);
+}
+function taggedClick(terminal: FakeTerminal, point: {x: number; y: number}, clientPid: number, bits = 16) {
+  tagged(terminal, clientPid, sgr(point.x, point.y, bits));
+  tagged(terminal, clientPid, sgr(point.x, point.y, bits, 'm'));
+}
 function screen(tui: TuiAltScreen): string[] { return (tui as unknown as { previousScreen: string[] }).previousScreen; }
 function target(tui: TuiAltScreen, prefix: string) {
   for (const [y, line] of screen(tui).entries()) for (let x = 0; x < tui.terminal.columns; x++) {
@@ -103,7 +111,8 @@ function click(terminal: FakeTerminal, point: {x: number; y: number}, bits = 0) 
 interface FixtureOptions {
   quiesce?: "success" | "failure" | "throw";
   copy?: (text: string) => Promise<void>;
-  open?: (href: string, cwd: string, lifetime: OpenLifetime) => Promise<void>;
+  open?: (href: string, cwd: string, lifetime: OpenLifetime, origin: OpenOrigin) => Promise<void>;
+  tmux?: boolean;
   cwd?: string;
   copySelection?: (text: string) => Promise<boolean>;
   installer?: typeof installAdapter;
@@ -117,7 +126,7 @@ function fixture(
 ) {
   const terminal = new FakeTerminal();
   const copied: string[] = [], opened: string[] = [], nativeOpened: string[] = [], notices: string[] = [], errorNotices: string[] = [];
-  const openRequests: Array<{ href: string; cwd: string; lifetime: OpenLifetime }> = [];
+  const openRequests: Array<{ href: string; cwd: string; lifetime: OpenLifetime; origin: OpenOrigin }> = [];
   let currentCwd = fixtureOptions.cwd ?? "/fixture";
   let active = true;
   let renderRequests = 0;
@@ -127,9 +136,10 @@ function fixture(
       if (fixtureOptions.copy) return fixtureOptions.copy(text);
       if (copyFailure) throw copyFailure;
       copied.push(text);
-    }, cwd: () => currentCwd, open: async (href, cwd, lifetime) => {
-      openRequests.push({ href, cwd, lifetime });
-      if (fixtureOptions.open) await fixtureOptions.open(href, cwd, lifetime);
+    }, cwd: () => currentCwd, requireTmuxOrigin: fixtureOptions.tmux ?? false,
+    open: async (href, cwd, lifetime, origin) => {
+      openRequests.push({ href, cwd, lifetime, origin });
+      if (fixtureOptions.open) await fixtureOptions.open(href, cwd, lifetime, origin);
       else opened.push(href);
     },
     notify: (text, error) => { notices.push(text); if (error) errorNotices.push(text); }, button: text => text,
@@ -1411,6 +1421,121 @@ test("throwing and no-op setters roll back all hooks and emit no private action 
   }
 });
 
+
+test("tmux Ctrl links and copy buttons require one client PID across press and release", async () => {
+  const f = fixture("[WEB](https://example.com/origin)\n\n```sh\necho source\n```", true, undefined, undefined, { tmux: true });
+  try {
+    const link = targets(f.tui, "pi-copy://")[0]!;
+    const copy = targets(f.tui, "pi-copy://")[1]!;
+    taggedClick(f.terminal, link, 12001);
+    await tick();
+    assert.deepEqual(f.openRequests.map(({ href, origin }) => ({ href, origin })),
+      [{ href: "https://example.com/origin", origin: 12001 }]);
+    tagged(f.terminal, 12001, sgr(link.x, link.y, 16));
+    tagged(f.terminal, 12002, sgr(link.x, link.y, 16, "m"));
+    tagged(f.terminal, 12002, sgr(copy.x, copy.y));
+    tagged(f.terminal, 12001, sgr(copy.x, copy.y, 0, "m"));
+    await tick();
+    assert.equal(f.openRequests.length, 1, "different clients cannot combine same-cell link edges");
+    assert.deepEqual(f.copied, [], "different clients cannot combine same-cell copy edges");
+    taggedClick(f.terminal, copy, 12002, 0);
+    await tick();
+    assert.deepEqual(f.copied, ["echo source"], "the tagged ordinary copy button still works");
+    assert.deepEqual(f.nativeOpened, []);
+  } finally { f.close(); }
+});
+
+test("tmux markers leave native selection, wheel and overlay mouse ownership intact", async () => {
+  const selected: string[] = [];
+  const source = `${"history line\n\n".repeat(35)}[WEB](https://example.com/overlay)\n\n\`\`\`sh\necho source\n\`\`\``;
+  const f = fixture(source, false, undefined, undefined, {
+    tmux: true, copySelection: async (text) => { selected.push(text); return true; },
+  });
+  try {
+    const point = target(f.tui, "pi-copy://");
+    const before = screen(f.tui).map(stripTerminalSequences);
+    tagged(f.terminal, 12001, sgr(point.x, point.y, 64));
+    f.tui.renderNow();
+    assert.notDeepEqual(screen(f.tui).map(stripTerminalSequences), before);
+    f.tui.scrollToBottom(); f.tui.renderNow();
+    const link = targets(f.tui, "pi-copy://")[0]!;
+    tagged(f.terminal, 12001, sgr(0, link.y));
+    f.terminal.input(sgr(link.x, link.y, 32)); // Native stock drag has no extension marker.
+    tagged(f.terminal, 12001, sgr(link.x, link.y, 0, "m"));
+    await tick();
+    assert.equal(selected.length, 1);
+    assert.deepEqual(f.openRequests, []);
+
+    const events: string[] = [];
+    const overlay = f.tui.showOverlay({
+      render: () => [hyperlink("private", link.url)], invalidate() {},
+      handleMouse: (event) => { events.push(event.type); return { handled: true, capture: event.type === "press" }; },
+    }, { anchor: "top-left", width: 12 });
+    f.tui.renderNow();
+    const overlayPoint = targetUrl(f.tui, link.url);
+    taggedClick(f.terminal, overlayPoint, 12001, 0);
+    await tick();
+    assert.deepEqual(events, ["press", "release", "click"]);
+    assert.deepEqual(f.nativeOpened, []);
+    assert.deepEqual(f.openRequests, []);
+    overlay.hide();
+  } finally { f.close(); }
+});
+
+test("tmux missing, malformed, duplicate and displaced origin markers fail visibly without local open", async () => {
+  const f = fixture("[WEB](https://example.com/origin)", false, undefined, undefined, { tmux: true });
+  try {
+    const link = target(f.tui, "pi-copy://");
+    click(f.terminal, link, 16);
+    tagged(f.terminal, "NaN", sgr(link.x, link.y, 16));
+    tagged(f.terminal, 12001, sgr(link.x, link.y, 16, "m"));
+    tagged(f.terminal, 12001, sgr(link.x, link.y, 16));
+    f.terminal.input("\x1b[998;12002~");
+    tagged(f.terminal, 12001, sgr(link.x, link.y, 16, "m"));
+    tagged(f.terminal, 12001, sgr(link.x, link.y, 16));
+    f.terminal.input("\x1b[O");
+    tagged(f.terminal, 12001, sgr(link.x, link.y, 16, "m"));
+    await tick();
+    assert.deepEqual(f.openRequests, []);
+    assert.ok(f.errorNotices.length >= 3, "Ctrl release without same tagged press reports the routing failure");
+    assert.ok(f.errorNotices.every((message) => message.includes("来源标记")));
+    assert.deepEqual(f.nativeOpened, []);
+    taggedClick(f.terminal, link, 12001);
+    await tick();
+    assert.deepEqual(f.openRequests.map(({ origin }) => origin), [12001], "a later valid gesture recovers");
+  } finally { f.close(); }
+});
+
+test("tmux lost-press recovery cannot borrow another client's ordinary release", async () => {
+  const f = fixture("[WEB](https://example.com/recovered)", true, undefined, undefined, { tmux: true });
+  try {
+    const link = target(f.tui, "pi-copy://");
+    tagged(f.terminal, 12001, sgr(link.x, link.y, 0, "m"));
+    tagged(f.terminal, 12002, sgr(link.x, link.y, 16, "m"));
+    await tick();
+    assert.deepEqual(f.openRequests, []);
+    tagged(f.terminal, 12001, sgr(link.x, link.y, 0, "m"));
+    tagged(f.terminal, 12001, sgr(link.x, link.y, 16, "m"));
+    await tick();
+    assert.deepEqual(f.openRequests.map(({ origin }) => origin), [12001]);
+    // A foreign release must not rearm recovery after canceling another client's pending press.
+    tagged(f.terminal, 12001, sgr(link.x, link.y, 16));
+    tagged(f.terminal, 12002, sgr(link.x, link.y, 0, "m"));
+    tagged(f.terminal, 12002, sgr(link.x, link.y, 16, "m"));
+    await tick();
+    assert.equal(f.openRequests.length, 1);
+  } finally { f.close(); }
+});
+
+test("local non-tmux Ctrl link still opens with explicit unknown origin", async () => {
+  const f = fixture("[WEB](https://example.com/local)");
+  try {
+    click(f.terminal, target(f.tui, "pi-copy://"), 16);
+    await tick();
+    assert.deepEqual(f.openRequests.map(({ href, origin }) => ({ href, origin })),
+      [{ href: "https://example.com/local", origin: "unknown" }]);
+  } finally { f.close(); }
+});
 
 test("tmux lost-press recovery requires the same action cell, a recent modifier transition, stable screen and no drag", async () => {
   const f = fixture('[link](https://example.com/)', true);

@@ -80,7 +80,9 @@ interface OverlaySnapshot {
   width: number;
   height: number;
 }
+export type OpenOrigin = number | "unknown";
 interface Press {
+  origin: OpenOrigin;
   url: string;
   actionKind: Action["kind"] | "expired";
   modifiers: number;
@@ -93,6 +95,7 @@ interface Press {
   moved: boolean;
 }
 interface Release {
+  origin: OpenOrigin;
   bits: number;
   at: number;
   screen: string[];
@@ -147,7 +150,9 @@ export interface AdapterOptions {
   active: () => boolean;
   copy: (text: string) => Promise<void>;
   cwd: () => string;
-  open: (href: string, cwd: string, lifetime: OpenLifetime) => Promise<void>;
+  open: (href: string, cwd: string, lifetime: OpenLifetime, origin: OpenOrigin) => Promise<void>;
+  /** A tmux pane requires a client marker for every actionable mouse edge. */
+  requireTmuxOrigin?: boolean;
   notify: (message: string, error?: boolean) => void;
   button: (text: string) => string;
   recoverTmuxRelease?: () => boolean;
@@ -450,6 +455,7 @@ export function installAdapter(options: AdapterOptions) {
   const frames: Frame[] = [];
   const presses = new WeakMap<object, Press>();
   const releases = new WeakMap<object, Release>();
+  const markers = new WeakMap<object, OpenOrigin>();
   let generation: BookkeepingGeneration | undefined;
   const MAX_TRACKED_INSTANCES = 100_000;
   const RECOVERY_ATTEMPTS = 8;
@@ -1069,7 +1075,7 @@ export function installAdapter(options: AdapterOptions) {
     });
   }
 
-  function invoke(url: string): void {
+  function invoke(url: string, origin: OpenOrigin): void {
     if (url.startsWith("pi-copy://")) {
       const resolved = currentPrivateAction(url);
       const { current, entry } = resolved;
@@ -1109,7 +1115,7 @@ export function installAdapter(options: AdapterOptions) {
       }
       if (!requireGenerationLive(current)) return;
       const lifetime = lifetimeFor(current);
-      void options.open(entry.action.href, cwd, lifetime).catch((error: unknown) => {
+      void options.open(entry.action.href, cwd, lifetime, origin).catch((error: unknown) => {
         if (!requireGenerationLive(current)) return;
         try { options.notify(`打开链接失败：${String(error)}`, true); } catch { /* best effort */ }
       });
@@ -1118,10 +1124,21 @@ export function installAdapter(options: AdapterOptions) {
   }
 
   function input(this: FullscreenRuntime, data: string) {
+    // Pi 0.87.1 dispatches the tmux CSI marker and SGR as successive calls.
+    // Consume the marker before the non-SGR focus-cancellation path. A second
+    // marker before a mouse event cannot replace the first client's identity.
+    if (data.startsWith("\x1b[998;")) {
+      const match = /^\x1b\[998;([1-9]\d*)~$/u.exec(data);
+      const pid = match ? Number(match[1]) : NaN;
+      markers.set(this, markers.has(this) || !Number.isSafeInteger(pid) ? "unknown" : pid);
+      return { consume: true };
+    }
     const active = enabled && isActive();
-    if (!active) return callNativeFiltered(this, data, original.input, true);
+    if (!active) { markers.delete(this); return callNativeFiltered(this, data, original.input, true); }
     lastTui = this;
     const event = /^\x1b\[<(\d+);(\d+);(\d+)([Mm])$/u.exec(data);
+    const origin = markers.get(this) ?? "unknown";
+    markers.delete(this);
     const pending = presses.get(this);
     if (!event) {
       presses.delete(this);
@@ -1129,6 +1146,13 @@ export function installAdapter(options: AdapterOptions) {
       setPressed(undefined);
       return callNativeFiltered(this, data, original.input, false);
     }
+    const sameOrigin = (other: OpenOrigin) => other === origin &&
+      (!options.requireTmuxOrigin || typeof origin === "number");
+    const refuseOrigin = () => {
+      if (!options.requireTmuxOrigin) return;
+      try { options.notify("tmux Ctrl+点击缺少同一客户端的有效来源标记，已拒绝打开；请检查 /copy-links 的绑定告警", true); }
+      catch { /* Input diagnostics must not interrupt native mouse handling. */ }
+    };
     const bits = Number(event[1]);
     const x = Number(event[2]) - 1;
     const y = Number(event[3]) - 1;
@@ -1152,6 +1176,7 @@ export function installAdapter(options: AdapterOptions) {
     const actionable = Boolean(url && primary && authorized);
     const rememberRelease = () => {
       if (valid && primary && release && !motion) releases.set(this, {
+        origin,
         bits,
         at: performance.now(),
         screen: [...this.previousScreen],
@@ -1175,12 +1200,12 @@ export function installAdapter(options: AdapterOptions) {
       if (release) {
         presses.delete(this);
         const releaseAuthorized = pending.actionKind === "copy" ? (bits & 12) === 0 : bits === 16;
-        if (primary && releaseAuthorized && modifiers === pending.modifiers && !pending.moved && valid &&
-            pending.url === url && sameOverlaySnapshot(this, pending.overlays) &&
-            unpress(pending.line) === unpress(line) && pending.width === width && pending.height === height) {
-          invoke(pending.url);
-        }
-        if (pending.moved) releases.delete(this);
+        const matchingTarget = primary && releaseAuthorized && modifiers === pending.modifiers && !pending.moved && valid &&
+          pending.url === url && sameOverlaySnapshot(this, pending.overlays) &&
+          unpress(pending.line) === unpress(line) && pending.width === width && pending.height === height;
+        if (matchingTarget && sameOrigin(pending.origin)) invoke(pending.url, origin);
+        else if (matchingTarget && pending.actionKind !== "copy") refuseOrigin();
+        if (pending.moved || !sameOrigin(pending.origin)) releases.delete(this);
         else rememberRelease();
         setPressed(undefined);
       }
@@ -1189,15 +1214,17 @@ export function installAdapter(options: AdapterOptions) {
     if (wheel) { presses.delete(this); setPressed(undefined); }
     if (motion || wheel || !valid) releases.delete(this);
     const previousRelease = releases.get(this);
+    if (release && bits === 16 && !motion && actionable && valid && options.requireTmuxOrigin &&
+        origin === "unknown") refuseOrigin();
     if (release && bits === 16 && !motion && actionable && valid && options.recoverTmuxRelease?.() &&
-        previousRelease && performance.now() - previousRelease.at <= 500 &&
+        previousRelease && sameOrigin(previousRelease.origin) && performance.now() - previousRelease.at <= 500 &&
         (previousRelease.bits & 28) === 0 && previousRelease.x === x && previousRelease.y === y &&
         previousRelease.url === url && previousRelease.privateAction === privateAction &&
         previousRelease.actionKind === actionKind && previousRelease.overlayOwned === overlayOwned &&
         sameOverlaySnapshot(this, previousRelease.overlays) && previousRelease.width === width &&
         previousRelease.height === height && previousRelease.screen.length === this.previousScreen.length &&
         previousRelease.screen.every((row, index) => unpress(row) === unpress(this.previousScreen[index]!))) {
-      invoke(url!);
+      invoke(url!, origin);
       rememberRelease();
       return { consume: true };
     }
@@ -1206,7 +1233,7 @@ export function installAdapter(options: AdapterOptions) {
     if (!wheel && !motion && !release && primary && valid && actionable) {
       releases.delete(this);
       presses.set(this, {
-        url: url!, actionKind: actionKind!, modifiers, x, y, line, width, height,
+        origin, url: url!, actionKind: actionKind!, modifiers, x, y, line, width, height,
         overlays: overlaySnapshot(this), moved: false,
       });
       setPressed(url);
