@@ -55,14 +55,11 @@ function validPort(value: unknown): value is number {
 
 function loopbackBindHost(url: URL): string | undefined {
   const host = url.hostname.replace(/^\[|\]$/gu, "").toLowerCase().replace(/\.$/u, "");
-  if (host === "localhost") return "127.0.0.1";
+  if (host === "localhost") return host;
   if (isIP(host) === 4 && host.startsWith("127.")) return host;
   if (host === "::1") return host;
   const mapped = /^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/u.exec(host);
-  if (mapped) {
-    const high = Number.parseInt(mapped[1]!, 16), low = Number.parseInt(mapped[2]!, 16);
-    if (high >>> 8 === 127) return `127.${high & 255}.${low >>> 8}.${low & 255}`;
-  }
+  if (mapped && (Number.parseInt(mapped[1]!, 16) >>> 8) === 127) return host;
   return undefined;
 }
 
@@ -252,6 +249,9 @@ function verifySuccess(reply: Record<string, unknown>, request: HelperRequest,
   }
   const original = new URL(request.url), opened = new URL(reply.openedUrl);
   const bindHost = loopbackBindHost(original);
+  if (bindHost === "localhost") {
+    throw new Error("客户端助手返回无效 JSON 协议回复（localhost 双栈尚未验证）");
+  }
   if (reply.tunnel === null) {
     if (bindHost) throw new Error("客户端助手返回无效 JSON 协议回复（缺少必需的公司回环隧道）");
     if (reply.openedUrl !== request.url) throw new Error("客户端助手返回无效 JSON 协议回复（网页目标不匹配）");
@@ -264,11 +264,9 @@ function verifySuccess(reply: Record<string, unknown>, request: HelperRequest,
     throw new Error("客户端助手返回无效 JSON 协议回复（隧道不匹配）");
   }
   const port = (url: URL) => Number(url.port || (url.protocol === "https:" ? 443 : 80));
-  if (!bindHost || tunnel.remoteHost !== bindHost ||
-      original.protocol !== opened.protocol || original.pathname !== opened.pathname ||
-      original.search !== opened.search || original.hash !== opened.hash ||
-      original.username !== opened.username || original.password !== opened.password ||
-      port(original) !== tunnel.remotePort || port(opened) !== tunnel.localPort ||
+  if (!bindHost || tunnel.remoteHost !== bindHost || reply.openedUrl !== request.url ||
+      port(original) !== tunnel.remotePort || tunnel.localPort !== tunnel.remotePort ||
+      port(opened) !== tunnel.localPort ||
       opened.hostname.replace(/^\[|\]$/gu, "") !== tunnel.remoteHost) {
     throw new Error("客户端助手返回无效 JSON 协议回复（网页/隧道目标不匹配）");
   }

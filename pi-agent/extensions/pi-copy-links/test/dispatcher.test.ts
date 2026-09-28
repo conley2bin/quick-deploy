@@ -25,7 +25,7 @@ function lifetime(controller = new AbortController()): OpenLifetime & { current:
 type Invocation = { command: string; args: readonly string[]; options: unknown; input: string; kills: string[] };
 function fakeSsh(
   invocations: Invocation[],
-  reply: (request: HelperRequest) => { status: number; stdout: string; stderr?: string } | "hang" =
+  reply: (request: HelperRequest) => { status: number; stdout: string; preparedStdout?: string; stderr?: string } | "hang" =
     (request) => ({ status: 0, stdout: JSON.stringify(request.action === "open-file" ?
       { ok: true, action: "open-file", kind: request.kind, path: request.path } :
       { ok: true, action: "open-web", openedUrl: request.url, tunnel: null }) + "\n" }),
@@ -58,7 +58,7 @@ function fakeSsh(
             return;
           }
           let payload: Record<string, unknown>;
-          try { payload = JSON.parse(value.stdout) as Record<string, unknown>; }
+          try { payload = JSON.parse(value.preparedStdout ?? value.stdout) as Record<string, unknown>; }
           catch { payload = {}; }
           const prepared = { version: 2, phase: "prepared", nonce: "a".repeat(32), ...payload };
           queueMicrotask(() => stdout.write(JSON.stringify(prepared) + "\n"));
@@ -140,45 +140,80 @@ test("direct SSH with no tmux and unknown/foreign/stale tmux origin fail closed"
   assert.deepEqual(invocations, []);
 });
 
-test("verified remote canonical web URL and rewritten loopback tunnel use only JSON stdin", async () => {
+test("verified remote canonical web URL retains its exact loopback origin in JSON", async () => {
   const invocations: Invocation[] = [];
   let localCalls = 0;
+  const url = "http://127.0.0.1:8743/a?q=1#frag";
   const deps = setup(invocations, { local: async () => { localCalls++; },
-    spawn: fakeSsh(invocations, (request) => ({ status: 0, stdout: JSON.stringify({
-      ok: true, action: "open-web", openedUrl: "http://127.0.0.1:54465/a?q=1#frag",
-      tunnel: { remoteHost: "127.0.0.1", remotePort: 8743, localPort: 54465, reused: false },
+    spawn: fakeSsh(invocations, () => ({ status: 0, stdout: JSON.stringify({
+      ok: true, action: "open-web", openedUrl: url,
+      tunnel: { remoteHost: "127.0.0.1", remotePort: 8743, localPort: 8743, reused: false },
     }) + "\n" })) });
   await dispatchOpenTarget("HTTP://127.0.0.1:8743/a?q=1#frag", "/work", lifetime(), 802, deps);
   assert.equal(localCalls, 0);
-  assert.deepEqual(decoded(invocations), [{ version: 2, action: "open-web", url: "http://127.0.0.1:8743/a?q=1#frag" }]);
+  assert.deepEqual(decoded(invocations), [{ version: 2, action: "open-web", url }]);
   pinned(invocations[0]!);
 });
 
-test("loopback replies require a tunnel bound to the same company address", async () => {
+test("loopback success replies require the source host and exact original port", async () => {
   const invocations: Invocation[] = [];
-  for (const [href, opened, remoteHost, pattern] of [
-    ["http://localhost:8743/a", "http://localhost:8743/a", null, /缺少必需的公司回环隧道/u],
-    ["http://127.0.0.1:8743/a", "http://127.0.0.2:54465/a", "127.0.0.2", /隧道目标不匹配/u],
+  const source = "http://127.0.0.1:8743/a";
+  for (const [opened, remoteHost, remotePort, localPort] of [
+    ["http://127.0.0.1:54465/a", "127.0.0.1", 8743, 54465],
+    ["http://127.0.0.2:8743/a", "127.0.0.2", 8743, 8743],
+    [source, "127.0.0.1", 8743, 54465],
+    [source, "127.0.0.1", 54465, 8743],
   ] as const) {
-    await assert.rejects(dispatchOpenTarget(href, "/work", lifetime(), 802, setup(invocations, {
-      spawn: fakeSsh(invocations, () => ({ status: 0, stdout: JSON.stringify(remoteHost ?
-        { ok: true, action: "open-web", openedUrl: opened,
-          tunnel: { remoteHost, remotePort: 8743, localPort: 54465, reused: false } } :
-        { ok: true, action: "open-web", openedUrl: opened, tunnel: null }) + "\n" })),
-    })), pattern);
+    const before = invocations.length;
+    await assert.rejects(dispatchOpenTarget(source, "/work", lifetime(), 802, setup(invocations, {
+      spawn: fakeSsh(invocations, () => ({ status: 0, stdout: JSON.stringify({
+        ok: true, action: "open-web", openedUrl: opened,
+        tunnel: { remoteHost, remotePort, localPort, reused: false },
+      }) + "\n" })),
+    })), /网页\/隧道目标不匹配/u);
+    assert.equal(invocations[before]!.input.trimEnd().split("\n").length, 1, "invalid PREPARED must not COMMIT");
   }
-  // The helper explicitly writes :80 even though WHATWG omits that default port.
-  await dispatchOpenTarget("http://localhost/path", "/work", lifetime(), 802, setup(invocations, {
+  await assert.rejects(dispatchOpenTarget(source, "/work", lifetime(), 802, setup(invocations, {
     spawn: fakeSsh(invocations, () => ({ status: 0, stdout: JSON.stringify({
-      ok: true, action: "open-web", openedUrl: "http://127.0.0.1:80/path",
-      tunnel: { remoteHost: "127.0.0.1", remotePort: 80, localPort: 80, reused: true },
+      ok: true, action: "open-web", openedUrl: source, tunnel: null,
     }) + "\n" })),
-  }));
+  })), /缺少必需的公司回环隧道/u);
+  for (const host of ["localhost", "127.0.0.1"] as const) {
+    const url = `http://${host}/path`;
+    const openedUrl = host === "localhost" ? url : "http://127.0.0.1:80/path";
+    if (host === "localhost") {
+      await assert.rejects(dispatchOpenTarget(url, "/work", lifetime(), 802, setup(invocations, {
+        spawn: fakeSsh(invocations, () => ({ status: 0, stdout: JSON.stringify({
+          ok: true, action: "open-web", openedUrl: openedUrl,
+          tunnel: { remoteHost: "localhost", remotePort: 80, localPort: 80, reused: true },
+        }) + "\n" })),
+      })), /localhost 双栈尚未验证/u);
+    } else {
+      await assert.rejects(dispatchOpenTarget(url, "/work", lifetime(), 802, setup(invocations, {
+        spawn: fakeSsh(invocations, () => ({ status: 0, stdout: JSON.stringify({
+          ok: true, action: "open-web", openedUrl,
+          tunnel: { remoteHost: host, remotePort: 80, localPort: 80, reused: true },
+        }) + "\n" })),
+      })), /网页\/隧道目标不匹配/u);
+    }
+  }
+  const beforeFinal = invocations.length;
+  await assert.rejects(dispatchOpenTarget(source, "/work", lifetime(), 802, setup(invocations, {
+    spawn: fakeSsh(invocations, () => ({ status: 0,
+      preparedStdout: JSON.stringify({ ok: true, action: "open-web", openedUrl: source,
+        tunnel: { remoteHost: "127.0.0.1", remotePort: 8743, localPort: 8743, reused: false } }) + "\n",
+      stdout: JSON.stringify({ ok: true, action: "open-web", openedUrl: "http://127.0.0.1:54465/a",
+        tunnel: { remoteHost: "127.0.0.1", remotePort: 8743, localPort: 54465, reused: false } }) + "\n",
+    })),
+  })), /网页\/隧道目标不匹配/u);
+  assert.equal(invocations[beforeFinal]!.input.trimEnd().split("\n").length, 2,
+    "an altered final reply must not be reported as success after COMMIT");
   const mapped = "http://[::ffff:127.0.0.1]:8743/a";
+  const canonical = "http://[::ffff:7f00:1]:8743/a";
   await dispatchOpenTarget(mapped, "/work", lifetime(), 802, setup(invocations, {
     spawn: fakeSsh(invocations, () => ({ status: 0, stdout: JSON.stringify({
-      ok: true, action: "open-web", openedUrl: "http://127.0.0.1:54465/a",
-      tunnel: { remoteHost: "127.0.0.1", remotePort: 8743, localPort: 54465, reused: true },
+      ok: true, action: "open-web", openedUrl: canonical,
+      tunnel: { remoteHost: "::ffff:7f00:1", remotePort: 8743, localPort: 8743, reused: true },
     }) + "\n" })),
   }));
 });

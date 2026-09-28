@@ -2,14 +2,18 @@
 """Black-box client helper tests: all SSH/desktop commands are isolated fakes."""
 
 import fcntl
+import http.client
+from http.server import BaseHTTPRequestHandler, HTTPServer
 import json
 import os
 from pathlib import Path
 import runpy
 import shutil
 import signal
+import socket
 import subprocess
 import sys
+import threading
 import tempfile
 import time
 import unittest
@@ -62,11 +66,33 @@ elif name == "xset":
         sys.exit(1)
 elif name == "ssh":
     if "-G" in args:
-        print("hostname 198.51.100.23\nuser conley\nport 22")
+        if state.get("ssh_config_lines"):
+            print(state["ssh_config_lines"])
+        elif os.environ.get("FAKE_SSH_CONFIG"):
+            import subprocess
+            config = Path(os.environ["FAKE_SSH_CONFIG"])
+            query = subprocess.run([os.environ["REAL_SSH"], "-G", "-F", str(config), "conley-company"],
+                                   text=True, capture_output=True, check=True)
+            print(query.stdout, end="")
+            if state.get("mutate_alias_after_snapshot"):
+                config.write_text(state["mutate_alias_after_snapshot"])
+        else:
+            print("hostname 198.51.100.23\nuser conley\nport 22")
     elif "-M" in args:
         assert "ClearAllForwardings=yes" in args and "BatchMode=yes" in args
         assert "ExitOnForwardFailure=yes" in args and "-fN" in args
+        assert "StrictHostKeyChecking=yes" in args
         assert "-R" not in args and args[-1] == "conley-company"
+        assert "HostName=198.51.100.23" in args and "User=conley" in args and "Port=22" in args
+        if os.environ.get("FAKE_SSH_CONFIG"):
+            import subprocess
+            expanded = [os.environ["REAL_SSH"], "-G", "-F", os.environ["FAKE_SSH_CONFIG"]]
+            for index, arg in enumerate(args[:-1]):
+                if arg == "-o":
+                    expanded.extend([arg, args[index + 1]])
+            expanded.append(args[-1])
+            query = subprocess.run(expanded, text=True, capture_output=True, check=True)
+            state["master_effective_config"] = query.stdout
         if state.get("master_fail"):
             print("Permission denied (publickey)", file=sys.stderr)
             sys.exit(255)
@@ -107,7 +133,8 @@ elif name == "ssh":
             if state.get("forward_fail"):
                 print("mux_client_forward: permission denied", file=sys.stderr)
                 sys.exit(255)
-            if any(item["port"] == port for item in state["listeners"]):
+            if any(item["port"] == port and item["host"] in
+                   (local.strip("[]"), "*", "0.0.0.0", "::") for item in state["listeners"]):
                 print("mux_client_forward: Port forwarding failed", file=sys.stderr)
                 sys.exit(255)
             if state.get("forward_no_listener"):
@@ -221,29 +248,73 @@ class HelperCase(unittest.TestCase):
     def web(self, url):
         return self.invoke({"action": "open-web", "url": url})
 
-    def test_collision_uses_owned_alternative_and_reuses_exact_mapping(self):
-        self.state["listeners"] = [{"host": "127.0.0.1", "port": 8743, "pid": 999}]
-        self.save()
+    def test_exact_origin_is_opened_and_reused_only_with_verified_record(self):
         original = "http://127.0.0.1:8743/a%2Fb?q=a%2Bb&x=1#frag%20raw"
         status, first = self.web(original)
         self.assertEqual(status, 0, (first, self.logs()))
-        alternative = first["tunnel"]["localPort"]
-        self.assertNotEqual(alternative, 8743)
-        self.assertEqual(first["openedUrl"], original.replace(":8743", f":{alternative}"))
-        self.assertEqual(self.calls("xdg-open")[-1]["args"], [first["openedUrl"]])
-        self.assertEqual(len(self.calls("ssh", "-M")), 1)
-        self.assertEqual(len(self.calls("ssh", "forward")), 1)
+        self.assertEqual(first["openedUrl"], original)
+        self.assertEqual(first["tunnel"], {"remoteHost": "127.0.0.1", "remotePort": 8743,
+                                            "localPort": 8743, "reused": False})
+        self.assertEqual(self.calls("xdg-open")[-1]["args"], [original])
         self.assertEqual(self.calls("xset")[-1]["display"], ":1")
         self.assertEqual(self.calls("xset")[-1]["authority"], str(self.runtime / "Xauthority"))
         status, again = self.web("http://127.0.0.1:8743/other?still=1#yes")
         self.assertEqual(status, 0)
+        self.assertEqual(again["openedUrl"], "http://127.0.0.1:8743/other?still=1#yes")
         self.assertTrue(again["tunnel"]["reused"])
-        self.assertEqual(again["tunnel"]["localPort"], alternative)
+        self.assertEqual(again["tunnel"]["localPort"], 8743)
         self.assertEqual(len(self.calls("ssh", "-M")), 1)
         self.assertEqual(len(self.calls("ssh", "forward")), 1)
         record = next((self.runtime / "pi-client-link-helper").glob("e-*.json"))
         self.assertEqual(record.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(json.loads(record.read_text())["version"], 2)
         self.assertEqual(json.loads(record.read_text())["endpoint"], {"host": "127.0.0.1", "port": 8743})
+
+    def test_original_port_decoy_and_company_absolute_redirect_refuse_before_browser(self):
+        class Decoy(BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(200); self.end_headers(); self.wfile.write(b"Y9000P-DECOY")
+            def log_message(self, *args):
+                pass
+
+        with HTTPServer(("127.0.0.1", 0), Decoy) as decoy:
+            decoy_thread = threading.Thread(target=decoy.serve_forever, daemon=True)
+            decoy_thread.start()
+            port = decoy.server_port
+            class Company(BaseHTTPRequestHandler):
+                def do_GET(self):
+                    self.send_response(302)
+                    self.send_header("Location", f"http://127.0.0.1:{port}/done")
+                    self.end_headers()
+                def log_message(self, *args):
+                    pass
+            # The same port is free on the other loopback address in this
+            # fixture, representing the separate company endpoint.
+            with HTTPServer(("127.0.0.2", port), Company) as company_server:
+                company_thread = threading.Thread(target=company_server.serve_forever, daemon=True)
+                company_thread.start()
+                company = http.client.HTTPConnection("127.0.0.2", port, timeout=2)
+                company.request("GET", "/start")
+                redirect = company.getresponse()
+                self.assertEqual((redirect.status, redirect.getheader("Location")),
+                                 (302, f"http://127.0.0.1:{port}/done"))
+                redirect.read(); company.close()
+                decoy_client = http.client.HTTPConnection("127.0.0.1", port, timeout=2)
+                decoy_client.request("GET", "/done")
+                self.assertEqual(decoy_client.getresponse().read(), b"Y9000P-DECOY")
+                decoy_client.close()
+                self.state["listeners"] = [{"host": "127.0.0.1", "port": port, "pid": 999}]
+                self.save()
+                status, result = self.web(f"http://127.0.0.1:{port}/start")
+                self.assertEqual((status, result["error"]["code"]), (1, "port_conflict"))
+                self.assertIn("remove the conflicting listener", result["error"]["message"])
+                self.assertFalse(self.calls("xdg-open"))
+                self.assertFalse(self.calls("ssh", "-M"))
+                self.assertFalse(self.calls("ssh", "forward"))
+                company_server.shutdown()
+                company_thread.join(timeout=2)
+            decoy.shutdown()
+            decoy_thread.join(timeout=2)
 
     def test_stale_control_socket_recreates_forward(self):
         status, first = self.web("http://127.0.0.1:8743/")
@@ -261,14 +332,14 @@ class HelperCase(unittest.TestCase):
         self.assertEqual(len(self.calls("ssh", "forward")), 2)
         self.assertEqual(next_result["openedUrl"], "http://127.0.0.1:8743/new")
 
-    def test_bind_race_retries_only_after_observed_collision(self):
+    def test_bind_race_refuses_without_alternate_or_browser(self):
         self.state["race_port"] = 8743
         self.save()
         status, result = self.web("http://127.0.0.1:8743/race")
-        self.assertEqual(status, 0, result)
-        self.assertNotEqual(result["tunnel"]["localPort"], 8743)
-        self.assertEqual(len(self.calls("ssh", "forward")), 2)
-        self.assertEqual(self.calls("xdg-open")[-1]["args"], [result["openedUrl"]])
+        self.assertEqual((status, result["error"]["code"]), (1, "port_conflict"))
+        self.assertEqual(len(self.calls("ssh", "forward")), 1)
+        self.assertEqual(len(self.calls("ssh", "exit")), 1)
+        self.assertFalse(self.calls("xdg-open"))
 
     def test_simultaneous_requests_are_serialized(self):
         processes = [self.start({"action": "open-web", "url": "http://127.0.0.1:8743/same"}) for _ in range(2)]
@@ -289,6 +360,57 @@ class HelperCase(unittest.TestCase):
         self.assertEqual(result["error"]["code"], "tunnel_unverified")
         self.assertEqual(len(self.calls("xdg-open")), 1)
         self.assertEqual(len(self.calls("ssh", "-M")), 1)
+
+    def test_old_or_alternate_record_cannot_be_reused_as_original_origin(self):
+        self.assertEqual(self.web("http://127.0.0.1:8743/")[0], 0)
+        record = next((self.runtime / "pi-client-link-helper").glob("e-*.json"))
+        original = json.loads(record.read_text())
+        for mutation, code in [({"version": 1}, "tunnel_unverified"),
+                               ({"local_port": 54465}, "port_conflict"),
+                               ({"endpoint": {"host": "127.0.0.2", "port": 8743}}, "invalid_state")]:
+            with self.subTest(mutation=mutation):
+                record.write_text(json.dumps({**original, **mutation}))
+                status, result = self.web("http://127.0.0.1:8743/reuse")
+                self.assertEqual((status, result["error"]["code"]), (1, code))
+        self.assertEqual(len(self.calls("xdg-open")), 1)
+        self.assertEqual(len(self.calls("ssh", "-M")), 1)
+
+    def test_master_pins_snapshot_when_alias_changes_before_creation(self):
+        real_ssh = shutil.which("ssh")
+        self.assertIsNotNone(real_ssh)
+        config = self.root / "ssh-config"
+        identity_file = self.root / "configured-id"
+        config.write_text("Host conley-company\n"
+                          " HostName 198.51.100.23\n User conley\n Port 22\n"
+                          f" IdentityFile {identity_file}\n")
+        self.env.update({"FAKE_SSH_CONFIG": str(config), "REAL_SSH": real_ssh})
+        self.state["mutate_alias_after_snapshot"] = (
+            "Host conley-company\n HostName 203.0.113.88\n User wrong\n Port 2200\n"
+            f" IdentityFile {identity_file}\n")
+        self.save()
+        status, result = self.web("http://127.0.0.1:8743/pin")
+        self.assertEqual(status, 0, result)
+        effective = json.loads(self.state_path.read_text())["master_effective_config"]
+        self.assertIn("\nhostname 198.51.100.23\n", "\n" + effective)
+        self.assertIn("\nuser conley\n", "\n" + effective)
+        self.assertIn("\nport 22\n", "\n" + effective)
+        self.assertIn("\nstricthostkeychecking true\n", "\n" + effective)
+        self.assertIn(f"\nidentityfile {identity_file}\n", "\n" + effective)
+        self.assertIn("HostName 203.0.113.88", config.read_text())
+        self.assertEqual(self.calls("xdg-open")[-1]["args"], ["http://127.0.0.1:8743/pin"])
+
+    def test_noncomparable_ssh_identity_fails_before_master_or_browser(self):
+        for config in ("hostname company.example\nuser conley\nport 22",
+                       "hostname 198.51.100.23\nhostname 203.0.113.88\nuser conley\nport 22",
+                       "hostname 198.51.100.23\nuser conley\nport 22\nport 2222",
+                       "hostname 198.51.100.23\nuser name with spaces\nport 22"):
+            with self.subTest(config=config):
+                self.state["ssh_config_lines"] = config
+                self.save()
+                status, result = self.web("http://127.0.0.1:8743/no-identity")
+                self.assertEqual((status, result["error"]["code"]), (1, "ssh_config_failed"))
+        self.assertFalse(self.calls("ssh", "-M"))
+        self.assertFalse(self.calls("xdg-open"))
 
     def test_ssh_failure_and_forward_failure_do_not_launch_browser(self):
         self.state["master_fail"] = True
@@ -406,13 +528,25 @@ class HelperCase(unittest.TestCase):
         self.assertFalse(self.calls("code"))
         self.assertFalse(self.calls("systemctl"))
 
-    def test_default_http_port_gets_an_owned_forward(self):
-        status, result = self.web("http://127.0.0.1/no-explicit-port?q=1#f")
-        self.assertEqual(status, 0, result)
-        self.assertEqual(result["tunnel"]["remotePort"], 80)
-        self.assertEqual(result["openedUrl"],
-                         f'http://127.0.0.1:{result["tunnel"]["localPort"]}/no-explicit-port?q=1#f')
-        self.assertEqual(self.calls("xdg-open")[-1]["args"], [result["openedUrl"]])
+    def test_default_http_port_preserves_url_or_refuses_low_port(self):
+        with socket.socket() as probe:
+            try:
+                probe.bind(("127.0.0.1", 80))
+                can_bind = True
+            except OSError as error:
+                self.assertIn(error.errno, (13, 98))  # EACCES or EADDRINUSE
+                can_bind = False
+        original = "http://127.0.0.1/no-explicit-port?q=1#f"
+        status, result = self.web(original)
+        if can_bind:
+            self.assertEqual(status, 0, result)
+            self.assertEqual(result["tunnel"]["remotePort"], 80)
+            self.assertEqual(result["tunnel"]["localPort"], 80)
+            self.assertEqual(result["openedUrl"], original)
+            self.assertEqual(self.calls("xdg-open")[-1]["args"], [original])
+        else:
+            self.assertEqual((status, result["error"]["code"]), (1, "port_conflict"))
+            self.assertFalse(self.calls("xdg-open"))
 
     def test_ipv6_loopback_binds_and_opens_exact_family(self):
         status, result = self.web("http://[::1]:8743/hello?x=1#f")
@@ -421,19 +555,53 @@ class HelperCase(unittest.TestCase):
         self.assertEqual(result["tunnel"]["remoteHost"], "::1")
         self.assertIn("[::1]:8743:[::1]:8743", self.calls("ssh", "forward")[-1]["args"])
 
-    def test_loopback_host_normalization_and_exact_suffix(self):
-        status, mapped = self.web("http://[::ffff:127.0.0.1]:8743/mapped")
+    def test_mapped_ip_preserves_source_host_and_localhost_does_not_launch(self):
+        mapped_url = "http://[::ffff:7f00:1]:8743/mapped"
+        status, mapped = self.web(mapped_url)
         self.assertEqual(status, 0, mapped)
-        self.assertEqual(mapped["openedUrl"], "http://127.0.0.1:8743/mapped")
-        status, result = self.web("https://localhost:8743/a?#")
-        self.assertEqual(status, 0)
-        self.assertEqual(result["openedUrl"], "https://127.0.0.1:8743/a?#")
-        self.assertEqual(result["tunnel"]["remoteHost"], "127.0.0.1")
+        self.assertEqual(mapped["openedUrl"], mapped_url)
+        self.assertEqual(mapped["tunnel"]["remoteHost"], "::ffff:7f00:1")
+        self.assertIn("[::ffff:7f00:1]:8743:[::ffff:7f00:1]:8743",
+                      self.calls("ssh", "forward")[-1]["args"])
+        before = len(self.calls("xdg-open"))
+        status, result = self.web("https://localhost:8744/a?#")
+        self.assertEqual((status, result["error"]["code"]), (1, "unsupported_target"))
+        self.assertIn("dual-stack", result["error"]["message"])
+        self.assertEqual(len(self.calls("xdg-open")), before)
+        self.assertFalse(self.calls("code"))
         status, result = self.web("http://example.org/a?q=2#x")
         self.assertEqual(status, 0)
         self.assertIsNone(result["tunnel"])
         self.assertEqual(result["openedUrl"], "http://example.org/a?q=2#x")
         self.assertEqual(len(self.calls("ssh", "-M")), 1)
+
+    def test_explicit_ip_can_own_port_occupied_only_on_other_loopback_family(self):
+        self.state["listeners"] = [{"host": "::1", "port": 8743, "pid": 999}]
+        self.save()
+        original = "http://127.0.0.1:8743/only-ipv4"
+        status, result = self.web(original)
+        self.assertEqual(status, 0, result)
+        self.assertEqual(result["openedUrl"], original)
+        self.assertEqual(result["tunnel"]["localPort"], 8743)
+
+    def test_mapped_loopback_ip_detects_ipv4_decoy(self):
+        self.state["listeners"] = [{"host": "127.0.0.1", "port": 8743, "pid": 999}]
+        self.save()
+        status, result = self.web("http://[::ffff:7f00:1]:8743/decoy")
+        self.assertEqual((status, result["error"]["code"]), (1, "port_conflict"))
+        self.assertFalse(self.calls("ssh", "-M"))
+        self.assertFalse(self.calls("xdg-open"))
+
+    def test_localhost_any_family_collision_is_port_conflict(self):
+        for host in ("127.0.0.1", "::1"):
+            with self.subTest(host=host):
+                self.state["listeners"] = [{"host": host, "port": 8795, "pid": 999}]
+                self.save()
+                status, result = self.web("http://localhost:8795/start")
+                self.assertEqual((status, result["error"]["code"]), (1, "port_conflict"))
+        self.assertFalse(self.calls("xdg-open"))
+        self.assertFalse(self.calls("ssh", "-M"))
+        self.assertFalse(self.calls("code"))
 
     def test_browser_normalized_loopback_cannot_open_local_decoy(self):
         self.state["listeners"] = [{"host": "127.0.0.1", "port": 8795, "pid": 999}]
@@ -459,10 +627,10 @@ class HelperCase(unittest.TestCase):
         self.state = json.loads(self.state_path.read_text())
         self.state["listeners"].append({"host": "127.0.0.1", "port": 8795, "pid": 999})
         self.save()
+        opened = len(self.calls("xdg-open"))
         status, collision = self.web("http://127.0.0.1:8795/collision")
-        self.assertEqual(status, 0, collision)
-        self.assertNotEqual(collision["tunnel"]["localPort"], 8795)
-        self.assertEqual(self.calls("xdg-open")[-1]["args"], [collision["openedUrl"]])
+        self.assertEqual((status, collision["error"]["code"]), (1, "port_conflict"))
+        self.assertEqual(len(self.calls("xdg-open")), opened)
         self.state = json.loads(self.state_path.read_text())
         self.state["environment_padding"] = 1_100_000
         self.save()
