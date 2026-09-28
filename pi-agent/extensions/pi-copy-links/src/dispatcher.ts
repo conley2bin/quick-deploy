@@ -1,5 +1,7 @@
 import { spawn, type ChildProcess } from "node:child_process";
-import { isIP } from "node:net";
+import type { LookupAddress } from "node:dns";
+import { lookup } from "node:dns/promises";
+import { isIP, Socket } from "node:net";
 import type { OpenOrigin } from "./adapter.ts";
 import { webUrl, type OpenLifetime } from "./browser.ts";
 import { openTarget, parseOpenTarget, validateLocalTarget, type OpenTargetDependencies } from "./links.ts";
@@ -13,8 +15,14 @@ const MAX_STDERR = 4_096;
 const HELPER_DEADLINE_MS = 60_000;
 const MAX_PREPARE_MS = 45_000;
 const KILL_GRACE_MS = 200;
+const BACKEND_DEADLINE_MS = 1_500;
 
-type WebRequest = Readonly<{ version: 2; action: "open-web"; url: string }>;
+type BackendHost = "127.0.0.1" | "::1";
+type WebRequest = Readonly<{
+  version: 2; action: "open-web"; url: string;
+  // Only localhost URLs carry the separately selected company TCP destination.
+  backendHost?: BackendHost;
+}>;
 type FileRequest = Readonly<{
   version: 2; action: "open-file"; kind: "file" | "directory";
   path: string; line?: number; column?: number;
@@ -35,6 +43,9 @@ export interface DispatcherDependencies {
   readonly stat?: OpenTargetDependencies["stat"];
   readonly spawn?: HelperSpawn;
   readonly timeoutMs?: number;
+  readonly probeBackend?: (host: BackendHost, port: number, signal: AbortSignal) => Promise<boolean>;
+  readonly lookupLocalhost?: (signal: AbortSignal) => Promise<readonly LookupAddress[]>;
+  readonly backendTimeoutMs?: number;
 }
 
 function ensureCurrent(lifetime: OpenLifetime): void {
@@ -61,6 +72,83 @@ function loopbackBindHost(url: URL): string | undefined {
   const mapped = /^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/u.exec(host);
   if (mapped && (Number.parseInt(mapped[1]!, 16) >>> 8) === 127) return host;
   return undefined;
+}
+
+// A successful TCP handshake proves a listener exists, without sending HTTP or TLS bytes.
+// Refusal/unreachable means absent; any other socket error is an explicit probe failure.
+function probeTcpBackend(host: BackendHost, port: number, signal: AbortSignal): Promise<boolean> {
+  return new Promise((resolve, reject) => {
+    const socket = new Socket();
+    let done = false;
+    const finish = (result: boolean | Error) => {
+      if (done) return;
+      done = true;
+      signal.removeEventListener("abort", onAbort);
+      socket.destroy();
+      if (result instanceof Error) reject(result);
+      else resolve(result);
+    };
+    const onAbort = () => finish(new Error("公司 localhost TCP 探测已中止"));
+    socket.once("connect", () => finish(true));
+    // Keep an error listener through destroy: an already queued socket error
+    // must not become an unhandled exception after a timeout or abort.
+    socket.on("error", (error: NodeJS.ErrnoException) => {
+      if (["ECONNREFUSED", "EHOSTUNREACH", "ENETUNREACH", "EADDRNOTAVAIL"].includes(error.code ?? "")) finish(false);
+      else finish(new Error(`公司 localhost ${host}:${port} TCP 探测失败：${error.message}`));
+    });
+    signal.addEventListener("abort", onAbort, { once: true });
+    if (signal.aborted) { onAbort(); return; }
+    try { socket.connect({ host, port, family: host === "::1" ? 6 : 4 }); }
+    catch (error) { finish(error instanceof Error ? error : new Error(String(error))); }
+  });
+}
+
+async function selectLocalhostBackend(
+  port: number, lifetime: OpenLifetime, dependencies: DispatcherDependencies,
+): Promise<BackendHost> {
+  ensureCurrent(lifetime);
+  const timeoutMs = dependencies.backendTimeoutMs ?? BACKEND_DEADLINE_MS;
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0) throw new Error("公司 localhost 探测超时设置无效");
+  const controller = new AbortController();
+  let interrupt!: (error: Error) => void;
+  const interrupted = new Promise<never>((_resolve, reject) => { interrupt = reject; });
+  const onAbort = () => { interrupt(new Error("打开动作已失效")); controller.abort(); };
+  lifetime.signal.addEventListener("abort", onAbort, { once: true });
+  const timer = setTimeout(() => {
+    interrupt(new Error(`公司 localhost TCP/DNS 探测超时（${timeoutMs} ms）`));
+    controller.abort();
+  }, timeoutMs);
+  try {
+    ensureCurrent(lifetime);
+    const choose = async (): Promise<BackendHost> => {
+      const probe = dependencies.probeBackend ?? probeTcpBackend;
+      // Probe numeric addresses concurrently; localhost resolution must not
+      // prevent detecting an IPv6-only service on this company machine.
+      const [v4, v6] = await Promise.all([
+        probe("127.0.0.1", port, controller.signal), probe("::1", port, controller.signal),
+      ]);
+      if (typeof v4 !== "boolean" || typeof v6 !== "boolean") throw new Error("公司 localhost TCP 探测返回无效结果");
+      if (v4 && !v6) return "127.0.0.1";
+      if (v6 && !v4) return "::1";
+      if (!v4) throw new Error(`公司 localhost:${port} 的 127.0.0.1 和 ::1 均无 TCP 服务`);
+      const addresses = await (dependencies.lookupLocalhost ??
+        (() => lookup("localhost", { all: true, order: "verbatim" })))(controller.signal);
+      // Use the company OS resolver's order, never the Y9000p resolver's.
+      // Only a literal address we have actually probed is a usable match.
+      for (const entry of addresses) {
+        if (entry.family === 4 && entry.address === "127.0.0.1") return "127.0.0.1";
+        if (entry.family === 6 && entry.address === "::1") return "::1";
+      }
+      throw new Error("公司 localhost DNS 未返回已验证的 127.0.0.1 或 ::1 地址");
+    };
+    const selected = await Promise.race([choose(), interrupted]);
+    ensureCurrent(lifetime);
+    return selected;
+  } finally {
+    clearTimeout(timer);
+    lifetime.signal.removeEventListener("abort", onAbort);
+    controller.abort();
+  }
 }
 
 function sshArguments(receiver: RemoteReceiver): string[] {
@@ -249,8 +337,10 @@ function verifySuccess(reply: Record<string, unknown>, request: HelperRequest,
   }
   const original = new URL(request.url), opened = new URL(reply.openedUrl);
   const bindHost = loopbackBindHost(original);
-  if (bindHost === "localhost") {
-    throw new Error("客户端助手返回无效 JSON 协议回复（localhost 双栈尚未验证）");
+  if (bindHost === "localhost" ?
+      request.backendHost !== "127.0.0.1" && request.backendHost !== "::1" :
+      request.backendHost !== undefined) {
+    throw new Error("客户端助手请求的 localhost 后端与源主机不匹配");
   }
   if (reply.tunnel === null) {
     if (bindHost) throw new Error("客户端助手返回无效 JSON 协议回复（缺少必需的公司回环隧道）");
@@ -264,10 +354,10 @@ function verifySuccess(reply: Record<string, unknown>, request: HelperRequest,
     throw new Error("客户端助手返回无效 JSON 协议回复（隧道不匹配）");
   }
   const port = (url: URL) => Number(url.port || (url.protocol === "https:" ? 443 : 80));
-  if (!bindHost || tunnel.remoteHost !== bindHost || reply.openedUrl !== request.url ||
+  const backend = bindHost === "localhost" ? request.backendHost : bindHost;
+  if (!bindHost || tunnel.remoteHost !== backend || reply.openedUrl !== request.url ||
       port(original) !== tunnel.remotePort || tunnel.localPort !== tunnel.remotePort ||
-      port(opened) !== tunnel.localPort ||
-      opened.hostname.replace(/^\[|\]$/gu, "") !== tunnel.remoteHost) {
+      port(opened) !== tunnel.localPort || loopbackBindHost(opened) !== bindHost) {
     throw new Error("客户端助手返回无效 JSON 协议回复（网页/隧道目标不匹配）");
   }
 }
@@ -295,8 +385,14 @@ export async function dispatchOpenTarget(
   if (!receiver || receiver.kind !== "remote") throw new Error("无法确认打开链接的客户端");
   const target = parseOpenTarget(href, cwd);
   let request: HelperRequest;
-  if (target.kind === "web") request = { version: 2, action: "open-web", url: target.url };
-  else {
+  if (target.kind === "web") {
+    const url = new URL(target.url);
+    const backendHost = loopbackBindHost(url) === "localhost" ?
+      await selectLocalhostBackend(Number(url.port || (url.protocol === "https:" ? 443 : 80)), lifetime, dependencies) :
+      undefined;
+    request = { version: 2, action: "open-web", url: target.url,
+      ...(backendHost === undefined ? {} : { backendHost }) };
+  } else {
     const kind = await validateLocalTarget(target, lifetime, dependencies.stat);
     request = { version: 2, action: "open-file", kind, path: target.path,
       ...(target.line === undefined ? {} : { line: target.line }),

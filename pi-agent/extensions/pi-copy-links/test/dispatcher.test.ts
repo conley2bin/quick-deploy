@@ -178,25 +178,13 @@ test("loopback success replies require the source host and exact original port",
       ok: true, action: "open-web", openedUrl: source, tunnel: null,
     }) + "\n" })),
   })), /缺少必需的公司回环隧道/u);
-  for (const host of ["localhost", "127.0.0.1"] as const) {
-    const url = `http://${host}/path`;
-    const openedUrl = host === "localhost" ? url : "http://127.0.0.1:80/path";
-    if (host === "localhost") {
-      await assert.rejects(dispatchOpenTarget(url, "/work", lifetime(), 802, setup(invocations, {
-        spawn: fakeSsh(invocations, () => ({ status: 0, stdout: JSON.stringify({
-          ok: true, action: "open-web", openedUrl: openedUrl,
-          tunnel: { remoteHost: "localhost", remotePort: 80, localPort: 80, reused: true },
-        }) + "\n" })),
-      })), /localhost 双栈尚未验证/u);
-    } else {
-      await assert.rejects(dispatchOpenTarget(url, "/work", lifetime(), 802, setup(invocations, {
-        spawn: fakeSsh(invocations, () => ({ status: 0, stdout: JSON.stringify({
-          ok: true, action: "open-web", openedUrl,
-          tunnel: { remoteHost: host, remotePort: 80, localPort: 80, reused: true },
-        }) + "\n" })),
-      })), /网页\/隧道目标不匹配/u);
-    }
-  }
+  const explicitIp = "http://127.0.0.1/path";
+  await assert.rejects(dispatchOpenTarget(explicitIp, "/work", lifetime(), 802, setup(invocations, {
+    spawn: fakeSsh(invocations, () => ({ status: 0, stdout: JSON.stringify({
+      ok: true, action: "open-web", openedUrl: "http://127.0.0.1:80/path",
+      tunnel: { remoteHost: "127.0.0.1", remotePort: 80, localPort: 80, reused: true },
+    }) + "\n" })),
+  })), /网页\/隧道目标不匹配/u);
   const beforeFinal = invocations.length;
   await assert.rejects(dispatchOpenTarget(source, "/work", lifetime(), 802, setup(invocations, {
     spawn: fakeSsh(invocations, () => ({ status: 0,
@@ -216,6 +204,174 @@ test("loopback success replies require the source host and exact original port",
       tunnel: { remoteHost: "::ffff:7f00:1", remotePort: 8743, localPort: 8743, reused: true },
     }) + "\n" })),
   }));
+});
+
+test("localhost selects sole reachable numeric company backend without rewriting URL or probing HTTP", async () => {
+  for (const reachable of ["::1", "127.0.0.1"] as const) {
+    const invocations: Invocation[] = [];
+    const probes: Array<[string, number]> = [];
+    const url = "https://localhost:8744/a?q=1#frag";
+    await dispatchOpenTarget("HTTPS://localhost:8744/a?q=1#frag", "/work", lifetime(), 802,
+      setup(invocations, {
+        probeBackend: async (host, port) => { probes.push([host, port]); return host === reachable; },
+        lookupLocalhost: async () => { throw Error("DNS must not decide a sole reachable family"); },
+        spawn: fakeSsh(invocations, (request) => {
+          assert.equal(request.action, "open-web");
+          return { status: 0, stdout: JSON.stringify({
+            ok: true, action: "open-web", openedUrl: request.url,
+            tunnel: { remoteHost: request.backendHost, remotePort: 8744, localPort: 8744, reused: false },
+          }) + "\n" };
+        }),
+      }));
+    assert.deepEqual(probes, [["127.0.0.1", 8744], ["::1", 8744]]);
+    assert.deepEqual(decoded(invocations), [{ version: 2, action: "open-web", url, backendHost: reachable }]);
+    pinned(invocations[0]!);
+  }
+});
+
+test("both reachable localhost families use the first matching company resolver entry", async () => {
+  for (const [order, expected] of [
+    [[{ address: "::1", family: 6 }, { address: "127.0.0.1", family: 4 }], "::1"],
+    [[{ address: "192.0.2.4", family: 4 }, { address: "127.0.0.1", family: 4 },
+      { address: "::1", family: 6 }], "127.0.0.1"],
+  ] as const) {
+    const invocations: Invocation[] = [];
+    let dnsCalls = 0;
+    await dispatchOpenTarget("http://localhost:3456/path", "/work", lifetime(), 802,
+      setup(invocations, {
+        probeBackend: async () => true,
+        lookupLocalhost: async () => { dnsCalls++; return order; },
+        spawn: fakeSsh(invocations, (request) => {
+          assert.equal(request.action, "open-web");
+          return { status: 0, stdout: JSON.stringify({
+            ok: true, action: "open-web", openedUrl: request.url,
+            tunnel: { remoteHost: request.backendHost, remotePort: 3456, localPort: 3456, reused: true },
+          }) + "\n" };
+        }),
+      }));
+    assert.equal(dnsCalls, 1);
+    assert.deepEqual(decoded(invocations), [{ version: 2, action: "open-web",
+      url: "http://localhost:3456/path", backendHost: expected }]);
+  }
+});
+
+test("unreachable or resolver-ambiguous localhost fails before SSH with no guessed backend", async () => {
+  for (const [v4, v6, addresses, error] of [
+    [false, false, [], /均无 TCP 服务/u],
+    [true, true, [], /DNS 未返回已验证/u],
+    [true, true, [{ address: "127.0.0.2", family: 4 }], /DNS 未返回已验证/u],
+  ] as const) {
+    const invocations: Invocation[] = [];
+    await assert.rejects(dispatchOpenTarget("http://localhost:4234/", "/work", lifetime(), 802,
+      setup(invocations, {
+        probeBackend: async (host) => host === "::1" ? v6 : v4,
+        lookupLocalhost: async () => addresses,
+      })), error);
+    assert.deepEqual(invocations, []);
+  }
+});
+
+test("localhost TCP and DNS probes obey abort and one bounded deadline before SSH", async () => {
+  const invocations: Invocation[] = [];
+  const controller = new AbortController();
+  const active = lifetime(controller);
+  let started!: () => void;
+  const bothStarted = new Promise<void>((resolve) => { started = resolve; });
+  const signals: AbortSignal[] = [];
+  const pending = dispatchOpenTarget("http://localhost:4234/", "/work", active, 802,
+    setup(invocations, { probeBackend: async (_host, _port, signal) => {
+      signals.push(signal);
+      if (signals.length === 2) started();
+      return await new Promise<boolean>(() => {});
+    } }));
+  await bothStarted;
+  controller.abort();
+  await assert.rejects(pending, /打开动作已失效/u);
+  assert.ok(signals.every((signal) => signal.aborted));
+  assert.deepEqual(invocations, []);
+
+  const tcpSignals: AbortSignal[] = [];
+  await assert.rejects(dispatchOpenTarget("https://localhost/", "/work", lifetime(), 802,
+    setup(invocations, { backendTimeoutMs: 15, probeBackend: async (_host, _port, signal) => {
+      tcpSignals.push(signal);
+      return await new Promise<boolean>(() => {});
+    } })), /TCP\/DNS 探测超时/u);
+  assert.ok(tcpSignals.every((signal) => signal.aborted));
+  let dnsSignal: AbortSignal | undefined;
+  await assert.rejects(dispatchOpenTarget("https://localhost/", "/work", lifetime(), 802,
+    setup(invocations, { backendTimeoutMs: 15, probeBackend: async () => true,
+      lookupLocalhost: async (signal) => { dnsSignal = signal; return await new Promise(() => {}); },
+    })), /TCP\/DNS 探测超时/u);
+  assert.equal(dnsSignal?.aborted, true);
+  assert.deepEqual(invocations, []);
+});
+
+test("localhost PREPARED must attest selected backend, original hostname and exact port", async () => {
+  const url = "https://localhost:8453/p";
+  for (const [openedUrl, remoteHost, localPort] of [
+    [url, "127.0.0.1", 8453],
+    ["https://127.0.0.1:8453/p", "::1", 8453],
+    [url, "::1", 45555],
+  ] as const) {
+    const invocations: Invocation[] = [];
+    await assert.rejects(dispatchOpenTarget(url, "/work", lifetime(), 802, setup(invocations, {
+      probeBackend: async (host) => host === "::1",
+      spawn: fakeSsh(invocations, () => ({ status: 0, stdout: JSON.stringify({
+        ok: true, action: "open-web", openedUrl,
+        tunnel: { remoteHost, remotePort: 8453, localPort, reused: false },
+      }) + "\n" })),
+    })), /网页\/隧道目标不匹配/u);
+    assert.equal(invocations[0]!.input.trimEnd().split("\n").length, 1,
+      "wrong PREPARED must not COMMIT");
+  }
+  const invocations: Invocation[] = [];
+  await assert.rejects(dispatchOpenTarget(url, "/work", lifetime(), 802, setup(invocations, {
+    probeBackend: async (host) => host === "::1",
+    spawn: fakeSsh(invocations, () => ({ status: 0, stdout: JSON.stringify({
+      ok: true, action: "open-web", openedUrl: url, tunnel: null,
+    }) + "\n" })),
+  })), /缺少必需的公司回环隧道/u);
+  assert.equal(invocations[0]!.input.trimEnd().split("\n").length, 1);
+});
+
+test("external, explicit IP, file and local routes never consult localhost probes", async () => {
+  const invocations: Invocation[] = [];
+  const calls: string[] = [];
+  const deps = setup(invocations, {
+    probeBackend: async () => { throw Error("unexpected localhost probe"); },
+    lookupLocalhost: async () => { throw Error("unexpected localhost DNS"); },
+    local: async () => { calls.push("local"); },
+    stat: async () => ({ isFile: () => true, isDirectory: () => false }),
+    spawn: fakeSsh(invocations, (request) => {
+      if (request.action === "open-file") return { status: 0, stdout: JSON.stringify({
+        ok: true, action: "open-file", kind: request.kind, path: request.path,
+      }) + "\n" };
+      return { status: 0, stdout: JSON.stringify({ ok: true, action: "open-web",
+        openedUrl: request.url, tunnel: request.url.includes("127.0.0.1") ?
+          { remoteHost: "127.0.0.1", remotePort: 8453, localPort: 8453, reused: false } : null,
+      }) + "\n" };
+    }),
+  });
+  await dispatchOpenTarget("http://127.0.0.1:8453/p", "/work", lifetime(), 802, deps);
+  await dispatchOpenTarget("https://[::1]:8453/p", "/work", lifetime(), 802,
+    { ...deps, spawn: fakeSsh(invocations, (request) => {
+      assert.equal(request.action, "open-web");
+      return { status: 0, stdout: JSON.stringify({
+        ok: true, action: "open-web", openedUrl: request.url,
+        tunnel: { remoteHost: "::1", remotePort: 8453, localPort: 8453, reused: false },
+      }) + "\n" };
+    }) });
+  await dispatchOpenTarget("https://example.org/x", "/work", lifetime(), 802, deps);
+  await dispatchOpenTarget("./file.txt", "/work", lifetime(), 802, deps);
+  await dispatchOpenTarget("https://localhost:8453/p", "/work", lifetime(), 802,
+    { ...deps, resolve: async () => "local" });
+  assert.deepEqual(decoded(invocations), [
+    { version: 2, action: "open-web", url: "http://127.0.0.1:8453/p" },
+    { version: 2, action: "open-web", url: "https://[::1]:8453/p" },
+    { version: 2, action: "open-web", url: "https://example.org/x" },
+    { version: 2, action: "open-file", kind: "file", path: "/work/file.txt" },
+  ]);
+  assert.deepEqual(calls, ["local"]);
 });
 
 test("verified peer is pinned into command-line SSH options despite post-resolution alias drift", async () => {
