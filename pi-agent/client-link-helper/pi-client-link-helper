@@ -16,12 +16,14 @@ import subprocess
 import sys
 import tempfile
 import time
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 
 
 SSH_ALIAS = "conley-company"
 REMOTE_CODE = "ssh-remote+conley-company"
 MAX_INPUT = 65536
+MAX_INVENTORY_OUTPUT = 1024 * 1024
+MAX_DIAGNOSTIC_OUTPUT = 4096
 GUI_KEYS = ("DISPLAY", "XAUTHORITY", "WAYLAND_DISPLAY", "XDG_RUNTIME_DIR",
             "DBUS_SESSION_BUS_ADDRESS", "XDG_CURRENT_DESKTOP", "XDG_SESSION_TYPE")
 PID_RE = re.compile(r"Master running \(pid=(\d+)\)")
@@ -39,8 +41,22 @@ def fail(code, message):
     raise LinkError(code, message)
 
 
-def run(argv, *, env=None, timeout=12):
-    """No shell or inherited stdin; a file avoids GUI grandchildren holding a pipe open."""
+def live_group_members(group):
+    """After KILL, wait for owned descendants to exit, not just the leader."""
+    for entry in os.scandir("/proc"):
+        if not entry.name.isdecimal():
+            continue
+        try:
+            fields = Path(entry.path, "stat").read_bytes().decode("utf-8", errors="replace").rpartition(") ")[2].split()
+            if len(fields) > 2 and int(fields[2]) == group and fields[0] not in ("Z", "X"):
+                return True
+        except (FileNotFoundError, ProcessLookupError, PermissionError, ValueError):
+            continue
+    return False
+
+
+def run(argv, *, env=None, timeout=12, output_limit=MAX_DIAGNOSTIC_OUTPUT):
+    """No shell/inherited stdin; distinguish complete bounded output from overflow."""
     with tempfile.TemporaryFile() as output:
         try:
             process = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=output,
@@ -50,20 +66,44 @@ def run(argv, *, env=None, timeout=12):
         try:
             status = process.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
-            os.killpg(process.pid, signal.SIGTERM)
+            group = process.pid
+            try:
+                os.killpg(group, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            grace_end = time.monotonic() + 1
             try:
                 process.wait(timeout=1)
             except subprocess.TimeoutExpired:
-                os.killpg(process.pid, signal.SIGKILL)
-                process.wait()
+                pass
+            remaining = grace_end - time.monotonic()
+            if remaining > 0:
+                time.sleep(remaining)
+            # The leader may have exited while another member ignored TERM.
+            try:
+                os.killpg(group, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            try:
+                process.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                fail("command_timeout", f"{argv[0]} did not reap after SIGKILL")
+            cleanup_end = time.monotonic() + 1
+            while live_group_members(group) and time.monotonic() < cleanup_end:
+                time.sleep(0.01)
+            if live_group_members(group):
+                fail("command_timeout", f"{argv[0]} left owned descendants after SIGKILL")
             fail("command_timeout", f"{argv[0]} did not finish in {timeout}s")
         output.seek(0)
-        text = output.read(4096).decode("utf-8", errors="replace").strip()
+        raw = output.read(output_limit + 1)
+        if len(raw) > output_limit:
+            fail("command_output_overflow", f"{argv[0]} exceeded {output_limit} output bytes")
+        text = raw.decode("utf-8", errors="replace").strip()
     return status, text
 
 
-def checked(argv, code, *, env=None, timeout=12):
-    status, text = run(argv, env=env, timeout=timeout)
+def checked(argv, code, *, env=None, timeout=12, output_limit=MAX_DIAGNOSTIC_OUTPUT):
+    status, text = run(argv, env=env, timeout=timeout, output_limit=output_limit)
     if status:
         fail(code, f"{argv[0]} exited {status}: {text or 'no diagnostic'}")
     return text
@@ -93,15 +133,17 @@ def request():
         if set(data) != {"version", "action", "url"} or not isinstance(data["url"], str):
             fail("invalid_request", "open-web requires only a string url")
     elif action == "open-file":
-        if not {"version", "action", "path"} <= set(data) or not set(data) <= {"version", "action", "path", "line", "column"}:
-            fail("invalid_request", "open-file requires path and optional line/column")
-        if not isinstance(data["path"], str):
-            fail("invalid_request", "path must be a string")
+        if not {"version", "action", "path", "kind"} <= set(data) or not set(data) <= {"version", "action", "path", "kind", "line", "column"}:
+            fail("invalid_request", "open-file requires path, kind, and optional line/column")
+        if not isinstance(data["path"], str) or data["kind"] not in ("file", "directory"):
+            fail("invalid_request", "path must be a string and kind must be file or directory")
         for name in ("line", "column"):
             if name in data and (type(data[name]) is not int or not 1 <= data[name] <= 2147483647):
                 fail("invalid_request", f"{name} must be a positive integer")
         if "column" in data and "line" not in data:
             fail("invalid_request", "column requires line")
+        if data["kind"] == "directory" and "line" in data:
+            fail("invalid_request", "a directory cannot have a line/column")
     else:
         fail("unsupported_target", "action must be open-web or open-file")
     return data
@@ -122,25 +164,37 @@ def web_target(raw):
         fail("unsupported_target", "escaped authority/userinfo is unsupported")
     if port == 0 or parsed.netloc.endswith(":"):
         fail("unsupported_target", "URL port must be a nonempty, nonzero number")
-    if host.lower().rstrip(".") == "localhost":
+    # Browsers apply IDNA and nonstandard IPv4 number rules before connecting.
+    # Only plain ASCII DNS syntax is permitted outside explicit IP/localhost forms;
+    # otherwise a laptop-local listener could be opened as an 'external' URL.
+    if not host.isascii() or host.endswith(".."):
+        fail("unsupported_target", "browser-normalized host spelling is unsupported")
+    canonical_host = host.lower().removesuffix(".")
+    if canonical_host == "localhost":
         bind_host = "127.0.0.1"  # Never browse ambiguous localhost when only IPv4 is owned.
     else:
         try:
             ip = ipaddress.ip_address(host)
         except ValueError:
-            numeric = re.fullmatch(r"(?:0x[0-9a-f]+|[0-9]+)(?:\.(?:0x[0-9a-f]+|[0-9]+))*", host.lower())
-            if host.lower().endswith(".localhost") or numeric:
-                fail("unsupported_target", "ambiguous loopback-like hostname")
+            numeric = re.fullmatch(r"(?:0x[0-9a-f]+|[0-9]+)(?:\.(?:0x[0-9a-f]+|[0-9]+))*", canonical_host)
+            labels = canonical_host.split(".")
+            dns = all(re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", label)
+                      and not label.startswith("xn--") for label in labels)
+            if canonical_host.endswith(".localhost") or numeric or not dns:
+                fail("unsupported_target", "ambiguous or unsupported browser authority")
             bind_host = None
         else:
             mapped = getattr(ip, "ipv4_mapped", None)
             effective_ip = mapped or ip
+            if effective_ip.is_unspecified or (effective_ip.version == 4 and effective_ip.packed[0] == 0):
+                fail("unsupported_target", "unspecified/zero-net address can reach a client-local service")
             bind_host = str(effective_ip) if effective_ip.is_loopback else None
     return parsed, bind_host, port or (443 if parsed.scheme == "https" else 80)
 
 
 def gui_environment():
-    text = checked(["systemctl", "--user", "show-environment"], "gui_unavailable")
+    text = checked(["systemctl", "--user", "show-environment"], "gui_unavailable",
+                   output_limit=MAX_INVENTORY_OUTPUT)
     imported = dict(line.split("=", 1) for line in text.splitlines() if "=" in line)
     gui = {key: value for key, value in os.environ.items() if key not in GUI_KEYS}
     gui.update({key: imported[key] for key in GUI_KEYS if key in imported})
@@ -149,7 +203,7 @@ def gui_environment():
     if not runtime or not os.path.isabs(runtime) or not bus:
         fail("gui_unavailable", "systemd user environment has no runtime dir or session bus")
     text = checked(["loginctl", "show-user", str(os.getuid()), "-p", "Display", "-p", "Sessions"],
-                   "gui_unavailable")
+                   "gui_unavailable", output_limit=MAX_INVENTORY_OUTPUT)
     user = dict(line.split("=", 1) for line in text.splitlines() if "=" in line)
     session = user.get("Display", "")
     sessions = user.get("Sessions", "").split()
@@ -158,7 +212,8 @@ def gui_environment():
     graphical = []
     for candidate in sessions:
         properties = checked(["loginctl", "show-session", candidate, "-p", "Active", "-p", "Remote",
-                              "-p", "Type", "-p", "Class", "-p", "User"], "gui_unavailable")
+                              "-p", "Type", "-p", "Class", "-p", "User"], "gui_unavailable",
+                             output_limit=MAX_INVENTORY_OUTPUT)
         details = dict(line.split("=", 1) for line in properties.splitlines() if "=" in line)
         if (details.get("Active") == "yes" and details.get("Remote") == "no" and
                 details.get("Class") == "user" and details.get("User") == str(os.getuid()) and
@@ -206,7 +261,8 @@ def private_state(runtime):
 
 
 def ssh_identity():
-    text = checked(["ssh", "-G", SSH_ALIAS], "ssh_config_failed", timeout=8)
+    text = checked(["ssh", "-G", SSH_ALIAS], "ssh_config_failed", timeout=8,
+                   output_limit=MAX_INVENTORY_OUTPUT)
     config = dict(line.split(" ", 1) for line in text.splitlines() if " " in line)
     host, user, port = (config.get(key, "") for key in ("hostname", "user", "port"))
     if not host or any(char.isspace() for char in host + user) or not user or not port.isdecimal() or not 1 <= int(port) <= 65535:
@@ -230,7 +286,8 @@ def master_pid(socket_path, identity):
 
 
 def listeners():
-    text = checked(["ss", "-H", "-ltnp"], "tunnel_unverified", timeout=5)
+    text = checked(["ss", "-H", "-ltnp"], "tunnel_unverified", timeout=5,
+                   output_limit=MAX_INVENTORY_OUTPUT)
     found = []
     for line in text.splitlines():
         columns = line.split(maxsplit=5)
@@ -410,23 +467,29 @@ def open_web(raw, gui, runtime):
     return {"ok": True, "action": "open-web", "openedUrl": url, "tunnel": tunnel}
 
 
-def file_target(path):
+def file_target(data):
+    path = data["path"]
     if not 0 < len(path) <= 4096 or "\0" in path or not PurePosixPath(path).is_absolute():
         fail("unsupported_target", "company path must be a nonempty absolute POSIX path")
+    if "line" in data and ":" in path:
+        fail("unsupported_target", "Code goto cannot preserve a colon-containing filename")
 
 
 def open_file(data, gui):
     path = data["path"]
+    # VS Code cannot stat a remote positional path and guesses by its basename.
+    # The company-side kind selects its typed resource resolver instead.
+    target = quote(path, safe="/")
     args = ["code", "--remote", REMOTE_CODE, "--new-window"]
-    target = path
     if "line" in data:
         args.append("--goto")
         target += f":{data['line']}"
         if "column" in data:
             target += f":{data['column']}"
-    args.extend(["--", target])
+    uri = f"vscode-remote://{REMOTE_CODE}{target}"
+    args.extend(["--file-uri" if data["kind"] == "file" else "--folder-uri", uri])
     checked(args, "code_failed", env=gui, timeout=12)
-    return {"ok": True, "action": "open-file", "path": path}
+    return {"ok": True, "action": "open-file", "path": path, "kind": data["kind"]}
 
 
 def main():
@@ -436,7 +499,7 @@ def main():
         if data["action"] == "open-web":
             web_target(data["url"])
         else:
-            file_target(data["path"])
+            file_target(data)
         gui, runtime = gui_environment()
         response = open_web(data["url"], gui, runtime) if data["action"] == "open-web" else open_file(data, gui)
         status = 0

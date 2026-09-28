@@ -4,10 +4,14 @@
 import json
 import os
 from pathlib import Path
+import runpy
+import shutil
+import signal
 import subprocess
 import sys
 import tempfile
 import unittest
+from urllib.parse import quote
 
 
 MODULE = Path(__file__).resolve().parents[1]
@@ -33,6 +37,8 @@ def save():
     state_path.write_text(json.dumps(state))
 
 if name == "systemctl":
+    if state.get("environment_padding"):
+        print("PADDING=" + "x" * state["environment_padding"])
     if state.get("gui_missing"):
         print("XDG_RUNTIME_DIR=" + os.environ["TEST_RUNTIME"])
     else:
@@ -119,6 +125,8 @@ elif name == "ssh":
         sys.exit(10)
 elif name == "ss":
     assert args == ["-H", "-ltnp"]
+    for number in range(state.get("ss_padding", 0)):
+        print('LISTEN 0 128 127.0.0.1:%d 0.0.0.0:* users:(("fake",pid=123,fd=5))' % (30000 + number))
     for item in state["listeners"]:
         pid = item.get("pid")
         process = 'users:(("ssh",pid=%s,fd=5))' % pid if pid else ""
@@ -286,7 +294,7 @@ class HelperCase(unittest.TestCase):
         self.state.pop("xdg-open_fail")
         self.state["code_fail"] = True
         self.save()
-        status, result = self.invoke({"version": 1, "action": "open-file", "path": "/srv/source.py"})
+        status, result = self.invoke({"version": 1, "action": "open-file", "kind": "file", "path": "/srv/source.py"})
         self.assertEqual((status, result["error"]["code"]), (1, "code_failed"))
 
     def test_multiple_active_graphical_sessions_fail_before_launch(self):
@@ -297,20 +305,74 @@ class HelperCase(unittest.TestCase):
         self.assertFalse(self.calls("ssh"))
         self.assertFalse(self.calls("xdg-open"))
 
-    def test_file_argv_is_remote_and_path_is_never_read_locally(self):
-        path = "/company/not-on-laptop/-name with spaces 'quotes':suffix.py"
-        status, result = self.invoke({"version": 1, "action": "open-file", "path": path,
-                                      "line": 31, "column": 7})
+    def test_file_kind_uri_argv_preserves_remote_paths_and_location(self):
+        prefix = "vscode-remote://ssh-remote+conley-company"
+        path = "/company/not-on-laptop/-name with spaces 'quotes'.py"
+        status, result = self.invoke({"version": 1, "action": "open-file", "kind": "file",
+                                      "path": path, "line": 31, "column": 7})
         self.assertEqual(status, 0)
         self.assertEqual(result["path"], path)
+        self.assertEqual(result["kind"], "file")
         self.assertEqual(self.calls("code")[-1]["args"],
-                         ["--remote", "ssh-remote+conley-company", "--new-window", "--goto", "--", path + ":31:7"])
+                         ["--remote", "ssh-remote+conley-company", "--new-window", "--goto",
+                          "--file-uri", prefix + quote(path, safe="/") + ":31:7"])
         self.assertFalse(self.calls("ssh"))
         self.assertFalse(self.calls("xdg-open"))
-        status, _ = self.invoke({"version": 1, "action": "open-file", "path": "/company/project"})
+        for name in ("Makefile", "Dockerfile", "README"):
+            path = "/company/" + name
+            status, _ = self.invoke({"version": 1, "action": "open-file", "kind": "file", "path": path})
+            self.assertEqual(status, 0)
+            self.assertEqual(self.calls("code")[-1]["args"],
+                             ["--remote", "ssh-remote+conley-company", "--new-window", "--file-uri", prefix + path])
+        status, _ = self.invoke({"version": 1, "action": "open-file", "kind": "directory",
+                                  "path": "/company/project.v2"})
         self.assertEqual(status, 0)
         self.assertEqual(self.calls("code")[-1]["args"],
-                         ["--remote", "ssh-remote+conley-company", "--new-window", "--", "/company/project"])
+                         ["--remote", "ssh-remote+conley-company", "--new-window", "--folder-uri",
+                          prefix + "/company/project.v2"])
+        colon_path = "/company/report:2026#raw?.txt"
+        status, _ = self.invoke({"version": 1, "action": "open-file", "kind": "file", "path": colon_path})
+        self.assertEqual(status, 0)
+        self.assertEqual(self.calls("code")[-1]["args"][-1], prefix + quote(colon_path, safe="/"))
+
+    def test_real_installed_code_resolver_selects_exact_remote_resource(self):
+        self.assertIsNotNone(shutil.which("node"), "installed Code resolver test requires Node")
+        self.assertTrue(Path("/usr/share/code/resources/app/out/main.js").is_file())
+        requests = [
+            {"path": "/company/Makefile", "kind": "file"},
+            {"path": "/company/Dockerfile", "kind": "file"},
+            {"path": "/company/README", "kind": "file"},
+            {"path": "/company/project.v2", "kind": "directory"},
+            {"path": "/company/a b#c?.py", "kind": "file", "line": 31, "column": 7},
+            {"path": "/company/report:2026#raw?.txt", "kind": "file"},
+        ]
+        for target in requests:
+            status, result = self.invoke({"version": 1, "action": "open-file", **target})
+            self.assertEqual(status, 0, result)
+        argvs = [call["args"] for call in self.calls("code")]
+        probe = subprocess.run(["node", str(MODULE / "tests/code_resolver_probe.cjs")],
+                               input=json.dumps(argvs), text=True, capture_output=True, timeout=10)
+        self.assertEqual(probe.returncode, 0, probe.stderr)
+        resolved = json.loads(probe.stdout)
+        self.assertEqual([(resource["kind"], resource["path"]) for resource in resolved],
+                         [(target["kind"], target["path"]) for target in requests])
+        self.assertEqual(resolved[4]["line"], 31)
+        self.assertEqual(resolved[4]["column"], 7)
+        self.assertEqual({resource["remoteAuthority"] for resource in resolved},
+                         {"ssh-remote+conley-company"})
+
+    def test_colon_path_with_goto_and_directory_location_fail_before_code(self):
+        for path in ("/company/report:2026", "/company/report:suffix.py"):
+            with self.subTest(path=path):
+                status, result = self.invoke({"version": 1, "action": "open-file", "kind": "file",
+                                              "path": path, "line": 7})
+                self.assertEqual(status, 1)
+                self.assertEqual(result["error"]["code"], "unsupported_target")
+        status, result = self.invoke({"version": 1, "action": "open-file", "kind": "directory",
+                                      "path": "/company/project", "line": 3})
+        self.assertEqual((status, result["error"]["code"]), (1, "invalid_request"))
+        self.assertFalse(self.calls("code"))
+        self.assertFalse(self.calls("systemctl"))
 
     def test_default_http_port_gets_an_owned_forward(self):
         status, result = self.web("http://127.0.0.1/no-explicit-port?q=1#f")
@@ -341,6 +403,42 @@ class HelperCase(unittest.TestCase):
         self.assertEqual(result["openedUrl"], "http://example.org/a?q=2#x")
         self.assertEqual(len(self.calls("ssh", "-M")), 1)
 
+    def test_browser_normalized_loopback_cannot_open_local_decoy(self):
+        self.state["listeners"] = [{"host": "127.0.0.1", "port": 8795, "pid": 999}]
+        self.save()
+        for url in ("http://127.0.0.1.:8795/path", "http://127.1.:8795/path",
+                    "http://0x7f000001.:8795/path", "http://１２７.０.０.１:8795/path",
+                    "http://0.0.0.0:8795/path", "http://[::]:8795/path"):
+            with self.subTest(url=url):
+                status, result = self.web(url)
+                self.assertEqual(status, 1)
+                self.assertEqual(result["error"]["code"], "unsupported_target")
+        self.assertFalse(self.calls("xdg-open"))
+        self.assertFalse(self.calls("ssh"))
+        self.assertFalse(self.calls("systemctl"))
+
+    def test_long_inventories_are_complete_or_explicit_overflow(self):
+        self.state["ss_padding"] = 90
+        self.state["environment_padding"] = 6000
+        self.save()
+        status, result = self.web("http://127.0.0.1:8743/owned")
+        self.assertEqual(status, 0, result)
+        self.assertEqual(result["tunnel"]["localPort"], 8743)
+        self.state = json.loads(self.state_path.read_text())
+        self.state["listeners"].append({"host": "127.0.0.1", "port": 8795, "pid": 999})
+        self.save()
+        status, collision = self.web("http://127.0.0.1:8795/collision")
+        self.assertEqual(status, 0, collision)
+        self.assertNotEqual(collision["tunnel"]["localPort"], 8795)
+        self.assertEqual(self.calls("xdg-open")[-1]["args"], [collision["openedUrl"]])
+        self.state = json.loads(self.state_path.read_text())
+        self.state["environment_padding"] = 1_100_000
+        self.save()
+        opened = len(self.calls("xdg-open"))
+        status, overflow = self.web("https://example.org/")
+        self.assertEqual((status, overflow["error"]["code"]), (1, "command_output_overflow"))
+        self.assertEqual(len(self.calls("xdg-open")), opened)
+
     def test_reject_malformed_targets_without_side_effect(self):
         requests = [
             b'{"version":1,"version":1,"action":"open-web","url":"http://x"}',
@@ -350,9 +448,10 @@ class HelperCase(unittest.TestCase):
             {"version": 1, "action": "open-web", "url": "file:///tmp/a"},
             {"version": 1, "action": "open-web", "url": "http://127.0.0.1:0/"},
             {"version": 1, "action": "open-web", "url": "http://127.0.0.1:/"},
-            {"version": 1, "action": "open-file", "path": "relative/file"},
-            {"version": 1, "action": "open-file", "path": "/absolute", "line": True},
-            {"version": 1, "action": "open-file", "path": "/absolute", "column": 2},
+            {"version": 1, "action": "open-file", "path": "/absolute"},
+            {"version": 1, "action": "open-file", "path": "relative/file", "kind": "file"},
+            {"version": 1, "action": "open-file", "path": "/absolute", "kind": "file", "line": True},
+            {"version": 1, "action": "open-file", "path": "/absolute", "kind": "file", "column": 2},
         ]
         for value in requests:
             with self.subTest(value=value):
@@ -360,6 +459,38 @@ class HelperCase(unittest.TestCase):
                 self.assertEqual(status, 1)
                 self.assertFalse(result["ok"])
         self.assertEqual(self.logs(), [])
+
+    def test_timeout_kills_term_ignoring_descendant_after_leader_exits(self):
+        helper = runpy.run_path(str(HELPER))
+        child_pid_file = self.root / "child.pid"
+        leader_pid_file = self.root / "leader.pid"
+        child = ("import os,signal,sys,time;"
+                 "signal.signal(signal.SIGTERM,signal.SIG_IGN);"
+                 "open(sys.argv[1],'w').write(str(os.getpid()));"
+                 "time.sleep(30)")
+        leader = ("import os,subprocess,sys,time;"
+                  "subprocess.Popen([sys.executable,'-c',sys.argv[2],sys.argv[1]],"
+                  "stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL);"
+                  "open(sys.argv[3],'w').write(str(os.getpid()));"
+                  "\nwhile not os.path.exists(sys.argv[1]): time.sleep(.01)"
+                  "\ntime.sleep(30)")
+        try:
+            with self.assertRaises(helper["LinkError"]) as caught:
+                helper["run"]([sys.executable, "-c", leader, str(child_pid_file), child,
+                               str(leader_pid_file)], timeout=.5)
+            self.assertEqual(caught.exception.code, "command_timeout")
+            self.assertTrue(child_pid_file.exists(), "child was not ready before timeout")
+            child_pid = int(child_pid_file.read_text())
+            child_stat = Path(f"/proc/{child_pid}/stat")
+            if child_stat.exists():
+                state = child_stat.read_text().split(") ", 1)[1].split()[0]
+                self.assertIn(state, ("Z", "X"), "TERM-ignoring descendant survived timeout")
+        finally:
+            if leader_pid_file.exists():
+                try:
+                    os.killpg(int(leader_pid_file.read_text()), signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
 
     def test_installer_only_owns_a_symlink_and_refuses_foreign_target(self):
         installer = MODULE / "install.sh"
