@@ -3,7 +3,7 @@
 给 Pi **fullscreen 模式**的助手 Markdown 增加两类受控操作：
 
 - 代码块右下角 **[复制]**：左键复制逻辑源文，保留代码自身的缩进、Tab、空行和行尾空格；不复制围栏、Pi 显示缩进、右侧补空格或屏幕折行。
-- Markdown 链接：仅 **Ctrl + 鼠标左键**激活。HTTP(S) 在默认 Chrome 的显式新窗口打开；已存在的本地文件或目录在 VS Code 的显式新窗口打开。普通点击和拖选继续交给 Pi。
+- Markdown 链接：仅 **Ctrl + 鼠标左键**激活。公司本机输入沿用 Chrome/VS Code 显式新窗口；已验证的 conley-Y9000p SSH/tmux 输入通过客户端助手在笔记本默认浏览器或 VS Code Remote-SSH 打开。普通点击和拖选继续交给 Pi。
 
 按下可执行目标时会反色，拖走、失焦、弹窗、滚动、尺寸变化或修饰键不匹配都会取消。每次激活都允许创建一个新应用窗口。
 
@@ -33,7 +33,7 @@ pi --tui-mode fullscreen
 
 接受绝对 `http://` 和 `https://` URL；查询参数和 fragment 原样作为浏览器数据，不解释为编辑器行号。空格、控制字符或无效 URL 会明确失败。
 
-Linux 每次网页激活都会：
+**公司本机输入**沿用原有 Linux 网页启动路径，每次激活都会：
 
 1. 以自有的 `spawn` 子进程、`shell: false`、2.5 秒硬 wall-clock deadline 和有界 stdout/stderr 执行 `xdg-settings get default-web-browser`；deadline/abort/输出溢出会先独立结算调用，再向 detached 进程组发送 SIGTERM，并在 200 ms 内升级 SIGKILL；leader 的 `exit` 只记录状态，不代表 ownership 完成；只有 child `close` 或两个输出流都关闭后才正常结算，因此继承管道的 descendants 会继续受到 deadline 约束；
 2. 要求结果是单个合法 desktop ID；
@@ -43,7 +43,7 @@ Linux 每次网页激活都会：
 
 不会读取 `BROWSER`，不会解析 desktop entry 的 `Exec`，不会搜索替代浏览器，也不会调用 `xdg-open`、`gio open` 或失败后的备用启动器。其他默认浏览器和非 Linux 平台在这个版本中明确失败。
 
-### 本地文件和目录
+### 公司文件和目录
 
 相对路径在**经过验证的 Ctrl+左键松开时**读取一次当前 Pi `ctx.cwd`，随后整次异步打开都使用这个快照。渲染时目录、扩展源码目录和 `process.cwd()` 都不参与解析。
 
@@ -71,7 +71,7 @@ Linux 每次网页激活都会：
 
 激活时使用 `stat` 跟随 symlink。只接受现有普通文件和目录；明确拒绝缺失/无权限/悬空 symlink、FIFO、socket 和设备节点。目录不能带行列。传给 Code 的绝对路径保留解析所得拼写，不做 `realpath`、项目根限制或 inode 固定。
 
-启动参数固定为：
+公司本机输入的启动参数固定为：
 
 ```text
 code --new-window -- /absolute/path
@@ -101,7 +101,13 @@ Pi 在 lexing 前把 Tab 展开成三个空格，native href 还可能保留 cha
 - 普通 local/private link 点击和拖选走 Pi 原生 viewport 状态机，但临时 opener filter 永远挡住所有 `pi-copy://`。只有 stored action kind 决定手势：copy 保留原行为；open/diagnostic/expired 必须是准确 Ctrl+左键，press/release 都满足且无 Shift/Alt/扩展按钮别名。
 - Overlay URL 只由准确 geometry 或 overlay-owned capture 授权。卸载先退役 action、失效 owner、强制同步 composed frame；仅证明 fullscreen 中无私有 URI 后才恢复 input hook。失败则保留单层最小被动 guard；后续实例吸收它，不保留前任闭包，也不覆盖后装 foreign wrapper。
 - tmux 3.4 的受管鼠标绑定在每个原始 SGR 事件前发送 `CSI 998;<client_pid>~`。仅在 `MouseDown1Pane` 等于已验证的 stock `select-pane -t = ; send-keys -M` 时接管它：先按原顺序选 pane，再对本扩展 pane 注入 marker、原样执行 `send-keys -M`；不带本扩展 owner 的 pane 仍依次执行 stock 的 `select-pane -t =` 和 `send-keys -M` 命令；真实双-pane 鼠标透传尚待单独验收。原本无绑定的 `MouseUp1Pane` 加入同样条件透传。旧版 Ctrl 绑定只在当前命令和记录的 receipt 完全一致、且属于已知旧版命令时升级；自定义/版本不符的绑定保留并在 `/copy-links` 告警。不改 `.tmux.conf`、`mouse` 设置或其他 pane。卸载只恢复 pane 所有权；共享绑定保持无主惰性状态，重载凭 receipt 复用。
-- 每个按下/松开都带相同 client PID 才能触发动作；窄 lost-press 恢复也要求先前普通 release 与 orphan Ctrl release 的 PID、cell、私有 URI/action kind 相同，并保持屏幕、尺寸、overlay ownership/snapshot 和无 motion。tmux Ctrl+点击缺失或畸形 marker 时报告错误，不打开链接；非 tmux 输入继续使用原有本机操作。PID 目前仅向打开回调传递，尚未解析 SSH 对端或改用客户端浏览器。当前打开回调**仍在 Pi 主机**运行：不要把本步骤误认为远端打开或自动端口转发。
+- 每个按下/松开都带相同 client PID 才能触发动作；窄 lost-press 恢复也要求先前普通 release 与 orphan Ctrl release 的 PID、cell、私有 URI/action kind 相同，并保持屏幕、尺寸、overlay ownership/snapshot 和无 motion。tmux Ctrl+点击缺失或畸形 marker 时报告错误，不打开链接。打开前再次枚举全部 tmux 客户端，校验准确 PID、当前 pane、完整 `/proc` 祖先链及 starttime；只有 sshd 祖先且 `SSH_CONNECTION` 对端匹配 `ssh -G conley-Y9000p` 的字面 IP/端口才路由远端。验证所得对端会钉在 SSH 命令行，避免 alias 在验证后变化时发往另一主机。公司本机来源沿用原 opener；无 tmux 的本机 Pi 沿用原行为，但没有 tmux 来源的直接 SSH 输入明确拒绝。
+
+### 已验证的 Y9000p 输入
+
+公司侧对语义 href 调用同一 `parseOpenTarget`；网页传规范 HTTP(S) URL。文件路径只在**公司侧**以 `stat` 跟随 symlink，确认普通文件/目录、位置规则及冒号+goto 限制，然后传 `kind`、绝对路径和可选行列。不会在笔记本 stat 公司路径，也不会回退到公司 GUI。
+
+公司侧用一条固定非交互 SSH 控制命令调用笔记本 `~/.local/bin/pi-client-link-helper`；命令含 `-T`、`BatchMode=yes`、`ClearAllForwardings=yes`、`StrictHostKeyChecking=yes`、`ConnectTimeout=8`，目标仍为 `conley-Y9000p`，但 HostName/User/Port 从刚验证的对端强制固定。目标仅作为 version 1 JSON 经 stdin 发送，绝不拼入 shell 或 SSH argv。对一个最多 64 KiB 的 stdout JSON 行、退出状态和 60 秒 deadline 做核对；abort/超时会终止 SSH 进程组，SSH/认证、助手错误及无效回复均报错，不尝试本机打开。助手在笔记本建立/复用自有 `-L`，碰到占用端口会选择自有新端口并改写浏览器 URL；文件/目录用 VS Code Remote-SSH 的 typed URI 打开。客户端助手的安装与实际浏览器页面/Code 窗口验收属于独立步骤；本次源码提交不会部署或重载运行中的 Pi。
 
 显式 `--new-window` 避免扩展主动复用其他 GNOME workspace 的窗口，但 Wayland 下最终 placement 属于 Mutter。真实 GNOME 验收必须作为有界、用户可见的手工步骤：在其他 workspace 已有 Chrome/Code 窗口时，从 Pi workspace 分别 Ctrl+点击网页、文件和目录，观察新窗口是否仍落在当前 workspace。若 compositor 行为不满足预期，需要单独的 GNOME Shell companion；本扩展不虚构 workspace 控制权。
 
@@ -118,6 +124,6 @@ python3 test/native-smoke.py --tmux
 python3 test/native-smoke.py --tmux --regular-start
 ```
 
-单元/集成测试覆盖代码源文、typed action failure atomicity、poisoned-generation clipboard queue、live cwd snapshot、Markdown recursion/table/reference、显式 web entity/reference 语义与 autolink disagreement、完整目标语法、symlink/type/existence、browser default 检测、硬 subprocess deadline 与 TERM/KILL 升级、transactional unref handoff、Chrome/Code argv、async retirement、selection/overlay/opener descriptor/tmux exact-target recovery/reload/quiescence。Native smoke 使用临时 Pi profile、真实 CLI/PTY 和 recorder executables：`wl-copy`、`xdg-settings`、`google-chrome-stable`、`code`；`xdg-open` 是失败 tripwire。它创建真实临时 `.3mf`、`.svg`、`.json` 和目录，只按显示 label 选择目标，不假定每个 `pi-copy://` 都是复制按钮。自动测试不会启动物理 Chrome/Code，也不会修改物理剪贴板。
+单元/集成测试覆盖代码源文、typed action failure atomicity、poisoned-generation clipboard queue、live cwd snapshot、Markdown recursion/table/reference、显式 web entity/reference 语义与 autolink disagreement、完整目标语法、symlink/type/existence、browser default 检测、硬 subprocess deadline 与 TERM/KILL 升级、transactional unref handoff、Chrome/Code argv、来源 PID 解析与客户端地址钉住、fake SSH JSON 协议/失败/abort/no-fallback、async retirement、selection/overlay/opener descriptor/tmux exact-target recovery/reload/quiescence。Native smoke 使用临时 Pi profile、真实 CLI/PTY 和 recorder executables：`wl-copy`、`xdg-settings`、`google-chrome-stable`、`code`；`xdg-open` 是失败 tripwire。它创建真实临时 `.3mf`、`.svg`、`.json` 和目录，只按显示 label 选择目标，不假定每个 `pi-copy://` 都是复制按钮。`--osc52` 模拟没有 tmux 来源的直接 SSH：复制仍通过 OSC52，链接明确拒绝且无公司 GUI 启动；其余模式测试本机打开。自动测试不会启动物理 Chrome/Code，也不会修改物理剪贴板。
 
 卸载前确认 `~/.pi/agent/extensions/pi-copy-links` 是本扩展 symlink，删除后 `/reload`。源码和依赖可保留。

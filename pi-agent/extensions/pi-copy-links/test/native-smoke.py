@@ -230,23 +230,34 @@ try:
     click(link)
     assert records('google-chrome-stable') == [], 'unmodified click opened a browser'
     click(link, 16)
-    wait_for(lambda: len(records('google-chrome-stable')) == 1, 'Ctrl-click browser handoff')
-    assert records('google-chrome-stable') == [{'argv': ['--new-window', url]}]
-    assert records('xdg-settings') == [
-        {'argv': ['get', 'default-web-browser']},
-        {'argv': ['check', 'default-web-browser', 'google-chrome.desktop']},
-    ]
-    local_expectations = [
-        ('MODEL_3MF', ['--new-window', '--', str(root / 'model sample.3mf')]),
-        ('DIAGRAM_SVG', ['--new-window', '--', str(root / 'diagram.svg')]),
-        ('DATA_JSON', ['--new-window', '--goto', '--', str(root / 'data.json') + ':2']),
-        ('SAMPLE_DIR', ['--new-window', '--', str(root / 'sample-dir')]),
-    ]
-    for label, expected in local_expectations:
-        click(target_by_label(after_copy, label), 16)
-        wait_for(lambda: len(records('code')) >= local_expectations.index((label, expected)) + 1,
-                 'Ctrl-click Code handoff ' + label)
-        assert records('code')[-1] == {'argv': expected}
+    if options.osc52:
+        # OSC52 fixture is a direct SSH-like input without a tmux origin. Copy
+        # still works; opening must now fail visibly instead of using company GUI.
+        wait_for(lambda: 'SSH 输入未经过带来源标记的 tmux'.encode() in wire,
+                 'direct SSH without origin refusal')
+        for label in ('MODEL_3MF', 'DIAGRAM_SVG', 'DATA_JSON', 'SAMPLE_DIR'):
+            click(target_by_label(after_copy, label), 16)
+        drain(0.2)
+        assert records('google-chrome-stable') == [] and records('code') == []
+        assert records('xdg-settings') == []
+    else:
+        wait_for(lambda: len(records('google-chrome-stable')) == 1, 'Ctrl-click browser handoff')
+        assert records('google-chrome-stable') == [{'argv': ['--new-window', url]}]
+        assert records('xdg-settings') == [
+            {'argv': ['get', 'default-web-browser']},
+            {'argv': ['check', 'default-web-browser', 'google-chrome.desktop']},
+        ]
+        local_expectations = [
+            ('MODEL_3MF', ['--new-window', '--', str(root / 'model sample.3mf')]),
+            ('DIAGRAM_SVG', ['--new-window', '--', str(root / 'diagram.svg')]),
+            ('DATA_JSON', ['--new-window', '--goto', '--', str(root / 'data.json') + ':2']),
+            ('SAMPLE_DIR', ['--new-window', '--', str(root / 'sample-dir')]),
+        ]
+        for label, expected in local_expectations:
+            click(target_by_label(after_copy, label), 16)
+            wait_for(lambda: len(records('code')) >= local_expectations.index((label, expected)) + 1,
+                     'Ctrl-click Code handoff ' + label)
+            assert records('code')[-1] == {'argv': expected}
     assert records('xdg-open') == [], 'forbidden xdg-open fallback ran'
     # Exercise tmux's lost-press modifier transition while dragging away and back.
     # Forwarded motion must prevent the release-recovery path from opening a URL.
@@ -255,7 +266,8 @@ try:
     send(mouse_sequence(link, 16) + mouse_sequence(away, 48) +
          mouse_sequence(link, 48) + mouse_sequence(link, 16, 'm'))
     drain(0.2)
-    assert records('google-chrome-stable') == [{'argv': ['--new-window', url]}], 'Ctrl-drag opened a browser'
+    expected_browser = [] if options.osc52 else [{'argv': ['--new-window', url]}]
+    assert records('google-chrome-stable') == expected_browser, 'Ctrl-drag opened a browser'
     # Native double-click/selection can itself write OPEN_LINK to the clipboard.
     # Compare each button's new write, rather than mistaking native selection for
     # a duplicate or failed code-copy operation.

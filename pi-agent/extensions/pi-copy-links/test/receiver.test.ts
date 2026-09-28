@@ -102,7 +102,8 @@ async function fails(f: ReturnType<typeof fixture>, origin: number | "unknown", 
 
 test("exact SSH client in shared pane resolves paired receiver with bracketed identity and ancestry", async () => {
   const f = fixture();
-  assert.equal(await resolveInputReceiver(ssh.pid, f.dependencies), "conley-Y9000p");
+  assert.deepEqual(await resolveInputReceiver(ssh.pid, f.dependencies),
+    { kind: "remote", peer: "100.123.34.64", port: 22, user: "conley" });
   assert.deepEqual(f.commands.map(({ program, args }) => `${program} ${args[2] ?? args[0]}`), [
     "tmux list-clients", "tmux display-message", "ssh -G", "tmux list-clients", "tmux display-message",
   ]);
@@ -111,7 +112,16 @@ test("exact SSH client in shared pane resolves paired receiver with bracketed id
   const decorated = fixture();
   decorated.stats.set(2686800, stat(2686800, 2660000, "sshd-session"));
   decorated.stats.set(2660000, stat(2660000, 1, "sshd: conley"));
-  assert.equal(await resolveInputReceiver(ssh.pid, decorated.dependencies), "conley-Y9000p");
+  assert.deepEqual(await resolveInputReceiver(ssh.pid, decorated.dependencies),
+    { kind: "remote", peer: "100.123.34.64", port: 22, user: "conley" });
+});
+
+test("a literal IPv6 peer remains an SSH-usable unbracketed pinned address", async () => {
+  const f = fixture();
+  f.setAlias("hostname 2001:db8::64\nuser conley\nport 2222\n");
+  f.setEnvironment(Buffer.from("SSH_CONNECTION=2001:db8::64 49301 2001:db8::10 2222\0"));
+  assert.deepEqual(await resolveInputReceiver(ssh.pid, f.dependencies),
+    { kind: "remote", peer: "2001:db8::64", port: 2222, user: "conley" });
 });
 
 test("grouped local Ghostty client on same pane is local despite inherited SSH_CONNECTION", async () => {

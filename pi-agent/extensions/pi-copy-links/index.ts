@@ -2,7 +2,7 @@ import { copyToClipboard, VERSION, type ExtensionAPI } from "@earendil-works/pi-
 import type { TUI } from "@earendil-works/pi-tui";
 import { installAdapter } from "./src/adapter.ts";
 import { remoteCopySink } from "./src/remote-copy.ts";
-import { openTarget } from "./src/links.ts";
+import { dispatchOpenTarget } from "./src/dispatcher.ts";
 import { enableTmuxMouse } from "./src/tmux.ts";
 
 const WIDGET = "pi-copy-links:bridge";
@@ -38,9 +38,7 @@ export default function copyLinksExtension(pi: ExtensionAPI): void {
         },
         cwd: () => ctx.cwd,
         requireTmuxOrigin: Boolean(process.env.TMUX),
-        // Origin is frozen at verified release. Client routing is a later change;
-        // this checkpoint retains the existing Pi-host opener as its consumer.
-        open: (href, cwd, lifetime, _origin) => openTarget(href, cwd, lifetime),
+        open: (href, cwd, lifetime, origin) => dispatchOpenTarget(href, cwd, lifetime, origin),
         button: (text) => ctx.ui.theme.fg("accent", text),
         recoverTmuxRelease: () => mouse?.enabled === true && mouse.warnings.length === 0,
         requestRender: () => { tui?.invalidate(); tui?.requestRender(); },

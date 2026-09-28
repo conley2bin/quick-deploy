@@ -10,7 +10,12 @@ const VIEW_FORMAT = "pid=#{client_pid}|tty=#{client_tty}|session=#{session_id}|p
 const REMOTE_ALIAS = "conley-Y9000p";
 const REMOTE_USER = "conley";
 
-export type InputReceiver = "local" | "conley-Y9000p";
+export type InputReceiver = "local" | Readonly<{
+  kind: "remote";
+  peer: string;
+  port: number;
+  user: "conley";
+}>;
 export type ReceiverErrorCode =
   | "invalid-origin" | "missing-tmux" | "command-failed" | "client-not-found"
   | "ambiguous-client" | "client-mismatch" | "pane-mismatch"
@@ -152,7 +157,7 @@ function literalIp(value: string): string | undefined {
   const family = isIP(value);
   if (family === 4) return value;
   if (family === 6) {
-    try { return new URL(`http://[${value}]/`).hostname.toLowerCase(); }
+    try { return new URL(`http://[${value}]/`).hostname.slice(1, -1).toLowerCase(); }
     catch { return undefined; }
   }
   return undefined;
@@ -234,12 +239,14 @@ export async function resolveInputReceiver(
 
   const remote = chain.some((entry) => entry.comm === "sshd" || entry.comm === "sshd-session" ||
     entry.comm.startsWith("sshd:"));
+  let verifiedPeer: { hostname: string; port: number } | undefined;
   if (remote) {
     const connection = await sshConnection(origin, readProc);
     const alias = sshAlias(await command(run, "ssh", ["-G", REMOTE_ALIAS], "ssh -G"));
     if (connection.peer !== alias.hostname || connection.serverPort !== alias.port) {
       reject("ssh-peer-mismatch", `origin SSH peer is not ${REMOTE_ALIAS}`);
     }
+    verifiedPeer = alias;
   }
 
   const last = attachedClient(await inventory(), origin);
@@ -251,5 +258,6 @@ export async function resolveInputReceiver(
   if (!sameAncestry(chain, after) || !sameStat(before, after[0]!)) {
     reject("proc-changed", "origin process ancestry changed during inspection");
   }
-  return remote ? REMOTE_ALIAS : "local";
+  return verifiedPeer ? Object.freeze({ kind: "remote", peer: verifiedPeer.hostname,
+    port: verifiedPeer.port, user: REMOTE_USER }) : "local";
 }

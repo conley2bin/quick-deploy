@@ -165,6 +165,29 @@ function ensureCurrent(lifetime: OpenLifetime): void {
   if (lifetime.signal.aborted || !lifetime.isCurrent()) throw new Error("打开动作已失效");
 }
 
+/** Resolve the company path once; stat follows symlinks and never consults a client filesystem. */
+export async function validateLocalTarget(
+  target: Extract<OpenTarget, { kind: "local" }>,
+  lifetime: OpenLifetime,
+  readStat: NonNullable<OpenTargetDependencies["stat"]> = stat,
+): Promise<"file" | "directory"> {
+  ensureCurrent(lifetime);
+  let metadata;
+  try { metadata = await readStat(target.path); }
+  catch (error) {
+    ensureCurrent(lifetime);
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ENOENT") throw new Error(`目标不存在：${target.path}`);
+    throw new Error(`无法读取目标：${target.path}（${error instanceof Error ? error.message : String(error)}）`);
+  }
+  ensureCurrent(lifetime);
+  const directory = metadata.isDirectory();
+  if (!directory && !metadata.isFile()) throw new Error(`目标不是普通文件或目录：${target.path}`);
+  codeArguments(target, directory); // Also enforces directory/position and Code's colon/goto limit.
+  ensureCurrent(lifetime);
+  return directory ? "directory" : "file";
+}
+
 /** Parse immediately, then validate the frozen request and launch without fallback. */
 export async function openTarget(
   href: string,
@@ -180,18 +203,8 @@ export async function openTarget(
   if ((dependencies.platform ?? process.platform) !== "linux") {
     throw new Error("当前版本仅支持 Linux VS Code 显式新窗口启动");
   }
-  ensureCurrent(lifetime);
-  let metadata;
-  try { metadata = await (dependencies.stat ?? stat)(target.path); }
-  catch (error) {
-    if (lifetime.signal.aborted || !lifetime.isCurrent()) throw new Error("打开动作已失效");
-    const code = (error as NodeJS.ErrnoException).code;
-    if (code === "ENOENT") throw new Error(`目标不存在：${target.path}`);
-    throw new Error(`无法读取目标：${target.path}（${error instanceof Error ? error.message : String(error)}）`);
-  }
-  const directory = metadata.isDirectory();
-  if (!directory && !metadata.isFile()) throw new Error(`目标不是普通文件或目录：${target.path}`);
-  const args = codeArguments(target, directory);
+  const kind = await validateLocalTarget(target, lifetime, dependencies.stat);
+  const args = codeArguments(target, kind === "directory");
   ensureCurrent(lifetime);
   await launchApplication({
     command: "code",
