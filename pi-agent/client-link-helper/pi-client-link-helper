@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path, PurePosixPath
 import re
+import select
 import signal
 import socket
 import stat
@@ -22,6 +23,7 @@ from urllib.parse import quote, urlsplit
 SSH_ALIAS = "conley-company"
 REMOTE_CODE = "ssh-remote+conley-company"
 MAX_INPUT = 65536
+MAX_PREPARE_MS = 45000
 MAX_INVENTORY_OUTPUT = 1024 * 1024
 MAX_DIAGNOSTIC_OUTPUT = 4096
 GUI_KEYS = ("DISPLAY", "XAUTHORITY", "WAYLAND_DISPLAY", "XDG_RUNTIME_DIR",
@@ -118,22 +120,78 @@ def unique_pairs(pairs):
     return result
 
 
-def request():
-    raw = sys.stdin.buffer.read(MAX_INPUT + 1)
-    if len(raw) > MAX_INPUT:
-        fail("invalid_request", "request exceeds 64 KiB")
+def parse_message(raw):
     try:
-        data = json.loads(raw.decode("utf-8"), object_pairs_hook=unique_pairs)
+        return json.loads(raw.decode("utf-8"), object_pairs_hook=unique_pairs)
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
         fail("invalid_request", f"invalid UTF-8 JSON: {error}")
-    if not isinstance(data, dict) or type(data.get("version")) is not int or data["version"] != 1:
-        fail("invalid_request", "expected a version 1 JSON object")
+
+
+class Peer:
+    """Bounded line framing on the live SSH stdin; EOF cannot authorize a launch."""
+    def __init__(self):
+        self.fd = sys.stdin.fileno()
+        os.set_blocking(self.fd, False)
+        self.poller = select.poll()
+        self.poller.register(self.fd, select.POLLIN | select.POLLHUP | select.POLLERR)
+        self.buffer = bytearray()
+        self.eof = False
+
+    def receive(self, wait_ms):
+        for _, events in self.poller.poll(wait_ms):
+            if events & select.POLLERR:
+                fail("request_aborted", "SSH input channel failed")
+            if events & (select.POLLIN | select.POLLHUP):
+                chunk = os.read(self.fd, MAX_INPUT + 1)
+                if chunk:
+                    self.buffer.extend(chunk)
+                else:
+                    self.eof = True
+        if len(self.buffer) > MAX_INPUT and b"\n" not in self.buffer[:MAX_INPUT + 1]:
+            fail("invalid_request", "message exceeds 64 KiB")
+
+    def line(self, deadline, phase):
+        while True:
+            end = self.buffer.find(b"\n")
+            if end >= 0:
+                if end + 1 > MAX_INPUT:
+                    fail("invalid_request", "message exceeds 64 KiB")
+                raw = bytes(self.buffer[:end])
+                del self.buffer[:end + 1]
+                return parse_message(raw)
+            if self.eof:
+                fail("request_aborted", f"SSH input closed before {phase}")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                fail("request_timeout", f"client preparation deadline expired before {phase}")
+            self.receive(min(100, max(1, int(remaining * 1000))))
+
+    def alive(self, deadline):
+        if time.monotonic() >= deadline:
+            fail("request_timeout", "client preparation deadline expired")
+        self.receive(0)
+        if self.eof:
+            fail("request_aborted", "SSH input closed before COMMIT")
+        if self.buffer:
+            fail("invalid_commit", "message arrived before PREPARED or after COMMIT")
+
+
+def request(peer):
+    # Initial request itself is bounded even when a caller never sends newline.
+    data = peer.line(time.monotonic() + MAX_PREPARE_MS / 1000, "request")
+    if not isinstance(data, dict) or type(data.get("version")) is not int or data["version"] != 2 or data.get("phase") != "request":
+        fail("invalid_request", "expected a version 2 request object")
+    duration = data.get("prepareDeadlineMs")
+    if type(duration) is not int or not 1 <= duration <= MAX_PREPARE_MS:
+        fail("invalid_request", "prepareDeadlineMs must be 1..45000")
+    deadline = time.monotonic() + duration / 1000
+    peer.alive(deadline)
     action = data.get("action")
     if action == "open-web":
-        if set(data) != {"version", "action", "url"} or not isinstance(data["url"], str):
+        if set(data) != {"version", "phase", "prepareDeadlineMs", "action", "url"} or not isinstance(data["url"], str):
             fail("invalid_request", "open-web requires only a string url")
     elif action == "open-file":
-        if not {"version", "action", "path", "kind"} <= set(data) or not set(data) <= {"version", "action", "path", "kind", "line", "column"}:
+        if not {"version", "phase", "prepareDeadlineMs", "action", "path", "kind"} <= set(data) or not set(data) <= {"version", "phase", "prepareDeadlineMs", "action", "path", "kind", "line", "column"}:
             fail("invalid_request", "open-file requires path, kind, and optional line/column")
         if not isinstance(data["path"], str) or data["kind"] not in ("file", "directory"):
             fail("invalid_request", "path must be a string and kind must be file or directory")
@@ -146,7 +204,7 @@ def request():
             fail("invalid_request", "a directory cannot have a line/column")
     else:
         fail("unsupported_target", "action must be open-web or open-file")
-    return data
+    return data, deadline
 
 
 def web_target(raw):
@@ -448,14 +506,21 @@ def owned_forward(directory, bind_host, remote_port, identity):
         raise
 
 
-def open_web(raw, gui, runtime):
+def prepare_web(raw, runtime, peer, deadline):
     parsed, bind_host, remote_port = web_target(raw)
     if bind_host is None:
         url, tunnel = raw, None
     else:
         directory, lock_fd = private_state(runtime)
         try:
-            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            while True:
+                peer.alive(deadline)
+                try:
+                    fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    time.sleep(min(0.05, max(0, deadline - time.monotonic())))
+            peer.alive(deadline)
             identity = ssh_identity()
             local_port, reused = owned_forward(directory, bind_host, remote_port, identity)
         finally:
@@ -463,7 +528,6 @@ def open_web(raw, gui, runtime):
         url = replace_port(raw, parsed, bind_host, local_port)
         tunnel = {"remoteHost": bind_host, "remotePort": remote_port,
                   "localPort": local_port, "reused": reused}
-    checked(["xdg-open", url], "browser_failed", env=gui, timeout=12)
     return {"ok": True, "action": "open-web", "openedUrl": url, "tunnel": tunnel}
 
 
@@ -475,7 +539,7 @@ def file_target(data):
         fail("unsupported_target", "Code goto cannot preserve a colon-containing filename")
 
 
-def open_file(data, gui):
+def file_command(data):
     path = data["path"]
     # VS Code cannot stat a remote positional path and guesses by its basename.
     # The company-side kind selects its typed resource resolver instead.
@@ -488,26 +552,48 @@ def open_file(data, gui):
             target += f":{data['column']}"
     uri = f"vscode-remote://{REMOTE_CODE}{target}"
     args.extend(["--file-uri" if data["kind"] == "file" else "--folder-uri", uri])
-    checked(args, "code_failed", env=gui, timeout=12)
-    return {"ok": True, "action": "open-file", "path": path, "kind": data["kind"]}
+    return args, {"ok": True, "action": "open-file", "path": path, "kind": data["kind"]}
+
+
+def emit(response):
+    print(json.dumps(response, ensure_ascii=False, separators=(",", ":")), flush=True)
 
 
 def main():
     try:
-        data = request()
-        # Validate target before touching the GUI or any transport state.
+        peer = Peer()
+        data, deadline = request(peer)
+        # Validate the exact target before touching GUI or transport state.
         if data["action"] == "open-web":
             web_target(data["url"])
         else:
             file_target(data)
+        peer.alive(deadline)
         gui, runtime = gui_environment()
-        response = open_web(data["url"], gui, runtime) if data["action"] == "open-web" else open_file(data, gui)
+        peer.alive(deadline)
+        response = prepare_web(data["url"], runtime, peer, deadline) if data["action"] == "open-web" else file_command(data)[1]
+        peer.alive(deadline)
+        nonce = os.urandom(16).hex()
+        emit({"version": 2, "phase": "prepared", "nonce": nonce, **response})
+        commit = peer.line(deadline, "COMMIT")
+        if (not isinstance(commit, dict) or set(commit) != {"version", "phase", "nonce"} or
+                type(commit["version"]) is not int or commit["version"] != 2 or
+                commit["phase"] != "commit" or commit["nonce"] != nonce):
+            fail("invalid_commit", "expected the matching version 2 COMMIT")
+        # This check is the handoff boundary: once accepted, a later company-side
+        # timeout may not revoke the desktop request. Do not launch on buffered
+        # duplicate messages or an already disconnected transport.
+        peer.alive(deadline)
+        if data["action"] == "open-web":
+            checked(["xdg-open", response["openedUrl"]], "browser_failed", env=gui, timeout=12)
+        else:
+            checked(file_command(data)[0], "code_failed", env=gui, timeout=12)
         status = 0
     except LinkError as error:
         response, status = {"ok": False, "error": {"code": error.code, "message": str(error)}}, 1
     except (OSError, ValueError) as error:
         response, status = {"ok": False, "error": {"code": "runtime_failed", "message": str(error)}}, 1
-    print(json.dumps(response, ensure_ascii=False, separators=(",", ":")), flush=True)
+    emit({"version": 2, "phase": "result", **response})
     return status
 
 

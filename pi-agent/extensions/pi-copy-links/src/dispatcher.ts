@@ -11,11 +11,12 @@ const MAX_REQUEST = 65_536;
 const MAX_REPLY = 65_536;
 const MAX_STDERR = 4_096;
 const HELPER_DEADLINE_MS = 60_000;
+const MAX_PREPARE_MS = 45_000;
 const KILL_GRACE_MS = 200;
 
-type WebRequest = Readonly<{ version: 1; action: "open-web"; url: string }>;
+type WebRequest = Readonly<{ version: 2; action: "open-web"; url: string }>;
 type FileRequest = Readonly<{
-  version: 1; action: "open-file"; kind: "file" | "directory";
+  version: 2; action: "open-file"; kind: "file" | "directory";
   path: string; line?: number; column?: number;
 }>;
 export type HelperRequest = WebRequest | FileRequest;
@@ -94,22 +95,25 @@ function stop(child: ChildProcess): void {
   timer.unref();
 }
 
-/** One request on stdin, one bounded reply; no target ever enters SSH argv or a shell command. */
+/** PREPARED is inspected before COMMIT; stdin stays open until the final reply. */
 export async function runClientHelper(
   receiver: RemoteReceiver, request: HelperRequest, lifetime: OpenLifetime,
   run: HelperSpawn = spawn, timeoutMs = HELPER_DEADLINE_MS,
 ): Promise<void> {
   ensureCurrent(lifetime);
   const args = sshArguments(receiver);
-  const input = Buffer.from(JSON.stringify(request) + "\n", "utf8");
-  if (input.length > MAX_REQUEST) throw new Error("客户端助手请求超过 64 KiB");
   if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0) throw new Error("客户端助手超时设置无效");
-  const result = await new Promise<{ code: number | null; stdout: Buffer; stderr: Buffer }>((resolve, reject) => {
+  const input = Buffer.from(JSON.stringify({ ...request, phase: "request",
+    prepareDeadlineMs: Math.min(timeoutMs, MAX_PREPARE_MS) }) + "\n", "utf8");
+  if (input.length > MAX_REQUEST) throw new Error("客户端助手请求超过 64 KiB");
+  await new Promise<void>((resolve, reject) => {
     let child: ChildProcess | undefined;
     let settled = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
-    const out: Buffer[] = [], err: Buffer[] = [];
-    let outBytes = 0, errBytes = 0;
+    let outBytes = 0, errBytes = 0, lines = 0;
+    let pending = Buffer.alloc(0);
+    let prepared: Record<string, unknown> | undefined;
+    let final: unknown;
     const detach = () => {
       if (timer) clearTimeout(timer);
       lifetime.signal.removeEventListener("abort", onAbort);
@@ -129,24 +133,55 @@ export async function runClientHelper(
       if (child) stop(child);
       reject(error);
     };
-    const append = (chunks: Buffer[], chunk: Buffer | string, stdout: boolean) => {
+    const onOut = (chunk: Buffer | string) => {
+      if (settled) return;
       const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
-      if (stdout) outBytes += bytes.length;
-      else errBytes += bytes.length;
-      if ((stdout ? outBytes > MAX_REPLY : errBytes > MAX_STDERR)) {
-        fail(new Error(`客户端助手${stdout ? "回复" : "诊断"}超过大小限制`));
-      } else chunks.push(bytes);
+      outBytes += bytes.length;
+      if (outBytes > MAX_REPLY) { fail(new Error("客户端助手回复超过大小限制")); return; }
+      pending = Buffer.concat([pending, bytes]);
+      for (let end = pending.indexOf(10); end >= 0 && !settled; end = pending.indexOf(10)) {
+        const raw = pending.subarray(0, end);
+        pending = pending.subarray(end + 1);
+        if (++lines > 2 || raw.includes(13)) { fail(new Error("客户端助手返回无效 JSON 协议回复")); return; }
+        let reply: unknown;
+        try { reply = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(raw)); }
+        catch { fail(new Error("客户端助手返回无效 JSON 协议回复")); return; }
+        if (lines === 1 && record(reply) && reply.phase === "prepared") {
+          try {
+            ensureCurrent(lifetime);
+            if (reply.version !== 2 || typeof reply.nonce !== "string" || !/^[0-9a-f]{32}$/u.test(reply.nonce)) {
+              throw new Error("客户端助手返回无效 PREPARED 协议回复");
+            }
+            verifySuccess(reply, request, "prepared");
+            if (pending.length) throw new Error("客户端助手 PREPARED 后有提前到达的数据");
+            prepared = reply;
+            ensureCurrent(lifetime);
+            child?.stdin?.write(JSON.stringify({ version: 2, phase: "commit", nonce: reply.nonce }) + "\n");
+          } catch (error) { fail(error instanceof Error ? error : new Error(String(error))); return; }
+        } else if (final === undefined && (lines === 2 || lines === 1 && !prepared)) {
+          final = reply;
+        } else { fail(new Error("客户端助手返回无效 JSON 协议回复（消息顺序不匹配）")); return; }
+      }
     };
-    const onOut = (chunk: Buffer | string) => append(out, chunk, true);
-    const onErr = (chunk: Buffer | string) => append(err, chunk, false);
+    const onErr = (chunk: Buffer | string) => {
+      errBytes += Buffer.byteLength(chunk);
+      if (errBytes > MAX_STDERR) fail(new Error("客户端助手诊断超过大小限制"));
+    };
     const onInputError = (error: Error) => fail(new Error(`无法向客户端助手发送请求：${error.message}`));
     const onOutputError = (error: Error) => fail(new Error(`无法读取客户端助手回复：${error.message}`));
     const onAbort = () => fail(new Error("打开动作已失效"));
     const onClose = (code: number | null) => {
       if (settled) return;
+      try {
+        ensureCurrent(lifetime);
+        if (pending.length) throw new Error("客户端助手返回无效 JSON 协议回复");
+        verifyReply(code, final, request, prepared);
+        ensureCurrent(lifetime);
+      } catch (error) { fail(error instanceof Error ? error : new Error(String(error))); return; }
       settled = true;
       detach();
-      resolve({ code, stdout: Buffer.concat(out), stderr: Buffer.concat(err) });
+      child?.stdin?.destroy();
+      resolve();
     };
     try {
       child = run("ssh", args, { stdio: ["pipe", "pipe", "pipe"], shell: false, detached: true });
@@ -161,33 +196,24 @@ export async function runClientHelper(
       lifetime.signal.addEventListener("abort", onAbort, { once: true });
       timer = setTimeout(() => fail(new Error(`客户端助手 SSH 请求超时（${timeoutMs} ms）`)), timeoutMs);
       if (lifetime.signal.aborted || !lifetime.isCurrent()) onAbort();
-      else child.stdin.end(input);
+      else child.stdin.write(input);
     } catch (error) {
       fail(new Error(`无法启动客户端 SSH：${error instanceof Error ? error.message : String(error)}`));
     }
   });
-  ensureCurrent(lifetime);
-  verifyReply(result, request);
-  ensureCurrent(lifetime);
 }
 
-function verifyReply(result: { code: number | null; stdout: Buffer; stderr: Buffer }, request: HelperRequest): void {
-  let reply: unknown;
-  try {
-    const text = new TextDecoder("utf-8", { fatal: true }).decode(result.stdout);
-    if (!text.endsWith("\n") || text.indexOf("\n") !== text.length - 1 || text.includes("\r")) {
-      throw new Error("expected exactly one newline-terminated JSON reply");
-    }
-    reply = JSON.parse(text.slice(0, -1));
-  } catch {
-    if (result.code === 255) throw new Error("客户端 SSH 连接或认证失败（退出码 255）");
-    if (result.code === 127) throw new Error("Y9000p 客户端助手未安装或不可执行（退出码 127）");
-    if (result.code !== 0) throw new Error(`客户端 SSH/助手退出码 ${String(result.code)}，且没有有效 JSON 回复`);
+function verifyReply(code: number | null, reply: unknown, request: HelperRequest,
+                     prepared: Record<string, unknown> | undefined): void {
+  if (!record(reply)) {
+    if (code === 255) throw new Error("客户端 SSH 连接或认证失败（退出码 255）");
+    if (code === 127) throw new Error("Y9000p 客户端助手未安装或不可执行（退出码 127）");
+    if (code !== 0) throw new Error(`客户端 SSH/助手退出码 ${String(code)}，且没有有效 JSON 回复`);
     throw new Error("客户端助手返回无效 JSON 协议回复");
   }
-  if (!record(reply)) throw new Error("客户端助手返回无效 JSON 协议回复");
-  if (result.code !== 0) {
-    if (exactKeys(reply, ["ok", "error"]) && reply.ok === false && record(reply.error) &&
+  if (reply.version !== 2 || reply.phase !== "result") throw new Error("客户端助手返回无效 JSON 协议回复");
+  if (code !== 0) {
+    if (exactKeys(reply, ["version", "phase", "ok", "error"]) && reply.ok === false && record(reply.error) &&
         exactKeys(reply.error, ["code", "message"]) &&
         typeof reply.error.code === "string" && /^[a-z][a-z0-9_]{0,63}$/u.test(reply.error.code) &&
         typeof reply.error.message === "string" && reply.error.message.length <= 1024 &&
@@ -196,17 +222,31 @@ function verifyReply(result: { code: number | null; stdout: Buffer; stderr: Buff
     }
     throw new Error("客户端助手返回无效 JSON 协议回复（退出状态与错误结构不匹配）");
   }
+  if (!prepared) throw new Error("客户端助手未发送 PREPARED，不能接受成功回复");
+  verifySuccess(reply, request, "result");
+  if (JSON.stringify(targetReply(reply)) !== JSON.stringify(targetReply(prepared))) {
+    throw new Error("客户端助手 PREPARED 与最终目标不匹配");
+  }
+}
+
+function targetReply(reply: Record<string, unknown>): unknown {
+  const { version: _version, phase: _phase, nonce: _nonce, ...target } = reply;
+  return target;
+}
+
+function verifySuccess(reply: Record<string, unknown>, request: HelperRequest,
+                       phase: "prepared" | "result"): void {
   if (reply.ok !== true || reply.action !== request.action) {
     throw new Error("客户端助手返回无效 JSON 协议回复（操作不匹配）");
   }
   if (request.action === "open-file") {
-    if (!exactKeys(reply, ["ok", "action", "kind", "path"]) ||
+    if (!exactKeys(reply, [...(phase === "prepared" ? ["nonce"] : []), "version", "phase", "ok", "action", "kind", "path"]) ||
         reply.kind !== request.kind || reply.path !== request.path) {
       throw new Error("客户端助手返回无效 JSON 协议回复（文件目标不匹配）");
     }
     return;
   }
-  if (!exactKeys(reply, ["ok", "action", "openedUrl", "tunnel"]) ||
+  if (!exactKeys(reply, [...(phase === "prepared" ? ["nonce"] : []), "version", "phase", "ok", "action", "openedUrl", "tunnel"]) ||
       typeof reply.openedUrl !== "string" || !webUrl(reply.openedUrl)) {
     throw new Error("客户端助手返回无效 JSON 协议回复（网页目标不匹配）");
   }
@@ -257,10 +297,10 @@ export async function dispatchOpenTarget(
   if (!receiver || receiver.kind !== "remote") throw new Error("无法确认打开链接的客户端");
   const target = parseOpenTarget(href, cwd);
   let request: HelperRequest;
-  if (target.kind === "web") request = { version: 1, action: "open-web", url: target.url };
+  if (target.kind === "web") request = { version: 2, action: "open-web", url: target.url };
   else {
     const kind = await validateLocalTarget(target, lifetime, dependencies.stat);
-    request = { version: 1, action: "open-file", kind, path: target.path,
+    request = { version: 2, action: "open-file", kind, path: target.path,
       ...(target.line === undefined ? {} : { line: target.line }),
       ...(target.column === undefined ? {} : { column: target.column }) };
   }

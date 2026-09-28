@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Black-box client helper tests: all SSH/desktop commands are isolated fakes."""
 
+import fcntl
 import json
 import os
 from pathlib import Path
@@ -10,6 +11,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from urllib.parse import quote
 
@@ -177,15 +179,47 @@ class HelperCase(unittest.TestCase):
             found = [item for item in found if operation in item["args"]]
         return found
 
+    def start(self, request):
+        process = subprocess.Popen([str(HELPER)], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                   stderr=subprocess.PIPE, env=self.env)
+        data = {"phase": "request", "prepareDeadlineMs": 15000, **request, "version": 2}
+        process.stdin.write(json.dumps(data).encode() + b"\n")
+        process.stdin.flush()
+        return process
+
+    def finish(self, process, prepared):
+        self.assertEqual(prepared["phase"], "prepared", prepared)
+        self.assertEqual(prepared["version"], 2)
+        process.stdin.write(json.dumps({"version": 2, "phase": "commit", "nonce": prepared["nonce"]}).encode() + b"\n")
+        process.stdin.flush()
+        result = json.loads(process.stdout.readline())
+        process.wait(timeout=20)
+        process.stdin.close()
+        self.assertEqual(process.stderr.read(), b"")
+        process.stderr.close()
+        process.stdout.close()
+        self.assertEqual((result["version"], result["phase"]), (2, "result"))
+        return process.returncode, result
+
     def invoke(self, request):
-        raw = request if isinstance(request, bytes) else json.dumps(request).encode()
-        process = subprocess.run([str(HELPER)], input=raw, env=self.env,
-                                 capture_output=True, timeout=20)
-        self.assertEqual(process.stderr, b"")
-        return process.returncode, json.loads(process.stdout)
+        if isinstance(request, bytes):
+            process = subprocess.run([str(HELPER)], input=request, env=self.env,
+                                     capture_output=True, timeout=20)
+            self.assertEqual(process.stderr, b"")
+            return process.returncode, json.loads(process.stdout)
+        process = self.start(request)
+        first = json.loads(process.stdout.readline())
+        if first["phase"] == "result":
+            process.wait(timeout=20)
+            process.stdin.close()
+            self.assertEqual(process.stderr.read(), b"")
+            process.stderr.close()
+            process.stdout.close()
+            return process.returncode, first
+        return self.finish(process, first)
 
     def web(self, url):
-        return self.invoke({"version": 1, "action": "open-web", "url": url})
+        return self.invoke({"action": "open-web", "url": url})
 
     def test_collision_uses_owned_alternative_and_reuses_exact_mapping(self):
         self.state["listeners"] = [{"host": "127.0.0.1", "port": 8743, "pid": 999}]
@@ -237,12 +271,10 @@ class HelperCase(unittest.TestCase):
         self.assertEqual(self.calls("xdg-open")[-1]["args"], [result["openedUrl"]])
 
     def test_simultaneous_requests_are_serialized(self):
-        payload = json.dumps({"version": 1, "action": "open-web", "url": "http://127.0.0.1:8743/same"}).encode()
-        processes = [subprocess.Popen([str(HELPER)], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                      stderr=subprocess.PIPE, env=self.env) for _ in range(2)]
-        results = [process.communicate(payload, timeout=20) for process in processes]
-        self.assertTrue(all(process.returncode == 0 for process in processes), results)
-        parsed = [json.loads(output) for output, _ in results]
+        processes = [self.start({"action": "open-web", "url": "http://127.0.0.1:8743/same"}) for _ in range(2)]
+        results = [self.finish(process, json.loads(process.stdout.readline())) for process in processes]
+        self.assertTrue(all(status == 0 for status, _ in results), results)
+        parsed = [result for _, result in results]
         self.assertEqual(sorted(result["tunnel"]["reused"] for result in parsed), [False, True])
         self.assertEqual(len(self.calls("ssh", "-M")), 1)
         self.assertEqual(len(self.calls("ssh", "forward")), 1)
@@ -441,7 +473,9 @@ class HelperCase(unittest.TestCase):
 
     def test_reject_malformed_targets_without_side_effect(self):
         requests = [
-            b'{"version":1,"version":1,"action":"open-web","url":"http://x"}',
+            b'{"version":2,"version":2,"phase":"request","prepareDeadlineMs":100,"action":"open-web","url":"http://x"}\n',
+            b'{"version":1,"action":"open-web","url":"https://example.org/"}\n',
+            b'{"version":2,"phase":"request","prepareDeadlineMs":45001,"action":"open-web","url":"https://example.org/"}\n',
             {"version": 1, "action": "open-web", "url": "http://user@127.0.0.1:8743/"},
             {"version": 1, "action": "open-web", "url": "http://foo.localhost:8743/"},
             {"version": 1, "action": "open-web", "url": "http://0x7f000001:8743/"},
@@ -491,6 +525,107 @@ class HelperCase(unittest.TestCase):
                     os.killpg(int(leader_pid_file.read_text()), signal.SIGKILL)
                 except ProcessLookupError:
                     pass
+
+    def test_disconnect_while_waiting_for_owned_lock_never_launches_later(self):
+        directory = self.runtime / "pi-client-link-helper"
+        directory.mkdir(mode=0o700)
+        with (directory / "lock").open("w") as lock:
+            os.chmod(directory / "lock", 0o600)
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            process = self.start({"action": "open-web", "url": "http://127.0.0.1:8743/late"})
+            try:
+                until = time.monotonic() + 5
+                while not self.calls("xset") and time.monotonic() < until:
+                    time.sleep(.02)
+                self.assertTrue(self.calls("xset"), "helper did not reach the lock")
+                # Stand in for a dead SSH channel, not just a local child kill.
+                process.stdin.close()
+                process.stdout.close()
+                process.stderr.close()
+            finally:
+                fcntl.flock(lock, fcntl.LOCK_UN)
+                process.wait(timeout=5)
+        self.assertFalse(self.calls("xdg-open"))
+        self.assertFalse(self.calls("ssh", "forward"))
+
+    def test_web_and_file_launch_exactly_once_only_after_matching_commit(self):
+        for request, opener in [({"action": "open-web", "url": "http://127.0.0.1:8743/commit"}, "xdg-open"),
+                                ({"action": "open-file", "kind": "file", "path": "/company/README"}, "code")]:
+            with self.subTest(opener=opener):
+                before = len(self.calls(opener))
+                process = self.start(request)
+                prepared = json.loads(process.stdout.readline())
+                self.assertEqual(prepared["phase"], "prepared")
+                self.assertEqual(prepared["action"], request["action"])
+                self.assertEqual(len(self.calls(opener)), before)
+                status, result = self.finish(process, prepared)
+                self.assertEqual(status, 0, result)
+                self.assertEqual(result["action"], request["action"])
+                self.assertEqual(len(self.calls(opener)), before + 1)
+
+    def test_prepared_disconnect_and_bad_commit_never_launch_web_or_code(self):
+        for request, opener in [({"action": "open-web", "url": "http://127.0.0.1:8743/x"}, "xdg-open"),
+                                ({"action": "open-file", "kind": "file", "path": "/company/file"}, "code")]:
+            with self.subTest(opener=opener):
+                before = len(self.calls(opener))
+                process = self.start(request)
+                prepared = json.loads(process.stdout.readline())
+                self.assertEqual(prepared["phase"], "prepared")
+                process.stdin.close()
+                result = json.loads(process.stdout.readline())
+                self.assertEqual(result["error"]["code"], "request_aborted")
+                self.assertNotEqual(process.wait(timeout=5), 0)
+                process.stdout.close(); process.stderr.close()
+                self.assertEqual(len(self.calls(opener)), before)
+                for commit in [
+                    {"version": 2, "phase": "commit", "nonce": "wrong"},
+                    {"version": 2, "nonce": prepared["nonce"]},
+                    {"version": 1, "phase": "commit", "nonce": prepared["nonce"]},
+                    {"version": 2, "phase": "commit", "nonce": prepared["nonce"], "extra": 1},
+                ]:
+                    process = self.start(request)
+                    current = json.loads(process.stdout.readline())
+                    process.stdin.write(json.dumps({**commit, "nonce": "wrong" if commit["nonce"] == "wrong" else current["nonce"]}).encode() + b"\n")
+                    process.stdin.flush()
+                    result = json.loads(process.stdout.readline())
+                    self.assertEqual(result["error"]["code"], "invalid_commit")
+                    self.assertNotEqual(process.wait(timeout=5), 0)
+                    process.stdin.close(); process.stdout.close(); process.stderr.close()
+                    self.assertEqual(len(self.calls(opener)), before)
+
+    def test_duplicate_commit_and_deadlines_never_launch(self):
+        request = {"action": "open-web", "url": "https://example.org/"}
+        process = self.start(request)
+        prepared = json.loads(process.stdout.readline())
+        commit = json.dumps({"version": 2, "phase": "commit", "nonce": prepared["nonce"]}).encode() + b"\n"
+        process.stdin.write(commit + commit); process.stdin.flush()
+        result = json.loads(process.stdout.readline())
+        self.assertEqual(result["error"]["code"], "invalid_commit")
+        self.assertNotEqual(process.wait(timeout=5), 0)
+        process.stdin.close(); process.stdout.close(); process.stderr.close()
+        self.assertFalse(self.calls("xdg-open"))
+        # GUI preflight spawns several programs before PREPARED. Give it a
+        # realistic budget, then let the helper's commit-wait deadline expire.
+        process = self.start({**request, "prepareDeadlineMs": 5000})
+        first = json.loads(process.stdout.readline())
+        self.assertEqual(first["phase"], "prepared", first)
+        result = json.loads(process.stdout.readline())
+        self.assertEqual(result["error"]["code"], "request_timeout")
+        self.assertNotEqual(process.wait(timeout=5), 0)
+        process.stdin.close(); process.stdout.close(); process.stderr.close()
+        self.assertFalse(self.calls("xdg-open"))
+        directory = self.runtime / "pi-client-link-helper"
+        directory.mkdir(mode=0o700, exist_ok=True)
+        with (directory / "lock").open("w") as lock:
+            os.chmod(directory / "lock", 0o600)
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            process = self.start({"action": "open-web", "url": "http://127.0.0.1:8743/late",
+                                  "prepareDeadlineMs": 5000})
+            result = json.loads(process.stdout.readline())
+            self.assertEqual(result["error"]["code"], "request_timeout")
+            self.assertNotEqual(process.wait(timeout=5), 0)
+            process.stdin.close(); process.stdout.close(); process.stderr.close()
+        self.assertFalse(self.calls("xdg-open"))
 
     def test_installer_only_owns_a_symlink_and_refuses_foreign_target(self):
         installer = MODULE / "install.sh"

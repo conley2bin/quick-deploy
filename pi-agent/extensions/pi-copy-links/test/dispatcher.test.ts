@@ -38,16 +38,45 @@ function fakeSsh(
     Object.assign(child, { stdin, stdout, stderr, kill: (signal: string) => {
       invocation.kills.push(signal); return true;
     } });
-    stdin.on("data", (chunk: Buffer) => { invocation.input += chunk.toString("utf8"); });
-    stdin.on("finish", () => {
-      const response = reply(JSON.parse(invocation.input) as HelperRequest);
-      if (response === "hang") return;
-      queueMicrotask(() => {
-        stdout.end(response.stdout);
-        stderr.end(response.stderr ?? "");
-        child.emit("close", response.status, null);
-      });
+    let buffer = "", lines = 0, response: Exclude<ReturnType<typeof reply>, "hang"> | undefined;
+    stdin.on("data", (chunk: Buffer) => {
+      const text = chunk.toString("utf8");
+      invocation.input += text;
+      buffer += text;
+      for (let end = buffer.indexOf("\n"); end >= 0; end = buffer.indexOf("\n")) {
+        const line = JSON.parse(buffer.slice(0, end)) as Record<string, unknown>;
+        buffer = buffer.slice(end + 1);
+        if (++lines === 1) {
+          assert.equal(line.phase, "request");
+          assert.equal(line.version, 2);
+          assert.ok(Number.isInteger(line.prepareDeadlineMs));
+          const value = reply(line as HelperRequest);
+          if (value === "hang") return;
+          response = value;
+          if (value.status !== 0) {
+            queueMicrotask(() => finish(value));
+            return;
+          }
+          let payload: Record<string, unknown>;
+          try { payload = JSON.parse(value.stdout) as Record<string, unknown>; }
+          catch { payload = {}; }
+          const prepared = { version: 2, phase: "prepared", nonce: "a".repeat(32), ...payload };
+          queueMicrotask(() => stdout.write(JSON.stringify(prepared) + "\n"));
+        } else if (lines === 2) {
+          assert.equal(line.phase, "commit");
+          assert.equal(line.nonce, "a".repeat(32));
+          if (response) queueMicrotask(() => finish(response!));
+        }
+      }
     });
+    function finish(value: Exclude<ReturnType<typeof reply>, "hang">): void {
+      let text = value.stdout;
+      try { text = JSON.stringify({ version: 2, phase: "result", ...JSON.parse(text) }) + "\n"; }
+      catch { /* preserve bad output */ }
+      stdout.end(text);
+      stderr.end(value.stderr ?? "");
+      child.emit("close", value.status, null);
+    }
     return child;
   };
 }
@@ -57,7 +86,11 @@ function setup(invocations: Invocation[], extras: DispatcherDependencies = {}): 
 }
 
 function decoded(invocations: Invocation[]): HelperRequest[] {
-  return invocations.map(({ input }) => JSON.parse(input) as HelperRequest);
+  return invocations.map(({ input }) => {
+    const { phase: _phase, prepareDeadlineMs: _deadline, ...request } =
+      JSON.parse(input.split("\n")[0]!) as Record<string, unknown>;
+    return request as HelperRequest;
+  });
 }
 
 function pinned(invocation: Invocation): void {
@@ -67,7 +100,9 @@ function pinned(invocation: Invocation): void {
     "-o", "StrictHostKeyChecking=yes", "-o", "ConnectTimeout=8", "-o", "HostName=192.0.2.64",
     "-o", "Port=2222", "-o", "User=conley", "conley-Y9000p", "~/.local/bin/pi-client-link-helper"]);
   assert.ok(invocation.input.endsWith("\n"));
-  assert.equal(invocation.input.trimEnd().split("\n").length, 1);
+  assert.equal(invocation.input.trimEnd().split("\n").length, 2);
+  assert.deepEqual(JSON.parse(invocation.input.split("\n")[1]!),
+    { version: 2, phase: "commit", nonce: "a".repeat(32) });
   assert.doesNotMatch(invocation.args.join(" "), /example\.org|work\/|L12/u);
 }
 
@@ -115,7 +150,7 @@ test("verified remote canonical web URL and rewritten loopback tunnel use only J
     }) + "\n" })) });
   await dispatchOpenTarget("HTTP://127.0.0.1:8743/a?q=1#frag", "/work", lifetime(), 802, deps);
   assert.equal(localCalls, 0);
-  assert.deepEqual(decoded(invocations), [{ version: 1, action: "open-web", url: "http://127.0.0.1:8743/a?q=1#frag" }]);
+  assert.deepEqual(decoded(invocations), [{ version: 2, action: "open-web", url: "http://127.0.0.1:8743/a?q=1#frag" }]);
   pinned(invocations[0]!);
 });
 
@@ -158,7 +193,7 @@ test("verified peer is pinned into command-line SSH options despite post-resolut
   await dispatchOpenTarget("https://example.org/a", "/work", lifetime(), 802, dependencies);
   assert.equal(aliasNow, "203.0.113.8");
   pinned(invocations[0]!);
-  assert.deepEqual(decoded(invocations), [{ version: 1, action: "open-web", url: "https://example.org/a" }]);
+  assert.deepEqual(decoded(invocations), [{ version: 2, action: "open-web", url: "https://example.org/a" }]);
   // OpenSSH's actual config expansion must honor the verified endpoint even
   // after a fixture alias changes host/user/port. No real host is contacted.
   const root = mkdtempSync(join(tmpdir(), "pi-dispatcher-config-"));
@@ -185,9 +220,9 @@ test("company stat follows symlinks and transmits exact file/directory kind plus
       await dispatchOpenTarget(href, root, lifetime(), 802, setup(invocations));
     }
     assert.deepEqual(decoded(invocations), [
-      { version: 1, action: "open-file", kind: "file", path: file, line: 12, column: 3 },
-      { version: 1, action: "open-file", kind: "directory", path: folder },
-      { version: 1, action: "open-file", kind: "file", path: link },
+      { version: 2, action: "open-file", kind: "file", path: file, line: 12, column: 3 },
+      { version: 2, action: "open-file", kind: "directory", path: folder },
+      { version: 2, action: "open-file", kind: "file", path: link },
     ]);
     invocations.forEach(pinned);
   } finally { rmSync(root, { recursive: true, force: true }); }
@@ -261,8 +296,38 @@ test("bounded SSH timeout and oversized reply kill the request rather than openi
     setup(invocations, { timeoutMs: 15, spawn: fakeSsh(invocations, () => "hang") })), /SSH 请求超时/u);
   assert.deepEqual(invocations[0]!.kills, ["SIGTERM"]);
   await assert.rejects(dispatchOpenTarget("https://example.org", "/work", lifetime(), 802,
-    setup(invocations, { spawn: fakeSsh(invocations, () => ({ status: 0, stdout: "x".repeat(65_537) })) })), /回复超过大小限制/u);
+    setup(invocations, { spawn: fakeSsh(invocations, () => ({ status: 0, stdout: JSON.stringify({
+      ok: true, action: "open-web", openedUrl: "x".repeat(65_537), tunnel: null,
+    }) + "\n" })) })), /回复超过大小限制/u);
   assert.deepEqual(invocations[1]!.kills, ["SIGTERM"]);
+});
+
+test("cumulative PREPARED plus final stdout remains bounded", async () => {
+  const invocations: Invocation[] = [];
+  const oversizedFinal: HelperSpawn = (command, args, options) => {
+    const invocation: Invocation = { command, args, options, input: "", kills: [] };
+    invocations.push(invocation);
+    const child = new EventEmitter() as ChildProcess;
+    const stdin = new PassThrough(), stdout = new PassThrough(), stderr = new PassThrough();
+    Object.assign(child, { stdin, stdout, stderr, kill: (signal: string) => {
+      invocation.kills.push(signal); return true;
+    } });
+    stdin.on("data", (chunk: Buffer) => {
+      invocation.input += chunk.toString();
+      if (invocation.input.trimEnd().split("\n").length === 1) {
+        stdout.write(JSON.stringify({ version: 2, phase: "prepared", nonce: "a".repeat(32),
+          ok: true, action: "open-web", openedUrl: "https://example.org/", tunnel: null }) + "\n");
+      } else {
+        stdout.write("x".repeat(65_536));
+      }
+    });
+    return child;
+  };
+  await assert.rejects(runClientHelper(client,
+    { version: 2, action: "open-web", url: "https://example.org/" }, lifetime(), oversizedFinal),
+  /回复超过大小限制/u);
+  assert.equal(invocations[0]!.input.trimEnd().split("\n").length, 2);
+  assert.deepEqual(invocations[0]!.kills, ["SIGTERM"]);
 });
 
 test("a real fake-SSH process holding pipes is killed after the independent deadline", async () => {
@@ -273,18 +338,38 @@ test("a real fake-SSH process holding pipes is killed after the independent dead
     return child;
   };
   await assert.rejects(runClientHelper(client,
-    { version: 1, action: "open-web", url: "https://example.org/" }, lifetime(), standIn, 100),
+    { version: 2, action: "open-web", url: "https://example.org/" }, lifetime(), standIn, 100),
   /SSH 请求超时/u);
   assert.ok(pid);
   await new Promise((resolve) => setTimeout(resolve, 350));
   assert.throws(() => process.kill(pid!, 0), { code: "ESRCH" });
 });
 
+test("invalid PREPARED and lifetime revoked before COMMIT never authorize the helper", async () => {
+  const invocations: Invocation[] = [];
+  await assert.rejects(dispatchOpenTarget("https://example.org/a", "/work", lifetime(), 802,
+    setup(invocations, { spawn: fakeSsh(invocations, () => ({ status: 0, stdout: JSON.stringify({
+      ok: true, action: "open-web", openedUrl: "https://attacker.invalid", tunnel: null,
+    }) + "\n" })) })), /网页目标不匹配/u);
+  assert.equal(invocations[0]!.input.trimEnd().split("\n").length, 1);
+  const active = lifetime();
+  await assert.rejects(runClientHelper(client,
+    { version: 2, action: "open-web", url: "https://example.org/" }, active,
+    fakeSsh(invocations, (request) => {
+      active.current = false;
+      assert.equal(request.action, "open-web");
+      return { status: 0, stdout: JSON.stringify({
+        ok: true, action: "open-web", openedUrl: request.url, tunnel: null,
+      }) + "\n" };
+    })), /动作已失效/u);
+  assert.equal(invocations[1]!.input.trimEnd().split("\n").length, 1);
+});
+
 test("reply processing checks lifetime after SSH completes", async () => {
   const active = lifetime();
   const invocations: Invocation[] = [];
   await assert.rejects(runClientHelper(client,
-    { version: 1, action: "open-web", url: "https://example.org/" }, active,
+    { version: 2, action: "open-web", url: "https://example.org/" }, active,
     fakeSsh(invocations, () => {
       active.current = false;
       return { status: 0, stdout: JSON.stringify({ ok: true, action: "open-web",
