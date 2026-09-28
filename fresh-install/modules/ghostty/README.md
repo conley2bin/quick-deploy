@@ -82,6 +82,8 @@ sudo apt install --allow-downgrades ghostty=1.3.1~ppa2-noble1
   - 从模块内 C 源码编译的用户级库及逐字节校验副本；只在新启动的原生 Wayland Ghostty 生效
 - `~/.local/bin/ghostty`
   - 唯一受保护的用户级启动器；图形菜单、Ctrl+Alt+T 和交互式 PATH 都指向它
+- `~/.local/bin/ghostty-pi`
+  - 只供主动打开 Pi 专用窗口的入口；转交给上述受保护启动器，并仅在新进程内把 `Ctrl+Shift+V` 转为原始 `Ctrl+V` 输入（见下节）
 - `~/.local/share/applications/com.mitchellh.ghostty.desktop`
   - 由系统模板 `/usr/share/applications/com.mitchellh.ghostty.desktop` 逐行生成，把两个 `Exec=` 改为
     用户级启动器与 `--gtk-single-instance=false`，并写 `DBusActivatable=false`；系统文件本身不改
@@ -178,6 +180,31 @@ keybind = ctrl+shift+v=paste_from_clipboard
   Ghostty 选区，`Ctrl+Shift+C` 直接可用。
 - `never` 会让终端内程序永远收不到 Shift+鼠标组合；这是为稳定保留本地复制
   手势付出的明确代价。本机当前的 Pi/tmux 工作流不依赖该组合。
+
+### Pi 专用窗口：Ctrl+Shift+V 复用 Pi 的 Ctrl+V
+
+需使用另一条粘贴读取路径时，主动启动 `~/.local/bin/ghostty-pi`。它先通过
+`~/.local/bin/ghostty` 保留 Wayland 背压修复，再以独立 Ghostty 进程覆盖**一条**
+按键：`--keybind=ctrl+shift+v=text:\x16`。Ghostty 的 `text` 动作向 pty 发送
+原始 0x16（Ctrl+V），由 Pi 已有的 `app.clipboard.pasteImage` 绑定进入原生
+图片优先/文本回退粘贴入口；SSH 输入时仍由已安装的 Pi 剪贴板桥按原有逻辑
+处理。它不调用 Ghostty 的 `paste_from_clipboard`，所以避开该窗口内可能陈旧的
+GTK 剪贴板读取。`Ctrl+V`、`Ctrl+C`、Ghostty 的 `Ctrl+Shift+C`、OSC 52
+复制链和全局配置一律不变。
+
+```bash
+~/.local/bin/ghostty-pi                    # 打开新窗口；在其中运行 piox
+~/.local/bin/ghostty-pi -e tmux attach-session -t quick-deploy_pi-agent
+                                            # 附着已有 tmux/Pi session，不新起 Pi
+```
+
+第二条命令的 `-e` 后面原样传给 Ghostty；tmux 中选到原有 Pi window 即可。
+不要加 `tmux attach -d`，它会断开其他正在观看该 session 的客户端。这个入口
+是**窗口级**而不是程序检测：切到同一窗口的 shell/tmux 其他 pane 时，
+`Ctrl+Shift+V` 仍发送原始 Ctrl+V，**不会**执行 Ghostty 的文本粘贴；需要
+终端粘贴就使用普通 Ghostty 窗口。现有运行中的 Ghostty 窗口不会因安装而
+改变按键，必须从新入口打开。安装器只接受目标不存在或逐字节匹配的受管
+`ghostty-pi`；用户自有文件、符号链接及目录均明确拒绝覆盖。
 
 ## 字体
 
@@ -400,7 +427,7 @@ GTK/libwayland 符号进入库；事故原始负载没有复现，不能许诺�
 bash ../../tests/ghostty/run.sh
 ```
 
-预检报告：系统与架构、Ghostty 版本、apt 候选版本、PPA 是否已在源中、配置状态、C 编译器与 Wayland 背压库/启动器状态、用户级 desktop 覆盖状态（已是基准内容 / 将被替换 / 将被拒绝）、两种字体、`xterm-ghostty` terminfo（含 OSC 52 所需的 `Ms` 能力是否在场）、SSH 鼠标自愈 hook、当前默认终端所有者以及计划动作。它不会添加软件源、调用修改状态的 apt 命令、访问 GitHub、下载文件或写入用户目录。
+预检报告：系统与架构、Ghostty 版本、apt 候选版本、PPA 是否已在源中、配置状态、C 编译器与 Wayland 背压库/启动器状态、Pi 专用启动器状态（缺失 / 基准 / 将拒绝覆盖）、用户级 desktop 覆盖状态（已是基准内容 / 将被替换 / 将被拒绝）、两种字体、`xterm-ghostty` terminfo（含 OSC 52 所需的 `Ms` 能力是否在场）、SSH 鼠标自愈 hook、当前默认终端所有者以及计划动作。它不会添加软件源、调用修改状态的 apt 命令、访问 GitHub、下载文件或写入用户目录。
 
 ## 安装后的用户验收清单
 
@@ -418,7 +445,8 @@ bash ../../tests/ghostty/run.sh
    infocmp -x xterm-ghostty | ssh HOST -- tic -x -
    ```
 
-10. SSH 进远端并进入 Pi 全屏（或 tmux `mouse on`）后，验证“鼠标上报下的复制”一节的两条键：普通拖选被程序接管；按住 **Shift** 拖选产生 Ghostty 本地选区，再按 `Ctrl+Shift+C`；`Ctrl+Shift+V` 应把本机剪贴板内容粘贴进去。
+10. SSH 进远端并进入 Pi 全屏（或 tmux `mouse on`）后，在**普通 Ghostty 窗口**验证“鼠标上报下的复制”一节的两条键：普通拖选被程序接管；按住 **Shift** 拖选产生 Ghostty 本地选区，再按 `Ctrl+Shift+C`；`Ctrl+Shift+V` 应把本机剪贴板内容粘贴进去。
+11. 从 `ghostty-pi` 的新窗口进入同一 Pi 输入，先后按 `Ctrl+V` 和 `Ctrl+Shift+V`，核对两者读取相同的当前文本；图片粘贴也应进入 Pi 已有路径。普通窗口仍按第 10 条工作。
 
 GUI 冒烟测试只在 `DISPLAY` 或 `WAYLAND_DISPLAY` 存在时运行。它不使用 xdotool、XTEST、libXtst 或任何合成键鼠事件；测试依据是从受保护启动器启动的进程持续存活、stderr 未出现错误，以及 `/proc/<pid>/maps` 中出现 fcitx5 GTK4 immodule（在 Wayland 下还要出现背压库）。
 

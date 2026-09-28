@@ -149,6 +149,84 @@ if [ -x /usr/bin/ghostty ]; then
 fi
 
 # ============================================================
+# Pi 专用入口：仅覆盖当前新进程的 Ctrl+Shift+V，普通启动器保持原样。
+# 录制真实渲染脚本交给受保护启动器的 argv；不启动 GUI 或读写剪贴板。
+# ============================================================
+cat > "$WORK/ghostty-argv-recorder" <<'EOF'
+#!/bin/sh
+for arg in "$@"; do printf '%s\0' "$arg"; done
+EOF
+chmod 755 "$WORK/ghostty-argv-recorder"
+HOME="$WORK/pi-launcher-home" bash -c '
+    set -euo pipefail
+    source "$1"
+    mkdir -p "$(dirname "$USER_GHOSTTY_LAUNCHER")"
+    cp "$2" "$USER_GHOSTTY_LAUNCHER"
+    cp "$USER_GHOSTTY_LAUNCHER" "$HOME/normal-baseline"
+    test "$(pi_launcher_state)" = "未安装（正式安装将生成）"
+    install_pi_launcher > "$HOME/first.log"
+    verify_pi_launcher >/dev/null
+    sh -n "$USER_PI_GHOSTTY_LAUNCHER"
+    cmp -s "$USER_PI_GHOSTTY_LAUNCHER" <(render_pi_launcher)
+    cmp -s "$USER_GHOSTTY_LAUNCHER" "$HOME/normal-baseline"
+    test "$(pi_launcher_state)" = "已是当前基准"
+    digest=$(sha256sum "$USER_PI_GHOSTTY_LAUNCHER" | cut -d" " -f1)
+    install_pi_launcher > "$HOME/second.log"
+    grep -Fq "文件无变化" "$HOME/second.log"
+    test "$digest" = "$(sha256sum "$USER_PI_GHOSTTY_LAUNCHER" | cut -d" " -f1)"
+    ! compgen -G "$USER_PI_GHOSTTY_LAUNCHER.bak.*" >/dev/null
+    cmp -s "$USER_GHOSTTY_LAUNCHER" "$HOME/normal-baseline"
+    "$USER_PI_GHOSTTY_LAUNCHER" -e tmux attach-session -t quick-deploy_pi-agent > "$HOME/attach-argv"
+    "$USER_PI_GHOSTTY_LAUNCHER" --working-directory=inherit > "$HOME/generic-argv"
+    "$USER_GHOSTTY_LAUNCHER" > "$HOME/normal-argv"
+' _ "$WORK/functions.sh" "$WORK/ghostty-argv-recorder" \
+    || fail "Pi 专用启动器未安全渲染、转发参数或幂等安装"
+python3 - "$WORK/pi-launcher-home" <<'PY'
+from pathlib import Path
+import sys
+
+home = Path(sys.argv[1])
+def argv(name):
+    raw = (home / name).read_bytes()
+    assert raw.endswith(b"\0"), (name, raw)
+    return [value.decode() for value in raw[:-1].split(b"\0")]
+
+special = ["--gtk-single-instance=false", r"--keybind=ctrl+shift+v=text:\x16"]
+assert argv("attach-argv") == special + ["-e", "tmux", "attach-session", "-t", "quick-deploy_pi-agent"]
+assert argv("generic-argv") == special + ["--working-directory=inherit"]
+assert (home / "normal-argv").read_bytes() == b"", "ordinary Ghostty entry gained flags"
+PY
+
+for kind in custom symlink directory nonexec; do
+    HOME="$WORK/pi-refuse-$kind" bash -c '
+        set -euo pipefail
+        source "$1"
+        mkdir -p "$(dirname "$USER_PI_GHOSTTY_LAUNCHER")"
+        case "$2" in
+            custom) printf "KEEP\n" > "$USER_PI_GHOSTTY_LAUNCHER" ;;
+            symlink) printf "KEEP\n" > "$HOME/target"; ln -s "$HOME/target" "$USER_PI_GHOSTTY_LAUNCHER" ;;
+            directory) mkdir "$USER_PI_GHOSTTY_LAUNCHER"; printf "KEEP\n" > "$USER_PI_GHOSTTY_LAUNCHER/content" ;;
+            nonexec) render_pi_launcher > "$USER_PI_GHOSTTY_LAUNCHER"; chmod 644 "$USER_PI_GHOSTTY_LAUNCHER" ;;
+        esac
+        case "$2" in
+            custom) test "$(pi_launcher_state)" = "含非基准内容（正式安装将拒绝覆盖）" ;;
+            symlink) test "$(pi_launcher_state)" = "符号链接（正式安装将拒绝覆盖）" ;;
+            directory) test "$(pi_launcher_state)" = "不是普通文件（正式安装将拒绝覆盖）" ;;
+            nonexec) test "$(pi_launcher_state)" = "内容相同但不可执行（正式安装将拒绝覆盖）" ;;
+        esac
+        ( install_pi_launcher ) > "$HOME/refuse.log" 2>&1 && exit 1
+        grep -Fq "拒绝覆盖" "$HOME/refuse.log"
+        ! compgen -G "$USER_PI_GHOSTTY_LAUNCHER.bak.*" >/dev/null
+        case "$2" in
+            custom) test "$(cat "$USER_PI_GHOSTTY_LAUNCHER")" = KEEP ;;
+            symlink) test -L "$USER_PI_GHOSTTY_LAUNCHER" && test "$(cat "$HOME/target")" = KEEP ;;
+            directory) test -d "$USER_PI_GHOSTTY_LAUNCHER" && test "$(cat "$USER_PI_GHOSTTY_LAUNCHER/content")" = KEEP ;;
+            nonexec) test -f "$USER_PI_GHOSTTY_LAUNCHER" && test ! -x "$USER_PI_GHOSTTY_LAUNCHER" && cmp -s "$USER_PI_GHOSTTY_LAUNCHER" <(render_pi_launcher) ;;
+        esac
+    ' _ "$WORK/functions.sh" "$kind" || fail "Pi 专用启动器未拒绝 $kind 用户目标"
+done
+
+# ============================================================
 # 用户级 desktop 覆盖：只改三处启动语义，幂等，拒绝覆盖带用户改动的文件
 # ============================================================
 # fixture 构造与系统模板同构的入口：两个 Exec= 带 --gtk-single-instance=true，
@@ -629,7 +707,7 @@ if command -v cc >/dev/null 2>&1; then
 fi
 
 if [ "$HAVE_ZSH" = true ]; then
-    echo "PASS: Ghostty single-installer Wayland backpressure, desktop migration, font/clipboard/SSH integration"
+    echo "PASS: Ghostty single-installer Wayland backpressure, Pi-scoped launcher, desktop migration, font/clipboard/SSH integration"
 else
-    echo "PASS (zsh 未安装，hook 行为与 PTY 部分已跳过): Ghostty single-installer Wayland backpressure, desktop migration, font/clipboard integration"
+    echo "PASS (zsh 未安装，hook 行为与 PTY 部分已跳过): Ghostty single-installer Wayland backpressure, Pi-scoped launcher, desktop migration, font/clipboard integration"
 fi

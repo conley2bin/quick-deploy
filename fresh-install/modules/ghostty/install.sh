@@ -44,6 +44,7 @@ USER_DESKTOP_DIR="$HOME/.local/share/applications"
 USER_DESKTOP_FILE="$USER_DESKTOP_DIR/$DESKTOP_ID"
 GHOSTTY_BIN="/usr/bin/ghostty"
 USER_GHOSTTY_LAUNCHER="$HOME/.local/bin/ghostty"
+USER_PI_GHOSTTY_LAUNCHER="$HOME/.local/bin/ghostty-pi"
 BACKPRESSURE_SOURCE="$SCRIPT_DIR/wayland-backpressure.c"
 BACKPRESSURE_LIBRARY="$HOME/.local/lib/ghostty/libwayland-backpressure.so"
 BACKPRESSURE_STATE="$HOME/.config/ghostty/wayland-backpressure"
@@ -445,6 +446,7 @@ show_check() {
     fi
     echo "配置: $CONFIG_FILE —— $(config_state)"
     echo "Wayland 背压修复: $(backpressure_state)"
+    echo "Pi 专用启动器: $USER_PI_GHOSTTY_LAUNCHER —— $(pi_launcher_state)"
     echo "用户级 desktop 覆盖: $USER_DESKTOP_FILE —— $(desktop_override_state)"
     echo "字体:"
     if font_exists "$FONT_FAMILY"; then
@@ -1113,6 +1115,54 @@ verify_backpressure() {
     echo "OK: 原生 Wayland 背压修复库与启动器已托管（新启动的窗口生效）"
 }
 
+# 独立 Ghostty 进程中的唯一按键差异：把 Ctrl+Shift+V 转成 Ctrl+V 原始字节。
+# 必须经过已验证的用户级启动器，保留原生 Wayland 背压保护；-e 及其后所有
+# 参数原样传给 Ghostty。普通 Ghostty 的配置、desktop 和快捷键均不变。
+render_pi_launcher() {
+    cat <<'EOF'
+#!/bin/sh
+# 由 fresh-install/modules/ghostty/install.sh 生成与维护。
+exec "$HOME/.local/bin/ghostty" --gtk-single-instance=false '--keybind=ctrl+shift+v=text:\x16' "$@"
+EOF
+}
+
+pi_launcher_state() {
+    if [ ! -e "$USER_PI_GHOSTTY_LAUNCHER" ] && [ ! -L "$USER_PI_GHOSTTY_LAUNCHER" ]; then
+        echo "未安装（正式安装将生成）"
+    elif [ -L "$USER_PI_GHOSTTY_LAUNCHER" ]; then
+        echo "符号链接（正式安装将拒绝覆盖）"
+    elif [ ! -f "$USER_PI_GHOSTTY_LAUNCHER" ]; then
+        echo "不是普通文件（正式安装将拒绝覆盖）"
+    elif cmp -s "$USER_PI_GHOSTTY_LAUNCHER" <(render_pi_launcher); then
+        if [ -x "$USER_PI_GHOSTTY_LAUNCHER" ]; then
+            echo "已是当前基准"
+        else
+            echo "内容相同但不可执行（正式安装将拒绝覆盖）"
+        fi
+    else
+        echo "含非基准内容（正式安装将拒绝覆盖）"
+    fi
+}
+
+install_pi_launcher() {
+    [ ! -L "$USER_PI_GHOSTTY_LAUNCHER" ] || die "Pi 专用 Ghostty 启动器是符号链接，拒绝覆盖: $USER_PI_GHOSTTY_LAUNCHER"
+    if [ -e "$USER_PI_GHOSTTY_LAUNCHER" ]; then
+        [ -f "$USER_PI_GHOSTTY_LAUNCHER" ] || die "Pi 专用 Ghostty 启动器不是普通文件，拒绝覆盖: $USER_PI_GHOSTTY_LAUNCHER"
+        cmp -s "$USER_PI_GHOSTTY_LAUNCHER" <(render_pi_launcher) \
+            || die "用户已有自定义 Pi 专用 Ghostty 启动器，拒绝覆盖: $USER_PI_GHOSTTY_LAUNCHER"
+        [ -x "$USER_PI_GHOSTTY_LAUNCHER" ] \
+            || die "Pi 专用 Ghostty 启动器内容相同但不可执行，拒绝覆盖: $USER_PI_GHOSTTY_LAUNCHER"
+    fi
+    write_atomic_text "$USER_PI_GHOSTTY_LAUNCHER" "$(render_pi_launcher)"$'\n' 755
+}
+
+verify_pi_launcher() {
+    [ -x "$USER_PI_GHOSTTY_LAUNCHER" ] &&
+        cmp -s "$USER_PI_GHOSTTY_LAUNCHER" <(render_pi_launcher) \
+        || die "Pi 专用 Ghostty 启动器不是可执行的受管基准: $USER_PI_GHOSTTY_LAUNCHER"
+    echo "OK: Pi 专用启动器经受保护的 Ghostty 启动器新开独立进程"
+}
+
 # ============================================
 # 用户级 desktop 覆盖：外部启动不复用已有进程
 # ============================================
@@ -1695,9 +1745,11 @@ main() {
     section "[1/10] 安装最新版 Ghostty"
     install_ghostty
 
-    section "[2/10] 构建并托管原生 Wayland 背压修复"
+    section "[2/10] 构建并托管原生 Wayland 背压修复和 Pi 专用启动器"
     install_backpressure
     verify_backpressure
+    install_pi_launcher
+    verify_pi_launcher
 
     # 字体必须先于写配置：render_config 用 font_exists 决定要不要写
     # font-family 行，顺序反了就会把刚装上的字体漏写。
@@ -1742,6 +1794,7 @@ main() {
     echo "版本: $(installed_version)"
     echo "配置: $CONFIG_FILE"
     echo "Wayland 修复启动器: $USER_GHOSTTY_LAUNCHER"
+    echo "Pi 专用启动器: $USER_PI_GHOSTTY_LAUNCHER"
     echo "外部启动: 每个窗口独立进程（$USER_DESKTOP_FILE）"
     if [ "$DEFAULT_TERMINAL" = true ]; then
         echo "Ctrl+Alt+T: 已通过 $TERMINAL_WRAPPER 接管"
