@@ -1,0 +1,452 @@
+#!/usr/bin/env python3
+"""Y9000p-side, one-request JSON link opener. No Pi/server-side routing here."""
+
+import errno
+import fcntl
+import hashlib
+import ipaddress
+import json
+import os
+from pathlib import Path, PurePosixPath
+import re
+import signal
+import socket
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+from urllib.parse import urlsplit
+
+
+SSH_ALIAS = "conley-company"
+REMOTE_CODE = "ssh-remote+conley-company"
+MAX_INPUT = 65536
+GUI_KEYS = ("DISPLAY", "XAUTHORITY", "WAYLAND_DISPLAY", "XDG_RUNTIME_DIR",
+            "DBUS_SESSION_BUS_ADDRESS", "XDG_CURRENT_DESKTOP", "XDG_SESSION_TYPE")
+PID_RE = re.compile(r"Master running \(pid=(\d+)\)")
+SS_PID_RE = re.compile(r"\bpid=(\d+)\b")
+SOCKET_NAME_RE = re.compile(r"m-[0-9a-f]{24}\.sock")
+
+
+class LinkError(Exception):
+    def __init__(self, code, message):
+        super().__init__(message)
+        self.code = code
+
+
+def fail(code, message):
+    raise LinkError(code, message)
+
+
+def run(argv, *, env=None, timeout=12):
+    """No shell or inherited stdin; a file avoids GUI grandchildren holding a pipe open."""
+    with tempfile.TemporaryFile() as output:
+        try:
+            process = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=output,
+                                       stderr=subprocess.STDOUT, env=env, start_new_session=True)
+        except OSError as error:
+            fail("command_start_failed", f"{argv[0]}: {error}")
+        try:
+            status = process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            os.killpg(process.pid, signal.SIGTERM)
+            try:
+                process.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                os.killpg(process.pid, signal.SIGKILL)
+                process.wait()
+            fail("command_timeout", f"{argv[0]} did not finish in {timeout}s")
+        output.seek(0)
+        text = output.read(4096).decode("utf-8", errors="replace").strip()
+    return status, text
+
+
+def checked(argv, code, *, env=None, timeout=12):
+    status, text = run(argv, env=env, timeout=timeout)
+    if status:
+        fail(code, f"{argv[0]} exited {status}: {text or 'no diagnostic'}")
+    return text
+
+
+def unique_pairs(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            fail("invalid_request", f"duplicate JSON key: {key}")
+        result[key] = value
+    return result
+
+
+def request():
+    raw = sys.stdin.buffer.read(MAX_INPUT + 1)
+    if len(raw) > MAX_INPUT:
+        fail("invalid_request", "request exceeds 64 KiB")
+    try:
+        data = json.loads(raw.decode("utf-8"), object_pairs_hook=unique_pairs)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        fail("invalid_request", f"invalid UTF-8 JSON: {error}")
+    if not isinstance(data, dict) or type(data.get("version")) is not int or data["version"] != 1:
+        fail("invalid_request", "expected a version 1 JSON object")
+    action = data.get("action")
+    if action == "open-web":
+        if set(data) != {"version", "action", "url"} or not isinstance(data["url"], str):
+            fail("invalid_request", "open-web requires only a string url")
+    elif action == "open-file":
+        if not {"version", "action", "path"} <= set(data) or not set(data) <= {"version", "action", "path", "line", "column"}:
+            fail("invalid_request", "open-file requires path and optional line/column")
+        if not isinstance(data["path"], str):
+            fail("invalid_request", "path must be a string")
+        for name in ("line", "column"):
+            if name in data and (type(data[name]) is not int or not 1 <= data[name] <= 2147483647):
+                fail("invalid_request", f"{name} must be a positive integer")
+        if "column" in data and "line" not in data:
+            fail("invalid_request", "column requires line")
+    else:
+        fail("unsupported_target", "action must be open-web or open-file")
+    return data
+
+
+def web_target(raw):
+    if not raw or len(raw) > 8192 or any(ord(char) <= 32 or ord(char) == 127 or char == "\\" for char in raw):
+        fail("unsupported_target", "URL contains whitespace/control/backslash or is too long")
+    try:
+        parsed = urlsplit(raw)
+        host = parsed.hostname
+        port = parsed.port
+    except ValueError as error:
+        fail("unsupported_target", f"invalid URL authority: {error}")
+    if parsed.scheme not in ("http", "https") or not parsed.netloc or not host or parsed.username is not None or parsed.password is not None:
+        fail("unsupported_target", "expected an http(s) URL with a host and no userinfo")
+    if "%" in parsed.netloc or "@" in parsed.netloc:
+        fail("unsupported_target", "escaped authority/userinfo is unsupported")
+    if port == 0 or parsed.netloc.endswith(":"):
+        fail("unsupported_target", "URL port must be a nonempty, nonzero number")
+    if host.lower().rstrip(".") == "localhost":
+        bind_host = "127.0.0.1"  # Never browse ambiguous localhost when only IPv4 is owned.
+    else:
+        try:
+            ip = ipaddress.ip_address(host)
+        except ValueError:
+            numeric = re.fullmatch(r"(?:0x[0-9a-f]+|[0-9]+)(?:\.(?:0x[0-9a-f]+|[0-9]+))*", host.lower())
+            if host.lower().endswith(".localhost") or numeric:
+                fail("unsupported_target", "ambiguous loopback-like hostname")
+            bind_host = None
+        else:
+            mapped = getattr(ip, "ipv4_mapped", None)
+            effective_ip = mapped or ip
+            bind_host = str(effective_ip) if effective_ip.is_loopback else None
+    return parsed, bind_host, port or (443 if parsed.scheme == "https" else 80)
+
+
+def gui_environment():
+    text = checked(["systemctl", "--user", "show-environment"], "gui_unavailable")
+    imported = dict(line.split("=", 1) for line in text.splitlines() if "=" in line)
+    gui = {key: value for key, value in os.environ.items() if key not in GUI_KEYS}
+    gui.update({key: imported[key] for key in GUI_KEYS if key in imported})
+    runtime = imported.get("XDG_RUNTIME_DIR")
+    bus = imported.get("DBUS_SESSION_BUS_ADDRESS")
+    if not runtime or not os.path.isabs(runtime) or not bus:
+        fail("gui_unavailable", "systemd user environment has no runtime dir or session bus")
+    text = checked(["loginctl", "show-user", str(os.getuid()), "-p", "Display", "-p", "Sessions"],
+                   "gui_unavailable")
+    user = dict(line.split("=", 1) for line in text.splitlines() if "=" in line)
+    session = user.get("Display", "")
+    sessions = user.get("Sessions", "").split()
+    if not session or session not in sessions or any(not re.fullmatch(r"[A-Za-z0-9_-]+", item) for item in sessions):
+        fail("gui_unavailable", "no identified local GUI session")
+    graphical = []
+    for candidate in sessions:
+        properties = checked(["loginctl", "show-session", candidate, "-p", "Active", "-p", "Remote",
+                              "-p", "Type", "-p", "Class", "-p", "User"], "gui_unavailable")
+        details = dict(line.split("=", 1) for line in properties.splitlines() if "=" in line)
+        if (details.get("Active") == "yes" and details.get("Remote") == "no" and
+                details.get("Class") == "user" and details.get("User") == str(os.getuid()) and
+                details.get("Type") in ("x11", "wayland")):
+            graphical.append((candidate, details["Type"]))
+    if len(graphical) != 1 or graphical[0][0] != session or imported.get("XDG_SESSION_TYPE") != graphical[0][1]:
+        fail("gui_unavailable", "systemd environment does not identify one active local GUI session")
+    kind = graphical[0][1]
+    if kind == "x11":
+        if not imported.get("DISPLAY") or not imported.get("XAUTHORITY"):
+            fail("gui_unavailable", "active X11 display/authority is missing")
+        checked(["xset", "q"], "gui_unavailable", env=gui, timeout=4)
+    else:
+        wayland = imported.get("WAYLAND_DISPLAY")
+        if not wayland or "/" in wayland:
+            fail("gui_unavailable", "active Wayland socket is missing")
+        try:
+            with socket.socket(socket.AF_UNIX) as probe:
+                probe.settimeout(2)
+                probe.connect(os.path.join(runtime, wayland))
+        except OSError as error:
+            fail("gui_unavailable", f"Wayland compositor is unreachable: {error}")
+    return gui, runtime
+
+
+def private_state(runtime):
+    root = Path(runtime)
+    try:
+        info = root.stat()
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+            fail("invalid_state", "XDG_RUNTIME_DIR must be a private directory owned by this user")
+        directory = root / "pi-client-link-helper"
+        directory.mkdir(mode=0o700, exist_ok=True)
+        info = directory.lstat()
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o700:
+            fail("invalid_state", "helper state directory is not private")
+        lock_fd = os.open(directory / "lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+        info = os.fstat(lock_fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o600:
+            os.close(lock_fd)
+            fail("invalid_state", "helper lock is not private")
+        return directory, lock_fd
+    except OSError as error:
+        fail("invalid_state", f"cannot create private runtime state: {error}")
+
+
+def ssh_identity():
+    text = checked(["ssh", "-G", SSH_ALIAS], "ssh_config_failed", timeout=8)
+    config = dict(line.split(" ", 1) for line in text.splitlines() if " " in line)
+    host, user, port = (config.get(key, "") for key in ("hostname", "user", "port"))
+    if not host or any(char.isspace() for char in host + user) or not user or not port.isdecimal() or not 1 <= int(port) <= 65535:
+        fail("ssh_config_failed", "configured SSH alias has no usable hostname/user/port")
+    return {"host": host, "user": user, "port": int(port)}
+
+
+def mux_args(socket_path, operation, identity):
+    return ["ssh", "-F", "/dev/null", "-S", str(socket_path), "-O", operation,
+            "-o", "BatchMode=yes", "-p", str(identity["port"]), "-l", identity["user"], identity["host"]]
+
+
+def master_pid(socket_path, identity):
+    status, text = run(mux_args(socket_path, "check", identity), timeout=6)
+    if status:
+        return None
+    match = PID_RE.search(text)
+    if not match:
+        fail("tunnel_unverified", "SSH master check returned no process identity")
+    return int(match.group(1))
+
+
+def listeners():
+    text = checked(["ss", "-H", "-ltnp"], "tunnel_unverified", timeout=5)
+    found = []
+    for line in text.splitlines():
+        columns = line.split(maxsplit=5)
+        if len(columns) < 5 or columns[0] != "LISTEN":
+            continue
+        try:
+            host, port = columns[3].rsplit(":", 1)
+            port = int(port)
+        except ValueError:
+            fail("tunnel_unverified", "unrecognized ss listener address")
+        found.append((host.strip("[]"), port, {int(pid) for pid in SS_PID_RE.findall(line)}))
+    return found
+
+
+def owns_listener(bind_host, port, pid):
+    return any(host == bind_host and number == port and pid in pids
+               for host, number, pids in listeners())
+
+
+def replace_port(raw, parsed, bind_host, port):
+    # Keep original path, query, fragment, delimiters and encoding byte-for-byte.
+    scheme_end = raw.find("://") + 3
+    authority = f"[{bind_host}]" if ":" in bind_host else bind_host
+    return raw[:scheme_end] + f"{authority}:{port}" + raw[scheme_end + len(parsed.netloc):]
+
+
+def record_path(directory, host, port):
+    digest = hashlib.sha256(f"{host}\0{port}".encode()).hexdigest()[:32]
+    return directory / f"e-{digest}.json"
+
+
+def load_record(path, directory, endpoint, identity):
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return None
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o600 or info.st_size > 4096:
+        fail("invalid_state", "tunnel record is not a private regular file")
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError) as error:
+        fail("invalid_state", f"unreadable tunnel record: {error}")
+    if (not isinstance(data, dict) or set(data) != {"version", "endpoint", "identity", "local_port", "socket", "pid"} or
+            data["version"] != 1 or data["endpoint"] != endpoint or data["identity"] != identity or
+            type(data["local_port"]) is not int or not 1 <= data["local_port"] <= 65535 or
+            type(data["pid"]) is not int or data["pid"] <= 0 or
+            not isinstance(data["socket"], str) or Path(data["socket"]).parent != directory or
+            not SOCKET_NAME_RE.fullmatch(Path(data["socket"]).name)):
+        fail("invalid_state", "tunnel record does not match the exact owned endpoint/SSH identity")
+    return data
+
+
+def save_record(path, data):
+    fd, name = tempfile.mkstemp(prefix="record-", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w") as output:
+            json.dump(data, output)
+            output.flush()
+            os.fsync(output.fileno())
+        os.chmod(name, 0o600)
+        os.replace(name, path)
+    finally:
+        if os.path.exists(name):
+            os.unlink(name)
+
+
+def stale_socket(socket_path):
+    try:
+        info = socket_path.lstat()
+    except FileNotFoundError:
+        return
+    if not stat.S_ISSOCK(info.st_mode) or info.st_uid != os.getuid():
+        fail("invalid_state", "stale SSH control path is not an owned socket")
+    socket_path.unlink()
+
+
+def can_bind_preferred(bind_host, port):
+    family = socket.AF_INET6 if ":" in bind_host else socket.AF_INET
+    with socket.socket(family) as probe:
+        try:
+            probe.bind((bind_host, port))
+        except OSError as error:
+            if error.errno in (errno.EACCES, errno.EADDRINUSE):
+                return False
+            fail("ssh_forward_failed", f"local loopback bind preflight failed: {error}")
+    return True
+
+
+def free_candidate(bind_host):
+    family = socket.AF_INET6 if ":" in bind_host else socket.AF_INET
+    with socket.socket(family) as probe:
+        probe.bind((bind_host, 0))
+        return probe.getsockname()[1]
+
+
+def forward_spec(bind_host, local_port, remote_port):
+    address = f"[{bind_host}]" if ":" in bind_host else bind_host
+    return f"{address}:{local_port}:{address}:{remote_port}"
+
+
+def owned_forward(directory, bind_host, remote_port, identity):
+    endpoint = {"host": bind_host, "port": remote_port}
+    path = record_path(directory, bind_host, remote_port)
+    data = load_record(path, directory, endpoint, identity)
+    if data:
+        sock = Path(data["socket"])
+        pid = master_pid(sock, identity)
+        if pid is not None:
+            if pid != data["pid"] or not owns_listener(bind_host, data["local_port"], pid):
+                fail("tunnel_unverified", "live SSH master does not own its recorded exact loopback listener")
+            return data["local_port"], True
+        stale_socket(sock)
+        path.unlink()
+
+    sock = directory / ("m-" + os.urandom(12).hex() + ".sock")
+    checked(["ssh", "-M", "-S", str(sock), "-fN", "-o", "ClearAllForwardings=yes",
+             "-o", "BatchMode=yes", "-o", "ExitOnForwardFailure=yes", "-o", "ConnectTimeout=8",
+             "-o", "StrictHostKeyChecking=yes", SSH_ALIAS], "ssh_master_failed", timeout=12)
+    try:
+        pid = master_pid(sock, identity)
+        if pid is None:
+            fail("ssh_master_failed", "new SSH master is not alive")
+        for attempt in range(12):
+            before = listeners()
+            preferred = (attempt == 0 and not any(number == remote_port for _, number, _ in before)
+                         and (remote_port >= 1024 or can_bind_preferred(bind_host, remote_port)))
+            local_port = remote_port if preferred else free_candidate(bind_host)
+            if any(number == local_port for _, number, _ in before):
+                continue
+            args = mux_args(sock, "forward", identity)
+            args[args.index("-p"):args.index("-p")] = [
+                "-o", "ExitOnForwardFailure=yes", "-L",
+                forward_spec(bind_host, local_port, remote_port)]
+            status, text = run(args, timeout=8)
+            if status:
+                if any(number == local_port for _, number, _ in listeners()):
+                    continue  # A real competing bind raced us; try an owned alternative.
+                fail("ssh_forward_failed", f"SSH forward exited {status}: {text or 'no diagnostic'}")
+            if master_pid(sock, identity) != pid or not owns_listener(bind_host, local_port, pid):
+                fail("tunnel_unverified", "SSH forward returned success without an owned loopback listener")
+            data = {"version": 1, "endpoint": endpoint, "identity": identity,
+                    "local_port": local_port, "socket": str(sock), "pid": pid}
+            save_record(path, data)
+            return local_port, False
+        fail("ssh_forward_failed", "unable to bind an owned local port after 12 attempts")
+    except BaseException:
+        try:
+            run(mux_args(sock, "exit", identity), timeout=6)
+            for _ in range(20):
+                if master_pid(sock, identity) is None:
+                    break
+                time.sleep(0.05)
+            else:
+                fail("ssh_cleanup_failed", f"private SSH master did not exit: {sock}")
+            stale_socket(sock)
+        except LinkError as error:
+            fail("ssh_cleanup_failed", f"cannot close private SSH master {sock}: {error}")
+        raise
+
+
+def open_web(raw, gui, runtime):
+    parsed, bind_host, remote_port = web_target(raw)
+    if bind_host is None:
+        url, tunnel = raw, None
+    else:
+        directory, lock_fd = private_state(runtime)
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            identity = ssh_identity()
+            local_port, reused = owned_forward(directory, bind_host, remote_port, identity)
+        finally:
+            os.close(lock_fd)
+        url = replace_port(raw, parsed, bind_host, local_port)
+        tunnel = {"remoteHost": bind_host, "remotePort": remote_port,
+                  "localPort": local_port, "reused": reused}
+    checked(["xdg-open", url], "browser_failed", env=gui, timeout=12)
+    return {"ok": True, "action": "open-web", "openedUrl": url, "tunnel": tunnel}
+
+
+def file_target(path):
+    if not 0 < len(path) <= 4096 or "\0" in path or not PurePosixPath(path).is_absolute():
+        fail("unsupported_target", "company path must be a nonempty absolute POSIX path")
+
+
+def open_file(data, gui):
+    path = data["path"]
+    args = ["code", "--remote", REMOTE_CODE, "--new-window"]
+    target = path
+    if "line" in data:
+        args.append("--goto")
+        target += f":{data['line']}"
+        if "column" in data:
+            target += f":{data['column']}"
+    args.extend(["--", target])
+    checked(args, "code_failed", env=gui, timeout=12)
+    return {"ok": True, "action": "open-file", "path": path}
+
+
+def main():
+    try:
+        data = request()
+        # Validate target before touching the GUI or any transport state.
+        if data["action"] == "open-web":
+            web_target(data["url"])
+        else:
+            file_target(data["path"])
+        gui, runtime = gui_environment()
+        response = open_web(data["url"], gui, runtime) if data["action"] == "open-web" else open_file(data, gui)
+        status = 0
+    except LinkError as error:
+        response, status = {"ok": False, "error": {"code": error.code, "message": str(error)}}, 1
+    except (OSError, ValueError) as error:
+        response, status = {"ok": False, "error": {"code": "runtime_failed", "message": str(error)}}, 1
+    print(json.dumps(response, ensure_ascii=False, separators=(",", ":")), flush=True)
+    return status
+
+
+if __name__ == "__main__":
+    sys.exit(main())
