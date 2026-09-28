@@ -338,6 +338,51 @@ emulator），不是对 X11 API 的依赖。切到 Wayland 后，只有“按键
 > `GDK_BACKEND=x11 ghostty` 强制走 XWayland 验证，那是排障手段，不是本模块
 > 写入的配置。
 
+## 原生 Wayland：GTK 遇发送背压直接退出的可选防护
+
+在 Ubuntu 24.04 的 GTK 4.14.5 中，`gdk/wayland/gdkeventsource.c` 把
+`wl_display_flush()` 的任何负返回都记录为 `Error flushing display`，随后
+`_exit(1)`。其中 `EAGAIN`（日志常显示“资源暂时不可用”）是非阻塞 Wayland
+套接字暂时写不进去，libwayland 的正常处理应等待 fd 可写并重试。终端进程因此
+退出时 tmux/Pi 往往仍活着；会话附着时的重绘可以使背压显现，但仅凭日志不能
+断言是文字、图片、Ghostty 渲染或 compositor 的哪一个动作先占满了套接字。
+[GTK 4.14.5 源码](https://github.com/GNOME/gtk/blob/4.14.5/gdk/wayland/gdkeventsource.c#L83-L89)、
+[libwayland 1.22 源码](https://github.com/wayland-mirror/wayland/blob/1.22.0/src/connection.c#L289-L317)。
+
+本机可**选择**启用 `wayland-backpressure.sh`，不更改显示后端，不修改系统
+GTK/Ghostty 二进制，不影响正在运行的窗口：
+
+```bash
+cd ~/quick-deploy/fresh-install/modules/ghostty
+bash tests/wayland-backpressure.sh  # 私有 socketpair，真实 libwayland，不碰桌面
+./wayland-backpressure.sh --enable
+./wayland-backpressure.sh --check
+```
+
+它把一个用户级 C 小库装到 `~/.local/lib/ghostty/`，并仅将本模块已生成的
+Ghostty 菜单入口、Ctrl+Alt+T 入口和 `~/.local/bin/ghostty` 命令指向用户级
+包装脚本。脚本仅在 `WAYLAND_DISPLAY` 存在时给新 Ghostty 进程加载此库，
+**不设置 `GDK_BACKEND`**。在 libwayland 发送请求的 `sendmsg` 边界，
+只有登记过的 Wayland 套接字遇到 `EAGAIN` 才最多等待 10 秒可写并重试；
+其他 socket、`EPIPE` 等错误原样传递。只在 GTK 的 `wl_display_flush` 外层
+重试是不够的：libwayland 可能已在填满内部 4096 字节环时锁存 EAGAIN。
+私有实验通过了这个分支的阴性对照、延迟 300ms 后恢复的 600 条有序
+Wayland 消息、SCM_RIGHTS fd 完整性、持续阻塞超时和晚于普通 `sendmsg`
+才加载 Wayland 的子进程。真实 GUI 冒烟验证了 GTK 与 libwayland 的符号
+确实进入该库；尚未重现真实事故的完整负载，不能许诺杜绝所有闪退。
+
+失败必须可见：库丢失或与已装版本不符时包装脚本拒绝启动，不悄悄回退
+到没有保护的 Ghostty；超过 10 秒持续堵塞、Wayland 连接真的断开、
+或非 EAGAIN 的故障仍会失败，并留下 `ghostty-wayland-backpressure:`
+日志。`LD_PRELOAD` 会被终端里启动的程序继承，但拦截发送仅作用于该进程
+内自己登记的 Wayland fd；子程序先网络发送、后加载 Wayland 的路径也已测试。
+不通过菜单/包装脚本而直接执行 `/usr/bin/ghostty` 会绕过防护。
+
+回滚时先执行 `./wayland-backpressure.sh --disable`；它只会在三个启动文件
+仍与启用时逐字节一致时恢复原模块基准，有用户改动就拒绝覆盖。
+**重跑 `install.sh` 之前也先禁用，再安装，之后按需重新启用**；
+`install.sh` 对非基准 desktop 的拒绝是有意的，它不会静默撤销防护。
+
 ## `--check` 是只读预检
 
 ```bash

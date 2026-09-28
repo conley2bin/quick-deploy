@@ -493,8 +493,55 @@ if [ "$HAVE_ZSH" = true ]; then
     python3 "$WORK/pty-check.py" "$HOOK_SOURCE" "$GHOSTTY_RESOURCES_DIR" no
 fi
 
+bash "$MODULE_DIR/tests/wayland-backpressure.sh"
+
+# Opt-in launcher install/rollback: entirely fake HOME, but real vendor desktop
+# template. The original module remains the source of truth for the baseline.
+if [ -f /usr/share/applications/com.mitchellh.ghostty.desktop ] && command -v cc >/dev/null 2>&1; then
+    wayland_home="$WORK/wayland-home"
+    mkdir -p "$wayland_home/.local/share/applications" "$wayland_home/.local/bin"
+    HOME="$wayland_home" bash -c '
+        source "$1"
+        render_desktop_override > "$HOME/.local/share/applications/com.mitchellh.ghostty.desktop"
+    ' _ "$WORK/functions.sh"
+    cat > "$wayland_home/.local/bin/x-terminal-emulator" <<'WRAPPER'
+#!/bin/bash
+# 由 fresh-install/modules/ghostty/install.sh 生成：让 GNOME 的 Ctrl+Alt+T 启动 Ghostty
+exec /usr/bin/ghostty "$@"
+WRAPPER
+    HOME="$wayland_home" bash "$MODULE_DIR/wayland-backpressure.sh" --enable > "$WORK/wayland-enable.log"
+    HOME="$wayland_home" bash "$MODULE_DIR/wayland-backpressure.sh" --check > "$WORK/wayland-check.log"
+    grep -Fq '已启用' "$WORK/wayland-check.log" || fail 'Wayland 启用状态检查失败'
+    grep -Fq "Exec=$wayland_home/.local/bin/ghostty --gtk-single-instance=false" \
+        "$wayland_home/.local/share/applications/com.mitchellh.ghostty.desktop" \
+        || fail '桌面入口未使用有界背压启动器'
+    grep -Fq 'exec "$HOME/.local/bin/ghostty" "$@"' "$wayland_home/.local/bin/x-terminal-emulator" \
+        || fail 'Ctrl+Alt+T 未使用有界背压启动器'
+    mv "$wayland_home/.local/lib/ghostty/libwayland-backpressure.so" "$wayland_home/temporarily-missing.so"
+    if HOME="$wayland_home" WAYLAND_DISPLAY=wayland-0 "$wayland_home/.local/bin/ghostty" +version \
+        > "$WORK/missing-shim.out" 2>&1; then
+        fail '缺失 shim 时启动器静默绕过修复'
+    fi
+    grep -Fq 'shim missing' "$WORK/missing-shim.out" || fail '缺失 shim 未明确报告'
+    mv "$wayland_home/temporarily-missing.so" "$wayland_home/.local/lib/ghostty/libwayland-backpressure.so"
+    printf 'X-User-Custom=keep\n' >> "$wayland_home/.local/share/applications/com.mitchellh.ghostty.desktop"
+    if HOME="$wayland_home" bash "$MODULE_DIR/wayland-backpressure.sh" --disable \
+        > "$WORK/refused-disable.out" 2>&1; then
+        fail '禁用时覆盖用户自定义 desktop'
+    fi
+    grep -Fq 'X-User-Custom=keep' "$wayland_home/.local/share/applications/com.mitchellh.ghostty.desktop" \
+        || fail '禁用时丢失用户自定义 desktop'
+    sed -i '/^X-User-Custom=keep$/d' "$wayland_home/.local/share/applications/com.mitchellh.ghostty.desktop"
+    HOME="$wayland_home" bash "$MODULE_DIR/wayland-backpressure.sh" --disable > "$WORK/wayland-disable.log"
+    HOME="$wayland_home" bash -c '
+        source "$1"
+        cmp -s "$HOME/.local/share/applications/com.mitchellh.ghostty.desktop" <(render_desktop_override)
+    ' _ "$WORK/functions.sh" || fail '禁用后没有恢复模块 desktop 基准'
+    ! test -e "$wayland_home/.local/bin/ghostty" || fail '禁用后遗留启动器'
+fi
+
 if [ "$HAVE_ZSH" = true ]; then
-    echo "PASS: Ghostty SSH mouse cleanup, reset fallback, syntax, idempotency, isolation, write-only OSC 52 clipboard policy, terminfo Ms verification, and desktop override"
+    echo "PASS: Ghostty SSH mouse cleanup, reset fallback, syntax, idempotency, isolation, write-only OSC 52 clipboard policy, terminfo Ms verification, desktop override, and opt-in Wayland backpressure"
 else
     echo "PASS (zsh 未安装，hook 行为与 PTY 部分已跳过): Ghostty syntax, idempotency, isolation, write-only OSC 52 clipboard policy, terminfo Ms verification, and desktop override"
 fi
