@@ -16,6 +16,7 @@
 set -euo pipefail
 
 CHECK_ONLY=false
+PI_LAUNCHER_ONLY=false
 # 默认接管 Ctrl+Alt+T。本模块刚引入时默认为否，是为了不和当时还在的
 # kitty 模块争抢同一个包装脚本（两个模块都写就是后跑者赢，无告警）。
 # kitty 模块已移除，Ghostty 是本仓库唯一的终端模块，该理由不再成立；
@@ -114,9 +115,11 @@ usage() {
     cat <<'EOF'
 用法:
   ./install.sh [--check] [--no-default-terminal] [--ppa-only | --deb-only] [--help]
+  ./install.sh --pi-launcher-only
 
 选项:
   --check                 只读预检：报告当前状态与计划，不安装、不修改
+  --pi-launcher-only      只验证受保护启动器/背压库，再安装 Pi 专用启动器
   --no-default-terminal   不接管 Ctrl+Alt+T（默认会接管）
   --default-terminal      兼容旧命令行，默认已是开启状态
   --ppa-only              只使用第三方 PPA；失败时不退回 GitHub .deb
@@ -129,28 +132,37 @@ usage() {
   Ghostty 配置重置为本模块的基准内容；内容变化时会先保存 .bak.<时间戳> 备份。
   用户级 desktop 覆盖（每个外部启动用独立进程）含本模块之外的改动时，
   脚本会明确失败而不是覆盖，处理方式见 README 的对应章节。
+  --pi-launcher-only 不执行软件包/编译器、配置、字体、桌面入口、默认终端
+  或 GUI 步骤，也不能与其他选项组合。
 EOF
 }
 
 parse_args() {
+    local other_mode=false
     while [ "$#" -gt 0 ]; do
         case "$1" in
-            --check) CHECK_ONLY=true ;;
-            --default-terminal) DEFAULT_TERMINAL=true ;;
-            --no-default-terminal) DEFAULT_TERMINAL=false ;;
+            --check) CHECK_ONLY=true; other_mode=true ;;
+            --pi-launcher-only) PI_LAUNCHER_ONLY=true ;;
+            --default-terminal) DEFAULT_TERMINAL=true; other_mode=true ;;
+            --no-default-terminal) DEFAULT_TERMINAL=false; other_mode=true ;;
             --ppa-only)
                 [ "$INSTALL_MODE" != "deb" ] || die "--ppa-only 与 --deb-only 不能同时使用"
                 INSTALL_MODE="ppa"
+                other_mode=true
                 ;;
             --deb-only)
                 [ "$INSTALL_MODE" != "ppa" ] || die "--ppa-only 与 --deb-only 不能同时使用"
                 INSTALL_MODE="deb"
+                other_mode=true
                 ;;
             --help|-h) usage; exit 0 ;;
             *) die "未知参数: $1（请用 --help 查看用法）" ;;
         esac
         shift
     done
+    if [ "$PI_LAUNCHER_ONLY" = true ] && [ "$other_mode" = true ]; then
+        die "--pi-launcher-only 不能与其他安装或预检选项组合"
+    fi
 }
 
 ensure_not_root() {
@@ -1163,6 +1175,24 @@ verify_pi_launcher() {
     echo "OK: Pi 专用启动器经受保护的 Ghostty 启动器新开独立进程"
 }
 
+# 窄安装只核对现有受保护路径，既不重建库也不加载完整安装预检。
+# 受保护启动器内容、可执行性以及库/校验副本均须保持原来的受管基准。
+verify_pi_launcher_prerequisites() {
+    local command_name
+    for command_name in cat cmp mktemp chmod mkdir mv rm cp date dirname; do
+        require_command "$command_name"
+    done
+    [ -x "$GHOSTTY_BIN" ] || die "Pi 专用启动器依赖已安装的 Ghostty: $GHOSTTY_BIN"
+    [ -f "$USER_GHOSTTY_LAUNCHER" ] && [ ! -L "$USER_GHOSTTY_LAUNCHER" ] \
+        || die "受保护的 Ghostty 启动器缺失或不是受管普通文件: $USER_GHOSTTY_LAUNCHER"
+    [ -f "$BACKPRESSURE_LIBRARY" ] && [ ! -L "$BACKPRESSURE_LIBRARY" ] \
+        || die "Wayland 背压库缺失或不是受管普通文件: $BACKPRESSURE_LIBRARY"
+    [ -d "$BACKPRESSURE_STATE" ] && [ ! -L "$BACKPRESSURE_STATE" ] &&
+        [ -f "$BACKPRESSURE_STATE/enabled.library" ] && [ ! -L "$BACKPRESSURE_STATE/enabled.library" ] \
+        || die "Wayland 背压校验副本缺失或不是受管普通文件: $BACKPRESSURE_STATE/enabled.library"
+    verify_backpressure
+}
+
 # ============================================
 # 用户级 desktop 覆盖：外部启动不复用已有进程
 # ============================================
@@ -1726,6 +1756,13 @@ smoke_test() {
 main() {
     parse_args "$@"
     ensure_not_root
+    if [ "$PI_LAUNCHER_ONLY" = true ]; then
+        verify_pi_launcher_prerequisites
+        install_pi_launcher
+        verify_pi_launcher
+        echo "Pi 专用启动器安装完成: $USER_PI_GHOSTTY_LAUNCHER（其他 Ghostty 状态未改）"
+        return 0
+    fi
     check_supported_system
     preflight_commands
 

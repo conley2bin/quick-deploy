@@ -183,6 +183,19 @@ keybind = ctrl+shift+v=paste_from_clipboard
 
 ### Pi 专用窗口：Ctrl+Shift+V 复用 Pi 的 Ctrl+V
 
+**只部署这个已批准的快捷键入口**时，从仓库根目录运行：
+
+```bash
+bash fresh-install/modules/ghostty/install.sh --pi-launcher-only
+```
+
+此模式先只读核对已安装的 `/usr/bin/ghostty`、受保护的
+`~/.local/bin/ghostty` 的受管字节与可执行性，以及 Wayland 背压库和校验副本
+逐字节一致；不匹配就拒绝写入。然后只在不存在时安装
+`~/.local/bin/ghostty-pi`（已是受管基准则跳过）。不安装软件包、不编译、
+不更新全局 Ghostty 配置/字体/desktop/默认终端，也不运行 GUI 冒烟。
+不要为单独部署此入口运行无参数的完整 `install.sh`。
+
 需使用另一条粘贴读取路径时，主动启动 `~/.local/bin/ghostty-pi`。它先通过
 `~/.local/bin/ghostty` 保留 Wayland 背压修复，再以独立 Ghostty 进程覆盖**一条**
 按键：`--keybind=ctrl+shift+v=text:\x16`。Ghostty 的 `text` 动作向 pty 发送
@@ -415,6 +428,9 @@ GTK/libwayland 符号进入库；事故原始负载没有复现，不能许诺�
 `install.sh`。
 
 ## `--check` 是只读预检
+
+它报告完整安装流程的 apt/配置等计划，不代表 `--pi-launcher-only` 会执行
+这些步骤。两个选项不可组合。
 
 ```bash
 ./install.sh --check

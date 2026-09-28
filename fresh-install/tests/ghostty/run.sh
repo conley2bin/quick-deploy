@@ -227,6 +227,139 @@ for kind in custom symlink directory nonexec; do
 done
 
 # ============================================================
+# 真实窄安装入口：复制同一 install.sh 到无 C 源码的临时包，配备已托管的
+# 启动器/库。若误走完整预检，会在任何写入前因缺 C 源码失败；apt/编译器/
+# GSettings 均用拒绝命令封住，且没有显示会话。全程只在私有 HOME 写入。
+# ============================================================
+mkdir -p "$WORK/pi-only-package" "$WORK/pi-only-deny"
+cp "$INSTALLER" "$WORK/pi-only-package/install.sh"
+for blocked in apt-get cc gsettings curl update-desktop-database; do
+    ln -s /bin/false "$WORK/pi-only-deny/$blocked"
+done
+prepare_pi_only_home() {
+    HOME="$1" bash -c '
+        set -euo pipefail
+        source "$1"
+        mkdir -p "$(dirname "$USER_GHOSTTY_LAUNCHER")" "$(dirname "$BACKPRESSURE_LIBRARY")" \
+            "$BACKPRESSURE_STATE" "$CONFIG_DIR" "$USER_DESKTOP_DIR" \
+            "$HOME/.config/fontconfig/conf.d" "$HOME/.config"
+        render_backpressure_launcher > "$USER_GHOSTTY_LAUNCHER"
+        chmod 755 "$USER_GHOSTTY_LAUNCHER"
+        printf "SHIM-BASELINE\n" > "$BACKPRESSURE_LIBRARY"
+        cp "$BACKPRESSURE_LIBRARY" "$BACKPRESSURE_STATE/enabled.library"
+        printf "GLOBAL-CONFIG-KEEP\n" > "$CONFIG_FILE"
+        printf "DESKTOP-KEEP\n" > "$USER_DESKTOP_FILE"
+        printf "TERMINAL-KEEP\n" > "$TERMINAL_WRAPPER"
+        printf "XDG-KEEP\n" > "$XDG_TERMINALS_FILE"
+        printf "FONT-KEEP\n" > "$HOME/.config/fontconfig/conf.d/89-ghostty-zh-mono.conf"
+        printf "ZSHRC-KEEP\n" > "$HOME/.zshrc"
+    ' _ "$WORK/functions.sh"
+}
+snapshot_pi_only_home() {
+    python3 - "$1" <<'PY'
+from pathlib import Path
+import hashlib
+import stat
+import sys
+
+root = Path(sys.argv[1])
+for path in sorted(root.rglob("*")):
+    rel = path.relative_to(root).as_posix()
+    if rel == ".local/bin/ghostty-pi":
+        continue
+    mode = stat.S_IMODE(path.lstat().st_mode)
+    if path.is_symlink():
+        value = ("link", str(path.readlink()))
+    elif path.is_file():
+        value = ("file", hashlib.sha256(path.read_bytes()).hexdigest())
+    else:
+        value = ("directory",)
+    print(repr((rel, mode, value)))
+PY
+}
+run_pi_only() {
+    local private_home="$1"
+    shift
+    env -u DISPLAY -u WAYLAND_DISPLAY HOME="$private_home" \
+        PATH="$WORK/pi-only-deny:$PATH" SUDO_CMD=/bin/false GSETTINGS_BACKEND=memory \
+        bash "$WORK/pi-only-package/install.sh" "$@"
+}
+if [ -x /usr/bin/ghostty ]; then
+    PI_ONLY_HOME="$WORK/pi-only-live-entry"
+    prepare_pi_only_home "$PI_ONLY_HOME"
+    snapshot_pi_only_home "$PI_ONLY_HOME" > "$WORK/pi-only-before"
+    run_pi_only "$PI_ONLY_HOME" --pi-launcher-only > "$WORK/pi-only-first.log" \
+        || fail "Pi 窄安装未接受已托管的启动器与库"
+    test -x "$PI_ONLY_HOME/.local/bin/ghostty-pi" || fail "Pi 窄安装未生成启动器"
+    HOME="$PI_ONLY_HOME" bash -c '
+        source "$1"
+        cmp -s "$USER_PI_GHOSTTY_LAUNCHER" <(render_pi_launcher)
+    ' _ "$WORK/functions.sh" || fail "Pi 窄安装目标内容不是受管基准"
+    snapshot_pi_only_home "$PI_ONLY_HOME" > "$WORK/pi-only-after"
+    cmp -s "$WORK/pi-only-before" "$WORK/pi-only-after" \
+        || fail "Pi 窄安装修改了普通 Ghostty/配置/桌面或其他非目标文件"
+    pi_inode=$(stat -c %i "$PI_ONLY_HOME/.local/bin/ghostty-pi")
+    run_pi_only "$PI_ONLY_HOME" --pi-launcher-only > "$WORK/pi-only-second.log" \
+        || fail "Pi 窄安装重跑失败"
+    grep -Fq "文件无变化" "$WORK/pi-only-second.log" || fail "Pi 窄安装重跑未跳过相同目标"
+    test "$pi_inode" = "$(stat -c %i "$PI_ONLY_HOME/.local/bin/ghostty-pi")" \
+        || fail "Pi 窄安装重跑替换了相同目标"
+    snapshot_pi_only_home "$PI_ONLY_HOME" > "$WORK/pi-only-rerun"
+    cmp -s "$WORK/pi-only-before" "$WORK/pi-only-rerun" \
+        || fail "Pi 窄安装重跑修改了非目标文件"
+    ! compgen -G "$PI_ONLY_HOME/.local/bin/ghostty-pi.bak.*" >/dev/null \
+        || fail "Pi 窄安装意外生成启动器备份"
+
+    for other in --check --ppa-only --deb-only --default-terminal --no-default-terminal; do
+        if run_pi_only "$PI_ONLY_HOME" --pi-launcher-only "$other" > "$WORK/pi-only-args.log" 2>&1; then
+            fail "Pi 窄安装接受了冲突选项 $other"
+        fi
+        grep -Fq "不能与其他安装或预检选项组合" "$WORK/pi-only-args.log" \
+            || fail "Pi 窄安装冲突选项 $other 未明确拒绝"
+    done
+
+    for scenario in changed-launcher missing-copy mismatched-library symlink-library nonexec-launcher; do
+        private_home="$WORK/pi-only-$scenario"
+        prepare_pi_only_home "$private_home"
+        case "$scenario" in
+            changed-launcher) printf "USER-CHANGE\n" >> "$private_home/.local/bin/ghostty" ;;
+            missing-copy) rm "$private_home/.config/ghostty/wayland-backpressure/enabled.library" ;;
+            mismatched-library) printf "MISMATCH\n" >> "$private_home/.local/lib/ghostty/libwayland-backpressure.so" ;;
+            symlink-library)
+                mv "$private_home/.local/lib/ghostty/libwayland-backpressure.so" "$private_home/real-shim"
+                ln -s "$private_home/real-shim" "$private_home/.local/lib/ghostty/libwayland-backpressure.so"
+                ;;
+            nonexec-launcher) chmod 644 "$private_home/.local/bin/ghostty" ;;
+        esac
+        snapshot_pi_only_home "$private_home" > "$WORK/$scenario.before"
+        if run_pi_only "$private_home" --pi-launcher-only > "$WORK/$scenario.log" 2>&1; then
+            fail "Pi 窄安装接受了损坏的前置状态 $scenario"
+        fi
+        test ! -e "$private_home/.local/bin/ghostty-pi" \
+            || fail "Pi 窄安装在前置校验失败后写入启动器 $scenario"
+        snapshot_pi_only_home "$private_home" > "$WORK/$scenario.after"
+        cmp -s "$WORK/$scenario.before" "$WORK/$scenario.after" \
+            || fail "Pi 窄安装失败后修改了文件 $scenario"
+    done
+
+    private_home="$WORK/pi-only-conflict"
+    prepare_pi_only_home "$private_home"
+    printf "KEEP\n" > "$private_home/.local/bin/ghostty-pi"
+    snapshot_pi_only_home "$private_home" > "$WORK/pi-only-conflict.before"
+    if run_pi_only "$private_home" --pi-launcher-only > "$WORK/pi-only-conflict.log" 2>&1; then
+        fail "Pi 窄安装覆盖了自有 ghostty-pi 文件"
+    fi
+    grep -Fq "拒绝覆盖" "$WORK/pi-only-conflict.log" || fail "Pi 窄安装未说明拒绝原因"
+    test "$(cat "$private_home/.local/bin/ghostty-pi")" = KEEP \
+        || fail "Pi 窄安装改变了自有目标"
+    snapshot_pi_only_home "$private_home" > "$WORK/pi-only-conflict.after"
+    cmp -s "$WORK/pi-only-conflict.before" "$WORK/pi-only-conflict.after" \
+        || fail "Pi 窄安装拒绝时修改了普通受管文件"
+else
+    echo "SKIP: 本机未安装 /usr/bin/ghostty，真实 --pi-launcher-only 入口需要既有二进制"
+fi
+
+# ============================================================
 # 用户级 desktop 覆盖：只改三处启动语义，幂等，拒绝覆盖带用户改动的文件
 # ============================================================
 # fixture 构造与系统模板同构的入口：两个 Exec= 带 --gtk-single-instance=true，
@@ -707,7 +840,7 @@ if command -v cc >/dev/null 2>&1; then
 fi
 
 if [ "$HAVE_ZSH" = true ]; then
-    echo "PASS: Ghostty single-installer Wayland backpressure, Pi-scoped launcher, desktop migration, font/clipboard/SSH integration"
+    echo "PASS: Ghostty single-installer Wayland backpressure, Pi-scoped launcher/only-mode, desktop migration, font/clipboard/SSH integration"
 else
-    echo "PASS (zsh 未安装，hook 行为与 PTY 部分已跳过): Ghostty single-installer Wayland backpressure, Pi-scoped launcher, desktop migration, font/clipboard integration"
+    echo "PASS (zsh 未安装，hook 行为与 PTY 部分已跳过): Ghostty single-installer Wayland backpressure, Pi-scoped launcher/only-mode, desktop migration, font/clipboard integration"
 fi
