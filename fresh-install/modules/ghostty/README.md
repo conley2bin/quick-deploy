@@ -470,6 +470,15 @@ Ghostty 是本地程序，负责画窗口、渲染字体、调 GPU；远端只�
 当前本地 shell。zsh 的行编辑器消费报文前缀后，数字尾部就会显示在提示符中。
 这与 `ssh-env` / `ssh-terminfo` 无关：那两个特性只处理环境变量和 terminfo，继续保留。
 
+仓库里的 `ssh-mouse-reset.zsh` 是 **zsh 运行时 hook 的源码**，不是第二个安装脚本：
+`setup.sh` 只运行 `modules/ghostty/install.sh`，后者把 hook 复制到
+`~/.config/ghostty/ghostty-ssh-mouse-reset.zsh`，并让 `.zshrc` 在每个交互式
+shell 启动时加载它。SSH 返回提示符是安装结束后才发生的事件，安装脚本本身不会
+常驻；即使把这段 zsh 源码内嵌在 Bash 安装脚本里，安装时仍需生成同一个
+运行时文件。分开放便于用 `zsh -n` 和交互式 PTY 直接验证 hook。打包必须包含
+整个 Ghostty 模块目录；若漏掉 hook 或 Wayland C 源码，`install.sh --check`
+和正式安装现在都会在任何写入前明确失败。
+
 本模块采用两层处理：
 
 1. `~/.config/ghostty/config.ghostty` 中绑定

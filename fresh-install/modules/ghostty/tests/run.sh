@@ -28,6 +28,27 @@ fi
 # 只取安装器函数定义，避免测试触发 main/apt/GUI。
 sed '/^main "\$@"$/,$d' "$INSTALLER" > "$WORK/functions.sh"
 
+# setup.sh 打包不能只拷 install.sh 而漏掉运行时 hook/C 源码。
+# --check 与正式安装共享早期门控；缺资源必须明确失败而不是跳过。
+HOME="$WORK/module-bundle" bash -c '
+    set -euo pipefail
+    source "$1"
+    CHECK_ONLY=true
+    SSH_MOUSE_HOOK_SOURCE="$2"
+    BACKPRESSURE_SOURCE="$3"
+    mkdir -p "$HOME"
+    preflight_commands
+    SSH_MOUSE_HOOK_SOURCE="$HOME/missing-hook.zsh"
+    ( preflight_commands ) > "$HOME/hook.err" 2>&1 && exit 1
+    grep -Fq "模块不完整，缺少运行时 zsh hook" "$HOME/hook.err"
+    SSH_MOUSE_HOOK_SOURCE="$2"
+    BACKPRESSURE_SOURCE="$HOME/missing-backpressure.c"
+    ( preflight_commands ) > "$HOME/backpressure.err" 2>&1 && exit 1
+    grep -Fq "模块不完整，缺少 Wayland 修复源码" "$HOME/backpressure.err"
+    test ! -e "$HOME/.config/ghostty/config.ghostty"
+' _ "$WORK/functions.sh" "$HOOK_SOURCE" "$MODULE_DIR/wayland-backpressure.c" \
+    || fail "模块资源缺失未在安装写入前显式拒绝"
+
 # 配置必须保留 SSH 能力，同时提供不依赖 shell 的 reset 兜底；不要用
 # mouse-reporting=false 牺牲 tmux 的鼠标功能。
 # 显示会话环境矩阵：基准与 headless 用 env -u 真正清掉三个变量（“定义为空”

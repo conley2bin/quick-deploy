@@ -183,6 +183,11 @@ check_supported_system() {
 }
 
 preflight_commands() {
+    # setup.sh 打包的是整个模块，不只是 install.sh。运行时 zsh hook 与
+    # Wayland 库源码都是必需资源；缺失时在任何安装写入前拒绝，不能让
+    # setup.sh 报告 Ghostty 成功、实际上却漏掉一个功能。
+    [ -f "$SSH_MOUSE_HOOK_SOURCE" ] || die "Ghostty 模块不完整，缺少运行时 zsh hook: $SSH_MOUSE_HOOK_SOURCE"
+    [ -f "$BACKPRESSURE_SOURCE" ] || die "Ghostty 模块不完整，缺少 Wayland 修复源码: $BACKPRESSURE_SOURCE"
     local command_name
     for command_name in dpkg apt-cache grep awk sed cmp cp mv mktemp chmod mkdir date fc-list infocmp; do
         require_command "$command_name"
@@ -1336,10 +1341,8 @@ install_ssh_mouse_hook() {
         warn "未找到 zsh，跳过 SSH 鼠标自愈 hook（Ctrl+Shift+R 仍可手动复位）"
         return 0
     fi
-    if [ ! -f "$SSH_MOUSE_HOOK_SOURCE" ]; then
-        warn "缺少 Ghostty SSH hook 源文件，跳过自动自愈（Ctrl+Shift+R 仍可手动复位）: $SSH_MOUSE_HOOK_SOURCE"
-        return 0
-    fi
+    [ -f "$SSH_MOUSE_HOOK_SOURCE" ] \
+        || die "Ghostty 模块不完整，无法安装 SSH 鼠标自愈 hook: $SSH_MOUSE_HOOK_SOURCE"
 
     if [ -L "$SSH_MOUSE_HOOK_CONFIG" ]; then
         warn "$SSH_MOUSE_HOOK_CONFIG 是符号链接，拒绝覆盖；SSH 鼠标自愈 hook 未启用"
@@ -1369,7 +1372,7 @@ ssh_mouse_hook_state() {
         return 0
     fi
     if [ ! -f "$SSH_MOUSE_HOOK_SOURCE" ]; then
-        echo "  zsh hook: 跳过（源文件缺失；正式安装也会跳过）"
+        echo "  zsh hook: 模块资源缺失（--check 与正式安装均会失败）"
         return 0
     fi
     if [ -L "$SSH_MOUSE_HOOK_CONFIG" ]; then
