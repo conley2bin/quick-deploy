@@ -17,7 +17,11 @@ import threading
 import tempfile
 import time
 import unittest
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
+
+
+class IPv6HTTPServer(HTTPServer):
+    address_family = socket.AF_INET6
 
 
 MODULE = Path(__file__).resolve().parents[1]
@@ -281,8 +285,12 @@ class HelperCase(unittest.TestCase):
         self.assertEqual(len(self.calls("ssh", "forward")), 1)
         record = next((self.runtime / "pi-client-link-helper").glob("e-*.json"))
         self.assertEqual(record.stat().st_mode & 0o777, 0o600)
-        self.assertEqual(json.loads(record.read_text())["version"], 2)
-        self.assertEqual(json.loads(record.read_text())["endpoint"], {"host": "127.0.0.1", "port": 8743})
+        self.assertEqual(json.loads(record.read_text())["version"], 4)
+        self.assertEqual(json.loads(record.read_text())["endpoint"],
+                         {"host": "127.0.0.1", "port": 8743, "backendHost": "127.0.0.1"})
+        state = json.loads(self.state_path.read_text())
+        self.assertEqual({item["host"] for item in state["listeners"]}, {"127.0.0.1", "::1"})
+        self.assertEqual({item["remote_host"] for item in state["listeners"]}, {"127.0.0.1"})
 
     def test_original_port_decoy_and_company_absolute_redirect_refuse_before_browser(self):
         class Decoy(BaseHTTPRequestHandler):
@@ -371,7 +379,7 @@ class HelperCase(unittest.TestCase):
         self.save()
         status, result = self.web("http://127.0.0.1:8743/again")
         self.assertEqual(status, 1)
-        self.assertEqual(result["error"]["code"], "tunnel_unverified")
+        self.assertEqual(result["error"]["code"], "port_conflict")
         self.assertEqual(len(self.calls("xdg-open")), 1)
         self.assertEqual(len(self.calls("ssh", "-M")), 1)
 
@@ -380,8 +388,11 @@ class HelperCase(unittest.TestCase):
         record = next((self.runtime / "pi-client-link-helper").glob("e-*.json"))
         original = json.loads(record.read_text())
         for mutation, code in [({"version": 1}, "tunnel_unverified"),
+                               ({"version": 2}, "tunnel_unverified"),
+                               ({"version": 3}, "tunnel_unverified"),
                                ({"local_port": 54465}, "port_conflict"),
-                               ({"endpoint": {"host": "127.0.0.2", "port": 8743}}, "invalid_state")]:
+                               ({"endpoint": {"host": "127.0.0.2", "port": 8743,
+                                              "backendHost": "127.0.0.1"}}, "tunnel_unverified")]:
             with self.subTest(mutation=mutation):
                 record.write_text(json.dumps({**original, **mutation}))
                 status, result = self.web("http://127.0.0.1:8743/reuse")
@@ -543,13 +554,14 @@ class HelperCase(unittest.TestCase):
         self.assertFalse(self.calls("systemctl"))
 
     def test_default_http_port_preserves_url_or_refuses_low_port(self):
-        with socket.socket() as probe:
-            try:
-                probe.bind(("127.0.0.1", 80))
-                can_bind = True
-            except OSError as error:
-                self.assertIn(error.errno, (13, 98))  # EACCES or EADDRINUSE
-                can_bind = False
+        can_bind = True
+        for family, host in ((socket.AF_INET, "127.0.0.1"), (socket.AF_INET6, "::1")):
+            with socket.socket(family) as probe:
+                try:
+                    probe.bind((host, 80))
+                except OSError as error:
+                    self.assertIn(error.errno, (13, 98))  # EACCES or EADDRINUSE
+                    can_bind = False
         original = "http://127.0.0.1/no-explicit-port?q=1#f"
         status, result = self.web(original)
         if can_bind:
@@ -562,26 +574,29 @@ class HelperCase(unittest.TestCase):
             self.assertEqual((status, result["error"]["code"]), (1, "port_conflict"))
             self.assertFalse(self.calls("xdg-open"))
 
-    def test_ipv6_loopback_binds_and_opens_exact_family(self):
+    def test_ipv6_loopback_binds_both_families_to_ipv6_backend(self):
         status, result = self.web("http://[::1]:8743/hello?x=1#f")
         self.assertEqual(status, 0, result)
         self.assertEqual(result["openedUrl"], "http://[::1]:8743/hello?x=1#f")
         self.assertEqual(result["tunnel"]["remoteHost"], "::1")
-        self.assertIn("[::1]:8743:[::1]:8743", self.calls("ssh", "forward")[-1]["args"])
+        self.assertIn("localhost:8743:[::1]:8743", self.calls("ssh", "forward")[-1]["args"])
+        state = json.loads(self.state_path.read_text())
+        self.assertEqual({item["host"] for item in state["listeners"]}, {"127.0.0.1", "::1"})
+        self.assertEqual({item["remote_host"] for item in state["listeners"]}, {"::1"})
 
-    def test_mapped_ip_and_external_url_keep_prior_routing(self):
-        mapped_url = "http://[::ffff:7f00:1]:8743/mapped"
-        status, mapped = self.web(mapped_url)
-        self.assertEqual(status, 0, mapped)
-        self.assertEqual(mapped["openedUrl"], mapped_url)
-        self.assertEqual(mapped["tunnel"]["remoteHost"], "::ffff:7f00:1")
-        self.assertIn("[::ffff:7f00:1]:8743:[::ffff:7f00:1]:8743",
-                      self.calls("ssh", "forward")[-1]["args"])
+    def test_nonstandard_loopback_addresses_refuse_before_prepared_or_gui(self):
+        for url in ("http://127.0.0.2:8743/path", "http://127.255.255.254:8743/path",
+                    "http://[::ffff:7f00:1]:8743/mapped", "http://[::ffff:7f00:2]:8743/mapped"):
+            with self.subTest(url=url):
+                status, result = self.web(url)
+                self.assertEqual((status, result["phase"], result["error"]["code"]),
+                                 (1, "result", "unsupported_target"))
+        self.assertEqual(self.logs(), [])
         status, result = self.web("http://example.org/a?q=2#x")
         self.assertEqual(status, 0)
         self.assertIsNone(result["tunnel"])
         self.assertEqual(result["openedUrl"], "http://example.org/a?q=2#x")
-        self.assertEqual(len(self.calls("ssh", "-M")), 1)
+        self.assertFalse(self.calls("ssh", "-M"))
 
     def test_company_chosen_backend_binds_both_exact_client_families_and_preserves_url(self):
         for url, backend, port in [
@@ -634,22 +649,206 @@ class HelperCase(unittest.TestCase):
                 self.assertEqual((status, result["error"]["code"]), (1, "invalid_request"))
         self.assertEqual(self.logs(), [])
 
-    def test_explicit_ip_can_own_port_occupied_only_on_other_loopback_family(self):
-        self.state["listeners"] = [{"host": "::1", "port": 8743, "pid": 999}]
-        self.save()
-        original = "http://127.0.0.1:8743/only-ipv4"
-        status, result = self.web(original)
-        self.assertEqual(status, 0, result)
-        self.assertEqual(result["openedUrl"], original)
-        self.assertEqual(result["tunnel"]["localPort"], 8743)
+    def test_explicit_ip_other_family_decoy_blocks_same_port_redirect(self):
+        class Decoy(BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(200); self.end_headers(); self.wfile.write(b"Y9000P-DECOY")
+            def log_message(self, *args):
+                pass
 
-    def test_mapped_loopback_ip_detects_ipv4_decoy(self):
+        # The company backend is a separate 127.0.0.2 fixture; the ::1 socket
+        # stands for the other Y9000p family of an initial 127.0.0.1 URL.
+        with IPv6HTTPServer(("::1", 0), Decoy) as decoy:
+            port = decoy.server_port
+            class Company(BaseHTTPRequestHandler):
+                def do_GET(self):
+                    self.send_response(302)
+                    self.send_header("Location", f"http://localhost:{port}/done")
+                    self.end_headers()
+                def log_message(self, *args):
+                    pass
+            with HTTPServer(("127.0.0.2", port), Company) as company:
+                thread = threading.Thread(target=company.serve_forever, daemon=True)
+                thread.start()
+                try:
+                    client = http.client.HTTPConnection("127.0.0.2", port, timeout=2)
+                    client.request("GET", "/start")
+                    redirect = client.getresponse()
+                    self.assertEqual((redirect.status, redirect.getheader("Location")),
+                                     (302, f"http://localhost:{port}/done"))
+                    redirect.read(); client.close()
+                    self.state["listeners"] = [{"host": "::1", "port": port, "pid": 999}]
+                    self.save()
+                    status, result = self.web(f"http://127.0.0.1:{port}/start")
+                    self.assertEqual((status, result["phase"], result["error"]["code"]),
+                                     (1, "result", "port_conflict"))
+                    self.assertIn("remove the conflicting listener", result["error"]["message"])
+                    self.assertFalse(self.calls("ssh", "-M"))
+                    self.assertFalse(self.calls("xdg-open"))
+                finally:
+                    company.shutdown(); thread.join(timeout=2)
+
+    def test_explicit_ipv6_other_family_decoy_blocks_same_port_redirect(self):
         self.state["listeners"] = [{"host": "127.0.0.1", "port": 8743, "pid": 999}]
         self.save()
-        status, result = self.web("http://[::ffff:7f00:1]:8743/decoy")
-        self.assertEqual((status, result["error"]["code"]), (1, "port_conflict"))
+        status, result = self.web("http://[::1]:8743/start")
+        self.assertEqual((status, result["phase"], result["error"]["code"]),
+                         (1, "result", "port_conflict"))
         self.assertFalse(self.calls("ssh", "-M"))
         self.assertFalse(self.calls("xdg-open"))
+
+    def test_explicit_ip_opposite_family_bind_race_and_precommit_takeover(self):
+        for source, other, port in (("127.0.0.1", "::1", 8761),
+                                    ("[::1]", "127.0.0.1", 8762)):
+            with self.subTest(source=source):
+                self.state = {"next_pid": 4001, "masters": {}, "listeners": [],
+                              "race_port": port, "race_host": other}
+                self.save()
+                url = f"http://{source}:{port}/start"
+                status, result = self.web(url)
+                self.assertEqual((status, result["error"]["code"]), (1, "port_conflict"))
+                self.assertIn("remove the conflicting listener", result["error"]["message"])
+                self.assertFalse(self.calls("xdg-open"))
+                raced = json.loads(self.state_path.read_text())["listeners"]
+                self.assertEqual([(item["host"], item["port"], item["pid"]) for item in raced],
+                                 [(other, port, 999)])
+
+                # A free pair must also remain jointly owned after PREPARED.
+                self.state = {"next_pid": 4001, "masters": {}, "listeners": []}
+                self.save()
+                process = self.start({"action": "open-web", "url": url})
+                prepared = json.loads(process.stdout.readline())
+                self.assertEqual(prepared["phase"], "prepared", prepared)
+                current = json.loads(self.state_path.read_text())
+                self.assertEqual({item["host"] for item in current["listeners"] if item["port"] == port},
+                                 {"127.0.0.1", "::1"})
+                for listener in current["listeners"]:
+                    if listener["host"] == other and listener["port"] == port:
+                        listener["pid"] = 999
+                self.state = current
+                self.save()
+                status, result = self.finish(process, prepared)
+                self.assertEqual((status, result["error"]["code"]), (1, "port_conflict"))
+                self.assertFalse(self.calls("xdg-open"))
+
+    def test_explicit_ip_redirect_reaches_company_on_opposite_family(self):
+        # Fake SSH attests its requested -L and PID ownership; these local HTTP
+        # relays model the data plane without touching a physical Y9000p install.
+        # Force the redirect to the opposite localhost family a browser may use.
+        for source, backend, redirected_to in (("127.0.0.1", "127.0.0.1", "::1"),
+                                                ("[::1]", "::1", "127.0.0.1")):
+            with self.subTest(source=source):
+                requests = []
+                class Company(BaseHTTPRequestHandler):
+                    def do_GET(self):
+                        requests.append((self.path, self.headers["Host"]))
+                        if self.path == "/start":
+                            self.send_response(302)
+                            self.send_header("Location", f"http://localhost:{port}/done")
+                            self.end_headers()
+                        else:
+                            self.send_response(200)
+                            self.end_headers()
+                            self.wfile.write(b"COMPANY-FINAL-BODY")
+                    def log_message(self, *args):
+                        pass
+                class Relay(BaseHTTPRequestHandler):
+                    def do_GET(self):
+                        upstream = http.client.HTTPConnection("127.0.0.2", port, timeout=2)
+                        upstream.request("GET", self.path, headers={"Host": self.headers["Host"]})
+                        reply = upstream.getresponse()
+                        body = reply.read()
+                        self.send_response(reply.status)
+                        if reply.getheader("Location"):
+                            self.send_header("Location", reply.getheader("Location"))
+                        self.end_headers()
+                        self.wfile.write(body)
+                        upstream.close()
+                    def log_message(self, *args):
+                        pass
+                with HTTPServer(("127.0.0.1", 0), Relay) as ipv4:
+                    port = ipv4.server_port
+                    with IPv6HTTPServer(("::1", port), Relay) as ipv6:
+                        with HTTPServer(("127.0.0.2", port), Company) as company:
+                            servers = (ipv4, ipv6, company)
+                            threads = [threading.Thread(target=s.serve_forever, daemon=True) for s in servers]
+                            for thread in threads:
+                                thread.start()
+                            try:
+                                url = f"http://{source}:{port}/start"
+                                opened_before = len(self.calls("xdg-open"))
+                                process = self.start({"action": "open-web", "url": url})
+                                prepared = json.loads(process.stdout.readline())
+                                self.assertEqual(prepared["phase"], "prepared", prepared)
+                                self.assertEqual(prepared["openedUrl"], url)
+                                self.assertEqual(prepared["tunnel"]["remoteHost"], backend)
+                                self.assertEqual(len(self.calls("xdg-open")), opened_before)
+                                listener_state = json.loads(self.state_path.read_text())["listeners"]
+                                exact = [item for item in listener_state if item["port"] == port]
+                                self.assertEqual(len(exact), 2)
+                                self.assertEqual({item["host"] for item in exact}, {"127.0.0.1", "::1"})
+                                self.assertEqual({item["pid"] for item in exact}, {exact[0]["pid"]})
+                                self.assertEqual({item["remote_host"] for item in exact}, {backend})
+                                forward = self.calls("ssh", "forward")[-1]["args"]
+                                destination = f"[{backend}]" if ":" in backend else backend
+                                self.assertIn(f"localhost:{port}:{destination}:{port}", forward)
+                                status, result = self.finish(process, prepared)
+                                self.assertEqual(status, 0, result)
+                                self.assertEqual(self.calls("xdg-open")[-1]["args"], [url])
+
+                                first = http.client.HTTPConnection(backend, port, timeout=2)
+                                first.request("GET", "/start", headers={"Host": f"{source}:{port}"})
+                                redirect = first.getresponse()
+                                location = redirect.getheader("Location")
+                                self.assertEqual(redirect.status, 302)
+                                redirect.read(); first.close()
+                                self.assertEqual(location, f"http://localhost:{port}/done")
+                                self.assertEqual(urlsplit(location).hostname, "localhost")
+                                final = http.client.HTTPConnection(redirected_to, port, timeout=2)
+                                final.request("GET", "/done", headers={"Host": f"localhost:{port}"})
+                                reply = final.getresponse()
+                                self.assertEqual(reply.status, 200)
+                                self.assertEqual(reply.read(), b"COMPANY-FINAL-BODY")
+                                final.close()
+                                self.assertEqual([path for path, _ in requests], ["/start", "/done"])
+                            finally:
+                                for server in servers:
+                                    server.shutdown()
+                                for thread in threads:
+                                    thread.join(timeout=2)
+
+    def test_explicit_ip_reuse_requires_new_dual_family_source_backend_record(self):
+        for source, backend, port in (("127.0.0.1", "127.0.0.1", 8743), ("[::1]", "::1", 8744)):
+            with self.subTest(source=source):
+                url = f"http://{source}:{port}/start"
+                status, result = self.web(url)
+                self.assertEqual(status, 0, result)
+                record = [p for p in (self.runtime / "pi-client-link-helper").glob("e-*.json")
+                          if json.loads(p.read_text())["endpoint"]["port"] == port][0]
+                original = json.loads(record.read_text())
+                self.assertEqual(original["version"], 4)
+                self.assertEqual(original["endpoint"], {"host": backend, "port": port,
+                                                         "backendHost": backend})
+                self.assertEqual(self.web(f"http://{source}:{port}/again")[1]["tunnel"]["reused"], True)
+                opened = len(self.calls("xdg-open"))
+                for mutation in ({"version": 2}, {"version": 3},
+                                 {"endpoint": {"host": backend, "port": port}},
+                                 {"endpoint": {**original["endpoint"],
+                                               "backendHost": "::1" if backend == "127.0.0.1" else "127.0.0.1"}}):
+                    record.write_text(json.dumps({**original, **mutation}))
+                    failed, reply = self.web(url)
+                    self.assertEqual((failed, reply["error"]["code"]), (1, "tunnel_unverified"))
+                record.write_text(json.dumps(original))
+                self.assertEqual(len(self.calls("xdg-open")), opened)
+                self.assertFalse(self.calls("ssh", "exit"))
+
+    def test_explicit_ip_other_source_family_cannot_reuse_owned_pair(self):
+        self.assertEqual(self.web("http://127.0.0.1:8743/first")[0], 0)
+        status, result = self.web("http://[::1]:8743/other-backend")
+        self.assertEqual((status, result["error"]["code"]), (1, "port_conflict"))
+        self.assertEqual(len(self.calls("ssh", "-M")), 1)
+        self.assertEqual(len(self.calls("ssh", "forward")), 1)
+        self.assertEqual(len(self.calls("xdg-open")), 1)
 
     def test_localhost_any_covered_family_collision_is_port_conflict(self):
         for host in ("127.0.0.1", "::1", "::ffff:7f00:1", "0.0.0.0", "::"):
@@ -664,7 +863,7 @@ class HelperCase(unittest.TestCase):
 
     def test_localhost_partial_forward_wrong_pid_and_race_close_only_new_master(self):
         cases = [({"forward_omit_family": "::1"}, "tunnel_unverified"),
-                 ({"forward_wrong_pid_family": "127.0.0.1"}, "tunnel_unverified"),
+                 ({"forward_wrong_pid_family": "127.0.0.1"}, "port_conflict"),
                  ({"forward_partial_failure": True}, "tunnel_unverified"),
                  ({"forward_no_listener": True}, "tunnel_unverified"),
                  ({"race_port": 8744, "race_host": "::1"}, "port_conflict")]

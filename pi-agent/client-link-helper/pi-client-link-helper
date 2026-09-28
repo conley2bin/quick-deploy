@@ -254,6 +254,8 @@ def web_target(raw):
             effective_ip = mapped or ip
             if effective_ip.is_unspecified or (effective_ip.version == 4 and effective_ip.packed[0] == 0):
                 fail("unsupported_target", "unspecified/zero-net address can reach a client-local service")
+            if effective_ip.is_loopback and (mapped is not None or str(ip) not in ("127.0.0.1", "::1")):
+                fail("unsupported_target", "nonstandard loopback IP cannot be owned across same-port redirects")
             bind_host = str(ip) if effective_ip.is_loopback else None
     return parsed, bind_host, port or (443 if parsed.scheme == "https" else 80)
 
@@ -387,7 +389,9 @@ def listeners():
 
 
 def bind_hosts(bind_host):
-    return ("127.0.0.1", "::1") if bind_host == "localhost" else (bind_host,)
+    # A standard explicit-IP page may redirect to localhost on the same port.
+    # Every supported loopback source therefore owns both browser destinations.
+    return ("127.0.0.1", "::1")
 
 
 def covers_host(listener_host, bind_host):
@@ -440,7 +444,7 @@ def load_record(path, directory, endpoint, identity):
         data = json.loads(path.read_text())
     except (OSError, ValueError) as error:
         fail("invalid_state", f"unreadable tunnel record: {error}")
-    schema = 3 if endpoint["host"] == "localhost" else 2
+    schema = 3 if endpoint["host"] == "localhost" else 4
     if isinstance(data, dict) and type(data.get("version")) is int and data["version"] < schema:
         fail("tunnel_unverified", "old tunnel record cannot attest this endpoint and backend")
     if (not isinstance(data, dict) or set(data) != {"version", "endpoint", "identity", "local_port", "socket", "pid"} or
@@ -450,8 +454,7 @@ def load_record(path, directory, endpoint, identity):
             type(data["pid"]) is not int or data["pid"] <= 0 or
             not isinstance(data["socket"], str) or Path(data["socket"]).parent != directory or
             not SOCKET_NAME_RE.fullmatch(Path(data["socket"]).name)):
-        fail("tunnel_unverified" if schema == 3 else "invalid_state",
-             "tunnel record does not match the exact owned endpoint/backend/SSH identity")
+        fail("tunnel_unverified", "tunnel record does not match the exact owned endpoint/backend/SSH identity")
     return data
 
 
@@ -499,22 +502,23 @@ def forward_spec(bind_host, local_port, remote_host, remote_port):
 
 def port_conflict(bind_host, port):
     authority = f"[{bind_host}]" if ":" in bind_host else bind_host
-    fail("port_conflict", f"Y9000p loopback port {authority}:{port} is occupied or cannot be bound; "
-                          "remove the conflicting listener and retry the original URL")
+    fail("port_conflict", f"Y9000p loopback port {authority}:{port} cannot be owned on both "
+                          "127.0.0.1 and [::1]; remove the conflicting listener and retry the original URL")
 
 
 def verified_record(directory, bind_host, port, backend_host, identity, expected_pid=None):
-    endpoint = {"host": bind_host, "port": port}
-    if bind_host == "localhost":
-        endpoint["backendHost"] = backend_host
+    endpoint = {"host": bind_host, "port": port, "backendHost": backend_host}
     data = load_record(record_path(directory, bind_host, port), directory, endpoint, identity)
     if data is None:
         fail("tunnel_unverified", "owned SSH forward record disappeared")
     if data["local_port"] != port:
         port_conflict(bind_host, port)
     pid = master_pid(Path(data["socket"]), identity)
-    if (pid is None or pid != data["pid"] or (expected_pid is not None and pid != expected_pid) or
-            not owns_listeners(bind_host, port, pid)):
+    if pid is None or pid != data["pid"] or (expected_pid is not None and pid != expected_pid):
+        fail("tunnel_unverified", "SSH master does not match the recorded process identity")
+    if not owns_listeners(bind_host, port, pid):
+        if foreign_listener(bind_host, port, pid):
+            port_conflict(bind_host, port)
         fail("tunnel_unverified", "SSH master does not own every recorded exact loopback listener")
     return pid
 
@@ -524,9 +528,7 @@ def cannot_bind(bind_host, port):
 
 
 def owned_forward(directory, bind_host, remote_port, backend_host, identity):
-    endpoint = {"host": bind_host, "port": remote_port}
-    if bind_host == "localhost":
-        endpoint["backendHost"] = backend_host
+    endpoint = {"host": bind_host, "port": remote_port, "backendHost": backend_host}
     path = record_path(directory, bind_host, remote_port)
     data = load_record(path, directory, endpoint, identity)
     if data:
@@ -555,18 +557,21 @@ def owned_forward(directory, bind_host, remote_port, backend_host, identity):
         args = mux_args(sock, "forward", identity)
         args[args.index("-p"):args.index("-p")] = [
             "-o", "ExitOnForwardFailure=yes", "-L",
-            forward_spec(bind_host, remote_port, backend_host, remote_port)]
+            forward_spec("localhost", remote_port, backend_host, remote_port)]
         status, text = run(args, timeout=8)
         if status:
-            occupied = (foreign_listener(bind_host, remote_port, pid) if bind_host == "localhost"
-                        else port_occupied(bind_host, remote_port))
+            occupied = foreign_listener(bind_host, remote_port, pid)
             if occupied or cannot_bind(bind_host, remote_port):
                 port_conflict(bind_host, remote_port)
             fail("tunnel_unverified" if bind_host == "localhost" else "ssh_forward_failed",
                  f"SSH forward exited {status}: {text or 'no diagnostic'}")
-        if master_pid(sock, identity) != pid or not owns_listeners(bind_host, remote_port, pid):
+        if master_pid(sock, identity) != pid:
+            fail("tunnel_unverified", "SSH forward returned success with a changed master identity")
+        if not owns_listeners(bind_host, remote_port, pid):
+            if foreign_listener(bind_host, remote_port, pid):
+                port_conflict(bind_host, remote_port)
             fail("tunnel_unverified", "SSH forward returned success without every owned exact-port loopback listener")
-        data = {"version": 3 if bind_host == "localhost" else 2, "endpoint": endpoint, "identity": identity,
+        data = {"version": 3 if bind_host == "localhost" else 4, "endpoint": endpoint, "identity": identity,
                 "local_port": remote_port, "socket": str(sock), "pid": pid}
         save_record(path, data)
         return False, pid
