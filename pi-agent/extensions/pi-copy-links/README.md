@@ -3,9 +3,17 @@
 给 Pi **fullscreen 模式**的助手 Markdown 增加两类受控操作：
 
 - 代码块右下角 **[复制]**：左键复制逻辑源文，保留代码自身的缩进、Tab、空行和行尾空格；不复制围栏、Pi 显示缩进、右侧补空格或屏幕折行。
-- Markdown 链接：仅 **Ctrl + 鼠标左键**激活。公司本机输入沿用 Chrome/VS Code 显式新窗口；已验证的 conley-Y9000p SSH/tmux 输入通过客户端助手在笔记本默认浏览器或 VS Code Remote-SSH 打开。普通点击和拖选继续交给 Pi。
+- Markdown 链接：仅 **Ctrl + 鼠标左键**激活；普通点击不打开链接，拖选继续交给 Pi。公司本机点击让 Chrome/VS Code 显式请求新窗口；来自已验证 conley-Y9000p SSH/tmux 客户端的点击在 Y9000p 用 `xdg-open` 调用默认浏览器（可能复用已有窗口或标签），公司文件则在 Y9000p 的 VS Code Remote-SSH 新窗口打开。
 
-按下可执行目标时会反色，拖走、失焦、弹窗、滚动、尺寸变化或修饰键不匹配都会取消。每次激活都允许创建一个新应用窗口。
+按下可执行目标时会反色，拖走、失焦、弹窗、滚动、尺寸变化或修饰键不匹配都会取消。不会承诺远端 X11/GNOME 窗口落在哪个 workspace。
+
+## 使用：在点击来源的桌面打开
+
+先确认公司侧扩展和 Y9000p 已安装的客户端助手使用匹配的 v2 协议；助手版本/软链接核验见 [客户端助手说明](../../client-link-helper/README.md#install-and-version-check)。不要把 Y9000p 较旧的仓库 checkout 上的 `install.sh` 当作升级。匹配后：
+
+1. 在 Pi **空闲时**执行 `/reload`，确认 `/settings` 中 **TUI mode = fullscreen**；`/copy-links` 查看扩展状态。也可用 `pi --tui-mode fullscreen` 启动。
+2. 对仍有效的助手 Markdown 链接按 **Ctrl + 鼠标左键**；打开动作跟随发出点击的桌面。公司回环网址在 Y9000p 需要助手自有的 SSH 本地转发，浏览器仍收到原网址。
+3. 若报告 `port_conflict`，先在 Y9000p 查明占用原端口的监听器及其所有者。例如 `ss -H -ltnp '( sport = :8795 )'`，再将输出中的 PID 交给 `ps -fp` 辨认旧转发；确认有无依赖它的标签页，**取得所有者同意后**才显式关闭旧转发并重试原链接。已有手动 `ssh -N -L 8795:127.0.0.1:8795 ...` 会占用 Y9000p 的 8795；助手不会接管或自动终止它，也不会改端口打开替代网址。
 
 ## 安装和启用
 
@@ -17,13 +25,7 @@ bash pi-agent/extensions/pi-copy-links/install.sh
 
 安装器把整个源码目录软链接到 `~/.pi/agent/extensions/pi-copy-links`，也已纳入 `pi-agent/install.sh` 的扩展发现流程。可用 `PI_CODING_AGENT_DIR` 指定其他 Pi home。安装器不修改 `settings.json`、Pi bundle 或桌面关联。
 
-在 Pi 空闲时执行 `/reload`，再从 `/settings` 把 **TUI mode** 设为 **fullscreen**。`/copy-links` 显示当前状态。也可单次启动：
-
-```bash
-pi --tui-mode fullscreen
-```
-
-普通模式把历史滚动交给终端/tmux，Pi 无法可靠命中滚动后的历史内容，因此扩展不在普通模式接管鼠标。tmux copy-mode 也会接管鼠标；点击前应先退出。
+客户端助手在 Y9000p 单独部署；公司侧安装器不更新它。两侧协议版本核对后按上面的使用步骤在 Pi 空闲时 `/reload`。普通模式把历史滚动交给终端/tmux，Pi 无法可靠命中滚动后的历史内容，因此扩展不在普通模式接管鼠标。tmux copy-mode 也会接管鼠标；点击前应先退出。
 
 ## 链接目标
 
@@ -33,15 +35,7 @@ pi --tui-mode fullscreen
 
 接受绝对 `http://` 和 `https://` URL；查询参数和 fragment 原样作为浏览器数据，不解释为编辑器行号。空格、控制字符或无效 URL 会明确失败。
 
-**公司本机输入**沿用原有 Linux 网页启动路径，每次激活都会：
-
-1. 以自有的 `spawn` 子进程、`shell: false`、2.5 秒硬 wall-clock deadline 和有界 stdout/stderr 执行 `xdg-settings get default-web-browser`；deadline/abort/输出溢出会先独立结算调用，再向 detached 进程组发送 SIGTERM，并在 200 ms 内升级 SIGKILL；leader 的 `exit` 只记录状态，不代表 ownership 完成；只有 child `close` 或两个输出流都关闭后才正常结算，因此继承管道的 descendants 会继续受到 deadline 约束；
-2. 要求结果是单个合法 desktop ID；
-3. 执行 `xdg-settings check default-web-browser <id>` 并要求 `yes`；
-4. 只接受当前白名单 `google-chrome.desktop`；
-5. 执行 `google-chrome-stable --new-window URL`。
-
-不会读取 `BROWSER`，不会解析 desktop entry 的 `Exec`，不会搜索替代浏览器，也不会调用 `xdg-open`、`gio open` 或失败后的备用启动器。其他默认浏览器和非 Linux 平台在这个版本中明确失败。
+**公司本机输入**核对默认浏览器是 `google-chrome.desktop` 后执行 `google-chrome-stable --new-window URL`，其他默认浏览器或非 Linux 平台会明确失败。**Y9000p SSH 输入**由笔记本的 `xdg-open URL` 交给其默认浏览器；这可能复用窗口或标签，不按公司侧 Chrome 新窗口策略运行。公司回环网址需先建立原端口、双回环地址都归助手所有的 SSH 转发；外部网址不需要转发。
 
 ### 公司文件和目录
 
@@ -80,7 +74,7 @@ code --new-window --goto -- /absolute/path:12:3
 
 带位置时仅接受普通文件。由于当前 Code CLI 的 `--goto` operand 不能安全表达含字面冒号的 POSIX 路径，这一组合会明确失败；不带位置的冒号路径仍可打开。启动环境复制当前桌面环境，但删除 `VSCODE_IPC_HOOK_CLI`，避免被远端 CLI socket 重定向。不会使用 `--reuse-window`。
 
-Chrome 和 Code 都通过参数数组、`shell: false`、`stdio: "ignore"`、detached 子进程启动。监听器安装、abort 脱钩和 `unref()` 全部成功后才完成应用所有权交接；任何 spawn 后的同步 handoff 失败都会先移除全部 observer，再立即 TERM+KILL 尚属扩展的 detached 进程组，避免“报错但仍打开”或 pin 住 Pi。完成交接后，代际 abort 只移除 observer，不会 kill 已接受的应用。可观测的 executable lookup、权限和非零退出会在动作仍有效时报告。成功只表示显式新窗口请求已被接受，不宣称窗口已绘制或位于指定 workspace。
+在 Y9000p，文件与目录仍指向**公司机器**，由 `code --remote ssh-remote+conley-company --new-window` 配合明确的文件/目录 URI 打开；不会在笔记本本地查找同名路径。两侧的启动成功均只表示桌面接受请求，不保证窗口已经绘制或位于某个 workspace。
 
 ### 源文分歧
 
@@ -90,9 +84,11 @@ Pi 在 lexing 前把 Tab 展开成三个空格，native href 还可能保留 cha
 
 本地链接仍额外要求唯一源文语义与 native href 一致。Tab/三个空格碰撞或 `a&amp;b.svg` 一类本地分歧会生成私有诊断动作；Ctrl+点击只解释拒绝原因，不猜文件名。Percent-encoded 等价写法是可靠表示。
 
-## 兼容和生命周期边界
+## 维护者：兼容和生命周期边界
 
 - 精确支持 **Pi 0.85.1、0.86.1 和 0.87.1**。其他版本会在改写任何 prototype 前拒绝；已验证版本若缺少 `Markdown.render`、`renderToken`、`renderInlineTokens` 或 `TuiAltScreen.handleViewportInput` 会指出具体方法。
+- 公司本机网页启动先以自有 `spawn`（`shell: false`、有界输出、2.5 秒硬 deadline）执行 `xdg-settings get default-web-browser`，要求单个合法 desktop ID，再以 `xdg-settings check default-web-browser <id>` 确认 `yes`；只接受 `google-chrome.desktop` 并执行 `google-chrome-stable --new-window URL`。不读取 `BROWSER`、desktop entry `Exec`，不调用 `xdg-open`/`gio open` 或备用启动器。deadline/abort/输出溢出独立结算，detached 进程组先 TERM、200 ms 内 KILL；leader `exit` 不代表继承管道的 descendants 已完成，正常结算等待 child `close` 或两个输出流关闭。
+- 公司本机 Chrome/Code 使用参数数组、`shell: false`、`stdio: "ignore"`、detached 子进程。监听器安装、abort 脱钩与 `unref()` 成功才交接；spawn 后同步 handoff 失败先移除 observer，再 TERM+KILL 尚属扩展的组。已接受应用独立于后来代际 abort；可观测 lookup/权限/非零退出在动作仍有效时报告。
 - 一个 mounted Markdown 拥有其全部 copy/open/diagnostic action。所有动作都使用同一随机 `pi-copy://<nonce>/<sequence>` 内存命名空间；URI 不包含路径、命令或代码内容。
 - 缓存 miss 采用原生收集 pass、一次联合 action commit、装饰 pass；链接以 exact `[raw, href]` key 和计数绑定，不用递归 cursor，因此 table 的测量/输出双渲染不会错位或多分配。代码块仍用源位置、容器路径、围栏结构、语言/meta 和逻辑文本做线性最早/最晚唯一对齐。若私有 action 登记不可用，transcript 中看似仍有的 native HTTP 链接也保持不可执行；不会退回 Marked href 绕过源文语义核对。
 - 动作按字段比较，未变 rerender 复用 URI。owner batch 变化时同步删除并 unregister 被替代条目；任何 allocation、Map/WeakMap/WeakRef/finalizer、commit 或 cleanup 异常都会先摘除整个代际，再尽力清理并用全新 prefix 恢复。
@@ -103,13 +99,15 @@ Pi 在 lexing 前把 Tab 展开成三个空格，native href 还可能保留 cha
 - tmux 3.4 的受管鼠标绑定在每个原始 SGR 事件前发送 `CSI 998;<client_pid>~`。仅在 `MouseDown1Pane` 等于已验证的 stock `select-pane -t = ; send-keys -M` 时接管它：先按原顺序选 pane，再对本扩展 pane 注入 marker、原样执行 `send-keys -M`；不带本扩展 owner 的 pane 仍依次执行 stock 的 `select-pane -t =` 和 `send-keys -M` 命令；真实双-pane 鼠标透传尚待单独验收。原本无绑定的 `MouseUp1Pane` 加入同样条件透传。旧版 Ctrl 绑定只在当前命令和记录的 receipt 完全一致、且属于已知旧版命令时升级；自定义/版本不符的绑定保留并在 `/copy-links` 告警。不改 `.tmux.conf`、`mouse` 设置或其他 pane。卸载只恢复 pane 所有权；共享绑定保持无主惰性状态，重载凭 receipt 复用。
 - 每个按下/松开都带相同 client PID 才能触发动作；窄 lost-press 恢复也要求先前普通 release 与 orphan Ctrl release 的 PID、cell、私有 URI/action kind 相同，并保持屏幕、尺寸、overlay ownership/snapshot 和无 motion。tmux Ctrl+点击缺失或畸形 marker 时报告错误，不打开链接。打开前再次枚举全部 tmux 客户端，校验准确 PID、当前 pane、完整 `/proc` 祖先链及 starttime；只有 sshd 祖先且 `SSH_CONNECTION` 对端匹配 `ssh -G conley-Y9000p` 的字面 IP/端口才路由远端。验证所得对端会钉在 SSH 命令行，避免 alias 在验证后变化时发往另一主机。公司本机来源沿用原 opener；无 tmux 的本机 Pi 沿用原行为，但没有 tmux 来源的直接 SSH 输入明确拒绝。
 
-### 已验证的 Y9000p 输入
+### Y9000p 输入、协议与隧道
 
-公司侧对语义 href 调用同一 `parseOpenTarget`；网页传规范 HTTP(S) URL。文件路径只在**公司侧**以 `stat` 跟随 symlink，确认普通文件/目录、位置规则及冒号+goto 限制，然后传 `kind`、绝对路径和可选行列。不会在笔记本 stat 公司路径，也不会回退到公司 GUI。
+公司侧仍使用同一 `parseOpenTarget` 解析源文 href；公司文件在公司侧 `stat` 跟随 symlink，验证普通文件/目录、位置规则和冒号+goto 限制，向笔记本发送资源 `kind` 与绝对路径。笔记本不 stat 公司路径，也不会在远端失败时回退到公司 GUI。
 
-公司侧用一条固定非交互 SSH 控制命令调用笔记本 `~/.local/bin/pi-client-link-helper`；命令含 `-T`、`BatchMode=yes`、`ClearAllForwardings=yes`、`StrictHostKeyChecking=yes`、`ConnectTimeout=8`，目标仍为 `conley-Y9000p`，但 HostName/User/Port 从刚验证的对端强制固定。目标仅作为 version 2 JSON 请求行经 stdin 发送，绝不拼入 shell 或 SSH argv。SSH stdin 保持打开；助手先验证目标、准备 GUI 和自有 `-L`，返回含 nonce 与目标信息的 `PREPARED` 行，**此时不会打开浏览器或 Code**。公司侧核对该行与源目标、重查 `OpenLifetime` 后，才在同一连接发送匹配的 `COMMIT` 行。助手对准备阶段实行最长 45 秒的单调时钟 deadline、有限非阻塞锁轮询以及 EOF/断线检查；COMMIT 前 abort、超时或断线不会在锁后来释放时补开窗口。COMMIT 被接受后，桌面 handoff 可以独立完成，后来公司侧的 abort/超时不能保证撤销已授权动作。最终还须核对一个 JSON 结果行、退出状态、目标与 PREPARED 的一致性、总 stdout 64 KiB 限额及公司侧 60 秒 deadline；错误不尝试本机打开。公司回环显式 IP 网页必须在笔记本**原主机 + 原端口**建立有 PID/监听器及端点记录证明的自有转发，回复仍须是请求的原 URL。占用、无权绑定或转发时发生竞态均返回 `port_conflict`，提示检查并清除冲突监听；不改写端口或主机，也不会打开可能沿绝对重定向访问笔记本诱饵的浏览器。公司侧对已验证的远端 `http(s)://localhost:<端口>/...` 在发起 SSH 前并行探测本机 `127.0.0.1` 与 `::1` 的原端口 TCP 连接（只握手、不发 HTTP，连同必要 DNS 查询总限时 1.5 秒且随动作中止）。仅一个可达时选它；两个可达时用公司 OS `localhost` 解析顺序中的首个匹配且已探测可达的字面地址；均不可达、解析无匹配或超时则明确报错，不猜笔记本解析结果。v2 `open-web` 请求保留原 `url`（包括 `localhost`、端口和路径），只对这类 URL 增加 `backendHost: "127.0.0.1" | "::1"`；显式 IP 与外部 URL 不带该字段。公司侧 PREPARED/最终回复要求 `openedUrl` 与原 URL 一致，`tunnel.remoteHost` 等于所选 `backendHost` 且远近端口均等于源端口；不匹配时不发 COMMIT。**笔记本助手尚不认识 `backendHost`，双栈绑定/转发仍未实现**：现有 helper 会在 PREPARED 前拒绝此请求，本阶段不部署、重载或声称 `localhost` 端到端可用。助手在创建 SSH master 时把 `ssh -G conley-company` 的字面 IP HostName/User/Port 钉在命令行，仍保留 alias 的 IdentityFile 和严格主机密钥校验；旧版未钉住端点的 record 不复用。文件/目录用 VS Code Remote-SSH 的 typed URI 打开。笔记本当前已安装的旧 v1 助手与 v2 不兼容，必须另行升级；本次源码提交不会部署或重载运行中的 Pi。
+公司侧向已验证的 Y9000p 对端发起固定的非交互 SSH 命令，强制固定刚核实的 HostName/User/Port，带 `-T`、`BatchMode=yes`、`ClearAllForwardings=yes`、`StrictHostKeyChecking=yes` 和 `ConnectTimeout=8`；目标传给 `~/.local/bin/pi-client-link-helper` 的 **v2 JSON stdin**，不拼入 shell/SSH argv。连接保持打开：助手先验证目标、准备 GUI 与自有转发，返回携带 nonce 和原目标的 `PREPARED`，此时**不打开**浏览器/Code；公司侧核对目标并重查动作仍有效，才在同一连接发送匹配 `COMMIT`。助手在有限非阻塞锁等待中检查 EOF 和最长 45 秒准备 deadline；COMMIT 前 abort/断线/超时不会在锁释放后补开窗口。接受 COMMIT 后桌面 handoff 独立进行，后来公司侧超时不能撤销已授权的打开。最终结果仍需符合目标、回复次序、退出状态、64 KiB stdout 上限和公司侧 60 秒 deadline；错误不降级为公司本机打开。
 
-显式 `--new-window` 避免扩展主动复用其他 GNOME workspace 的窗口，但 Wayland 下最终 placement 属于 Mutter。真实 GNOME 验收必须作为有界、用户可见的手工步骤：在其他 workspace 已有 Chrome/Code 窗口时，从 Pi workspace 分别 Ctrl+点击网页、文件和目录，观察新窗口是否仍落在当前 workspace。若 compositor 行为不满足预期，需要单独的 GNOME Shell companion；本扩展不虚构 workspace 控制权。
+公司回环网址保留原 URL、主机名和端口。`localhost` 源网址在发 SSH 前并行探测公司 `127.0.0.1`、`::1` 的原端口 TCP（不发 HTTP/TLS），共享 1.5 秒可中止期限；仅一边可达则选择该数字后端，两边可达按公司 OS 的 `localhost` 解析顺序选首个已验证地址，均不可达或解析不明确即失败。v2 请求只在 `localhost` 情况附加 `backendHost`；显式 `127.0.0.1`/`[::1]` 以其源 IP 为公司数字后端。助手用一个钉住 `ssh -G conley-company` 字面 IP/User/Port 的私有 SSH master，在 Y9000p 请求 **原端口**的 `-L localhost:<端口>:<数字公司后端>:<端口>`。对所有受支持的回环源，必须在同一次 `ss` 清单中证明 Y9000p 的 `127.0.0.1` 与 `::1` 原端口监听都归同一个 master PID；在 `PREPARED` 前和浏览器 handoff 前各复核一次。公司侧核对 `PREPARED`/最终回复的原 URL、数字后端和两端原端口。端口被其他监听器覆盖（包括任何单边占用）、无权绑定或 bind race 返回 `port_conflict`；不会接管、杀掉其他转发，不改写成替代端口/URL。旧单栈显式 IP record 不复用；无法覆盖同端口跳转目标的非标准 127/8、IPv4-mapped loopback 等地址会在打开前拒绝。
+
+这保证已验证的**初始端口**和同端口跳转到 `localhost` 时，两种标准浏览器回环地址都通往选定的公司后端；重定向到**其他端口或其他 authority** 尚不在这个所有权保证内。TCP 探测/隧道准备也不证明 HTTP 服务之后持续可用。外部网页不建公司回环隧道；文件/目录使用 VS Code Remote-SSH typed URI 与明确的 `--file-uri`/`--folder-uri`，请求 `--new-window`。公司本机 Chrome/Code 也只请求新窗口，不控制 GNOME Wayland 的最终 workspace；Y9000p 的默认浏览器由 `xdg-open` 在其 X11 桌面处理，可能复用已有窗口或标签，不能套用公司 Wayland 的窗口预期。
 
 ## 验证
 
