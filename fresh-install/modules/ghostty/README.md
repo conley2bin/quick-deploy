@@ -73,7 +73,7 @@ sudo apt install --allow-downgrades ghostty=1.3.1~ppa2-noble1
   - 为 `Ctrl+Alt+=/+` 显式发送 CSI-u 序列，交给 tmux 新建 window
   - `Ctrl+Shift+R` 绑定 Ghostty 原生 `reset`，用于清理异常 SSH 后残留的终端状态
   - `mouse-shift-capture = never`：鼠标上报的程序（Pi 全屏、tmux `mouse on`）里用 **Shift+拖选** 产生 Ghostty 本地选区，并禁止程序用 `XTSHIFTESCAPE` 抢走 Shift（见“鼠标上报下的复制”一节）
-  - `Ctrl+Shift+C` 绑定 `copy_to_clipboard:mixed`，`Ctrl+Shift+V` 绑定 `paste_from_clipboard`：本机复制/粘贴的两条键，显式写入，不依赖上游默认绑定（见“鼠标上报下的复制”一节）
+  - `Ctrl+Shift+C` 保留 `copy_to_clipboard:mixed`；全局 `Ctrl+Shift+V` 改为 `text:\x16`，向终端内发送原始 Ctrl+V，普通 Pi 会使用自身图片/文本粘贴动作（见下节）。`Ctrl+C/V` 不变
   - `clipboard-write = allow` / `clipboard-read = deny`：允许 OSC 52 写入（远端 tmux 复制回本机剪贴板的入口），拒绝 OSC 52 读取（见下节）
   - 新终端起始目录 `~/Documents`（不存在时回退到 XDG 文档目录，再不行就 `home`）
   - 关闭新窗口工作目录继承；新标签页和分屏仍保留继承
@@ -140,96 +140,76 @@ clipboard-read = deny
 ```
 
 - **写允许**：终端里的程序（包括 SSH 远端 tmux 发来的、由本地 tmux 重发的序列）可以发 OSC 52 把内容写进本机系统剪贴板。这是 `fresh-install/modules/tmux` 那条“远端 tmux 复制 → 本机剪贴板”路径的终点：序列经 SSH 与本地 tmux 到达 Ghostty，再由 Ghostty 用**它当前平台的剪贴板后端**（Wayland/X11/macOS 等由 Ghostty 自己选择）落下。因此远端与路径中间的机器都不需要 Wayland/X11 会话或剪贴板工具。
-- **读拒绝**：OSC 52 读取会让终端里的程序把本机剪贴板内容取走。Ghostty 默认值是 `ask`（弹窗询问），本模块改为无条件拒绝：终端内程序永远读不到本机剪贴板。
-- **日常粘贴不受影响**：`Ctrl+Shift+V`、鼠标右键、`Shift+Insert` 是 Ghostty 自己的本地动作，由终端直接把剪贴板内容写进 pty，不经过 OSC 52 读取；`Ctrl+Shift+C` 复制同样走 Ghostty 的本地选区。远端只需要用户按一次粘贴键。
+- **读拒绝**：OSC 52 读取会让终端里的程序向 Ghostty 查询本机剪贴板。Ghostty 默认值是 `ask`（弹窗询问），本模块改为无条件拒绝这种终端协议查询；本机程序自己调用 `wl-paste` 等系统接口不受该设置约束，Pi 的 Ctrl+V 正走自己的读取路径。
+- **本地粘贴与 Pi 粘贴**：鼠标右键、`Shift+Insert` 仍可触发 Ghostty 的本地粘贴；`Ctrl+Shift+V` 发送原始 Ctrl+V，由 Pi 自己读取图片或文本，不经过 OSC 52 查询。`Ctrl+Shift+C` 复制仍走 Ghostty 本地选区。普通 shell 里的 `Ctrl+Shift+V` 不再触发终端原生剪贴板粘贴。
 - 策略与显示服务器、系统版本无关：脚本里没有任何按 Wayland/X11 或 Ubuntu 版本分叉的剪贴板逻辑。回归测试在 Wayland、X11、无会话变量三种环境下断言渲染结果逐字节相同——这只证明**配置渲染不分叉**，不证明任何剪贴板后端的实际行为（后者需要真实图形会话）。
 - 本模块不写 `terminal-features` 之类的终端能力声明，也不强制声明 `Ms`；远端 tmux 能不能发 OSC 52 取决于它客户端侧的有效 `Ms`（可能来自 terminfo、配置的特性或 tmux 的运行时识别，见 `fresh-install/modules/tmux/README.md` 剪贴板一节）。本模块能做的是保证本机 `xterm-ghostty` 记录确实带 `Ms`：`--check` 会报告它，正式安装的验证阶段缺 `Ms` 会明确失败。
 
-### 鼠标上报下的复制：先 Shift+拖选，再 Ctrl+Shift+C
+### 鼠标上报下的复制与 Pi 粘贴
 
-在 Pi 全屏或 tmux `mouse on` 里，普通拖选会被申请了鼠标上报的程序接管
-（Pi 自己画选区并在释放时复制，tmux 进 copy-mode）。此刻 Ghostty 没有本地选区，
-`Ctrl+Shift+C` 无内容可复制，看起来像“快捷键失效”。本模块显式写死三行，
-把用户实际使用的两条键与选择所有权固定下来：
+在 Pi 全屏或 tmux `mouse on` 里，普通拖选由申请鼠标上报的程序接管（Pi
+自己画选区并在释放时复制，tmux 进入 copy-mode）。此时 Ghostty 没有本地
+选区，`Ctrl+Shift+C` 无内容可复制。按住 Shift 拖选可创建 Ghostty 本地
+选区，再用 `Ctrl+Shift+C` 写入本机剪贴板。配置固定为：
 
 ```ini
 mouse-shift-capture = never
 keybind = ctrl+shift+c=copy_to_clipboard:mixed
-keybind = ctrl+shift+v=paste_from_clipboard
+keybind = ctrl+shift+v=text:\x16
 ```
 
-| 动作 | 谁执行 | 结果 |
-| --- | --- | --- |
-| `Shift+拖选` | Ghostty | 按住 Shift 的鼠标事件永远不按鼠标协议上报给程序，而是扩展 Ghostty 本地选区 |
-| `Ctrl+Shift+C` | Ghostty | 把本地选区写进**本机**系统剪贴板；`mixed` 同时提供纯文本与带样式两种格式（无选区时不做任何事） |
-| `Ctrl+Shift+V` | Ghostty | 把**本机**剪贴板内容直接写进 pty；SSH 场景下内容作为输入送到远端，不需要远端有剪贴板工具 |
+`never` 阻止程序通过 `XTSHIFTESCAPE` 抢走 Shift+鼠标；普通拖选仍属于申请
+鼠标上报的程序。`Ctrl+Shift+C` 的 `mixed` 同时提供纯文本和带样式格式。
+`Ctrl+C` 和 `Ctrl+V` 原有行为保持不变。
 
-选择与复制全在本机 Ghostty 内完成，与远端有没有 Wayland/X11、有没有
-`wl-copy`/`xclip` 无关；这也是 SSH 场景下这两条键仍然可用的原因。
+**所有普通 Ghostty 窗口**的 `Ctrl+Shift+V` 现在向 pty 发送原始 0x16，
+等同按下 `Ctrl+V`。本地 Pi 的现有 `app.clipboard.pasteImage` 动作先尝试
+图片再回退文本，读取当前剪贴板，避开 Ghostty/GTK 可能陈旧的文本粘贴
+视图；已有 `ghostty-pi` 以同一覆盖参数启动，保持兼容但不再是必需入口。
+SSH 中的 Pi 若启用了已安装的剪贴板桥，则继续由该桥处理 Ctrl+V；这项
+Ghostty 配置不改变远端 Pi 本身的剪贴板能力。
 
-两条键都显式写入，不依赖上游默认绑定：本文件由模块重置维护，即使将来上游
-改了默认绑定或默认 `mouse-shift-capture`，这里的行为不变。这里刻意选 `never`
-而不是上游默认 `false`：两者通常都把 Shift 留给 Ghostty，但 `false` 可被程序用
-`XTSHIFTESCAPE` 覆盖；`never` 才能保证用户始终有 Shift+拖选这条本地选择路径。
+代价是普通 shell 中 `Ctrl+Shift+V` 也发送原始 Ctrl+V（通常是 shell 的
+逐字输入命令），**不再是 Ghostty 原生粘贴**。需要普通终端粘贴时可使用
+右键或 `Shift+Insert` 等原生入口；在其他 TUI 中 Ctrl+V 的具体含义由该
+程序决定。`Ctrl+Shift+C` 仍复制 Ghostty 本地选区，OSC 52 策略不变。
 
-边界：
+### 现有安装只迁移这一个按键
 
-- 程序申请了鼠标上报时，**普通拖选属于程序**；只有按住 Shift 的那次拖选才会
-  产生 Ghostty 本地选区，`Ctrl+Shift+C` 复制的也是这个选区。
-- 没有程序申请鼠标上报时（例如普通 shell 提示符），普通拖选本来就是
-  Ghostty 选区，`Ctrl+Shift+C` 直接可用。
-- `never` 会让终端内程序永远收不到 Shift+鼠标组合；这是为稳定保留本地复制
-  手势付出的明确代价。本机当前的 Pi/tmux 工作流不依赖该组合。
-
-### Pi 专用窗口：Ctrl+Shift+V 复用 Pi 的 Ctrl+V
-
-**只部署这个已批准的快捷键入口**时，从仓库根目录运行：
+从仓库根目录运行：
 
 ```bash
-bash fresh-install/modules/ghostty/install.sh --pi-launcher-only
+bash fresh-install/modules/ghostty/install.sh --paste-keybind-only
 ```
 
-此模式先只读核对已安装的 `/usr/bin/ghostty`、受保护的
-`~/.local/bin/ghostty` 的受管字节与可执行性，以及 Wayland 背压库和校验副本
-逐字节一致；不匹配就拒绝写入。然后只在不存在时安装
-`~/.local/bin/ghostty-pi`（已是受管基准则跳过）。不安装软件包、不编译、
-不更新全局 Ghostty 配置/字体/desktop/默认终端，也不运行 GUI 冒烟。
-不要为单独部署此入口运行无参数的完整 `install.sh`。
+窄模式只接受已存在、非符号链接、**逐字节等于旧版受管基准**的
+`~/.config/ghostty/config.ghostty`，将其原子替换为仅按键行不同的新基准；
+已是新基准则不重写。若文件有自定义内容，或旧安装以来字体/起始目录
+环境已改变使基准不再吻合，就明确拒绝，保留原文件供人工处理。
+不会调用 apt、重建 Wayland 背压库、更新字体/桌面入口/默认终端或启动 GUI，
+也不会修改已安装的 `ghostty-pi` 或普通启动器。不要为这次迁移运行无参数的
+完整 `install.sh`，因为完整模式会重置整份配置并执行以上其它步骤。
 
-需使用另一条粘贴读取路径时，主动启动 `~/.local/bin/ghostty-pi`。它先通过
-`~/.local/bin/ghostty` 保留 Wayland 背压修复，再以独立 Ghostty 进程覆盖**一条**
-按键：`--keybind=ctrl+shift+v=text:\x16`。Ghostty 的 `text` 动作向 pty 发送
-原始 0x16（Ctrl+V），由 Pi 已有的 `app.clipboard.pasteImage` 绑定进入原生
-图片优先/文本回退粘贴入口；SSH 输入时仍由已安装的 Pi 剪贴板桥按原有逻辑
-处理。它不调用 Ghostty 的 `paste_from_clipboard`，所以避开该窗口内可能陈旧的
-GTK 剪贴板读取。`Ctrl+V`、`Ctrl+C`、Ghostty 的 `Ctrl+Shift+C`、OSC 52
-复制链和全局配置一律不变。
+**当前运行中的 Ghostty 进程**需要正常重载 Ghostty 配置（Ghostty 1.3.1
+默认 `Ctrl+Shift+,`，动作为 `reload_config`），或从受管入口开启新进程，
+才能获得新绑定；仅在旧窗口里新建 Pi pane 不构成进程级重载。重新进入
+Pi 后可先后按 `Ctrl+V` 与 `Ctrl+Shift+V` 验证相同当前
+文本，再试图片。专用 `ghostty-pi` 仍可运行，仍在新进程用同一
+`--keybind=ctrl+shift+v=text:\x16` 参数覆盖这条键。
+
+若只在尚未安装专用入口的机器补装 `ghostty-pi`，仍可运行
+`install.sh --pi-launcher-only`；它只核对受保护启动器及背压库并安装该入口，
+**不会**迁移全局配置。两种窄模式不可组合。保留的专用入口仍可直接启动，
+也可附着原有 Pi 会话：
 
 ```bash
-~/.local/bin/ghostty-pi                    # 打开新窗口；在其中运行 piox
+~/.local/bin/ghostty-pi
 ~/.local/bin/ghostty-pi -e tmux attach-session -t quick-deploy_pi-agent
-                                            # 附着已有 tmux/Pi session，不新起 Pi
 ```
 
-第二条命令的 `-e` 后面原样传给 Ghostty。若已有 tmux session 同时被其他
-客户端观看，直接切换它的窗口会影响那些客户端。此时先创建与原 session 共享
-窗口、但各自独立选窗的 tmux grouped session，再在新 session 选中 Pi window，
-从 `ghostty-pi` 附着新 session；无需启动第二个 Pi 进程。例如：
-
-```bash
-tmux new-session -d -s quick-deploy_pi-paste -t quick-deploy_pi-agent
-tmux list-windows -t quick-deploy_pi-paste  # 找到现有 Pi window 的 index
-tmux select-window -t quick-deploy_pi-paste:3  # 示例：将 3 换成找到的 index
-~/.local/bin/ghostty-pi -e tmux attach-session -t quick-deploy_pi-paste
-```
-
-仅在 grouped session 尚不存在时执行 `new-session`；重开专用窗口时只需最后一行。
-不要加 `tmux attach -d`，它会断开其他正在观看该 session 的客户端。这个入口
-是**窗口级**而不是程序检测：切到同一窗口的 shell/tmux 其他 pane 时，
-`Ctrl+Shift+V` 仍发送原始 Ctrl+V，**不会**执行 Ghostty 的文本粘贴；需要
-终端粘贴就使用普通 Ghostty 窗口。现有运行中的 Ghostty 窗口不会因安装而
-改变按键，必须从新入口打开。安装器只接受目标不存在或逐字节匹配的受管
-`ghostty-pi`；用户自有文件、符号链接及目录均明确拒绝覆盖。
+第二条 `-e` 后的参数原样交给 Ghostty。若同一 tmux session 有其他客户端，
+切换窗口会影响它们；可使用 tmux grouped session 独立选窗，避免
+`tmux attach -d` 断开原客户端。
 
 ## 字体
 
@@ -441,8 +421,8 @@ GTK/libwayland 符号进入库；事故原始负载没有复现，不能许诺�
 
 ## `--check` 是只读预检
 
-它报告完整安装流程的 apt/配置等计划，不代表 `--pi-launcher-only` 会执行
-这些步骤。两个选项不可组合。
+它报告完整安装流程的 apt/配置等计划，不代表 `--pi-launcher-only` 或
+`--paste-keybind-only` 会执行这些步骤；窄模式与其它选项不可组合。
 
 ```bash
 ./install.sh --check
@@ -473,8 +453,8 @@ bash ../../tests/ghostty/run.sh
    infocmp -x xterm-ghostty | ssh HOST -- tic -x -
    ```
 
-10. SSH 进远端并进入 Pi 全屏（或 tmux `mouse on`）后，在**普通 Ghostty 窗口**验证“鼠标上报下的复制”一节的两条键：普通拖选被程序接管；按住 **Shift** 拖选产生 Ghostty 本地选区，再按 `Ctrl+Shift+C`；`Ctrl+Shift+V` 应把本机剪贴板内容粘贴进去。
-11. 从 `ghostty-pi` 的新窗口进入同一 Pi 输入，先后按 `Ctrl+V` 和 `Ctrl+Shift+V`，核对两者读取相同的当前文本；图片粘贴也应进入 Pi 已有路径。普通窗口仍按第 10 条工作。
+10. 在普通 Ghostty/Pi 窗口验证：按住 **Shift** 拖选产生 Ghostty 本地选区，`Ctrl+Shift+C` 复制；先后按 `Ctrl+V` 与 `Ctrl+Shift+V`，确认两者读取相同的当前文本，再试图片。普通 shell 中 `Ctrl+Shift+V` 应发送原始 Ctrl+V，而非粘贴文本。现有窗口须先正常重载配置，或打开新进程。
+11. 可选：从 `ghostty-pi` 新窗口进入同一 Pi 输入，确认其同样工作。SSH Pi 的粘贴依赖该 Pi 的 Ctrl+V/剪贴板桥行为，不把全局按键改动误当作远端桥的验证。
 
 GUI 冒烟测试只在 `DISPLAY` 或 `WAYLAND_DISPLAY` 存在时运行。它不使用 xdotool、XTEST、libXtst 或任何合成键鼠事件；测试依据是从受保护启动器启动的进程持续存活、stderr 未出现错误，以及 `/proc/<pid>/maps` 中出现 fcitx5 GTK4 immodule（在 Wayland 下还要出现背压库）。
 

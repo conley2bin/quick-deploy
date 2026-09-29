@@ -17,6 +17,7 @@ set -euo pipefail
 
 CHECK_ONLY=false
 PI_LAUNCHER_ONLY=false
+PASTE_KEYBIND_ONLY=false
 # 默认接管 Ctrl+Alt+T。本模块刚引入时默认为否，是为了不和当时还在的
 # kitty 模块争抢同一个包装脚本（两个模块都写就是后跑者赢，无告警）。
 # kitty 模块已移除，Ghostty 是本仓库唯一的终端模块，该理由不再成立；
@@ -88,6 +89,9 @@ WORKING_DIRECTORY="~/Documents"
 # xterm-256color，不会把用户卡在花屏状态。前提是远端有 infocmp 与 tic
 # （ncurses 自带，绝大多数 Linux 都有）；极简容器镜像可能没有，那种情况下回退。
 SHELL_INTEGRATION_FEATURES="ssh-env,ssh-terminfo"
+# 所有普通 Ghostty 窗口将 Ctrl+Shift+V 交给终端内的 Ctrl+V 处理器。
+# 历史基准 paste_from_clipboard 只用于窄迁移的逐字节核对。
+GHOSTTY_PASTE_ACTION='text:\x16'
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -116,10 +120,12 @@ usage() {
 用法:
   ./install.sh [--check] [--no-default-terminal] [--ppa-only | --deb-only] [--help]
   ./install.sh --pi-launcher-only
+  ./install.sh --paste-keybind-only
 
 选项:
   --check                 只读预检：报告当前状态与计划，不安装、不修改
   --pi-launcher-only      只验证受保护启动器/背压库，再安装 Pi 专用启动器
+  --paste-keybind-only    只迁移现有受管全局配置的一条粘贴按键绑定
   --no-default-terminal   不接管 Ctrl+Alt+T（默认会接管）
   --default-terminal      兼容旧命令行，默认已是开启状态
   --ppa-only              只使用第三方 PPA；失败时不退回 GitHub .deb
@@ -133,7 +139,9 @@ usage() {
   用户级 desktop 覆盖（每个外部启动用独立进程）含本模块之外的改动时，
   脚本会明确失败而不是覆盖，处理方式见 README 的对应章节。
   --pi-launcher-only 不执行软件包/编译器、配置、字体、桌面入口、默认终端
-  或 GUI 步骤，也不能与其他选项组合。
+  或 GUI 步骤。--paste-keybind-only 只接受旧/新精确受管配置，拒绝自定义
+  内容和符号链接；不执行软件包、启动器、字体、桌面入口、默认终端或 GUI
+  步骤。两个窄模式都不能与其他选项组合。
 EOF
 }
 
@@ -143,6 +151,7 @@ parse_args() {
         case "$1" in
             --check) CHECK_ONLY=true; other_mode=true ;;
             --pi-launcher-only) PI_LAUNCHER_ONLY=true ;;
+            --paste-keybind-only) PASTE_KEYBIND_ONLY=true ;;
             --default-terminal) DEFAULT_TERMINAL=true; other_mode=true ;;
             --no-default-terminal) DEFAULT_TERMINAL=false; other_mode=true ;;
             --ppa-only)
@@ -160,8 +169,11 @@ parse_args() {
         esac
         shift
     done
-    if [ "$PI_LAUNCHER_ONLY" = true ] && [ "$other_mode" = true ]; then
+    if [ "$PI_LAUNCHER_ONLY" = true ] && { [ "$PASTE_KEYBIND_ONLY" = true ] || [ "$other_mode" = true ]; }; then
         die "--pi-launcher-only 不能与其他安装或预检选项组合"
+    fi
+    if [ "$PASTE_KEYBIND_ONLY" = true ] && [ "$other_mode" = true ]; then
+        die "--paste-keybind-only 不能与其他安装或预检选项组合"
     fi
 }
 
@@ -849,6 +861,7 @@ resolved_working_directory() {
 }
 
 render_config() {
+    local paste_action="${1-$GHOSTTY_PASTE_ACTION}"
     echo "# 由 fresh-install/modules/ghostty/install.sh 生成与维护。"
     echo "# 重跑脚本会把本文件重置为基准内容；手工修改请在脚本里改。"
     font_exists "$FONT_FAMILY" && echo "font-family = $FONT_FAMILY"
@@ -888,25 +901,21 @@ render_config() {
     # 上报时，普通拖选仍属于程序。
     echo "mouse-shift-capture = never"
 
-    # 用户实际使用的两条键，同样不依赖上游默认绑定：
-    #   Ctrl+Shift+C 把 Ghostty 本地选区写进本机系统剪贴板。mixed 同时提供
-    #     纯文本与带样式两种格式（上游文档：selected text in both plain and
-    #     styled formats），粘到纯文本目标时仍是纯文本。
-    #   Ctrl+Shift+V 把本机剪贴板内容直接写进 pty；SSH 场景下内容作为输入
-    #     送到远端，不需要远端有剪贴板工具。
-    # 两者都由本机 Ghostty 执行，只作用于本机剪贴板与本地选区。
+    # Ctrl+Shift+C 把 Ghostty 本地选区写进本机系统剪贴板。mixed 同时提供
+    # 纯文本与带样式两种格式。Ctrl+Shift+V 发送原始 Ctrl+V (0x16)，绕过
+    # Ghostty 可能陈旧的 GTK 粘贴视图；在 Pi 内由现有图片/文本粘贴动作处理。
+    # 在普通 shell 里这只是 Ctrl+V 输入，不再是 Ghostty 原生粘贴。
     echo "keybind = ctrl+shift+c=copy_to_clipboard:mixed"
-    echo "keybind = ctrl+shift+v=paste_from_clipboard"
+    echo "keybind = ctrl+shift+v=$paste_action"
 
     # 剪贴板策略：允许 OSC 52 写入，拒绝 OSC 52 读取。
     # 写入是远端复制路径的关键一环：远端 tmux 复制后发出的 OSC 52 经
     # SSH 到达本机 Ghostty，由它落到本机系统剪贴板。写入端是终端本身，
     # 不需要远端有 Wayland / X11 会话或任何剪贴板工具，也与本机跑在
     # Wayland 还是 X11 无关。
-    # 拒绝读取：读取会让终端里的程序把本机剪贴板内容取走。日常粘贴是
-    # Ghostty 自己的本地动作（Ctrl+Shift+V、右键或 Shift+Insert），由
-    # 终端直接把剪贴板内容写进 pty，不经过 OSC 52 读取，因此 deny 不
-    # 影响用户触发的粘贴；远端只需要用户按一次这个粘贴键。
+    # 拒绝读取：读取会让终端里的程序把本机剪贴板内容取走。右键或
+    # Shift+Insert 仍可走 Ghostty 本地粘贴；Ctrl+Shift+V 是上面的原始
+    # Ctrl+V 输入，Pi 再按自己已有的粘贴路径读取，不经过 OSC 52 查询。
     echo "clipboard-write = allow"
     echo "clipboard-read = deny"
 
@@ -928,6 +937,42 @@ render_config() {
     echo "gtk-single-instance = false"
     [ -n "$SHELL_INTEGRATION_FEATURES" ] && \
         echo "shell-integration-features = $SHELL_INTEGRATION_FEATURES"
+}
+
+# 现有受管配置的单键迁移。完整安装会备份并重置任意配置、执行 apt 等步骤，
+# 因此这里独立核对旧渲染的逐字节基准，仅替换这一行；已是新基准不动 inode。
+# 字体/起始目录若自安装以来变化，基准不再匹配，明确拒绝而非重置其它行。
+apply_paste_keybind_only() {
+    local command_name tmp
+    for command_name in cmp mktemp chmod mv rm sed; do require_command "$command_name"; done
+    [ -d "$CONFIG_DIR" ] && [ ! -L "$CONFIG_DIR" ] \
+        || die "Ghostty 配置目录缺失或是符号链接，拒绝窄迁移: $CONFIG_DIR"
+    [ ! -L "$CONFIG_FILE" ] && [ -f "$CONFIG_FILE" ] \
+        || die "Ghostty 配置缺失、是符号链接或不是普通文件，拒绝窄迁移: $CONFIG_FILE"
+    if cmp -s "$CONFIG_FILE" <(render_config); then
+        echo "配置按键已是当前基准，跳过写入: $CONFIG_FILE"
+        return 0
+    fi
+    cmp -s "$CONFIG_FILE" <(render_config paste_from_clipboard) \
+        || die "Ghostty 配置不等于旧版受管基准，拒绝覆盖用户内容: $CONFIG_FILE"
+
+    tmp="$(mktemp "$CONFIG_FILE.tmp.XXXXXX")"
+    # 从已核对的旧文件替换单行，避免生成期间字体/目录环境变化改动其它行。
+    if ! sed 's|^keybind = ctrl+shift+v=paste_from_clipboard$|keybind = ctrl+shift+v=text:\\x16|' \
+        "$CONFIG_FILE" > "$tmp" || ! chmod --reference="$CONFIG_FILE" "$tmp"; then
+        rm -f -- "$tmp"
+        die "无法生成新的 Ghostty 配置: $CONFIG_FILE"
+    fi
+    # 防止比较和原子替换之间已有别的写入；绝不根据过期的旧内容覆盖它。
+    if [ -L "$CONFIG_FILE" ] || ! cmp -s "$CONFIG_FILE" <(render_config paste_from_clipboard); then
+        rm -f -- "$tmp"
+        die "Ghostty 配置在迁移期间变化，拒绝覆盖: $CONFIG_FILE"
+    fi
+    if ! mv -f -- "$tmp" "$CONFIG_FILE"; then
+        rm -f -- "$tmp"
+        die "无法替换 Ghostty 配置: $CONFIG_FILE"
+    fi
+    echo "已将全局 Ctrl+Shift+V 改为原始 Ctrl+V: $CONFIG_FILE"
 }
 
 write_config() {
@@ -1127,9 +1172,9 @@ verify_backpressure() {
     echo "OK: 原生 Wayland 背压修复库与启动器已托管（新启动的窗口生效）"
 }
 
-# 独立 Ghostty 进程中的唯一按键差异：把 Ctrl+Shift+V 转成 Ctrl+V 原始字节。
-# 必须经过已验证的用户级启动器，保留原生 Wayland 背压保护；-e 及其后所有
-# 参数原样传给 Ghostty。普通 Ghostty 的配置、desktop 和快捷键均不变。
+# 专用入口保留兼容：全局基准现已发送同样的 Ctrl+V 原始字节；CLI 选项
+# 对旧配置启动的窗口也生效。仍须经过用户级启动器保留 Wayland 背压保护，
+# -e 及后续参数原样传给 Ghostty；普通启动器/desktop 不被专用入口改写。
 render_pi_launcher() {
     cat <<'EOF'
 #!/bin/sh
@@ -1761,6 +1806,11 @@ main() {
         install_pi_launcher
         verify_pi_launcher
         echo "Pi 专用启动器安装完成: $USER_PI_GHOSTTY_LAUNCHER（其他 Ghostty 状态未改）"
+        return 0
+    fi
+    if [ "$PASTE_KEYBIND_ONLY" = true ]; then
+        apply_paste_keybind_only
+        echo "已完成全局按键迁移；现有 Ghostty 需正常重载配置或开启新进程"
         return 0
     fi
     check_supported_system

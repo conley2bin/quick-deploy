@@ -80,14 +80,16 @@ render_variant() {
 }
 render_variant "$WORK/config.ghostty"
 grep -Fqx 'keybind = ctrl+shift+r=reset' "$WORK/config.ghostty" || fail "缺少 reset keybind"
-# 鼠标上报下用户的两条键：普通拖选被 Pi/tmux 接管，必须 Shift+拖选才能产生
-# Ghostty 本地选区，再由 Ctrl+Shift+C 复制、Ctrl+Shift+V 粘贴。三条均显式
-# 写入：never 还禁止程序用 XTSHIFTESCAPE 抢走 Shift，行为不随上游默认漂移。
+# 鼠标上报下普通拖选属于 Pi/tmux，Shift+拖选产生 Ghostty 本地选区，
+# Ctrl+Shift+C 复制；Ctrl+Shift+V 向 Pi 发送原始 Ctrl+V。三行显式写入，
+# never 还禁止程序用 XTSHIFTESCAPE 抢走 Shift，行为不随上游默认漂移。
 grep -Fqx 'mouse-shift-capture = never' "$WORK/config.ghostty" || fail "缺少 mouse-shift-capture = never"
 grep -Fqx 'keybind = ctrl+shift+c=copy_to_clipboard:mixed' "$WORK/config.ghostty" \
     || fail "缺少 ctrl+shift+c 复制绑定"
-grep -Fqx 'keybind = ctrl+shift+v=paste_from_clipboard' "$WORK/config.ghostty" \
-    || fail "缺少 ctrl+shift+v 粘贴绑定"
+grep -Fqx 'keybind = ctrl+shift+v=text:\x16' "$WORK/config.ghostty" \
+    || fail "缺少 ctrl+shift+v 原始 Ctrl+V 绑定"
+! grep -Eq '^keybind = ctrl\+(c|v)=' "$WORK/config.ghostty" \
+    || fail "Ctrl+C/V 不应被全局改绑"
 # 只有 never 能保证程序不能通过 XTSHIFTESCAPE 改写这条本地选择路径。
 ! grep -Eq '^mouse-shift-capture[[:space:]]*=[[:space:]]*(true|false|always)[[:space:]]*$' "$WORK/config.ghostty" \
     || fail "mouse-shift-capture 必须固定为 never"
@@ -123,7 +125,7 @@ HOME="$WORK/config-home" bash -c '
     grep -Fqx "clipboard-read = deny" "$CONFIG_FILE"
     grep -Fqx "mouse-shift-capture = never" "$CONFIG_FILE"
     grep -Fqx "keybind = ctrl+shift+c=copy_to_clipboard:mixed" "$CONFIG_FILE"
-    grep -Fqx "keybind = ctrl+shift+v=paste_from_clipboard" "$CONFIG_FILE"
+    grep -Fqx '\''keybind = ctrl+shift+v=text:\x16'\'' "$CONFIG_FILE"
     digest=$(sha256sum "$CONFIG_FILE" | cut -d" " -f1)
     write_config > "$HOME/second.out"
     grep -Fq "配置文件无变化" "$HOME/second.out"
@@ -256,16 +258,17 @@ prepare_pi_only_home() {
     ' _ "$WORK/functions.sh"
 }
 snapshot_pi_only_home() {
-    python3 - "$1" <<'PY'
+    python3 - "$1" "${2:-.local/bin/ghostty-pi}" <<'PY'
 from pathlib import Path
 import hashlib
 import stat
 import sys
 
 root = Path(sys.argv[1])
+excluded = sys.argv[2]
 for path in sorted(root.rglob("*")):
     rel = path.relative_to(root).as_posix()
-    if rel == ".local/bin/ghostty-pi":
+    if rel == excluded:
         continue
     mode = stat.S_IMODE(path.lstat().st_mode)
     if path.is_symlink():
@@ -310,7 +313,7 @@ if [ -x /usr/bin/ghostty ]; then
     ! compgen -G "$PI_ONLY_HOME/.local/bin/ghostty-pi.bak.*" >/dev/null \
         || fail "Pi 窄安装意外生成启动器备份"
 
-    for other in --check --ppa-only --deb-only --default-terminal --no-default-terminal; do
+    for other in --check --ppa-only --deb-only --default-terminal --no-default-terminal --paste-keybind-only; do
         if run_pi_only "$PI_ONLY_HOME" --pi-launcher-only "$other" > "$WORK/pi-only-args.log" 2>&1; then
             fail "Pi 窄安装接受了冲突选项 $other"
         fi
@@ -358,6 +361,94 @@ if [ -x /usr/bin/ghostty ]; then
 else
     echo "SKIP: 本机未安装 /usr/bin/ghostty，真实 --pi-launcher-only 入口需要既有二进制"
 fi
+
+# ============================================================
+# 真实全局单键窄迁移：同一 install.sh 副本无 C 源码，阻断 apt/cc/
+# gsettings/GUI，只在私有 HOME 用实际渲染器生成历史逐字节基准。
+# 迁移结果必须仅替换一行，不碰启动器、桌面、字体或任何其它文件。
+# ============================================================
+PASTE_ONLY_HOME="$WORK/paste-only-baseline"
+prepare_pi_only_home "$PASTE_ONLY_HOME"
+HOME="$PASTE_ONLY_HOME" bash -c '
+    set -euo pipefail
+    source "$1"
+    render_config paste_from_clipboard > "$CONFIG_FILE"
+    chmod 600 "$CONFIG_FILE"
+' _ "$WORK/functions.sh" || fail "无法生成旧版受管配置"
+cp "$PASTE_ONLY_HOME/.config/ghostty/config.ghostty" "$WORK/paste-old-baseline"
+snapshot_pi_only_home "$PASTE_ONLY_HOME" .config/ghostty/config.ghostty > "$WORK/paste-only-before"
+run_pi_only "$PASTE_ONLY_HOME" --paste-keybind-only > "$WORK/paste-only-first.log" \
+    || fail "全局单键窄迁移未接受旧版受管基准"
+python3 - "$WORK/paste-old-baseline" "$PASTE_ONLY_HOME/.config/ghostty/config.ghostty" <<'PY'
+from pathlib import Path
+import sys
+
+before = Path(sys.argv[1]).read_bytes()
+after = Path(sys.argv[2]).read_bytes()
+old = b"keybind = ctrl+shift+v=paste_from_clipboard\n"
+new = b"keybind = ctrl+shift+v=text:\\x16\n"
+assert before.count(old) == 1, "old baseline lacks unique keybind"
+assert after == before.replace(old, new), "migration changed more than one binding"
+PY
+test "$(stat -c %a "$PASTE_ONLY_HOME/.config/ghostty/config.ghostty")" = 600 \
+    || fail "全局单键窄迁移未保留配置权限"
+snapshot_pi_only_home "$PASTE_ONLY_HOME" .config/ghostty/config.ghostty > "$WORK/paste-only-after"
+cmp -s "$WORK/paste-only-before" "$WORK/paste-only-after" \
+    || fail "全局单键窄迁移修改了非目标文件（包括普通启动器）"
+paste_inode=$(stat -c %i "$PASTE_ONLY_HOME/.config/ghostty/config.ghostty")
+run_pi_only "$PASTE_ONLY_HOME" --paste-keybind-only > "$WORK/paste-only-second.log" \
+    || fail "全局单键窄迁移重跑失败"
+grep -Fq "已是当前基准，跳过写入" "$WORK/paste-only-second.log" \
+    || fail "全局单键窄迁移重跑没有识别新基准"
+test "$paste_inode" = "$(stat -c %i "$PASTE_ONLY_HOME/.config/ghostty/config.ghostty")" \
+    || fail "全局单键窄迁移重跑替换了配置文件"
+snapshot_pi_only_home "$PASTE_ONLY_HOME" .config/ghostty/config.ghostty > "$WORK/paste-only-rerun"
+cmp -s "$WORK/paste-only-before" "$WORK/paste-only-rerun" \
+    || fail "全局单键窄迁移重跑修改了其它文件"
+! compgen -G "$PASTE_ONLY_HOME/.config/ghostty/config.ghostty.bak.*" >/dev/null \
+    || fail "全局单键窄迁移写了非目标备份"
+
+for other in --check --ppa-only --deb-only --default-terminal --no-default-terminal --pi-launcher-only; do
+    if run_pi_only "$PASTE_ONLY_HOME" --paste-keybind-only "$other" > "$WORK/paste-only-args.log" 2>&1; then
+        fail "全局单键窄迁移接受了冲突选项 $other"
+    fi
+    grep -Fq "不能与其他安装或预检选项组合" "$WORK/paste-only-args.log" \
+        || fail "全局单键窄迁移未明确拒绝冲突选项 $other"
+done
+
+for scenario in custom-old custom-new symlink directory missing symlink-config-dir; do
+    private_home="$WORK/paste-refuse-$scenario"
+    prepare_pi_only_home "$private_home"
+    HOME="$private_home" bash -c '
+        set -euo pipefail
+        source "$1"
+        render_config "$2" > "$CONFIG_FILE"
+    ' _ "$WORK/functions.sh" paste_from_clipboard \
+        || fail "无法生成拒绝场景的受管配置 $scenario"
+    config="$private_home/.config/ghostty/config.ghostty"
+    case "$scenario" in
+        custom-old) printf "# USER CUSTOM\n" >> "$config" ;;
+        custom-new)
+            HOME="$private_home" bash -c 'source "$1"; render_config > "$CONFIG_FILE"' _ "$WORK/functions.sh"
+            printf "# USER CUSTOM\n" >> "$config" ;;
+        symlink) mv "$config" "$private_home/original-config"; ln -s "$private_home/original-config" "$config" ;;
+        directory) rm "$config"; mkdir "$config"; printf "KEEP\n" > "$config/content" ;;
+        missing) rm "$config" ;;
+        symlink-config-dir)
+            mv "$private_home/.config/ghostty" "$private_home/real-ghostty-config"
+            ln -s "$private_home/real-ghostty-config" "$private_home/.config/ghostty"
+            ;;
+    esac
+    snapshot_pi_only_home "$private_home" > "$WORK/paste-$scenario.before"
+    if run_pi_only "$private_home" --paste-keybind-only > "$WORK/paste-$scenario.log" 2>&1; then
+        fail "全局单键窄迁移接受了用户内容/符号链接/缺失文件 $scenario"
+    fi
+    grep -Eq "拒绝(覆盖|窄迁移)" "$WORK/paste-$scenario.log" \
+        || fail "全局单键窄迁移未明确拒绝 $scenario"
+    snapshot_pi_only_home "$private_home" > "$WORK/paste-$scenario.after"
+    cmp -s "$WORK/paste-$scenario.before" "$WORK/paste-$scenario.after" \
+        || fail "全局单键窄迁移拒绝 $scenario 时修改了文件"
+done
 
 # ============================================================
 # 用户级 desktop 覆盖：只改三处启动语义，幂等，拒绝覆盖带用户改动的文件
@@ -840,7 +931,7 @@ if command -v cc >/dev/null 2>&1; then
 fi
 
 if [ "$HAVE_ZSH" = true ]; then
-    echo "PASS: Ghostty single-installer Wayland backpressure, Pi-scoped launcher/only-mode, desktop migration, font/clipboard/SSH integration"
+    echo "PASS: Ghostty single-installer Wayland backpressure, guarded global paste/only-mode, Pi-scoped launcher/only-mode, desktop migration, font/clipboard/SSH integration"
 else
-    echo "PASS (zsh 未安装，hook 行为与 PTY 部分已跳过): Ghostty single-installer Wayland backpressure, Pi-scoped launcher/only-mode, desktop migration, font/clipboard integration"
+    echo "PASS (zsh 未安装，hook 行为与 PTY 部分已跳过): Ghostty single-installer Wayland backpressure, guarded global paste/only-mode, Pi-scoped launcher/only-mode, desktop migration, font/clipboard integration"
 fi
