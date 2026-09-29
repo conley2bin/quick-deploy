@@ -116,10 +116,12 @@ test("native cached components retain immutable geometry across changed bytes an
   const first = component(firstMessage);
   const entries = [entry(firstMessage, "first")];
   const tui = { children: [first], terminal: { columns: 80 }, render: () => [], invalidate() {}, requestRender() {} };
+  const hostTui = await import(pathToFileURL(join(root, "node_modules/@earendil-works/pi-tui/dist/index.js")).href);
   const adapter = new HostImageOwnershipAdapter(
     session,
     () => undefined,
-    { version: "0.85.1", sessionEntryToContextMessages: (entry) => entry.message ? [entry.message] : [] },
+    { version: "0.85.1", sessionEntryToContextMessages: (entry) => entry.message ? [entry.message] : [],
+      isAssistantTextMarkdown: (value) => value instanceof hostTui.Markdown },
   );
   adapter.setTui(tui as never);
   assert.equal(adapter.reconcile(entries as never, entries as never), true);

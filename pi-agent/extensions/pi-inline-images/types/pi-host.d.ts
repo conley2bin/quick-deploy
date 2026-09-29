@@ -8,6 +8,10 @@ declare module "@earendil-works/pi-tui" {
     terminal: { columns: number };
     requestRender(force?: boolean): void;
   }
+  export class Markdown implements Component {
+    render(width: number): string[];
+    invalidate(): void;
+  }
   export function allocateImageId(): number;
   export function getCapabilities(): { images: "kitty" | "iterm2" | null; trueColor: boolean; hyperlinks: boolean };
   export function getCellDimensions(): { widthPx: number; heightPx: number };

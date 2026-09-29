@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import type { Component, TUI } from "@earendil-works/pi-tui";
-import type { ImageSession } from "./session.ts";
+import { assistantTextBlocks, type ImageSession } from "./session.ts";
 
 export const READ_PREVIEW_ENTRIES_CHANGED = "pi-inline-images:read-preview-entries-changed";
 export const READ_PREVIEW_COORDINATION = "pi-inline-images:read-preview-coordination";
@@ -21,6 +21,8 @@ export type HostAdapterApi = {
   sessionEntryToContextMessages(entry: HostSessionEntry): unknown[];
   /** Public native protocol capability; null means no native bitmap can compete. */
   nativeImageProtocol?(): "kitty" | "iterm2" | null;
+  /** Identify Pi's public Markdown component; source is checked against the bound text block at transform time. */
+  isAssistantTextMarkdown(component: Component): boolean;
 };
 type AssistantComponent = Component & {
   setHideThinkingBlock(hidden: boolean): void;
@@ -79,6 +81,19 @@ function isToolComponent(value: unknown): value is ToolComponent {
   const candidate = value as Partial<ToolComponent>;
   return typeof candidate.render === "function" && typeof candidate.setShowImages === "function"
     && typeof candidate.setImageWidthCells === "function";
+}
+function assistantMarkdownComponents(root: AssistantComponent, isMarkdown: HostAdapterApi["isAssistantTextMarkdown"]): Component[] {
+  const markdown: Component[] = [];
+  const seen = new Set<object>();
+  const visit = (value: unknown) => {
+    if (!value || typeof value !== "object" || seen.has(value)) return;
+    seen.add(value);
+    if (isMarkdown(value as Component)) { markdown.push(value as Component); return; }
+    const children = (value as { children?: unknown }).children;
+    if (Array.isArray(children)) for (const child of children) visit(child);
+  };
+  visit(root);
+  return markdown;
 }
 function observedComponents(root: TUI): Observed[] {
   const observed: Observed[] = [];
@@ -511,6 +526,8 @@ export class HostImageOwnershipAdapter {
       this.hostRejection = "sessionEntryToContextMessages is not a function";
     } else if (this.host.nativeImageProtocol !== undefined && typeof this.host.nativeImageProtocol !== "function") {
       this.hostRejection = "nativeImageProtocol is present but not a function";
+    } else if (typeof this.host.isAssistantTextMarkdown !== "function") {
+      this.hostRejection = "isAssistantTextMarkdown is not a function";
     }
     return this.hostRejection;
   }
@@ -537,11 +554,53 @@ export class HostImageOwnershipAdapter {
       active: true,
     };
     binding.wrapper = (width) => binding.active
-      ? this.session.withRenderMessage(binding.message, () => binding.original.call(component, width))
+      ? this.renderAssistant(binding, width)
       : binding.original.call(component, width);
     component.render = binding.wrapper;
     this.assistants.set(component, binding);
+    try {
+      // The host may have rendered this new component before reconciliation. Its
+      // Markdown then caches an unbound coordination notice and will not run the
+      // transformer again merely because the assistant render is now decorated.
+      // Clear only these child caches once, on first binding, not the whole TUI.
+      for (const markdown of assistantMarkdownComponents(component, this.host.isAssistantTextMarkdown)) markdown.invalidate();
+    } catch (error) {
+      return `assistant Markdown cache invalidation failed: ${errorMessage(error)}`;
+    }
     return undefined;
+  }
+
+  private renderAssistant(binding: AssistantBinding, width: number): string[] {
+    type RenderOverride = { component: Component; original: Component["render"]; wrapper: Component["render"]; hadOwnMethod: boolean };
+    const overrides: RenderOverride[] = [];
+    const restore = () => {
+      for (const { component, original, wrapper, hadOwnMethod } of overrides.reverse()) {
+        if (component.render !== wrapper) continue; // another owner replaced it
+        if (hadOwnMethod) component.render = original;
+        else delete (component as Partial<Component>).render;
+      }
+      overrides.length = 0;
+    };
+    try {
+      const blocks = assistantMarkdownComponents(binding.component, this.host.isAssistantTextMarkdown);
+      if (blocks.length !== assistantTextBlocks(binding.message).length) throw new Error("assistant Markdown block sequence mismatch");
+      for (const [blockIndex, component] of blocks.entries()) {
+        const irreversible = reversibleMethod(component, "render");
+        if (irreversible) throw new Error(`assistant Markdown render cannot be wrapped reversibly: ${irreversible}`);
+        const original = component.render;
+        const wrapper = (availableWidth: number) => this.session.withRenderBlock(binding.message, blockIndex,
+          () => original.call(component, availableWidth));
+        overrides.push({ component, original, wrapper, hadOwnMethod: Object.prototype.hasOwnProperty.call(component, "render") });
+        component.render = wrapper;
+        if (component.render !== wrapper) throw new Error("assistant Markdown render override did not commit");
+      }
+    } catch {
+      restore();
+      // A drifting host tree cannot assign identical sources by invocation order.
+      return this.session.withRenderBlock(binding.message, -1, () => binding.original.call(binding.component, width));
+    }
+    try { return binding.original.call(binding.component, width); }
+    finally { restore(); }
   }
 
   private bindTool(component: ToolComponent, id: string, completedWithoutImages: boolean): string | undefined {

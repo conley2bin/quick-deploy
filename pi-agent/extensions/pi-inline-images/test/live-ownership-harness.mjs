@@ -33,7 +33,7 @@ const report={};
 {
  const message=assistant(['pending']); const a=new AssistantMessageComponent(message); const row=new ToolExecutionComponent('read','pending',{}, {showImages:true},undefined,{requestRender(){}},'/fixture');
  const terminal=new TerminalImages(()=>1,()=>({widthPx:10,heightPx:20}),{write:()=>true},{},false);
- const adapter=new HostImageOwnershipAdapter(new ImageSession(terminal),()=>{}, {version:'0.85.1',sessionEntryToContextMessages:e=>e.message?[e.message]:[]});
+ const adapter=new HostImageOwnershipAdapter(new ImageSession(terminal),()=>{}, {version:'0.85.1',sessionEntryToContextMessages:e=>e.message?[e.message]:[],isAssistantTextMarkdown:c=>c instanceof tui.Markdown});
  adapter.setTui({children:[a,row],terminal:{columns:80}});
  const entries=[{type:'message',message}]; adapter.reconcile(entries,entries);
  row.updateResult(result('pending')); const before=hasNative(row);

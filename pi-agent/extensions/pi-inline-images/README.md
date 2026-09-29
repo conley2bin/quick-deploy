@@ -168,10 +168,21 @@ session. Native protocol capability is separate: when Pi reports `images:null` (
 bitmap can compete, so the ready custom owner is authorized unless an explicit
 public off choice was observed; the latent host flag is never rewritten. Capability
 changes are part of the reconciliation signature. Assistant component `render` is
-decorated per instance (never by prototype) so local thinking/invalidate rebuilds
-retain exact historical Markdown occurrences. Successful compaction/tree rebuilds
-revoke old-generation claims before the first reconstructed frame and renew only
-after new public component identities appear. Every ownership transition coalesces
+decorated per instance (never by prototype). During that render, each public child
+`Markdown` instance is temporarily bound to its prepared text-block ordinal; the
+instance override is restored immediately afterward. Fullscreen `pi-copy-links`
+may invalidate and render that Markdown instance twice (collect/decorate), while
+regular mode may skip a cached sibling. Both paths resolve the same prepared
+occurrence by component identity, so identical blocks can retain different
+immutable PNG versions after a file changes. A child-count/source mismatch shows
+a coordination notice instead of consuming another block's image. A rebuilt
+assistant can render and cache that notice before host reconciliation. First
+binding invalidates only that assistant's Markdown child caches once; the next
+diff render selects prepared images without replaying the whole history. Stable
+reconciliations do not invalidate again. Local thinking/invalidate rebuilds
+retain exact historical Markdown occurrences. Successful compaction/tree
+rebuilds revoke old-generation claims before the first reconstructed frame and
+renew only after new public component identities appear. Every ownership transition coalesces
 one invalidate/forced render; ordinary live binding updates (streaming tokens, structural
 live-binding changes) coalesce a diff render only, so a token can reconcile but never resets
 renderer state or re-emits scrollback.
@@ -225,6 +236,8 @@ The provider-free captured-sink integration harness can be run alone:
 
 ```bash
 node --test --import tsx test/integration.test.ts
+node --test --import tsx test/paired-fullscreen.test.ts
+node --test --import tsx test/compaction-inline.test.ts
 ```
 
 It exercises a real large Sharp preview, many distinct ~384 KiB PNG previews,
@@ -233,9 +246,15 @@ actual Kitty APC decoding/byte counts, multi-image FIFO, placement-before-grid,
 placement/image-high-bit mapping, cell-metric change failure, old-plugin command
 coexistence, aggregate rejection, same-runtime reuse/new-factory reupload,
 late-load and queued-catalog cancellation, accepted-false ordering, and
-listener/timer cleanup. Other tests retain installed Pi native Markdown rendering, raw message
-preservation, parser/reference/table behavior, cancelled-switch behavior, immutable
-cached resources, and isolated installer ownership.
+listener/timer cleanup. The paired-adapter harness loads installed Pi's actual
+AssistantMessage/Markdown classes together with `pi-copy-links`; it checks both
+render modes, two native fullscreen passes, independent same-message blocks,
+changed-file versions, raw bytes, and exact uploaded PNGs. The production-loader
+compaction harness first caches duplicate-source notices in an unbound native
+assistant tree, then checks the first successful binding recovers grids with a
+diff-only repaint. Other tests retain parser/reference/table behavior,
+cancelled-switch behavior, immutable cached resources, and isolated installer
+ownership.
 
 For a later independent pixel check, use a disposable private Ghostty/tmux setup;
 do not run the fixture against an active desktop. The captured-output checks

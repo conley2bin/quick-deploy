@@ -65,16 +65,16 @@ export class ImageSession {
     return prepared;
   }
 
-  /** Scope Markdown resolution to one positively associated native assistant component. */
-  withRenderMessage<T>(message: object, render: () => T): T {
+  /** A native Markdown component owns one text block, even across cached or repeated render passes. */
+  withRenderBlock<T>(message: object, blockIndex: number, render: () => T): T {
     const previous = this.activeRender;
-    this.activeRender = { message, blockIndex: 0 };
+    this.activeRender = { message, blockIndex };
     try { return render(); } finally { this.activeRender = previous; }
   }
 
   preparedForRender(source: string): PreparedMarkdown | undefined {
     if (this.activeRender) {
-      const candidate = this.preparedMessages.get(this.activeRender.message)?.[this.activeRender.blockIndex++];
+      const candidate = this.preparedMessages.get(this.activeRender.message)?.[this.activeRender.blockIndex];
       return candidate?.source === source ? candidate : this.coordinationFailure(source, candidate?.cwd);
     }
     const candidates = this.occurrences.get(source);

@@ -68,6 +68,7 @@ function adapterFixture(
       sessionEntryToContextMessages: hostOverride?.sessionEntryToContextMessages
         ?? ((entry: HostSessionEntry) => entry.message ? [entry.message] : []),
       nativeImageProtocol,
+      isAssistantTextMarkdown: (component) => component.constructor.name === "Markdown",
     },
   );
   const tui = { children, terminal: { columns: 80 }, render: () => [], invalidate() {}, requestRender() {} };
@@ -449,7 +450,8 @@ test("a host without sessionEntryToContextMessages fails closed with the missing
   const adapter = new HostImageOwnershipAdapter(
     new ImageSession(terminal),
     (event) => events.push(event),
-    { version: "0.86.1", sessionEntryToContextMessages: undefined as never },
+    { version: "0.86.1", sessionEntryToContextMessages: undefined as never,
+      isAssistantTextMarkdown: (component) => component.constructor.name === "Markdown" },
   );
   adapter.setTui({ children: [], terminal: { columns: 80 }, render: () => [], invalidate() {}, requestRender() {} } as never);
   assert.equal(adapter.reconcile([], []), false);

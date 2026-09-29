@@ -1,5 +1,5 @@
 import { sessionEntryToContextMessages, VERSION, type ExtensionAPI, type SessionEntry } from "@earendil-works/pi-coding-agent";
-import { allocateImageId, getCapabilities, getCellDimensions, type TUI } from "@earendil-works/pi-tui";
+import { allocateImageId, getCapabilities, getCellDimensions, Markdown, type TUI } from "@earendil-works/pi-tui";
 import { installGraphicsBridge } from "./src/bridge.ts";
 import {
   HostImageOwnershipAdapter,
@@ -26,7 +26,8 @@ export default function piInlineImages(pi: ExtensionAPI) {
   const host = new HostImageOwnershipAdapter(
     session,
     (coordination) => pi.events.emit(READ_PREVIEW_COORDINATION, coordination),
-    { version: VERSION, sessionEntryToContextMessages, nativeImageProtocol: () => getCapabilities().images },
+    { version: VERSION, sessionEntryToContextMessages, nativeImageProtocol: () => getCapabilities().images,
+      isAssistantTextMarkdown: (component) => component instanceof Markdown },
     () => wake(),
   );
   let tui: TUI | undefined;
