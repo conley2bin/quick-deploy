@@ -59,8 +59,24 @@ function startRepair(vscode, context) {
 
       output().info(`Calling vscode.openWith for ${uri.toString()} as ${VIDEO_PREVIEW}`);
       await vscode.commands.executeCommand('vscode.openWith', uri, VIDEO_PREVIEW);
-      const current = active().tab?.input;
-      output().info(`openWith returned; active tab is ${current instanceof vscode.TabInputCustom ? `TabInputCustom(${current.viewType}, ${current.uri.toString()})` : current?.constructor.name || 'none'}`);
+      const nowPlaying = active();
+      const preview = nowPlaying.tab?.input;
+      output().info(`openWith returned; active tab is ${preview instanceof vscode.TabInputCustom ? `TabInputCustom(${preview.viewType}, ${preview.uri.toString()})` : preview?.constructor.name || 'none'}`);
+
+      // openWith creates another tab. Remove only the original, inactive text
+      // tab after proving that the new active tab owns the same video URI.
+      if (!standalone() || nowPlaying.group !== group || !group.isActive ||
+          !nowPlaying.tab?.isActive || nowPlaying.tab === tab ||
+          !(preview instanceof vscode.TabInputCustom) ||
+          preview.viewType !== VIDEO_PREVIEW || preview.uri.toString() !== uri.toString() ||
+          !group.tabs.includes(tab) || tab.isActive || tab.isDirty ||
+          !(tab.input instanceof vscode.TabInputText) ||
+          tab.input.uri.toString() !== uri.toString()) {
+        output().info('Original text tab retained: cleanup guard did not match');
+        return;
+      }
+      const closed = await window.tabGroups.close(tab, true);
+      output().info(closed ? 'Closed original inactive text tab' : 'Original text tab retained: tabGroups.close returned false');
     } catch (error) {
       report(error);
     }

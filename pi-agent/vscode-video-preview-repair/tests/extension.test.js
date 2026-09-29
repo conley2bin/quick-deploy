@@ -29,7 +29,8 @@ function harness(initialTab, options = {}) {
   const calls = [];
   const errors = [];
   const log = [];
-  const group = { isActive: true, activeTab: initialTab };
+  const closeCalls = [];
+  const group = { isActive: true, activeTab: initialTab, tabs: initialTab ? [initialTab] : [] };
   let event;
   let disposed = false;
   const media = options.media === undefined ? {
@@ -44,7 +45,14 @@ function harness(initialTab, options = {}) {
       },
       tabGroups: {
         activeTabGroup: group,
-        onDidChangeTabs(callback) { event = callback; return { dispose() { disposed = true; event = undefined; } }; }
+        onDidChangeTabs(callback) { event = callback; return { dispose() { disposed = true; event = undefined; } }; },
+        async close(target, preserveFocus) {
+          closeCalls.push([target, preserveFocus]);
+          if (options.closeError) throw options.closeError;
+          if (options.closeResult === false) return false;
+          group.tabs = group.tabs.filter(existing => existing !== target);
+          return true;
+        }
       },
       showErrorMessage(message) { errors.push(message); return Promise.resolve(); }
     },
@@ -54,14 +62,17 @@ function harness(initialTab, options = {}) {
         calls.push(args);
         if (options.commandError) throw options.commandError;
         if (options.convert !== false) {
+          if (group.activeTab) group.activeTab.isActive = false;
           group.activeTab = tab(new TabInputCustom(args[1], args[2]));
+          group.tabs.push(group.activeTab);
         }
+        options.afterOpenWith?.(group, workspace, vscode);
       }
     }
   };
   const context = { subscriptions: [] };
   return {
-    vscode, workspace, group, calls, errors, log, context,
+    vscode, workspace, group, initialTab, calls, closeCalls, errors, log, context,
     emit() { event?.({ opened: [], closed: [], changed: [] }); },
     get disposed() { return disposed; },
     start() { startRepair(vscode, context); }
@@ -79,7 +90,10 @@ test('startup text MP4 activates bundled provider and explicitly selects video o
   assert.deepEqual(commands(h), [['vscode.openWith', h.group.activeTab.input.uri, 'vscode.videoPreview']]);
   assert.equal(h.group.activeTab.input.viewType, 'vscode.videoPreview');
   assert.match(h.log[0][1], /First active tab is TabInputText: file:\/\/\/tmp\/movie\.mp4/);
-  assert.match(h.log.at(-1)[1], /TabInputCustom\(vscode\.videoPreview, file:\/\/\/tmp\/movie\.mp4\)/);
+  assert.match(h.log.find(([level, message]) => level === 'info' && message.includes('openWith returned'))[1], /TabInputCustom\(vscode\.videoPreview, file:\/\/\/tmp\/movie\.mp4\)/);
+  assert.deepEqual(h.closeCalls, [[h.initialTab, true]]);
+  assert.deepEqual(h.group.tabs, [h.group.activeTab]);
+  assert.match(h.log.at(-1)[1], /Closed original inactive text tab/);
   assert.equal(h.disposed, true);
   h.group.activeTab = video(); // a later deliberate Reopen as Text
   h.emit();
@@ -96,6 +110,58 @@ test('first tab event after empty startup can repair; later events cannot', asyn
   await settled();
   assert.equal(commands(h).length, 1);
   assert.equal(h.disposed, true);
+});
+
+test('cleanup closes only the original tab, preserving another tab and focus', async () => {
+  const extra = tab(new TabInputText(uri('/tmp/notes.txt')), { isActive: false });
+  const h = harness(video(), { afterOpenWith(group) { group.tabs.push(extra); } });
+  h.start();
+  await settled();
+  assert.deepEqual(h.closeCalls, [[h.initialTab, true]]);
+  assert.deepEqual(h.group.tabs, [h.group.activeTab, extra]);
+  assert.equal(h.group.activeTab.input.viewType, 'vscode.videoPreview');
+});
+
+test('cleanup retains original when focus, identity, URI, type, or dirty state changes', async () => {
+  const races = [
+    (_, workspace) => { workspace.workspaceFolders = [{ uri: uri('/project') }]; },
+    (group, _, vscode) => { vscode.window.tabGroups.activeTabGroup = { isActive: true, activeTab: group.activeTab }; },
+    group => { group.isActive = false; },
+    group => { group.activeTab.isActive = false; },
+    group => { group.activeTab.input = new TabInputCustom(uri('/tmp/other.mp4'), 'vscode.videoPreview'); },
+    group => { group.activeTab.input = new TabInputCustom(uri('/tmp/movie.mp4'), 'other.preview'); },
+    group => { group.activeTab.input = new TabInputText(uri('/tmp/movie.mp4')); },
+    group => { group.tabs[0].isDirty = true; },
+    group => { group.tabs[0].isActive = true; },
+    group => { group.tabs[0].input = new TabInputText(uri('/tmp/other.mp4')); },
+    group => { group.tabs.shift(); }
+  ];
+  for (const afterOpenWith of races) {
+    const h = harness(video(), { afterOpenWith });
+    h.start();
+    await settled();
+    assert.equal(h.closeCalls.length, 0);
+    assert.match(h.log.at(-1)[1], /Original text tab retained: cleanup guard did not match/);
+    assert.equal(h.errors.length, 0);
+  }
+});
+
+test('cleanup false result leaves original and logs refusal', async () => {
+  const h = harness(video(), { closeResult: false });
+  h.start();
+  await settled();
+  assert.deepEqual(h.closeCalls, [[h.initialTab, true]]);
+  assert.equal(h.group.tabs.includes(h.initialTab), true);
+  assert.match(h.log.at(-1)[1], /tabGroups\.close returned false/);
+});
+
+test('cleanup failure notifies instead of silently swallowing it', async () => {
+  const h = harness(video(), { closeError: new Error('close refused') });
+  h.start();
+  await settled();
+  assert.deepEqual(h.closeCalls, [[h.initialTab, true]]);
+  assert.equal(h.group.tabs.includes(h.initialTab), true);
+  assert.match(h.errors[0], /close refused/);
 });
 
 test('already-custom preview is left untouched', async () => {
