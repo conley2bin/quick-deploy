@@ -24,6 +24,11 @@ mapfile -t module_shell_files < <(find "$MODULE_DIR" -type f \
 sed '/^main "\$@"$/,$d' "$INSTALLER" > "$WORK/functions.sh"
 HOME="$WORK/render-hook-home" bash -c 'source "$1"; render_ssh_mouse_hook' _ "$WORK/functions.sh" > "$HOOK_SOURCE"
 HOME="$WORK/render-hook-home" bash -c 'source "$1"; render_local_paste_hook' _ "$WORK/functions.sh" > "$PASTE_HOOK_SOURCE"
+HOME="$WORK/render-hook-home" bash -c 'source "$1"; render_local_paste_hook v1' \
+    _ "$WORK/functions.sh" > "$WORK/ghostty-local-paste-v1.zsh"
+printf '6d53e9c81646f1ebb72872df4ec9f014117957042bce2ccd33fa2bfcc43423eb  %s\n' \
+    "$WORK/ghostty-local-paste-v1.zsh" | sha256sum --check --status \
+    || fail "历史 v1 粘贴 hook 渲染不再是已部署的精确字节"
 # 真正打包的模块副本只含 install.sh + C 源码：没有独立 .zsh/.sh 资源。
 # 源码渲染应与原模块等同，并在 --check/正式安装共用的预检下完整。
 mkdir -p "$WORK/packaged-module"
@@ -48,6 +53,7 @@ if command -v zsh >/dev/null 2>&1; then
     HAVE_ZSH=true
     zsh -n "$HOOK_SOURCE" || fail "zsh SSH hook 语法错误"
     zsh -n "$PASTE_HOOK_SOURCE" || fail "zsh 粘贴 hook 语法错误"
+    zsh -n "$WORK/ghostty-local-paste-v1.zsh" || fail "历史 v1 hook 语法错误"
 else
     echo "SKIP: 未安装 zsh，跳过 zsh hook 语法、hook 行为与 PTY 测试（其余测试继续）"
 fi
@@ -555,6 +561,46 @@ cmp -s "$WORK/shell-after" "$WORK/shell-rerun" || fail "zsh 粘贴窄模式重�
 test "$(find "$SHELL_ONLY_HOME" -name '.zshrc.bak.*' | wc -l)" -eq 1 \
     || fail "zsh 粘贴窄模式重跑生成了额外备份"
 
+# Live v1 has the already-migrated .zshrc block. Rerunning the narrow mode
+# must recognize the exact historical hook, replace only that file, and keep
+# .zshrc inode/user text plus global Ghostty config entirely untouched.
+cp "$WORK/ghostty-local-paste-v1.zsh" "$PASTE_INSTALLED"
+chmod 600 "$PASTE_INSTALLED"
+snapshot_pi_only_home "$SHELL_ONLY_HOME" > "$WORK/shell-v1-before"
+run_shell_only "$SHELL_ONLY_HOME" --shell-paste-only > "$WORK/shell-v1-migrate.log" \
+    || fail "已部署的 v1 hook 无法窄迁移"
+cmp -s "$PASTE_INSTALLED" "$PASTE_HOOK_SOURCE" || fail "v1 未迁移为 v2 hook"
+test "$(stat -c %a "$PASTE_INSTALLED")" = 600 || fail "v1 迁移未保留 hook 权限"
+test "$shell_rc_inode" = "$(stat -c %i "$SHELL_ONLY_HOME/.zshrc")" \
+    || fail "v1 hook 迁移错误改写 .zshrc"
+cmp -s "$SHELL_ONLY_HOME/.config/ghostty/config.ghostty" "$WORK/shell-global-config" \
+    || fail "v1 hook 迁移错误改写全局 Ghostty 配置"
+snapshot_pi_only_home "$SHELL_ONLY_HOME" > "$WORK/shell-v1-after"
+python3 - "$SHELL_ONLY_HOME" "$WORK/shell-v1-before" "$WORK/shell-v1-after" "$WORK/ghostty-local-paste-v1.zsh" <<'PY'
+from pathlib import Path
+import ast
+import sys
+
+home, before_file, after_file, old_hook = (Path(path) for path in sys.argv[1:])
+backup = list((home / '.config/ghostty').glob('ghostty-local-paste.zsh.bak.*'))
+assert len(backup) == 1 and backup[0].read_bytes() == old_hook.read_bytes()
+before = {row[0]: row for row in map(ast.literal_eval, before_file.read_text().splitlines())}
+after = {row[0]: row for row in map(ast.literal_eval, after_file.read_text().splitlines())}
+changed = {path for path in before.keys() | after.keys() if before.get(path) != after.get(path)}
+assert changed == {
+    '.config/ghostty/ghostty-local-paste.zsh',
+    backup[0].relative_to(home).as_posix(),
+}, changed
+PY
+migrated_hook_inode=$(stat -c %i "$PASTE_INSTALLED")
+run_shell_only "$SHELL_ONLY_HOME" --shell-paste-only > "$WORK/shell-v1-rerun.log" \
+    || fail "v1→v2 窄迁移重跑失败"
+test "$migrated_hook_inode" = "$(stat -c %i "$PASTE_INSTALLED")" \
+    || fail "v1→v2 窄迁移重跑改写了 hook"
+snapshot_pi_only_home "$SHELL_ONLY_HOME" > "$WORK/shell-v1-rerun"
+cmp -s "$WORK/shell-v1-after" "$WORK/shell-v1-rerun" \
+    || fail "v1→v2 窄迁移重跑修改了文件"
+
 for other in --check --ppa-only --deb-only --default-terminal --no-default-terminal --paste-keybind-only --pi-launcher-only; do
     if run_shell_only "$SHELL_ONLY_HOME" --shell-paste-only "$other" > "$WORK/shell-args.log" 2>&1; then
         fail "zsh 粘贴窄模式接受了冲突选项 $other"
@@ -563,7 +609,7 @@ for other in --check --ppa-only --deb-only --default-terminal --no-default-termi
         || fail "zsh 粘贴窄模式未明确拒绝冲突选项 $other"
 done
 
-for scenario in old-global custom-global custom-zshrc symlink-zshrc malformed-zshrc custom-hook symlink-hook custom-mouse; do
+for scenario in old-global custom-global custom-zshrc symlink-zshrc malformed-zshrc custom-hook custom-v1-hook symlink-hook custom-mouse; do
     private_home="$WORK/shell-refuse-$scenario"
     prepare_shell_paste_home "$private_home"
     config="$private_home/.config/ghostty/config.ghostty"
@@ -576,6 +622,7 @@ for scenario in old-global custom-global custom-zshrc symlink-zshrc malformed-zs
         symlink-zshrc) mv "$zshrc" "$private_home/real-zshrc"; ln -s "$private_home/real-zshrc" "$zshrc" ;;
         malformed-zshrc) sed -i '/^# <<< fresh-install ghostty: ssh 鼠标复位 hook <<</d' "$zshrc" ;;
         custom-hook) printf 'KEEP\n' > "$paste_hook" ;;
+        custom-v1-hook) cp "$WORK/ghostty-local-paste-v1.zsh" "$paste_hook"; printf '# user addition\n' >> "$paste_hook" ;;
         symlink-hook) printf 'KEEP\n' > "$private_home/real-hook"; ln -s "$private_home/real-hook" "$paste_hook" ;;
         custom-mouse) printf 'KEEP\n' >> "$private_home/.config/ghostty/ghostty-ssh-mouse-reset.zsh" ;;
     esac
@@ -1023,6 +1070,8 @@ run.mkdir()
 display = socket.socket(socket.AF_UNIX)
 display.bind(str(run / "wayland-0"))
 display.listen(1)
+resources = home / "ghostty-resources"
+resources.mkdir()
 clip = home / "fake-clipboard"
 mode = home / "fake-mode"
 log = home / "fake-reads"
@@ -1034,11 +1083,13 @@ for key in ("SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY", "DISPLAY"):
     env.pop(key, None)
 env.update(HOME=str(home), ZDOTDIR=str(home), XDG_RUNTIME_DIR=str(run),
            WAYLAND_DISPLAY="wayland-0", TERM="xterm-256color", HISTFILE="/dev/null",
+           TERM_PROGRAM="ghostty", GHOSTTY_RESOURCES_DIR=str(resources),
+           SSH_CONNECTION="stale-from-launcher", SSH_CLIENT="stale-from-launcher",
            PATH=f"{fake_bin}:{env['PATH']}", FAKE_CLIPBOARD_TEXT=str(clip),
            FAKE_CLIPBOARD_MODE=str(mode), FAKE_WL_LOG=str(log))
 
-# Startup guards keep ^V quoted-insert when there is no local Wayland socket
-# or when zsh is an SSH server shell; noninteractive shells must stay inert.
+# The local direct Ghostty shell deliberately carries stale SSH_CONNECTION:
+# it MUST bind ^V. A missing Ghostty marker or genuine SSH_TTY must stay inert.
 def check_binding(overrides, command, expected_stdout, expected_stderr=None):
     case_env = env.copy()
     case_env.update(overrides)
@@ -1051,7 +1102,13 @@ def check_binding(overrides, command, expected_stdout, expected_stderr=None):
 
 check_binding({"WAYLAND_DISPLAY": "absent"},
               f'source "{hook}"; bindkey -M main "^V"', '"^V" quoted-insert')
-check_binding({"SSH_CONNECTION": "1.2.3.4 123 5.6.7.8 22"},
+check_binding({}, f'source "{hook}"; bindkey -M main "^V"',
+              '"^V" _quick_deploy_ghostty_paste')
+check_binding({"SSH_TTY": "/dev/pts/12"},
+              f'source "{hook}"; bindkey -M main "^V"', '"^V" quoted-insert')
+check_binding({"TERM_PROGRAM": "tmux"},
+              f'source "{hook}"; bindkey -M main "^V"', '"^V" quoted-insert')
+check_binding({"GHOSTTY_RESOURCES_DIR": str(home / "missing-resources")},
               f'source "{hook}"; bindkey -M main "^V"', '"^V" quoted-insert')
 check_binding({}, f'bindkey -e; source "{hook}"; source "{hook}"; '
                   'bindkey -M main "^V"; bindkey -M main "^[^V"',

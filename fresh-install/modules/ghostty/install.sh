@@ -1548,11 +1548,28 @@ ZSH_MOUSE_HOOK
 # Ctrl+Shift+V 和 Ctrl+V 都到达原始 ^V；只有 ZLE 正在编辑本地 Wayland
 # shell 提示符时才读取剪贴板。Pi 等 raw-mode 程序不经过 ZLE。
 render_local_paste_hook() {
-    cat <<'ZSH_LOCAL_PASTE_HOOK'
+    cat <<'ZSH_LOCAL_PASTE_HEADER'
 # Local Wayland zsh prompt paste for Ghostty's raw Ctrl+V key route.
 # Installed and maintained by fresh-install/modules/ghostty/install.sh.
 [[ -o interactive && -n ${WAYLAND_DISPLAY:-} && -n ${XDG_RUNTIME_DIR:-} ]] || return 0
-[[ -z ${SSH_CONNECTION:-} && -z ${SSH_CLIENT:-} && -z ${SSH_TTY:-} ]] || return 0
+ZSH_LOCAL_PASTE_HEADER
+    case "${1:-current}" in
+        v1)
+            # Exact first-installed guard. Keep the shared body below unchanged
+            # until this migration is retired; its historical digest is tested.
+            echo '[[ -z ${SSH_CONNECTION:-} && -z ${SSH_CLIENT:-} && -z ${SSH_TTY:-} ]] || return 0'
+            ;;
+        current)
+            cat <<'ZSH_LOCAL_PASTE_GUARD'
+# Ghostty sets these for its direct shell even if the launching process has
+# inherited an obsolete SSH_CONNECTION. SSH_TTY identifies an actual SSH pty.
+[[ ${TERM_PROGRAM:-} == ghostty && -n ${GHOSTTY_RESOURCES_DIR:-} && -d ${GHOSTTY_RESOURCES_DIR:-} ]] || return 0
+[[ -z ${SSH_TTY:-} ]] || return 0
+ZSH_LOCAL_PASTE_GUARD
+            ;;
+        *) die "未知的 zsh 粘贴 hook 渲染版本: $1" ;;
+    esac
+    cat <<'ZSH_LOCAL_PASTE_HOOK'
 
 _quick_deploy_ghostty_local_wayland() {
     local socket="$WAYLAND_DISPLAY"
@@ -1726,6 +1743,26 @@ else:
 PY
 }
 
+# Only the first deployed hook (v1) and the current hook may be replaced.
+# The same renderer emits the historical v1 bytes; tests pin its digest so a
+# future body change cannot accidentally broaden this migration contract.
+local_paste_hook_state() {
+    if [ -L "$LOCAL_PASTE_HOOK_CONFIG" ]; then
+        die "shell 粘贴 hook 是符号链接，拒绝覆盖: $LOCAL_PASTE_HOOK_CONFIG"
+    fi
+    if [ ! -e "$LOCAL_PASTE_HOOK_CONFIG" ]; then
+        echo absent
+    elif [ ! -f "$LOCAL_PASTE_HOOK_CONFIG" ]; then
+        die "shell 粘贴 hook 不是普通文件，拒绝覆盖: $LOCAL_PASTE_HOOK_CONFIG"
+    elif cmp -s "$LOCAL_PASTE_HOOK_CONFIG" <(render_local_paste_hook); then
+        echo current
+    elif cmp -s "$LOCAL_PASTE_HOOK_CONFIG" <(render_local_paste_hook v1); then
+        echo v1
+    else
+        die "shell 粘贴 hook 含非基准内容，拒绝覆盖: $LOCAL_PASTE_HOOK_CONFIG"
+    fi
+}
+
 verify_local_paste_prerequisites() {
     local command_name
     for command_name in zsh wl-paste timeout python3 cmp mktemp chmod mv cp rm; do
@@ -1740,18 +1777,14 @@ verify_local_paste_prerequisites() {
         || die "SSH 鼠标 hook 不是受管基准，拒绝迁移其 .zshrc 块: $SSH_MOUSE_HOOK_CONFIG"
     [ -f "$HOME/.zshrc" ] && [ ! -L "$HOME/.zshrc" ] && zshrc_hook_markers_valid "$HOME/.zshrc" \
         || die ".zshrc 缺失、是符号链接或托管标记异常，拒绝安装 shell 粘贴"
-    [ ! -L "$LOCAL_PASTE_HOOK_CONFIG" ] \
-        || die "shell 粘贴 hook 是符号链接，拒绝覆盖: $LOCAL_PASTE_HOOK_CONFIG"
-    if [ -e "$LOCAL_PASTE_HOOK_CONFIG" ]; then
-        [ -f "$LOCAL_PASTE_HOOK_CONFIG" ] && cmp -s "$LOCAL_PASTE_HOOK_CONFIG" <(render_local_paste_hook) \
-            || die "shell 粘贴 hook 含非基准内容，拒绝覆盖: $LOCAL_PASTE_HOOK_CONFIG"
-    fi
+    LOCAL_PASTE_HOOK_STATE="$(local_paste_hook_state)" \
+        || die "shell 粘贴 hook 目标不符合受管版本，拒绝迁移"
     LOCAL_PASTE_ZSHRC_STATE="$(local_paste_zshrc_state)" \
         || die ".zshrc 托管块含非基准内容，拒绝迁移"
 }
 
 install_local_paste_hook() {
-    local hook_tmp zshrc_tmp zshrc_before old new
+    local hook_tmp hook_state_now zshrc_tmp zshrc_before old new
     verify_local_paste_prerequisites
     hook_tmp="$(mktemp "$LOCAL_PASTE_HOOK_CONFIG.tmp.XXXXXX")"
     render_local_paste_hook > "$hook_tmp"
@@ -1784,7 +1817,13 @@ PY
             die ".zshrc 托管块不再符合旧版基准，拒绝安装 shell 粘贴"
         fi
     fi
-    write_atomic_file_from_source "$LOCAL_PASTE_HOOK_CONFIG" "$hook_tmp" 644
+    hook_state_now="$(local_paste_hook_state)" || hook_state_now=''
+    if [ "$hook_state_now" != "$LOCAL_PASTE_HOOK_STATE" ]; then
+        rm -f -- "$hook_tmp"
+        if [ -n "${zshrc_tmp:-}" ]; then rm -f -- "$zshrc_tmp" "$zshrc_before"; fi
+        die "shell 粘贴 hook 在迁移期间变化，拒绝覆盖"
+    fi
+    write_atomic_file_keep_mode "$LOCAL_PASTE_HOOK_CONFIG" "$hook_tmp" 644
     rm -f -- "$hook_tmp"
     if [ "$LOCAL_PASTE_ZSHRC_STATE" = old ]; then
         # Recheck immediately before replacing the user's file. A concurrent

@@ -181,13 +181,17 @@ Ghostty 配置不改变远端 Pi 本身的剪贴板能力。
 （`^[^V`）；载入时先核对该序列未被占用以及 `^V` 是 zsh 默认
 `quoted-insert` / `vi-quoted-insert`，冲突会报错而不抢用户自有按键。
 
-hook 只在有本地 Wayland socket、没有 SSH 会话标记的交互式 zsh 中绑定
-ZLE 键；Pi 等 raw-mode 程序不经过 ZLE，仍由自己的 Ctrl+V 处理器读图片/
-文本，SSH 剪贴板桥和 OSC 52 写入路径不变。其他 TUI 仍自行解释原始
-`^V`；非 Wayland、SSH zsh、其他 shell 不安装这个 ZLE 按键，可继续用
-右键或 `Shift+Insert` 的 Ghostty 原生粘贴入口。若本地 shell 继承了
-`SSH_CONNECTION`/`SSH_CLIENT`/`SSH_TTY`，hook 会保守跳过，此时应先查清
-shell 环境来源，而不是把远端 shell 误当成本地 Wayland 会话。
+hook 只在**具备原生 Ghostty 子 shell 标记**、有本地 Wayland socket 的
+交互式 zsh 中绑定 ZLE 键：同时核对 `TERM_PROGRAM=ghostty`
+和可用的 `GHOSTTY_RESOURCES_DIR`，有 `SSH_TTY` 时拒绝启用。Ghostty 若从
+先前的 Pi/tmux 进程启动，可能继承过期的 `SSH_CONNECTION`/`SSH_CLIENT`；
+这两个变量不再作为远端判据，否则真实本地提示符会被错误跳过。SSH 分配
+了 PTY 的远端 zsh 则被 `SSH_TTY` 守卫拦住。该子环境标记用于判断此类
+本地提示符；hook 不尝试判定共享 tmux pane 中每次输入的实际客户端来源。
+Pi 等 raw-mode 程序不经过 ZLE，仍由自己的 Ctrl+V 处理器读图片/文本，
+SSH 剪贴板桥和 OSC 52 写入路径不变。其他 TUI 仍自行解释原始 `^V`；
+非 Wayland、SSH PTY zsh、其他 shell 和不满足上述 Ghostty 子 shell 条件的
+终端不安装该 ZLE 按键，可继续用右键或 `Shift+Insert` 的 Ghostty 原生入口。
 
 ### 现有安装只迁移这一个按键
 
@@ -221,12 +225,15 @@ bash fresh-install/modules/ghostty/install.sh --shell-paste-only
 ```
 
 该窄模式先逐字节核对当前受管 Ghostty 配置（必须仍是
-`ctrl+shift+v=text:\x16`）、SSH 鼠标 hook 和已有 `.zshrc` 标记块。只接受
-旧版/本次精确托管块，以及不存在或内容完全匹配的新粘贴 hook；自定义配置、
-块内用户改动、符号链接、缺失文件会**在写入前拒绝**。首次迁移只新增
-`~/.config/ghostty/ghostty-local-paste.zsh`，并在现有 `.zshrc` 托管块中
-增加一条 source（更改前备份 `.zshrc.bak.<时间戳>`）。重复运行不重写同样
-内容；块外 `.zshrc` 内容和文件权限保持原样。不会执行 apt、重建背压库、
+`ctrl+shift+v=text:\x16`）、SSH 鼠标 hook 和已有 `.zshrc` 标记块。粘贴
+hook 仅接受不存在、**首版已部署内容 v1 的精确字节**、或本次 v2 基准；
+自定义配置、hook 内用户改动、块内用户改动、符号链接、缺失的前置文件会
+**在写入前拒绝**。首次安装新增 `~/.config/ghostty/ghostty-local-paste.zsh`，
+并在现有 `.zshrc` 托管块中增加一条 source（更改前备份
+`.zshrc.bak.<时间戳>`）。已装 v1 的机器只将 hook 原子替换为 v2，并留存
+`ghostty-local-paste.zsh.bak.<时间戳>`；已有新 `.zshrc` 托管块原字节/原 inode
+保持不变。重复运行不重写同样内容；块外 `.zshrc` 内容和文件权限保持原样。
+不会执行 apt、重建背压库、
 更改全局 Ghostty 绑定/启动器/桌面入口/字体、启动 GUI，也不读取或改动
 真实剪贴板。开启新的本地 zsh 提示符后，复制一段文本，分别试两种粘贴键；
 再试含换行的文本，确认它进入编辑缓冲区但未自动执行。`Esc Ctrl+V` 应能
