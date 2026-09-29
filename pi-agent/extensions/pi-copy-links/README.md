@@ -12,8 +12,9 @@
 先确认公司侧扩展和 Y9000p 已安装的客户端助手使用匹配的 v2 协议；助手版本/软链接核验见 [客户端助手说明](../../client-link-helper/README.md#install-and-version-check)。不要把 Y9000p 较旧的仓库 checkout 上的 `install.sh` 当作升级。匹配后：
 
 1. 在 Pi **空闲时**执行 `/reload`，确认 `/settings` 中 **TUI mode = fullscreen**；`/copy-links` 查看扩展状态。也可用 `pi --tui-mode fullscreen` 启动。
-2. 对仍有效的助手 Markdown 链接按 **Ctrl + 鼠标左键**；打开动作跟随发出点击的桌面。公司回环网址在 Y9000p 需要助手自有的 SSH 本地转发，浏览器仍收到原网址。
-3. 若报告 `port_conflict`，先在 Y9000p 查明占用原端口的监听器及其所有者。例如 `ss -H -ltnp '( sport = :8795 )'`，再将输出中的 PID 交给 `ps -fp` 辨认旧转发；确认有无依赖它的标签页，**取得所有者同意后**才显式关闭旧转发并重试原链接。已有手动 `ssh -N -L 8795:127.0.0.1:8795 ...` 会占用 Y9000p 的 8795；助手不会接管或自动终止它，也不会改端口打开替代网址。
+2. 从 Y9000p 经 SSH 操作公司 Pi 时，Pi 必须运行在**公司 tmux pane** 里，鼠标事件才能带上确切的 SSH 客户端 PID。直接在 SSH/Codoxear PTY 里运行 Pi，即使有 `SSH_CONNECTION`，也会报“SSH 输入未经带来源标记的 tmux”，不会打开任何一端的 Code。迁移已有对话时先正常退出旧 Pi，在 Y9000p 的 SSH shell 登录公司，进入原工作目录后执行 `tmux new -A -s pi-video`，在 tmux pane 内用 `pi --tui-mode fullscreen --resume` 选回原会话；不要让两个 Pi 进程同时写同一个会话文件。
+3. 对仍有效的助手 Markdown 链接按 **Ctrl + 鼠标左键**；打开动作跟随发出点击的桌面。公司回环网址在 Y9000p 需要助手自有的 SSH 本地转发，浏览器仍收到原网址。
+4. 若报告 `port_conflict`，先在 Y9000p 查明占用原端口的监听器及其所有者。例如 `ss -H -ltnp '( sport = :8795 )'`，再将输出中的 PID 交给 `ps -fp` 辨认旧转发；确认有无依赖它的标签页，**取得所有者同意后**才显式关闭旧转发并重试原链接。已有手动 `ssh -N -L 8795:127.0.0.1:8795 ...` 会占用 Y9000p 的 8795；助手不会接管或自动终止它，也不会改端口打开替代网址。
 
 ## 安装和启用
 
