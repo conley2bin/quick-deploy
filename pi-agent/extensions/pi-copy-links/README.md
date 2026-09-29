@@ -74,6 +74,8 @@ code --new-window --goto -- /absolute/path:12:3
 
 带位置时仅接受普通文件。由于当前 Code CLI 的 `--goto` operand 不能安全表达含字面冒号的 POSIX 路径，这一组合会明确失败；不带位置的冒号路径仍可打开。启动环境复制当前桌面环境，但删除 `VSCODE_IPC_HOOK_CLI`，避免被远端 CLI socket 重定向。不会使用 `--reuse-window`。
 
+**本机 MP4 预览需要单独安装 [VS Code 侧修复扩展](../../vscode-video-preview-repair/README.md)。** Code 1.135 的新建独立窗口可能先把 MP4 解析成二进制/文本编辑器；Pi 的通用启动参数不能指定自定义编辑器。修复扩展在目标 Code 窗口启动后仅对首个未修改的本地 MP4 文本标签调用 `vscode.openWith(..., 'vscode.videoPreview')`；它不随 Pi 扩展安装，不修改上述启动参数或 SSH 路由。
+
 在 Y9000p，文件与目录仍指向**公司机器**，由 `code --remote ssh-remote+conley-company --new-window` 配合明确的文件/目录 URI 打开；不会在笔记本本地查找同名路径。两侧的启动成功均只表示桌面接受请求，不保证窗口已经绘制或位于某个 workspace。
 
 ### 源文分歧

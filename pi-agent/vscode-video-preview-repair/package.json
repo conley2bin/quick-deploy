@@ -1,0 +1,22 @@
+{
+  "name": "pi-video-preview-repair",
+  "displayName": "Pi MP4 Video Preview Repair",
+  "description": "Select the built-in video preview for a cold standalone MP4 text tab.",
+  "version": "0.1.0",
+  "publisher": "pi-local",
+  "private": true,
+  "license": "UNLICENSED",
+  "engines": {
+    "vscode": "^1.135.0"
+  },
+  "categories": ["Other"],
+  "extensionKind": ["ui"],
+  "capabilities": {
+    "untrustedWorkspaces": { "supported": true }
+  },
+  "main": "./extension.js",
+  "activationEvents": ["onStartupFinished"],
+  "scripts": {
+    "test": "node --test tests/*.test.js"
+  }
+}
