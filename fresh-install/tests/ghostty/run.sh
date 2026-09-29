@@ -8,6 +8,7 @@ MODULE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../modules/ghostty" && pwd)"
 INSTALLER="$MODULE_DIR/install.sh"
 WORK="$(mktemp -d /tmp/ghostty-module-test.XXXXXX)"
 HOOK_SOURCE="$WORK/ghostty-ssh-mouse-reset.zsh"
+PASTE_HOOK_SOURCE="$WORK/ghostty-local-paste.zsh"
 trap 'rm -rf "$WORK"' EXIT
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
@@ -22,6 +23,7 @@ mapfile -t module_shell_files < <(find "$MODULE_DIR" -type f \
 # shell 源文件渲染，不再依赖仓库中的第二个 .zsh 源文件。
 sed '/^main "\$@"$/,$d' "$INSTALLER" > "$WORK/functions.sh"
 HOME="$WORK/render-hook-home" bash -c 'source "$1"; render_ssh_mouse_hook' _ "$WORK/functions.sh" > "$HOOK_SOURCE"
+HOME="$WORK/render-hook-home" bash -c 'source "$1"; render_local_paste_hook' _ "$WORK/functions.sh" > "$PASTE_HOOK_SOURCE"
 # 真正打包的模块副本只含 install.sh + C 源码：没有独立 .zsh/.sh 资源。
 # 源码渲染应与原模块等同，并在 --check/正式安装共用的预检下完整。
 mkdir -p "$WORK/packaged-module"
@@ -33,14 +35,19 @@ HOME="$WORK/packaged-home" bash -c '
     preflight_commands
     render_ssh_mouse_hook
 ' _ "$WORK/packaged-module/functions.sh" > "$WORK/packaged-hook.zsh"
-cmp -s "$HOOK_SOURCE" "$WORK/packaged-hook.zsh" || fail "精简打包丢失 hook 源码"
+cmp -s "$HOOK_SOURCE" "$WORK/packaged-hook.zsh" || fail "精简打包丢失 SSH hook 源码"
+HOME="$WORK/packaged-home" bash -c 'source "$1"; render_local_paste_hook' \
+    _ "$WORK/packaged-module/functions.sh" > "$WORK/packaged-paste-hook.zsh"
+cmp -s "$PASTE_HOOK_SOURCE" "$WORK/packaged-paste-hook.zsh" \
+    || fail "精简打包丢失 zsh 粘贴 hook 源码"
 # zsh 只影响 hook 语法、hook 行为与 PTY 三部分；其余测试（配置渲染、
 # 显示会话矩阵、desktop 覆盖、安装器 helper、terminfo 验证）不依赖 zsh，
 # 必须继续跑，不能被一道提前 exit 挡住。
 HAVE_ZSH=false
 if command -v zsh >/dev/null 2>&1; then
     HAVE_ZSH=true
-    zsh -n "$HOOK_SOURCE" || fail "zsh hook 语法错误"
+    zsh -n "$HOOK_SOURCE" || fail "zsh SSH hook 语法错误"
+    zsh -n "$PASTE_HOOK_SOURCE" || fail "zsh 粘贴 hook 语法错误"
 else
     echo "SKIP: 未安装 zsh，跳过 zsh hook 语法、hook 行为与 PTY 测试（其余测试继续）"
 fi
@@ -313,7 +320,7 @@ if [ -x /usr/bin/ghostty ]; then
     ! compgen -G "$PI_ONLY_HOME/.local/bin/ghostty-pi.bak.*" >/dev/null \
         || fail "Pi 窄安装意外生成启动器备份"
 
-    for other in --check --ppa-only --deb-only --default-terminal --no-default-terminal --paste-keybind-only; do
+    for other in --check --ppa-only --deb-only --default-terminal --no-default-terminal --paste-keybind-only --shell-paste-only; do
         if run_pi_only "$PI_ONLY_HOME" --pi-launcher-only "$other" > "$WORK/pi-only-args.log" 2>&1; then
             fail "Pi 窄安装接受了冲突选项 $other"
         fi
@@ -408,7 +415,7 @@ cmp -s "$WORK/paste-only-before" "$WORK/paste-only-rerun" \
 ! compgen -G "$PASTE_ONLY_HOME/.config/ghostty/config.ghostty.bak.*" >/dev/null \
     || fail "全局单键窄迁移写了非目标备份"
 
-for other in --check --ppa-only --deb-only --default-terminal --no-default-terminal --pi-launcher-only; do
+for other in --check --ppa-only --deb-only --default-terminal --no-default-terminal --pi-launcher-only --shell-paste-only; do
     if run_pi_only "$PASTE_ONLY_HOME" --paste-keybind-only "$other" > "$WORK/paste-only-args.log" 2>&1; then
         fail "全局单键窄迁移接受了冲突选项 $other"
     fi
@@ -449,6 +456,152 @@ for scenario in custom-old custom-new symlink directory missing symlink-config-d
     cmp -s "$WORK/paste-$scenario.before" "$WORK/paste-$scenario.after" \
         || fail "全局单键窄迁移拒绝 $scenario 时修改了文件"
 done
+
+# ============================================================
+# 已装机器的 zsh 粘贴窄模式：旧受管块逐字节迁移、幂等、拒绝用户内容。
+# 使用无 C 源码的包 + 拒绝命令，不会 apt/编译/GSettings/启动 GUI。
+# ============================================================
+if [ "$HAVE_ZSH" = true ]; then
+mkdir -p "$WORK/paste-fake-bin"
+cat > "$WORK/paste-fake-bin/wl-paste" <<'EOF'
+#!/bin/sh
+[ "$*" = '--no-newline --type text' ] || exit 40
+printf 'read\n' >> "$FAKE_WL_LOG"
+case "$(cat "$FAKE_CLIPBOARD_MODE")" in
+    fail) printf PARTIAL; exit 23 ;;
+    timeout) sleep 5; exit 0 ;;
+    *) cat "$FAKE_CLIPBOARD_TEXT" ;;
+esac
+EOF
+chmod 755 "$WORK/paste-fake-bin/wl-paste"
+prepare_shell_paste_home() {
+    local home="$1"
+    prepare_pi_only_home "$home"
+    HOME="$home" bash -c '
+        set -euo pipefail
+        source "$1"
+        render_config > "$CONFIG_FILE"
+        render_ssh_mouse_hook > "$SSH_MOUSE_HOOK_CONFIG"
+        printf '\''PS1="READY:%%? > "\nexport USER_CONTENT=1\n'\'' > "$HOME/.zshrc"
+        render_legacy_zshrc_hook_block >> "$HOME/.zshrc"
+        cat >> "$HOME/.zshrc" <<'\''ZSHRC_TAIL'\''
+_capture_zle_buffer() {
+    print -rn -- "$BUFFER" > "$HOME/zle-buffer.tmp"
+    mv -f -- "$HOME/zle-buffer.tmp" "$HOME/zle-buffer"
+}
+_reset_zle_buffer() { BUFFER='' }
+zle -N _capture_zle_buffer
+zle -N _reset_zle_buffer
+bindkey '^G' _capture_zle_buffer
+bindkey '^X' _reset_zle_buffer
+ZSHRC_TAIL
+        chmod 600 "$HOME/.zshrc"
+    ' _ "$WORK/functions.sh"
+}
+run_shell_only() {
+    local private_home="$1"
+    shift
+    env -u DISPLAY -u WAYLAND_DISPLAY HOME="$private_home" \
+        PATH="$WORK/paste-fake-bin:$WORK/pi-only-deny:$PATH" SUDO_CMD=/bin/false GSETTINGS_BACKEND=memory \
+        bash "$WORK/pi-only-package/install.sh" "$@"
+}
+SHELL_ONLY_HOME="$WORK/shell-paste-home"
+prepare_shell_paste_home "$SHELL_ONLY_HOME"
+cp "$SHELL_ONLY_HOME/.zshrc" "$WORK/zshrc-old"
+cp "$SHELL_ONLY_HOME/.config/ghostty/config.ghostty" "$WORK/shell-global-config"
+snapshot_pi_only_home "$SHELL_ONLY_HOME" > "$WORK/shell-before"
+run_shell_only "$SHELL_ONLY_HOME" --shell-paste-only > "$WORK/shell-first.log" \
+    || fail "zsh 粘贴窄模式未接受旧版托管块"
+PASTE_INSTALLED="$SHELL_ONLY_HOME/.config/ghostty/ghostty-local-paste.zsh"
+cmp -s "$PASTE_INSTALLED" "$PASTE_HOOK_SOURCE" || fail "粘贴 hook 未按单一模块源码渲染"
+cmp -s "$SHELL_ONLY_HOME/.config/ghostty/config.ghostty" "$WORK/shell-global-config" \
+    || fail "zsh 窄模式改动了全局 Ghostty 键绑定"
+test "$(stat -c %a "$SHELL_ONLY_HOME/.zshrc")" = 600 \
+    || fail "zsh 窄模式未保留 .zshrc 的私有权限"
+python3 - "$WORK/zshrc-old" "$SHELL_ONLY_HOME/.zshrc" "$WORK/shell-before" <<'PY'
+from pathlib import Path
+import ast
+import sys
+
+before, after, snapshot = (Path(path) for path in sys.argv[1:])
+old = before.read_bytes()
+new = after.read_bytes()
+old_source = (b'if [ -f "$HOME/.config/ghostty/ghostty-ssh-mouse-reset.zsh" ]; then\n'
+              b'    source "$HOME/.config/ghostty/ghostty-ssh-mouse-reset.zsh"\nfi\n')
+added = (b'if [ -f "$HOME/.config/ghostty/ghostty-local-paste.zsh" ]; then\n'
+         b'    source "$HOME/.config/ghostty/ghostty-local-paste.zsh"\nfi\n')
+assert old.count(old_source) == 1
+assert new == old.replace(old_source, old_source + added, 1), "user .zshrc bytes changed"
+root = after.parent
+backups = list(root.glob('.zshrc.bak.*'))
+assert len(backups) == 1 and backups[0].read_bytes() == old
+before_paths = {row[0] for row in map(ast.literal_eval, snapshot.read_text().splitlines())}
+after_paths = {p.relative_to(root).as_posix() for p in root.rglob('*')}
+assert after_paths - before_paths == {
+    '.config/ghostty/ghostty-local-paste.zsh', backups[0].name
+}, after_paths - before_paths
+PY
+shell_rc_inode=$(stat -c %i "$SHELL_ONLY_HOME/.zshrc")
+shell_hook_inode=$(stat -c %i "$PASTE_INSTALLED")
+snapshot_pi_only_home "$SHELL_ONLY_HOME" > "$WORK/shell-after"
+run_shell_only "$SHELL_ONLY_HOME" --shell-paste-only > "$WORK/shell-second.log" \
+    || fail "zsh 粘贴窄模式重跑失败"
+test "$shell_rc_inode" = "$(stat -c %i "$SHELL_ONLY_HOME/.zshrc")" \
+    || fail "zsh 粘贴窄模式重跑改写了 .zshrc"
+test "$shell_hook_inode" = "$(stat -c %i "$PASTE_INSTALLED")" \
+    || fail "zsh 粘贴窄模式重跑改写了 hook"
+snapshot_pi_only_home "$SHELL_ONLY_HOME" > "$WORK/shell-rerun"
+cmp -s "$WORK/shell-after" "$WORK/shell-rerun" || fail "zsh 粘贴窄模式重跑改动了用户文件"
+test "$(find "$SHELL_ONLY_HOME" -name '.zshrc.bak.*' | wc -l)" -eq 1 \
+    || fail "zsh 粘贴窄模式重跑生成了额外备份"
+
+for other in --check --ppa-only --deb-only --default-terminal --no-default-terminal --paste-keybind-only --pi-launcher-only; do
+    if run_shell_only "$SHELL_ONLY_HOME" --shell-paste-only "$other" > "$WORK/shell-args.log" 2>&1; then
+        fail "zsh 粘贴窄模式接受了冲突选项 $other"
+    fi
+    grep -Fq '不能与其他安装或预检选项组合' "$WORK/shell-args.log" \
+        || fail "zsh 粘贴窄模式未明确拒绝冲突选项 $other"
+done
+
+for scenario in old-global custom-global custom-zshrc symlink-zshrc malformed-zshrc custom-hook symlink-hook custom-mouse; do
+    private_home="$WORK/shell-refuse-$scenario"
+    prepare_shell_paste_home "$private_home"
+    config="$private_home/.config/ghostty/config.ghostty"
+    zshrc="$private_home/.zshrc"
+    paste_hook="$private_home/.config/ghostty/ghostty-local-paste.zsh"
+    case "$scenario" in
+        old-global) sed -i 's|^keybind = ctrl+shift+v=text:\\x16$|keybind = ctrl+shift+v=paste_from_clipboard|' "$config" ;;
+        custom-global) printf '# user config\n' >> "$config" ;;
+        custom-zshrc) sed -i 's|# 由 fresh-install/modules/ghostty/install.sh 管理|# user edit inside managed block|' "$zshrc" ;;
+        symlink-zshrc) mv "$zshrc" "$private_home/real-zshrc"; ln -s "$private_home/real-zshrc" "$zshrc" ;;
+        malformed-zshrc) sed -i '/^# <<< fresh-install ghostty: ssh 鼠标复位 hook <<</d' "$zshrc" ;;
+        custom-hook) printf 'KEEP\n' > "$paste_hook" ;;
+        symlink-hook) printf 'KEEP\n' > "$private_home/real-hook"; ln -s "$private_home/real-hook" "$paste_hook" ;;
+        custom-mouse) printf 'KEEP\n' >> "$private_home/.config/ghostty/ghostty-ssh-mouse-reset.zsh" ;;
+    esac
+    snapshot_pi_only_home "$private_home" > "$WORK/shell-$scenario.before"
+    if run_shell_only "$private_home" --shell-paste-only > "$WORK/shell-$scenario.log" 2>&1; then
+        fail "zsh 粘贴窄模式错误接受 $scenario"
+    fi
+    grep -Fq '拒绝' "$WORK/shell-$scenario.log" || fail "zsh 粘贴窄模式未说明拒绝 $scenario"
+    snapshot_pi_only_home "$private_home" > "$WORK/shell-$scenario.after"
+    cmp -s "$WORK/shell-$scenario.before" "$WORK/shell-$scenario.after" \
+        || fail "zsh 粘贴窄模式拒绝 $scenario 后改动了用户文件"
+done
+
+# 全新安装的正常路径先装 SSH hook，再写入 zsh 粘贴；它直接生成新的合并块。
+HOME="$WORK/shell-fresh" bash -c '
+    set -euo pipefail
+    source "$1"
+    mkdir -p "$CONFIG_DIR"
+    render_config > "$CONFIG_FILE"
+    install_ssh_mouse_hook >/dev/null
+    install_local_paste_hook >/dev/null
+    cmp -s "$LOCAL_PASTE_HOOK_CONFIG" <(render_local_paste_hook)
+    test "$(local_paste_zshrc_state)" = current
+    ! compgen -G "$HOME/.zshrc.bak.*" >/dev/null
+' _ "$WORK/functions.sh" || fail "全新安装未生成合并的 zsh 托管块与粘贴 hook"
+fi
 
 # ============================================================
 # 用户级 desktop 覆盖：只改三处启动语义，幂等，拒绝覆盖带用户改动的文件
@@ -846,6 +999,180 @@ if [ "$HAVE_ZSH" = true ]; then
     python3 "$WORK/pty-check.py" "$HOOK_SOURCE" "$GHOSTTY_RESOURCES_DIR" no
 fi
 
+# PTY 的输入只送 fake wl-paste；不运行真实安装器、不读写真实剪贴板。
+# ZLE 测试 widget 直接将 BUFFER 输出到文件，不按 Enter；这既验证精确
+# 插入字节，也能检测粘贴里的换行是否提前执行了 shell 命令。
+cat > "$WORK/paste-pty-check.py" <<'PY'
+import fcntl
+import os
+from pathlib import Path
+import pty
+import select
+import socket
+import struct
+import subprocess
+import sys
+import termios
+import time
+
+work, hook, fake_bin, home = map(Path, sys.argv[1:])
+# This HOME is the private --shell-paste-only result, including its migrated
+# managed .zshrc block; the PTY loads the real installed source lines.
+run = home / ".run"
+run.mkdir()
+display = socket.socket(socket.AF_UNIX)
+display.bind(str(run / "wayland-0"))
+display.listen(1)
+clip = home / "fake-clipboard"
+mode = home / "fake-mode"
+log = home / "fake-reads"
+clip.write_bytes(b"FIRST-current")
+mode.write_text("ok")
+log.touch()
+env = os.environ.copy()
+for key in ("SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY", "DISPLAY"):
+    env.pop(key, None)
+env.update(HOME=str(home), ZDOTDIR=str(home), XDG_RUNTIME_DIR=str(run),
+           WAYLAND_DISPLAY="wayland-0", TERM="xterm-256color", HISTFILE="/dev/null",
+           PATH=f"{fake_bin}:{env['PATH']}", FAKE_CLIPBOARD_TEXT=str(clip),
+           FAKE_CLIPBOARD_MODE=str(mode), FAKE_WL_LOG=str(log))
+
+# Startup guards keep ^V quoted-insert when there is no local Wayland socket
+# or when zsh is an SSH server shell; noninteractive shells must stay inert.
+def check_binding(overrides, command, expected_stdout, expected_stderr=None):
+    case_env = env.copy()
+    case_env.update(overrides)
+    result = subprocess.run(["zsh", "-f", "-i", "-c", command], env=case_env,
+                            capture_output=True, text=True, timeout=5)
+    assert result.returncode == 0, result
+    assert expected_stdout in result.stdout, result
+    if expected_stderr is not None:
+        assert expected_stderr in result.stderr, result
+
+check_binding({"WAYLAND_DISPLAY": "absent"},
+              f'source "{hook}"; bindkey -M main "^V"', '"^V" quoted-insert')
+check_binding({"SSH_CONNECTION": "1.2.3.4 123 5.6.7.8 22"},
+              f'source "{hook}"; bindkey -M main "^V"', '"^V" quoted-insert')
+check_binding({}, f'bindkey -e; source "{hook}"; source "{hook}"; '
+                  'bindkey -M main "^V"; bindkey -M main "^[^V"',
+              '"^[^V" quoted-insert')
+check_binding({}, f'bindkey -v; source "{hook}"; '
+                  'bindkey -M main "^V"; bindkey -M main "^[^V"',
+              '"^[^V" vi-quoted-insert')
+check_binding({}, f'bindkey -e; bindkey -M main "^[^V" backward-char; '
+                  f'source "{hook}"; bindkey -M main "^V"',
+              '"^V" quoted-insert', 'refusing to override')
+noninteractive = subprocess.run(["zsh", "-f", "-c", 'source "$1"; print INERT',
+                                  "_", str(hook)], env=env, capture_output=True,
+                                 text=True, timeout=5)
+assert noninteractive.returncode == 0 and noninteractive.stdout.strip() == "INERT", noninteractive
+
+master, slave = pty.openpty()
+fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 120, 0, 0))
+proc = subprocess.Popen(["zsh", "-i"], stdin=slave, stdout=slave, stderr=slave,
+                        env=env, close_fds=True)
+os.close(slave)
+output = bytearray()
+
+def drain(seconds=0.05):
+    end = time.monotonic() + seconds
+    while time.monotonic() < end:
+        ready, _, _ = select.select([master], [], [], 0.02)
+        if ready:
+            try:
+                data = os.read(master, 65536)
+            except OSError:
+                return
+            if data:
+                output.extend(data)
+
+def wait_for(marker, seconds=5):
+    end = time.monotonic() + seconds
+    while time.monotonic() < end:
+        if marker in output:
+            return
+        drain()
+    raise AssertionError(f"timed out for {marker!r}; tail={bytes(output[-500:])!r}")
+
+def capture():
+    result = home / "zle-buffer"
+    result.unlink(missing_ok=True)
+    os.write(master, b"\x07")  # private capture widget, not accept-line
+    end = time.monotonic() + 5
+    while time.monotonic() < end and not result.exists():
+        drain()
+    assert result.exists(), bytes(output[-500:])
+    return result.read_bytes()
+
+def clear():
+    os.write(master, b"\x18")  # private reset widget, no command acceptance
+    assert capture() == b"", bytes(output[-500:])
+    output.clear()
+
+try:
+    wait_for(b"READY:0 > ")
+    output.clear()
+    os.write(master, b"\x16")
+    assert capture() == b"FIRST-current", bytes(output[-500:])
+    clear()
+
+    # Same PTY byte represents either physical key under the unchanged global
+    # Ghostty binding; changing fake clipboard must be observed on next ^V.
+    clip.write_bytes(b"SECOND-now")
+    os.write(master, b"\x16")
+    assert capture() == b"SECOND-now"
+    clear()
+    assert log.read_text().splitlines() == ["read", "read"]
+
+    clip.write_bytes(b"-INSERT-")
+    os.write(master, b"leftRIGHT" + b"\x02" * 5 + b"\x16")
+    assert capture() == b"left-INSERT-RIGHT", "ZLE paste lost text after cursor"
+    clear()
+
+    executed = home / "MUST-NOT-RUN"
+    payload = f"touch {executed}\nprintf 'next line'\n".encode()
+    clip.write_bytes(payload)
+    os.write(master, b"\x16")
+    assert capture() == payload, repr((home / "zle-buffer").read_bytes())
+    assert not executed.exists(), "pasted newline executed a command"
+    clear()
+
+    # Preserve the separate literal insertion action on a sequence verified
+    # undefined in the original emacs and vi-insert keymaps.
+    os.write(master, b"\x1b\x16\x01")  # Esc Ctrl+V, then literal Ctrl+A
+    assert capture() == b"\x01", bytes(output[-500:])
+    clear()
+
+    mode.write_text("fail")
+    os.write(master, b"keep-\x16")
+    wait_for(b"Clipboard paste failed")
+    assert capture() == b"keep-", "failed read inserted partial or stale data"
+    clear()
+
+    mode.write_text("timeout")
+    os.write(master, b"stay-\x16")
+    wait_for(b"Clipboard paste failed", seconds=4)
+    assert capture() == b"stay-", "timed-out read inserted data"
+    clear()
+    assert not executed.exists(), "some pasted command ran"
+finally:
+    try:
+        os.write(master, b"exit\n")
+    except OSError:
+        pass
+    try:
+        proc.wait(timeout=3)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+    os.close(master)
+    display.close()
+PY
+if [ "$HAVE_ZSH" = true ]; then
+    python3 "$WORK/paste-pty-check.py" "$WORK" "$PASTE_INSTALLED" "$WORK/paste-fake-bin" "$SHELL_ONLY_HOME" \
+        || fail "私有 PTY 未验证当前剪贴板文本/多行安全、quoted-insert 或读取失败"
+fi
+
 bash "$(dirname "${BASH_SOURCE[0]}")/wayland-backpressure.sh"
 
 # setup.sh must have exactly one Ghostty installation route. Test the installer
@@ -931,7 +1258,7 @@ if command -v cc >/dev/null 2>&1; then
 fi
 
 if [ "$HAVE_ZSH" = true ]; then
-    echo "PASS: Ghostty single-installer Wayland backpressure, guarded global paste/only-mode, Pi-scoped launcher/only-mode, desktop migration, font/clipboard/SSH integration"
+    echo "PASS: Ghostty single-installer Wayland backpressure, guarded global and zsh paste modes, private ZLE PTY/current clipboard/newline/error, Pi launcher, desktop/font/SSH integration"
 else
     echo "PASS (zsh 未安装，hook 行为与 PTY 部分已跳过): Ghostty single-installer Wayland backpressure, guarded global paste/only-mode, Pi-scoped launcher/only-mode, desktop migration, font/clipboard integration"
 fi

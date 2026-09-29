@@ -18,6 +18,7 @@ set -euo pipefail
 CHECK_ONLY=false
 PI_LAUNCHER_ONLY=false
 PASTE_KEYBIND_ONLY=false
+SHELL_PASTE_ONLY=false
 # 默认接管 Ctrl+Alt+T。本模块刚引入时默认为否，是为了不和当时还在的
 # kitty 模块争抢同一个包装脚本（两个模块都写就是后跑者赢，无告警）。
 # kitty 模块已移除，Ghostty 是本仓库唯一的终端模块，该理由不再成立；
@@ -57,6 +58,8 @@ LOCAL_BIN_DIR="$HOME/.local/bin"
 # render_ssh_mouse_hook，安装时写入用户目录；不会引用仓库运行时路径。
 SSH_MOUSE_HOOK_FILENAME="ghostty-ssh-mouse-reset.zsh"
 SSH_MOUSE_HOOK_CONFIG="$HOME/.config/ghostty/$SSH_MOUSE_HOOK_FILENAME"
+LOCAL_PASTE_HOOK_FILENAME="ghostty-local-paste.zsh"
+LOCAL_PASTE_HOOK_CONFIG="$HOME/.config/ghostty/$LOCAL_PASTE_HOOK_FILENAME"
 ZSHRC_BLOCK_BEGIN="# >>> fresh-install ghostty: ssh 鼠标复位 hook >>>"
 ZSHRC_BLOCK_END="# <<< fresh-install ghostty: ssh 鼠标复位 hook <<<"
 FONTCONFIG_CONF_DIR="$HOME/.config/fontconfig/conf.d"
@@ -121,11 +124,13 @@ usage() {
   ./install.sh [--check] [--no-default-terminal] [--ppa-only | --deb-only] [--help]
   ./install.sh --pi-launcher-only
   ./install.sh --paste-keybind-only
+  ./install.sh --shell-paste-only
 
 选项:
   --check                 只读预检：报告当前状态与计划，不安装、不修改
   --pi-launcher-only      只验证受保护启动器/背压库，再安装 Pi 专用启动器
   --paste-keybind-only    只迁移现有受管全局配置的一条粘贴按键绑定
+  --shell-paste-only      只为现有受管 Ghostty/zsh 安装本地 Wayland 提示符粘贴 hook
   --no-default-terminal   不接管 Ctrl+Alt+T（默认会接管）
   --default-terminal      兼容旧命令行，默认已是开启状态
   --ppa-only              只使用第三方 PPA；失败时不退回 GitHub .deb
@@ -141,7 +146,8 @@ usage() {
   --pi-launcher-only 不执行软件包/编译器、配置、字体、桌面入口、默认终端
   或 GUI 步骤。--paste-keybind-only 只接受旧/新精确受管配置，拒绝自定义
   内容和符号链接；不执行软件包、启动器、字体、桌面入口、默认终端或 GUI
-  步骤。两个窄模式都不能与其他选项组合。
+  步骤。--shell-paste-only 核对现有全局按键及 zsh 托管块，只写入粘贴 hook
+  和必要时迁移 .zshrc 托管块；不执行其它安装步骤。窄模式不能组合。
 EOF
 }
 
@@ -152,6 +158,7 @@ parse_args() {
             --check) CHECK_ONLY=true; other_mode=true ;;
             --pi-launcher-only) PI_LAUNCHER_ONLY=true ;;
             --paste-keybind-only) PASTE_KEYBIND_ONLY=true ;;
+            --shell-paste-only) SHELL_PASTE_ONLY=true ;;
             --default-terminal) DEFAULT_TERMINAL=true; other_mode=true ;;
             --no-default-terminal) DEFAULT_TERMINAL=false; other_mode=true ;;
             --ppa-only)
@@ -169,11 +176,14 @@ parse_args() {
         esac
         shift
     done
-    if [ "$PI_LAUNCHER_ONLY" = true ] && { [ "$PASTE_KEYBIND_ONLY" = true ] || [ "$other_mode" = true ]; }; then
+    if [ "$PI_LAUNCHER_ONLY" = true ] && { [ "$PASTE_KEYBIND_ONLY" = true ] || [ "$SHELL_PASTE_ONLY" = true ] || [ "$other_mode" = true ]; }; then
         die "--pi-launcher-only 不能与其他安装或预检选项组合"
     fi
-    if [ "$PASTE_KEYBIND_ONLY" = true ] && [ "$other_mode" = true ]; then
+    if [ "$PASTE_KEYBIND_ONLY" = true ] && { [ "$SHELL_PASTE_ONLY" = true ] || [ "$other_mode" = true ]; }; then
         die "--paste-keybind-only 不能与其他安装或预检选项组合"
+    fi
+    if [ "$SHELL_PASTE_ONLY" = true ] && [ "$other_mode" = true ]; then
+        die "--shell-paste-only 不能与其他安装或预检选项组合"
     fi
 }
 
@@ -524,6 +534,7 @@ show_check() {
     echo "SSH 断开后的鼠标状态自愈:"
     ssh_mouse_hook_state
     echo "  复位键: Ctrl+Shift+R -> Ghostty reset 动作"
+    echo "本地 Wayland zsh 提示符粘贴: 正式安装会写入 $LOCAL_PASTE_HOOK_CONFIG 并迁移 .zshrc 托管块"
 
     case "$INSTALL_MODE" in
         ppa) echo "计划: 只走 PPA，更新 apt 并安装最新版 ghostty；失败即退出" ;;
@@ -904,7 +915,8 @@ render_config() {
     # Ctrl+Shift+C 把 Ghostty 本地选区写进本机系统剪贴板。mixed 同时提供
     # 纯文本与带样式两种格式。Ctrl+Shift+V 发送原始 Ctrl+V (0x16)，绕过
     # Ghostty 可能陈旧的 GTK 粘贴视图；在 Pi 内由现有图片/文本粘贴动作处理。
-    # 在普通 shell 里这只是 Ctrl+V 输入，不再是 Ghostty 原生粘贴。
+    # 在本地 Wayland zsh 提示符由本模块 ZLE widget 读取当前剪贴板；
+    # Pi/TUI 的原始按键输入不经过 zsh 的行编辑器。
     echo "keybind = ctrl+shift+c=copy_to_clipboard:mixed"
     echo "keybind = ctrl+shift+v=$paste_action"
 
@@ -1533,12 +1545,83 @@ add-zsh-hook precmd _quick_deploy_ghostty_ssh_precmd
 ZSH_MOUSE_HOOK
 }
 
+# Ctrl+Shift+V 和 Ctrl+V 都到达原始 ^V；只有 ZLE 正在编辑本地 Wayland
+# shell 提示符时才读取剪贴板。Pi 等 raw-mode 程序不经过 ZLE。
+render_local_paste_hook() {
+    cat <<'ZSH_LOCAL_PASTE_HOOK'
+# Local Wayland zsh prompt paste for Ghostty's raw Ctrl+V key route.
+# Installed and maintained by fresh-install/modules/ghostty/install.sh.
+[[ -o interactive && -n ${WAYLAND_DISPLAY:-} && -n ${XDG_RUNTIME_DIR:-} ]] || return 0
+[[ -z ${SSH_CONNECTION:-} && -z ${SSH_CLIENT:-} && -z ${SSH_TTY:-} ]] || return 0
+
+_quick_deploy_ghostty_local_wayland() {
+    local socket="$WAYLAND_DISPLAY"
+    [[ $socket == /* ]] || socket="$XDG_RUNTIME_DIR/$socket"
+    [[ -S $socket ]]
+}
+_quick_deploy_ghostty_local_wayland || return 0
+
+# Do not take over a user's own ^V or the alternate quoted-insert binding.
+# In default emacs/vi-insert maps, Esc then Ctrl+V (^[^V) is undefined.
+# At source time verify BOTH keys in the active `main` ZLE map before binding.
+_quick_deploy_ghostty_ctrlv_widget="${$(bindkey -M main '^V')##* }"
+_quick_deploy_ghostty_quote_widget="${$(bindkey -M main '^[^V')##* }"
+if [[ $_quick_deploy_ghostty_ctrlv_widget == _quick_deploy_ghostty_paste &&
+      ( $_quick_deploy_ghostty_quote_widget == quoted-insert ||
+        $_quick_deploy_ghostty_quote_widget == vi-quoted-insert ) ]]; then
+    unset _quick_deploy_ghostty_ctrlv_widget _quick_deploy_ghostty_quote_widget
+    return 0
+fi
+if [[ ( $_quick_deploy_ghostty_ctrlv_widget != quoted-insert &&
+        $_quick_deploy_ghostty_ctrlv_widget != vi-quoted-insert ) ||
+      $_quick_deploy_ghostty_quote_widget != undefined-key ]]; then
+    print -u2 'Ghostty local paste: ^V or Esc Ctrl+V already has a custom ZLE binding; refusing to override it.'
+    unset _quick_deploy_ghostty_ctrlv_widget _quick_deploy_ghostty_quote_widget
+    return 1
+fi
+
+_quick_deploy_ghostty_paste() {
+    local clipboard
+    # wl-paste -n avoids an artificial newline. The sentinel preserves real
+    # trailing newlines through command substitution, which otherwise strips them.
+    # Append it only after a successful read; a failed/timed-out read never
+    # reuses a previous value or inserts a partial selection.
+    if clipboard="$(timeout 2s wl-paste --no-newline --type text && printf '\001')"; then
+        LBUFFER+="${clipboard%$'\001'}"
+    else
+        zle -M 'Clipboard paste failed or timed out (wl-paste); editor unchanged'
+        return 1
+    fi
+}
+zle -N _quick_deploy_ghostty_paste
+bindkey -M main '^[^V' "$_quick_deploy_ghostty_ctrlv_widget"
+bindkey -M main '^V' _quick_deploy_ghostty_paste
+unset _quick_deploy_ghostty_ctrlv_widget _quick_deploy_ghostty_quote_widget
+ZSH_LOCAL_PASTE_HOOK
+}
+
+# Historical exact block for guarded migration; existing user text outside it
+# is copied byte-for-byte, and edits *inside* the marked block are refused.
+render_legacy_zshrc_hook_block() {
+    cat <<EOF
+$ZSHRC_BLOCK_BEGIN
+# 由 fresh-install/modules/ghostty/install.sh 管理；其余 .zshrc 内容不动。
+if [ -f "\$HOME/.config/ghostty/$SSH_MOUSE_HOOK_FILENAME" ]; then
+    source "\$HOME/.config/ghostty/$SSH_MOUSE_HOOK_FILENAME"
+fi
+$ZSHRC_BLOCK_END
+EOF
+}
+
 render_zshrc_hook_block() {
     cat <<EOF
 $ZSHRC_BLOCK_BEGIN
 # 由 fresh-install/modules/ghostty/install.sh 管理；其余 .zshrc 内容不动。
 if [ -f "\$HOME/.config/ghostty/$SSH_MOUSE_HOOK_FILENAME" ]; then
     source "\$HOME/.config/ghostty/$SSH_MOUSE_HOOK_FILENAME"
+fi
+if [ -f "\$HOME/.config/ghostty/$LOCAL_PASTE_HOOK_FILENAME" ]; then
+    source "\$HOME/.config/ghostty/$LOCAL_PASTE_HOOK_FILENAME"
 fi
 $ZSHRC_BLOCK_END
 EOF
@@ -1618,6 +1701,105 @@ install_ssh_mouse_hook() {
     else
         warn "SSH 鼠标自愈 hook 文件已写入，但 .zshrc 未登记；请按上方提示手动 source"
     fi
+}
+
+# Verify all prerequisites before either of the two target files is written.
+# A narrow run must not silently reset a user-customized Ghostty config/hook
+# or add a second .zshrc block when the existing managed block has drifted.
+local_paste_zshrc_state() {
+    local old new
+    old="$(render_legacy_zshrc_hook_block)"
+    new="$(render_zshrc_hook_block)"
+    python3 - "$HOME/.zshrc" "$old" "$new" <<'PY'
+from pathlib import Path
+import os
+import sys
+
+body = Path(sys.argv[1]).read_bytes()
+old, new = (os.fsencode(text) + b"\n" for text in sys.argv[2:])
+if body.count(new) == 1:
+    print("current")
+elif body.count(old) == 1:
+    print("old")
+else:
+    raise SystemExit("marked .zshrc block differs from both managed baselines")
+PY
+}
+
+verify_local_paste_prerequisites() {
+    local command_name
+    for command_name in zsh wl-paste timeout python3 cmp mktemp chmod mv cp rm; do
+        require_command "$command_name"
+    done
+    [ -d "$CONFIG_DIR" ] && [ ! -L "$CONFIG_DIR" ] \
+        || die "Ghostty 配置目录缺失或是符号链接，拒绝安装 shell 粘贴: $CONFIG_DIR"
+    [ -f "$CONFIG_FILE" ] && [ ! -L "$CONFIG_FILE" ] && cmp -s "$CONFIG_FILE" <(render_config) \
+        || die "全局按键不是当前逐字节受管基准，拒绝安装 shell 粘贴: $CONFIG_FILE"
+    [ -f "$SSH_MOUSE_HOOK_CONFIG" ] && [ ! -L "$SSH_MOUSE_HOOK_CONFIG" ] &&
+        cmp -s "$SSH_MOUSE_HOOK_CONFIG" <(render_ssh_mouse_hook) \
+        || die "SSH 鼠标 hook 不是受管基准，拒绝迁移其 .zshrc 块: $SSH_MOUSE_HOOK_CONFIG"
+    [ -f "$HOME/.zshrc" ] && [ ! -L "$HOME/.zshrc" ] && zshrc_hook_markers_valid "$HOME/.zshrc" \
+        || die ".zshrc 缺失、是符号链接或托管标记异常，拒绝安装 shell 粘贴"
+    [ ! -L "$LOCAL_PASTE_HOOK_CONFIG" ] \
+        || die "shell 粘贴 hook 是符号链接，拒绝覆盖: $LOCAL_PASTE_HOOK_CONFIG"
+    if [ -e "$LOCAL_PASTE_HOOK_CONFIG" ]; then
+        [ -f "$LOCAL_PASTE_HOOK_CONFIG" ] && cmp -s "$LOCAL_PASTE_HOOK_CONFIG" <(render_local_paste_hook) \
+            || die "shell 粘贴 hook 含非基准内容，拒绝覆盖: $LOCAL_PASTE_HOOK_CONFIG"
+    fi
+    LOCAL_PASTE_ZSHRC_STATE="$(local_paste_zshrc_state)" \
+        || die ".zshrc 托管块含非基准内容，拒绝迁移"
+}
+
+install_local_paste_hook() {
+    local hook_tmp zshrc_tmp zshrc_before old new
+    verify_local_paste_prerequisites
+    hook_tmp="$(mktemp "$LOCAL_PASTE_HOOK_CONFIG.tmp.XXXXXX")"
+    render_local_paste_hook > "$hook_tmp"
+    if ! zsh -n "$hook_tmp"; then
+        rm -f -- "$hook_tmp"
+        die "shell 粘贴 hook 语法检查失败，未安装"
+    fi
+    if [ "$LOCAL_PASTE_ZSHRC_STATE" = old ]; then
+        old="$(render_legacy_zshrc_hook_block)"
+        new="$(render_zshrc_hook_block)"
+        zshrc_tmp="$(mktemp "$HOME/.zshrc.tmp.XXXXXX")"
+        zshrc_before="$(mktemp "$HOME/.zshrc.before.XXXXXX")"
+        cp -- "$HOME/.zshrc" "$zshrc_before"
+        # Only replace the exact old block. Python copies all user-owned bytes,
+        # including CRLF/trailing newlines outside the managed block, untouched.
+        if ! python3 - "$zshrc_before" "$zshrc_tmp" "$old" "$new" <<'PY'
+from pathlib import Path
+import os
+import sys
+
+source, target = (Path(path) for path in sys.argv[1:3])
+old, new = (os.fsencode(text) + b"\n" for text in sys.argv[3:])
+body = source.read_bytes()
+if body.count(old) != 1:
+    raise SystemExit("managed .zshrc block changed during migration")
+target.write_bytes(body.replace(old, new, 1))
+PY
+        then
+            rm -f -- "$hook_tmp" "$zshrc_tmp" "$zshrc_before"
+            die ".zshrc 托管块不再符合旧版基准，拒绝安装 shell 粘贴"
+        fi
+    fi
+    write_atomic_file_from_source "$LOCAL_PASTE_HOOK_CONFIG" "$hook_tmp" 644
+    rm -f -- "$hook_tmp"
+    if [ "$LOCAL_PASTE_ZSHRC_STATE" = old ]; then
+        # Recheck immediately before replacing the user's file. A concurrent
+        # change must not be replaced using an out-of-date baseline snapshot.
+        if [ -L "$HOME/.zshrc" ] || ! cmp -s "$HOME/.zshrc" "$zshrc_before"; then
+            rm -f -- "$zshrc_tmp" "$zshrc_before"
+            die ".zshrc 在迁移期间变化，拒绝覆盖"
+        fi
+        rm -f -- "$zshrc_before"
+        write_atomic_file_keep_mode "$HOME/.zshrc" "$zshrc_tmp" 644
+    fi
+    [ "$(local_paste_zshrc_state)" = current ] &&
+        cmp -s "$LOCAL_PASTE_HOOK_CONFIG" <(render_local_paste_hook) \
+        || die "shell 粘贴 hook 或 .zshrc 托管块写入后校验失败"
+    echo "OK: 本地 Wayland zsh 的 ^V 从当前剪贴板插入；Esc Ctrl+V 保留 quoted-insert"
 }
 
 ssh_mouse_hook_state() {
@@ -1813,6 +1995,11 @@ main() {
         echo "已完成全局按键迁移；现有 Ghostty 需正常重载配置或开启新进程"
         return 0
     fi
+    if [ "$SHELL_PASTE_ONLY" = true ]; then
+        install_local_paste_hook
+        echo "已安装本地 Wayland zsh 提示符粘贴；请开启新的交互式 shell"
+        return 0
+    fi
     check_supported_system
     preflight_commands
 
@@ -1851,8 +2038,13 @@ main() {
     write_config
     verify_config
 
-    section "[6/10] 配置 SSH 断开后的鼠标状态自愈"
+    section "[6/10] 配置 SSH 鼠标自愈与本地 zsh 粘贴"
     install_ssh_mouse_hook
+    if command -v zsh >/dev/null 2>&1; then
+        install_local_paste_hook
+    else
+        warn "未安装 zsh，跳过本地提示符粘贴 hook；安装 zsh 后重跑本模块"
+    fi
 
     section "[7/10] 验证系统桌面入口与 terminfo"
     verify_system_integration
@@ -1898,6 +2090,8 @@ main() {
     echo "     infocmp -x xterm-ghostty | ssh HOST -- tic -x -"
     echo "  5. SSH 异常断开后点击若出现 0;xx;xxM 乱码，按 Ctrl+Shift+R；"
     echo "     zsh hook 会在 ssh 返回到本地提示符时自动清理常见鼠标模式。"
+    echo "  6. 本地 Wayland zsh 提示符中 Ctrl+Shift+V/Ctrl+V 粘贴当前文本；"
+    echo "     Esc 后按 Ctrl+V 仍可 quoted-insert，Pi 的原始 Ctrl+V 不变。"
 }
 
 main "$@"

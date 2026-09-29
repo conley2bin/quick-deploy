@@ -90,8 +90,10 @@ sudo apt install --allow-downgrades ghostty=1.3.1~ppa2-noble1
   - 同目录的 `mimeinfo.cache` 由 `update-desktop-database` 刷新（查找缓存，失败不影响入口生效）
 - `~/.config/ghostty/ghostty-ssh-mouse-reset.zsh`
   - zsh 在 SSH 返回本地提示符前自动清理常见鼠标模式
+- `~/.config/ghostty/ghostty-local-paste.zsh`
+  - 本地 Wayland 交互式 zsh 提示符的 ZLE 粘贴 widget；由 `install.sh` 内嵌源码生成
 - `~/.zshrc`
-  - 追加一个标记包围的 hook 加载块（符号链接 `.zshrc` 不会被改写）
+  - 一个标记包围的加载块 source 上述两个 hook；现有旧块按精确基准迁移，块外用户内容逐字节保留
 
 ### 为什么同时写 `working-directory` 和 `window-inherit-working-directory`
 
@@ -141,8 +143,8 @@ clipboard-read = deny
 
 - **写允许**：终端里的程序（包括 SSH 远端 tmux 发来的、由本地 tmux 重发的序列）可以发 OSC 52 把内容写进本机系统剪贴板。这是 `fresh-install/modules/tmux` 那条“远端 tmux 复制 → 本机剪贴板”路径的终点：序列经 SSH 与本地 tmux 到达 Ghostty，再由 Ghostty 用**它当前平台的剪贴板后端**（Wayland/X11/macOS 等由 Ghostty 自己选择）落下。因此远端与路径中间的机器都不需要 Wayland/X11 会话或剪贴板工具。
 - **读拒绝**：OSC 52 读取会让终端里的程序向 Ghostty 查询本机剪贴板。Ghostty 默认值是 `ask`（弹窗询问），本模块改为无条件拒绝这种终端协议查询；本机程序自己调用 `wl-paste` 等系统接口不受该设置约束，Pi 的 Ctrl+V 正走自己的读取路径。
-- **本地粘贴与 Pi 粘贴**：鼠标右键、`Shift+Insert` 仍可触发 Ghostty 的本地粘贴；`Ctrl+Shift+V` 发送原始 Ctrl+V，由 Pi 自己读取图片或文本，不经过 OSC 52 查询。`Ctrl+Shift+C` 复制仍走 Ghostty 本地选区。普通 shell 里的 `Ctrl+Shift+V` 不再触发终端原生剪贴板粘贴。
-- 策略与显示服务器、系统版本无关：脚本里没有任何按 Wayland/X11 或 Ubuntu 版本分叉的剪贴板逻辑。回归测试在 Wayland、X11、无会话变量三种环境下断言渲染结果逐字节相同——这只证明**配置渲染不分叉**，不证明任何剪贴板后端的实际行为（后者需要真实图形会话）。
+- **本地粘贴与 Pi 粘贴**：鼠标右键、`Shift+Insert` 仍可触发 Ghostty 的本地粘贴；`Ctrl+Shift+V` 发送原始 Ctrl+V，由 Pi 自己读取图片或文本，不经过 OSC 52 查询。`Ctrl+Shift+C` 复制仍走 Ghostty 本地选区。本地 Wayland 交互式 zsh 提示符通过下述 ZLE widget 消费原始 Ctrl+V 并读取当前剪贴板。
+- **Ghostty 配置渲染**与显示服务器无关：回归测试在 Wayland、X11、无会话变量下断言这两条 OSC 52 策略及全局按键渲染逐字节相同。本地 zsh 粘贴 hook 则只在 Wayland 会话启用；配置渲染测试不能替代真实图形会话验收。
 - 本模块不写 `terminal-features` 之类的终端能力声明，也不强制声明 `Ms`；远端 tmux 能不能发 OSC 52 取决于它客户端侧的有效 `Ms`（可能来自 terminfo、配置的特性或 tmux 的运行时识别，见 `fresh-install/modules/tmux/README.md` 剪贴板一节）。本模块能做的是保证本机 `xterm-ghostty` 记录确实带 `Ms`：`--check` 会报告它，正式安装的验证阶段缺 `Ms` 会明确失败。
 
 ### 鼠标上报下的复制与 Pi 粘贴
@@ -169,10 +171,23 @@ keybind = ctrl+shift+v=text:\x16
 SSH 中的 Pi 若启用了已安装的剪贴板桥，则继续由该桥处理 Ctrl+V；这项
 Ghostty 配置不改变远端 Pi 本身的剪贴板能力。
 
-代价是普通 shell 中 `Ctrl+Shift+V` 也发送原始 Ctrl+V（通常是 shell 的
-逐字输入命令），**不再是 Ghostty 原生粘贴**。需要普通终端粘贴时可使用
-右键或 `Shift+Insert` 等原生入口；在其他 TUI 中 Ctrl+V 的具体含义由该
-程序决定。`Ctrl+Shift+C` 仍复制 Ghostty 本地选区，OSC 52 策略不变。
+本地 Wayland **交互式 zsh 提示符**加载模块托管的 ZLE widget：`Ctrl+V`
+和 `Ctrl+Shift+V` 都以原始 `^V` 到达 zsh，然后每次由 `wl-paste
+--no-newline --type text` 读取**当前**系统 CLIPBOARD，用 2 秒上限将完整
+文本直接插入 ZLE 编辑缓冲区。真实结尾换行会保留；粘贴中的换行、分号、
+命令替换等不会在粘贴时执行，只有用户之后主动提交编辑缓冲区才可能运行
+其中命令。读取失败或超时会在提示符报错，保持原缓冲区，不用 tmux 历史
+缓冲区或过期结果回退。原有 quoted-insert 搬到 **Esc 再按 Ctrl+V**
+（`^[^V`）；载入时先核对该序列未被占用以及 `^V` 是 zsh 默认
+`quoted-insert` / `vi-quoted-insert`，冲突会报错而不抢用户自有按键。
+
+hook 只在有本地 Wayland socket、没有 SSH 会话标记的交互式 zsh 中绑定
+ZLE 键；Pi 等 raw-mode 程序不经过 ZLE，仍由自己的 Ctrl+V 处理器读图片/
+文本，SSH 剪贴板桥和 OSC 52 写入路径不变。其他 TUI 仍自行解释原始
+`^V`；非 Wayland、SSH zsh、其他 shell 不安装这个 ZLE 按键，可继续用
+右键或 `Shift+Insert` 的 Ghostty 原生粘贴入口。若本地 shell 继承了
+`SSH_CONNECTION`/`SSH_CLIENT`/`SSH_TTY`，hook 会保守跳过，此时应先查清
+shell 环境来源，而不是把远端 shell 误当成本地 Wayland 会话。
 
 ### 现有安装只迁移这一个按键
 
@@ -197,9 +212,32 @@ Pi 后可先后按 `Ctrl+V` 与 `Ctrl+Shift+V` 验证相同当前
 文本，再试图片。专用 `ghostty-pi` 仍可运行，仍在新进程用同一
 `--keybind=ctrl+shift+v=text:\x16` 参数覆盖这条键。
 
+### 现有机器只补装 zsh 提示符粘贴
+
+全局键已迁移后，从仓库根目录运行：
+
+```bash
+bash fresh-install/modules/ghostty/install.sh --shell-paste-only
+```
+
+该窄模式先逐字节核对当前受管 Ghostty 配置（必须仍是
+`ctrl+shift+v=text:\x16`）、SSH 鼠标 hook 和已有 `.zshrc` 标记块。只接受
+旧版/本次精确托管块，以及不存在或内容完全匹配的新粘贴 hook；自定义配置、
+块内用户改动、符号链接、缺失文件会**在写入前拒绝**。首次迁移只新增
+`~/.config/ghostty/ghostty-local-paste.zsh`，并在现有 `.zshrc` 托管块中
+增加一条 source（更改前备份 `.zshrc.bak.<时间戳>`）。重复运行不重写同样
+内容；块外 `.zshrc` 内容和文件权限保持原样。不会执行 apt、重建背压库、
+更改全局 Ghostty 绑定/启动器/桌面入口/字体、启动 GUI，也不读取或改动
+真实剪贴板。开启新的本地 zsh 提示符后，复制一段文本，分别试两种粘贴键；
+再试含换行的文本，确认它进入编辑缓冲区但未自动执行。`Esc Ctrl+V` 应能
+逐字插入下一个控制字符。
+
+无参数的完整 `install.sh` 也会在安装 Ghostty 时渲染这份 hook，写入同一
+托管块；模块中依然只有 `install.sh` 一个 shell 源文件。
+
 若只在尚未安装专用入口的机器补装 `ghostty-pi`，仍可运行
 `install.sh --pi-launcher-only`；它只核对受保护启动器及背压库并安装该入口，
-**不会**迁移全局配置。两种窄模式不可组合。保留的专用入口仍可直接启动，
+**不会**迁移全局配置。三种窄模式不可组合。保留的专用入口仍可直接启动，
 也可附着原有 Pi 会话：
 
 ```bash
@@ -421,8 +459,9 @@ GTK/libwayland 符号进入库；事故原始负载没有复现，不能许诺�
 
 ## `--check` 是只读预检
 
-它报告完整安装流程的 apt/配置等计划，不代表 `--pi-launcher-only` 或
-`--paste-keybind-only` 会执行这些步骤；窄模式与其它选项不可组合。
+它报告完整安装流程的 apt/配置等计划，不代表 `--pi-launcher-only`、
+`--paste-keybind-only` 或 `--shell-paste-only` 会执行这些步骤；窄模式与
+其它选项不可组合。
 
 ```bash
 ./install.sh --check
@@ -453,8 +492,9 @@ bash ../../tests/ghostty/run.sh
    infocmp -x xterm-ghostty | ssh HOST -- tic -x -
    ```
 
-10. 在普通 Ghostty/Pi 窗口验证：按住 **Shift** 拖选产生 Ghostty 本地选区，`Ctrl+Shift+C` 复制；先后按 `Ctrl+V` 与 `Ctrl+Shift+V`，确认两者读取相同的当前文本，再试图片。普通 shell 中 `Ctrl+Shift+V` 应发送原始 Ctrl+V，而非粘贴文本。现有窗口须先正常重载配置，或打开新进程。
-11. 可选：从 `ghostty-pi` 新窗口进入同一 Pi 输入，确认其同样工作。SSH Pi 的粘贴依赖该 Pi 的 Ctrl+V/剪贴板桥行为，不把全局按键改动误当作远端桥的验证。
+10. 在普通 Ghostty/Pi 窗口验证：按住 **Shift** 拖选产生 Ghostty 本地选区，`Ctrl+Shift+C` 复制；先后按 `Ctrl+V` 与 `Ctrl+Shift+V`，确认两者读取相同的当前文本，再试图片。现有窗口须先正常重载配置，或打开新进程。
+11. 在新开的本地 Wayland zsh 提示符复制当前文本，两键均应粘贴且不提交命令；多行粘贴应保持在编辑缓冲区。`Esc Ctrl+V` 应提供 quoted-insert。若提示符显示 `wl-paste` 错误或绑定冲突，检查本地 Wayland/SSH 环境与自有 zsh 键映射。
+12. 可选：从 `ghostty-pi` 新窗口进入同一 Pi 输入，确认其同样工作。SSH Pi 的粘贴依赖该 Pi 的 Ctrl+V/剪贴板桥行为，不把全局按键改动误当作远端桥的验证。
 
 GUI 冒烟测试只在 `DISPLAY` 或 `WAYLAND_DISPLAY` 存在时运行。它不使用 xdotool、XTEST、libXtst 或任何合成键鼠事件；测试依据是从受保护启动器启动的进程持续存活、stderr 未出现错误，以及 `/proc/<pid>/maps` 中出现 fcitx5 GTK4 immodule（在 Wayland 下还要出现背压库）。
 
@@ -507,11 +547,13 @@ Ghostty 是本地程序，负责画窗口、渲染字体、调 GPU；远端只�
 这与 `ssh-env` / `ssh-terminfo` 无关：那两个特性只处理环境变量和 terminfo，继续保留。
 
 Ghostty 模块目录里只有 **`install.sh` 一个 shell 源文件**。其中的
-`render_ssh_mouse_hook` 直接包含 zsh hook 源码；安装时生成
-`~/.config/ghostty/ghostty-ssh-mouse-reset.zsh`，并让 `.zshrc` 在每个交互式
-shell 启动时加载它。安装器退出以后，SSH 返回提示符时仍需这个本机运行时
-文件。测试脚本位于模块外的 `fresh-install/tests/ghostty/`，会渲染 hook 并用
-`zsh -n` / 交互式 PTY 验证。打包这个模块只需 `install.sh` 与非 shell 的
+`render_ssh_mouse_hook` 和 `render_local_paste_hook` 直接包含两份 zsh hook
+源码；安装时生成
+`~/.config/ghostty/ghostty-ssh-mouse-reset.zsh` 与
+`~/.config/ghostty/ghostty-local-paste.zsh`，并让 `.zshrc` 加载它们。安装器退出
+以后，SSH 返回提示符和本地 ZLE 粘贴仍需这些运行时文件。测试脚本位于模块
+外的 `fresh-install/tests/ghostty/`，会渲染 hook 并用 `zsh -n` / 私有
+交互式 PTY、假的 `wl-paste` 验证。打包这个模块只需 `install.sh` 与非 shell 的
 `wayland-backpressure.c`；C 源码缺失时 `--check` 与安装都会在写入前失败。
 
 本模块采用两层处理：
