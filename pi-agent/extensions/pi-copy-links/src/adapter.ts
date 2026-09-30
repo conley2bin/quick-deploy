@@ -1471,15 +1471,15 @@ export async function checkCompatibility(version: string): Promise<Compatibility
     });
     viewport = tui as unknown as FullscreenRuntime;
     require(viewport.terminal === terminal, "缺少 TuiAltScreen.terminal");
-    for (const key of ["previousScreen", "renderedOverlayLayouts", "overlayStack"] as const) {
-      require(Array.isArray(viewport[key]), `缺少 TuiAltScreen.${key} 数组`);
-    }
-    for (const key of ["previousScreenWidth", "previousScreenHeight"] as const) {
-      require(typeof viewport[key] === "number", `缺少 TuiAltScreen.${key} 尺寸`);
-    }
     require(typeof viewport.containsComponent === "function", "缺少 TuiAltScreen.containsComponent");
-    // Never start a terminal or touch capabilities. The fixture owns a composed
-    // Markdown frame, native viewport input, and a no-scheduling render endpoint.
+    // Constructor cache values are not a used interface. Establish blank state
+    // only on this owned fixture; paint supplies frame/dimensions before input.
+    // Native cache production is tested separately by isolated native regressions.
+    viewport.renderedOverlayLayouts = [];
+    viewport.overlayStack = [];
+    // Never start a terminal or touch capabilities. Native fullscreen start can
+    // change global image capabilities, so this bounded fixture owns its frame
+    // and tests native consumers, not the terminal compositor/lifecycle.
     Object.defineProperty(tui, "requestRender", { value() {}, configurable: true });
     const source = "probe plain\n\n- ```make\n  target:\n  \techo 中文  \n  ```\n\n" +
       "[WEB](https://example.com/?a=1&amp;b=2)\n\n[REF][r]\n\n" +
@@ -1537,12 +1537,18 @@ export async function checkCompatibility(version: string): Promise<Compatibility
     ]), "显式/引用链接语义或 Ctrl+左键动作分歧");
     require(nativeCalls === beforeNative + 2 && nativeOpens.length === 0, "私有动作进入了 native opener/input");
     stage = "source/width rerender";
-    markdown.setText(source.replace("\techo", "   echo").replace("b=2", "b=3"));
-    terminal.columns = 38; paint();
-    const freshButton = target("[复制]");
-    click(freshButton); click(target("WEB"), 16); await settle();
+    // Tab-only first: the whole normalized source stays identical, so a host
+    // token-cache hit must not hide the changed logical clipboard bytes.
+    const spacesSource = source.replace("\techo", "   echo");
+    markdown.setText(spacesSource); paint();
+    click(target("[复制]")); await settle();
     require(copies.length === 2 && copies[1] === "target:\n   echo 中文  ", "Tab→空格同屏源文更新仍复制旧数据");
+    markdown.setText(spacesSource.replace("b=2", "b=3")); paint();
+    click(target("WEB"), 16); await settle();
     require(opens.at(-1) === "https://example.com/?a=1&b=3", "源文更新仍打开旧链接");
+    const freshButton = target("[复制]");
+    terminal.columns = 38; paint();
+    require(target("[复制]").url === freshButton.url, "仅宽度 rerender 更换了稳定动作");
     terminal.columns = 52; paint();
     require(target("[复制]").url === freshButton.url, "仅宽度 rerender 更换了稳定动作");
     click(target("[复制]")); await settle();
