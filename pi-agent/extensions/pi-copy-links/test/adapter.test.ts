@@ -5,7 +5,7 @@ import {
   getCapabilities, getOsc8LinkAtColumn, hyperlink, Markdown, setCapabilities, stripTerminalSequences,
   TuiAltScreen, visibleWidth, type MarkdownTheme, type Terminal,
 } from "@earendil-works/pi-tui";
-import { installAdapter, SUPPORTED_PI, type OpenOrigin } from "../src/adapter.ts";
+import { installAdapter, type OpenOrigin } from "../src/adapter.ts";
 import type { OpenLifetime } from "../src/browser.ts";
 
 // Count WeakRef constructions for every adapter installed below. V8 both caps a
@@ -1411,13 +1411,16 @@ test("dispose never clobbers a later input wrapper", () => {
   }
 });
 
-test("unverified Pi versions refuse adaptation before any prototype changes", () => {
-  assert.deepEqual(SUPPORTED_PI, ["0.85.1", "0.86.1", "0.87.1", "0.99.1"]);
+test("unknown Pi version metadata does not block conforming hooks", () => {
   const originals = runtimeMethods();
-  assert.throws(() => installAdapter({ version: '9.9.9', active: () => true,
-    copy: async () => {}, cwd: () => '/fixture', open: async () => {}, notify: () => {}, button: s => s }),
-  /不支持 Pi 9\.9\.9；已验证版本：0\.85\.1、0\.86\.1、0\.87\.1、0\.99\.1；未修改渲染器/);
+  const descriptors = runtimeDescriptors();
+  const adapter = installAdapter({ version: 'fictional-next-release', active: () => true,
+    copy: async () => {}, cwd: () => '/fixture', open: async () => {}, notify: () => {}, button: s => s });
+  assert.equal(adapter.status().available, true);
+  assert.notDeepEqual(runtimeMethods(), originals);
+  assert.deepEqual(adapter.dispose(), { quiesced: true, passive: false });
   assert.deepEqual(runtimeMethods(), originals);
+  assert.deepEqual(runtimeDescriptors(), descriptors);
 });
 
 test("each missing private runtime method is diagnosed before any hook is installed", () => {

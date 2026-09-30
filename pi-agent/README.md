@@ -22,7 +22,7 @@
 
 | 主机 | 安装与作用 |
 | --- | --- |
-| 公司机（运行 Pi） | 单独安装 Node.js ≥22.19 和受支持的 Pi，例如 `npm install -g --ignore-scripts @earendil-works/pi-coding-agent@0.99.1`；用 `pi --version` 核验，再执行 `bash pi-agent/install.sh` 安装 `extensions/*/install.sh`。Pi 不自动重载。 |
+| 公司机（运行 Pi） | 单独安装 Node.js ≥22.19 和 Pi，例如 `npm install -g --ignore-scripts @earendil-works/pi-coding-agent@latest`；用 `pi --version` 核验，再执行 `bash pi-agent/install.sh` 安装 `extensions/*/install.sh`。`pi-copy-links` 按实际运行时契约自动判定兼容，不要求逐版更新名单。Pi 不自动重载。 |
 | Y9000p（提供桌面） | 更新到与公司助手源码匹配的**已审阅 checkout**，执行 `bash pi-agent/client-link-helper/install.sh`。这只把当前 checkout 的助手链接到 `~/.local/bin/`，不会安装 Pi 扩展、从公司机获取更新或覆盖外来软链接；详见[助手说明](client-link-helper/README.md#install-and-version-check)。 |
 
 公司机须配置 `conley-Y9000p`，Y9000p 须配置 `conley-company`：两端 `ssh -G <对端别名>` 应解析为正确的**字面 IP**、`conley` 用户和端口，两端 SSH 服务（缺失时须单独安装/启用）、授权密钥与经核验指纹的 `known_hosts` 均应就绪。分别执行 `ssh -T -o BatchMode=yes -o StrictHostKeyChecking=yes -o ClearAllForwardings=yes <对端别名> true` 验证非交互双向连接。Y9000p 还须有 `code` CLI/VS Code Remote-SSH 对公司机的连接、`xdg-open` 默认浏览器，以及活跃的本地图形会话和可由 user systemd 提供的桌面环境。
@@ -38,6 +38,6 @@
 | `extensions/<name>/` | 扩展源码（`index.ts` 入口） | 各自的 `install.sh` 创建 `~/.pi/agent/extensions/<name>` 受管符号链接；PI home 是 git worktree 时同时写入 `info/exclude` |
 | `skills/` | 技能源码（`SKILL.md`） | `skills/install-skills.sh` 交互式复制到 `~/.pi/agent/skills/` |
 
-`pi-copy-links` 提供代码块右下角复制按钮和 Ctrl+左键打开网页及公司文件；需使用 Pi 的 `fullscreen` 模式。它不修改全局设置，源码精确支持 Pi 0.85.1、0.86.1、0.87.1、0.99.1；更新源码后须在 Pi 空闲时手动 `/reload` 或重启才会生效，详见 [使用说明](extensions/pi-copy-links/README.md)。
+`pi-copy-links` 提供代码块右下角复制按钮和 Ctrl+左键打开网页及公司文件；需使用 Pi 的 `fullscreen` 模式。它不修改全局设置，版本号仅作诊断：TUI 启动时在自有隔离对象上检查实际接口与关键行为，契约成立即启用，无需用户逐版验证或编辑版本名单。具体接口/行为不兼容时只停用增强并提示原因，原生 Markdown/Pi 保持可用；`/copy-links` 查看实际状态。更新源码后须在 Pi 空闲时手动 `/reload` 或重启才会生效，详见 [使用说明](extensions/pi-copy-links/README.md)。
 
 扩展测试在各自 `test/` 下，例如 `extensions/pi-suspend-guard/test/run.sh`、`extensions/pi-tmux-window-status/test/installer.sh`；`pi-copy-links` 使用 `npm run check`。

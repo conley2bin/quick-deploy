@@ -1,6 +1,6 @@
 import { copyToClipboard, VERSION, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { TUI } from "@earendil-works/pi-tui";
-import { installAdapter } from "./src/adapter.ts";
+import { checkCompatibility, compatibilityDiagnostic, installAdapter, type CompatibilityStatus } from "./src/adapter.ts";
 import { remoteCopySink } from "./src/remote-copy.ts";
 import { dispatchOpenTarget } from "./src/dispatcher.ts";
 import { enableTmuxMouse } from "./src/tmux.ts";
@@ -12,6 +12,8 @@ export default function copyLinksExtension(pi: ExtensionAPI): void {
   let adapter: ReturnType<typeof installAdapter> | undefined;
   let tui: TUI | undefined;
   let failure: string | undefined;
+  let compatibility: CompatibilityStatus | undefined;
+  let warnedFailure: string | undefined;
   let mouse: Awaited<ReturnType<typeof enableTmuxMouse>> | undefined;
   let mouseWarning: string | undefined;
   pi.registerMarkdownTransformer((source, context) => adapter?.transform(source, context) ?? source);
@@ -28,6 +30,10 @@ export default function copyLinksExtension(pi: ExtensionAPI): void {
       return { render: () => [], invalidate() {} };
     });
     try {
+      compatibility = await checkCompatibility(VERSION);
+      if (!compatibility.compatible) throw new Error(compatibility.cause);
+      // Re-capture the production descriptors after the isolated async probe;
+      // installAdapter still commits the four real hooks as one transaction.
       adapter = installAdapter({
         version: VERSION,
         active: () => tui?.mode === "fullscreen",
@@ -65,17 +71,25 @@ export default function copyLinksExtension(pi: ExtensionAPI): void {
       tui?.requestRender();
       if (tui?.mode !== "fullscreen") ctx.ui.notify(`pi-copy-links 已加载。${HELP}`, "info");
     } catch (error) {
-      failure = String(error);
-      ctx.ui.notify(failure, "error");
+      failure = compatibilityDiagnostic(VERSION, error);
+      if (failure !== warnedFailure) {
+        warnedFailure = failure;
+        ctx.ui.notify(failure, "warning");
+      }
     }
   });
 
   pi.registerCommand("copy-links", {
     description: "查看代码复制和 Ctrl+单击网页/文件链接的启用状态",
     handler: async (_args, ctx) => {
-      const state = failure ?? (adapter && tui?.mode === "fullscreen" ?
-        "已启用：点击 [复制] 获取原始代码；Ctrl+左键在新窗口打开 HTTP(S) 网页或现有本地目标。" : HELP);
-      ctx.ui.notify([state, mouseWarning].filter(Boolean).join("\n"), failure ? "error" : mouseWarning ? "warning" : "info");
+      const actual = adapter?.status();
+      const state = failure ?? (actual && !actual.available ? compatibilityDiagnostic(VERSION, actual.cause) :
+        actual?.available && tui?.mode === "fullscreen" ?
+          "已启用：点击 [复制] 获取原始代码；Ctrl+左键在新窗口打开 HTTP(S) 网页或现有本地目标。" : HELP);
+      const contract = compatibility?.compatible ?
+        `实际兼容检查通过（Pi ${VERSION}，隔离探针 ${compatibility.probeMs.toFixed(1)} ms）` : undefined;
+      ctx.ui.notify([state, contract, mouseWarning].filter(Boolean).join("\n"),
+        failure || (actual && !actual.available) || mouseWarning ? "warning" : "info");
     },
   });
 

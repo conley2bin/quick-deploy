@@ -1,8 +1,8 @@
 import { isAbsolute } from "node:path";
 import type { MarkdownTransformContext } from "@earendil-works/pi-coding-agent";
 import {
-  getOsc8LinkAtColumn, hyperlink, Markdown, TuiAltScreen, visibleWidth,
-  type MarkdownTheme, type TUI,
+  getOsc8LinkAtColumn, hyperlink, Markdown, stripTerminalSequences, TuiAltScreen, visibleWidth,
+  type MarkdownTheme, type Terminal, type TUI,
 } from "@earendil-works/pi-tui";
 import { webUrl, type OpenLifetime } from "./browser.ts";
 import { hasUriScheme, isLocalHref } from "./links.ts";
@@ -12,11 +12,8 @@ import {
   type RenderedCodeBlock, type SourceCodeBlock, type SourceLinkEvidence,
 } from "./source.ts";
 
-// Pi has no public code-block renderer or pre-viewport mouse hook in these releases.
-// Keep the exact private surface here, reject unknown versions and restore on unload.
-// 0.99.1 retains these hooks; its cached Markdown tokens are source-keyed and
-// its wheel acceleration stays inside the native input method we delegate to.
-export const SUPPORTED_PI = ["0.85.1", "0.86.1", "0.87.1", "0.99.1"] as const;
+// Pi has no public code-block renderer or pre-viewport mouse hook.
+// Version is diagnostic only; startup checks the actual interface and behavior.
 interface Token { type: string; text?: string; lang?: string; href?: string; tokens?: Token[]; raw?: string }
 interface InlineStyle { applyText: (text: string) => string; stylePrefix: string }
 interface MarkdownRuntime {
@@ -119,7 +116,16 @@ interface HookCapture {
   method: (...args: never[]) => unknown;
 }
 interface HookSurface extends HookCapture { wrapper: (...args: never[]) => unknown }
+const HOOK_BASE = Symbol.for("pi-copy-links:hook-base");
+const HOOK_OWNER = Symbol.for("pi-copy-links:hook-owner");
 const INPUT_GUARD = Symbol.for("pi-copy-links:input-guard");
+interface HookOwners { markdown: object; fullscreen: object }
+const runtimeOwners: HookOwners = { markdown: Markdown.prototype, fullscreen: TuiAltScreen.prototype };
+// Owned probe subclasses shadow this marker. A foreign wrapper delegating to an
+// already-live adapter must not register the probe instance in that live store.
+function ownsInstance(instance: object, owner: object): boolean {
+  return !(HOOK_OWNER in instance) || Reflect.get(instance, HOOK_OWNER) === owner;
+}
 const OPEN_URL_FILTER = Symbol.for("pi-copy-links:open-url-filter");
 const CLIPBOARD_QUEUE = Symbol.for("pi-copy-links:clipboard-queue");
 interface InputGuardMetadata {
@@ -336,8 +342,7 @@ function clipboardQueue(): ClipboardQueueState {
   return created;
 }
 
-function enqueueClipboard(operation: () => Promise<void>): Promise<void> {
-  const state = clipboardQueue();
+function enqueueClipboard(operation: () => Promise<void>, state = clipboardQueue()): Promise<void> {
   const result = state.tail.then(operation);
   state.tail = result.then(() => undefined, () => undefined);
   return result;
@@ -414,28 +419,25 @@ function installHooks(surfaces: readonly HookSurface[]): void {
   }
 }
 
-export function installAdapter(options: AdapterOptions) {
-  const md = Markdown.prototype as unknown as MarkdownRuntime;
-  const alt = TuiAltScreen.prototype as unknown as FullscreenRuntime;
-  const supported = SUPPORTED_PI.join("、");
-  if (!SUPPORTED_PI.some((version) => version === options.version)) {
-    throw new Error(`pi-copy-links 不支持 Pi ${options.version}；已验证版本：${supported}；未修改渲染器`);
-  }
+function captureRuntimeHooks(owners: HookOwners): HookCapture[] {
+  return [
+    captureHook("Markdown.render", owners.markdown, "render"),
+    captureHook("Markdown.renderToken", owners.markdown, "renderToken"),
+    captureHook("Markdown.renderInlineTokens", owners.markdown, "renderInlineTokens"),
+    captureHook("TuiAltScreen.handleViewportInput", owners.fullscreen, "handleViewportInput"),
+  ];
+}
 
+export function installAdapter(options: AdapterOptions) {
+  return installOwnedAdapter(options, runtimeOwners);
+}
+
+// The only alternative owners are isolated subclasses in checkCompatibility.
+// Production keeps its process-wide clipboard queue; probes own a private tail.
+function installOwnedAdapter(options: AdapterOptions, owners: HookOwners, clipboard?: ClipboardQueueState) {
   let captures: HookCapture[];
-  try {
-    captures = [
-      captureHook("Markdown.render", md, "render"),
-      captureHook("Markdown.renderToken", md, "renderToken"),
-      captureHook("Markdown.renderInlineTokens", md, "renderInlineTokens"),
-      captureHook("TuiAltScreen.handleViewportInput", alt, "handleViewportInput"),
-    ];
-  } catch (error) {
-    throw new Error(
-      `pi-copy-links 无法适配 Pi ${options.version}：${error instanceof Error ? error.message : String(error)}；` +
-      `已验证版本：${supported}；未修改渲染器`,
-    );
-  }
+  try { captures = captureRuntimeHooks(owners); }
+  catch (error) { throw new Error(compatibilityDiagnostic(options.version, error)); }
   const predecessorInput = captures[3]!.method as unknown as GuardedInput;
   const predecessorGuard = predecessorInput[INPUT_GUARD];
   const absorbedGuard = predecessorGuard?.passive === true ? predecessorGuard : undefined;
@@ -448,7 +450,7 @@ export function installAdapter(options: AdapterOptions) {
   const inputBaseCapture: HookCapture = absorbedGuard
     ? {
         name: captures[3]!.name,
-        owner: TuiAltScreen.prototype as unknown as Record<string, unknown>,
+        owner: owners.fullscreen,
         key: "handleViewportInput",
         descriptor: absorbedGuard.baseDescriptor,
         method: absorbedGuard.baseMethod as unknown as (...args: never[]) => unknown,
@@ -803,7 +805,7 @@ export function installAdapter(options: AdapterOptions) {
   }
 
   function render(this: MarkdownRuntime, width: number): string[] {
-    if (!isActive()) return original.render.call(this, width);
+    if (!ownsInstance(this, owners.markdown) || !isActive()) return original.render.call(this, width);
     const frame: Frame = {
       owner: this,
       tracking: false,
@@ -890,7 +892,7 @@ export function installAdapter(options: AdapterOptions) {
   }
 
   function token(this: MarkdownRuntime, value: Token, width: number, next?: string, style?: InlineStyle): string[] {
-    const frame = currentFrame(this);
+    const frame = ownsInstance(this, owners.markdown) ? currentFrame(this) : undefined;
     const container = value.type === "blockquote" || value.type === "list" ? value.type : undefined;
     if (frame && container) frame.containers.push(container);
     let lines: string[];
@@ -994,7 +996,7 @@ export function installAdapter(options: AdapterOptions) {
   }
 
   function inline(this: MarkdownRuntime, tokens: Token[], style?: InlineStyle): string {
-    const frame = currentFrame(this);
+    const frame = ownsInstance(this, owners.markdown) ? currentFrame(this) : undefined;
     if (!enabled || !frame || frame.phase === "native" || !frame.assistant || frame.failed) {
       return original.inline.call(this, tokens, style);
     }
@@ -1100,7 +1102,7 @@ export function installAdapter(options: AdapterOptions) {
           if (!requireGenerationLive(current)) return;
           try { options.notify("代码已复制"); } catch { /* best effort */ }
           flash(entry.url);
-        }).catch((error: unknown) => {
+        }, clipboard).catch((error: unknown) => {
           if (!requireGenerationLive(current)) return;
           try { options.notify(`复制失败：${String(error)}`, true); } catch { /* best effort */ }
         });
@@ -1126,7 +1128,8 @@ export function installAdapter(options: AdapterOptions) {
   }
 
   function input(this: FullscreenRuntime, data: string) {
-    // The supported fullscreen hosts dispatch the tmux CSI marker and SGR as successive calls.
+    if (!ownsInstance(this, owners.fullscreen)) return callNativeFiltered(this, data, original.input, true);
+    // Fullscreen hosts dispatch the tmux CSI marker and SGR as successive calls.
     // Consume the marker before the non-SGR focus-cancellation path. A second
     // marker before a mouse event cannot replace the first client's identity.
     if (data.startsWith("\x1b[998;")) {
@@ -1259,10 +1262,14 @@ export function installAdapter(options: AdapterOptions) {
     throw new Error(`pi-copy-links 无法创建动作登记代际：${reasonOf(error)}`);
   }
 
-  const surfaces: HookSurface[] = captures.map((capture, index) => ({
-    ...capture,
-    wrapper: [render, token, inline, input][index] as HookSurface["wrapper"],
-  }));
+  const surfaces: HookSurface[] = captures.map((capture, index) => {
+    const wrapper = [render, token, inline, input][index] as HookSurface["wrapper"];
+    // Unwrap only our own known hooks during a probe or module reload. Foreign
+    // wrappers remain part of the observed host behavior, on owned instances.
+    const base = (capture.method as typeof wrapper & { [HOOK_BASE]?: HookCapture })[HOOK_BASE] ?? capture;
+    Object.defineProperty(wrapper, HOOK_BASE, { value: base });
+    return { ...capture, wrapper };
+  });
   try { installHooks(surfaces); }
   catch (error) {
     enabled = false;
@@ -1274,6 +1281,10 @@ export function installAdapter(options: AdapterOptions) {
 
   return {
     transform,
+    status() {
+      const available = enabled && !trackingDisabled && generation !== undefined && generationIsLive(generation);
+      return { available, cause: available ? undefined : enabled ? recoveryReason : "adapter 已卸载" };
+    },
     dispose() {
       enabled = false;
       const issues: CleanupIssue[] = [];
@@ -1371,5 +1382,217 @@ export function installAdapter(options: AdapterOptions) {
       }
       return { quiesced, passive };
     },
+  };
+}
+
+export interface CompatibilityStatus {
+  compatible: boolean;
+  version: string;
+  probeMs: number;
+  cause?: string;
+}
+
+function bounded(value: unknown, limit: number): string {
+  let text: string;
+  try { text = value instanceof Error ? value.message : String(value); }
+  catch { text = "无法读取失败原因"; }
+  return text.replace(/[\x00-\x1f\x7f-\x9f]/gu, " ").slice(0, limit);
+}
+
+export function compatibilityDiagnostic(version: string, cause: unknown): string {
+  return `pi-copy-links 增强已停用（Pi ${bounded(version, 48)}）：${bounded(cause, 260)}；原生 Markdown/Pi 保持可用`;
+}
+
+function sameDescriptor(left: PropertyDescriptor | undefined, right: PropertyDescriptor | undefined): boolean {
+  return left !== undefined && right !== undefined &&
+    ["value", "get", "set", "writable", "enumerable", "configurable"].every((key) =>
+      Reflect.get(left, key) === Reflect.get(right, key));
+}
+
+/** Bounded startup contract, not the full regression suite. No shared hook is ever installed. */
+export async function checkCompatibility(version: string): Promise<CompatibilityStatus> {
+  const started = performance.now();
+  let stage = "运行时接口";
+  let failure: unknown;
+  let adapter: ReturnType<typeof installOwnedAdapter> | undefined;
+  let production: HookCapture[] = [];
+  let owned: HookCapture[] = [];
+  let viewport: FullscreenRuntime | undefined;
+  let markdown: Markdown | undefined;
+  const clipboard: ClipboardQueueState = { tail: Promise.resolve() };
+  const notices: string[] = [];
+  const require = (condition: unknown, message: string): void => {
+    if (!condition) throw new Error(message);
+  };
+  const issue = (error: unknown) => {
+    // Keep the primary concrete failure, even when cleanup also fails.
+    if (failure === undefined) failure = `${stage}：${bounded(error, 220)}`;
+  };
+  try {
+    // Check the real production surfaces first, including their patchability.
+    // A subclass's writable shadow is not evidence that the live hook is writable.
+    production = captureRuntimeHooks(runtimeOwners);
+    class ProbeMarkdown extends Markdown {}
+    class ProbeViewport extends TuiAltScreen {}
+    const owners: HookOwners = { markdown: ProbeMarkdown.prototype, fullscreen: ProbeViewport.prototype };
+    for (const owner of Object.values(owners)) {
+      Object.defineProperty(owner, HOOK_OWNER, { value: owner });
+    }
+    for (const [index, capture] of production.entries()) {
+      const base = (capture.method as HookCapture["method"] & { [HOOK_BASE]?: HookCapture })[HOOK_BASE] ?? capture;
+      const owner = index < 3 ? owners.markdown : owners.fullscreen;
+      Object.defineProperty(owner, capture.key, {
+        value: base.method, configurable: true, writable: true, enumerable: capture.descriptor.enumerable,
+      });
+    }
+    let nativeCalls = 0;
+    const nativeInput = Reflect.get(owners.fullscreen, "handleViewportInput") as NativeInput;
+    Object.defineProperty(owners.fullscreen, "handleViewportInput", {
+      ...Object.getOwnPropertyDescriptor(owners.fullscreen, "handleViewportInput"),
+      value(this: FullscreenRuntime, data: string) { nativeCalls += 1; return nativeInput.call(this, data); },
+    });
+    owned = captureRuntimeHooks(owners);
+    const identity = (text: string) => text;
+    const theme: MarkdownTheme = {
+      heading: identity, link: identity, linkUrl: identity, code: identity,
+      codeBlock: identity, codeBlockBorder: identity, quote: identity, quoteBorder: identity,
+      hr: identity, listBullet: identity, bold: identity, italic: identity,
+      strikethrough: identity, underline: identity,
+    };
+    const terminal = {
+      columns: 64, rows: 40, kittyProtocolActive: false,
+      start() {}, stop() {}, async drainInput() {}, write() {}, moveBy() {},
+      hideCursor() {}, showCursor() {}, clearLine() {}, clearFromCursor() {},
+      clearScreen() {}, setTitle() {}, setProgress() {},
+    } satisfies Terminal;
+    const copies: string[] = [], opens: string[] = [], nativeOpens: string[] = [];
+    const tui = new ProbeViewport(terminal, false, undefined, {
+      openUrl: (url) => { nativeOpens.push(url); }, copyOnSelect: false, copySelection: async () => true,
+    });
+    viewport = tui as unknown as FullscreenRuntime;
+    require(viewport.terminal === terminal, "缺少 TuiAltScreen.terminal");
+    for (const key of ["previousScreen", "renderedOverlayLayouts", "overlayStack"] as const) {
+      require(Array.isArray(viewport[key]), `缺少 TuiAltScreen.${key} 数组`);
+    }
+    for (const key of ["previousScreenWidth", "previousScreenHeight"] as const) {
+      require(typeof viewport[key] === "number", `缺少 TuiAltScreen.${key} 尺寸`);
+    }
+    require(typeof viewport.containsComponent === "function", "缺少 TuiAltScreen.containsComponent");
+    // Never start a terminal or touch capabilities. The fixture owns a composed
+    // Markdown frame, native viewport input, and a no-scheduling render endpoint.
+    Object.defineProperty(tui, "requestRender", { value() {}, configurable: true });
+    const source = "probe plain\n\n- ```make\n  target:\n  \techo 中文  \n  ```\n\n" +
+      "[WEB](https://example.com/?a=1&amp;b=2)\n\n[REF][r]\n\n" +
+      "[r]: https://example.com/ref?a=1&amp;b=2\n\n[FILE](./probe.txt#L2)";
+    const paint = () => {
+      markdown!.invalidate();
+      const lines = markdown!.render(terminal.columns);
+      require(lines.every((line) => typeof line === "string" && visibleWidth(line) <= terminal.columns),
+        "Markdown.render 返回无效行或超宽行");
+      viewport!.previousScreen = lines;
+      viewport!.previousScreenWidth = terminal.columns;
+      viewport!.previousScreenHeight = terminal.rows;
+      return lines;
+    };
+    adapter = installOwnedAdapter({
+      version, active: () => true, copy: async (text) => { copies.push(text); },
+      cwd: () => "/pi-copy-links-probe", open: async (href) => { opens.push(href); },
+      notify: (message, error) => { if (error) notices.push(message); }, button: identity,
+      requestRender() {}, quiesce: () => paint().every((line) => !line.includes("pi-copy://")),
+    }, owners, clipboard);
+    markdown = new ProbeMarkdown(source, 0, 0, theme, undefined, {
+      transform: (text, availableWidth) => adapter!.transform(text, {
+        messageType: "assistant", isStreaming: false, availableWidth,
+      }),
+    });
+    require(typeof markdown.invalidate === "function", "缺少 Markdown.invalidate");
+    require(typeof markdown.setText === "function", "缺少 Markdown.setText");
+    const target = (label: string) => {
+      const found = new Map<string, { x: number; y: number; url: string }>();
+      for (const [y, line] of viewport!.previousScreen.entries()) {
+        if (!stripTerminalSequences(line).includes(label)) continue;
+        for (let x = 0; x < terminal.columns; x++) {
+          const url = getOsc8LinkAtColumn(line, x);
+          if (url?.startsWith("pi-copy://") && !found.has(url)) found.set(url, { x, y, url });
+        }
+      }
+      require(found.size === 1, `${label} 应有一个源文对齐动作，实际 ${found.size}`);
+      return [...found.values()][0]!;
+    };
+    const send = (point: { x: number; y: number }, bits = 0, edge = "M") =>
+      viewport!.handleViewportInput(`\x1b[<${bits};${point.x + 1};${point.y + 1}${edge}`);
+    const click = (point: { x: number; y: number }, bits = 0) => { send(point, bits); send(point, bits, "m"); };
+    const settle = async () => { await clipboard.tail; await Promise.resolve(); };
+    stage = "代码源文/链接语义";
+    paint();
+    click(target("[复制]")); await settle();
+    require(copies.length === 1 && copies[0] === "target:\n\techo 中文  ", "复制未保留 Tab/中文/行尾空格");
+    const web = target("WEB");
+    const beforeNative = nativeCalls;
+    click(web); await settle();
+    require(opens.length === 0 && nativeCalls === beforeNative + 2, "普通链接点击未保留 native 路由");
+    click(web, 16); click(target("REF"), 16); click(target("FILE"), 16); await settle();
+    require(JSON.stringify(opens) === JSON.stringify([
+      "https://example.com/?a=1&b=2", "https://example.com/ref?a=1&b=2", "./probe.txt#L2",
+    ]), "显式/引用链接语义或 Ctrl+左键动作分歧");
+    require(nativeCalls === beforeNative + 2 && nativeOpens.length === 0, "私有动作进入了 native opener/input");
+    stage = "source/width rerender";
+    markdown.setText(source.replace("\techo", "   echo").replace("b=2", "b=3"));
+    terminal.columns = 38; paint();
+    const freshButton = target("[复制]");
+    click(freshButton); click(target("WEB"), 16); await settle();
+    require(copies.length === 2 && copies[1] === "target:\n   echo 中文  ", "Tab→空格同屏源文更新仍复制旧数据");
+    require(opens.at(-1) === "https://example.com/?a=1&b=3", "源文更新仍打开旧链接");
+    terminal.columns = 52; paint();
+    require(target("[复制]").url === freshButton.url, "仅宽度 rerender 更换了稳定动作");
+    click(target("[复制]")); await settle();
+    require(copies.length === 3 && copies[2] === copies[1], "宽度 rerender 改变复制数据");
+    stage = "native mouse/overlay/私有 URI";
+    send({ x: 0, y: 0 }); send({ x: 5, y: 0 }, 32); send({ x: 5, y: 0 }, 0, "m");
+    require(tui.hasActiveSelection(), "原生拖选未保留 selection");
+    viewport.handleViewportInput("\x1b[O");
+    require(send({ x: 0, y: 0 }, 64)?.consume === true, "原生 wheel 未消费事件");
+    const events: string[] = [];
+    const overlay = {
+      render: () => ["overlay"], invalidate() {},
+      handleMouse: (event: { type: string }) => {
+        events.push(event.type); return { handled: true, capture: event.type === "press" };
+      },
+    };
+    const entry = { component: overlay, hidden: false, focusOrder: 1 };
+    viewport.overlayStack = [entry];
+    viewport.renderedOverlayLayouts = [{ entry, row: 0, col: 0, width: 8, height: 1 }];
+    click({ x: 0, y: 0 });
+    require(events.join(",") === "press,release,click", "overlay native capture 路由改变");
+    viewport.overlayStack = []; viewport.renderedOverlayLayouts = [];
+    viewport.previousScreen = [hyperlink("stale", "pi-copy://retired-probe/1")];
+    click({ x: 0, y: 0 }); await settle();
+    require(nativeOpens.length === 0 && copies.length === 3 && opens.length === 4, "未知私有 URI 逃逸或触发副作用");
+    require(adapter.status().available, "探针动作登记已停用");
+    require(notices.length === 0, notices[0] ?? "探针出现诊断");
+  } catch (error) { issue(error); }
+  finally {
+    stage = "探针清理";
+    try {
+      if (adapter) {
+        const result = adapter.dispose();
+        require(result.quiesced && !result.passive, "隔离 hook/动作未完全清理");
+        require(!adapter.status().available, "清理后动作登记仍可用");
+      }
+    } catch (error) { issue(error); }
+    try {
+      await clipboard.tail;
+      require(owned.every((capture) => sameDescriptor(
+        Object.getOwnPropertyDescriptor(capture.owner, capture.key), capture.descriptor,
+      )), "隔离原始 descriptor 未恢复");
+      require(production.every((capture) => sameDescriptor(
+        Object.getOwnPropertyDescriptor(capture.owner, capture.key), capture.descriptor,
+      )), "真实运行时 descriptor 被探针改变");
+      require(!viewport?.previousScreen.some((line) => line.includes("pi-copy://")), "清理后隔离 frame 残留私有 URI");
+    } catch (error) { issue(error); }
+  }
+  return {
+    compatible: failure === undefined, version, probeMs: performance.now() - started,
+    ...(failure === undefined ? {} : { cause: bounded(failure, 260) }),
   };
 }

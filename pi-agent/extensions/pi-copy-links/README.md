@@ -89,7 +89,9 @@ Pi 在 lexing 前把 Tab 展开成三个空格，native href 还可能保留 cha
 
 ## 维护者：兼容和生命周期边界
 
-- 精确支持 **Pi 0.85.1、0.86.1、0.87.1 和 0.99.1**。其他版本会在改写任何 prototype 前拒绝；已验证版本若缺少 `Markdown.render`、`renderToken`、`renderInlineTokens` 或 `TuiAltScreen.handleViewportInput` 会指出具体方法。0.99.1 的解析 token 缓存按 Tab 归一化后的源文复用；扩展仍在每次源文渲染时重新核对代码块/链接语义，Tab 与三个空格的同屏显示不会混淆复制内容。新版滚轮加速与 overlay 焦点仍由 Pi 的原生 viewport 输入处理。
+- **Pi 版本号只用于诊断，不作为启用名单。** 每次 TUI 会话启动先检查实际运行时接口与行为；未知版本标签只要契约成立也会启用，普通升级不需要用户修改版本列表或逐版执行验收脚本。缺少/不可替换的 `Markdown.render`、`renderToken`、`renderInlineTokens`、`TuiAltScreen.handleViewportInput`，或具名行为检查失败时，仅停用复制/链接增强，保留原生 Markdown/Pi。同一扩展实例的同一失败只自动提示一次有界、具体的原因；`/copy-links` 显示兼容检查、探针耗时和当前动作登记是否可用。
+- 启动探针复用生产 adapter 与当前 Pi 的类身份，但只安装到自有 Markdown/fullscreen 子类 prototype；不会在异步等待时临时改写共享 live prototype。自有 hook-owner 标记阻止已有 adapter 经 foreign wrapper 接管探针对象；复制使用独立的内存队列，所有 clipboard/opener/terminal 端点均为假实现，不启动终端、不调用 GUI/进程/tmux、不修改全局 theme/capabilities。退出时退役自有动作、取消 timer、恢复自有原始 descriptor，并核对真实运行时 descriptor 未变。通过后才重新捕获生产 hooks，执行原有四方法原子安装。
+- 有界探针覆盖 Tab/中文/行尾空格的精确代码、显式/引用网页及本地链接语义、Tab→空格源文变化与宽度 rerender、动作和原生点击/拖选/wheel/overlay 路由、未知私有 URI containment 与清理；不会在启动时运行完整回归套件。非 TUI 的 RPC/JSON/print 模式不探针、不安装 hooks。有限 fixture 不能证明所有未来解析/布局变化：每次真实源文渲染仍重新对齐代码块/链接，完整回归与 bundled CLI/PTY 验证由维护者另行运行。Pi 0.99.1 按 Tab 归一化源文复用 token，但 Tab 与三个空格的同屏显示仍必须得到不同的复制数据；探针不依赖具体 cache 字段名。原生滚轮与 overlay 焦点仍交给 Pi。
 - 公司本机网页启动先以自有 `spawn`（`shell: false`、有界输出、2.5 秒硬 deadline）执行 `xdg-settings get default-web-browser`，要求单个合法 desktop ID，再以 `xdg-settings check default-web-browser <id>` 确认 `yes`；只接受 `google-chrome.desktop` 并执行 `google-chrome-stable --new-window URL`。不读取 `BROWSER`、desktop entry `Exec`，不调用 `xdg-open`/`gio open` 或备用启动器。deadline/abort/输出溢出独立结算，detached 进程组先 TERM、200 ms 内 KILL；leader `exit` 不代表继承管道的 descendants 已完成，正常结算等待 child `close` 或两个输出流关闭。
 - 公司本机 Chrome/Code 使用参数数组、`shell: false`、`stdio: "ignore"`、detached 子进程。监听器安装、abort 脱钩与 `unref()` 成功才交接；spawn 后同步 handoff 失败先移除 observer，再 TERM+KILL 尚属扩展的组。已接受应用独立于后来代际 abort；可观测 lookup/权限/非零退出在动作仍有效时报告。
 - 一个 mounted Markdown 拥有其全部 copy/open/diagnostic action。所有动作都使用同一随机 `pi-copy://<nonce>/<sequence>` 内存命名空间；URI 不包含路径、命令或代码内容。
