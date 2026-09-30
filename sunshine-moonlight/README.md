@@ -89,13 +89,12 @@ $EDITOR machines.yaml
 ```bash
 ./run_server.sh desktop              # 默认 Moonlight Desktop
 ./run_server.sh --moonlight desktop  # 同上
-./run_server.sh --4k desktop         # 原生 4K/60 HEVC、20 Mbps 请求码率
 ./run_server.sh --config /path/to/inventory.yaml desktop
 ```
 
 连接器先运行 `~/.local/bin/moonlight list -- <Tailnet IPv4>:<基准端口>` 查询配对状态，再决定动作：
 
-1. **已配对**：直接执行固定的 `~/.local/bin/moonlight stream -- <Tailnet IPv4>:<基准端口> Desktop`；加 `--4k` 时改为执行明确的 `moonlight stream --4K --fps 60 --bitrate 20000 --video-codec HEVC -- <Tailnet IPv4>:<基准端口> Desktop`。
+1. **已配对**：直接执行固定的 `~/.local/bin/moonlight stream -- <Tailnet IPv4>:<基准端口> Desktop`。
 2. **明确未配对**（Moonlight 输出已知的未配对诊断）：用系统安全随机数生成 4 位 PIN，打印目标主机、`https://<Tailnet IPv4>:<基准端口+1>`、PIN 与编号步骤（远端 Sunshine 网页输入 PIN；本机 Moonlight 自动配对），随后运行 `~/.local/bin/moonlight pair --pin <PIN> -- <Tailnet IPv4>:<基准端口>`。配对进程返回后**重新查询一次** list，只有确认已配对才进入串流。
 3. **无法确认**（网络失败、未知或其它诊断）：打印有界的 Moonlight 诊断和目标 Web UI 地址后以非零状态退出；不会静默开始配对，也不会串流。
 
@@ -113,13 +112,11 @@ SSH 是另一个明确动作，只打开交互式登录并沿用现有 SSH confi
 
 先用 **1080p、60 FPS、20 Mbps**。在 A 打开一个空白编辑器，通过 B 检查画面持续更新、鼠标位置准确、键盘文字能输入；随后断开并重新连接，确认回到同一桌面。
 
-已验收的原生 4K 路线可用 `--4k`：它固定为 4K/60 HEVC，请求 20 Mbps 码率。当前实测的 Y9000P→外接 `DP-1` 路径在原生 4K 下达到约 60 FPS、0% 网络丢帧；这不表示 30–50 Mbps 更好，实测 50 Mbps 反而出现严重网络丢帧。若 `--4k` 出现卡顿或等待 IDR，退回默认命令并重新测量网络，不主动固定 30 Hz。
-
 - `Ctrl+Alt+Shift+Q`：退出串流；`Z`：切换键鼠捕获；`X`：切换全屏。
 - `Ctrl+Alt+Shift+S`：性能统计；`M`：切换鼠标模式（以上均保留相同修饰键）。
 - 卡顿时先看性能统计，再用 `tailscale ping` 检查到 A 的连接是 direct 还是 relay。延迟和可用吞吐会影响串流，不能只凭成功配对判断网络质量。
 
-本流程捕获一个选定的显示输出，不保证同时映射 A/B 两块显示器。安装脚本不创建登录前桌面、不配置自动登录，也不提供文件传输或完整双向剪贴板；文件可走 `scp`/SFTP。`--4k` 只是本机 Moonlight 的 stream 参数，不改 A 的输出、编码器或网络；若 A/B 的显示或网络不满足原生 4K/60，仍应退回默认模式或先手动测量。
+本流程捕获一个选定的显示输出，不保证同时映射 A/B 两块显示器。安装脚本不创建登录前桌面、不配置自动登录，也不提供文件传输或完整双向剪贴板；文件可走 `scp`/SFTP。
 
 ### 选择与切换显示输出
 

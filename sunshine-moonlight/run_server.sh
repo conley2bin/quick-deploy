@@ -7,12 +7,9 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 usage() {
     cat <<'USAGE'
 用法: ./run_server.sh [--config PATH] [--moonlight | --ssh] <机器名>
-       ./run_server.sh [--config PATH] [--moonlight] --4k <机器名>
        ./run_server.sh [--config PATH] --list
 
 默认以本机 Moonlight 连接指定主机的 Desktop；--moonlight 与默认相同。
---4k 使用已实测的原生 4K/60 HEVC、20 Mbps 请求码率；只影响最终 stream 命令，
-不影响配对检查、清单、SSH 或远端配置。
 连接前先用 Moonlight 查询该主机的配对状态：
 - 已配对：直接启动 Desktop 串流。
 - 明确未配对：打印目标主机、Sunshine Web UI 地址 https://<IP>:<基准端口+1>、本机随机

@@ -17,7 +17,6 @@ from typing import Any
 MODULE_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_INVENTORY = MODULE_ROOT / "machines.yaml"
 DEFAULT_MOONLIGHT_PORT = 47989
-DEFAULT_4K_BITRATE = 20000
 MIN_MOONLIGHT_PORT = 1029
 MAX_MOONLIGHT_PORT = 65514
 DESTINATION_RE = re.compile(r"(?:[A-Za-z0-9][A-Za-z0-9_.-]*@)?[A-Za-z0-9][A-Za-z0-9_.-]*$")
@@ -70,15 +69,6 @@ def parser() -> argparse.ArgumentParser:
     mode.add_argument("--moonlight", action="store_true")
     mode.add_argument("--ssh", action="store_true")
     argument_parser.add_argument("--list", action="store_true", dest="list_machines")
-    argument_parser.add_argument(
-        "--4k",
-        action="store_true",
-        dest="native_4k",
-        help=(
-            f"stream Desktop as native 4K/60 HEVC with the tested "
-            f"{DEFAULT_4K_BITRATE} Kbps bitrate"
-        ),
-    )
     argument_parser.add_argument("name", nargs="?")
     return argument_parser
 
@@ -349,7 +339,7 @@ def print_pair_failure(
     print("修正后重新运行本脚本：脚本会重新检测；若仍未配对，会重新给出 PIN 与步骤。", file=sys.stderr)
 
 
-def connect_moonlight(name: str, machine: dict[str, Any], wrapper: Path, native_4k: bool) -> None:
+def connect_moonlight(name: str, machine: dict[str, Any], wrapper: Path) -> None:
     """Check pair state, guide and pair a clearly unpaired host, then stream."""
     program = str(wrapper)
     target = f"{machine['tailnet_ip']}:{machine['moonlight_port']}"
@@ -387,30 +377,14 @@ def connect_moonlight(name: str, machine: dict[str, Any], wrapper: Path, native_
     elif not has_desktop_app(stdout):
         print_app_missing(name, target, web_ui, stdout)
         raise SystemExit(1)
-    if native_4k:
-        print(f"使用原生 4K/60 HEVC（{DEFAULT_4K_BITRATE} Kbps）启动 Desktop 串流。", file=sys.stderr)
-        exec_program([
-            program,
-            "stream",
-            "--4K",
-            "--fps",
-            "60",
-            "--bitrate",
-            str(DEFAULT_4K_BITRATE),
-            "--video-codec",
-            "HEVC",
-            "--",
-            target,
-            "Desktop",
-        ])
     exec_program([program, "stream", "--", target, "Desktop"])
 
 
 def main(argv: list[str]) -> None:
     args = parser().parse_args(argv)
     if args.list_machines:
-        if args.name is not None or args.moonlight or args.ssh or args.native_4k:
-            parser().error("--list 不能与机器名、连接模式或 4K 模式同时使用")
+        if args.name is not None or args.moonlight or args.ssh:
+            parser().error("--list 不能与机器名或连接模式同时使用")
     elif args.name is None:
         parser().error("必须指定机器名；使用 --list 查看可用名称")
 
@@ -430,10 +404,6 @@ def main(argv: list[str]) -> None:
     if machine is None:
         print(f"错误: 清单中没有机器: {args.name}", file=sys.stderr)
         raise SystemExit(1)
-    if args.ssh and args.native_4k:
-        print("错误: --4k 只能与 Moonlight 串流一起使用", file=sys.stderr)
-        raise SystemExit(2)
-
     if args.ssh:
         command = ["ssh"]
         if machine["ssh_port"] is not None:
@@ -441,7 +411,7 @@ def main(argv: list[str]) -> None:
         command.append(machine["ssh"])
         exec_program(command)
     else:
-        connect_moonlight(args.name, machine, Path.home() / ".local/bin/moonlight", args.native_4k)
+        connect_moonlight(args.name, machine, Path.home() / ".local/bin/moonlight")
 
 
 if __name__ == "__main__":
