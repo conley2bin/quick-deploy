@@ -683,6 +683,65 @@ machines:
         self.assert_no_browser()
         self.assert_no_tailscale()
 
+    def test_explicit_4k_mode_uses_native_hevc_stream_options(self) -> None:
+        self.write_default()
+        result = self.invoke("--4k", "desktop", stdin="stream stdin\n", exit_code=17)
+        self.assertEqual(result.returncode, 17, result.stderr)
+        self.assertEqual(self.actions(), ["list", "stream"])
+        self.assertEqual(
+            self.records()[-1]["argv"][1:],
+            [
+                "stream",
+                "--4K",
+                "--fps",
+                "60",
+                "--bitrate",
+                "20000",
+                "--video-codec",
+                "HEVC",
+                "--",
+                "100.64.0.2:47989",
+                "Desktop",
+            ],
+        )
+        self.assertEqual(self.records()[-1]["stdin"], "stream stdin\n")
+        self.assertIn("原生 4K/60 HEVC", result.stderr)
+        self.assert_no_browser()
+        self.assert_no_tailscale()
+
+    def test_4k_mode_does_not_change_pairing_or_fail_closed_paths(self) -> None:
+        self.write_default()
+        result = self.invoke(
+            "--4k",
+            "desktop",
+            extra_env={"FAKE_INITIAL_PAIRED": "0"},
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.actions(), ["list", "pair", "list", "stream"])
+        self.assertEqual(self.records()[1]["argv"][1:3], ["pair", "--pin"])
+        self.assertEqual(self.records()[-1]["argv"][1:3], ["stream", "--4K"])
+        self.assertIn("pair --pin", result.stderr)
+
+        result = self.invoke(
+            "--4k",
+            "desktop",
+            extra_env={"FAKE_LIST_MODE": "network"},
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.actions(), ["list"])
+        self.assertIn("配对状态检查失败", result.stderr)
+        self.assertIn("Failed to connect to 100.64.0.2", result.stderr)
+
+    def test_4k_mode_rejects_non_stream_contexts(self) -> None:
+        self.write_default()
+        result = self.invoke("--list", "--4k")
+        self.assertNotEqual(result.returncode, 0)
+        self.assert_no_program()
+        result = self.invoke("--ssh", "--4k", "desktop")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("--4k 只能与 Moonlight", result.stderr)
+        self.assert_no_program()
+
     def test_pre_stream_query_never_consumes_stdin(self) -> None:
         # The classification query gets /dev/null; only the final stream exec inherits
         # the caller's stdin, preserving the historical stream contract exactly.
