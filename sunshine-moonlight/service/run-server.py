@@ -38,8 +38,8 @@ class InventoryError(Exception):
 
 
 def missing_inventory_message(path: Path) -> str:
-    """The installer refreshes only the module-root inventory; any other path is
-    read exactly as given, so an absent custom path gets path-shaped advice."""
+    """The installer creates only an absent module-root inventory; any other path
+    is read exactly as given, so an absent custom path gets path-shaped advice."""
     if path != DEFAULT_INVENTORY:
         return (
             f"清单不存在: {path}\n"
@@ -48,8 +48,8 @@ def missing_inventory_message(path: Path) -> str:
         )
     return (
         f"清单不存在: {path}\n"
-        f"它由一次成功的模块根安装器生成/刷新，内容是不含真实地址的通用占位清单，也不会读取旧文件兜底。\n"
-        f"请先按实际用途在模块目录运行一次安装器（所选安装阶段全部成功后才会刷新该清单）：\n"
+        f"它只在缺失时由一次成功的模块根安装器新建，内容是不含真实地址的通用占位清单；已有普通清单会原样保留，也不会读取旧文件兜底。\n"
+        f"请先按实际用途在模块目录运行一次安装器（所选安装阶段全部成功且清单缺失时才会新建）：\n"
         f"    cd -- {shlex.quote(str(MODULE_ROOT))} && ./install.sh\n"
         f"成功后直接编辑 {shlex.quote(str(path))}，按其中文注释填入你的真实机器信息。"
     )

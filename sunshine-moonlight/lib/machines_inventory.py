@@ -1,15 +1,14 @@
 #!/usr/bin/python3
-"""Write the deterministic all-Chinese machines.yaml inventory template.
+"""Create the deterministic all-Chinese inventory only when machines.yaml is absent.
 
-The module-root install.sh refreshes the module-root inventory after every
-successful role install. The bytes are a generic placeholder: no address
-discovery (Tailscale, SSH configuration, network scan) happens here, and no
-other inventory file next to the target is read, migrated, copied, or deleted.
+Existing regular inventories belong to the user and are never opened or replaced.
+No address discovery or legacy-inventory read/migration happens here.
 """
 from __future__ import annotations
 
 import os
 from pathlib import Path
+import stat
 import sys
 import tempfile
 
@@ -17,10 +16,9 @@ MODULE_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_TARGET = MODULE_ROOT / "machines.yaml"
 
 TEMPLATE = """\
-# 本文件由模块根目录的 ./install.sh 在所选安装阶段全部成功后自动生成/刷新：
+# 本文件只在模块根目录的 ./install.sh 所选安装阶段全部成功、且清单不存在时创建：
 # 它是全字段中文的通用占位清单，不是自动扫描或探测的结果，也不含任何真实地址；
-# 每次成功安装都会按本模板整体重写，你在这里填写的真实信息会被下一次成功安装覆盖，
-# 所以请在最后一次成功安装之后，把下面各字段改成你自己的机器。
+# 请把下面各字段改成自己的机器。以后成功安装会保留这份普通文件，不覆盖你的修改。
 # 只写连接信息：不要放密码、配对 PIN、私钥或任何命令/参数。
 
 # 顶层键固定为 machines；其下每一项是一台机器，键名就是机器名。
@@ -51,12 +49,18 @@ def template_bytes() -> bytes:
     return TEMPLATE.encode("utf-8")
 
 
-def publish(target: Path) -> None:
-    """Atomically replace the inventory, refusing links and non-regular targets."""
-    if target.is_symlink():
-        raise InventoryError(f"清单路径 {target} 是符号链接；拒绝追随链接，未写入任何文件")
-    if target.exists() and not target.is_file():
-        raise InventoryError(f"清单路径 {target} 不是普通文件；拒绝覆盖")
+def publish(target: Path) -> str:
+    """Return 'created' or 'retained'; link(2) never replaces a racing target."""
+    try:
+        mode = target.lstat().st_mode
+    except FileNotFoundError:
+        pass
+    else:
+        if stat.S_ISLNK(mode):
+            raise InventoryError(f"清单路径 {target} 是符号链接；拒绝追随链接，未写入任何文件")
+        if not stat.S_ISREG(mode):
+            raise InventoryError(f"清单路径 {target} 不是普通文件；拒绝覆盖")
+        return "retained"
     parent = target.parent
     if not parent.is_dir():
         raise InventoryError(f"清单目录 {parent} 不存在或不是目录")
@@ -69,19 +73,15 @@ def publish(target: Path) -> None:
             handle.flush()
             os.fsync(handle.fileno())
         os.chmod(temp_name, 0o644)
-        # Best-effort re-check just before the atomic rename: refuse a target
-        # that is already a symlink or non-regular file at this point. This
-        # check is not a concurrency guarantee; a path swapped after it can
-        # still be replaced by the rename.
-        if target.is_symlink() or (target.exists() and not target.is_file()):
-            raise InventoryError(f"清单路径 {target} 在写入期间不再是普通文件；拒绝发布")
-        os.replace(temp_name, target)
-    except BaseException:
         try:
-            os.unlink(temp_name)
-        except OSError:
-            pass
-        raise
+            # Atomic create-only publication: EEXIST protects even a target
+            # appearing after lstat, unlike a check followed by os.replace.
+            os.link(temp_name, target)
+        except FileExistsError as error:
+            raise InventoryError(f"清单路径 {target} 在发布期间已出现；拒绝覆盖，请核对后重跑") from error
+        return "created"
+    finally:
+        os.unlink(temp_name)
 
 
 def main(argv: list[str]) -> int:
@@ -92,7 +92,7 @@ def main(argv: list[str]) -> int:
             to_stdout = True
         elif argument in ("-h", "--help"):
             print(f"用法: {Path(__file__).name} [--stdout] [清单路径]")
-            print("无参数时按模块根目录生成 machines.yaml；--stdout 只打印模板，不写文件。")
+            print("无参数时仅在模块根目录缺失 machines.yaml 时创建；已有普通文件原样保留；--stdout 只打印模板。")
             return 0
         elif argument.startswith("-"):
             print(f"错误: 未知参数 {argument}", file=sys.stderr)
@@ -107,13 +107,17 @@ def main(argv: list[str]) -> int:
         return 0
     target = Path(targets[0]) if targets else DEFAULT_TARGET
     try:
-        publish(target)
+        outcome = publish(target)
     except InventoryError as error:
         print(f"错误: {error}", file=sys.stderr)
         return 1
     except OSError as error:
         print(f"错误: 无法写入清单 {target}: {error}", file=sys.stderr)
         return 1
+    if outcome == "created":
+        print("已新建全字段中文占位清单 machines.yaml；请编辑它，填入你的真实机器信息。")
+    else:
+        print("已保留现有普通清单 machines.yaml；原有内容、权限和修改时间未改动。")
     return 0
 
 

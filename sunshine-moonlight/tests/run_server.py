@@ -15,6 +15,7 @@ import sys
 import tempfile
 import textwrap
 import unittest
+from unittest import mock
 
 MODULE = Path(__file__).resolve().parents[1]
 # Loading the connector module directly must never leave bytecode cache in the
@@ -490,22 +491,67 @@ class RunServerTests(unittest.TestCase):
 
     def test_generator_writes_module_inventory_regardless_of_cwd(self) -> None:
         self.assertFalse(self.default.exists())
+        export = subprocess.run([sys.executable, str(self.module / "lib/machines_inventory.py"), "--stdout"],
+                                capture_output=True, check=True)
+        self.assertFalse(self.default.exists())
         unrelated = self.root / "generator cwd"
         unrelated.mkdir()
-        self.generate_inventory()
+        created = self.generate_inventory()
+        self.assertIn("已新建全字段中文占位清单", created.stdout)
         self.assertTrue(self.default.is_file())
+        self.assertEqual(self.default.read_bytes(), export.stdout)
         self.assertEqual(self.default.stat().st_mode & 0o777, 0o644)
         self.assertFalse((unrelated / "machines.yaml").exists())
-        # Regeneration replaces the module inventory and leaves every other file alone.
+        # Reinstallation retains user edits and metadata, not merely parsed values.
         self.write_legacy()
         self.stale.write_text("leftover stays\n")
         legacy_before = self.legacy.read_bytes()
         stale_before = self.stale.read_bytes()
         self.write_default()
-        self.generate_inventory()
-        self.assertNotIn("desktop:\n    ssh: conley@100.64.0.2", self.default.read_text(encoding="utf-8"))
+        self.default.chmod(0o400)
+        os.utime(self.default, ns=(978307200000000000, 978307200000000000))
+        user_bytes = self.default.read_bytes()
+        user_mode = stat.S_IMODE(self.default.stat().st_mode)
+        user_mtime = self.default.stat().st_mtime_ns
+        result = self.generate_inventory()
+        self.assertIn("已保留现有普通清单", result.stdout)
+        self.assertEqual(self.default.read_bytes(), user_bytes)
+        self.assertEqual(stat.S_IMODE(self.default.stat().st_mode), user_mode)
+        self.assertEqual(self.default.stat().st_mtime_ns, user_mtime)
         self.assertEqual(self.legacy.read_bytes(), legacy_before)
         self.assertEqual(self.stale.read_bytes(), stale_before)
+        export = subprocess.run([sys.executable, str(self.module / "lib/machines_inventory.py"), "--stdout"],
+                                capture_output=True, check=True)
+        self.assertIn(b"machines:\n", export.stdout)
+        self.assertNotEqual(export.stdout, user_bytes)
+        self.assertEqual(self.default.read_bytes(), user_bytes)
+        self.assertEqual(self.default.stat().st_mtime_ns, user_mtime)
+
+    def test_generator_atomic_publication_refuses_a_racing_target(self) -> None:
+        spec = importlib.util.spec_from_file_location("fixture_inventory", self.module / "lib/machines_inventory.py")
+        self.assertIsNotNone(spec)
+        generator = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(generator)
+        original_link = os.link
+        raced = b"machines:\n  concurrent-user: preserved\n"
+
+        def appear_then_link(source: str, destination: Path) -> None:
+            self.assertFalse(destination.exists())
+            destination.write_bytes(raced)
+            destination.chmod(0o400)
+            os.utime(destination, ns=(978307200000000000, 978307200000000000))
+            original_link(source, destination)
+
+        with mock.patch.object(generator.os, "link", side_effect=appear_then_link):
+            with self.assertRaisesRegex(generator.InventoryError, "发布期间已出现"):
+                generator.publish(self.default)
+        self.assertEqual(self.default.read_bytes(), raced)
+        self.assertEqual(stat.S_IMODE(self.default.stat().st_mode), 0o400)
+        self.assertEqual(self.default.stat().st_mtime_ns, 978307200000000000)
+        self.assertEqual(list(self.module.glob(".machines.yaml.*.qdtmp")), [])
+        # The same generator must subsequently retain this target without opening it.
+        self.assertIn("已保留现有普通清单", self.generate_inventory().stdout)
+        self.assertEqual(self.default.read_bytes(), raced)
 
     def test_generator_refuses_link_and_directory_inventory_targets(self) -> None:
         self.write_legacy()

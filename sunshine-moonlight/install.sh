@@ -21,8 +21,8 @@ usage() {
   --client-only  只安装本机 Moonlight 客户端
   -h, --help     显示帮助
 
-所选安装阶段全部成功后，在模块根目录生成/刷新全字段中文清单 machines.yaml：
-它是通用占位清单，不含真实地址，每次成功安装都会按模板整体重写，请在安装完成后直接编辑它。
+所选安装阶段全部成功后，仅在模块根目录缺少 machines.yaml 时新建全字段中文占位清单；
+已有普通清单原样保留（内容、权限、修改时间不变）。占位模板不含真实地址，请新建后编辑它。
 旧文件名 machines.local.yaml 与其它遗留清单文件不会被读取、迁移或清理，请自行核对后手动处理。
 
 高级主机/客户端选项请直接运行 commands/install-host.sh 或 commands/install-client.sh。
@@ -77,10 +77,9 @@ run_client() {
     qd_die 'Moonlight 客户端安装失败。此前成功的 Sunshine 主机安装不会自动回滚。'
 }
 
-# The generated template is never a tracked artifact: refresh the module-root
-# inventory only after every selected stage succeeded, relative to the module
-# (never the caller's cwd). Completed stages are reported separately from the
-# refresh failure so a refused write is never read as a finished install.
+# Create only after every selected stage succeeded, relative to the module
+# (never the caller's cwd). The generator itself reports created versus retained;
+# a refused path never receives a false install-complete message.
 generate_inventory() {
     local completed
     case "$ROLE_MODE" in
@@ -89,8 +88,7 @@ generate_inventory() {
         *)      completed='Sunshine 主机与 Moonlight 客户端安装均已完成' ;;
     esac
     "$SYSTEM_PYTHON" "$SCRIPT_DIR/lib/machines_inventory.py" "$SCRIPT_DIR/machines.yaml" \
-        || qd_die "$completed，但生成/刷新 machines.yaml 失败或遭拒绝（目标可能是符号链接、目录或其它非普通文件，也可能是权限不足或写入失败）。该文件原有字节未被改动；本次安装未全部完成，请处理后重跑 ./install.sh。"
-    qd_info '已生成/刷新全字段中文清单 machines.yaml；请直接编辑它，填入你的真实机器信息。'
+        || qd_die "$completed，但未能新建或保留 machines.yaml（目标可能是符号链接、非普通文件、发布时出现的其它文件，或权限/写入失败）。生成器未覆盖既有目标；本次安装未全部完成，请核对后重跑 ./install.sh。"
 }
 
 main() {
