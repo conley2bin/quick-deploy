@@ -24,11 +24,17 @@ mapfile -t module_shell_files < <(find "$MODULE_DIR" -type f \
 sed '/^main "\$@"$/,$d' "$INSTALLER" > "$WORK/functions.sh"
 HOME="$WORK/render-hook-home" bash -c 'source "$1"; render_ssh_mouse_hook' _ "$WORK/functions.sh" > "$HOOK_SOURCE"
 HOME="$WORK/render-hook-home" bash -c 'source "$1"; render_local_paste_hook' _ "$WORK/functions.sh" > "$PASTE_HOOK_SOURCE"
-HOME="$WORK/render-hook-home" bash -c 'source "$1"; render_local_paste_hook v1' \
-    _ "$WORK/functions.sh" > "$WORK/ghostty-local-paste-v1.zsh"
-printf '6d53e9c81646f1ebb72872df4ec9f014117957042bce2ccd33fa2bfcc43423eb  %s\n' \
-    "$WORK/ghostty-local-paste-v1.zsh" | sha256sum --check --status \
-    || fail "历史 v1 粘贴 hook 渲染不再是已部署的精确字节"
+for version in v1 v2; do
+    HOME="$WORK/render-hook-home" bash -c 'source "$1"; render_local_paste_hook "$2"' \
+        _ "$WORK/functions.sh" "$version" > "$WORK/ghostty-local-paste-$version.zsh"
+done
+{
+    printf '6d53e9c81646f1ebb72872df4ec9f014117957042bce2ccd33fa2bfcc43423eb  %s\n' \
+        "$WORK/ghostty-local-paste-v1.zsh"
+    printf 'f6e9f1b772c21c82b99ce922fd819ec9f2a1f006a6255f31b8399c6679ea9fc2  %s\n' \
+        "$WORK/ghostty-local-paste-v2.zsh"
+} | sha256sum --check --status \
+    || fail "历史 v1/v2 粘贴 hook 渲染不再是已部署的精确字节"
 # 真正打包的模块副本只含 install.sh + C 源码：没有独立 .zsh/.sh 资源。
 # 源码渲染应与原模块等同，并在 --check/正式安装共用的预检下完整。
 mkdir -p "$WORK/packaged-module"
@@ -53,7 +59,9 @@ if command -v zsh >/dev/null 2>&1; then
     HAVE_ZSH=true
     zsh -n "$HOOK_SOURCE" || fail "zsh SSH hook 语法错误"
     zsh -n "$PASTE_HOOK_SOURCE" || fail "zsh 粘贴 hook 语法错误"
-    zsh -n "$WORK/ghostty-local-paste-v1.zsh" || fail "历史 v1 hook 语法错误"
+    for version in v1 v2; do
+        zsh -n "$WORK/ghostty-local-paste-$version.zsh" || fail "历史 $version hook 语法错误"
+    done
 else
     echo "SKIP: 未安装 zsh，跳过 zsh hook 语法、hook 行为与 PTY 测试（其余测试继续）"
 fi
@@ -488,7 +496,7 @@ prepare_shell_paste_home() {
         source "$1"
         render_config > "$CONFIG_FILE"
         render_ssh_mouse_hook > "$SSH_MOUSE_HOOK_CONFIG"
-        printf '\''PS1="READY:%%? > "\nexport USER_CONTENT=1\n'\'' > "$HOME/.zshrc"
+        printf '\''PS1="READY:%%? > "\nexport USER_CONTENT=1\nbindkey -e\n'\'' > "$HOME/.zshrc"
         render_legacy_zshrc_hook_block >> "$HOME/.zshrc"
         cat >> "$HOME/.zshrc" <<'\''ZSHRC_TAIL'\''
 _capture_zle_buffer() {
@@ -500,6 +508,9 @@ zle -N _capture_zle_buffer
 zle -N _reset_zle_buffer
 bindkey '^G' _capture_zle_buffer
 bindkey '^X' _reset_zle_buffer
+printf "%s\0" "${TERM_PROGRAM:-}" "${TMUX:-}" "${GHOSTTY_RESOURCES_DIR:-}" \
+    "${WAYLAND_DISPLAY:-}" "${SSH_TTY:-}" > "$HOME/shell-context"
+bindkey -M main '^V' > "$HOME/ctrlv-binding"
 ZSHRC_TAIL
         chmod 600 "$HOME/.zshrc"
     ' _ "$WORK/functions.sh"
@@ -561,22 +572,28 @@ cmp -s "$WORK/shell-after" "$WORK/shell-rerun" || fail "zsh 粘贴窄模式重�
 test "$(find "$SHELL_ONLY_HOME" -name '.zshrc.bak.*' | wc -l)" -eq 1 \
     || fail "zsh 粘贴窄模式重跑生成了额外备份"
 
-# Live v1 has the already-migrated .zshrc block. Rerunning the narrow mode
-# must recognize the exact historical hook, replace only that file, and keep
-# .zshrc inode/user text plus global Ghostty config entirely untouched.
-cp "$WORK/ghostty-local-paste-v1.zsh" "$PASTE_INSTALLED"
-chmod 600 "$PASTE_INSTALLED"
-snapshot_pi_only_home "$SHELL_ONLY_HOME" > "$WORK/shell-v1-before"
-run_shell_only "$SHELL_ONLY_HOME" --shell-paste-only > "$WORK/shell-v1-migrate.log" \
-    || fail "已部署的 v1 hook 无法窄迁移"
-cmp -s "$PASTE_INSTALLED" "$PASTE_HOOK_SOURCE" || fail "v1 未迁移为 v2 hook"
-test "$(stat -c %a "$PASTE_INSTALLED")" = 600 || fail "v1 迁移未保留 hook 权限"
-test "$shell_rc_inode" = "$(stat -c %i "$SHELL_ONLY_HOME/.zshrc")" \
-    || fail "v1 hook 迁移错误改写 .zshrc"
-cmp -s "$SHELL_ONLY_HOME/.config/ghostty/config.ghostty" "$WORK/shell-global-config" \
-    || fail "v1 hook 迁移错误改写全局 Ghostty 配置"
-snapshot_pi_only_home "$SHELL_ONLY_HOME" > "$WORK/shell-v1-after"
-python3 - "$SHELL_ONLY_HOME" "$WORK/shell-v1-before" "$WORK/shell-v1-after" "$WORK/ghostty-local-paste-v1.zsh" <<'PY'
+# Deployed v1 and v2 both use the already-migrated .zshrc block. Upgrade only
+# the exact historical hook; preserve .zshrc bytes/inode and all other files.
+for version in v1 v2; do
+    private_home="$WORK/shell-migrate-$version"
+    prepare_shell_paste_home "$private_home"
+    run_shell_only "$private_home" --shell-paste-only > "$WORK/shell-$version-prepare.log"
+    installed="$private_home/.config/ghostty/ghostty-local-paste.zsh"
+    cp "$WORK/ghostty-local-paste-$version.zsh" "$installed"
+    chmod 600 "$installed"
+    cp "$private_home/.zshrc" "$WORK/shell-$version-zshrc"
+    rc_inode=$(stat -c %i "$private_home/.zshrc")
+    snapshot_pi_only_home "$private_home" > "$WORK/shell-$version-before"
+    run_shell_only "$private_home" --shell-paste-only > "$WORK/shell-$version-migrate.log" \
+        || fail "已部署的 $version hook 无法窄迁移"
+    cmp -s "$installed" "$PASTE_HOOK_SOURCE" || fail "$version 未迁移为当前 hook"
+    test "$(stat -c %a "$installed")" = 600 || fail "$version 迁移未保留 hook 权限"
+    test "$rc_inode" = "$(stat -c %i "$private_home/.zshrc")" \
+        || fail "$version hook 迁移错误改写 .zshrc inode"
+    cmp -s "$private_home/.zshrc" "$WORK/shell-$version-zshrc" \
+        || fail "$version hook 迁移错误改写 .zshrc 字节"
+    snapshot_pi_only_home "$private_home" > "$WORK/shell-$version-after"
+    python3 - "$private_home" "$WORK/shell-$version-before" "$WORK/shell-$version-after" "$WORK/ghostty-local-paste-$version.zsh" <<'PY'
 from pathlib import Path
 import ast
 import sys
@@ -592,14 +609,16 @@ assert changed == {
     backup[0].relative_to(home).as_posix(),
 }, changed
 PY
-migrated_hook_inode=$(stat -c %i "$PASTE_INSTALLED")
-run_shell_only "$SHELL_ONLY_HOME" --shell-paste-only > "$WORK/shell-v1-rerun.log" \
-    || fail "v1→v2 窄迁移重跑失败"
-test "$migrated_hook_inode" = "$(stat -c %i "$PASTE_INSTALLED")" \
-    || fail "v1→v2 窄迁移重跑改写了 hook"
-snapshot_pi_only_home "$SHELL_ONLY_HOME" > "$WORK/shell-v1-rerun"
-cmp -s "$WORK/shell-v1-after" "$WORK/shell-v1-rerun" \
-    || fail "v1→v2 窄迁移重跑修改了文件"
+    migrated_hook_inode=$(stat -c %i "$installed")
+    run_shell_only "$private_home" --shell-paste-only > "$WORK/shell-$version-rerun.log" \
+        || fail "$version→current 窄迁移重跑失败"
+    test "$migrated_hook_inode" = "$(stat -c %i "$installed")" \
+        || fail "$version→current 窄迁移重跑改写了 hook"
+    snapshot_pi_only_home "$private_home" > "$WORK/shell-$version-rerun"
+    cmp -s "$WORK/shell-$version-after" "$WORK/shell-$version-rerun" \
+        || fail "$version→current 窄迁移重跑修改了文件"
+done
+echo 'PASS: exact v1/v2/current hook migrations, .zshrc bytes/inode preservation, narrow-mode idempotence'
 
 for other in --check --ppa-only --deb-only --default-terminal --no-default-terminal --paste-keybind-only --pi-launcher-only; do
     if run_shell_only "$SHELL_ONLY_HOME" --shell-paste-only "$other" > "$WORK/shell-args.log" 2>&1; then
@@ -609,7 +628,7 @@ for other in --check --ppa-only --deb-only --default-terminal --no-default-termi
         || fail "zsh 粘贴窄模式未明确拒绝冲突选项 $other"
 done
 
-for scenario in old-global custom-global custom-zshrc symlink-zshrc malformed-zshrc custom-hook custom-v1-hook symlink-hook custom-mouse; do
+for scenario in old-global custom-global custom-zshrc symlink-zshrc malformed-zshrc custom-hook custom-v1-hook custom-v2-hook symlink-hook custom-mouse; do
     private_home="$WORK/shell-refuse-$scenario"
     prepare_shell_paste_home "$private_home"
     config="$private_home/.config/ghostty/config.ghostty"
@@ -622,7 +641,11 @@ for scenario in old-global custom-global custom-zshrc symlink-zshrc malformed-zs
         symlink-zshrc) mv "$zshrc" "$private_home/real-zshrc"; ln -s "$private_home/real-zshrc" "$zshrc" ;;
         malformed-zshrc) sed -i '/^# <<< fresh-install ghostty: ssh 鼠标复位 hook <<</d' "$zshrc" ;;
         custom-hook) printf 'KEEP\n' > "$paste_hook" ;;
-        custom-v1-hook) cp "$WORK/ghostty-local-paste-v1.zsh" "$paste_hook"; printf '# user addition\n' >> "$paste_hook" ;;
+        custom-v1-hook|custom-v2-hook)
+            version="${scenario#custom-}"; version="${version%-hook}"
+            cp "$WORK/ghostty-local-paste-$version.zsh" "$paste_hook"
+            printf '# user addition\n' >> "$paste_hook"
+            ;;
         symlink-hook) printf 'KEEP\n' > "$private_home/real-hook"; ln -s "$private_home/real-hook" "$paste_hook" ;;
         custom-mouse) printf 'KEEP\n' >> "$private_home/.config/ghostty/ghostty-ssh-mouse-reset.zsh" ;;
     esac
@@ -1046,9 +1069,10 @@ if [ "$HAVE_ZSH" = true ]; then
     python3 "$WORK/pty-check.py" "$HOOK_SOURCE" "$GHOSTTY_RESOURCES_DIR" no
 fi
 
-# PTY 的输入只送 fake wl-paste；不运行真实安装器、不读写真实剪贴板。
-# ZLE 测试 widget 直接将 BUFFER 输出到文件，不按 Enter；这既验证精确
-# 插入字节，也能检测粘贴里的换行是否提前执行了 shell 命令。
+# 私有 HOME + fake wl-paste + 私有 -S tmux socket：既测 direct Ghostty，
+# 也从 Ghostty 环境真正启动 tmux，让 tmux 自己设置 TERM_PROGRAM/TMUX。
+# ZLE 测试 widget 直接捕获 BUFFER，不按 Enter；清理时也不提交缓冲区。
+# 旧 v2、SSH_TTY 和未知终端对照必须保持 quoted-insert，且不读剪贴板。
 cat > "$WORK/paste-pty-check.py" <<'PY'
 import fcntl
 import os
@@ -1062,9 +1086,12 @@ import sys
 import termios
 import time
 
-work, hook, fake_bin, home = map(Path, sys.argv[1:])
-# This HOME is the private --shell-paste-only result, including its migrated
-# managed .zshrc block; the PTY loads the real installed source lines.
+work, hook, fake_bin, home = map(Path, sys.argv[1:5])
+transport = sys.argv[5]
+use_tmux = transport.startswith("tmux")
+expect_paste = transport in ("direct", "tmux")
+# This HOME is a private --shell-paste-only result, including its migrated
+# managed .zshrc block; the PTY loads the actual installed source lines.
 run = home / ".run"
 run.mkdir()
 display = socket.socket(socket.AF_UNIX)
@@ -1079,7 +1106,7 @@ clip.write_bytes(b"FIRST-current")
 mode.write_text("ok")
 log.touch()
 env = os.environ.copy()
-for key in ("SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY", "DISPLAY"):
+for key in ("SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY", "DISPLAY", "TMUX", "TMUX_PANE", "STY"):
     env.pop(key, None)
 env.update(HOME=str(home), ZDOTDIR=str(home), XDG_RUNTIME_DIR=str(run),
            WAYLAND_DISPLAY="wayland-0", TERM="xterm-256color", HISTFILE="/dev/null",
@@ -1087,12 +1114,20 @@ env.update(HOME=str(home), ZDOTDIR=str(home), XDG_RUNTIME_DIR=str(run),
            SSH_CONNECTION="stale-from-launcher", SSH_CLIENT="stale-from-launcher",
            PATH=f"{fake_bin}:{env['PATH']}", FAKE_CLIPBOARD_TEXT=str(clip),
            FAKE_CLIPBOARD_MODE=str(mode), FAKE_WL_LOG=str(log))
+if transport == "tmux-ssh":
+    env["SSH_TTY"] = "/dev/pts/test-ssh"
+if transport == "unknown":
+    env["TERM_PROGRAM"] = "vscode"
 
-# The local direct Ghostty shell deliberately carries stale SSH_CONNECTION:
-# it MUST bind ^V. A missing Ghostty marker or genuine SSH_TTY must stay inert.
+# Probe each guard with otherwise usable local resources, including a tmux
+# marker. Actual tmux-created variables and key delivery are tested below.
 def check_binding(overrides, command, expected_stdout, expected_stderr=None):
     case_env = env.copy()
-    case_env.update(overrides)
+    for key, value in overrides.items():
+        if value is None:
+            case_env.pop(key, None)
+        else:
+            case_env[key] = value
     result = subprocess.run(["zsh", "-f", "-i", "-c", command], env=case_env,
                             capture_output=True, text=True, timeout=5)
     assert result.returncode == 0, result
@@ -1100,34 +1135,55 @@ def check_binding(overrides, command, expected_stdout, expected_stderr=None):
     if expected_stderr is not None:
         assert expected_stderr in result.stderr, result
 
-check_binding({"WAYLAND_DISPLAY": "absent"},
-              f'source "{hook}"; bindkey -M main "^V"', '"^V" quoted-insert')
-check_binding({}, f'source "{hook}"; bindkey -M main "^V"',
-              '"^V" _quick_deploy_ghostty_paste')
-check_binding({"SSH_TTY": "/dev/pts/12"},
-              f'source "{hook}"; bindkey -M main "^V"', '"^V" quoted-insert')
-check_binding({"TERM_PROGRAM": "tmux"},
-              f'source "{hook}"; bindkey -M main "^V"', '"^V" quoted-insert')
-check_binding({"GHOSTTY_RESOURCES_DIR": str(home / "missing-resources")},
-              f'source "{hook}"; bindkey -M main "^V"', '"^V" quoted-insert')
-check_binding({}, f'bindkey -e; source "{hook}"; source "{hook}"; '
-                  'bindkey -M main "^V"; bindkey -M main "^[^V"',
-              '"^[^V" quoted-insert')
-check_binding({}, f'bindkey -v; source "{hook}"; '
-                  'bindkey -M main "^V"; bindkey -M main "^[^V"',
-              '"^[^V" vi-quoted-insert')
-check_binding({}, f'bindkey -e; bindkey -M main "^[^V" backward-char; '
-                  f'source "{hook}"; bindkey -M main "^V"',
-              '"^V" quoted-insert', 'refusing to override')
-noninteractive = subprocess.run(["zsh", "-f", "-c", 'source "$1"; print INERT',
-                                  "_", str(hook)], env=env, capture_output=True,
-                                 text=True, timeout=5)
-assert noninteractive.returncode == 0 and noninteractive.stdout.strip() == "INERT", noninteractive
+if transport == "direct":
+    query = f'bindkey -e; source "{hook}"; bindkey -M main "^V"'
+    probe_tmux = {"TERM_PROGRAM": "tmux", "TMUX": str(run / "guard-probe") + ",1,0"}
+    for context in ({}, probe_tmux):
+        check_binding(context, query, '"^V" _quick_deploy_ghostty_paste')
+        check_binding({**context, "WAYLAND_DISPLAY": str(run / "wayland-0")},
+                      query, '"^V" _quick_deploy_ghostty_paste')
+        for excluded in ({"WAYLAND_DISPLAY": "absent"},
+                         {"WAYLAND_DISPLAY": ""}, {"XDG_RUNTIME_DIR": ""},
+                         {"SSH_TTY": "/dev/pts/test-ssh"},
+                         {"GHOSTTY_RESOURCES_DIR": ""},
+                         {"GHOSTTY_RESOURCES_DIR": str(home / "missing-resources")}):
+            check_binding({**context, **excluded}, query, '"^V" quoted-insert')
+    check_binding({"TERM_PROGRAM": "tmux", "TMUX": None}, query, '"^V" quoted-insert')
+    check_binding({"TERM_PROGRAM": "tmux", "TMUX": ""}, query, '"^V" quoted-insert')
+    check_binding({**probe_tmux, "TERM_PROGRAM": "vscode"}, query, '"^V" quoted-insert')
+    check_binding({"TERM_PROGRAM": ""}, query, '"^V" quoted-insert')
+    for context in ({}, probe_tmux):
+        check_binding(context, f'bindkey -e; source "{hook}"; source "{hook}"; '
+                      'bindkey -M main "^V"; bindkey -M main "^[^V"',
+                      '"^[^V" quoted-insert')
+        check_binding(context, f'bindkey -v; source "{hook}"; '
+                      'bindkey -M main "^V"; bindkey -M main "^[^V"',
+                      '"^[^V" vi-quoted-insert')
+        check_binding(context, f'bindkey -e; bindkey -M main "^[^V" backward-char; '
+                      f'source "{hook}"; bindkey -M main "^V"',
+                      '"^V" quoted-insert', 'refusing to override')
+        check_binding(context, f'bindkey -e; bindkey -M main "^V" backward-char; '
+                      f'source "{hook}"; bindkey -M main "^V"',
+                      '"^V" backward-char', 'refusing to override')
+    noninteractive = subprocess.run(["zsh", "-f", "-c", 'source "$1"; print INERT',
+                                      "_", str(hook)], env=env, capture_output=True,
+                                     text=True, timeout=5)
+    assert noninteractive.returncode == 0 and noninteractive.stdout.strip() == "INERT", noninteractive
+    assert log.read_bytes() == b"", "binding probes read the clipboard"
 
+private_socket = run / "tmux-socket"
+tmux_base = ["tmux", "-S", str(private_socket), "-f", "/dev/null"]
+launch = (tmux_base + ["new-session", "-s", "paste-check", "exec zsh -i"]
+          if use_tmux else ["zsh", "-i"])
 master, slave = pty.openpty()
 fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 120, 0, 0))
-proc = subprocess.Popen(["zsh", "-i"], stdin=slave, stdout=slave, stderr=slave,
-                        env=env, close_fds=True)
+
+def claim_tty():
+    os.setsid()
+    fcntl.ioctl(0, termios.TIOCSCTTY, 0)
+
+proc = subprocess.Popen(launch, stdin=slave, stdout=slave, stderr=slave,
+                        env=env, close_fds=True, preexec_fn=claim_tty)
 os.close(slave)
 output = bytearray()
 
@@ -1168,6 +1224,26 @@ def clear():
 
 try:
     wait_for(b"READY:0 > ")
+    context = (home / "shell-context").read_bytes().split(b"\0")
+    actual_term, actual_tmux, actual_resources, actual_display, actual_ssh, end = context
+    assert end == b"" and actual_resources == os.fsencode(resources), context
+    assert actual_display == b"wayland-0", context
+    assert actual_ssh == env.get("SSH_TTY", "").encode(), context
+    if use_tmux:
+        assert actual_term == b"tmux", "tmux must set TERM_PROGRAM itself"
+        assert actual_tmux.startswith(os.fsencode(private_socket) + b","), context
+        assert env["TERM_PROGRAM"] == "ghostty" and "TMUX" not in env, env
+    else:
+        assert actual_term == env["TERM_PROGRAM"].encode() and actual_tmux == b"", context
+    binding = (home / "ctrlv-binding").read_text().strip()
+    if not expect_paste:
+        assert binding == '"^V" quoted-insert', binding
+        os.write(master, b"\x16\x01")  # ^V must still quote the next Ctrl+A.
+        assert capture() == b"\x01", "excluded context took ownership of ^V"
+        assert log.read_bytes() == b"", "excluded context read clipboard"
+        print(f"PASS: {transport}: actual TERM_PROGRAM={actual_term.decode()}, quoted-insert, zero clipboard reads")
+        raise SystemExit(0)
+    assert binding == '"^V" _quick_deploy_ghostty_paste', binding
     output.clear()
     os.write(master, b"\x16")
     assert capture() == b"FIRST-current", bytes(output[-500:])
@@ -1187,7 +1263,7 @@ try:
     clear()
 
     executed = home / "MUST-NOT-RUN"
-    payload = f"touch {executed}\nprintf 'next line'\n".encode()
+    payload = f"touch {executed}\nprintf 'next line'; echo $(touch {executed}) # 多行\n\n\n".encode()
     clip.write_bytes(payload)
     os.write(master, b"\x16")
     assert capture() == payload, repr((home / "zle-buffer").read_bytes())
@@ -1213,21 +1289,40 @@ try:
     clear()
     assert not executed.exists(), "some pasted command ran"
 finally:
-    try:
-        os.write(master, b"exit\n")
-    except OSError:
-        pass
-    try:
-        proc.wait(timeout=3)
-    except subprocess.TimeoutExpired:
+    # Never send Enter during teardown: even a failed assertion must not
+    # submit pasted commands. This socket/server belongs only to this test.
+    if use_tmux:
+        subprocess.run(tmux_base + ["kill-server"], env=env, capture_output=True, timeout=5, check=True)
+    if proc.poll() is None:
         proc.kill()
-        proc.wait()
+    proc.wait(timeout=3)
     os.close(master)
     display.close()
+print(f"PASS: {transport}: actual TERM_PROGRAM={actual_term.decode()}, exact ZLE text/cursor/multiline/3 trailing newlines, no autoexecution, quoted-insert, read errors")
 PY
 if [ "$HAVE_ZSH" = true ]; then
-    python3 "$WORK/paste-pty-check.py" "$WORK" "$PASTE_INSTALLED" "$WORK/paste-fake-bin" "$SHELL_ONLY_HOME" \
-        || fail "私有 PTY 未验证当前剪贴板文本/多行安全、quoted-insert 或读取失败"
+    python3 "$WORK/paste-pty-check.py" "$WORK" "$PASTE_INSTALLED" "$WORK/paste-fake-bin" "$SHELL_ONLY_HOME" direct \
+        || fail "私有 direct PTY 未验证当前剪贴板文本/多行不自动执行、quoted-insert 或读取失败"
+    if command -v tmux >/dev/null 2>&1; then
+        for transport in tmux tmux-v2 tmux-ssh; do
+            private_home="$WORK/pty-$transport-home"
+            prepare_shell_paste_home "$private_home"
+            run_shell_only "$private_home" --shell-paste-only > "$WORK/pty-$transport-install.log"
+            installed="$private_home/.config/ghostty/ghostty-local-paste.zsh"
+            if [ "$transport" = tmux-v2 ]; then
+                cp "$WORK/ghostty-local-paste-v2.zsh" "$installed"
+            fi
+            python3 "$WORK/paste-pty-check.py" "$WORK" "$installed" "$WORK/paste-fake-bin" "$private_home" "$transport" \
+                || fail "私有 $transport PTY 粘贴/排除对照失败"
+        done
+    else
+        echo 'SKIP: 未安装 tmux，跳过真实 tmux 子 shell PTY 测试'
+    fi
+    private_home="$WORK/pty-unknown-home"
+    prepare_shell_paste_home "$private_home"
+    run_shell_only "$private_home" --shell-paste-only > "$WORK/pty-unknown-install.log"
+    python3 "$WORK/paste-pty-check.py" "$WORK" "$private_home/.config/ghostty/ghostty-local-paste.zsh" \
+        "$WORK/paste-fake-bin" "$private_home" unknown || fail "未知终端 PTY 错误启用粘贴"
 fi
 
 bash "$(dirname "${BASH_SOURCE[0]}")/wayland-backpressure.sh"

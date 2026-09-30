@@ -1559,11 +1559,22 @@ ZSH_LOCAL_PASTE_HEADER
             # until this migration is retired; its historical digest is tested.
             echo '[[ -z ${SSH_CONNECTION:-} && -z ${SSH_CLIENT:-} && -z ${SSH_TTY:-} ]] || return 0'
             ;;
-        current)
-            cat <<'ZSH_LOCAL_PASTE_GUARD'
+        v2)
+            # Exact deployed direct-Ghostty guard; its digest is pinned below.
+            cat <<'ZSH_LOCAL_PASTE_GUARD_V2'
 # Ghostty sets these for its direct shell even if the launching process has
 # inherited an obsolete SSH_CONNECTION. SSH_TTY identifies an actual SSH pty.
 [[ ${TERM_PROGRAM:-} == ghostty && -n ${GHOSTTY_RESOURCES_DIR:-} && -d ${GHOSTTY_RESOURCES_DIR:-} ]] || return 0
+[[ -z ${SSH_TTY:-} ]] || return 0
+ZSH_LOCAL_PASTE_GUARD_V2
+            ;;
+        current)
+            cat <<'ZSH_LOCAL_PASTE_GUARD'
+# tmux replaces TERM_PROGRAM but inherits Ghostty's local shell resources.
+# These markers allow reading the shell host clipboard, not routing by client.
+[[ ${TERM_PROGRAM:-} == ghostty || ( ${TERM_PROGRAM:-} == tmux && -n ${TMUX:-} ) ]] || return 0
+[[ -n ${GHOSTTY_RESOURCES_DIR:-} && -d ${GHOSTTY_RESOURCES_DIR:-} ]] || return 0
+# Stale SSH_CONNECTION/SSH_CLIENT may be inherited; SSH_TTY is an actual SSH pty.
 [[ -z ${SSH_TTY:-} ]] || return 0
 ZSH_LOCAL_PASTE_GUARD
             ;;
@@ -1743,10 +1754,11 @@ else:
 PY
 }
 
-# Only the first deployed hook (v1) and the current hook may be replaced.
-# The same renderer emits the historical v1 bytes; tests pin its digest so a
-# future body change cannot accidentally broaden this migration contract.
+# Only exact deployed v1/v2 bytes and the current hook may be replaced.
+# Pin the historical digests independently of the renderer's shared body so
+# future edits cannot silently redefine which installed files are managed.
 local_paste_hook_state() {
+    local digest
     if [ -L "$LOCAL_PASTE_HOOK_CONFIG" ]; then
         die "shell 粘贴 hook 是符号链接，拒绝覆盖: $LOCAL_PASTE_HOOK_CONFIG"
     fi
@@ -1756,16 +1768,19 @@ local_paste_hook_state() {
         die "shell 粘贴 hook 不是普通文件，拒绝覆盖: $LOCAL_PASTE_HOOK_CONFIG"
     elif cmp -s "$LOCAL_PASTE_HOOK_CONFIG" <(render_local_paste_hook); then
         echo current
-    elif cmp -s "$LOCAL_PASTE_HOOK_CONFIG" <(render_local_paste_hook v1); then
-        echo v1
     else
-        die "shell 粘贴 hook 含非基准内容，拒绝覆盖: $LOCAL_PASTE_HOOK_CONFIG"
+        digest="$(sha256sum "$LOCAL_PASTE_HOOK_CONFIG")"
+        case "${digest%% *}" in
+            6d53e9c81646f1ebb72872df4ec9f014117957042bce2ccd33fa2bfcc43423eb) echo v1 ;;
+            f6e9f1b772c21c82b99ce922fd819ec9f2a1f006a6255f31b8399c6679ea9fc2) echo v2 ;;
+            *) die "shell 粘贴 hook 含非基准内容，拒绝覆盖: $LOCAL_PASTE_HOOK_CONFIG" ;;
+        esac
     fi
 }
 
 verify_local_paste_prerequisites() {
     local command_name
-    for command_name in zsh wl-paste timeout python3 cmp mktemp chmod mv cp rm; do
+    for command_name in zsh wl-paste timeout python3 cmp sha256sum mktemp chmod mv cp rm; do
         require_command "$command_name"
     done
     [ -d "$CONFIG_DIR" ] && [ ! -L "$CONFIG_DIR" ] \

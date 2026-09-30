@@ -91,7 +91,7 @@ sudo apt install --allow-downgrades ghostty=1.3.1~ppa2-noble1
 - `~/.config/ghostty/ghostty-ssh-mouse-reset.zsh`
   - zsh 在 SSH 返回本地提示符前自动清理常见鼠标模式
 - `~/.config/ghostty/ghostty-local-paste.zsh`
-  - 本地 Wayland 交互式 zsh 提示符的 ZLE 粘贴 widget；由 `install.sh` 内嵌源码生成
+  - 本地 Wayland 交互式 zsh 提示符（含本机 tmux pane）的 ZLE 粘贴 widget；由 `install.sh` 内嵌源码生成
 - `~/.zshrc`
   - 一个标记包围的加载块 source 上述两个 hook；现有旧块按精确基准迁移，块外用户内容逐字节保留
 
@@ -171,8 +171,8 @@ keybind = ctrl+shift+v=text:\x16
 SSH 中的 Pi 若启用了已安装的剪贴板桥，则继续由该桥处理 Ctrl+V；这项
 Ghostty 配置不改变远端 Pi 本身的剪贴板能力。
 
-本地 Wayland **交互式 zsh 提示符**加载模块托管的 ZLE widget：`Ctrl+V`
-和 `Ctrl+Shift+V` 都以原始 `^V` 到达 zsh，然后每次由 `wl-paste
+本地 Wayland **交互式 zsh 提示符（含本机 tmux pane）**加载模块托管的
+ZLE widget：`Ctrl+V` 和 `Ctrl+Shift+V` 都以原始 `^V` 到达 zsh，然后每次由 `wl-paste
 --no-newline --type text` 读取**当前**系统 CLIPBOARD，用 2 秒上限将完整
 文本直接插入 ZLE 编辑缓冲区。真实结尾换行会保留；粘贴中的换行、分号、
 命令替换等不会在粘贴时执行，只有用户之后主动提交编辑缓冲区才可能运行
@@ -182,12 +182,22 @@ Ghostty 配置不改变远端 Pi 本身的剪贴板能力。
 `quoted-insert` / `vi-quoted-insert`，冲突会报错而不抢用户自有按键。
 
 hook 只在**具备原生 Ghostty 子 shell 标记**、有本地 Wayland socket 的
-交互式 zsh 中绑定 ZLE 键：同时核对 `TERM_PROGRAM=ghostty`
-和可用的 `GHOSTTY_RESOURCES_DIR`，有 `SSH_TTY` 时拒绝启用。Ghostty 若从
-先前的 Pi/tmux 进程启动，可能继承过期的 `SSH_CONNECTION`/`SSH_CLIENT`；
-这两个变量不再作为远端判据，否则真实本地提示符会被错误跳过。SSH 分配
-了 PTY 的远端 zsh 则被 `SSH_TTY` 守卫拦住。该子环境标记用于判断此类
-本地提示符；hook 不尝试判定共享 tmux pane 中每次输入的实际客户端来源。
+交互式 zsh 中绑定 ZLE 键。终端上下文仅接受 `TERM_PROGRAM=ghostty`，或
+`TERM_PROGRAM=tmux` **且 `TMUX` 非空**；两者都须有可用的
+`GHOSTTY_RESOURCES_DIR` 目录、Wayland socket，且无 `SSH_TTY`。tmux 会将
+子 shell 的 `TERM_PROGRAM` 改成 `tmux`，所以仅检查 `ghostty` 的已部署 v2
+会跳过真正的本机 tmux 提示符，让 `^V` 留在 quoted-insert；本次只补上该
+tmux 子 shell 条件。Ghostty 若从先前的 Pi/tmux 进程启动，可能继承过期的
+`SSH_CONNECTION`/`SSH_CLIENT`；这两个变量不作为远端判据，否则真实本地
+提示符会被错误跳过。SSH 分配了 PTY 的远端 zsh 被 `SSH_TTY` 守卫拦住。
+
+**剪贴板属于 zsh 所在的主机/Wayland 会话**：在 tmux 中，`wl-paste` 读取
+shell/server 主机的剪贴板，不是发送此按键的远端客户端剪贴板。另一台机器
+附着同一 pane 不会改变已运行 shell 的环境；这些标记不能判定共享 pane 中
+每次输入的实际来源，hook 不做按客户端路由或“最近活动客户端”推断。
+粘贴时还须已退出 tmux copy-mode，让原始 `^V` 到达 ZLE；本次不改变
+copy-mode、复制绑定或 tmux 鼠标行为。
+
 Pi 等 raw-mode 程序不经过 ZLE，仍由自己的 Ctrl+V 处理器读图片/文本，
 SSH 剪贴板桥和 OSC 52 写入路径不变。其他 TUI 仍自行解释原始 `^V`；
 非 Wayland、SSH PTY zsh、其他 shell 和不满足上述 Ghostty 子 shell 条件的
@@ -226,18 +236,21 @@ bash fresh-install/modules/ghostty/install.sh --shell-paste-only
 
 该窄模式先逐字节核对当前受管 Ghostty 配置（必须仍是
 `ctrl+shift+v=text:\x16`）、SSH 鼠标 hook 和已有 `.zshrc` 标记块。粘贴
-hook 仅接受不存在、**首版已部署内容 v1 的精确字节**、或本次 v2 基准；
+hook 仅接受不存在、**已部署 v1/v2 的精确字节**、或本次基准；历史内容
+由安装器和测试中固定的 SHA-256 核对，不能因改动渲染器而重新定义旧版本。
 自定义配置、hook 内用户改动、块内用户改动、符号链接、缺失的前置文件会
 **在写入前拒绝**。首次安装新增 `~/.config/ghostty/ghostty-local-paste.zsh`，
 并在现有 `.zshrc` 托管块中增加一条 source（更改前备份
-`.zshrc.bak.<时间戳>`）。已装 v1 的机器只将 hook 原子替换为 v2，并留存
-`ghostty-local-paste.zsh.bak.<时间戳>`；已有新 `.zshrc` 托管块原字节/原 inode
-保持不变。重复运行不重写同样内容；块外 `.zshrc` 内容和文件权限保持原样。
+`.zshrc.bak.<时间戳>`）。已装 v1/v2 的机器只将 hook 原子替换为本次基准，
+并留存 `ghostty-local-paste.zsh.bak.<时间戳>`；已有新 `.zshrc` 托管块的
+整个文件原字节/原 inode 保持不变。重复运行不重写同样内容；块外 `.zshrc`
+内容和文件权限保持原样。
 不会执行 apt、重建背压库、
 更改全局 Ghostty 绑定/启动器/桌面入口/字体、启动 GUI，也不读取或改动
-真实剪贴板。开启新的本地 zsh 提示符后，复制一段文本，分别试两种粘贴键；
-再试含换行的文本，确认它进入编辑缓冲区但未自动执行。`Esc Ctrl+V` 应能
-逐字插入下一个控制字符。
+真实剪贴板。升级后开启新的本地 zsh 提示符，也在本机 tmux 普通 pane
+中开启新 zsh（已有 shell 不会自动重载 hook）。复制一段文本，分别试两种
+粘贴键；再试含换行的文本，确认它进入编辑缓冲区但未自动执行。
+`Esc Ctrl+V` 应能逐字插入下一个控制字符。
 
 无参数的完整 `install.sh` 也会在安装 Ghostty 时渲染这份 hook，写入同一
 托管块；模块中依然只有 `install.sh` 一个 shell 源文件。
@@ -481,6 +494,14 @@ GTK/libwayland 符号进入库；事故原始负载没有复现，不能许诺�
 bash ../../tests/ghostty/run.sh
 ```
 
+粘贴测试使用私有 HOME、假的 `wl-paste` 和私有 Wayland socket；真实 tmux
+测试另用独占 `-S` socket，从 Ghostty 环境启动 pane，核对 tmux 实际设置的
+`TERM_PROGRAM=tmux` 和 ZLE 缓冲区精确文本。覆盖当前剪贴板重新读取、光标
+插入、多行/多个结尾换行、不自动执行、quoted-insert、冲突与读取失败；
+已部署 v2、`SSH_TTY` 和未知终端的 PTY 对照保持 quoted-insert 且零剪贴板
+读取。测试还验证 v1/v2 窄迁移与已有新 `.zshrc` 块的字节/inode 保留。
+这些隔离测试不证明真实 Ghostty 图形按键、物理剪贴板或复制流程已验收。
+
 预检报告：系统与架构、Ghostty 版本、apt 候选版本、PPA 是否已在源中、配置状态、C 编译器与 Wayland 背压库/启动器状态、Pi 专用启动器状态（缺失 / 基准 / 将拒绝覆盖）、用户级 desktop 覆盖状态（已是基准内容 / 将被替换 / 将被拒绝）、两种字体、`xterm-ghostty` terminfo（含 OSC 52 所需的 `Ms` 能力是否在场）、SSH 鼠标自愈 hook、当前默认终端所有者以及计划动作。它不会添加软件源、调用修改状态的 apt 命令、访问 GitHub、下载文件或写入用户目录。
 
 ## 安装后的用户验收清单
@@ -500,7 +521,7 @@ bash ../../tests/ghostty/run.sh
    ```
 
 10. 在普通 Ghostty/Pi 窗口验证：按住 **Shift** 拖选产生 Ghostty 本地选区，`Ctrl+Shift+C` 复制；先后按 `Ctrl+V` 与 `Ctrl+Shift+V`，确认两者读取相同的当前文本，再试图片。现有窗口须先正常重载配置，或打开新进程。
-11. 在新开的本地 Wayland zsh 提示符复制当前文本，两键均应粘贴且不提交命令；多行粘贴应保持在编辑缓冲区。`Esc Ctrl+V` 应提供 quoted-insert。若提示符显示 `wl-paste` 错误或绑定冲突，检查本地 Wayland/SSH 环境与自有 zsh 键映射。
+11. 在新开的本地 Wayland zsh 提示符和本机 tmux 普通 pane（已退出 copy-mode）的新 zsh 中，两键均应粘贴当前文本且不提交命令；多行与结尾换行应保持在编辑缓冲区。`Esc Ctrl+V` 应提供 quoted-insert。若提示符显示 `wl-paste` 错误或绑定冲突，检查本地 Wayland/SSH 环境与自有 zsh 键映射。共享 tmux 的远端客户端仍读取 shell 主机剪贴板。
 12. 可选：从 `ghostty-pi` 新窗口进入同一 Pi 输入，确认其同样工作。SSH Pi 的粘贴依赖该 Pi 的 Ctrl+V/剪贴板桥行为，不把全局按键改动误当作远端桥的验证。
 
 GUI 冒烟测试只在 `DISPLAY` 或 `WAYLAND_DISPLAY` 存在时运行。它不使用 xdotool、XTEST、libXtst 或任何合成键鼠事件；测试依据是从受保护启动器启动的进程持续存活、stderr 未出现错误，以及 `/proc/<pid>/maps` 中出现 fcitx5 GTK4 immodule（在 Wayland 下还要出现背压库）。
