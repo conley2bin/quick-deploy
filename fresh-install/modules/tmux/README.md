@@ -33,7 +33,7 @@
 
 - 单一事实源：改 `~/.tmux.conf.local` 就是改仓库文件（`<前缀> e` 打开的也是它）；保存只更新基线文件，运行中的 tmux server 仍需 `<前缀> r` 重载；`git commit` 入库后，已链接的机器只靠 `git pull` 即可接收更新。
 - 注意：gpakosz 每次加载配置都会用 `cut -c3- "$TMUX_CONF_LOCAL" | sh -s printf probe` 探测本文件是否旧式脚本格式——注释行剥掉前两个字符（`# `）后会**被 shell 真实执行**，因此注释里不要写 `> < ; | & $() 反引号` 等元字符（历史上的 `（CSI > 4 ; 2 m）` 曾在服务器工作目录生成空文件 `4`）；需要表达时用全角 `＞ ；` 代替。
-- 基线只记真实改动（目前是鼠标模式、DCS 透传 `allow-passthrough all`（机制与代价见下节）、`set -s set-clipboard on`（原生 OSC 52，见下节）、状态栏左键释放切换 window、禁用状态栏区域滚轮切换 window、copy-mode 字母键退出并原样输入、pane-owned Pi error Esc sentinel 路由、精简状态栏、选中 window 两端蓝色竖条、取消 `Ctrl+a` 第二前缀、`Ctrl+Alt+←/→` 切换 window、`Ctrl+Alt+=/+` 新建 window）；全部可用选项查上游模板 `~/.tmux/.tmux.conf.local`。该文件本质是 tmux 配置片段，可直接写 `set -g ...`；若某行被主配置覆盖，按上游说明在行尾加 `#!important`。
+- 基线只记真实改动（目前是鼠标模式、DCS 透传 `allow-passthrough all`（机制与代价见下节）、`set -s set-clipboard on`（原生 OSC 52，见下节）、状态栏左键释放切换 window、禁用状态栏区域滚轮切换 window、copy-mode 字母键退出并原样输入、Ctrl+V 退出后交给应用粘贴、vi Alt+V 矩形选择、pane-owned Pi error Esc sentinel 路由、精简状态栏、选中 window 两端蓝色竖条、取消 `Ctrl+a` 第二前缀、`Ctrl+Alt+←/→` 切换 window、`Ctrl+Alt+=/+` 新建 window）；全部可用选项查上游模板 `~/.tmux/.tmux.conf.local`。该文件本质是 tmux 配置片段，可直接写 `set -g ...`；若某行被主配置覆盖，按上游说明在行尾加 `#!important`。
 
 仓库编辑、`git pull` 和本模块测试都不会向当前用户的 tmux server 写选项。已安装上述链接的机器，运行中 server 在重载后读取新基线；尚未启动的 server 在下次启动时读取。
 
@@ -106,6 +106,63 @@ gpakosz 配置自带的复制到系统剪贴板是 `<前缀> y`：跑一个后�
 
 copy-mode 表里的绑定只有在可选项 `tmux_conf_copy_to_os_clipboard` 显式开启时才会被改写成 `copy-pipe <工具>`；本基线与上游默认都让它保持 `false`（未开启时上游反而会把已有的 `copy-pipe <命令>` 剥回 `copy-pipe`/`copy-selection`）。本模块仍安装 `xclip`/`wl-clipboard`，因为它们服务的是另一个场景：直接在本地图形会话里跑 tmux、用 `<前缀> y` 写本地剪贴板。两条路径各自独立，`on` 不会覆盖或禁用 `y` 绑定。
 
+## 滚动/拖选后的粘贴
+
+滚轮和普通拖选都会进入 copy-mode。拖选释放已经复制，但仍保留历史位置；
+清除选区不等于退出模式。默认 emacs 表把 `Ctrl+V` 用作翻页，vi 表用作矩形
+选择，会吞掉 Ghostty 为 `Ctrl+Shift+V` 发送的原始 `0x16`，Pi/ZLE 收不到。
+本基线仅在两张 mode table 中让粘贴请求**先退出，再转交原始 Ctrl+V**：
+
+```tmux
+bind -T copy-mode    C-v send-keys -X cancel \; send-keys -H 16 #!important
+bind -T copy-mode-vi C-v send-keys -X cancel \; send-keys -H 16 #!important
+bind -T copy-mode-vi M-v send-keys -X rectangle-toggle #!important
+```
+
+只转交一个字节，不发送 Esc/回车，不读取系统剪贴板或粘贴 tmux buffer；
+root 表保持正常转发。滚动与拖选释放仍停留在原位置，直到用户按粘贴键。
+vi 的矩形选择改用 **Alt+V**，emacs 原来的翻页仍可用 PageDown。行尾
+`#!important` 保证 Oh My Tmux 重建键位后重放这三条绑定。
+
+复制的所有者各不相同：
+
+- **Ghostty**：Shift+拖选产生终端选区，再用 Ctrl+Shift+C；普通拖选被应用
+  接管时，Ctrl+Shift+C 不会自动获取应用选区。
+- **tmux**：应用未请求鼠标上报时，普通拖选释放通过 OSC 52 自动复制，无需
+  再按 Ctrl+Shift+C；复制后仍在历史模式，但现在按粘贴键就能退出并转交。
+- **Pi**：Pi 请求鼠标上报时普通拖选交给 Pi，由 Pi 的剪贴板适配器复制。
+  转交的 Ctrl+V 继续使用 Pi 原有图片/文本粘贴或 SSH 桥。
+
+本地 Wayland zsh 需要 Ghostty 模块的受管 ZLE hook；它读取 **shell/server
+主机** 的 Wayland 剪贴板，不按共享 pane 的输入客户端路由。其他程序自行
+解释 Ctrl+V。打开的 tmux 命令/搜索 prompt 先于 mode table 消费按键，这三条
+绑定不处理 prompt 编辑。真实 Ghostty/系统剪贴板结果仍须人工验收。
+
+### 现有机器的窄部署
+
+从仓库根目录只升级 zsh hook，然后开启新 zsh；已有 shell 不会自动重载：
+
+```bash
+bash fresh-install/modules/ghostty/install.sh --shell-paste-only
+```
+
+如只想更新运行中 server 的这三个键，不用重跑安装器或完整配置重载。
+**先确认目标 server 的 socket 路径**，再显式指定它（下列命令是部署说明，
+回归测试不会执行到用户 server）：
+
+```bash
+socket=/path/to/confirmed/tmux.sock
+tmux -S "$socket" bind-key -T copy-mode C-v 'send-keys -X cancel ; send-keys -H 16'
+tmux -S "$socket" bind-key -T copy-mode-vi C-v 'send-keys -X cancel ; send-keys -H 16'
+tmux -S "$socket" bind-key -T copy-mode-vi M-v send-keys -X rectangle-toggle
+```
+
+CLI 中须像上例把两步命令列表整体引用；单独传未转义的分号会在安装绑定时
+执行第二条命令，不能保存完整路由。配置文件中则保留上文的 `\;`。部署后
+分别在 emacs/vi 模式滚历史、拖选，按两种粘贴键确认当前内容到达 Pi/新 zsh；
+多行文本不应自动提交，vi Alt+V 应仍切换矩形选择。此过程不改变全局 Ghostty
+快捷键、OSC 52 策略或 Pi 剪贴板实现。
+
 ## 幂等语义
 
 重跑本脚本：
@@ -124,7 +181,14 @@ copy-mode 表里的绑定只有在可选项 `tmux_conf_copy_to_os_clipboard` 显
 ./tests/run.sh
 ```
 
-测试使用 $WORK 内的独立 tmux socket（`-S`，不留 `/tmp/tmux-<uid>/` 节点）和临时目录，source 仓库基线后用 `show-options -Apv -t` 精确断言目标 pane 的有效 `allow-passthrough` 值为 `all`；随后真实验证状态栏鼠标释放切换、emacs/vi 两张 copy-mode 键表的字母原样输入，以及两 pane 红色 window 中 root/copy-mode Esc 只有在当前 pane 持有 recovery marker 时才投递 sentinel + Esc。未 armed pane 的 root 只收到普通 Esc，copy-mode 则零注入。不会改动当前 tmux server。
+测试使用 $WORK 内的独立 tmux socket（`-S`，不留 `/tmp/tmux-<uid>/` 节点）、私有 HOME 和无图形/SSH 会话变量的临时环境，source 仓库基线后用 `show-options -Apv -t` 精确断言目标 pane 的有效 `allow-passthrough` 值为 `all`；随后真实验证状态栏鼠标释放切换、emacs/vi 两张 copy-mode 键表的字母原样输入，以及两 pane 红色 window 中 root/copy-mode Esc 只有在当前 pane 持有 recovery marker 时才投递 sentinel + Esc。未 armed pane 的 root 只收到普通 Esc，copy-mode 则零注入。不会改动当前 tmux server。
+
+Ctrl+V 部分复用 OSC 52 的 attached PTY 驱动，在 emacs/vi × wheel/drag 四种
+情形断言滚动位置保留到粘贴请求、随后退出模式，并且 raw 接收器恰好收到
+`16`，没有额外 Esc/Enter 或 tmux buffer 文本；normal mode 原始转发不变。
+vi Alt+V 保持模式/滚动位置、切换矩形选择且零应用输入。另核对完整存储的
+两步绑定；本机安装了 Oh My Tmux 时，在私有 HOME/server 跑两次完整主配置
+重载，确认 `#!important` 重放仍保留三条键，root Ctrl+V 没有被接管。
 
 OSC 52 部分用 `tic` 编译两份只差 `Ms` 能力的 terminfo，让两个 PTY 客户端同时显示同一个 pane 做对照（拖动故意由**不带 Ms** 的客户端发起，证明 tmux 按接收方能力分发）；每个阶段用全新 socket 启动独立 server，客户端进程有界收尾（超时强杀，不无期限 waitpid）：
 

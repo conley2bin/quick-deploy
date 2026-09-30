@@ -5,6 +5,11 @@ set -euo pipefail
 MODULE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CONF="$MODULE_DIR/tmux.conf.local"
 WORK="$(mktemp -d /tmp/quick-deploy-tmux-test.XXXXXX)"
+UPSTREAM_CONF="$HOME/.tmux/.tmux.conf"
+# 所有 server/后台配置任务继承私有 HOME 与 headless 环境。
+mkdir -p "$WORK/home"
+export HOME="$WORK/home"
+unset DISPLAY WAYLAND_DISPLAY SSH_CONNECTION SSH_CLIENT SSH_TTY
 SOCKET="$WORK/tmux.sock"
 SESSION="bindings"
 ESCAPE_SESSION="escape-routing"
@@ -79,6 +84,18 @@ for table in copy-mode copy-mode-vi; do
         esac
     done
 done
+
+# 粘贴只接管 mode table：必须存下 cancel + literal 16 的完整命令列表，
+# 不得在安装绑定时误执行第二条命令，也不接管 root C-v。
+[ -z "$(root_binding_for C-v)" ] || fail "root C-v 不应被改绑"
+for table in copy-mode copy-mode-vi; do
+    binding="$(table_binding_for "$table" C-v | tr -s ' ')"
+    [ "$binding" = "bind-key -T $table C-v send-keys -X cancel \\; send-keys -H 16" ] \
+        || fail "$table 的 C-v 未保存完整粘贴路由: [$binding]"
+done
+binding="$(table_binding_for copy-mode-vi M-v | tr -s ' ')"
+[ "$binding" = 'bind-key -T copy-mode-vi M-v send-keys -X rectangle-toggle' ] \
+    || fail "vi Alt+V 未保留矩形选择: [$binding]"
 
 # 两张 copy-mode 表的 MouseDragEnd1Pane 必须仍是完整的自定义「复制后留在
 # copy-mode」绑定（整行比对，不是子串）：OSC 52 行为在 tmux 默认的
@@ -482,6 +499,28 @@ if infocmp -x -A "$WORK/terminfo" qp-osc52-noms 2>/dev/null \
     fail "不带 Ms 的对照 terminfo 意外包含 Ms"
 fi
 
+# 复用下面 OSC 52 的 attached PTY 驱动测试粘贴；接收器记录所有实际字节，
+# 不能只读第一个字节而漏掉附加的 Enter/Esc 或陈旧 buffer 文本。
+cat > "$WORK/read-paste.py" <<'PY'
+import os
+from pathlib import Path
+import sys
+import tty
+
+output = Path(sys.argv[1])
+output.write_bytes(b"")
+for row in range(80):
+    print(f"hist-{row:02d}")
+print("PASTE-READY", flush=True)
+tty.setraw(sys.stdin.fileno())
+while True:
+    data = os.read(sys.stdin.fileno(), 4096)
+    if not data:
+        break
+    with output.open("ab") as stream:
+        stream.write(data)
+PY
+
 # 选择范围刻意停在行尾前的一个保护字符：tmux 的 emacs 键表把鼠标终点
 # 当作排他的，vi 键表把它当作包含的。保护字符把两种模式的差异固定成
 # 一个可见字节，避免把版本相关的“是否附带行尾换行”误当成 OSC 52 行为。
@@ -513,6 +552,8 @@ import time
 
 socket_name, terminfo, session, marker, row_s, start_s, end_s, actor = sys.argv[1:9]
 row, start_col, end_col = int(row_s), int(start_s), int(end_s)
+paste_output = sys.argv[9] if len(sys.argv) > 9 else None
+entry = sys.argv[10] if paste_output else None
 
 env = os.environ.copy()
 env.pop("TMUX", None)
@@ -596,6 +637,57 @@ try:
             rendered[key] += drain(fd, 0.1)
 
     actor_fd = {"ms": ms_fd, "noms": noms_fd}[actor]
+    if paste_output:
+        from pathlib import Path
+        received = Path(paste_output)
+
+        def state():
+            return tx("display-message", "-p", "-t", session,
+                      "#{pane_in_mode}:#{scroll_position}:#{selection_present}:#{rectangle_toggle}").stdout.strip().split(":")
+
+        def assert_input(expected):
+            end = time.monotonic() + 3
+            while received.read_bytes() != expected and time.monotonic() < end:
+                drain(actor_fd, 0.05)
+            # Wait for the whole command-list delivery, detecting extra bytes.
+            drain(actor_fd, 0.2)
+            assert received.read_bytes() == expected, received.read_bytes().hex()
+
+        assert state()[0] == "0", state()
+        tx("set-buffer", "STALE-TMUX-BUFFER-MUST-NOT-PASTE")
+        os.write(actor_fd, b"\x16")
+        assert_input(b"\x16")  # root still forwards without a custom binding.
+        received.write_bytes(b"")
+
+        # Enter history with actual SGR wheel events, not tmux send-keys.
+        os.write(actor_fd, b"\x1b[<64;1;5M" * 40)
+        drain(actor_fd, 0.3)
+        before = state()
+        assert before[0] == "1" and int(before[1]) > 0, before
+        if entry == "drag":
+            os.write(actor_fd, b"\x1b[<0;1;5M\x1b[<32;8;5M\x1b[<0;8;5m")
+            drain(actor_fd, 0.3)
+            after_drag = state()
+            assert after_drag[0:2] == before[0:2] and after_drag[2] == "0", (before, after_drag)
+        drain(actor_fd, 0.2)
+        assert state()[0:2] == before[0:2], "idle/drag lost history position"
+        assert received.read_bytes() == b"", "mouse/copy injected application input"
+
+        if tx("show-options", "-wv", "-t", session, "mode-keys").stdout.strip() == "vi":
+            rectangle = state()[3]
+            os.write(actor_fd, b"\x1bv")  # Alt+V remains a mode command.
+            drain(actor_fd, 0.3)
+            alternate = state()
+            assert alternate[0:2] == before[0:2] and alternate[3] != rectangle, alternate
+            assert received.read_bytes() == b"", "Alt+V forwarded application bytes"
+            print(f"VI_ALT_V={entry}:rectangle-toggle,mode=1,scroll={before[1]},input=empty")
+
+        os.write(actor_fd, b"\x16")
+        assert_input(b"\x16")
+        assert state()[0] == "0", state()
+        print(f"PASTE_HANDOFF={entry}:root=16,mode=0,input=16,held-scroll={before[1]}")
+        raise SystemExit(0)
+
     os.write(actor_fd, f"\x1b[<0;{start_col};{row}M".encode())
     time.sleep(0.05)
     for col in range(start_col + 1, end_col + 1):
@@ -688,6 +780,22 @@ check_clip_mode() {
 # 绑定；binding 文本断言在文件顶部，两者合起来才能把行为归因到该绑定。
 check_clip_mode emacs "$CLIP_EXPECTED_HEX_EMACS"
 check_clip_mode vi "$CLIP_EXPECTED_HEX_VI"
+
+# 同一个私有 PTY 驱动，覆盖 emacs/vi × wheel/drag 的真实 Ctrl+V 投递。
+for mode in emacs vi; do
+    for entry in wheel drag; do
+        next_clip_socket
+        txc set-option -w -t "$CLIP_SESSION" mode-keys "$mode"
+        txc respawn-pane -k -t "$CLIP_SESSION" "python3 '$WORK/read-paste.py' '$WORK/paste-$mode-$entry.input'"
+        sleep 0.2
+        result="$(python3 "$WORK/osc52-check.py" "$CLIP_SOCKET" "$WORK/terminfo" \
+            "$CLIP_SESSION" PASTE-READY 5 1 8 noms "$WORK/paste-$mode-$entry.input" "$entry")" \
+            || fail "$mode/$entry 粘贴 PTY 投递失败"
+        echo "$mode: $result"
+        grep -Eq "^PASTE_HANDOFF=$entry:root=16,mode=0,input=16,held-scroll=[1-9][0-9]*$" <<<"$result" \
+            || fail "$mode/$entry 未报告精确 16 与历史位置保留"
+    done
+done
 
 # ---- 边界 2：pane 应用 / 内层 tmux 发来的 OSC 52 被外层 tmux 解析并重发 ----
 # 输入直接复用边界 1 观测到的形式（选择器为空，见 CLIP_COPY_FLAGS），断言重发
@@ -852,4 +960,37 @@ check_clip_relay() {
 
 check_clip_relay
 
-echo "PASS: tmux passthrough、状态栏点击、copy-mode 输入、pane-owned Esc sentinel 路由与 OSC 52 复制发送/中继校验"
+# 本机已装 Oh My Tmux 时复制主配置到私有 HOME，跑完整生成/important 重放。
+# 不读取用户 local 配置、不更新插件、不触碰真实 server。
+if [ -r "$UPSTREAM_CONF" ]; then
+    cp "$UPSTREAM_CONF" "$HOME/.tmux.conf"
+    cp "$CONF" "$HOME/.tmux.conf.local"
+    printf '\ntmux_conf_update_plugins_on_launch=false\ntmux_conf_update_plugins_on_reload=false\n' >> "$HOME/.tmux.conf.local"
+    REPLAY_SOCKET="$WORK/important-replay.sock"
+    replay() {
+        env -u TMUX -u TMUX_PANE TMUX_PROGRAM="$(command -v tmux)" \
+            TMUX_SOCKET="$REPLAY_SOCKET" TMUX_CONF="$HOME/.tmux.conf" \
+            TMUX_CONF_LOCAL="$HOME/.tmux.conf.local" tmux -S "$REPLAY_SOCKET" "$@"
+    }
+    replay -f /dev/null new-session -d -s replay
+    # 两次完整重载，避免仅验证首次 local source 而漏掉上游重建。
+    for pass in 1 2; do
+        replay source-file "$HOME/.tmux.conf" > "$WORK/replay-$pass.log" 2>&1 \
+            || { cat "$WORK/replay-$pass.log" >&2; fail "Oh My Tmux 完整重放失败"; }
+        for table in copy-mode copy-mode-vi; do
+            binding="$(replay list-keys -T "$table" | awk '$4 == "C-v"' | tr -s ' ')"
+            [ "$binding" = "bind-key -T $table C-v send-keys -X cancel \\; send-keys -H 16" ] \
+                || fail "Oh My Tmux 重放丢失 $table 粘贴路由: [$binding]"
+        done
+        binding="$(replay list-keys -T copy-mode-vi | awk '$4 == "M-v"' | tr -s ' ')"
+        [ "$binding" = 'bind-key -T copy-mode-vi M-v send-keys -X rectangle-toggle' ] \
+            || fail "Oh My Tmux 重放丢失 vi Alt+V: [$binding]"
+        [ -z "$(replay list-keys -T root | awk '$4 == "C-v"')" ] \
+            || fail "Oh My Tmux 重放意外接管 root C-v"
+    done
+    echo 'PASS: full Oh My Tmux important replay preserves both C-v handoffs and vi Alt+V, root unchanged'
+else
+    echo 'SKIP: 未安装 Oh My Tmux，跳过完整 important 重放（基线和 PTY 测试仍执行）'
+fi
+
+echo "PASS: tmux passthrough、状态栏点击、copy-mode 精确 Ctrl+V 输入、pane-owned Esc sentinel 路由与 OSC 52 复制发送/中继校验"
