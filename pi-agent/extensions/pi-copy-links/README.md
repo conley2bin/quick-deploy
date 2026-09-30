@@ -114,7 +114,17 @@ Pi 在 lexing 前把 Tab 展开成三个空格，native href 还可能保留 cha
 
 这保证已验证的**初始端口**和同端口跳转到 `localhost` 时，两种标准浏览器回环地址都通往选定的公司后端；重定向到**其他端口或其他 authority** 尚不在这个所有权保证内。TCP 探测/隧道准备也不证明 HTTP 服务之后持续可用。外部网页不建公司回环隧道；文件/目录使用 VS Code Remote-SSH typed URI 与明确的 `--file-uri`/`--folder-uri`，请求 `--new-window`。公司本机 Chrome/Code 也只请求新窗口，不控制 GNOME Wayland 的最终 workspace；Y9000p 的默认浏览器由 `xdg-open` 在其 X11 桌面处理，可能复用已有窗口或标签，不能套用公司 Wayland 的窗口预期。
 
-## 验证
+## 维护者自动回归
+
+[兼容 workflow](../../../.github/workflows/pi-copy-links-compat.yml) 在扩展目录、`pi-agent/README.md` 或 workflow 本身的 push/PR 变更时运行，也支持手动触发；每周一 **05:17 UTC** 重新检查 npm Pi latest，包括仓库未改动时发布的 Pi 新版。
+
+它只在临时 Ubuntu 24.04 runner 安装 Node 22 和 npm Pi latest，以 `npm ci --ignore-scripts --legacy-peer-deps` 安装测试依赖，再由现有 `test/setup-pi.mjs` 链接并核对实际 host 的 Pi/TUI 身份。随后执行完整 `npm run check`、下述四种 bundled CLI/PTY recorder，并在自有源码副本中删除测试 peer 链接、验证生产加载。各 native 模式即使前面的回归失败也分别运行，日志与 recorder 证据保存为 14 天的 CI artifact；不会创建新的用户升级/重放脚本，也不会升级操作员机器或修改 Pi bundles/settings。
+
+这是**维护者持续回归**，不是普通用户每次升级后的验证步骤。用户仍只需正常升级/启动；扩展按实际启动契约自动启用或解释具体拒绝原因。Workflow 必须先推送到启用了 GitHub Actions 的远端仓库才会执行；周期任务使用默认分支的文件。本地提交、YAML 检查或本机 recorder 通过都不表示远端 runner 已运行。
+
+## 开发者诊断与本地复现
+
+以下命令用于扩展开发和故障排查，不是逐 Pi 版本的用户准入流程：
 
 ```bash
 cd pi-agent/extensions/pi-copy-links
@@ -129,6 +139,6 @@ python3 test/native-smoke.py --tmux --regular-start
 
 `--legacy-peer-deps` 只用于测试依赖安装，避免 npm 自动装入与正在运行的 Pi 不同身份的 peer；`npm run check` 中的 `test/setup-pi.mjs` 核验并链接本机已安装的 Pi/TUI，发现不匹配的第二份运行时会拒绝执行。验收以实际 `pi` 的 bundled CLI 和上面的离线 PTY/recorder 为准，不用未打包入口代替。
 
-单元/集成测试覆盖代码源文、typed action failure atomicity、poisoned-generation clipboard queue、live cwd snapshot、Markdown recursion/table/reference、显式 web entity/reference 语义与 autolink disagreement、完整目标语法、symlink/type/existence、browser default 检测、硬 subprocess deadline 与 TERM/KILL 升级、transactional unref handoff、Chrome/Code argv、来源 PID 解析与客户端地址钉住、fake SSH JSON 协议/失败/abort/no-fallback、async retirement、selection/overlay/opener descriptor/tmux exact-target recovery/reload/quiescence。Native smoke 使用临时 Pi profile、真实 CLI/PTY 和 recorder executables：`wl-copy`、`xdg-settings`、`google-chrome-stable`、`code`；`xdg-open` 是失败 tripwire。它创建真实临时 `.3mf`、`.svg`、`.json` 和目录，只按显示 label 选择目标，不假定每个 `pi-copy://` 都是复制按钮。`--osc52` 模拟没有 tmux 来源的直接 SSH：复制仍通过 OSC52，链接明确拒绝且无公司 GUI 启动；其余模式测试本机打开。自动测试不会启动物理 Chrome/Code，也不会修改物理剪贴板。
+单元/集成测试覆盖代码源文、typed action failure atomicity、poisoned-generation clipboard queue、live cwd snapshot、Markdown recursion/table/reference、显式 web entity/reference 语义与 autolink disagreement、完整目标语法、symlink/type/existence、browser default 检测、硬 subprocess deadline 与 TERM/KILL 升级、transactional unref handoff、Chrome/Code argv、来源 PID 解析与客户端地址钉住、fake SSH JSON 协议/失败/abort/no-fallback、async retirement、selection/overlay/opener descriptor/tmux exact-target recovery/reload/quiescence。Native smoke 使用临时 Pi profile、真实 CLI/PTY 和 recorder executables：`wl-copy`、`xdg-settings`、`google-chrome-stable`、`code`；`xdg-open` 是失败 tripwire。它创建真实临时 `.3mf`、`.svg`、`.json` 和目录，只按显示 label 选择目标，不假定每个 `pi-copy://` 都是复制按钮。`--osc52` 模拟没有 tmux 来源的直接 SSH：复制仍通过 OSC52，链接明确拒绝且无公司 GUI 启动；其余模式测试本机打开。四种模式还通过真实 PTY 拖选普通文字，核对原生 selection 写出的 `Native`，并核对普通链接点击和 Ctrl-drag 不打开浏览器、`/reload` 后 action URI 更换、窄屏复制字节不变。自动测试不会启动物理 Chrome/Code，也不会修改物理剪贴板。用 `--artifacts <目录>` 为每次 native 运行指定独立证据目录；默认也保留临时目录。失败时仍保存 `run.json`、PTY/input 原始流、已有 recorder JSONL、snapshot 和人工 fixture 的 session/settings，便于从实际输入/输出定位分歧；这些文件属于隔离测试 profile，不来自用户会话。
 
 卸载前确认 `~/.pi/agent/extensions/pi-copy-links` 是本扩展 symlink，删除后 `/reload`。源码和依赖可保留。

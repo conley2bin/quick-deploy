@@ -1,0 +1,94 @@
+name: pi-copy-links compatibility
+
+on:
+  push:
+    paths:
+      - 'pi-agent/extensions/pi-copy-links/**'
+      - 'pi-agent/README.md'
+      - '.github/workflows/pi-copy-links-compat.yml'
+  pull_request:
+    paths:
+      - 'pi-agent/extensions/pi-copy-links/**'
+      - 'pi-agent/README.md'
+      - '.github/workflows/pi-copy-links-compat.yml'
+  schedule:
+    # Reinstall npm latest every Monday, including releases without repo changes.
+    - cron: '17 5 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  latest-pi:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: bash
+        working-directory: pi-agent/extensions/pi-copy-links
+    env:
+      ARTIFACTS: ${{ runner.temp }}/pi-copy-links-compat
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          check-latest: true
+
+      - name: Install ephemeral host and test dependencies
+        run: |
+          mkdir -p "$ARTIFACTS"
+          sudo apt-get update
+          sudo apt-get install -y tmux
+          # Only the disposable runner is upgraded; never npm-install Pi peers
+          # into the extension's node_modules.
+          npm install -g --ignore-scripts @earendil-works/pi-coding-agent@latest
+          npm ci --ignore-scripts --legacy-peer-deps
+          node test/setup-pi.mjs
+          {
+            node --version
+            npm --version
+            pi --version
+            readlink -f "$(command -v pi)"
+          } | tee "$ARTIFACTS/host.txt"
+
+      - name: Full installed-host regression suite
+        run: npm run check 2>&1 | tee "$ARTIFACTS/check.log"
+
+      # Independent steps preserve results from every transport even if an
+      # earlier regression fails. Bash pipefail keeps each failure visible.
+      - name: Native direct recorder
+        if: ${{ !cancelled() }}
+        run: python3 test/native-smoke.py --artifacts "$ARTIFACTS/direct" 2>&1 | tee "$ARTIFACTS/direct.log"
+
+      - name: Native OSC52 recorder
+        if: ${{ !cancelled() }}
+        run: python3 test/native-smoke.py --osc52 --artifacts "$ARTIFACTS/osc52" 2>&1 | tee "$ARTIFACTS/osc52.log"
+
+      - name: Native tmux recorder
+        if: ${{ !cancelled() }}
+        run: python3 test/native-smoke.py --tmux --artifacts "$ARTIFACTS/tmux" 2>&1 | tee "$ARTIFACTS/tmux.log"
+
+      - name: Native regular to fullscreen recorder
+        if: ${{ !cancelled() }}
+        run: python3 test/native-smoke.py --tmux --regular-start --artifacts "$ARTIFACTS/tmux-regular" 2>&1 | tee "$ARTIFACTS/tmux-regular.log"
+
+      - name: Production loader without test peers
+        if: ${{ !cancelled() }}
+        run: |
+          # Preserve deployed/test peers; remove links only from an owned copy.
+          production="$RUNNER_TEMP/pi-copy-links-production"
+          mkdir -p "$production"
+          cp -a index.ts src test package.json node_modules "$production/"
+          rm -rf "$production/node_modules/@earendil-works"
+          python3 "$production/test/native-smoke.py" --artifacts "$ARTIFACTS/production" 2>&1 | tee "$ARTIFACTS/production.log"
+
+      - name: Retain logs and recorder evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: pi-copy-links-compat-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.ARTIFACTS }}
+          if-no-files-found: warn
+          retention-days: 14

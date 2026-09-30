@@ -37,6 +37,12 @@ source = Path(__file__).resolve().parents[1]
 root = Path(tempfile.mkdtemp(prefix='pi-copy-links-native-'))
 artifacts = options.artifacts or root
 artifacts.mkdir(parents=True, exist_ok=True)
+# Available even when startup/setup fails before the PTY fixture can snapshot.
+(artifacts / 'run.json').write_text(json.dumps({
+    'scratch': str(root),
+    'transport': 'osc52' if options.osc52 else 'tmux' if options.tmux else 'direct',
+    'regularToFullscreen': options.regular_start,
+}, indent=2))
 agent = root / 'agent'
 (agent / 'extensions').mkdir(parents=True)
 (agent / 'extensions/pi-copy-links').symlink_to(source, target_is_directory=True)
@@ -268,6 +274,21 @@ try:
     drain(0.2)
     expected_browser = [] if options.osc52 else [{'argv': ['--new-window', url]}]
     assert records('google-chrome-stable') == expected_browser, 'Ctrl-drag opened a browser'
+    # A plain-text drag must still reach Pi's native selection/copy path through
+    # the real PTY (including tmux stock motion), not merely suppress openers.
+    selection_frame = snapshot('selection-start')
+    header = [(y, line.index('Native copy test')) for y, line in enumerate(selection_frame['lines'])
+              if 'Native copy test' in line]
+    assert len(header) == 1, selection_frame
+    y, x = header[0]
+    selection_start, selection_end = {'x': x, 'y': y}, {'x': x + 5, 'y': y}
+    before_selection = clipboard()
+    send(mouse_sequence(selection_start) + mouse_sequence(selection_end, 32) +
+         mouse_sequence(selection_end, 0, 'm'))
+    wait_for(lambda: len(clipboard()) > len(before_selection), 'native plain-text drag copy')
+    assert clipboard() == before_selection + ['Native'], repr(clipboard())
+    native_selection = clipboard()[-1]
+    assert records('google-chrome-stable') == expected_browser, 'plain-text drag opened a browser'
     # Native double-click/selection can itself write OPEN_LINK to the clipboard.
     # Compare each button's new write, rather than mistaking native selection for
     # a duplicate or failed code-copy operation.
@@ -306,7 +327,7 @@ try:
     wait_for(stopped, 'graceful exit')
     result = {'result': 'passed', 'transport': 'OSC52' if options.osc52 else 'tmux → wl-copy stdin' if options.tmux else 'wl-copy stdin',
               'regularToFullscreen': options.regular_start,
-              'buttonCopies': button_copies, 'clipboardWrites': clipboard(),
+              'buttonCopies': button_copies, 'clipboardWrites': clipboard(), 'nativeSelection': native_selection,
               'browser': records('google-chrome-stable'), 'code': records('code'),
               'browserDetection': records('xdg-settings'), 'forbiddenXdgOpen': records('xdg-open'),
               'scratch': str(root)}
@@ -314,8 +335,15 @@ try:
     print(json.dumps(result, ensure_ascii=False))
 finally:
     (artifacts / 'terminal.raw').write_bytes(wire)
-    if (root / 'input.raw').exists() and (root / 'input.raw').resolve() != (artifacts / 'input.raw').resolve():
-        shutil.copyfile(root / 'input.raw', artifacts / 'input.raw')
+    # These fixture-owned records must survive failures too: an ephemeral CI
+    # runner cannot retain the scratch path printed only on successful exit.
+    evidence = [root / 'input.raw', root / 'snapshot.json', root / 'session.jsonl',
+                agent / 'settings.json', *[root / (command + '.jsonl') for command in
+                ('wl-copy', 'xdg-settings', 'google-chrome-stable', 'code', 'xdg-open')]]
+    for path in evidence:
+        target = artifacts / path.name
+        if path.exists() and path.resolve() != target.resolve():
+            shutil.copyfile(path, target)
     if not exited:
         # Only the exact child started by this test; never touch a shared server/session.
         try:
