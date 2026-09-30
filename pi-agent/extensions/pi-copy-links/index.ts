@@ -16,20 +16,34 @@ export default function copyLinksExtension(pi: ExtensionAPI): void {
   let warnedFailure: string | undefined;
   let mouse: Awaited<ReturnType<typeof enableTmuxMouse>> | undefined;
   let mouseWarning: string | undefined;
+  let rollbackNotes: unknown[] | undefined;
+  // Detach every owner before any fallible cleanup or awaited mouse release.
+  async function releaseOwners(): Promise<unknown[]> {
+    const retiredAdapter = adapter, retiredMouse = mouse;
+    adapter = undefined;
+    mouse = undefined;
+    mouseWarning = undefined;
+    const issues: unknown[] = [];
+    try { retiredAdapter?.dispose(); } catch (error) { issues.push(error); }
+    try { await retiredMouse?.dispose(); } catch (error) { issues.push(error); }
+    return issues;
+  }
+  const reason = (error: unknown): string => {
+    try { return error instanceof Error ? error.message : String(error); }
+    catch { return "无法读取清理原因"; }
+  };
   pi.registerMarkdownTransformer((source, context) => adapter?.transform(source, context) ?? source);
 
   pi.on("session_start", async (_event, ctx) => {
     if (ctx.mode !== "tui") return;
-    adapter?.dispose();
-    adapter = undefined;
-    await mouse?.dispose();
-    mouse = undefined;
-    mouseWarning = undefined;
-    ctx.ui.setWidget(WIDGET, (current) => {
-      tui = current; // Stable Pi proxy follows /settings mode switches.
-      return { render: () => [], invalidate() {} };
-    });
+    compatibility = undefined;
     try {
+      const priorIssues = await releaseOwners();
+      if (priorIssues.length) throw priorIssues[0];
+      ctx.ui.setWidget(WIDGET, (current) => {
+        tui = current; // Stable Pi proxy follows /settings mode switches.
+        return { render: () => [], invalidate() {} };
+      });
       compatibility = await checkCompatibility(VERSION);
       if (!compatibility.compatible) throw new Error(compatibility.cause);
       // Re-capture the production descriptors after the isolated async probe;
@@ -59,9 +73,11 @@ export default function copyLinksExtension(pi: ExtensionAPI): void {
             (row) => typeof row === "string" && !row.includes("pi-copy://"),
           );
         },
-        notify: (message, error) => ctx.ui.notify(message, error ? "error" : "info"),
+        notify: (message, error) => {
+          if (rollbackNotes) { if (error) rollbackNotes.push(message); return; }
+          ctx.ui.notify(message, error ? "error" : "info");
+        },
       });
-      failure = undefined;
       try {
         mouse = await enableTmuxMouse();
         if (mouse.warnings.length) mouseWarning = `tmux 鼠标绑定缺少来源标记，未覆盖非受管绑定：${mouse.warnings.join(", ")}；缺标记的 Ctrl+点击会拒绝打开`;
@@ -70,11 +86,22 @@ export default function copyLinksExtension(pi: ExtensionAPI): void {
       tui?.invalidate();
       tui?.requestRender();
       if (tui?.mode !== "fullscreen") ctx.ui.notify(`pi-copy-links 已加载。${HELP}`, "info");
+      failure = undefined;
     } catch (error) {
-      failure = compatibilityDiagnostic(VERSION, error);
-      if (failure !== warnedFailure) {
-        warnedFailure = failure;
-        ctx.ui.notify(failure, "warning");
+      // Preserve the original startup failure while retiring hooks/actions and
+      // releasing mouse ownership, even when later cleanup/UI operations fail.
+      const primary = reason(error);
+      rollbackNotes = [];
+      rollbackNotes.push(...await releaseOwners());
+      try { ctx.ui.setWidget(WIDGET, undefined); } catch (cleanup) { rollbackNotes.push(cleanup); }
+      tui = undefined;
+      const suffix = rollbackNotes.length ? `；启动清理：${rollbackNotes.map(reason).join("；")}` : "";
+      rollbackNotes = undefined;
+      failure = compatibilityDiagnostic(VERSION, primary + suffix);
+      const warningKey = compatibilityDiagnostic(VERSION, primary);
+      if (warningKey !== warnedFailure) {
+        warnedFailure = warningKey;
+        try { ctx.ui.notify(failure, "warning"); } catch { /* /copy-links retains the primary failure. */ }
       }
     }
   });
@@ -86,7 +113,7 @@ export default function copyLinksExtension(pi: ExtensionAPI): void {
       const state = failure ?? (actual && !actual.available ? compatibilityDiagnostic(VERSION, actual.cause) :
         actual?.available && tui?.mode === "fullscreen" ?
           "已启用：点击 [复制] 获取原始代码；Ctrl+左键在新窗口打开 HTTP(S) 网页或现有本地目标。" : HELP);
-      const contract = compatibility?.compatible ?
+      const contract = !failure && actual?.available && compatibility?.compatible ?
         `实际兼容检查通过（Pi ${VERSION}，隔离探针 ${compatibility.probeMs.toFixed(1)} ms）` : undefined;
       ctx.ui.notify([state, contract, mouseWarning].filter(Boolean).join("\n"),
         failure || (actual && !actual.available) || mouseWarning ? "warning" : "info");
@@ -94,15 +121,14 @@ export default function copyLinksExtension(pi: ExtensionAPI): void {
   });
 
   pi.on("session_shutdown", async (_event, ctx) => {
-    adapter?.dispose();
-    adapter = undefined;
-    try { await mouse?.dispose(); }
-    catch (error) { if (ctx.mode === "tui") ctx.ui.notify(`tmux 鼠标标记清理失败：${String(error)}`, "warning"); }
-    mouse = undefined;
+    const issues = await releaseOwners();
     if (ctx.mode === "tui") {
-      tui?.invalidate();
-      ctx.ui.setWidget(WIDGET, undefined);
+      try { tui?.invalidate(); } catch (error) { issues.push(error); }
+      try { ctx.ui.setWidget(WIDGET, undefined); } catch (error) { issues.push(error); }
     }
     tui = undefined;
+    if (issues.length && ctx.mode === "tui") {
+      try { ctx.ui.notify(`pi-copy-links 会话清理失败：${reason(issues[0])}`, "warning"); } catch { /* noexcept */ }
+    }
   });
 }

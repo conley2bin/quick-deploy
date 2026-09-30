@@ -89,7 +89,7 @@ Pi 在 lexing 前把 Tab 展开成三个空格，native href 还可能保留 cha
 
 ## 维护者：兼容和生命周期边界
 
-- **Pi 版本号只用于诊断，不作为启用名单。** 每次 TUI 会话启动先检查实际运行时接口与行为；未知版本标签只要契约成立也会启用，普通升级不需要用户修改版本列表或逐版执行验收脚本。缺少/不可替换的 `Markdown.render`、`renderToken`、`renderInlineTokens`、`TuiAltScreen.handleViewportInput`，或具名行为检查失败时，仅停用复制/链接增强，保留原生 Markdown/Pi。同一扩展实例的同一失败只自动提示一次有界、具体的原因；`/copy-links` 显示兼容检查、探针耗时和当前动作登记是否可用。
+- **Pi 版本号只用于诊断，不作为启用名单。** 每次 TUI 会话启动先检查实际运行时接口与行为；未知版本标签只要契约成立也会启用，普通升级不需要用户修改版本列表或逐版执行验收脚本。缺少/不可替换的 `Markdown.render`、`renderToken`、`renderInlineTokens`、`TuiAltScreen.handleViewportInput`，或具名行为检查失败时，仅停用复制/链接增强，保留原生 Markdown/Pi。同一扩展实例的同一首要失败只自动提示一次有界、具体的原因；`/copy-links` 显示兼容检查、探针耗时和当前动作登记是否可用。启动后半段 UI/渲染失败也会先摘除并退役 adapter、释放鼠标 owner，再报告停用；清理继续尝试全部步骤，次要错误不替换首要原因。仍含私有 URI 的旧 frame 只保留既有最小被动 input guard，不保留活动 transformer/动作登记。
 - 启动探针复用生产 adapter 与当前 Pi 的类身份，但只安装到自有 Markdown/fullscreen 子类 prototype；不会在异步等待时临时改写共享 live prototype。自有 hook-owner 标记阻止已有 adapter 经 foreign wrapper 接管探针对象；复制使用独立的内存队列，所有 clipboard/opener/terminal 端点均为假实现，不启动终端、不调用 GUI/进程/tmux、不修改全局 theme/capabilities。退出时退役自有动作、取消 timer、恢复自有原始 descriptor，并核对真实运行时 descriptor 未变。通过后才重新捕获生产 hooks，执行原有四方法原子安装。
 - 有界探针覆盖 Tab/中文/行尾空格的精确代码、显式/引用网页及本地链接语义、动作和原生点击/拖选/wheel/overlay 路由、未知私有 URI containment 与清理；不会在启动时运行完整回归套件。先只将 Tab 换成三个空格，保持整份归一化源文不变并核对复制数据，再独立修改 href，最后改变宽度；不读取 token cache 字段。构造时尚未使用的 cache 值不参与准入，自有空白 fixture 建立 frame/尺寸/overlay 状态后检查实际原生 input 消费行为，允许真实 host 延迟初始化缓存。
 - 启动 fixture 使用真实 Markdown 渲染和 viewport input，frame/overlay 几何由自有 fixture 提供；它不验证真实 compositor 的缓存生产。原生 fullscreen start 会在部分图片能力分支修改进程级 capabilities，因此探针不启动终端，也不引入私有运行标志。完整原生 composition/lifecycle、懒初始化及能力分支由隔离回归/维护者 CI 验证。非 TUI 的 RPC/JSON/print 模式不探针、不安装 hooks。每次真实源文渲染仍重新对齐代码块/链接，有限 fixture 不能证明所有未来解析/布局变化；原生滚轮与 overlay 焦点仍交给 Pi。
