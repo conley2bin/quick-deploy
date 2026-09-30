@@ -14,7 +14,9 @@ import {
 
 // Pi has no public code-block renderer or pre-viewport mouse hook in these releases.
 // Keep the exact private surface here, reject unknown versions and restore on unload.
-export const SUPPORTED_PI = ["0.85.1", "0.86.1", "0.87.1"] as const;
+// 0.99.1 retains these hooks; its cached Markdown tokens are source-keyed and
+// its wheel acceleration stays inside the native input method we delegate to.
+export const SUPPORTED_PI = ["0.85.1", "0.86.1", "0.87.1", "0.99.1"] as const;
 interface Token { type: string; text?: string; lang?: string; href?: string; tokens?: Token[]; raw?: string }
 interface InlineStyle { applyText: (text: string) => string; stylePrefix: string }
 interface MarkdownRuntime {
@@ -1124,7 +1126,7 @@ export function installAdapter(options: AdapterOptions) {
   }
 
   function input(this: FullscreenRuntime, data: string) {
-    // Pi 0.87.1 dispatches the tmux CSI marker and SGR as successive calls.
+    // The supported fullscreen hosts dispatch the tmux CSI marker and SGR as successive calls.
     // Consume the marker before the non-SGR focus-cancellation path. A second
     // marker before a mouse event cannot replace the first client's identity.
     if (data.startsWith("\x1b[998;")) {

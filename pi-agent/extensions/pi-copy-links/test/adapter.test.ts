@@ -3,7 +3,7 @@ import test from "node:test";
 import { AssistantMessageComponent, getMarkdownTheme, initTheme, VERSION } from "@earendil-works/pi-coding-agent";
 import {
   getCapabilities, getOsc8LinkAtColumn, hyperlink, Markdown, setCapabilities, stripTerminalSequences,
-  TuiAltScreen, visibleWidth, type Terminal,
+  TuiAltScreen, visibleWidth, type MarkdownTheme, type Terminal,
 } from "@earendil-works/pi-tui";
 import { installAdapter, SUPPORTED_PI, type OpenOrigin } from "../src/adapter.ts";
 import type { OpenLifetime } from "../src/browser.ts";
@@ -183,6 +183,75 @@ test("native assistant buttons copy exact code, including nested tabs and no vis
       assert.equal(visibleWidth(screen(f.tui)[button.y]!), f.terminal.columns);
     } finally { f.close(); }
   }
+});
+
+test("Pi 0.99.1 source-keyed parsed tokens keep copies and links current across source, width and theme changes", async (t) => {
+  if (VERSION !== "0.99.1") {
+    t.skip("source-keyed parsed-token cache was added in Pi 0.99.1");
+    return;
+  }
+  const terminal = new FakeTerminal();
+  const copies: string[] = [], opened: string[] = [], nativeOpened: string[] = [];
+  const adapter = installAdapter({ version: VERSION, active: () => true,
+    copy: async (text) => { copies.push(text); }, cwd: () => "/fixture",
+    open: async (href) => { opened.push(href); }, notify: () => {}, button: (text) => text,
+    quiesce: () => {
+      tui.invalidate(); tui.renderNow(true);
+      return screen(tui).every((row) => !row.includes("pi-copy://"));
+    },
+  });
+  const source = "```make\ntarget:\n\techo done  \n```\n\n[WEB](https://example.com/?a=1&amp;b=2)";
+  const markdown = new Markdown(source, 1, 0, getMarkdownTheme(), undefined, {
+    transform: (text, availableWidth) => adapter.transform(text, {
+      messageType: "assistant", isStreaming: false, availableWidth,
+    }),
+  });
+  const tui = new TuiAltScreen(terminal, false, undefined, { openUrl: (url) => nativeOpened.push(url) });
+  const parsedCache = markdown as unknown as {
+    cachedTokens?: { source: string; tokens: unknown[] };
+    theme: MarkdownTheme;
+  };
+  const button = () => {
+    const found = targets(tui, "pi-copy://").filter((point) =>
+      stripTerminalSequences(screen(tui)[point.y]!).includes("[复制]"));
+    assert.equal(found.length, 1, "one visible source-aligned code button");
+    return found[0]!;
+  };
+  const web = () => {
+    const found = targets(tui, "pi-copy://").filter((point) =>
+      stripTerminalSequences(screen(tui)[point.y]!).includes("WEB"));
+    assert.equal(found.length, 1, "one source-aligned web link");
+    return found[0]!;
+  };
+  try {
+    tui.addChild(markdown); tui.start(); tui.renderNow(true);
+    const cachedTokens = parsedCache.cachedTokens?.tokens;
+    assert.ok(cachedTokens, "host parsed-token cache exists");
+    click(terminal, button()); await tick();
+    assert.deepEqual(copies, ["target:\n\techo done  "]);
+    click(terminal, web(), 16); await tick();
+    assert.deepEqual(opened, ["https://example.com/?a=1&b=2"]);
+
+    // Replacing a Tab by exactly three spaces preserves the host's normalized
+    // cache key but changes the only source-exact clipboard payload.
+    markdown.setText(source.replace("\techo", "   echo"));
+    terminal.columns = 42;
+    tui.renderNow(true);
+    assert.equal(parsedCache.cachedTokens?.tokens, cachedTokens, "new source reused the same native tokens");
+    click(terminal, button()); await tick();
+    assert.deepEqual(copies, ["target:\n\techo done  ", "target:\n   echo done  "]);
+    const theme = parsedCache.theme;
+    parsedCache.theme = { ...theme, codeBlockBorder: (text) => `\x1b[34m${theme.codeBlockBorder(text)}\x1b[39m` };
+    markdown.invalidate();
+    terminal.columns = 54;
+    tui.renderNow(true);
+    assert.equal(parsedCache.cachedTokens?.tokens, cachedTokens, "width/theme rerender reused parsed tokens");
+    click(terminal, button()); await tick();
+    click(terminal, web(), 16); await tick();
+    assert.deepEqual(copies, ["target:\n\techo done  ", "target:\n   echo done  ", "target:\n   echo done  "]);
+    assert.deepEqual(opened, ["https://example.com/?a=1&b=2", "https://example.com/?a=1&b=2"]);
+    assert.deepEqual(nativeOpened, [], "private URL never escaped to Pi's opener");
+  } finally { adapter.dispose(); tui.stop(); }
 });
 
 test("Pi 0.86.1 parser changes keep source blocks and reference URLs aligned", async (t) => {
@@ -1343,11 +1412,11 @@ test("dispose never clobbers a later input wrapper", () => {
 });
 
 test("unverified Pi versions refuse adaptation before any prototype changes", () => {
-  assert.deepEqual(SUPPORTED_PI, ["0.85.1", "0.86.1", "0.87.1"]);
+  assert.deepEqual(SUPPORTED_PI, ["0.85.1", "0.86.1", "0.87.1", "0.99.1"]);
   const originals = runtimeMethods();
   assert.throws(() => installAdapter({ version: '9.9.9', active: () => true,
     copy: async () => {}, cwd: () => '/fixture', open: async () => {}, notify: () => {}, button: s => s }),
-  /不支持 Pi 9\.9\.9；已验证版本：0\.85\.1、0\.86\.1、0\.87\.1；未修改渲染器/);
+  /不支持 Pi 9\.9\.9；已验证版本：0\.85\.1、0\.86\.1、0\.87\.1、0\.99\.1；未修改渲染器/);
   assert.deepEqual(runtimeMethods(), originals);
 });
 

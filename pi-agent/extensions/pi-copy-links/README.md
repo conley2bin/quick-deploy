@@ -89,7 +89,7 @@ Pi 在 lexing 前把 Tab 展开成三个空格，native href 还可能保留 cha
 
 ## 维护者：兼容和生命周期边界
 
-- 精确支持 **Pi 0.85.1、0.86.1 和 0.87.1**。其他版本会在改写任何 prototype 前拒绝；已验证版本若缺少 `Markdown.render`、`renderToken`、`renderInlineTokens` 或 `TuiAltScreen.handleViewportInput` 会指出具体方法。
+- 精确支持 **Pi 0.85.1、0.86.1、0.87.1 和 0.99.1**。其他版本会在改写任何 prototype 前拒绝；已验证版本若缺少 `Markdown.render`、`renderToken`、`renderInlineTokens` 或 `TuiAltScreen.handleViewportInput` 会指出具体方法。0.99.1 的解析 token 缓存按 Tab 归一化后的源文复用；扩展仍在每次源文渲染时重新核对代码块/链接语义，Tab 与三个空格的同屏显示不会混淆复制内容。新版滚轮加速与 overlay 焦点仍由 Pi 的原生 viewport 输入处理。
 - 公司本机网页启动先以自有 `spawn`（`shell: false`、有界输出、2.5 秒硬 deadline）执行 `xdg-settings get default-web-browser`，要求单个合法 desktop ID，再以 `xdg-settings check default-web-browser <id>` 确认 `yes`；只接受 `google-chrome.desktop` 并执行 `google-chrome-stable --new-window URL`。不读取 `BROWSER`、desktop entry `Exec`，不调用 `xdg-open`/`gio open` 或备用启动器。deadline/abort/输出溢出独立结算，detached 进程组先 TERM、200 ms 内 KILL；leader `exit` 不代表继承管道的 descendants 已完成，正常结算等待 child `close` 或两个输出流关闭。
 - 公司本机 Chrome/Code 使用参数数组、`shell: false`、`stdio: "ignore"`、detached 子进程。监听器安装、abort 脱钩与 `unref()` 成功才交接；spawn 后同步 handoff 失败先移除 observer，再 TERM+KILL 尚属扩展的组。已接受应用独立于后来代际 abort；可观测 lookup/权限/非零退出在动作仍有效时报告。
 - 一个 mounted Markdown 拥有其全部 copy/open/diagnostic action。所有动作都使用同一随机 `pi-copy://<nonce>/<sequence>` 内存命名空间；URI 不包含路径、命令或代码内容。
@@ -116,7 +116,7 @@ Pi 在 lexing 前把 Tab 展开成三个空格，native href 还可能保留 cha
 
 ```bash
 cd pi-agent/extensions/pi-copy-links
-npm ci --ignore-scripts
+npm ci --ignore-scripts --legacy-peer-deps
 npm run check
 
 python3 test/native-smoke.py
@@ -124,6 +124,8 @@ python3 test/native-smoke.py --osc52
 python3 test/native-smoke.py --tmux
 python3 test/native-smoke.py --tmux --regular-start
 ```
+
+`--legacy-peer-deps` 只用于测试依赖安装，避免 npm 自动装入与正在运行的 Pi 不同身份的 peer；`npm run check` 中的 `test/setup-pi.mjs` 核验并链接本机已安装的 Pi/TUI，发现不匹配的第二份运行时会拒绝执行。验收以实际 `pi` 的 bundled CLI 和上面的离线 PTY/recorder 为准，不用未打包入口代替。
 
 单元/集成测试覆盖代码源文、typed action failure atomicity、poisoned-generation clipboard queue、live cwd snapshot、Markdown recursion/table/reference、显式 web entity/reference 语义与 autolink disagreement、完整目标语法、symlink/type/existence、browser default 检测、硬 subprocess deadline 与 TERM/KILL 升级、transactional unref handoff、Chrome/Code argv、来源 PID 解析与客户端地址钉住、fake SSH JSON 协议/失败/abort/no-fallback、async retirement、selection/overlay/opener descriptor/tmux exact-target recovery/reload/quiescence。Native smoke 使用临时 Pi profile、真实 CLI/PTY 和 recorder executables：`wl-copy`、`xdg-settings`、`google-chrome-stable`、`code`；`xdg-open` 是失败 tripwire。它创建真实临时 `.3mf`、`.svg`、`.json` 和目录，只按显示 label 选择目标，不假定每个 `pi-copy://` 都是复制按钮。`--osc52` 模拟没有 tmux 来源的直接 SSH：复制仍通过 OSC52，链接明确拒绝且无公司 GUI 启动；其余模式测试本机打开。自动测试不会启动物理 Chrome/Code，也不会修改物理剪贴板。
 
