@@ -41,7 +41,3 @@
 `pi-copy-links` 提供代码块右下角复制按钮和 Ctrl+左键打开网页及公司文件；需使用 Pi 的 `fullscreen` 模式。它不修改全局设置，源码精确支持 Pi 0.85.1、0.86.1、0.87.1、0.99.1；更新源码后须在 Pi 空闲时手动 `/reload` 或重启才会生效，详见 [使用说明](extensions/pi-copy-links/README.md)。
 
 扩展测试在各自 `test/` 下，例如 `extensions/pi-suspend-guard/test/run.sh`、`extensions/pi-tmux-window-status/test/installer.sh`；`pi-copy-links` 使用 `npm run check`。
-
-## `pi-code-reasoning` 的 typebox dependency 告警
-
-`@feniix/pi-code-reasoning@5.1.0` 已归档，仍把 Pi 提供的 `typebox` 声明成普通依赖。可运行 `bash pi-agent/patches/pi-code-reasoning-5.1.0/apply.sh` 将其改为 `"*"` peer；脚本核对精确 manifest 哈希，保留其他依赖和配置。npm 重装或 Pi 扩展更新后可能需要重放。用法、版本边界及测试见[补丁说明](patches/pi-code-reasoning-5.1.0/README.md)。
