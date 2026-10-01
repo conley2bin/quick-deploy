@@ -539,7 +539,9 @@ qd_check_display_environment() {
         *'(x11)') pattern='^DISPLAY=.+';;
         *'(wayland)') pattern='^WAYLAND_DISPLAY=.+';;
     esac
-    systemctl --user show-environment | grep -qE "$pattern" \
+    # Drain to EOF: quiet grep can close after a match and give the producer
+    # SIGPIPE, falsely failing this probe under pipefail. Keep real errors.
+    systemctl --user show-environment | grep -E "$pattern" >/dev/null \
         || { qd_warn '用户服务没有匹配图形会话的 DISPLAY/WAYLAND_DISPLAY；请重新登录图形会话后运行'; return 1; }
 }
 qd_sunshine_binary() { dpkg -L sunshine | grep -E '/bin/sunshine$' | head -n1; }

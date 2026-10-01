@@ -14,6 +14,8 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import threading
+import time
 import unittest
 from unittest import mock
 
@@ -52,8 +54,13 @@ def read_state():
 argv = sys.argv[1:]
 record = {
     'argv': sys.argv,
-    'stdin': sys.stdin.read(),
+    'stdin': (sys.stdin.readline() if setting('FAKE_READ_STDIN') == '1' and argv and argv[0] == 'stream' else
+              (sys.stdin.read() if not sys.stdin.isatty() else '')),
     'lc_all': os.environ.get('LC_ALL'),
+    'pid': os.getpid(),
+    'display': os.environ.get('DISPLAY'),
+    'wayland_display': os.environ.get('WAYLAND_DISPLAY'),
+    'xauthority': os.environ.get('XAUTHORITY'),
 }
 with Path(os.environ['FAKE_LOG']).open('a', encoding='utf-8') as handle:
     handle.write(json.dumps(record) + '\\n')
@@ -76,7 +83,8 @@ if action == 'list':
         raise SystemExit(255)
     if forced == 'unpaired-zero':
         print('Computer 100.64.0.2 has not been paired. Please open Moonlight to pair before retrieving games list.', file=sys.stderr)
-        print('Desktop')
+        print('Name, ID, HDR Support, App Collection Game, Hidden, Direct Launch, Boxart URL')
+        print('"Desktop",123,false,false,false,false,"file:///box.png"')
         raise SystemExit(0)
     if forced in ('network', 'ambiguous', 'nonzero'):
         if forced == 'network':
@@ -92,9 +100,10 @@ if action == 'list':
         raise SystemExit(255)
     if paired:
         if setting('FAKE_NO_DESKTOP') == '1':
-            print('Steam Big Picture')
+            print('Name, ID, HDR Support, App Collection Game, Hidden, Direct Launch, Boxart URL')
+            print('"Steam Big Picture",456,false,false,false,false,"file:///box.png"')
         else:
-            print('Desktop')
+            print(setting('FAKE_CATALOGUE', 'Name, ID, HDR Support, App Collection Game, Hidden, Direct Launch, Boxart URL\\n"Desktop",123,false,false,false,false,"file:///box.png"'))
     raise SystemExit(0)
 if action == 'pair':
     print('FAKE PAIR STARTED', file=sys.stderr)
@@ -104,7 +113,19 @@ if action == 'pair':
         Path(os.environ['FAKE_STATE']).write_text(json.dumps(state))
     raise SystemExit(int(setting('FAKE_PAIR_EXIT', '0')))
 if action == 'stream':
+    import time
+    state = read_state()
+    if setting('FAKE_QUICK_EXIT') != '1':
+        state['active'] = True
+        Path(os.environ['FAKE_STATE']).write_text(json.dumps(state))
+        time.sleep(float(setting('FAKE_STREAM_HOLD', '0.35')))
     raise SystemExit(int(setting('FAKE_STREAM_EXIT', setting('FAKE_EXIT', '0'))))
+if action == 'quit':
+    if setting('FAKE_QUIT_EFFECT', 'close') == 'close':
+        state = read_state()
+        state['active'] = False
+        Path(os.environ['FAKE_STATE']).write_text(json.dumps(state))
+    raise SystemExit(int(setting('FAKE_QUIT_EXIT', '0')))
 raise SystemExit(int(setting('FAKE_EXIT', '0')))
 """
 
@@ -157,7 +178,169 @@ Host laptop-alias
 """
 
 
-class RunServerTests(unittest.TestCase):
+STREAM_ARGS = ["stream", "--resolution", "2560x1440", "--fps", "60", "--bitrate", "8889",
+               "--display-mode", "borderless", "--video-codec", "auto", "--no-hdr",
+               "--no-yuv444", "--no-quit-after", "--", "100.64.0.2:47989", "Desktop"]
+
+# Test-only controller effect model. Records never serialize capabilities.
+# Production transport/UI siblings are intentionally NOT copied or reimplemented.
+FAKE_CONTROLLER = r'''
+import json, os
+from pathlib import Path
+CAP = 'b' * 64
+UUID = '00000000-0000-0000-0000-000000000001'
+SNAP = 'a' * 64
+class ControllerError(Exception):
+    def __init__(self, code, remote_refusal=True):
+        self.code, self.remote_refusal = code, remote_refusal
+        super().__init__('sanitized fixture controller error')
+class ControllerTransport:
+    def __init__(self, ssh_target, ssh_port, target, *, runner=None):
+        self.target = target
+        self.path = Path(os.environ['FAKE_CONTROL_STATE'])
+        self.log = Path(os.environ['FAKE_CONTROL_LOG'])
+        with self.log.open('a') as f:
+            f.write(json.dumps({'action':'construct','ssh':ssh_target,'port':ssh_port,'target':target})+'\n')
+    def call(self, action, **fields):
+        state = json.loads(self.path.read_text()) if self.path.exists() else {
+            'revision':1,'phase':'available','uncertainty':None,'attempt_revision':None}
+        def save():
+            self.path.write_text(json.dumps(state))
+        def ticket():
+            return {k:state[k] for k in ('revision','phase','uncertainty','attempt_revision')}
+        display = {'id':'kms:card1:DP-3','label':'Actual display','selectable':True,
+                   'connected':True,'width':2560,'height':1440,'refresh_num':60000,'refresh_den':1000,
+                   'requested_fps':60,'rotation':0}
+        if state.get('refreshed'):
+            display['id'] = 'kms:card1:HDMI-A-2'
+            display['label'] = 'Refreshed actual display'
+        moon = Path(os.environ['FAKE_STATE'])
+        active = (json.loads(moon.read_text()).get('active',False) if moon.exists() else False)
+        record = {'action':action, 'revision':fields.get('revision'),
+                  'snapshot':fields.get('snapshot'), 'display_id':fields.get('display_id'),
+                  'active_before':active}
+        with self.log.open('a') as f:
+            f.write(json.dumps(record)+'\n')
+        if action not in ('list','status'):
+            if fields.get('revision') != state['revision']:
+                raise ControllerError('stale_revision')
+            if action != 'acquire' and fields.get('capability') != CAP:
+                raise ControllerError('owner_mismatch')
+        if os.environ.get('FAKE_REFUSE_ACTION') == action:
+            if os.environ.get('FAKE_REFUSE_DIRTY') == '1':
+                state.update(phase='reconciliation_required', uncertainty='runtime_changed')
+                state['revision'] += 1
+                save()
+            raise ControllerError(os.environ.get('FAKE_REFUSE_CODE','backend_unavailable'))
+        if action in ('list','status'):
+            result = {**ticket(),'target':self.target,'host_uniqueid':UUID,
+                      'activity':'busy' if active else 'idle_application'}
+            if action == 'list':
+                result.update(screens=[display], snapshot=SNAP,selection_ready=state['phase']=='available' and not active)
+                if os.environ.get('FAKE_BUSY') == '1':
+                    result.update(activity='busy',selection_ready=False)
+                if os.environ.get('FAKE_UNREADY') == '1':
+                    result.update(phase='reconciliation_required',uncertainty='needs_onboarding',selection_ready=False)
+            else:
+                result['sampling'] = 'ownership'
+                if os.environ.get('FAKE_WRONG_STATUS_HOST') == '1':
+                    result['host_uniqueid'] = '00000000-0000-0000-0000-000000000002'
+        elif action == 'acquire':
+            if os.environ.get('FAKE_ACQUIRE_RACE') == '1' and not state.get('acquire_race'):
+                state['acquire_race'] = True
+                save()
+                raise ControllerError('stale_snapshot')
+            assert state['phase'] == 'available' and fields['snapshot'] == SNAP
+            state.update(phase='selecting')
+            state['revision'] += 1
+            result = {**ticket(),'capability':CAP,'snapshot':SNAP}
+        elif action == 'refresh':
+            assert state['phase'] == 'selecting'
+            state['refreshed'] = True
+            display.update(id='kms:card1:HDMI-A-2',label='Refreshed actual display')
+            state['revision'] += 1
+            result = {**ticket(),'capability':CAP,'snapshot':'c'*64,'screens':[display]}
+        elif action == 'prepare':
+            assert state['phase'] == 'selecting'
+            if os.environ.get('FAKE_STALE') == '1' and not state.get('refreshed'):
+                raise ControllerError('stale_snapshot')
+            assert fields['snapshot'] == ('c'*64 if state.get('refreshed') else SNAP)
+            assert fields['display_id'] == display['id']
+            state['revision'] += 2
+            state.update(phase='preparing')
+            result = {**ticket(),'capability':CAP,'display':display,'snapshot':SNAP,
+                      'launch_authorized':True,'desktop_title':'Desktop','desktop_app_id':123}
+        elif action == 'launch':
+            assert state['phase'] == 'preparing' and not active
+            state['revision'] += 1
+            state.update(phase='connecting',attempt_revision=state['revision'])
+            result = {**ticket(),'capability':CAP,'desktop_title':'Desktop','desktop_app_id':123,
+                      'display':display,'quit_policy':'explicit_quit'}
+        elif action == 'observe_active':
+            assert state['phase'] == 'connecting'
+            if not active:
+                raise ControllerError('launch_unconfirmed')
+            state['revision'] += 1
+            state['phase'] = 'active'
+            result = {**ticket(),'capability':CAP}
+        elif action == 'begin_release':
+            assert state['phase'] == 'active' and active
+            state['phase'] = 'releasing'
+            state['revision'] += 1
+            result = {**ticket(),'capability':CAP}
+        elif action == 'finish_release':
+            assert state['phase'] == 'releasing'
+            if active:
+                raise ControllerError('host_busy')
+            state['phase'] = 'available'
+            state['attempt_revision'] = None
+            state['revision'] += 1
+            result = {**ticket(),'closure_basis':'same_generation_owned_desktop_cancelled'}
+        elif action == 'abort':
+            assert state['phase'] in ('selecting','preparing') and state['attempt_revision'] is None
+            state['revision'] += 1
+            state['phase'] = 'available'
+            result = ticket()
+        elif action == 'control_lost':
+            state.update(phase='reconciliation_required',uncertainty='owner_lost')
+            state['revision'] += 1
+            result = ticket()
+        else:
+            raise AssertionError('unexpected action')
+        save()
+        if os.environ.get('FAKE_SIGNAL_ACTION') == action:
+            import signal
+            os.kill(os.getpid(), signal.SIGTERM)
+        if os.environ.get('FAKE_LOST_ACTION') == action:
+            raise ControllerError('timeout',False)
+        return {'version':1,'ok':True,'action':action,**result}
+'''
+
+FAKE_PICKER = r'''
+import json, os
+from pathlib import Path
+class ScreenPickerError(Exception):
+    pass
+
+def choose_screen(screens, *, title=None, input_stream=None, output_stream=None):
+    path = Path(os.environ['FAKE_PICK_LOG'])
+    previous = path.read_text().splitlines() if path.exists() else []
+    with path.open('a') as f:
+        f.write(json.dumps({'screens':screens,'title':title})+'\n')
+    mode = os.environ.get('FAKE_PICK','first')
+    if mode == 'cancel' or (mode == 'cancel-refresh' and previous):
+        return None
+    if mode == 'interrupt':
+        raise KeyboardInterrupt()
+    if mode == 'error':
+        raise ScreenPickerError('private irrelevant error')
+    if mode == 'wrong':
+        return 'kms:card1:NOT_IN_MENU'
+    return screens[0]['id']
+'''
+
+
+class ConnectorFixture:
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory(prefix="qd run server ")
         self.root = Path(self.tmp.name)
@@ -167,6 +350,10 @@ class RunServerTests(unittest.TestCase):
         shutil.copy2(MODULE / "run_server.sh", self.module / "run_server.sh")
         shutil.copy2(MODULE / "service/run-server.py", self.module / "service/run-server.py")
         shutil.copy2(MODULE / "lib/machines_inventory.py", self.module / "lib/machines_inventory.py")
+        shutil.copy2(MODULE / "lib/display_client.py", self.module / "lib/display_client.py")
+        # These adapters are TEST-ONLY effects, not sibling transport/picker code.
+        (self.module / "lib/display_transport.py").write_text(FAKE_CONTROLLER)
+        (self.module / "lib/screen_picker.py").write_text(FAKE_PICKER)
         self.default = self.module / "machines.yaml"
         self.legacy = self.module / "machines.local.yaml"
         self.stale = self.module / "machines.example.yaml"
@@ -174,6 +361,9 @@ class RunServerTests(unittest.TestCase):
         self.bin = self.root / "fake bin"
         self.log = self.root / "program.json"
         self.state = self.root / "fake state.json"
+        self.control_state = self.root / "control state.json"
+        self.control_log = self.root / "control log.jsonl"
+        self.pick_log = self.root / "picker log.jsonl"
         self.browser_log = self.root / "browser.log"
         self.tailscale_log = self.root / "tailscale.log"
         self.home.mkdir()
@@ -184,11 +374,24 @@ class RunServerTests(unittest.TestCase):
             PATH=f"{self.bin}:{os.environ['PATH']}",
             FAKE_LOG=str(self.log),
             FAKE_STATE=str(self.state),
+            FAKE_CONTROL_STATE=str(self.control_state),
+            FAKE_CONTROL_LOG=str(self.control_log),
+            FAKE_PICK_LOG=str(self.pick_log),
+            TMPDIR=str(self.root),
+            PYTHONDONTWRITEBYTECODE="1",
             FAKE_BROWSER_LOG=str(self.browser_log),
             FAKE_TAILSCALE_LOG=str(self.tailscale_log),
         )
         self.write_program(self.home / ".local/bin/moonlight", FAKE_MOONLIGHT)
-        self.write_program(self.bin / "ssh")
+        self.write_program(self.bin / "ssh", FAKE_PROGRAM.replace(
+            "raise SystemExit(int", "if os.environ.get('FAKE_ALLOW_SSH') != '1': raise SystemExit(97)\nraise SystemExit(int"))
+        # Every fixture Python child rejects real network before module imports.
+        (self.bin / "sitecustomize.py").write_text(
+            "import socket\n"
+            "def forbidden(*a, **k): raise AssertionError('REAL NETWORK TRIPWIRE')\n"
+            "socket.socket.connect = forbidden\nsocket.socket.connect_ex = forbidden\n"
+            "socket.create_connection = forbidden\nsocket.getaddrinfo = forbidden\n")
+        self.env['PYTHONPATH'] = str(self.bin)
         for browser in ("xdg-open", "sensible-browser"):
             self.write_program(self.bin / browser, FAKE_BROWSER)
         self.write_program(self.bin / "tailscale", FAKE_TAILSCALE)
@@ -245,24 +448,55 @@ class RunServerTests(unittest.TestCase):
     def ssh_bytes(self) -> dict[str, bytes]:
         return {path.name: path.read_bytes() for path in sorted((self.home / ".ssh").iterdir())}
 
-    def invoke(self, *args: str, cwd: Path | None = None, stdin: str = "", exit_code: int = 0, extra_env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+    def invoke(self, *args: str, cwd: Path | None = None, stdin: str = "", exit_code: int = 0, extra_env: dict[str, str] | None = None, terminal: bool | None = None) -> subprocess.CompletedProcess[str]:
         self.log.unlink(missing_ok=True)
         env = dict(self.env, FAKE_EXIT=str(exit_code), **(extra_env or {}))
-        return subprocess.run(
-            [str(self.module / "run_server.sh"), *args],
-            cwd=cwd or self.root,
-            env=env,
-            input=stdin,
-            text=True,
-            capture_output=True,
-            check=False,
-        )
+        command = [str(self.module / "run_server.sh"), *args]
+        if "--ssh" in args:
+            env['FAKE_ALLOW_SSH'] = '1'
+        if terminal is None:
+            terminal = not any(arg in args for arg in ("--ssh", "--list", "--help"))
+        if not terminal:
+            return subprocess.run(command, cwd=cwd or self.root, env=env,
+                                  input=stdin, text=True, capture_output=True, check=False, timeout=15)
+        # REAL shell/Python entrypoint: stdin AND picker output must be TTY.
+        # A private PTY + injected picker isolates orchestration, not UI.
+        import pty
+        master, slave = pty.openpty()
+        stderr = bytearray()
+        env['FAKE_READ_STDIN'] = '1' if stdin else '0'
+        child = subprocess.Popen(command, cwd=cwd or self.root, env=env,
+                                 stdin=slave, stdout=subprocess.PIPE, stderr=slave)
+        os.close(slave)
+        def drain():
+            while True:
+                try:
+                    data = os.read(master, 4096)
+                except OSError:
+                    return
+                if not data:
+                    return
+                stderr.extend(data)
+        reader = threading.Thread(target=drain, daemon=True)
+        reader.start()
+        if stdin:
+            os.write(master, stdin.encode())
+        try:
+            stdout, _ = child.communicate(timeout=15)
+            reader.join(timeout=2)
+            return subprocess.CompletedProcess(command, child.returncode, stdout.decode(),
+                                               stderr.decode('utf-8', 'replace').replace('\r\n', '\n'))
+        finally:
+            if child.poll() is None:
+                child.kill()
+                child.wait()
+            os.close(master)
 
     def records(self) -> list[dict[str, object]]:
         return [json.loads(line) for line in self.log.read_text().splitlines() if line.strip()]
 
     def recorded(self) -> dict[str, object]:
-        return self.records()[-1]
+        return next((r for r in self.records() if r["argv"][1] == "stream"), self.records()[-1])
 
     def actions(self) -> list[str]:
         return [str(record["argv"][1]) for record in self.records()]
@@ -291,12 +525,14 @@ class RunServerTests(unittest.TestCase):
             self.tailscale_log.read_text() if self.tailscale_log.exists() else "",
         )
 
+
+class RunServerTests(ConnectorFixture, unittest.TestCase):
     def test_default_moonlight_exact_argv_stdin_and_exit(self) -> None:
         self.write_default()
         result = self.invoke("desktop", stdin="stdin remains attached\n", exit_code=23)
         self.assertEqual(result.returncode, 23, result.stderr)
         record = self.recorded()
-        self.assertEqual(record["argv"][1:], ["stream", "--", "100.64.0.2:47989", "Desktop"])
+        self.assertEqual(record["argv"][1:], STREAM_ARGS)
         self.assertEqual(record["stdin"], "stdin remains attached\n")
         self.assert_no_tailscale()
 
@@ -306,7 +542,7 @@ class RunServerTests(unittest.TestCase):
         (config_dir / "custom inventory.yaml").write_text(textwrap.dedent(VALID))
         result = self.invoke("--config", "custom inventory.yaml", "--moonlight", "laptop", cwd=config_dir)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.recorded()["argv"][1:], ["stream", "--", "100.64.0.3:48000", "Desktop"])
+        self.assertEqual(self.recorded()["argv"][1:], STREAM_ARGS[:-2] + ["100.64.0.3:48000", "Desktop"])
         self.assertFalse(self.default.exists())
 
         missing = config_dir / "absent inventory.yaml"
@@ -421,7 +657,7 @@ class RunServerTests(unittest.TestCase):
         self.assertEqual(result.stdout.splitlines(), ["desktop", "laptop"])
         result = self.invoke("--config=-inventory.yaml", "--moonlight", "desktop", cwd=config_dir)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.recorded()["argv"][1:], ["stream", "--", "100.64.0.2:47989", "Desktop"])
+        self.assertEqual(self.recorded()["argv"][1:], STREAM_ARGS)
 
         self.assertFalse(self.default.exists())
         self.assertFalse(self.legacy.exists())
@@ -479,7 +715,7 @@ class RunServerTests(unittest.TestCase):
         self.assertEqual(result.stdout.splitlines(), ["desktop"])
         result = self.invoke("--moonlight", "desktop")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.recorded()["argv"][1:], ["stream", "--", "100.64.0.10:47989", "Desktop"])
+        self.assertEqual(self.recorded()["argv"][1:], STREAM_ARGS[:-2] + ["100.64.0.10:47989", "Desktop"])
         # Editing this file in place is the documented next step after one install.
         self.write_default()
         result = self.invoke("--list")
@@ -613,7 +849,7 @@ class RunServerTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         result = self.invoke("--moonlight", "desktop")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.recorded()["argv"][1:], ["stream", "--", "100.64.0.2:47989", "Desktop"])
+        self.assertEqual(self.recorded()["argv"][1:], STREAM_ARGS)
         result = self.invoke("--ssh", "laptop", exit_code=17)
         self.assertEqual(result.returncode, 17, result.stderr)
         # The alias is passed through verbatim; the connector never resolves it from ~/.ssh/config.
@@ -698,10 +934,10 @@ machines:
         self.write_default()
         result = self.invoke("desktop", stdin="stream stdin\n", exit_code=23)
         self.assertEqual(result.returncode, 23, result.stderr)
-        self.assertEqual(self.actions(), ["list", "stream"])
-        self.assertEqual(self.records()[0]["argv"][1:], ["list", "--", "100.64.0.2:47989"])
-        self.assertEqual(self.records()[-1]["argv"][1:], ["stream", "--", "100.64.0.2:47989", "Desktop"])
-        self.assertEqual(self.records()[-1]["stdin"], "stream stdin\n")
+        self.assertEqual(self.actions(), ["list", "stream", "quit"])
+        self.assertEqual(self.records()[0]["argv"][1:], ["list", "--csv", "--", "100.64.0.2:47989"])
+        self.assertEqual(self.recorded()["argv"][1:], STREAM_ARGS)
+        self.assertEqual(self.recorded()["stdin"], "stream stdin\n")
         self.assertNotIn("PIN", result.stdout + result.stderr)
         self.assert_no_browser()
         self.assert_no_tailscale()
@@ -736,7 +972,7 @@ machines:
         result = self.invoke("desktop", stdin="stream stdin\n", exit_code=23)
         self.assertEqual(result.returncode, 23, result.stderr)
         self.assertEqual(self.records()[0]["stdin"], "")
-        self.assertEqual(self.records()[-1]["stdin"], "stream stdin\n")
+        self.assertEqual(self.recorded()["stdin"], "stream stdin\n")
 
     def test_unpaired_host_prints_pin_url_steps_then_pairs_confirms_and_streams(self) -> None:
         inventory = self.write_default()
@@ -744,8 +980,8 @@ machines:
         module_before = self.module_snapshot()
         result = self.invoke("desktop", extra_env={"FAKE_INITIAL_PAIRED": "0"})
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.actions(), ["list", "pair", "list", "stream"])
-        self.assertEqual(self.records()[0]["argv"][1:], ["list", "--", "100.64.0.2:47989"])
+        self.assertEqual(self.actions(), ["list", "pair", "list", "stream", "quit"])
+        self.assertEqual(self.records()[0]["argv"][1:], ["list", "--csv", "--", "100.64.0.2:47989"])
 
         match = PIN.search(result.stderr)
         self.assertIsNotNone(match, result.stderr)
@@ -754,8 +990,8 @@ machines:
         # Exact Qt6.1 grammar: pair host is positional after `--`, --pin carries the PIN.
         self.assertEqual(self.records()[1]["argv"][1:], ["pair", "--pin", pin, "--", "100.64.0.2:47989"])
         # The confirmation list is a fresh query after pair, before stream.
-        self.assertEqual(self.records()[2]["argv"][1:], ["list", "--", "100.64.0.2:47989"])
-        self.assertEqual(self.records()[3]["argv"][1:], ["stream", "--", "100.64.0.2:47989", "Desktop"])
+        self.assertEqual(self.records()[2]["argv"][1:], ["list", "--csv", "--", "100.64.0.2:47989"])
+        self.assertEqual(self.records()[3]["argv"][1:], STREAM_ARGS)
 
         # Terminal guidance: target, Web UI (base+1), PIN, numbered remote/local steps.
         self.assertIn("100.64.0.2:47989", result.stderr)
@@ -776,10 +1012,10 @@ machines:
         self.write_default()
         result = self.invoke("laptop", extra_env={"FAKE_INITIAL_PAIRED": "0"})
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.actions(), ["list", "pair", "list", "stream"])
-        self.assertEqual(self.records()[0]["argv"][1:], ["list", "--", "100.64.0.3:48000"])
+        self.assertEqual(self.actions(), ["list", "pair", "list", "stream", "quit"])
+        self.assertEqual(self.records()[0]["argv"][1:], ["list", "--csv", "--", "100.64.0.3:48000"])
         self.assertEqual(self.records()[1]["argv"][4:], ["--", "100.64.0.3:48000"])
-        self.assertEqual(self.records()[3]["argv"][1:], ["stream", "--", "100.64.0.3:48000", "Desktop"])
+        self.assertEqual(self.records()[3]["argv"][1:], STREAM_ARGS[:-2] + ["100.64.0.3:48000", "Desktop"])
         self.assertIn("https://100.64.0.3:48001", result.stderr)
 
     def test_pair_without_confirmed_state_never_streams(self) -> None:
@@ -809,13 +1045,13 @@ machines:
         self.write_default()
         result = self.invoke("desktop", extra_env={"FAKE_INITIAL_PAIRED": "0", "FAKE_PAIR_EXIT": "9"})
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.actions(), ["list", "pair", "list", "stream"])
+        self.assertEqual(self.actions(), ["list", "pair", "list", "stream", "quit"])
 
     def test_zero_exit_with_unpaired_text_does_not_trigger_pair(self) -> None:
         self.write_default()
         result = self.invoke("desktop", extra_env={"FAKE_LIST_MODE": "unpaired-zero"})
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.actions(), ["list", "stream"])
+        self.assertEqual(self.actions(), ["list", "stream", "quit"])
         self.assertNotIn("pair", result.stderr)
 
     def test_unclassified_list_results_stop_before_pair_and_stream(self) -> None:
@@ -847,7 +1083,7 @@ machines:
         self.write_default()
         result = self.invoke("desktop", extra_env={"FAKE_LIST_MODE": "unpaired-zh", "FAKE_INITIAL_PAIRED": "0"})
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.actions(), ["list", "pair", "list", "stream"])
+        self.assertEqual(self.actions(), ["list", "pair", "list", "stream", "quit"])
 
     def test_classification_query_is_locale_pinned_but_pair_and_stream_do_not_change_environment(self) -> None:
         self.write_default()

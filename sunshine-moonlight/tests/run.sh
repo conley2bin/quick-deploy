@@ -1,8 +1,15 @@
 #!/bin/bash
-# Isolated HOME/PATH fixtures. Only the dummy .deb test invokes real apt, with --simulate.
+# Isolated HOME/PATH fixtures; --fixtures-only omits legacy native host probes.
 set -euo pipefail
 TESTS_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 MODULE_DIR="$(dirname "$TESTS_DIR")"
+FIXTURES_ONLY=false
+case "${1:-}" in
+    '') [ "$#" -eq 0 ] || { echo 'Unexpected test argument' >&2; exit 2; };;
+    --fixtures-only) [ "$#" -eq 1 ] || exit 2; FIXTURES_ONLY=true;;
+    -h|--help) printf 'Usage: tests/run.sh [--fixtures-only]\n--fixtures-only skips real APT simulation and systemd static probes; all installer mutations use temporary fixtures.\n'; exit 0;;
+    *) printf 'Unknown test option: %s\n' "$1" >&2; exit 2;;
+esac
 export QD_TEST_BINDING_HELPER="$MODULE_DIR/service/check-tailnet.py"
 BASE_PATH="$PATH"
 ORIGINAL_HOME="$HOME"
@@ -90,6 +97,15 @@ make_module_copy() {
     MODULE_COPY="$CASE/${1:-module copy}/sunshine-moonlight"
     mkdir -p "$MODULE_COPY"
     cp -a "$MODULE_DIR/install.sh" "$MODULE_DIR/run_server.sh" "$MODULE_DIR/commands" "$MODULE_DIR/lib" "$MODULE_DIR/service" "$MODULE_COPY/"
+    # Historical vendor fixtures use an older synthetic package, not the
+    # companion's supported build. Inject ONLY this new root publication stage;
+    # display_install.py separately exercises the real qualifier/installer.
+    cat >"$MODULE_COPY/commands/install-display-control.sh" <<'COMPANION_FIXTURE'
+#!/bin/bash
+printf 'display-control fixture-stage args=%s\n' "$*" >>"$CASE/log"
+exit "${MOCK_COMPANION_FAIL:-0}"
+COMPANION_FIXTURE
+    chmod +x "$MODULE_COPY/commands/install-display-control.sh"
 }
 run_install() {
     RC=0
@@ -195,7 +211,7 @@ cat >squashfs-root/usr/bin/moonlight <<'MOONLIGHT'
 #!/bin/sh
 case "${1:-}" in
 list) printf 'Desktop\n' ;;
-stream) printf 'fixture only\n' ;;
+stream) printf 'fixture-stream-dispatch\n' >>"$CASE/log"; printf 'fixture only\n' ;;
 *) exit 1 ;;
 esac
 MOONLIGHT
@@ -432,6 +448,11 @@ for path in "$@"; do
 done
 exec /usr/bin/rm "$@"
 MOCK
+    cat >"$CASE/bin/ssh" <<'MOCK'
+#!/bin/bash
+printf 'forbidden-ssh-dispatch\n' >>"$CASE/log"
+exit 99
+MOCK
     cat >"$CASE/bin/sleep" <<'MOCK'
 #!/bin/bash
 exit 0
@@ -444,18 +465,24 @@ MOCK
 }
 
 # Packaging: real apt suffix classification, actual deb metadata and Debian ordering.
-new_case
-make_deb qd-sunshine-audit-fixture all 1
-cp "$CASE/fixtures/sunshine.deb" "$CASE/extensionless"
-real_rc=0
-LC_ALL=C /usr/bin/apt-get --simulate install "$CASE/extensionless" >"$CASE/apt-out" 2>&1 || real_rc=$?
-check 'real apt rejects extensionless valid deb' test "$real_rc" -eq 100
-check 'real apt identifies filename failure' contains "$CASE/apt-out" 'Unsupported file'
-real_rc=0
-LC_ALL=C /usr/bin/apt-get --simulate install "$CASE/fixtures/sunshine.deb" >"$CASE/apt-out" 2>&1 || real_rc=$?
-check 'real apt accepts same deb bytes with suffix' test "$real_rc" -eq 0
-check 'real apt selected only dummy package' contains "$CASE/apt-out" 'Inst qd-sunshine-audit-fixture'
-end_case
+# Keep the marker above: binding.py extracts only the fixture definitions before
+# it. --fixtures-only skips this native probe without changing that harness seam.
+if [ "$FIXTURES_ONLY" = true ]; then
+    printf 'SKIP real APT suffix simulation (--fixtures-only)\n'
+else
+    new_case
+    make_deb qd-sunshine-audit-fixture all 1
+    cp "$CASE/fixtures/sunshine.deb" "$CASE/extensionless"
+    real_rc=0
+    LC_ALL=C /usr/bin/apt-get --simulate install "$CASE/extensionless" >"$CASE/apt-out" 2>&1 || real_rc=$?
+    check 'real apt rejects extensionless valid deb' test "$real_rc" -eq 100
+    check 'real apt identifies filename failure' contains "$CASE/apt-out" 'Unsupported file'
+    real_rc=0
+    LC_ALL=C /usr/bin/apt-get --simulate install "$CASE/fixtures/sunshine.deb" >"$CASE/apt-out" 2>&1 || real_rc=$?
+    check 'real apt accepts same deb bytes with suffix' test "$real_rc" -eq 0
+    check 'real apt selected only dummy package' contains "$CASE/apt-out" 'Inst qd-sunshine-audit-fixture'
+    end_case
+fi
 
 new_case
 run commands/install-host.sh
@@ -835,8 +862,26 @@ end_case
 
 # New recovery checks reuse only these isolated fixtures.
 . "$TESTS_DIR/retry.sh"
+check 'environment EOF consumption, producer errors and session matching' python3 -B "$TESTS_DIR/environment_probe.py"
 check 'native binding semantics and byte-preserving rewrite' python3 "$TESTS_DIR/binding.py"
-check 'real prestart guard and retry time model' python3 "$TESTS_DIR/retry.py"
+if [ "$FIXTURES_ONLY" = true ]; then
+    # retry.py's two native analyzer tests already explicitly skip when that
+    # dependency is absent. Inject only its absence, never a false native pass.
+    run_retry_fixtures() {
+        python3 - "$TESTS_DIR/retry.py" <<'PY_RETRY_FIXTURES'
+import runpy, sys, unittest
+from unittest import mock
+module = runpy.run_path(sys.argv[1])
+original = module['shutil'].which
+with mock.patch.object(module['shutil'], 'which', side_effect=lambda name, **kw: None if name == 'systemd-analyze' else original(name, **kw)):
+    result = unittest.TextTestRunner(verbosity=2).run(unittest.defaultTestLoader.loadTestsFromTestCase(module['RetryTests']))
+raise SystemExit(not result.wasSuccessful())
+PY_RETRY_FIXTURES
+    }
+    check 'prestart guard and retry model (native analyzer skipped)' run_retry_fixtures
+else
+    check 'real prestart guard and retry time model' python3 "$TESTS_DIR/retry.py"
+fi
 
 # Client extraction, pins/provenance, ownership and interrupted replacement.
 new_case; client_fixture; run commands/install-client.sh
@@ -958,6 +1003,8 @@ check 'combined installer succeeds' test "$RC" -eq 0
 check 'combined installer invokes host before client' test "$(grep -n 'api.github.com/repos/LizardByte/Sunshine' "$CASE/log" | head -1 | cut -d: -f1)" -lt "$(grep -n 'Moonlight-6.1.0-x86_64.AppImage' "$CASE/log" | head -1 | cut -d: -f1)"
 check 'combined installer selects KMS capture' grep -Fxq 'capture = kms' "$QD_SUNSHINE_CONFIG_DIR/sunshine.conf"
 check 'combined installer creates client wrapper' test -x "$HOME/.local/bin/moonlight"
+check 'companion follows successful client before inventory' test "$(grep -n '^display-control fixture-stage' "$CASE/log" | cut -d: -f1)" -gt "$(grep -n 'Moonlight-6.1.0-x86_64.AppImage' "$CASE/log" | head -1 | cut -d: -f1)"
+check 'default root never opts into privileged shim publication' absent "$CASE/log" '--publish-shim'
 check 'combined installer skips apt when system Python has PyYAML' absent "$CASE/log" 'apt-get install -y python3-yaml'
 check 'client ownership marker keeps historic bytes' grep -Fxq '# Managed by quick-deploy/sunshine-moonlight/install-client.sh' "$HOME/.local/bin/moonlight"
 check 'combined installer retains existing inventory bytes' cmp -s "$CASE/user-before" "$MODULE_COPY/machines.yaml"
@@ -985,6 +1032,7 @@ write_expected_inventory
 run_install --host-only
 check 'host-only installer succeeds' test "$RC" -eq 0
 check 'host-only installer skips client' test ! -e "$HOME/.local/bin/moonlight"
+check 'host-only installer reaches independent companion' contains "$CASE/log" 'display-control fixture-stage'
 check 'host-only installer creates absent module inventory' cmp -s "$CASE/expected-inventory" "$MODULE_COPY/machines.yaml"
 check 'host-only installer reports new template' contains "$CASE/out" '已新建全字段中文占位清单 machines.yaml'
 check 'host-only installer creates no legacy inventory' test ! -e "$MODULE_COPY/machines.local.yaml"
@@ -995,6 +1043,7 @@ write_expected_inventory
 run_install --client-only
 check 'client-only installer succeeds' test "$RC" -eq 0
 check 'client-only installer skips host' test ! -s "$CASE/version"
+check 'client-only installer skips host companion' absent "$CASE/log" 'display-control fixture-stage'
 check 'client-only installer creates absent module inventory' cmp -s "$CASE/expected-inventory" "$MODULE_COPY/machines.yaml"
 check 'client-only installer creates no legacy inventory' test ! -e "$MODULE_COPY/machines.local.yaml"
 end_case
@@ -1023,6 +1072,20 @@ check 'host failure leaves client unstarted' test ! -e "$HOME/.local/bin/moonlig
 check 'host failure makes zero Moonlight metadata calls' test "$(grep -c 'moonlight-stream/moonlight-qt' "$CASE/log")" -eq 0
 check 'host failure reports partial-completion boundary' contains "$CASE/out" 'Moonlight 客户端未开始'
 check 'host failure generates no inventory' test ! -e "$MODULE_COPY/machines.yaml"
+end_case
+
+new_case; make_module_copy; client_fixture; system_python_fixture; export QD_TEST_YAML_AVAILABLE=1 MOCK_COMPANION_FAIL=1
+run_install
+check 'companion failure stops inventory finalization' test "$RC" -ne 0
+check 'companion failure reports successful vendor boundary' contains "$CASE/out" 'vendor 阶段已成功'
+check 'companion failure creates no inventory' test ! -e "$MODULE_COPY/machines.yaml"
+check 'companion failure retains installed client' test -x "$HOME/.local/bin/moonlight"
+end_case
+
+new_case; make_module_copy; system_python_fixture; export QD_TEST_YAML_AVAILABLE=1
+run_install --host-only --publish-display-control-shim
+check 'explicit root shim opt-in reaches companion' test "$RC" -eq 0
+check 'root shim opt-in is passed as fixed flag' contains "$CASE/log" 'display-control fixture-stage args=--publish-shim'
 end_case
 
 new_case; make_module_copy; system_python_fixture
@@ -1118,14 +1181,17 @@ check 'absent-state install generates the module inventory' cmp -s "$CASE/expect
 check 'absent-state inventory mode is 644' test "$(stat -c %a "$MODULE_COPY/machines.yaml")" = 644
 check 'absent-state install creates no legacy inventory' test ! -e "$MODULE_COPY/machines.local.yaml"
 # Documented flow: edit the installer-generated inventory in place, then let the real
-# connector read it — --list first, then the stream path through the installed wrapper.
+# connector read it. Managed selection now requires a terminal; this redirected
+# legacy fixture must refuse before dispatch, not manufacture a fake menu.
 printf 'machines:\n  edited-host:\n    ssh: edited-alias\n    tailnet_ip: 100.64.0.31\n' >"$MODULE_COPY/machines.yaml"
 run_from "$CASE" "$MODULE_COPY/run_server.sh" --list
 check 'edited generated inventory passes connector --list' test "$RC" -eq 0
 check 'edited generated inventory lists the edited name' contains "$CASE/out" 'edited-host'
 run_from "$CASE" "$MODULE_COPY/run_server.sh" edited-host
-check 'edited generated inventory reaches the installed Moonlight wrapper' test "$RC" -eq 0
-check 'installed wrapper received the stream request' contains "$CASE/out" 'fixture only'
+check 'edited generated inventory non-TTY connection refuses' test "$RC" -ne 0
+check 'non-TTY refusal reports managed-selection terminal requirement' contains "$CASE/out" '需要交互终端'
+check 'non-TTY refusal dispatches no fake stream' absent "$CASE/log" 'fixture-stream-dispatch'
+check 'non-TTY refusal dispatches no SSH' absent "$CASE/log" 'forbidden-ssh-dispatch'
 end_case
 
 new_case; make_module_copy 'leftovers present'; client_fixture; system_python_fixture; export QD_TEST_YAML_AVAILABLE=1
@@ -1473,6 +1539,8 @@ run commands/install-client.sh
 check 'foreign active wrapper fails before API query' test "$RC" -ne 0
 check 'foreign active wrapper makes zero API calls' test ! -s "$CASE/log"
 end_case
+
+check 'independent companion qualification/publication/root fixtures' python3 "$TESTS_DIR/display_install.py"
 
 for script in "$MODULE_DIR"/*.sh "$MODULE_DIR"/commands/*.sh "$MODULE_DIR"/lib/common.sh "$MODULE_DIR"/lib/*.py "$TESTS_DIR"/*.sh "$TESTS_DIR"/*.py; do case "$script" in *.sh) check "syntax: ${script##*/}" bash -n "$script";; *) check "syntax: ${script##*/}" python3 -c 'import ast,sys; ast.parse(open(sys.argv[1], encoding="utf-8").read(), sys.argv[1])' "$script";; esac; done
 check 'scoped diff whitespace' git --no-pager -C "$MODULE_DIR" diff --check -- .

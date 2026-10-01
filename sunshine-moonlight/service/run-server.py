@@ -11,7 +11,6 @@ import secrets
 import shlex
 import subprocess
 import sys
-import threading
 from typing import Any
 
 MODULE_ROOT = Path(__file__).resolve().parents[1]
@@ -21,7 +20,11 @@ MIN_MOONLIGHT_PORT = 1029
 MAX_MOONLIGHT_PORT = 65514
 DESTINATION_RE = re.compile(r"(?:[A-Za-z0-9][A-Za-z0-9_.-]*@)?[A-Za-z0-9][A-Za-z0-9_.-]*$")
 MACHINE_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*$")
-QUERY_OUTPUT_LIMIT = 4096
+# Only the default streaming path imports the companion components.
+# Help, inventory listing, imports and interactive --ssh remain resource-free.
+sys.path.insert(0, str(MODULE_ROOT / "lib"))
+sys.dont_write_bytecode = True
+QUERY_OUTPUT_LIMIT = 65536
 # The unpaired sentence is the only machine-readable pair-state signal `moonlight
 # list` exposes. These are the exact upstream strings at Moonlight Qt v6.1.0
 # (commit f786e94c7b2f943e24e65d7d74deb539b827fc84): app/cli/listapps.cpp and the
@@ -58,10 +61,9 @@ def missing_inventory_message(path: Path) -> str:
 def parser() -> argparse.ArgumentParser:
     argument_parser = argparse.ArgumentParser(
         description=(
-            "Launch local Moonlight Desktop streaming or an interactive SSH login. "
-            "Before streaming, the connector queries `moonlight list`, and when the host "
-            "is clearly unpaired it prints a locally generated 4-digit PIN plus the "
-            "target Sunshine Web UI steps, pairs, re-confirms, and only then streams."
+            "Select a live remote screen and supervise official Moonlight Desktop, "
+            "or open an interactive SSH login. Streaming requires a terminal and an "
+            "installed/enrolled host controller; pairing is confirmed by a fresh list."
         )
     )
     argument_parser.add_argument("--config", metavar="PATH", type=Path)
@@ -69,6 +71,10 @@ def parser() -> argparse.ArgumentParser:
     mode.add_argument("--moonlight", action="store_true")
     mode.add_argument("--ssh", action="store_true")
     argument_parser.add_argument("--list", action="store_true", dest="list_machines")
+    argument_parser.add_argument(
+        "--moonlight-binary", metavar="PATH", type=Path,
+        help="explicit local installed official Moonlight Qt executable (not a YAML command)",
+    )
     argument_parser.add_argument("name", nargs="?")
     return argument_parser
 
@@ -77,9 +83,10 @@ def load_yaml(path: Path) -> Any:
     try:
         import yaml
     except ModuleNotFoundError as error:
-        raise InventoryError(
-            "系统 Python 缺少 PyYAML；请先运行 ./install.sh 安装 python3-yaml"
-        ) from error
+        message = ("系统 Python 缺少 PyYAML；请先运行 ./install.sh 安装 python3-yaml"
+                   if sys.platform == "linux" else
+                   "当前 Python 缺少 PyYAML；请为启动本连接器的 Python 安装 PyYAML 后重试")
+        raise InventoryError(message) from error
 
     class UniqueKeyLoader(yaml.SafeLoader):
         pass
@@ -199,56 +206,16 @@ def exec_program(argv: list[str]) -> None:
     raise SystemExit(127)
 
 
-def drain_bounded(stream: Any, sink: bytearray) -> None:
-    """Read a pipe to EOF, retaining only its leading QUERY_OUTPUT_LIMIT bytes."""
-    while True:
-        chunk = stream.read(4096)
-        if not chunk:
-            return
-        if len(sink) < QUERY_OUTPUT_LIMIT:
-            sink.extend(chunk[: QUERY_OUTPUT_LIMIT - len(sink)])
-
-
 def run_query(argv: list[str]) -> tuple[int, str, str]:
-    """Run one non-GUI `moonlight list` query and return bounded output.
-
-    Classification needs the canonical diagnostic, while Moonlight translates it
-    from the user's locale; pinning LC_ALL for this short-lived child keeps the
-    upstream English wording deterministic. The pair action and the final stream
-    still inherit the user's untouched environment.
-    """
-    try:
-        process = subprocess.Popen(
-            argv,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            env=dict(os.environ, LC_ALL="C"),
-        )
-    except OSError as error:
-        report_program_error(argv[0], error)
-    stdout, stderr = bytearray(), bytearray()
-    readers = [
-        threading.Thread(target=drain_bounded, args=(process.stdout, stdout), daemon=True),
-        threading.Thread(target=drain_bounded, args=(process.stderr, stderr), daemon=True),
-    ]
-    for reader in readers:
-        reader.start()
-    returncode = process.wait()
-    for reader in readers:
-        reader.join()
-    process.stdout.close()
-    process.stderr.close()
-    return returncode, stdout.decode("utf-8", "replace"), stderr.decode("utf-8", "replace")
+    """Bounded both-stream query; only list uses LC_ALL=C and DEVNULL stdin."""
+    from display_client import OfficialClient
+    return OfficialClient().query(argv)
 
 
 def run_pair(argv: list[str]) -> int:
-    """Run the GUI pair action in the foreground with the user's environment."""
-    try:
-        process = subprocess.Popen(argv)
-    except OSError as error:
-        report_program_error(argv[0], error)
-    return process.wait()
+    """Foreground official pairing with inherited environment and stdio."""
+    from display_client import OfficialClient
+    return OfficialClient().foreground(argv)
 
 
 def generate_pin() -> str:
@@ -270,18 +237,17 @@ def classify_list_result(returncode: int, stderr_text: str) -> str:
     return "paired" if returncode == 0 else "unknown"
 
 
-def has_desktop_app(stdout_text: str) -> bool:
-    """Require the exact Desktop application before sending a launch request."""
-    return any(line.strip().casefold() == "desktop" for line in stdout_text.splitlines())
-
-
 def print_bounded_diagnostic(label: str, diagnostics: str) -> None:
     if diagnostics.strip():
         print(f"{label}:", file=sys.stderr)
-        print(diagnostics.rstrip("\n"), file=sys.stderr)
+        # Keep bounded both-stream evidence, without terminal control injection.
+        clean = "".join(c for c in diagnostics[:QUERY_OUTPUT_LIMIT]
+                        if c in "\n\t" or (ord(c) >= 32 and ord(c) != 127 and
+                                           not __import__("unicodedata").category(c).startswith("C")))
+        print(clean.rstrip("\n"), file=sys.stderr)
 
 
-def print_unpaired_guidance(name: str, target: str, web_ui: str, pin: str) -> None:
+def print_unpaired_guidance(name: str, target: str, web_ui: str, pin: str, program: str) -> None:
     print(f"未配对: {name} ({target}) 尚未与本机 Moonlight 配对。", file=sys.stderr)
     print(f"本机 PIN: {pin}", file=sys.stderr)
     print("远端 Sunshine 网页操作（网页由目标主机的 Sunshine 服务内置提供）:", file=sys.stderr)
@@ -289,7 +255,7 @@ def print_unpaired_guidance(name: str, target: str, web_ui: str, pin: str) -> No
     print("  2. 用 Sunshine 管理员凭据登录后进入 PIN 页面", file=sys.stderr)
     print("  3. 核对待配对客户端名称与来源地址，在对应请求中输入上面的本机 PIN（若列表为空，等几秒刷新页面）", file=sys.stderr)
     print("本机 Moonlight 操作（保持本终端运行）:", file=sys.stderr)
-    print(f"  4. 脚本自动运行: ~/.local/bin/moonlight pair --pin {pin} -- {target}", file=sys.stderr)
+    print(f"  4. 脚本自动运行已选择的本地 Moonlight: {program} pair --pin {pin} -- {target}", file=sys.stderr)
     print("  5. 配对返回后脚本会重新确认已配对，确认通过才启动 Desktop 串流", file=sys.stderr)
 
 
@@ -339,14 +305,17 @@ def print_pair_failure(
     print("修正后重新运行本脚本：脚本会重新检测；若仍未配对，会重新给出 PIN 与步骤。", file=sys.stderr)
 
 
-def connect_moonlight(name: str, machine: dict[str, Any], wrapper: Path) -> None:
-    """Check pair state, guide and pair a clearly unpaired host, then stream."""
-    program = str(wrapper)
+def confirmed_catalogue(name: str, machine: dict[str, Any], program: str, official: Any) -> str:
+    """Preserved list→explicit-unpaired→manual PIN/pair→fresh list confirmation.
+
+    The ID-bearing CSV is freshly fetched AFTER host preparation. Its first
+    lowercase Desktop ID is checked by the session BEFORE launch/dispatch.
+    """
     target = f"{machine['tailnet_ip']}:{machine['moonlight_port']}"
     web_ui = f"https://{machine['tailnet_ip']}:{machine['moonlight_port'] + 1}"
-    query = [program, "list", "--", target]
+    query = [program, "list", "--csv", "--", target]
 
-    returncode, stdout, stderr = run_query(query)
+    returncode, stdout, stderr = official.query(query)
     state = classify_list_result(returncode, stderr)
     if state == "unknown":
         print_list_failure(
@@ -356,10 +325,10 @@ def connect_moonlight(name: str, machine: dict[str, Any], wrapper: Path) -> None
         raise SystemExit(1)
     if state == "unpaired":
         pin = generate_pin()
-        print_unpaired_guidance(name, target, web_ui, pin)
+        print_unpaired_guidance(name, target, web_ui, pin, program)
         print("开始本机 Moonlight 配对（等待远端 Sunshine 网页输入 PIN）…", file=sys.stderr)
-        pair_returncode = run_pair([program, "pair", "--pin", pin, "--", target])
-        returncode, stdout, stderr = run_query(query)
+        pair_returncode = official.foreground([program, "pair", "--pin", pin, "--", target])
+        returncode, stdout, stderr = official.query(query)
         state = classify_list_result(returncode, stderr)
         if state == "unknown":
             print_list_failure(
@@ -370,23 +339,32 @@ def connect_moonlight(name: str, machine: dict[str, Any], wrapper: Path) -> None
         if state == "unpaired":
             print_pair_failure(name, target, web_ui, pair_returncode, returncode, stdout, stderr)
             raise SystemExit(1)
-        if not has_desktop_app(stdout):
-            print_app_missing(name, target, web_ui, stdout)
-            raise SystemExit(1)
-        print(f"配对已确认: {name} ({target})；启动 Desktop 串流。", file=sys.stderr)
-    elif not has_desktop_app(stdout):
-        print_app_missing(name, target, web_ui, stdout)
-        raise SystemExit(1)
-    exec_program([program, "stream", "--", target, "Desktop"])
+        print(f"配对已确认: {name} ({target})；继续核对 Desktop ID。", file=sys.stderr)
+    return stdout
+
+
+def connect_moonlight(name: str, machine: dict[str, Any], binary: Path | None = None) -> None:
+    """The REAL default NAME path is managed selection/lifecycle, never direct exec."""
+    from display_client import ClientError, connect
+    try:
+        code = connect(name, machine, lambda program, official:
+                       confirmed_catalogue(name, machine, program, official), binary=binary)
+    except ClientError as error:
+        print(f"错误: {error}", file=sys.stderr)
+        raise SystemExit(127 if "找不到本地可执行文件" in str(error) else 1) from None
+    raise SystemExit(code)
 
 
 def main(argv: list[str]) -> None:
     args = parser().parse_args(argv)
     if args.list_machines:
-        if args.name is not None or args.moonlight or args.ssh:
+        if args.name is not None or args.moonlight or args.ssh or args.moonlight_binary is not None:
             parser().error("--list 不能与机器名或连接模式同时使用")
     elif args.name is None:
         parser().error("必须指定机器名；使用 --list 查看可用名称")
+
+    if args.ssh and args.moonlight_binary is not None:
+        parser().error("--moonlight-binary 不能与 --ssh 同时使用")
 
     config_path = args.config if args.config is not None else DEFAULT_INVENTORY
     try:
@@ -411,7 +389,7 @@ def main(argv: list[str]) -> None:
         command.append(machine["ssh"])
         exec_program(command)
     else:
-        connect_moonlight(args.name, machine, Path.home() / ".local/bin/moonlight")
+        connect_moonlight(args.name, machine, args.moonlight_binary)
 
 
 if __name__ == "__main__":
