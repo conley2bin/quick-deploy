@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Read-only host display inventory fixtures; never query installed host/services."""
+"""Native inventory and bounded host protocol fixtures; no installed host I/O."""
 from __future__ import annotations
 
 import ctypes as C
@@ -50,7 +50,8 @@ class ProtocolTests(unittest.TestCase):
             with self.subTest(value=value[:80]), self.assertRaises(protocol.Refusal):
                 protocol.request(value)
         valid_prepare = json.dumps({"version": 1, "action": "prepare", "target": TARGET,
-                                    "snapshot": "0" * 64, "display_id": "mac:4"}).encode()
+                                    "snapshot": "0" * 64, "display_id": "mac:4",
+                                    "revision": 1, "capability": "a" * 64}).encode()
         self.assertEqual(protocol.request(valid_prepare)["action"], "prepare")
         with self.assertRaises(protocol.Refusal):
             protocol.request(valid_prepare.replace(b'"mac:4"', b'"../../bin/sh"'))
@@ -96,7 +97,8 @@ class KmsTests(unittest.TestCase):
         second = next(s for s in items if s["id"] == "kms:card0:DP-1")
         self.assertEqual(second["requested_fps"], 60)
         self.assertFalse(second["capture_candidate"])
-        self.assertFalse(second["selectable"])
+        self.assertTrue(second["selectable"])  # Preparation intent does not assert capture.
+        self.assertEqual(second["selection_intent"], "prepare")
         self.assertEqual(second["runtime_capture"], "unverified")
 
     def test_inactive_alias_clone_fb_and_rotation_refuse(self):
@@ -131,11 +133,34 @@ class KmsTests(unittest.TestCase):
         system = kms.screens_from_kms(rows, "kms", device_type="system")
         self.assertEqual([s["id"] for s in system], ["kms:card0:eDP-1", "kms:card1:DP-1"])
         self.assertEqual(system[1]["mapping_reason"], "ambiguous_capture_name")
-        self.assertEqual(kms.screens_from_kms(rows, "kms")[1]["mapping_reason"], "ambiguous_capture_name")
+        provisional = kms.screens_from_kms(rows, "kms")[1]
+        self.assertEqual(provisional["mapping_status"], "unverified")
+        self.assertEqual(provisional["mapping_reason"], "encoder_filter_required")
         cuda = kms.screens_from_kms(rows, "kms", device_type="cuda")
         self.assertEqual(cuda[1]["mapping_status"], "mapped")  # Intel card excluded, including inactive alias
         vaapi = kms.screens_from_kms(rows, "kms", device_type="vaapi")
         self.assertEqual(vaapi[1]["mapping_reason"], "vaapi_skips_nvidia_card")
+
+    def test_filter_dependent_alias_intent_is_not_a_generic_duplicate_exception(self):
+        rows = [kms_record("card0", "DP-1", crtc=0, connected=False, mode=None,
+                           planes=[], gpu_nvidia=False),
+                kms_record("card1", "DP-1", crtc=22, mode=(3840, 2160, 60, 1), gpu_nvidia=True)]
+        unknown = kms.screens_from_kms(rows, "kms")
+        self.assertEqual(len(unknown), 1)
+        self.assertEqual(len(unknown.topology_facts), 2)  # inactive descriptor is retained
+        items, _ = host.presentation(unknown, "a" * 64, "fixture")
+        self.assertTrue(items[0]["selectable"])
+        self.assertFalse(items[0]["capture_candidate"])
+        self.assertEqual(items[0]["selector_mapping"], "unverified")
+        explicit = kms.screens_from_kms(rows, "kms", configured_encoder="nvenc")
+        self.assertEqual(explicit[0]["mapping_reason"], "ambiguous_capture_name")
+        self.assertEqual(kms.screens_from_kms(rows, "kms", device_type="cuda", configured_encoder="nvenc")[0]["mapping_status"], "unavailable")
+        rows[0]["gpu_nvidia"] = True  # the same eventual CUDA filter keeps both aliases
+        self.assertEqual(kms.screens_from_kms(rows, "kms")[0]["mapping_status"], "unavailable")
+        rows[0]["card"] = "card1"  # same-card ambiguity also cannot be resolved
+        self.assertEqual(kms.screens_from_kms(rows, "kms")[0]["mapping_status"], "unavailable")
+        rows[0]["gpu_nvidia"] = None  # unknown driver is not treated as filtered
+        self.assertEqual(kms.screens_from_kms(rows, "kms")[0]["mapping_status"], "unavailable")
 
     def test_mixed_gpu_encoder_filter_and_no_helper_fb_export(self):
         rows = [kms_record("card0", "eDP-1", crtc=1, mode=(1920, 1080, 60, 1), gpu_nvidia=False),
@@ -240,7 +265,8 @@ class WindowsTests(unittest.TestCase):
         self.assertTrue(presented["selector_candidate"])
         self.assertFalse(presented["capture_candidate"])
         self.assertEqual(presented["runtime_capture"], "unverified")
-        self.assertFalse(any(s["selectable"] for s in items))
+        self.assertTrue(any(s["selectable"] for s in items))  # Native intent only; host rejects non-Linux lifecycle.
+        self.assertFalse(any(s["capture_candidate"] for s in items))
         self.assertEqual(C.sizeof(windows.Path), 72)
         self.assertEqual(C.sizeof(windows.Mode), 64)
 
@@ -403,74 +429,45 @@ class MacTests(unittest.TestCase):
 
 
 class CliTests(unittest.TestCase):
-    def config_and_manifest(self, directory):
-        conf = directory / "sunshine.conf"
-        conf.write_bytes(b"bind_address = 100.100.20.30\naddress_family = ipv4\nport = 47989\n"
-                         b"capture = kms\nencoder = vaapi\noutput_name = DP-1\ncredentials = secret-not-returned\n")
-        manifest = directory / "host-settings.json"
-        manifest.write_text(json.dumps({"schema": 1, "platform": "linux", "config_file": str(conf),
-                                        "host_uniqueid": "server-111"}))
-        return conf, manifest
-
     def test_serverinfo_uses_plain_http_on_exact_base_port(self):
-        xml = (b'<root status_code="200"><uniqueid>server-111</uniqueid>'
-               b'<state>SUNSHINE_SERVER_FREE</state><currentgame>0</currentgame></root>')
+        identity = "AABBCCDD-1234-4321-ABCD-0123456789AB"
+        xml = (f'<root status_code="200"><uniqueid>{identity}</uniqueid>'
+               '<state>SUNSHINE_SERVER_FREE</state><currentgame>0</currentgame></root>').encode()
         opener = mock.Mock()
         opener.open.return_value = io.BytesIO(xml)
         with mock.patch.object(host.urllib.request, "build_opener", return_value=opener) as build:
-            self.assertEqual(host.serverinfo(TARGET["address"], TARGET["port"]), ("server-111", "unknown"))
+            observed = host.serverinfo(TARGET["address"], TARGET["port"])
+            self.assertEqual((observed.host_uniqueid, observed.state, observed.currentgame), (identity.lower(), "FREE", 0))
         self.assertEqual(opener.open.call_args.args[0], "http://100.100.20.30:47989/serverinfo")
         self.assertEqual(opener.open.call_args.kwargs["timeout"], 2)
         self.assertTrue(any(isinstance(arg, host.NoRedirect) for arg in build.call_args.args))
         self.assertTrue(any(isinstance(arg, host.urllib.request.ProxyHandler) and not arg.proxies
                             for arg in build.call_args.args))
+        for data in (xml.replace(b"<currentgame>0</currentgame>", b"<currentgame>1</currentgame>"),
+                     xml.replace(b"</root>", b"<currentgame>0</currentgame></root>"), b"x" * 4097):
+            opener.open.return_value = io.BytesIO(data)
+            with mock.patch.object(host.urllib.request, "build_opener", return_value=opener), self.assertRaises(protocol.Refusal):
+                host.serverinfo(TARGET["address"], TARGET["port"])
 
-    def test_identity_binding_snapshot_and_no_prepare(self):
+    def test_current_identity_snapshot_and_selection_intent(self):
+        from display_lifecycle import Fixture, SECOND
         with tempfile.TemporaryDirectory() as root:
-            conf, manifest = self.config_and_manifest(Path(root))
-            state = [kms_record("card0", "eDP-1", crtc=1, mode=(1920, 1080, 60, 1)),
-                     kms_record("card1", "DP-1", crtc=2, mode=(3840, 2160, 60000, 1001), gpu_nvidia=True)]
-            def inventory(platform, capture, encoder):
-                self.assertEqual((platform, capture, encoder), ("linux", "kms", "vaapi"))
-                return kms.screens_from_kms(state, capture)
-            def endpoint(addr, port):
-                self.assertEqual((addr, port), (TARGET["address"], TARGET["port"]))
-                return "server-111", "unknown"
-            run = lambda raw: json.loads(host.handle(raw, manifest=manifest, platform="linux",
-                                                  enumerate_native=inventory, info=endpoint))
-            first = run(listed())
-            self.assertTrue(first["ok"])
+            fixture = Fixture(root)
+            first = fixture.rpc("list")
             self.assertFalse(first["selection_ready"])
-            self.assertEqual(first["runtime"], "lifecycle_unverified")
-            self.assertEqual(first["activity"], "unknown")
-            selected = next(s for s in first["screens"] if s["id"] == "kms:card1:DP-1")
-            self.assertEqual(selected["requested_fps"], 60)
-            self.assertEqual(selected["selector"], "DP-1")
-            self.assertEqual(selected["selector_mapping"], "unverified")
-            self.assertEqual(selected["mapping_reason"], "effective_encoder_device_unknown")
-            self.assertEqual(selected["runtime_capture"], "unverified")
-            self.assertFalse(selected["capture_candidate"])
-            self.assertFalse(selected["selectable"])
-            self.assertEqual(first["configured_capture"], "kms")
-            self.assertEqual(first["configured_encoder"], "vaapi")
-            # A config value does not attest the effective running encoder.
-            self.assertEqual(selected["mapping_reason"], "effective_encoder_device_unknown")
-            self.assertNotIn("secret-not-returned", json.dumps(first))
-            self.assertEqual(first["snapshot"], run(listed())["snapshot"])
-            state[1]["mode"] = (2560, 1440, 120000, 1001)
-            self.assertNotEqual(first["snapshot"], run(listed())["snapshot"])
-            # A stale or fresh snapshot cannot authorize a switch in this milestone.
-            prepared = {"version": 1, "action": "prepare", "target": TARGET,
-                        "snapshot": first["snapshot"], "display_id": "kms:card0:DP-1"}
-            with self.assertRaisesRegex(protocol.Refusal, "reservation"):
-                run(json.dumps(prepared).encode())
-            self.assertIn(b"output_name = DP-1", conf.read_bytes())
-            with self.assertRaises(protocol.Refusal):
-                host.handle(listed(), manifest=manifest, platform="linux", enumerate_native=inventory,
-                            info=lambda *_: ("another-host", "unknown"))
-            with self.assertRaises(protocol.Refusal):
-                host.handle(json.dumps({"version": 1, "action": "list", "target": dict(TARGET, port=47990)}).encode(),
-                            manifest=manifest, platform="linux", enumerate_native=inventory, info=endpoint)
+            self.assertEqual(first["runtime"], "unverified")
+            self.assertEqual(first["activity"], "idle_application")
+            screen = next(s for s in first["screens"] if s["id"] == SECOND)
+            self.assertTrue(screen["selectable"])
+            self.assertFalse(screen["capture_candidate"])
+            self.assertEqual(screen["mapping_reason"], "effective_encoder_device_unknown")
+            self.assertEqual(first["snapshot"], fixture.rpc("list")["snapshot"])
+            self.assertNotIn("never-return-this-secret", json.dumps(first))
+            fixture.enroll()
+            prepared = fixture.prepare()
+            self.assertTrue(prepared["launch_authorized"])
+            self.assertEqual(first["topology_digest"], prepared["topology_digest"])
+            self.assertNotEqual(first["snapshot"], prepared["snapshot"])
 
     def test_config_parser_native_bracket_and_duplicate_refusal(self):
         text = b"apps = [\noutput_name = WRONG\n]\noutput_name = DP-1#owned comment\n"
@@ -480,6 +477,20 @@ class CliTests(unittest.TestCase):
                         b"output_name = [DP-1]\n", b"apps = [\n"):
             with self.assertRaises(protocol.Refusal):
                 config.get_settings(invalid)
+
+    def test_atomic_config_conflict_preserves_operator_bytes(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root) / "sunshine.conf"
+            original = b"output_name = DP-1\nsecret = kept\n"
+            path.write_bytes(original)
+            path.chmod(0o600)
+            content, identity = config.load(path)
+            changed = original + b"operator_edit = preserve\n"
+            path.write_bytes(changed)
+            with self.assertRaises(protocol.Refusal):
+                config.replace_if_same(path, content, identity, config.select_output(content, "DP-2"))
+            self.assertEqual(path.read_bytes(), changed)
+            self.assertEqual(list(Path(root).glob(".qd-display-*")), [])
 
     def test_real_cli_is_closed_and_bounded_without_installer_manifest(self):
         child = subprocess.run([sys.executable, str(SOURCE / "host.py")], input=listed(),
@@ -493,10 +504,11 @@ class CliTests(unittest.TestCase):
                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True, timeout=4)
         self.assertEqual(json.loads(invalid.stdout)["error"]["code"], "invalid_request")
         prepared = json.dumps({"version": 1, "action": "prepare", "target": TARGET,
-                               "snapshot": "0" * 64, "display_id": "mac:4"}).encode()
+                               "snapshot": "0" * 64, "display_id": "mac:4",
+                               "revision": 1, "capability": "a" * 64}).encode()
         child = subprocess.run([sys.executable, str(SOURCE / "host.py")], input=prepared,
                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True, timeout=4)
-        self.assertEqual(json.loads(child.stdout)["error"]["code"], "reservation_unavailable")
+        self.assertEqual(json.loads(child.stdout)["error"]["code"], "runtime_unconfigured")
         self.assertEqual(child.stderr, b"")
 
 

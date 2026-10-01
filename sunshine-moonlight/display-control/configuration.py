@@ -6,7 +6,6 @@ must be unique, plain and unambiguous. No other key/value bytes are rewritten.
 """
 from __future__ import annotations
 
-from contextlib import contextmanager
 import hashlib
 import os
 from pathlib import Path
@@ -20,7 +19,7 @@ MANAGED = {b"output_name", b"capture", b"encoder", b"port", b"bind_address", b"a
 SELECTOR = re.compile(rb"(?:[A-Za-z0-9][A-Za-z0-9_.-]{0,63}|\{[0-9a-f-]{36}\})\Z")
 
 
-def entries(data: bytes):
+def entries(data: bytes, *, keys=MANAGED, lists=frozenset()):
     result = {}
     pos, size = 0, len(data)
     while pos < size:
@@ -49,9 +48,9 @@ def entries(data: bytes):
                     end += 1
                 if depth:
                     raise Refusal("config_ambiguous", "unclosed Sunshine bracketed value")
-                if key in MANAGED:
+                if key in keys and key not in lists:
                     raise Refusal("config_ambiguous", "managed key has bracketed value")
-        if key in MANAGED:
+        if key in keys:
             if key in result:
                 raise Refusal("config_ambiguous", "duplicate managed Sunshine key")
             comment_start = data.find(b"#", value_begin, end)
@@ -87,7 +86,10 @@ def get_settings(data):
 
 
 def select_output(data: bytes, value: str) -> bytes:
-    selector = value.encode("ascii")
+    try:
+        selector = value.encode("ascii")
+    except (UnicodeError, AttributeError) as exc:
+        raise Refusal("invalid_selection", "capture selector must be an ASCII scalar") from exc
     if not SELECTOR.fullmatch(selector):
         raise Refusal("invalid_selection", "capture selector must be a plain scalar")
     found = entries(data)
@@ -109,23 +111,29 @@ def digest(data: bytes) -> str:
 def stable_identity(info: os.stat_result):
     # Reading the file itself can update atime; compare ownership/content state,
     # not read-observation metadata.
-    return info.st_dev, info.st_ino, info.st_mode, info.st_uid, info.st_size, info.st_mtime_ns
+    return (info.st_dev, info.st_ino, info.st_mode, info.st_uid, info.st_gid,
+            info.st_nlink, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
 
 
 def load(path: Path) -> tuple[bytes, os.stat_result]:
-    if path.is_symlink():
-        raise Refusal("config_unowned", "Sunshine config is a symlink")
     try:
-        identity = path.stat()
-        if not stat.S_ISREG(identity.st_mode) or identity.st_size > 1024 * 1024:
-            raise Refusal("config_unowned", "Sunshine config is not a bounded regular file")
-        if os.name != "nt" and identity.st_uid != os.geteuid():
-            raise Refusal("config_unowned", "Sunshine config is not owned by controller user")
-        data = path.read_bytes()
-        if len(data) != identity.st_size or stable_identity(path.stat()) != stable_identity(identity):
-            raise Refusal("config_changed", "Sunshine config changed while read")
-        get_settings(data)
-        return data, identity
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0))
+        try:
+            identity = os.fstat(fd)
+            if (not stat.S_ISREG(identity.st_mode) or identity.st_nlink != 1 or
+                    identity.st_size > 1024 * 1024 or
+                    (os.name != "nt" and (identity.st_uid != os.geteuid() or identity.st_mode & 0o022))):
+                raise Refusal("config_unowned", "Sunshine config must be bounded, owned and non-writable by others")
+            with os.fdopen(fd, "rb", closefd=False) as stream:
+                data = stream.read(1024 * 1024 + 1)
+            if (len(data) != identity.st_size or
+                    stable_identity(path.lstat()) != stable_identity(identity) or
+                    stable_identity(os.fstat(fd)) != stable_identity(identity)):
+                raise Refusal("config_changed", "Sunshine config changed while read")
+            get_settings(data)
+            return data, identity
+        finally:
+            os.close(fd)
     except OSError as exc:
         raise Refusal("config_unowned", "Sunshine config unavailable") from exc
 
@@ -143,6 +151,8 @@ def replace_if_same(path: Path, expected: bytes, identity: os.stat_result, updat
     fd, name = tempfile.mkstemp(prefix=".qd-display-", dir=path.parent)
     try:
         with os.fdopen(fd, "wb") as stream:
+            if hasattr(os, "fchown"):
+                os.fchown(stream.fileno(), identity.st_uid, identity.st_gid)
             os.fchmod(stream.fileno(), stat.S_IMODE(identity.st_mode)) if hasattr(os, "fchmod") else None
             stream.write(updated)
             stream.flush()
@@ -161,25 +171,5 @@ def replace_if_same(path: Path, expected: bytes, identity: os.stat_result, updat
             os.unlink(name)
 
 
-@contextmanager
-def locked_config(path: Path):
-    lock_path = path.parent / ".quick-deploy-display-control.lock"
-    if lock_path.is_symlink():
-        raise Refusal("config_unowned", "controller lock is a symlink")
-    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
-    try:
-        if os.name == "nt":
-            import msvcrt
-            os.lseek(fd, 0, os.SEEK_SET)
-            msvcrt.locking(fd, msvcrt.LK_LOCK, 1)
-        else:
-            import fcntl
-            fcntl.flock(fd, fcntl.LOCK_EX)
-        yield
-    finally:
-        if os.name == "nt":
-            os.lseek(fd, 0, os.SEEK_SET)
-            msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
-        else:
-            fcntl.flock(fd, fcntl.LOCK_UN)
-        os.close(fd)
+# Cross-process serialization belongs to lifecycle.PrivateFiles.operation.lock,
+# held for the entire config/restart/receipt/state operation, never this edit alone.

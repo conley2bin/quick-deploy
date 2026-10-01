@@ -181,6 +181,7 @@ def read_card(lib, card):
                         with managed(lib, "drmModeGetEncoder", "drmModeFreeEncoder", fd, conn.encoder_id) as enc:
                             crtc_id = int(enc.crtc_id)
                     item = {"card": card.name, "connector": f"{name.decode('ascii')}-{conn.connector_type_id}",
+                            "connector_id": int(conn.connector_id),
                             "crtc": crtc_id, "connected": conn.connection == 1, "mode": None,
                             "planes": [], "rotation": 0, "gpu_nvidia": nvidia}
                     if crtc_id:
@@ -226,12 +227,37 @@ def card_in_capture_list(connector, device_type, configured_encoder):
     return None
 
 
+def alias_filter_can_resolve(connector, connectors, configured_encoder):
+    """Existence of a source-supported filter, never a guessed effective device.
+
+    Unknown-vendor descriptors remain possible aliases; every colliding name
+    must be definitively filtered out before provisional intent is offered.
+    """
+    return any(card_in_capture_list(connector, device, configured_encoder) is True
+               and sum(other["connector"] == connector["connector"] for other in connectors
+                       if card_in_capture_list(other, device, configured_encoder) is not False) == 1
+               for device in ("cuda", "vaapi"))
+
+
+class KmsInventory(list):
+    """Live cards including inactive alias facts, separate from capture eligibility."""
+    def __init__(self, screens, connectors):
+        super().__init__(screens)
+        self.topology_facts = sorted([
+            {"card": c["card"], "connector": c["connector"],
+             "connector_id": c.get("connector_id"), "crtc": c["crtc"],
+             "connected": c["connected"], "mode": c["mode"],
+             "rotation": c["rotation"]}
+            for c in connectors], key=lambda c: (c["card"], c["connector"]))
+
+
 def screens_from_kms(connectors, capture, *, device_type=None, configured_encoder=""):
     """Native facts and source-derived selector membership, not service attestation.
 
     device_type is Sunshine's *effective* mem_type_e (cuda/vaapi/system), not
-    a guess from encoder= in an unverified config. Production list does not
-    have that runtime evidence yet, so it passes None and refuses membership.
+    a guess from encoder= in an unverified config. The host passes None before
+    controlled-start proof, and the attested effective device type afterwards.
+    Unknown membership permits preparation intent, never capture authorization.
     """
     connected = [c for c in connectors if c["connected"]]
     if len(connected) > 32:
@@ -271,7 +297,8 @@ def screens_from_kms(connectors, capture, *, device_type=None, configured_encode
             mapping = "filtered"
             mapping_reason = ("vaapi_skips_nvidia_card" if device_type == "vaapi"
                               else "cuda_skips_non_nvidia_card")
-        elif names.count(c["connector"]) != 1:
+        elif names.count(c["connector"]) != 1 and not (
+                device_type is None and alias_filter_can_resolve(c, connectors, configured_encoder)):
             mapping = "unavailable"
             mapping_reason = "ambiguous_capture_name"
         elif sum(1 for other in connected if other["crtc"] and other["crtc"] == c["crtc"] and other["card"] == c["card"]) != 1:
@@ -280,6 +307,9 @@ def screens_from_kms(connectors, capture, *, device_type=None, configured_encode
         elif len(c["planes"]) != 1:
             mapping = "unavailable"
             mapping_reason = "ambiguous_scanout_planes"
+        elif names.count(c["connector"]) != 1:
+            mapping = "unverified"
+            mapping_reason = "encoder_filter_required"
         elif device_type is None:
             mapping = "unverified"
             mapping_reason = "effective_encoder_device_unknown"
@@ -295,11 +325,13 @@ def screens_from_kms(connectors, capture, *, device_type=None, configured_encode
                        "primary": False, "connected": True, "native_reason": native_reason,
                        "mapping_status": mapping, "mapping_reason": mapping_reason,
                        "width": width, "height": height, "refresh_num": num,
-                       "refresh_den": den, "rotation": c["rotation"]})
-    return result
+                       "refresh_den": den, "rotation": c["rotation"],
+                       "connector_id": c.get("connector_id"), "card": c["card"],
+                       "crtc_id": c["crtc"]})
+    return KmsInventory(result, connectors)
 
 
-def enumerate_kms(capture, configured_encoder=""):
+def enumerate_kms(capture, configured_encoder="", *, device_type=None):
     cards = sorted(p for p in Path("/dev/dri").glob("card[0-9]*") if re.fullmatch(r"card[0-9]+", p.name))
     if not cards:
         raise Refusal("backend_unavailable", "no /dev/dri/cardN KMS devices")
@@ -310,4 +342,5 @@ def enumerate_kms(capture, configured_encoder=""):
             connectors.extend(read_card(lib, card))
         except (OSError, Refusal) as exc:
             raise Refusal("backend_unavailable", f"KMS card {card.name} cannot be fully inspected") from exc
-    return screens_from_kms(connectors, capture, configured_encoder=configured_encoder)
+    return screens_from_kms(connectors, capture, device_type=device_type,
+                            configured_encoder=configured_encoder)
