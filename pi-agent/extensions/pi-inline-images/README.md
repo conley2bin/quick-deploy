@@ -30,12 +30,16 @@ host Pi TUI allocator and deletes only IDs it owns.
 ./pi-agent/extensions/pi-inline-images/install.sh
 ```
 
-The installer runs `npm ci --ignore-scripts` in this source directory, creates
-`~/.pi/agent/extensions/pi-inline-images` as a symlink, and adds the exact local
-Git exclude rule `/extensions/pi-inline-images` through `git rev-parse --git-path
-info/exclude`. It refuses unknown target files/directories/links and does not edit
-`settings.json`, tracked `.gitignore`, Pi core, or the existing image package.
-Repeated runs are idempotent. Run `/reload` yourself afterward.
+The installer runs `npm ci --ignore-scripts` in this source directory and creates
+`~/.pi/agent/extensions/pi-inline-images` as a symlink. Ordinary non-Git Pi homes
+are supported; no repository is created. When the Pi home is a Git worktree, it
+also refuses indexed targets/descendants and adds the exact local exclude rule
+`/extensions/pi-inline-images` through `git rev-parse --git-path info/exclude`,
+requiring a writable exclude file. In either home type, unknown target
+files/directories/links are refused before dependencies are installed. This leaf
+installer does not edit `settings.json`, tracked `.gitignore`, Pi core, or the
+existing image package. Repeated runs retain the same owned symlink. Run
+`/reload` yourself afterward.
 
 The companion [guarded read-preview replay](patches/pi-tmux-images-0.2.0/README.md)
 was accepted and deployed locally with the image repairs. It keeps the existing

@@ -6,15 +6,16 @@ PI_HOME=${PI_CODING_AGENT_DIR:-"$HOME/.pi/agent"}
 TARGET="$PI_HOME/extensions/pi-inline-images"
 RULE=/extensions/pi-inline-images
 
-if ! git -C "$PI_HOME" rev-parse --git-dir >/dev/null 2>&1; then
-  echo "pi-inline-images: PI home is not a Git worktree: $PI_HOME" >&2
-  exit 1
-fi
-
-INDEXED=$(git -C "$PI_HOME" ls-files -- "extensions/pi-inline-images" "extensions/pi-inline-images/**")
-if [[ -n "$INDEXED" ]]; then
-  echo "pi-inline-images: refusing Git-index-owned target: ${INDEXED%%$'\n'*}" >&2
-  exit 1
+# Ordinary Pi homes need no repository. Git-owned homes retain the additional
+# index/exclude protections; target ownership is checked in either case.
+IS_GIT_HOME=0
+if git -C "$PI_HOME" rev-parse --git-dir >/dev/null 2>&1; then
+  IS_GIT_HOME=1
+  INDEXED=$(git -C "$PI_HOME" ls-files -- "extensions/pi-inline-images" "extensions/pi-inline-images/**")
+  if [[ -n "$INDEXED" ]]; then
+    echo "pi-inline-images: refusing Git-index-owned target: ${INDEXED%%$'\n'*}" >&2
+    exit 1
+  fi
 fi
 
 if [[ -e "$TARGET" || -L "$TARGET" ]]; then
@@ -29,18 +30,20 @@ if [[ -e "$TARGET" || -L "$TARGET" ]]; then
   fi
 fi
 
-EXCLUDE=$(git -C "$PI_HOME" rev-parse --git-path info/exclude)
-if [[ "$EXCLUDE" != /* ]]; then
-  GIT_DIR=$(git -C "$PI_HOME" rev-parse --absolute-git-dir)
-  EXCLUDE="$GIT_DIR/${EXCLUDE#*/}"
+if [[ $IS_GIT_HOME == 1 ]]; then
+  EXCLUDE=$(git -C "$PI_HOME" rev-parse --git-path info/exclude)
+  if [[ "$EXCLUDE" != /* ]]; then
+    GIT_DIR=$(git -C "$PI_HOME" rev-parse --absolute-git-dir)
+    EXCLUDE="$GIT_DIR/${EXCLUDE#*/}"
+  fi
+  [[ -f "$EXCLUDE" && -w "$EXCLUDE" ]] || { echo "pi-inline-images: Git exclude is not writable: $EXCLUDE" >&2; exit 1; }
 fi
-[[ -f "$EXCLUDE" && -w "$EXCLUDE" ]] || { echo "pi-inline-images: Git exclude is not writable: $EXCLUDE" >&2; exit 1; }
 
 # Dependencies remain beside the externally owned extension source.
 (cd "$SOURCE_DIR" && npm ci --ignore-scripts)
 
 mkdir -p -- "$PI_HOME/extensions"
-if ! grep -Fqx -- "$RULE" "$EXCLUDE"; then
+if [[ $IS_GIT_HOME == 1 ]] && ! grep -Fqx -- "$RULE" "$EXCLUDE"; then
   TMP=$(mktemp "${EXCLUDE}.tmp.XXXXXX")
   trap 'rm -f -- "${TMP:-}"' EXIT
   cat -- "$EXCLUDE" >"$TMP"
@@ -52,7 +55,9 @@ fi
 
 [[ -L "$TARGET" ]] || ln -s -- "$SOURCE_DIR" "$TARGET"
 [[ $(readlink -f -- "$TARGET") == "$SOURCE_DIR" ]] || { echo "pi-inline-images: link verification failed" >&2; exit 1; }
-grep -Fqx -- "$RULE" "$EXCLUDE" || { echo "pi-inline-images: exclude verification failed" >&2; exit 1; }
+if [[ $IS_GIT_HOME == 1 ]]; then
+  grep -Fqx -- "$RULE" "$EXCLUDE" || { echo "pi-inline-images: exclude verification failed" >&2; exit 1; }
+fi
 
 echo "pi-inline-images: installed $TARGET -> $SOURCE_DIR"
 echo "Run /reload in Pi when you are ready; this installer does not reload or restart Pi."

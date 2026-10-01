@@ -1,9 +1,9 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawn, spawnSync } from "node:child_process";
-import { chmodSync, chownSync, copyFileSync, existsSync, linkSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, readlinkSync, realpathSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, chownSync, copyFileSync, cpSync, existsSync, linkSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, readlinkSync, realpathSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import test from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
@@ -91,6 +91,53 @@ function fixture(t, location = "default") {
   };
 }
 
+function realInstallerFixture(t) {
+  const f = fixture(t);
+  rmSync(join(f.checkout, "extensions"), { recursive: true });
+  const names = readdirSync(join(source, "extensions"))
+    .filter(name => existsSync(join(source, "extensions", name, "install.sh"))).sort();
+  assert.ok(names.length > 0);
+  for (const name of names) cpSync(join(source, "extensions", name), join(f.checkout, "extensions", name), {
+    recursive: true, filter: path => !["node_modules", ".git"].includes(basename(path)),
+  });
+  // Execute every real leaf's shell flow. npm and systemctl are explicitly
+  // successful logging stubs, not dependency downloads or user-service work.
+  const npmLog = join(f.root, "npm-stub.log"), serviceLog = join(f.root, "systemctl-stub.log");
+  f.env.NPM_LOG = npmLog; f.env.SERVICE_LOG = serviceLog; f.env.CHECKOUT = f.checkout;
+  writeFileSync(join(f.bin, "npm"), `#!/usr/bin/env bash
+set -euo pipefail
+[[ "$PWD" == "$CHECKOUT/extensions/"* && "$1" == ci ]] || { echo npm-unexpected >> "$EFFECTS"; exit 91; }
+printf '%s\\t%s\\n' "$PWD" "$*" >> "$NPM_LOG"
+if [[ "$PWD" == "\${FAIL_NPM_DIR:-}" ]]; then echo 'controlled real leaf npm failure' >&2; exit 23; fi
+`);
+  writeFileSync(join(f.bin, "systemctl"), `#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\\n' "$*" >> "$SERVICE_LOG"
+case "$*" in
+  '--user is-active --quiet pi-remote-clipboard.service') exit 3 ;;
+  '--user daemon-reload'|'--user enable --now pi-remote-clipboard.service') exit 0 ;;
+  *) echo systemctl-unexpected >> "$EFFECTS"; exit 91 ;;
+esac
+`);
+  return { ...f, names, npmLog, serviceLog };
+}
+
+function assertRealInstallation(f) {
+  for (const name of f.names) {
+    const target = join(f.agent, "extensions", name);
+    const expected = join(f.checkout, "extensions", name, ...(name === "pi-remote-clipboard" ? ["pi-extension"] : []));
+    assert.equal(lstatSync(target).isSymbolicLink(), true, name);
+    assert.equal(realpathSync(target), expected, name);
+  }
+  const manager = SettingsManager.create(f.cwd, f.agent, { projectTrusted: false });
+  assert.equal(manager.getTuiMode(), "fullscreen"); assert.deepEqual(manager.drainErrors(), []);
+  assert.equal(readFileSync(join(f.home, ".local/lib/pi-remote-clipboard/provider.py"), "utf8"),
+    readFileSync(join(f.checkout, "extensions/pi-remote-clipboard/src/provider.py"), "utf8"));
+  assert.equal(existsSync(join(f.home, ".ssh/config")), false, "no SSH/auth fixture was manufactured");
+  assert.equal(existsSync(join(f.home, ".ssh/known_hosts")), false);
+  clean(f.agent);
+}
+
 function startProcess(command, args, options) {
   const child = spawn(command, args, options);
   let stdout = "", stderr = "";
@@ -141,6 +188,60 @@ for (const location of ["default", "custom", "tilde", "relative"]) test(`fresh a
   const manager = SettingsManager.create(f.cwd, f.agent, { projectTrusted: false });
   assert.equal(manager.getTuiMode(), "fullscreen"); assert.deepEqual(manager.drainErrors(), []);
   clean(f.agent);
+});
+
+test("all real discovered installers succeed in a fresh non-Git home and rerun", t => {
+  const f = realInstallerFixture(t);
+  assert.equal(existsSync(f.agent), false);
+  const first = f.run(); passed(first);
+  assert.deepEqual(f.read(), { tuiMode: "fullscreen" }); assertRealInstallation(f);
+  for (const name of f.names) assert.ok(first.stdout.includes(`--- ${name} ---`));
+  const before = snapshot(f.settings); passed(f.run()); unchanged(f.settings, before); assertRealInstallation(f);
+  for (const path of [f.root, f.home, f.agent, f.cwd, f.checkout]) assert.equal(existsSync(join(path, ".git")), false);
+  const npmRecords = readFileSync(f.npmLog, "utf8").trim().split("\n");
+  const expected = [
+    `${f.checkout}/extensions/pi-copy-links\tci --ignore-scripts --no-audit --no-fund`,
+    `${f.checkout}/extensions/pi-inline-images\tci --ignore-scripts`,
+  ];
+  assert.deepEqual(npmRecords, [...expected, ...expected]);
+  assert.deepEqual(readFileSync(f.serviceLog, "utf8").trim().split("\n"), Array(2).fill([
+    "--user daemon-reload", "--user is-active --quiet pi-remote-clipboard.service", "--user enable --now pi-remote-clipboard.service",
+  ]).flat());
+  t.diagnostic(JSON.stringify({ status: first.status,
+    sdkTuiMode: SettingsManager.create(f.cwd, f.agent, { projectTrusted: false }).getTuiMode(),
+    installedLinks: readdirSync(join(f.agent, "extensions")).sort(), gitMetadata: existsSync(join(f.agent, ".git")),
+    npm: "logging stub", systemctl: "logging no-op stub" }));
+});
+
+test("all real discovered installers retain ordinary Git-home behavior", t => {
+  const f = realInstallerFixture(t); f.seed('{"tuiMode":"regular","owned":42}\n');
+  execFileSync("git", ["init", "-q", f.agent]);
+  passed(f.run()); assert.deepEqual(f.read(), { tuiMode: "fullscreen", owned: 42 }); assertRealInstallation(f);
+  const before = snapshot(f.settings); passed(f.run()); unchanged(f.settings, before);
+  const exclude = readFileSync(join(f.agent, ".git/info/exclude"), "utf8").split("\n");
+  for (const name of f.names.filter(name => name !== "pi-remote-clipboard")) assert.equal(exclude.filter(rule => rule === `/extensions/${name}`).length, 1);
+});
+
+test("failed real inline npm step prevents settings creation or change", t => {
+  for (const existing of [false, true]) {
+    const f = realInstallerFixture(t); if (existing) f.seed('{"tuiMode":"regular","owned":42}\n');
+    const before = existing ? snapshot(f.settings) : undefined;
+    const result = f.run([], { FAIL_NPM_DIR: join(f.checkout, "extensions/pi-inline-images") });
+    assert.equal(result.status, 23); failed(result, /controlled real leaf npm failure/);
+    if (before) unchanged(f.settings, before); else assert.equal(existsSync(f.settings), false);
+    assert.equal(existsSync(join(f.agent, "extensions/pi-inline-images")), false);
+    assert.equal(existsSync(f.serviceLog), false, "later real leaf did not run");
+  }
+});
+
+test("real inline foreign target is retained and prevents fullscreen configuration", t => {
+  const f = realInstallerFixture(t); f.seed('{"tuiMode":"regular","owned":42}\n'); const before = snapshot(f.settings);
+  const target = join(f.agent, "extensions/pi-inline-images"); mkdirSync(dirname(target));
+  writeFileSync(target, "foreign owner\n");
+  failed(f.run(), /refusing to replace non-symlink/); unchanged(f.settings, before);
+  assert.equal(readFileSync(target, "utf8"), "foreign owner\n");
+  assert.equal(readFileSync(f.npmLog, "utf8").trim().split("\n").length, 1, "only the preceding real copy-links npm step ran");
+  assert.equal(existsSync(f.serviceLog), false);
 });
 
 test("existing regular changes only tuiMode and retains ownership/permissions", t => {

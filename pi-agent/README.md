@@ -16,7 +16,7 @@ pi                                 # 新会话直接使用 fullscreen；无需�
 
 行为：
 
-- 自动发现 `extensions/*/install.sh`，逐个执行；新增带 `install.sh` 的扩展即自动纳入，无需改本脚本。
+- 自动发现 `extensions/*/install.sh`，逐个执行；新增带 `install.sh` 的扩展即自动纳入，无需改本脚本。Pi home 无需初始化 Git；是 Git worktree 时才做对应安装器的 index/exclude 保护。
 - 各扩展安装器都是幂等的：已安装的跳过；旧 checkout 或旧名字的受管链接先备份再迁移；外部文件/目录/链接一律拒绝覆盖。
 - 默认不碰 skills（其安装器是交互式的）；不加 `--skills` 时只打印提示。
 - 所有安装步骤成功后，只将全局 `settings.json` 的 `tuiMode` 保存为 `fullscreen`：位置为 `PI_CODING_AGENT_DIR/settings.json`，未指定时为 `$HOME/.pi/agent/settings.json`。已有全局 `regular` 会有意改为 `fullscreen`；其他字段保留，已是 `fullscreen` 时不重写文件。
@@ -47,4 +47,4 @@ pi                                 # 新会话直接使用 fullscreen；无需�
 
 `pi-copy-links` 提供代码块右下角复制按钮和 Ctrl+左键打开网页及公司文件；需使用 Pi 的 `fullscreen` 模式。扩展运行时及其单独的叶安装器不修改全局设置；全局 fullscreen 默认策略由本目录的一键安装器负责。版本号仅作诊断：TUI 启动时在自有隔离对象上检查实际接口与关键行为，契约成立即启用，无需用户逐版验证或编辑版本名单。具体接口/行为不兼容时只停用增强并提示原因，原生 Markdown/Pi 保持可用；`/copy-links` 查看实际状态。更新源码后须在 Pi 空闲时手动 `/reload` 或重启才会生效，详见 [使用说明](extensions/pi-copy-links/README.md)。
 
-一键安装器的隔离测试用 `node --test pi-agent/test/installer.test.mjs`（从仓库根目录，需已安装 Pi 的锁依赖）；测试只执行临时源码副本中的主入口和受控叶安装器，不启动 Pi 或真实包安装。扩展测试在各自 `test/` 下，例如 `extensions/pi-suspend-guard/test/run.sh`、`extensions/pi-tmux-window-status/test/installer.sh`；`pi-copy-links` 使用 `npm run check`。其[维护者兼容 CI](../.github/workflows/pi-copy-links-compat.yml) 在相关 push/PR 和每周计划任务中，以临时 Ubuntu runner 的 npm Pi latest 运行完整回归和离线 native recorder，并保留失败证据；[本地诊断命令](extensions/pi-copy-links/README.md#开发者诊断与本地复现)用于开发/排查，不是用户逐版升级的验证任务。CI 文件须先推送到启用了 Actions 的远端仓库才会执行；本地提交不会启动远端检查。
+一键安装器的隔离测试用 `node --test pi-agent/test/installer.test.mjs`（从仓库根目录，需已安装 Pi 的锁依赖）；测试执行临时源码副本中的主入口，覆盖所有真实叶安装器的普通非 Git home 安装/重跑，以及受控失败；`npm` 和 `systemctl` 使用只记录调用的替身，不启动 Pi、不下载依赖或操作真实用户服务。扩展测试在各自 `test/` 下，例如 `extensions/pi-suspend-guard/test/run.sh`、`extensions/pi-tmux-window-status/test/installer.sh`；`pi-copy-links` 使用 `npm run check`。其[维护者兼容 CI](../.github/workflows/pi-copy-links-compat.yml) 在相关 push/PR 和每周计划任务中，以临时 Ubuntu runner 的 npm Pi latest 运行完整回归和离线 native recorder，并保留失败证据；[本地诊断命令](extensions/pi-copy-links/README.md#开发者诊断与本地复现)用于开发/排查，不是用户逐版升级的验证任务。CI 文件须先推送到启用了 Actions 的远端仓库才会执行；本地提交不会启动远端检查。
