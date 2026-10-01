@@ -211,7 +211,7 @@ cat >squashfs-root/usr/bin/moonlight <<'MOONLIGHT'
 #!/bin/sh
 case "${1:-}" in
 list) printf 'Desktop\n' ;;
-stream) printf 'fixture only\n' ;;
+stream) printf 'fixture-stream-dispatch\n' >>"$CASE/log"; printf 'fixture only\n' ;;
 *) exit 1 ;;
 esac
 MOONLIGHT
@@ -447,6 +447,11 @@ for path in "$@"; do
     esac
 done
 exec /usr/bin/rm "$@"
+MOCK
+    cat >"$CASE/bin/ssh" <<'MOCK'
+#!/bin/bash
+printf 'forbidden-ssh-dispatch\n' >>"$CASE/log"
+exit 99
 MOCK
     cat >"$CASE/bin/sleep" <<'MOCK'
 #!/bin/bash
@@ -857,6 +862,7 @@ end_case
 
 # New recovery checks reuse only these isolated fixtures.
 . "$TESTS_DIR/retry.sh"
+check 'environment EOF consumption, producer errors and session matching' python3 -B "$TESTS_DIR/environment_probe.py"
 check 'native binding semantics and byte-preserving rewrite' python3 "$TESTS_DIR/binding.py"
 if [ "$FIXTURES_ONLY" = true ]; then
     # retry.py's two native analyzer tests already explicitly skip when that
@@ -1175,14 +1181,17 @@ check 'absent-state install generates the module inventory' cmp -s "$CASE/expect
 check 'absent-state inventory mode is 644' test "$(stat -c %a "$MODULE_COPY/machines.yaml")" = 644
 check 'absent-state install creates no legacy inventory' test ! -e "$MODULE_COPY/machines.local.yaml"
 # Documented flow: edit the installer-generated inventory in place, then let the real
-# connector read it — --list first, then the stream path through the installed wrapper.
+# connector read it. Managed selection now requires a terminal; this redirected
+# legacy fixture must refuse before dispatch, not manufacture a fake menu.
 printf 'machines:\n  edited-host:\n    ssh: edited-alias\n    tailnet_ip: 100.64.0.31\n' >"$MODULE_COPY/machines.yaml"
 run_from "$CASE" "$MODULE_COPY/run_server.sh" --list
 check 'edited generated inventory passes connector --list' test "$RC" -eq 0
 check 'edited generated inventory lists the edited name' contains "$CASE/out" 'edited-host'
 run_from "$CASE" "$MODULE_COPY/run_server.sh" edited-host
-check 'edited generated inventory reaches the installed Moonlight wrapper' test "$RC" -eq 0
-check 'installed wrapper received the stream request' contains "$CASE/out" 'fixture only'
+check 'edited generated inventory non-TTY connection refuses' test "$RC" -ne 0
+check 'non-TTY refusal reports managed-selection terminal requirement' contains "$CASE/out" '需要交互终端'
+check 'non-TTY refusal dispatches no fake stream' absent "$CASE/log" 'fixture-stream-dispatch'
+check 'non-TTY refusal dispatches no SSH' absent "$CASE/log" 'forbidden-ssh-dispatch'
 end_case
 
 new_case; make_module_copy 'leftovers present'; client_fixture; system_python_fixture; export QD_TEST_YAML_AVAILABLE=1
