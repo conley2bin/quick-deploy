@@ -46,6 +46,19 @@ SHOW = ("/usr/bin/systemctl", "--user", "show", "--no-pager", rt.UNIT,
         "--property=" + EXPECTED_PROPERTIES)
 ENV = ("/usr/bin/systemctl", "--user", "show-environment")
 RESTART = ("/usr/bin/systemctl", "--user", "--no-block", "--no-ask-password", "restart", rt.UNIT)
+# Verbatim sanitized native255 shapes from native-systemd-properties.json and
+# native-systemd-environment-files.json. No runtime decoder constructs these.
+NATIVE_PRESTART_RECORDS = (
+    "{ path=/bin/sleep ; argv[]=/bin/sleep 5 ; ignore_errors=no ; start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 }",
+    "{ path=/usr/bin/python3 ; argv[]=/usr/bin/python3 /fixture/home/.config/systemd/user/app-dev.lizardbyte.app.Sunshine.service.d/check-tailnet.py /fixture/home/.config/sunshine ; ignore_errors=no ; start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 }",
+)
+BUS_OBJECT = "/org/freedesktop/systemd1/unit/app_2ddev_2elizardbyte_2eapp_2eSunshine_2eservice"
+BUS_PREFIX = ("/usr/bin/busctl", "--user", "--json=short", "--auto-start=no", "--allow-interactive-authorization=no")
+BUS_GET_UNIT = (*BUS_PREFIX, "call", "org.freedesktop.systemd1", "/org/freedesktop/systemd1",
+                "org.freedesktop.systemd1.Manager", "GetUnit", "s", rt.UNIT)
+BUS_ENV_FILES = (*BUS_PREFIX, "get-property", "org.freedesktop.systemd1", BUS_OBJECT,
+                 "org.freedesktop.systemd1.Service", "EnvironmentFiles")
+NATIVE_EMPTY_ENV_FILES = b'{"type":"a(sb)","data":[]}\n'
 
 
 def sha(data):
@@ -237,6 +250,142 @@ class AuthorityFixture(unittest.TestCase):
             action()
         self.assertEqual(raised.exception.code, code)
         return raised.exception
+
+
+class NativePropertyFramingTests(AuthorityFixture):
+    def native_shape(self, *, split=True, omit_environment_files=True):
+        self.transport.retry_policy()
+        self.runtime = rt.LinuxRuntime(replace(self.settings, retry_guard_sha256=sha(GUARD)), self.transport)
+        lines = [f"{key}={value}" for key, value in self.transport.props.items()
+                 if key != "ExecStartPre" and (key != "EnvironmentFiles" or not omit_environment_files)]
+        if split:
+            lines += ["ExecStartPre=" + record for record in NATIVE_PRESTART_RECORDS]
+        else:
+            lines.append("ExecStartPre=" + " ".join(NATIVE_PRESTART_RECORDS))
+        self.native_stdout = ("\n".join(lines) + "\n").encode()
+        self.transport.responses[SHOW] = rt.CommandResult(0, self.native_stdout)
+        self.transport.responses[BUS_GET_UNIT] = rt.CommandResult(0, json.dumps({"type": "o", "data": [BUS_OBJECT]}).encode())
+        self.transport.responses[BUS_ENV_FILES] = rt.CommandResult(0, NATIVE_EMPTY_ENV_FILES)
+
+    def test_saved_native_prestart_rows_and_omitted_array_decode(self):
+        self.native_shape()
+        self.assertEqual(self.native_stdout.count(b"ExecStartPre="), 2)
+        self.assertNotIn(b"EnvironmentFiles=", self.native_stdout)
+        observed = self.runtime.observe()
+        self.assertEqual(observed.generation.pid, 42)
+        self.assertEqual(observed.capture.reason, "start_receipt_required")
+        self.assertEqual([argv for argv, _, _ in self.transport.calls if argv[0] == "/usr/bin/busctl"],
+                         [BUS_GET_UNIT, BUS_ENV_FILES, BUS_GET_UNIT, BUS_ENV_FILES])
+        self.assertEqual([argv for argv, _, _ in self.transport.calls if argv[0] == "/usr/bin/systemctl"],
+                         [SHOW, ENV, SHOW, ENV])
+        self.assertTrue(all(timeout == 5 and limit == 1048576 for _, timeout, limit in self.transport.calls))
+        verified = self.runtime.observe(receipt=self.receipt(observed))
+        self.assertEqual(verified.capture.status, "verified")
+
+    def test_environment_files_omission_needs_typed_empty_proof(self):
+        self.native_shape(split=False)
+        self.assertEqual(self.runtime.observe().generation.pid, 42)
+        self.assertIn(BUS_ENV_FILES, [argv for argv, _, _ in self.transport.calls])
+        self.transport.responses[BUS_ENV_FILES] = rt.CommandResult(1, stderr=b"fixture missing property")
+        self.assert_refuses(self.runtime.observe, "command_failed")
+
+    def test_printed_empty_property_needs_no_dbus_and_same_owned_digest(self):
+        self.native_shape(omit_environment_files=False)
+        printed = self.runtime.observe()
+        self.assertFalse(any(argv[0] == "/usr/bin/busctl" for argv, _, _ in self.transport.calls))
+        # Change only native framing. Re-running retry_policy() would rewrite
+        # the fixture artifacts and correctly change their ownership identity.
+        omitted = self.native_stdout.replace(b"EnvironmentFiles=\n", b"")
+        self.transport.responses[SHOW] = rt.CommandResult(0, omitted)
+        proven = self.runtime.observe()
+        self.assertEqual(printed.unit, proven.unit)
+        self.assertEqual(printed.config, proven.config)
+        self.assertEqual(printed.binary, proven.binary)
+
+    def test_unknown_duplicate_scalar_and_missing_required_facts_refuse(self):
+        self.native_shape()
+        good = self.native_stdout
+        bad = [good + b"MainPID=42\n", good + b"EnvironmentFiles=\nEnvironmentFiles=\n", good + b"Unknown=value\n"]
+        for key in ("InvocationID", "Environment", "ConfigurationDirectory", "ExecStartPre", "ExecStart"):
+            bad.append(b"\n".join(line for line in good.splitlines() if not line.startswith(key.encode() + b"=")) + b"\n")
+        for raw in bad:
+            with self.subTest(raw=raw[-100:]):
+                self.transport.calls.clear()
+                self.transport.responses[SHOW] = rt.CommandResult(0, raw)
+                self.assert_refuses(self.runtime.observe, "unit_ambiguous")
+                self.assertFalse(any(argv[0] == "/usr/bin/busctl" for argv, _, _ in self.transport.calls))
+
+    def test_nonempty_environment_files_are_unowned_even_if_ignore_missing(self):
+        self.native_shape()
+        for ignore in (False, True):
+            with self.subTest(ignore=ignore):
+                self.transport.responses[BUS_ENV_FILES] = rt.CommandResult(0, json.dumps(
+                    {"type": "a(sb)", "data": [["/fixture/foreign.env", ignore]]}).encode())
+                self.assert_refuses(self.runtime.observe, "unit_unowned")
+
+    def test_environment_files_malformed_typed_json_cannot_mean_empty(self):
+        self.native_shape()
+        invalid = [b"{}", b"[]", b"null", b"{", b"\xff",
+                   b'{"type":"as","data":[]}', b'{"type":"a(sb)","data":null}',
+                   b'{"type":"a(sb)","data":""}', b'{"type":"a(sb)","data":{}}',
+                   b'{"type":"a(sb)","data":[true]}',
+                   b'{"type":"a(sb)","data":[["/fixture/file","false"]]}',
+                   b'{"type":"a(sb)","data":[],"extra":0}',
+                   b'{"type":"as","type":"a(sb)","data":[]}',
+                   b'{"type":"a(sb)","data":[1],"data":[]}']
+        for raw in invalid:
+            with self.subTest(raw=raw):
+                self.transport.responses[BUS_ENV_FILES] = rt.CommandResult(0, raw)
+                self.assert_refuses(self.runtime.observe, "unit_ambiguous")
+
+    def test_getunit_and_property_failure_are_explicit(self):
+        self.native_shape()
+        for argv in (BUS_GET_UNIT, BUS_ENV_FILES):
+            good = self.transport.responses[argv]
+            for result, code in ((rt.CommandResult(1, stderr=b"fixture denial"), "command_failed"),
+                                 (subprocess.TimeoutExpired(argv, 5), "transport_unavailable"),
+                                 (FileNotFoundError("fixture busctl missing"), "transport_unavailable")):
+                with self.subTest(argv=argv, result=result):
+                    self.transport.responses[argv] = result
+                    self.assert_refuses(self.runtime.observe, code)
+            self.transport.responses[argv] = good
+        for raw in (b'{"type":"s","data":["' + BUS_OBJECT.encode() + b'"]}',
+                    b'{"type":"o","data":[]}',
+                    b'{"type":"o","data":["/org/freedesktop/systemd1/unit/foreign_2eservice"]}',
+                    b'{"type":"o","data":["' + BUS_OBJECT.encode() + b'","extra"]}'):
+            self.transport.responses[BUS_GET_UNIT] = rt.CommandResult(0, raw)
+            self.transport.calls.clear()
+            self.assert_refuses(self.runtime.observe, "unit_ambiguous")
+            self.assertNotIn(BUS_ENV_FILES, [argv for argv, _, _ in self.transport.calls])
+
+    def test_all_command_array_rows_still_need_exact_ownership(self):
+        self.native_shape()
+        good = self.native_stdout
+        first, second = ("ExecStartPre=" + value + "\n" for value in NATIVE_PRESTART_RECORDS)
+        malformed = [good + b"ExecStartPre=\n", good + b"ExecStartPre=not-a-structured-command\n",
+                     good + (first).encode(), good + ("ExecStartPre=" + command("/usr/bin/foreign") + "\n").encode(),
+                     good.replace((first + second).encode(), (second + first).encode()),
+                     good.replace(second.encode(), b""),
+                     good.replace(b"ignore_errors=no", b"ignore_errors=yes"),
+                     good.replace(b"/bin/sleep 5 ;", b"/bin/sleep 2 ;"),
+                     good + ("ExecStart=" + command("/usr/bin/sunshine") + "\n").encode(),
+                     good + ("ExecStart=" + command("/usr/bin/foreign") + "\n").encode()]
+        for raw in malformed:
+            with self.subTest(raw=raw[-100:]):
+                self.transport.responses[SHOW] = rt.CommandResult(0, raw)
+                self.assert_refuses(self.runtime.observe, "unit_unowned")
+
+    def test_alias_getunit_queries_only_pinned_canonical_object(self):
+        self.native_shape()
+        alias_show = (*SHOW[:4], rt.ALIAS, *SHOW[5:])
+        alias_get = (*BUS_GET_UNIT[:-1], rt.ALIAS)
+        self.transport.responses[alias_show] = self.transport.responses[SHOW]
+        self.transport.responses[alias_get] = self.transport.responses[BUS_GET_UNIT]
+        settings = replace(self.settings, unit=rt.ALIAS, retry_guard_sha256=sha(GUARD))
+        self.runtime = rt.LinuxRuntime(settings, self.transport)
+        self.assertEqual(self.runtime.observe().unit.name, rt.UNIT)
+        bus_calls = [argv for argv, _, _ in self.transport.calls if argv[0] == "/usr/bin/busctl"]
+        self.assertEqual(bus_calls, [alias_get, BUS_ENV_FILES, alias_get, BUS_ENV_FILES])
 
 
 class AuthorityTests(AuthorityFixture):

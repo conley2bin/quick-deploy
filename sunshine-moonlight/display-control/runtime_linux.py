@@ -44,6 +44,10 @@ from protocol import Refusal
 SOURCE_COMMIT = "63d35f702ee9e362e43263742981836ec0710384"
 UNIT = "app-dev.lizardbyte.app.Sunshine.service"
 ALIAS = "sunshine.service"
+_UNIT_BUS_OBJECTS = {
+    UNIT: "/org/freedesktop/systemd1/unit/app_2ddev_2elizardbyte_2eapp_2eSunshine_2eservice",
+    ALIAS: "/org/freedesktop/systemd1/unit/sunshine_2eservice",
+}
 EXECUTABLE = Path("/usr/bin/sunshine")
 MAX_CONFIG = 1024 * 1024
 MAX_BINARY = 256 * 1024 * 1024
@@ -519,17 +523,72 @@ class LinuxRuntime:
                       fragment=asdict(fragment))
         return UnitRecord(props["Id"], props["FragmentPath"], _json_digest(stable))
 
+    def _require_empty_environment_files(self, unit_id: str) -> None:
+        """Only this omitted special array may be recovered from typed evidence.
+
+        systemctl255 omits empty EnvironmentFiles even with --all. busctl's
+        lossless JSON carries the a(sb) signature; never infer emptiness from
+        absence, failure, a different signature or a request-supplied object.
+        GetUnit resolves aliases, but the returned object must equal the fixed
+        path for the already observed canonical Id before it is queried.
+        """
+        if unit_id not in _UNIT_BUS_OBJECTS:
+            raise Refusal("unit_unowned", "unsupported systemd user unit identity")
+        expected_object = _UNIT_BUS_OBJECTS[unit_id]
+        prefix = ("/usr/bin/busctl", "--user", "--json=short", "--auto-start=no",
+                  "--allow-interactive-authorization=no")
+
+        def typed(raw: bytes, signature: str):
+            def unique(pairs):
+                result = {}
+                for key, value in pairs:
+                    if key in result:
+                        raise ValueError("duplicate D-Bus JSON field")
+                    result[key] = value
+                return result
+            try:
+                value = json.loads(_text(raw), object_pairs_hook=unique)
+                if (type(value) is not dict or set(value) != {"type", "data"}
+                        or value["type"] != signature):
+                    raise ValueError("unexpected D-Bus signature/envelope")
+                return value["data"]
+            except (UnicodeError, ValueError, TypeError, RecursionError) as exc:
+                raise Refusal("unit_ambiguous", "invalid typed systemd property proof") from exc
+
+        resolved = typed(self._run((*prefix, "call", "org.freedesktop.systemd1",
+                                   "/org/freedesktop/systemd1", "org.freedesktop.systemd1.Manager",
+                                   "GetUnit", "s", self.settings.unit)), "o")
+        if resolved != [expected_object]:
+            raise Refusal("unit_ambiguous", "GetUnit did not identify the observed owned unit")
+        files = typed(self._run((*prefix, "get-property", "org.freedesktop.systemd1",
+                                expected_object, "org.freedesktop.systemd1.Service", "EnvironmentFiles")), "a(sb)")
+        if (type(files) is not list or any(type(row) is not list or len(row) != 2
+                or type(row[0]) is not str or type(row[1]) is not bool for row in files)):
+            raise Refusal("unit_ambiguous", "invalid EnvironmentFiles array data")
+        if files:
+            raise Refusal("unit_unowned", "unit EnvironmentFiles override is unsupported")
+
     def _sample(self) -> RuntimeObservation:
         show = ("/usr/bin/systemctl", "--user", "show", "--no-pager", self.settings.unit,
                 "--property=" + ",".join(PROPERTIES))
         props = {}
         for line in _text(self._run(show)).splitlines():
             key, eq, value = line.partition("=")
-            if not eq or key not in PROPERTIES or key in props:
-                raise Refusal("unit_ambiguous", "unexpected or duplicate systemd property")
+            if not eq or key not in PROPERTIES or (key in props and key not in ("ExecStart", "ExecStartPre")):
+                raise Refusal("unit_ambiguous", "unexpected or duplicate scalar systemd property")
+            if key in ("ExecStart", "ExecStartPre"):
+                # Native command arrays print one same-key row per entry. Keep
+                # ALL entries in order; _unit still checks the exact owned tuple.
+                # Validate each row so an empty/malformed extra row is not lost.
+                _commands(value)
+                value = props[key] + " " + value if key in props else value
             props[key] = value
-        if set(props) != set(PROPERTIES):
+        missing = set(PROPERTIES) - set(props)
+        if missing - {"EnvironmentFiles"}:
             raise Refusal("unit_ambiguous", "incomplete systemd unit observation")
+        if "EnvironmentFiles" in missing:
+            self._require_empty_environment_files(props["Id"])
+            props["EnvironmentFiles"] = ""  # Explicit typed-empty proof, not an absent-property default.
         if props["ActiveState"] != "active" or props["SubState"] != "running":
             raise Refusal("service_not_running", "Sunshine user service is not active/running")
         env = _environment(_text(self._run(("/usr/bin/systemctl", "--user", "show-environment"))), "\n")
