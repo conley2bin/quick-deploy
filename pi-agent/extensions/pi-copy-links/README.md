@@ -24,7 +24,7 @@
 bash pi-agent/extensions/pi-copy-links/install.sh
 ```
 
-安装器把整个源码目录软链接到 `~/.pi/agent/extensions/pi-copy-links`，也已纳入 `pi-agent/install.sh` 的扩展发现流程。可用 `PI_CODING_AGENT_DIR` 指定其他 Pi home。安装器不修改 `settings.json`、Pi bundle 或桌面关联。
+这个单独的叶安装器把整个源码目录软链接到 `~/.pi/agent/extensions/pi-copy-links`，也已纳入 `pi-agent/install.sh` 的扩展发现流程。可用 `PI_CODING_AGENT_DIR` 指定其他 Pi home。叶安装器不修改 `settings.json`、Pi bundle 或桌面关联；主入口 `pi-agent/install.sh` 在全部安装成功后保存全局 `tuiMode=fullscreen`，新 Pi 会话无需另做 `/settings`。项目/CLI 模式覆盖仍有效，运行中的 Pi 不会自动切换模式或重载。
 
 客户端助手在 Y9000p 单独部署；公司侧安装器不更新它。两侧协议版本核对后按上面的使用步骤在 Pi 空闲时 `/reload`。普通模式把历史滚动交给终端/tmux，Pi 无法可靠命中滚动后的历史内容，因此扩展不在普通模式接管鼠标。tmux copy-mode 也会接管鼠标；点击前应先退出。
 

@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # One-click installer for everything pi-agent owns.
 #
-#   pi-agent/install.sh           install every extension that ships install.sh
-#   pi-agent/install.sh --skills  then also run the interactive skills installer
+#   pi-agent/install.sh           install extensions, persist global fullscreen
+#   pi-agent/install.sh --skills  also run the interactive skills installer
 #
-# Extensions are discovered generically as pi-agent/extensions/<name>/install.sh;
-# adding an extension with its own install.sh makes it part of the one-click
-# flow with no edits here. Sub-installers are idempotent and refuse foreign or
-# Git-index-owned targets. Nothing here reloads or restarts Pi.
+# Requires Node.js >=22.19, npm and an installed Pi; installs none of them.
+# Discovers extensions/<name>/install.sh; leaf installers remain settings-free.
+# After installation, only global tuiMode is set; existing fullscreen is a no-op.
+# Project/CLI overrides remain separate. No live mode switch/reload/restart.
 set -euo pipefail
 
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
@@ -24,6 +24,16 @@ while [[ $# -gt 0 ]]; do
       exit 2 ;;
   esac
 done
+
+command -v node >/dev/null 2>&1 || { echo 'pi-agent install: Node.js >=22.19 and npm must already be installed' >&2; exit 1; }
+PI_EXECUTABLE=$(type -P pi) || { echo 'pi-agent install: Pi must already be installed and on PATH' >&2; exit 1; }
+
+# Pi accepts a leading ~ in PI_CODING_AGENT_DIR; normalize it for leaf scripts
+# too, so installation and configuration cannot land in different homes.
+case "${PI_CODING_AGENT_DIR:-}" in
+  '~') export PI_CODING_AGENT_DIR="$HOME" ;;
+  '~/'*) export PI_CODING_AGENT_DIR="$HOME/${PI_CODING_AGENT_DIR:2}" ;;
+esac
 
 installers=()
 for candidate in "$SCRIPT_DIR"/extensions/*/install.sh; do
@@ -55,4 +65,6 @@ else
   echo "  $SCRIPT_DIR/skills/install-skills.sh"
 fi
 echo
-echo "When ready, run /reload in Pi (or restart it) to load updated extensions and skills."
+node "$SCRIPT_DIR/configure-fullscreen.mjs" "$PI_EXECUTABLE"
+echo "New Pi sessions default to fullscreen (project settings or --tui-mode can override)."
+echo "The running Pi session was not changed. When ready, run /reload or restart it to load updates."
