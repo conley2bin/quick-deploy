@@ -89,6 +89,61 @@ test("installer also refuses indexed descendants of an absent target directory",
   assert.equal(spawnSync("test", ["-e", join(setup.piHome, "extensions/pi-inline-images")]).status, 1);
 });
 
+test("inaccessible Git metadata cannot bypass a deleted indexed target", t => {
+  if (typeof process.getuid === "function" && process.getuid() === 0) { t.skip("requires unprivileged permission checks"); return; }
+  const setup = environment(), target = join(setup.piHome, "extensions/pi-inline-images"), metadata = join(setup.piHome, ".git");
+  mkdirSync(dirname(target)); writeFileSync(target, "indexed owner\n");
+  execFileSync("git", ["-C", setup.piHome, "add", "--", "extensions/pi-inline-images"], { env: setup.env });
+  const index = readFileSync(join(metadata, "index")), settings = readFileSync(join(setup.piHome, "settings.json"));
+  const mode = statSync(metadata).mode & 0o777; rmSync(target); chmodSync(metadata, 0o000);
+  try {
+    assert.notEqual(spawnSync("git", ["-C", setup.piHome, "rev-parse", "--git-dir"], { env: setup.env }).status, 0);
+    const result = spawnSync(INSTALL, { env: setup.env, encoding: "utf8" });
+    assert.notEqual(result.status, 0, result.stdout); assert.match(result.stderr, /cannot inspect Git ownership/);
+    assert.equal(existsSync(setup.npmLog), false); assert.throws(() => lstatSync(target), { code: "ENOENT" });
+    assert.deepEqual(readFileSync(join(setup.piHome, "settings.json")), settings);
+  } finally { chmodSync(metadata, mode); }
+  assert.deepEqual(readFileSync(join(metadata, "index")), index);
+  assert.equal(execFileSync("git", ["-C", setup.piHome, "status", "--short"], { env: setup.env, encoding: "utf8" }).includes("AD extensions/pi-inline-images"), true);
+});
+
+test("failed Git inspection rejects markers and explicit ownership context before npm", () => {
+  for (const kind of ["gitfile", "dangling marker", "explicit context", "empty explicit context"]) {
+    const setup = environment(false), marker = join(setup.piHome, ".git");
+    let env: NodeJS.ProcessEnv = setup.env;
+    if (kind === "gitfile") writeFileSync(marker, `gitdir: ${join(setup.root, "missing metadata")}\n`);
+    if (kind === "dangling marker") symlinkSync(join(setup.root, "missing metadata"), marker);
+    if (kind === "explicit context" || kind === "empty explicit context") env = { ...env, GIT_DIR: kind === "empty explicit context" ? "" : join(setup.root, "missing metadata") };
+    const settings = readFileSync(join(setup.piHome, "settings.json"));
+    const result = spawnSync(INSTALL, { env, encoding: "utf8" });
+    assert.notEqual(result.status, 0); assert.match(result.stderr, /cannot inspect Git ownership/);
+    assert.equal(existsSync(setup.npmLog), false); assert.equal(existsSync(join(setup.piHome, "extensions/pi-inline-images")), false);
+    assert.deepEqual(readFileSync(join(setup.piHome, "settings.json")), settings);
+    if (kind === "gitfile") assert.equal(readFileSync(marker, "utf8"), `gitdir: ${join(setup.root, "missing metadata")}\n`);
+    if (kind === "dangling marker") assert.equal(readlinkSync(marker), join(setup.root, "missing metadata"));
+  }
+});
+
+test("failed Git inspection follows physical ancestors and refuses inaccessible directory lookup", t => {
+  if (typeof process.getuid === "function" && process.getuid() === 0) { t.skip("requires unprivileged permission checks"); return; }
+  const setup = environment(false), metadata = join(setup.home, ".git");
+  execFileSync("git", ["init", "-q", setup.home], { env: setup.env });
+  const alias = join(setup.root, "Pi parent alias"); symlinkSync(join(setup.home, ".pi"), alias);
+  const mode = statSync(metadata).mode & 0o777; chmodSync(metadata, 0o000);
+  try {
+    const result = spawnSync(INSTALL, { env: { ...setup.env, PI_CODING_AGENT_DIR: join(alias, "agent") }, encoding: "utf8" });
+    assert.notEqual(result.status, 0); assert.match(result.stderr, /cannot inspect Git ownership/);
+    assert.equal(existsSync(setup.npmLog), false); assert.equal(existsSync(join(setup.piHome, "extensions/pi-inline-images")), false);
+  } finally { chmodSync(metadata, mode); }
+  const inaccessible = environment(false), homeMode = statSync(inaccessible.piHome).mode & 0o777;
+  chmodSync(inaccessible.piHome, 0o000);
+  try {
+    const result = spawnSync(INSTALL, { env: inaccessible.env, encoding: "utf8" });
+    assert.notEqual(result.status, 0); assert.match(result.stderr, /cannot inspect Git ownership/);
+    assert.equal(existsSync(inaccessible.npmLog), false);
+  } finally { chmodSync(inaccessible.piHome, homeMode); }
+});
+
 test("installer supports a missing non-Git Pi home and reruns without creating settings or Git metadata", () => {
   const setup = environment(false); rmSync(setup.piHome, { recursive: true });
   assert.equal(existsSync(setup.piHome), false);

@@ -6,8 +6,12 @@ PI_HOME=${PI_CODING_AGENT_DIR:-"$HOME/.pi/agent"}
 TARGET="$PI_HOME/extensions/pi-inline-images"
 RULE=/extensions/pi-inline-images
 
-# Ordinary Pi homes need no repository. Git-owned homes retain the additional
-# index/exclude protections; target ownership is checked in either case.
+git_inspection_failed() { echo "pi-inline-images: cannot inspect Git ownership of $PI_HOME: $*" >&2; exit 1; }
+command -v git >/dev/null 2>&1 || git_inspection_failed "git is unavailable"
+
+# A failed query is not evidence that no index owns the target. Accept ordinary
+# absence only after checking accessible physical ancestors and explicit context;
+# never classify by Git's localized stderr or clear the caller's Git variables.
 IS_GIT_HOME=0
 if git -C "$PI_HOME" rev-parse --git-dir >/dev/null 2>&1; then
   IS_GIT_HOME=1
@@ -16,6 +20,30 @@ if git -C "$PI_HOME" rev-parse --git-dir >/dev/null 2>&1; then
     echo "pi-inline-images: refusing Git-index-owned target: ${INDEXED%%$'\n'*}" >&2
     exit 1
   fi
+else
+  GIT_STATUS=$?
+  [[ $GIT_STATUS == 128 ]] || git_inspection_failed "Git query failed (exit $GIT_STATUS)"
+  for variable in GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES; do
+    [[ ! -v "$variable" ]] || git_inspection_failed "explicit $variable context is unresolved"
+  done
+  INSPECT_PATH="$PI_HOME"
+  while [[ ! -d "$INSPECT_PATH" ]]; do
+    [[ ! -e "$INSPECT_PATH" && ! -L "$INSPECT_PATH" ]] || git_inspection_failed "unsettled destination path: $INSPECT_PATH"
+    PARENT=$(dirname -- "$INSPECT_PATH")
+    [[ "$PARENT" != "$INSPECT_PATH" ]] || git_inspection_failed "destination ancestors are unavailable"
+    INSPECT_PATH="$PARENT"
+  done
+  [[ -r "$INSPECT_PATH" && -x "$INSPECT_PATH" ]] || git_inspection_failed "directory lookup unavailable: $INSPECT_PATH"
+  INSPECT_PATH=$(CDPATH= cd -P -- "$INSPECT_PATH" && pwd -P) || git_inspection_failed "physical destination is unavailable"
+  while :; do
+    [[ -r "$INSPECT_PATH" && -x "$INSPECT_PATH" ]] || git_inspection_failed "ancestor lookup unavailable: $INSPECT_PATH"
+    [[ ! -e "$INSPECT_PATH/.git" && ! -L "$INSPECT_PATH/.git" ]] || git_inspection_failed "repository marker exists: $INSPECT_PATH/.git"
+    if [[ -e "$INSPECT_PATH/HEAD" && -d "$INSPECT_PATH/objects" && -d "$INSPECT_PATH/refs" ]]; then
+      git_inspection_failed "repository metadata exists: $INSPECT_PATH"
+    fi
+    [[ "$INSPECT_PATH" == / ]] && break
+    INSPECT_PATH=$(dirname -- "$INSPECT_PATH")
+  done
 fi
 
 if [[ -e "$TARGET" || -L "$TARGET" ]]; then

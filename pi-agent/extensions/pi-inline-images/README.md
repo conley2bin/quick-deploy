@@ -35,7 +35,9 @@ The installer runs `npm ci --ignore-scripts` in this source directory and create
 are supported; no repository is created. When the Pi home is a Git worktree, it
 also refuses indexed targets/descendants and adds the exact local exclude rule
 `/extensions/pi-inline-images` through `git rev-parse --git-path info/exclude`,
-requiring a writable exclude file. In either home type, unknown target
+requiring a writable exclude file. Unresolved Git ownership (repository markers,
+explicit Git context or inaccessible directory lookup) is refused before dependency
+installation or target changes. In either home type, unknown target
 files/directories/links are refused before dependencies are installed. This leaf
 installer does not edit `settings.json`, tracked `.gitignore`, Pi core, or the
 existing image package. Repeated runs retain the same owned symlink. Run

@@ -213,6 +213,35 @@ test("all real discovered installers succeed in a fresh non-Git home and rerun",
     npm: "logging stub", systemctl: "logging no-op stub" }));
 });
 
+test("uninspectable Git ownership blocks real main before protected target or settings mutation", t => {
+  if (process.getuid() === 0) { t.skip("requires unprivileged permission checks"); return; }
+  for (const existing of [true, false]) {
+    const f = realInstallerFixture(t); mkdirSync(f.agent, { recursive: true });
+    if (existing) f.seed('{"tuiMode":"regular","owned":42}\n');
+    f.env.GIT_CONFIG_NOSYSTEM = "1"; f.env.GIT_CONFIG_GLOBAL = "/dev/null";
+    execFileSync("git", ["init", "-q", f.agent], { env: f.env });
+    const target = join(f.agent, "extensions/pi-inline-images"), metadata = join(f.agent, ".git");
+    mkdirSync(dirname(target)); writeFileSync(target, "indexed owner\n");
+    execFileSync("git", ["-C", f.agent, "add", "--", "extensions/pi-inline-images"], { env: f.env });
+    const index = readFileSync(join(metadata, "index")), before = existing ? snapshot(f.settings) : undefined;
+    const mode = statSync(metadata).mode & 0o777; rmSync(target);
+    f.beforeCleanup.push(() => chmodSync(metadata, mode)); chmodSync(metadata, 0o000);
+    try {
+      const result = f.run();
+      t.diagnostic(JSON.stringify({ status: result.status, existingSettings: existing, protectedTargetExists: existsSync(target),
+        sdkTuiMode: SettingsManager.create(f.cwd, f.agent, { projectTrusted: false }).getTuiMode() }));
+      failed(result, /cannot inspect Git ownership/); assert.throws(() => lstatSync(target), { code: "ENOENT" });
+      if (before) unchanged(f.settings, before); else assert.equal(existsSync(f.settings), false);
+      assert.deepEqual(readFileSync(f.npmLog, "utf8").trim().split("\n"), [
+        `${f.checkout}/extensions/pi-copy-links\tci --ignore-scripts --no-audit --no-fund`,
+      ], "inline npm was never called");
+      assert.equal(existsSync(f.serviceLog), false, "later leaves did not run");
+    } finally { chmodSync(metadata, mode); }
+    assert.deepEqual(readFileSync(join(metadata, "index")), index);
+    assert.ok(execFileSync("git", ["-C", f.agent, "status", "--short"], { env: f.env, encoding: "utf8" }).includes("AD extensions/pi-inline-images"));
+  }
+});
+
 test("all real discovered installers retain ordinary Git-home behavior", t => {
   const f = realInstallerFixture(t); f.seed('{"tuiMode":"regular","owned":42}\n');
   execFileSync("git", ["init", "-q", f.agent]);
