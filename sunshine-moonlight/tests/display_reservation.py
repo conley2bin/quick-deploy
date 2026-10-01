@@ -47,8 +47,12 @@ def running(ticket):
     return r.DesktopRunning(ticket.status.binding, DESKTOP, DESKTOP.app_id)
 
 
+def owned_running(ticket):
+    return r.OwnedDesktopRunning(r.OwnershipBinding.from_runtime(ticket.status.binding), DESKTOP, DESKTOP.app_id)
+
+
 def closure(ticket):
-    return r.DesktopClosure(ticket.status.binding, DESKTOP, 0, ticket.status.revision, CANCEL)
+    return r.DesktopClosure(r.OwnershipBinding.from_runtime(ticket.status.binding), DESKTOP, 0, ticket.status.revision, CANCEL)
 
 
 def contend(path, revision, barrier, output):
@@ -144,9 +148,9 @@ class LifecycleTests(StoreCase):
         self.assertEqual(r.ReservationStore(self.path, HOST).status(), ticket.status)
         ticket = self.store.attempt_reconnect(ticket, running(ticket))
         self.assertEqual(ticket.status.phase, r.Phase.RECONNECTING)
-        self.refuse("phase_mismatch", self.store.begin_release, ticket, running(ticket))
+        self.refuse("phase_mismatch", self.store.begin_release, ticket, owned_running(ticket))
         ticket = self.store.observe_active(ticket, active(ticket))
-        ticket = self.store.begin_release(ticket, running(ticket))
+        ticket = self.store.begin_release(ticket, owned_running(ticket))
         status = self.store.release(ticket, closure(ticket))
         self.assertEqual(status.phase, r.Phase.AVAILABLE)
         self.assertFalse(status.launch_attempted)
@@ -238,7 +242,7 @@ class LifecycleTests(StoreCase):
                      lambda t: self.store.observe_active(t, active(t)),
                      lambda t: self.store.attempt_reconnect(t, running(t)),
                      lambda t: self.store.observe_active(t, active(t)),
-                     lambda t: self.store.begin_release(t, running(t))):
+                     lambda t: self.store.begin_release(t, owned_running(t))):
             self.refuse("phase_mismatch", self.store.acquire, ticket.status.revision, idle())
             self.assertEqual(r.ReservationStore(self.path, HOST).status(), ticket.status)
             ticket = step(ticket)
@@ -301,7 +305,7 @@ class LifecycleTests(StoreCase):
 
     def test_attempt_without_positive_owned_active_cannot_normally_release(self):
         ticket = self.connecting()
-        self.refuse("phase_mismatch", self.store.begin_release, ticket, running(ticket))
+        self.refuse("phase_mismatch", self.store.begin_release, ticket, owned_running(ticket))
         self.refuse("phase_mismatch", self.store.release, ticket, closure(ticket))
         self.refuse("invalid_evidence", self.store.release, ticket, {"exit_code": 0, "state": "FREE"})
         self.assertEqual(self.store.status().phase, r.Phase.CONNECTING)
@@ -312,8 +316,8 @@ class LifecycleTests(StoreCase):
         ticket = self.owned_active()
         self.refuse("phase_mismatch", self.store.release, ticket, closure(ticket))
         self.refuse("application_mismatch", self.store.begin_release, ticket,
-                    replace(running(ticket), application_id=0))
-        ticket = self.store.begin_release(ticket, running(ticket))
+                    replace(owned_running(ticket), application_id=0))
+        ticket = self.store.begin_release(ticket, owned_running(ticket))
         for evidence in (replace(closure(ticket), cancel_transaction="exit0"),
                          replace(closure(ticket), cancel_transaction="")):
             self.refuse("invalid_evidence", self.store.release, ticket, evidence)
@@ -338,7 +342,7 @@ class LifecycleTests(StoreCase):
             self.refuse("phase_mismatch", self.store.acquire, status.revision, idle())
             self.assertEqual(self.store.status(), status)
         self.assertEqual(json.loads((self.path / r.STATE_FILE).read_bytes())["owner_digest"], owner)
-        self.refuse("phase_mismatch", self.store.begin_release, replace(ticket, status=status), running(ticket))
+        self.refuse("phase_mismatch", self.store.begin_release, replace(ticket, status=status), owned_running(ticket))
 
     def test_reconciliation_requires_exact_dead_service_and_verified_replacement(self):
         ticket = self.connecting()
@@ -365,6 +369,118 @@ class LifecycleTests(StoreCase):
         status = self.store.reconcile(status.revision, r.ExclusiveOnboarding(idle(), CEREMONY))
         self.assertEqual(status.phase, r.Phase.AVAILABLE)
         self.refuse("not_owner", self.store.abort, ticket, r.PrelaunchAbort(BINDING, 0))
+
+    def test_selecting_refresh_and_cancel_publish_truthful_current_topology(self):
+        ticket = self.acquire()
+        changed = replace(BINDING, topology_digest="d" * 64)
+        refreshed = self.store.refresh_selection(ticket, idle(changed))
+        self.assertEqual(refreshed.capability, ticket.capability)
+        self.assertEqual(refreshed.status.binding, changed)
+        self.assertEqual(refreshed.status.revision, ticket.status.revision + 1)
+        self.refuse("stale_revision", self.store.begin_prepare, ticket, idle())
+        changed_again = replace(changed, topology_digest="e" * 64)
+        status = self.store.abort(refreshed, r.PrelaunchAbort(changed_again, 0))
+        self.assertEqual(status.phase, r.Phase.AVAILABLE)
+        self.assertEqual(status.binding, changed_again)
+        self.assertIsNone(json.loads((self.path / r.STATE_FILE).read_bytes())["owner_digest"])
+
+    def test_selecting_refresh_is_owner_only_exact_process_config_and_idle(self):
+        for changed in (replace(BINDING, config_digest="d" * 64),
+                        replace(BINDING, generation=replace(GENERATION, pid=999)),
+                        replace(BINDING, host=replace(HOST, base_port=48000))):
+            ticket = self.acquire()
+            self.refuse("not_owner", self.store.refresh_selection,
+                        replace(ticket, capability=r.Capability("0" * 64)), idle(changed))
+            self.assertEqual(self.store.status(), ticket.status)
+            self.refuse("runtime_changed", self.store.refresh_selection, ticket, idle(changed))
+            self.assertEqual(self.store.status().phase, r.Phase.RECONCILIATION_REQUIRED)
+            self.assertEqual(self.store.status().binding, BINDING)
+        ticket = self.acquire()
+        self.refuse("application_mismatch", self.store.refresh_selection, ticket,
+                    r.IdleRuntime(BINDING, DESKTOP.app_id))
+        self.refuse("invalid_evidence", self.store.refresh_selection, ticket, {"verified": True})
+        self.assertEqual(self.store.status(), ticket.status)
+
+    def test_selecting_refresh_exception_cannot_extend_to_preparing_or_attempts(self):
+        ticket = self.store.begin_prepare(self.acquire(), idle())
+        self.refuse("phase_mismatch", self.store.refresh_selection, ticket, idle())
+        self.refuse("phase_mismatch", self.store.abort, ticket,
+                    r.SelectionAbort(r.OwnershipBinding.from_runtime(BINDING), 0))
+        self.refuse("runtime_changed", self.store.abort, ticket,
+                    r.PrelaunchAbort(replace(BINDING, topology_digest="d" * 64), 0))
+        self.assertEqual(self.store.status().phase, r.Phase.RECONCILIATION_REQUIRED)
+
+    def test_selecting_cancel_can_use_only_truthful_ownership_without_topology(self):
+        ticket = self.acquire()
+        evidence = r.SelectionAbort(r.OwnershipBinding.from_runtime(BINDING), 0)
+        status = self.store.abort(ticket, evidence)
+        self.assertEqual(status.phase, r.Phase.AVAILABLE)
+        self.assertEqual(status.binding, BINDING)  # retained historical full snapshot
+        self.refuse("not_owner", self.store.abort, ticket, evidence)
+
+    def test_cleanup_projection_has_no_capture_topology_and_requires_own_record(self):
+        ticket = self.owned_active()
+        self.refuse("invalid_evidence", self.store.begin_release, ticket, running(ticket))
+        changed_topology = replace(BINDING, topology_digest="d" * 64)
+        owned = r.OwnedDesktopRunning(r.OwnershipBinding.from_runtime(changed_topology), DESKTOP, DESKTOP.app_id)
+        self.assertFalse(hasattr(owned.binding, "topology_digest"))
+        ticket = self.store.begin_release(ticket, owned)
+        evidence = r.DesktopClosure(r.OwnershipBinding.from_runtime(changed_topology), DESKTOP, 0,
+                                    ticket.status.revision, CANCEL)
+        status = self.store.release(ticket, evidence)
+        self.assertEqual(status.phase, r.Phase.AVAILABLE)
+        # Retained full binding is historical selection, not fresh topology.
+        self.assertEqual(status.binding, BINDING)
+        self.assertEqual(self.store.acquire(status.revision, idle(changed_topology)).status.binding, changed_topology)
+
+    def test_owned_cleanup_still_pins_host_generation_config_and_desktop(self):
+        for changed in (replace(BINDING, config_digest="d" * 64),
+                        replace(BINDING, generation=replace(GENERATION, start_id="new-birth")),
+                        replace(BINDING, host=replace(HOST, uuid=CEREMONY))):
+            ticket = self.owned_active()
+            proof = r.OwnedDesktopRunning(r.OwnershipBinding.from_runtime(changed), DESKTOP, DESKTOP.app_id)
+            self.refuse("runtime_changed", self.store.begin_release, ticket, proof)
+            self.assertEqual(self.store.status().phase, r.Phase.RECONCILIATION_REQUIRED)
+            self.assertIsNotNone(json.loads((self.path / r.STATE_FILE).read_bytes())["owner_digest"])
+        ticket = self.owned_active()
+        proof = replace(owned_running(ticket), desktop=replace(DESKTOP, definition_digest="d" * 64))
+        self.refuse("application_mismatch", self.store.begin_release, ticket, proof)
+        ticket = self.store.begin_release(ticket, owned_running(ticket))
+        changed = replace(closure(ticket), binding=replace(closure(ticket).binding, config_digest="d" * 64))
+        self.refuse("runtime_changed", self.store.release, ticket, changed)
+        self.assertEqual(self.store.status().phase, r.Phase.RECONCILIATION_REQUIRED)
+
+    def test_resume_retains_full_capture_binding_guard(self):
+        ticket = self.owned_active()
+        changed = replace(running(ticket), binding=replace(BINDING, topology_digest="d" * 64))
+        self.refuse("runtime_changed", self.store.attempt_reconnect, ticket, changed)
+        self.assertEqual(self.store.status().phase, r.Phase.RECONCILIATION_REQUIRED)
+
+    def test_prepared_abort_requires_actual_prepared_transition_and_revision(self):
+        ticket = self.store.begin_prepare(self.acquire(), idle())
+        evidence = r.PreparedAbort(r.OwnershipBinding.from_runtime(BINDING), DESKTOP, 0, ticket.status.revision)
+        self.refuse("preparation_unconfirmed", self.store.abort, ticket, evidence)
+        self.assertEqual(self.store.status(), ticket.status)
+        ticket = self.store.prepared(ticket, r.PreparedRuntime(BINDING, BINDING, DESKTOP, 0))
+        self.refuse("stale_observation", self.store.abort, ticket, evidence)
+        evidence = replace(evidence, prepared_revision=ticket.status.revision)
+        self.refuse("preparation_unconfirmed", self.store.abort, ticket,
+                    replace(evidence, desktop=replace(DESKTOP, definition_digest="d" * 64)))
+        status = self.store.abort(ticket, evidence)
+        self.assertEqual(status.phase, r.Phase.AVAILABLE)
+        self.assertEqual(status.binding, BINDING)  # historical full snapshot, not invented current topology
+
+    def test_prepared_abort_cannot_clear_reconciliation_or_issued_attempt(self):
+        ticket = self.prepared()
+        evidence = r.PreparedAbort(r.OwnershipBinding.from_runtime(BINDING), DESKTOP, 0, ticket.status.revision)
+        status = self.store.require_reconciliation(ticket.status.revision, r.Uncertainty.OWNER_LOST)
+        self.refuse("phase_mismatch", self.store.abort, replace(ticket, status=status), evidence)
+        ticket = self.prepared()
+        evidence = replace(evidence, prepared_revision=ticket.status.revision)
+        ticket = self.store.attempt_launch(ticket, idle())
+        self.refuse("reconciliation_required", self.store.abort, ticket, evidence)
+        self.assertTrue(self.store.status().launch_attempted)
+        self.assertIsNotNone(json.loads((self.path / r.STATE_FILE).read_bytes())["owner_digest"])
 
     def test_untrusted_dicts_and_boolean_revision_are_not_evidence(self):
         ticket = self.acquire()

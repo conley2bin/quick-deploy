@@ -11,7 +11,10 @@ not claims a remote JSON request may make. In particular:
 * PreparedRuntime requires verified readiness/capture mapping and, on restart,
   actual termination of the previous Sunshine generation.
 * DesktopActive follows this reservation's persisted launch/resume attempt.
-* DesktopClosure requires completed authenticated cancellation of the owned
+* OwnedDesktopRunning/DesktopClosure use OwnershipBinding: fresh host,
+  process generation and config, plus the exact inspected app. They authorize
+  cleanup, not resume/launch; current topology/capture usability is irrelevant.
+  DesktopClosure requires completed authenticated cancellation of the owned
   Desktop AFTER begin_release, then same-generation application state zero.
   Moonlight GUI exit0, EOF, timeout and raw FREE cannot construct this evidence.
 * ServiceTermination proves the old SUNSHINE generation is dead, not the caller
@@ -42,10 +45,10 @@ import uuid
 
 from protocol import Refusal
 
-__all__ = ["HostIdentity", "ServiceGeneration", "RuntimeBinding", "PositiveDesktop",
+__all__ = ["HostIdentity", "ServiceGeneration", "RuntimeBinding", "OwnershipBinding", "PositiveDesktop",
            "Phase", "Uncertainty", "Capability", "Status", "Reservation", "IdleRuntime",
-           "PreparedRuntime", "DesktopActive", "DesktopRunning", "DesktopClosure",
-           "PrelaunchAbort", "ServiceTermination", "ExclusiveOnboarding", "ReservationStore"]
+           "PreparedRuntime", "DesktopActive", "DesktopRunning", "OwnedDesktopRunning", "DesktopClosure",
+           "PrelaunchAbort", "SelectionAbort", "PreparedAbort", "ServiceTermination", "ExclusiveOnboarding", "ReservationStore"]
 
 STATE_FILE = "reservation.json"
 LOCK_FILE = "reservation.lock"  # Permanent inode: never unlink it to release ownership.
@@ -120,6 +123,25 @@ class RuntimeBinding:
 
 
 @dataclass(frozen=True)
+class OwnershipBinding:
+    """Fresh non-capture ownership facts. Deliberately contains no topology."""
+    host: HostIdentity
+    generation: ServiceGeneration
+    config_digest: str
+
+    def __post_init__(self):
+        _typed(self.host, HostIdentity)
+        _typed(self.generation, ServiceGeneration)
+        if not _hex(self.config_digest):
+            _invalid("ownership requires host/process/config SHA256 facts")
+
+    @classmethod
+    def from_runtime(cls, binding: RuntimeBinding):
+        _typed(binding, RuntimeBinding)
+        return cls(binding.host, binding.generation, binding.config_digest)
+
+
+@dataclass(frozen=True)
 class PositiveDesktop:
     app_id: int
     definition_digest: str
@@ -166,6 +188,8 @@ class Status:
     host: HostIdentity
     revision: int
     phase: Phase
+    # Last full selection snapshot, not a claim that current displays remain
+    # unchanged. Cleanup observes OwnershipBinding; acquire refreshes topology.
     binding: RuntimeBinding | None = None
     desktop: PositiveDesktop | None = None
     attempt_revision: int | None = None
@@ -214,12 +238,33 @@ class DesktopRunning:
 
 
 @dataclass(frozen=True)
+class OwnedDesktopRunning:
+    binding: OwnershipBinding
+    desktop: PositiveDesktop
+    application_id: int
+
+
+@dataclass(frozen=True)
 class DesktopClosure:
-    binding: RuntimeBinding
+    binding: OwnershipBinding
     desktop: PositiveDesktop
     application_id: int
     release_revision: int
     cancel_transaction: str  # Local UUID correlating completed authenticated cancel.
+
+
+@dataclass(frozen=True)
+class SelectionAbort:
+    binding: OwnershipBinding
+    application_id: int  # Untouched SELECTING only; no native/capture claim.
+
+
+@dataclass(frozen=True)
+class PreparedAbort:
+    binding: OwnershipBinding
+    desktop: PositiveDesktop
+    application_id: int
+    prepared_revision: int  # Actual completed prepared transition, never mere PREPARING.
 
 
 @dataclass(frozen=True)
@@ -740,6 +785,13 @@ class ReservationStore:
                          uncertainty=Uncertainty.RUNTIME_CHANGED)
             raise Refusal("runtime_changed", "host/process/config/topology changed; reconciliation required")
 
+    def _ownership_bound(self, directory, stamp, state, binding):
+        _typed(binding, OwnershipBinding)
+        if binding != OwnershipBinding.from_runtime(state.status.binding):
+            self._update(directory, stamp, state, phase=Phase.RECONCILIATION_REQUIRED,
+                         uncertainty=Uncertainty.RUNTIME_CHANGED)
+            raise Refusal("runtime_changed", "owned host/process/config changed; reconciliation required")
+
     @staticmethod
     def _application(value, expected):
         if not _integer(value, 0, (1 << 31) - 1) or value != expected:
@@ -796,6 +848,25 @@ class ReservationStore:
             status = Status(self.host, expected_revision + 1, Phase.SELECTING, idle.binding)
             self._save(directory, stamp, _State(status, hashlib.sha256(capability.value.encode("ascii")).hexdigest()))
             return Reservation(capability, status)
+
+    def refresh_selection(self, ticket: Reservation, idle: IdleRuntime) -> Reservation:
+        """Refresh only untouched SELECTING intent, never external/capture authority.
+
+        The coordinator must hold its operation mutex and establish no external
+        intent. PREPARING precedes every external operation. Fresh host, exact
+        generation/config and idle state stay fixed; only observed topology may
+        change. Every refresh issues a new revision under the same capability.
+        """
+        _typed(idle, IdleRuntime)
+        _typed(idle.binding, RuntimeBinding)
+        self._application(idle.application_id, 0)
+        with self._transaction() as directory:
+            state, stamp = self._load(directory)
+            self._owner(state, ticket)
+            self._phase(state, Phase.SELECTING)
+            self._ownership_bound(directory, stamp, state, OwnershipBinding.from_runtime(idle.binding))
+            new = self._update(directory, stamp, state, binding=idle.binding)
+            return Reservation(ticket.capability, new.status)
 
     def begin_prepare(self, ticket: Reservation, idle: IdleRuntime) -> Reservation:
         _typed(idle, IdleRuntime)
@@ -880,14 +951,14 @@ class ReservationStore:
                                attempt_revision=state.status.revision + 1)
             return Reservation(ticket.capability, new.status)
 
-    def begin_release(self, ticket: Reservation, running: DesktopRunning) -> Reservation:
-        """Only an observed owned-active lifecycle may issue normal authenticated quit."""
-        _typed(running, DesktopRunning)
+    def begin_release(self, ticket: Reservation, running: OwnedDesktopRunning) -> Reservation:
+        """Observed owned app may quit even when capture is no longer usable."""
+        _typed(running, OwnedDesktopRunning)
         with self._transaction() as directory:
             state, stamp = self._load(directory)
             self._owner(state, ticket)
             self._phase(state, Phase.ACTIVE)
-            self._bound(directory, stamp, state, running.binding)
+            self._ownership_bound(directory, stamp, state, running.binding)
             self._desktop(state, running)
             new = self._update(directory, stamp, state, phase=Phase.RELEASING)
             return Reservation(ticket.capability, new.status)
@@ -901,19 +972,22 @@ class ReservationStore:
             state, stamp = self._load(directory)
             self._owner(state, ticket)
             self._phase(state, Phase.RELEASING)
-            self._bound(directory, stamp, state, evidence.binding)
+            self._ownership_bound(directory, stamp, state, evidence.binding)
             _typed(evidence.desktop, PositiveDesktop)
             if evidence.desktop != state.status.desktop:
                 raise Refusal("application_mismatch", "closure is not for the owned positive-ID Desktop")
             if not _integer(evidence.release_revision, 1) or evidence.release_revision != state.status.revision:
                 raise Refusal("stale_observation", "closure must follow this persisted release intent")
+            # Keep the historical full selection snapshot. No fresh topology is
+            # claimed by ownership-only closure; acquire must observe it again.
             status = Status(self.host, state.status.revision + 1, Phase.AVAILABLE, state.status.binding)
             self._save(directory, stamp, _State(status))
             return status
 
-    def abort(self, ticket: Reservation, evidence: PrelaunchAbort) -> Status:
-        """Clean rollback only before ANY attempt; attempted-but-unobserved is uncertain."""
-        _typed(evidence, PrelaunchAbort)
+    def abort(self, ticket: Reservation, evidence: PrelaunchAbort | SelectionAbort | PreparedAbort) -> Status:
+        """Untouched selection cancellation or verified completed prelaunch cleanup."""
+        if type(evidence) not in (PrelaunchAbort, SelectionAbort, PreparedAbort):
+            _invalid("trusted selection-cancel or completed prelaunch-cleanup evidence required")
         self._application(evidence.application_id, 0)
         with self._transaction() as directory:
             state, stamp = self._load(directory)
@@ -923,9 +997,32 @@ class ReservationStore:
                     self._update(directory, stamp, state, phase=Phase.RECONCILIATION_REQUIRED,
                                  uncertainty=Uncertainty.LAUNCH_UNCONFIRMED)
                 raise Refusal("reconciliation_required", "launch/resume was attempted; prelaunch abort cannot release ownership")
+            if type(evidence) is PreparedAbort:
+                self._phase(state, Phase.PREPARING)
+                _typed(evidence.desktop, PositiveDesktop)
+                if state.status.desktop is None or state.status.desktop != evidence.desktop:
+                    raise Refusal("preparation_unconfirmed", "completed preparation and exact inspected Desktop required")
+                if not _integer(evidence.prepared_revision, 1) or evidence.prepared_revision != state.status.revision:
+                    raise Refusal("stale_observation", "cleanup must follow the actual completed preparation revision")
+                self._ownership_bound(directory, stamp, state, evidence.binding)
+                status = Status(self.host, state.status.revision + 1, Phase.AVAILABLE, state.status.binding)
+                self._save(directory, stamp, _State(status))
+                return status  # Full topology remains historical; no synthetic old-topology observation.
+            if type(evidence) is SelectionAbort:
+                self._phase(state, Phase.SELECTING)
+                self._ownership_bound(directory, stamp, state, evidence.binding)
+                status = Status(self.host, state.status.revision + 1, Phase.AVAILABLE, state.status.binding)
+                self._save(directory, stamp, _State(status))
+                return status  # Last full snapshot stays historical, never fabricated fresh topology.
             self._phase(state, Phase.SELECTING, Phase.PREPARING)
-            self._bound(directory, stamp, state, evidence.binding)
-            status = Status(self.host, state.status.revision + 1, Phase.AVAILABLE, state.status.binding)
+            _typed(evidence.binding, RuntimeBinding)
+            if state.status.phase is Phase.SELECTING:
+                # No external work has started. Publish the genuinely observed
+                # current topology instead of pretending the old one is fresh.
+                self._ownership_bound(directory, stamp, state, OwnershipBinding.from_runtime(evidence.binding))
+            else:
+                self._bound(directory, stamp, state, evidence.binding)
+            status = Status(self.host, state.status.revision + 1, Phase.AVAILABLE, evidence.binding)
             self._save(directory, stamp, _State(status))
             return status
 
