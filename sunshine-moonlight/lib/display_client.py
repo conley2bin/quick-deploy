@@ -577,7 +577,7 @@ class Session:
                 if self.interrupts.signum is not None:
                     stop_child(self.child)
                     break
-                time.sleep(0.05)  # same-process reconnect retains the same host owner
+                time.sleep(0.05)  # Stock CLI is single-shot; retain owner until this child exits.
             child_code = self.child.wait()
         finally:
             stop_child(self.child)
