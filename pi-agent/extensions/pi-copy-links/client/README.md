@@ -1,18 +1,32 @@
 # Y9000p Pi client link helper
 
-This is the **Y9000p client half** of Pi's fullscreen Ctrl+left Markdown link opening. The company extension identifies the initiating SSH client and sends one verified target here. A failure is shown to the user, never retried against the company desktop. Y9000p web links use `xdg-open` and its default browser (which may reuse a window/tab); company file links use Y9000p VS Code Remote-SSH with `--new-window`. Ordinary left-click does not open a link. See the [short user runbook](../extensions/pi-copy-links/README.md) for `/reload`, `/copy-links`, and collision handling.
+This is the **Y9000p client half** of Pi's fullscreen Ctrl+left Markdown link opening. The company extension identifies the initiating SSH client and sends one verified target here. A failure is shown to the user, never retried against the company desktop. Y9000p web links use `xdg-open` and its default browser (which may reuse a window/tab); company file links use Y9000p VS Code Remote-SSH with `--new-window`. Ordinary left-click does not open a link. See the [short user runbook](../README.md) for `/reload`, `/copy-links`, and collision handling.
 
 ## Install and version check
 
-**Before an idle Pi `/reload`, the installed Y9000p executable must match the company source and its v2 protocol.** From the company repository root, compare the two executable checksums and inspect the client symlink target; the target should be the intended reviewed version, not an older checkout. These read-only commands do not hard-code a machine-specific versioned installation path:
+On **Y9000p**, first obtain the reviewed checkout matching the company helper source, then run from that checkout's root (requires Bash and Python 3):
 
 ```sh
-sha256sum pi-agent/client-link-helper/pi-client-link-helper
+bash pi-agent/extensions/pi-copy-links/client/install.sh
+# Only when deliberately repointing a separately versioned/foreign symlink:
+bash pi-agent/extensions/pi-copy-links/client/install.sh --replace
+```
+
+The installer links `~/.local/bin/pi-client-link-helper` to **its own checkout's** canonical executable using a relative symlink. An existing link to that same source is a no-op, preserving its inode. An exact link to **this checkout's** old `pi-agent/client-link-helper/pi-client-link-helper` migrates automatically, even if dangling after the move; absolute and relative links and checkout/HOME aliases are supported. The old source directory is deleted, with no alias or wrapper.
+
+Every other symlink, including an independent versioned deployment with identical bytes, is refused unless `--replace` is explicit. The report names the previous destination. Ordinary files/directories are refused even with `--replace`; the old destination itself is never modified or executed. The source must be an executable regular file before any directory/link mutation. Publication is atomic; setup/relink failure leaves the previous command in place. Observed source/link identity changes fail visibly, and cleanup never deletes/restores a successor command. Run one installer at a time: an uncooperative writer in the final check-to-rename interval cannot be excluded by pathname rechecks.
+
+This nested installer is **Y9000p-only**: the company's `pi-agent/install.sh` shallow `extensions/*/install.sh` scan excludes it. It does not fetch/copy code, install remotely, launch a helper, or change Pi extensions, SSH config, GUI/tunnels, or running sessions. Running an old Y9000p checkout's installer does not upgrade its code.
+
+**Before an idle Pi `/reload`, the installed Y9000p executable must match the company source and its v2 protocol.** From the company repository root, compare checksums and inspect the intended reviewed client destination:
+
+```sh
+sha256sum pi-agent/extensions/pi-copy-links/client/pi-client-link-helper
 ssh -T -o BatchMode=yes -o ClearAllForwardings=yes -o StrictHostKeyChecking=yes conley-Y9000p \
   'test -L "$HOME/.local/bin/pi-client-link-helper" && test -x "$HOME/.local/bin/pi-client-link-helper" && readlink -f "$HOME/.local/bin/pi-client-link-helper" && sha256sum "$HOME/.local/bin/pi-client-link-helper"'
 ```
 
-The two `sha256sum` digest fields must match. The installer `pi-agent/client-link-helper/install.sh` only creates `~/.local/bin/pi-client-link-helper` as a symlink to **its own checkout's** executable (or accepts that same existing target); it does not fetch, copy, or upgrade code and refuses another target. The Y9000p repository checkout may lag the company source, so running its old `install.sh` is **not** an upgrade. If the hashes differ, first deploy the reviewed matching executable on Y9000p and deliberately point the symlink to it, then rerun the checks; do not reload Pi against a mismatched helper. This is a version check, not an instruction to change the Y9000p host from this repository.
+The two `sha256sum` digest fields must match. If they differ, obtain the reviewed matching checkout on Y9000p, run the new installer (using `--replace` only for the deliberate foreign-link case), then repeat these checks. Do not reload Pi against a mismatched helper.
 
 ## Maintainer: invocation and v2 exchange
 
@@ -62,7 +76,13 @@ All subprocesses use argument arrays, no target interpolation. Neither a decoy l
 
 ## Validation boundary
 
-Run `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s pi-agent/client-link-helper/tests -v` in the repository. Fake SSH/`ss`/desktop commands test both required listeners and company-backend selection, opposite-family decoys and bind races, old-record rejection, before-COMMIT listener takeover/cancellation, unchanged URL, and preserved `localhost` and Code routing. Real local HTTP relays model both listener families: an explicit-IP `/start` returns a same-port `localhost` 302, and the opposite-family `/done` returns the company fixture body. The relays are **not** an actual SSH tunnel or Y9000p browser. The suite also exercises the installed Code resolver, bounded process cleanup, and SSH alias drift.
+From the repository root:
+
+```sh
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s pi-agent/extensions/pi-copy-links/client/tests -v
+```
+
+Installer tests use temporary checkout/HOME/bin fixtures, preserve old targets, and inject staging/relink failures and successor races without executing a receiver. The helper tests derive their paths from this directory. Fake SSH/`ss`/desktop commands test both required listeners and company-backend selection, opposite-family decoys and bind races, old-record rejection, before-COMMIT listener takeover/cancellation, unchanged URL, and preserved `localhost` and Code routing. Real local HTTP relays model both listener families: an explicit-IP `/start` returns a same-port `localhost` 302, and the opposite-family `/done` returns the company fixture body. The relays are **not** an actual SSH tunnel or Y9000p browser. The suite also exercises the installed Code resolver, bounded process cleanup, and SSH alias drift.
 
 The corrected helper was installed on Y9000p and exercised through real company dispatcher requests with a tagged SSH client origin. A controlled opposite-family listener caused `port_conflict` before PREPARED with no browser launch; after removing that controlled listener, Chrome followed an explicit-IP page's same-port 302 to `localhost` and displayed the **company final page**, with both client loopback families served by one owned forward. A separate company IPv6-only `localhost` page displayed correctly through the same dual-family client design. Code Remote-SSH file opening was physically checked in an earlier v2 run. Those controlled fixtures/masters were removed; at this documentation checkpoint the active user Pi has **not** yet been `/reload`ed or activated by a physical Ctrl+left gesture. That live click remains the acceptance boundary.
 

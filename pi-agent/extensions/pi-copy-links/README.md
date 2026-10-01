@@ -9,7 +9,7 @@
 
 ## 使用：在点击来源的桌面打开
 
-先确认公司侧扩展和 Y9000p 已安装的客户端助手使用匹配的 v2 协议；助手版本/软链接核验见 [客户端助手说明](../../client-link-helper/README.md#install-and-version-check)。不要把 Y9000p 较旧的仓库 checkout 上的 `install.sh` 当作升级。匹配后：
+先确认公司侧扩展和 Y9000p 已安装的客户端助手使用匹配的 v2 协议；助手安装、checksum/软链接核验和隔离测试见 [客户端助手说明](client/README.md#install-and-version-check)。不要把 Y9000p 较旧的仓库 checkout 上的 `install.sh` 当作升级。匹配后：
 
 1. 在 Pi **空闲时**执行 `/reload`，确认 `/settings` 中 **TUI mode = fullscreen**；`/copy-links` 查看扩展状态。也可用 `pi --tui-mode fullscreen` 启动。
 2. 从 Y9000p 经 SSH 操作公司 Pi 时，Pi 必须运行在**公司 tmux pane** 里，鼠标事件才能带上确切的 SSH 客户端 PID。直接在 SSH/Codoxear PTY 里运行 Pi，即使有 `SSH_CONNECTION`，也会报“SSH 输入未经带来源标记的 tmux”，不会打开任何一端的 Code。迁移已有对话时先正常退出旧 Pi，在 Y9000p 的 SSH shell 登录公司，进入原工作目录后执行 `tmux new -A -s pi-video`，在 tmux pane 内用 `pi --tui-mode fullscreen --resume` 选回原会话；不要让两个 Pi 进程同时写同一个会话文件。
@@ -26,7 +26,15 @@ bash pi-agent/extensions/pi-copy-links/install.sh
 
 这个单独的叶安装器把整个源码目录软链接到 `~/.pi/agent/extensions/pi-copy-links`，也已纳入 `pi-agent/install.sh` 的扩展发现流程。可用 `PI_CODING_AGENT_DIR` 指定其他 Pi home。叶安装器不修改 `settings.json`、Pi bundle 或桌面关联；主入口 `pi-agent/install.sh` 在全部安装成功后保存全局 `tuiMode=fullscreen`，新 Pi 会话无需另做 `/settings`。项目/CLI 模式覆盖仍有效，运行中的 Pi 不会自动切换模式或重载。
 
-客户端助手在 Y9000p 单独部署；公司侧安装器不更新它。两侧协议版本核对后按上面的使用步骤在 Pi 空闲时 `/reload`。普通模式把历史滚动交给终端/tmux，Pi 无法可靠命中滚动后的历史内容，因此扩展不在普通模式接管鼠标。tmux copy-mode 也会接管鼠标；点击前应先退出。
+客户端助手源码位于本扩展的 `client/`，在 **Y9000p** 的匹配已审阅 checkout 根目录单独运行：
+
+```bash
+bash pi-agent/extensions/pi-copy-links/client/install.sh
+# 独立版本/外来软链接只有有意重指向时才加：
+bash pi-agent/extensions/pi-copy-links/client/install.sh --replace
+```
+
+当前源链接重跑不变；同一 checkout 的旧 `pi-agent/client-link-helper/` 链接自动迁移（断链也可），旧源码目录已删除、无别名/包装。其他软链接默认拒绝；`--replace` 也不覆盖普通文件/目录，不改旧目标。安装器不取代码、不远程安装、不启动助手或 GUI/SSH；公司主入口仅扫描 `extensions/*/install.sh`，不会运行嵌套的客户端入口。客户端也不增加 Pi 扩展入口。两侧协议版本核对后按上面的使用步骤在 Pi 空闲时 `/reload`。普通模式把历史滚动交给终端/tmux，Pi 无法可靠命中滚动后的历史内容，因此扩展不在普通模式接管鼠标。tmux copy-mode 也会接管鼠标；点击前应先退出。
 
 ## 链接目标
 
@@ -136,6 +144,12 @@ python3 test/native-smoke.py
 python3 test/native-smoke.py --osc52
 python3 test/native-smoke.py --tmux
 python3 test/native-smoke.py --tmux --regular-start
+```
+
+客户端安装器及 fake-endpoint 接收助手回归从仓库根目录运行：
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s pi-agent/extensions/pi-copy-links/client/tests -v
 ```
 
 `--legacy-peer-deps` 只用于测试依赖安装，避免 npm 自动装入与正在运行的 Pi 不同身份的 peer；`npm run check` 中的 `test/setup-pi.mjs` 核验并链接本机已安装的 Pi/TUI，发现不匹配的第二份运行时会拒绝执行。验收以实际 `pi` 的 bundled CLI 和上面的离线 PTY/recorder 为准，不用未打包入口代替。
