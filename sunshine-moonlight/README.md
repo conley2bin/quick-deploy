@@ -17,7 +17,11 @@
 ./install.sh
 ```
 
-它先检查最新稳定 Sunshine，再检查最新稳定 Moonlight，并只在系统 Python 无法导入 PyYAML 时通过 `sudo apt-get install python3-yaml` 安装该依赖。每个组件独立查询一次其 GitHub release：缺失或较旧时下载/更新，相同版本跳过载荷但仍收敛既有配置，本机较新时保留且不降级。主机阶段失败时客户端不会查询或修改。只安装 A 时使用 `./install.sh --host-only`，只安装 B 时使用 `./install.sh --client-only`；已在双角色安装中完成这两个角色时，不要在下面的编号步骤重复安装。所选安装阶段全部成功后，本入口仅在模块根目录缺少 `machines.yaml` 时新建全字段中文占位清单（见第 3 节）：模板不含真实地址、不做地址发现；已有普通清单在以后安装时原样保留，包括内容、权限与修改时间。高级版本、捕获或绑定选项仍直接传给 `commands/install-host.sh` 或 `commands/install-client.sh`。任一阶段失败会停止后续阶段，已成功完成的阶段不会自动回滚。
+它先检查最新稳定 Sunshine，再检查最新稳定 Moonlight，并只在系统 Python 无法导入 PyYAML 时通过 `sudo apt-get install python3-yaml` 安装该依赖。每个 vendor 组件独立查询一次其 GitHub release：缺失或较旧时下载/更新，相同版本跳过载荷但仍收敛既有配置，本机较新时保留且不降级。主机阶段失败时客户端不会查询或修改。只安装 A 时使用 `./install.sh --host-only`，只安装 B 时使用 `./install.sh --client-only`；已完成的角色无需重复安装。
+
+所选 vendor 阶段成功后，含主机角色的安装再运行独立的显示控制伴随阶段（下节）；客户端单角色跳过它。伴随阶段只资格检查已安装的 **Sunshine 2026.914.233613/source63d35f7**，不降级其它版本、不把 vendor 安装成功当作兼容性证明。固定 SSH shim 缺失时，默认可完成私人控制器发布，但会明确返回失败、报告 `Shim NOT PUBLISHED`；默认不自动提权发布它。确认允许新增系统入口后，可选 `./install.sh --publish-display-control-shim`（或加在 `--host-only` 后）；已成功安装 vendor 时，优先单独补跑 `commands/install-display-control.sh --publish-shim`，避免为了补伴随程序重新触发 vendor 更新/重启。
+
+所选阶段**全部成功**后，本入口仅在模块根目录缺少 `machines.yaml` 时新建全字段中文占位清单（见第 3 节）：模板不含真实地址、不做地址发现；已有普通清单始终原样保留，包括内容、权限与修改时间。伴随阶段失败时明确报告 vendor 已成功，但不新建清单、不声称全部完成、不回滚已完成阶段。高级 vendor 版本、捕获或绑定选项仍直接传给 `commands/install-host.sh` 或 `commands/install-client.sh`。本根入口仍是 Ubuntu 安装器，不是 Windows/macOS vendor 包安装器。
 
 ## 1. 在 A 安装 Sunshine
 
@@ -43,20 +47,55 @@ tailscale ip -4
 
 这两台保留普通 GNOME Wayland 桌面，使用原生 `--capture kms`，不转换为 Xorg；KMS 不走桌面门户授权。不传 `--capture` 时已有有效后端设置会保留；`wlr`、`kwin` 需要 Wayland，`x11` 需要 Xorg。脚本拒绝与会话类型冲突的选择，具体 compositor/显卡是否可用仍需连接 Desktop 检查。无效值（如 `xcb` 或字面值 `auto`）会报错，由你明确选择修正方式。
 
-## 2. 在 B 安装 Moonlight 并配对
+### 在已安装的 A 独立安装显示控制伴随程序
+
+这是与官方 Sunshine 包分开拥有的程序；协议见 [`display-control/README.md`](display-control/README.md)。客户端已接入实时选屏、配对与受管串流。当前主机 lifecycle 支持 Linux/KMS；Windows/macOS 的服务/图形会话控制器与安装适配仍待实现，原生枚举代码不能替代它们。Linux 的组合验收目前使用隔离运行事实和私有终端，实际捕获画面仍须按第 4 节核对。
+
+以运行 Sunshine 的同一桌面用户，在 A 本地执行（不要 `sudo` 整个安装器）：
+
+```bash
+./commands/install-display-control.sh --help
+./commands/install-display-control.sh
+# 仅在明确同意新增下面的系统级入口后：
+./commands/install-display-control.sh --publish-shim
+# 仅在无已有/在途非受管串流且同意所有受管连接使用同一控制器时：
+quick-deploy-display-control --enroll
+```
+
+- **实际依赖**：Ubuntu 24.04+ 的官方 amd64/arm64 deb，系统 `/usr/bin/python3`（3.10+、标准库）、`curl`、`sha256sum`、`stat`、`dpkg`/`dpkg-query`/`dpkg-deb`、`systemctl`/`busctl`/`journalctl`，以及运行时 Linux KMS 的 `libdrm` 和可用图形会话。安装器检查依赖，不自动用 APT 补装。只有显式 shim 发布步骤需要 `sudo` 和写 `/usr/bin` 的权限；API 不需要 Sunshine 管理员、TLS 或 Moonlight 凭据。
+- **来源资格**：复用 `common.sh` 的 GitHub API 凭据保护与 SHA256 校验，查询精确 `v2026.914.233613` 元数据，要求完整 `target_commitish=63d35f702ee9e362e43263742981836ec0710384`、对应 Ubuntu/架构的规范下载 URL、非空 SHA256 和精确 size。参考 deb 校验后，`dpkg-deb` 只读解出数据，不安装包、不执行二进制/maintainer scripts；逐项比较实际 root-owned `/usr/bin/sunshine`、加载的官方用户 unit 及整个 `/usr/share/sunshine` 资产文件集。该资产路径来自精确源码的编译/打包定义，不是猜测的工作目录。Package/Architecture/完整 Version 也须匹配已安装包；其它/较新版本、变化的 bytes 或缺少独立摘要都拒绝，不自动降级，也不支持未经证明的 source-build。
+- **实际运行来源**：沿用已接受的 Linux 用户管理器/进程 ownership 检查，解析真正的 HOME、配置根、`sunshine.conf`、`file_apps`、Tailnet bind/base port、官方 unit 和受管 retry guard；UUID 取自该绑定的公开 `/serverinfo`，不读取服务器 credential state 来找 ID。普通配置父目录链接可用，配置/资产/出版物的叶链接、外来 unit/ExecStart/环境 override、冲突设置均拒绝。
+- **固定 SSH 名称**：显式 `--publish-shim` 原子新建 root-owned、0755、非 setuid 的 `/usr/bin/quick-deploy-display-control`。非交互 SSH 的 PATH 必须含 `/usr/bin`，不依赖 `.local/bin`、登录 profile 或 shell 猜路径。已存在的同字节、正确归属 shim 保留；符号链接、非普通文件、外来/不同内容或发布时新出现的目标拒绝覆盖。运行 dispatcher 在 NSS 查找前拒绝 root EUID、UID/EUID 不一致和任意 command/path 参数；以有效 UID 的 NSS home 查找固定私人安装，不信任 `HOME`/`USER`/XDG 或 RPC 字段。RPC 保留有界 stdin JSON/stdout JSON，不运行 `sudo`。已完成的普通 stdin RPC 响应（包括协议错误/host refusal）沿用 host 的退出0契约，调用方仍须检查 JSON 的 `ok`/`error`，不能把退出0当作操作成功或释放证明；本地交互 `--enroll` 失败仍退出1。
+
+私人路径以 **NSS home 的真实路径**为根，不受调用 cwd 或环境变量重定向：
+
+| 路径 | 归属/含义 |
+|---|---|
+| `.local/share/quick-deploy/display-control/versions/v1-<source-sha256>/` | 当前用户0700；独立 controller 版本，代码与 `.owned.json` 为0600 |
+| 版本内 `host-settings.json` | 当前用户0600；schema2 的 qualified build、config/apps/assets、UUID/base、runtime user/home/unit 和固定 state 路径 |
+| `.local/share/quick-deploy/display-control/active/00000001.json` 等 | 当前用户0600；连续、create-only active 记录，最后完整记录指向当前版本，无易被覆盖的 symlink |
+| `.local/share/quick-deploy/display-control/state/` | 唯一当前用户0700 state；永久 lock、reservation、operation、StartReceipt、prepare backup，跨版本保留 |
+
+固定 dispatcher 及本地安装入口使用显式 `python3 -I -B` 启动 controller；`-I` 会忽略 `PYTHONDONTWRITEBYTECODE`，因此不能用该环境变量代替 `-B`。版本目录不生成 `__pycache__`，原有精确成员/hash 校验保持严格。
+
+重新运行独立安装器会再次独立资格检查；相同代码不重写，代码更新发布新版本/active 记录，保留有效 settings 原始字节及 state 的 bytes/权限/mtime/inode，不重新 enrollment、不清除能力或 receipt。冲突、腐坏、不完整或未知的中断发布显式停止，等待可信人工核对，不自动迁移/重置。官方 Sunshine 更新不会覆盖这些 companion-owned 文件；改变 vendor bytes 后必须重新取得兼容资格，旧 receipt 不能冒充新进程的证明。安装器不读写个人 `machines.yaml` 或遗留清单。
+
+首次发布是 **UNENROLLED**：没有收养已有串流，也没有签发受控启动 receipt。`--enroll` 必须从主机用户的交互终端调用，使用 `/dev/tty` 的 `ENROLL` 独占确认与新鲜 idle 事实；busy/非受管串流阻止 enrollment。普通 stdin RPC 即使提交 `action=enroll` 也拒绝，FREE 不会自动 enrollment。重新安装不重演仪式。后续必要的 idle restart/receipt 属于已预约的准备操作，不属于安装阶段；不要在受管预约中并行运行下文的手动改输出/重启步骤。
+
+独立伴随安装不改 Sunshine 配置、vendor unit、retry 策略、sshd 或设备，不启动/reload/restart/cancel 服务。`NeedDaemonReload=yes` 是实际拒绝条件：本入口不发布 unit，因此不会为了通过资格检查而 reload。应先核实真正的待加载定义及维护权限；不能绕过 guard，更不能用服务重启伪造 readiness。现有 vendor 安装器本身仍可能因包/配置变化重启活动 Sunshine，使用它前须安排获准的维护窗口。
+
+## 2. 在 B 安装 Moonlight
 
 ```bash
 cd ~/quick-deploy/sunshine-moonlight
 ./install.sh --client-only
-~/.local/bin/moonlight
 ```
 
-1. 在浏览器打开 A 的 Web UI，确认地址后接受自签名证书提示。首次设置 Sunshine 管理员用户名与密码。
-2. 在 Moonlight 手动添加安装器输出的主机地址；Tailnet 上不依赖自动发现。
-3. Moonlight 在 B 显示 PIN。到 A 的 Web UI **PIN** 页面，核对待配对客户端名称与来源地址，选择对应请求，**输入 B 显示的 PIN**。
-4. 配对完成后，在 Moonlight 选择 **Desktop**。
+首次使用 A 时，在浏览器打开它的 Web UI，核对地址后接受自签名证书提示并设置 Sunshine 管理员凭据。随后按第 3 节填写清单并运行连接器；不必先在 Moonlight GUI 添加主机或启动 Desktop。
 
-上面的手动流程仍然有效；第 3 节的 `./run_server.sh <名称>` 也内置了同一流程：本机未与目标 Sunshine 配对时，脚本会生成随机 4 位 PIN，打印目标主机、A 的 Web UI 地址（`https://<A 的 Tailnet IPv4>:<基准端口+1>`）和编号步骤，自动运行 Moonlight `pair`，并在配对进程返回后重新查询一次配对状态，确认已配对才启动 Desktop 串流。两种方式都由你在 A 的 Web UI PIN 页面输入 PIN：脚本不自动打开浏览器，也不操作远端。
+连接器在选屏、准备输出之后查询配对状态。只有官方客户端明确报告未配对时，才生成随机 4 位 PIN、打印 A 的 Web UI 地址与操作步骤，并运行官方 `pair`。你在 A 的 **PIN** 页面核对待配对客户端及来源地址，输入终端显示的 PIN。配对进程返回后再次查询确认；退出0不能替代确认。浏览器始终由你操作，连接器不打开或自动填写网页。
+
+受管连接统一从连接器发起；不要同时用 Moonlight GUI、其它客户端或手工命令启动、恢复或切换串流。已有手工串流不会被收养或关闭；切换到受管流程前须由原操作者结束它，再在获准的空闲窗口登记主机控制器。
 
 **Sunshine 网页（Web UI）的定位**：它是 Sunshine 服务自带的网页管理/配对界面，监听 `https://<A 的 Tailnet IPv4>:<基准端口+1>`，不是需要另外安装的软件。A 必须安装并运行 Sunshine 服务本体；网页只在首次设置管理员凭据、确认 PIN 配对和修改配置时需要。配对/配置完成后日常可以不打开网页，但不能单独删除网页而仍保留完整串流控制：网页由服务本体提供，删除或停用服务就失去被控端。反向连接时两台各自维护自己的 Sunshine 服务与网页。
 
@@ -84,21 +123,23 @@ $EDITOR machines.yaml
 
 需要区分职责：主机安装器与 `./commands/doctor.sh --host` 仍会只读查询**本机** Tailscale 状态和 `tailscale0` 上已分配的 Tailnet IPv4，用于确认 Sunshine 的绑定与服务启动条件（见「重启、等待网络与熄屏」）；这属于被控主机的本机网络就绪检查，不生成、不读取也不维护远端机器清单。
 
-以名称连接 Desktop（未配对时会先在本机终端给出 PIN 与步骤，配对确认后才串流）：
+A 已完成伴随安装、固定 SSH shim 发布和本地独占登记后，在 B 的正常图形会话终端按名称连接：
 
 ```bash
-./run_server.sh desktop              # 默认 Moonlight Desktop
+./run_server.sh desktop              # 实时选屏后连接受管 Desktop
 ./run_server.sh --moonlight desktop  # 同上
 ./run_server.sh --config /path/to/inventory.yaml desktop
 ```
 
-连接器先运行 `~/.local/bin/moonlight list -- <Tailnet IPv4>:<基准端口>` 查询配对状态，再决定动作：
+1. 通过正常系统 SSH 调用 A 的固定控制器，读取当次连接的屏幕身份、当前物理尺寸和刷新率。忙碌、未登记或预约不确定时停止，不接管其它会话。
+2. 取得主机预约后显示菜单：**左右箭头选择、Enter 确认、Esc 取消**。不可用屏幕说明原因；没有交互终端或数据失效时不默认选第一屏。拓扑变化会刷新菜单并要求重新选择。
+3. 控制器为精确输出准备 Sunshine；需要改 `output_name` 或重新探测时，只在已证实空闲且属于本次预约的主机上受控重启。它不改变桌面分辨率、布局或电源策略。
+4. 用官方 `list --csv` 查询配对与应用身份，按第 2 节处理明确未配对；核对 Moonlight 实际会解析的 Desktop ID 后才记录启动意图、运行官方串流。网络错误、未知诊断或身份不符均停止。
+5. 预约覆盖准备、配对、串流及同进程重连。退出时先记录已拥有的正数 Desktop 的关闭意图，再调用官方 `quit`，确认同代关闭后释放。控制/启动/关闭结果不确定时保留预约，需要主机可信对账；不靠超时或进程退出强行清除。
 
-1. **已配对**：直接执行固定的 `~/.local/bin/moonlight stream -- <Tailnet IPv4>:<基准端口> Desktop`。
-2. **明确未配对**（Moonlight 输出已知的未配对诊断）：用系统安全随机数生成 4 位 PIN，打印目标主机、`https://<Tailnet IPv4>:<基准端口+1>`、PIN 与编号步骤（远端 Sunshine 网页输入 PIN；本机 Moonlight 自动配对），随后运行 `~/.local/bin/moonlight pair --pin <PIN> -- <Tailnet IPv4>:<基准端口>`。配对进程返回后**重新查询一次** list，只有确认已配对才进入串流。
-3. **无法确认**（网络失败、未知或其它诊断）：打印有界的 Moonlight 诊断和目标 Web UI 地址后以非零状态退出；不会静默开始配对，也不会串流。
+PIN 只打印在终端，不写入清单或持久配置。客户端不远程安装软件、不使用 sudo、不修补 `Moonlight.conf`；已安装的主机控制器可执行上面的输出配置与空闲重启。`pair`/`stream` 保留本机图形环境。官方进程退出0既不是配对确认，也不是收到正确画面的证明。
 
-PIN 只打印在终端，不写入 `machines.yaml`、配置或任何文件，也不传给浏览器；脚本不自动打开浏览器、不远程安装/启动 Sunshine、不改写远端配置。`pair` 与 `stream` 都是 Moonlight GUI，须从拥有正常图形会话的本机用户运行；配对失败对话框可能在手动关闭后返回 0，因此退出码不能证明配对成功——本脚本只以重新查询的配对状态为准，也从不把串流进程返回 0 当作“已连接”。
+Linux 默认使用精确的 `~/.local/bin/moonlight` 包装器。macOS 的客户端核心查找 `Moonlight.app`/PATH；Windows 用 `run_server.cmd`、Python3.10+/PyYAML/系统 OpenSSH 和 PATH 中的 `Moonlight.exe`。也可显式 `--moonlight-binary PATH` 指定已安装的本地官方程序；不会从清单读取任意程序路径。Windows/macOS 客户端原生运行及宿主生命周期仍未验收，不能据此宣称三平台已可部署。
 
 SSH 是另一个明确动作，只打开交互式登录并沿用现有 SSH config、密钥/agent 与 known_hosts：
 
@@ -108,9 +149,11 @@ SSH 是另一个明确动作，只打开交互式登录并沿用现有 SSH confi
 
 它不会启动串流、传入远程命令或放宽主机密钥检查。`--list` 只列出清单名称，必须指定名称的模式不会默认选择或遍历机器。
 
-## 4. 先连接，再调整画质
+## 4. 核对选中画面与画质
 
-先用 **1080p、60 FPS、20 Mbps**。在 A 打开一个空白编辑器，通过 B 检查画面持续更新、鼠标位置准确、键盘文字能输入；随后断开并重新连接，确认回到同一桌面。
+连接器请求选中屏幕的当前像素尺寸，并把已知有理数刷新率取整为请求 FPS。初始码率以 **4K60/20 Mbps** 为像素率起点，使用 SDR、4:2:0、auto codec 和本机 borderless 窗口；这是起点，不保证最优码率、画质或收到的 FPS。当前模式超出已支持 CLI 范围时显式拒绝，不静默降尺寸/降帧。
+
+先确认 B 显示的确实是刚选中的 A 屏幕。在该屏幕的空白编辑器检查持续更新、鼠标位置与键盘输入；结束受管串流并确认释放后，再从连接器选择屏幕重连。屏幕 Hz、请求 FPS、性能统计中的收到/渲染 FPS 是不同事实。
 
 - `Ctrl+Alt+Shift+Q`：退出串流；`Z`：切换键鼠捕获；`X`：切换全屏。
 - `Ctrl+Alt+Shift+S`：性能统计；`M`：切换鼠标模式（以上均保留相同修饰键）。
@@ -120,9 +163,9 @@ SSH 是另一个明确动作，只打开交互式登录并沿用现有 SSH confi
 
 ### 选择与切换显示输出
 
-在 A 的 Sunshine 日志中查看实际报告的 connector 名称，将安装器所选配置目录内 `sunshine.conf` 的 `output_name` 设为该名称。以 **Sunshine 本次报告的名称**为准，不照抄另一台机器的名称、`/sys/class/drm` 路径或旧 `monitors.xml`。保存后，在 A 用运行 Sunshine 的同一桌面用户执行 `systemctl --user restart app-dev.lizardbyte.app.Sunshine.service` 使其生效（会中断当前串流），再重新连接 Desktop 核对捕获屏幕；仅断开重连或重跑安装器不保证应用这项手动修改。
+日常选屏使用连接器的实时菜单。要换屏，先结束本次受管串流并确认释放，再运行 `./run_server.sh <名称>` 选择新输出；不在受管流程中手改 `output_name`、重启服务或用 F1…F12 绕过选择。仅改变视频请求尺寸不能选择远端捕获输出。
 
-串流中用 `Ctrl+Alt+Shift+F1`…`F12` 切换 Sunshine 枚举的第 1…12 个输出，逐个确认对应屏幕。它只切换捕获对象，不修改 GNOME 布局或电源策略。两台均先验证 NVIDIA 外接 HDMI/DP 输出，再使用已通过画面、输入检查的输出。笔记本内屏走 Intel，KMS 可枚举的输出还受编码器影响；外接屏切换成功不代表可跨 GPU 切到内屏，内屏捕获须单独实测。
+控制器区分原生枚举、Sunshine selector 映射与实际捕获证明；屏幕 connected 不代表当前可捕获。混合显卡的内屏和外接输出可能受实际编码器/GPU过滤；外接屏通过不证明跨 GPU 内屏可用。每台主机、每个可选输出都须核对真实画面，不能照抄其它机器的 connector 名称或旧日志。
 
 ## 重启、等待网络与熄屏
 
@@ -212,7 +255,7 @@ Doctor 只读；退出 1 表示必需条件不满足。它检查包、实际服�
 
 ## 升级、卸载与维护
 
-版本、维护基线及审计例外集中在 [`lib/common.sh`](lib/common.sh)，生成清单的模板（含各字段中文说明）集中在 [`lib/machines_inventory.py`](lib/machines_inventory.py)：改模板只影响下一次缺失清单时的新建内容；已有普通清单保持原样，可用 `--stdout` 手动查阅新版模板。默认安装会检查最新稳定 release；最新不是“无条件成功”的承诺：每个资产必须有 GitHub API 提供的 `sha256:` 摘要和正的精确大小，下载后再次核对大小和 SHA-256。缺少/无效摘要会在任何相关载荷修改前停止，绝不把 HTTPS 下载、下载后自己计算的 hash 或旧版本冒充最新。
+vendor 版本、维护基线及审计例外集中在 [`lib/common.sh`](lib/common.sh)；独立 companion 的精确兼容 pin 位于 [`display-control/qualification.py`](display-control/qualification.py)，不会改 vendor 最新/不降级策略。生成清单的模板（含各字段中文说明）集中在 [`lib/machines_inventory.py`](lib/machines_inventory.py)：改模板只影响下一次缺失清单时的新建内容；已有普通清单保持原样，可用 `--stdout` 手动查阅新版模板。默认安装会检查最新稳定 release；最新不是“无条件成功”的承诺：每个资产必须有 GitHub API 提供的 `sha256:` 摘要和正的精确大小，下载后再次核对大小和 SHA-256。缺少/无效摘要会在任何相关载荷修改前停止，绝不把 HTTPS 下载、下载后自己计算的 hash 或旧版本冒充最新。
 
 唯一受审计例外是 Moonlight 的精确 `v6.1.0` `Moonlight-6.1.0-x86_64.AppImage`（release ID `175337682`、asset ID `193059073`、大小 `55325888`、SHA-256 `0e855ffd22d407e18ab5fdb575fed5f01ca119a3f91993c5f0213f15ac80b400`）。它的旧 API 记录没有 digest；一旦 API 为这个精确资产给出 digest，必须与该记录一致。未来任一 digest-null Moonlight 最新版会停止，等待单独审阅的 tag 专用校验值，而不会降级或复用 6.1.0 的摘要。
 
@@ -230,7 +273,9 @@ Doctor 只读；退出 1 表示必需条件不满足。它检查包、实际服�
 
 主机包移除默认保留凭据，预先存在的包默认拒绝删除；`--help` 说明显式强制选项。状态删除会停止并禁用服务，避免下次图形登录用默认配置启动；再次使用前重跑 `./commands/install-host.sh` 恢复 Tailnet 配置与服务。配置目录本身若为符号链接，会在停止服务前拒绝删除；普通 HOME/XDG 父目录链接不受此限制。目录外的凭据不在删除范围；其他用户或手动启动的 Sunshine 实例会报告 PID/UID，不会被终止。
 
-维护时运行 `./tests/run.sh` 及 `python3 ./tests/run_server.py`：前者在临时 HOME/PATH 下实际执行启动检查，覆盖地址缺失、配置来源变化、归属与卸载顺序，以及 HOME/XDG 父目录链接下的安装、复装、doctor 和移除；根安装器的测试在只复制公开代码的临时模块副本中实际运行安装与生成：三种角色成功时只在模块目录缺失 `machines.yaml` 时新建中文模板，同版本重跑保留现有清单，`--help`、参数错误、依赖或安装阶段失败都不生成；任意 cwd 与带空格路径仍取模块目录；清单路径为符号链接、目录或非普通文件时显式拒绝并保留原有字节与链接；父目录不可写等写入失败时显式报错、不创建清单，并单独报告已完成的安装阶段；已存在的普通 `machines.yaml` 字节、权限和修改时间保持不变，发布时出现的新目标不会被覆盖，旧 `machines.local.yaml` 与遗留 `machines.example.yaml` 的字节与权限保持不动；真实 checkout 只对照运行前后的存在形态、类型、权限与时间戳，从不读取实际清单。后者在带空格的临时模块副本中实际执行 `run_server.sh`→Python→假 Moonlight/SSH，核对参数、stdin、退出码与无副作用拒绝，缺失清单由真实生成器（而非被追踪的成品文件）创建，覆盖默认清单取自模块目录且不受当前目录影响、尚未生成时提示先运行一次成功的 `./install.sh` 并直接编辑、只有旧文件名或遗留 `machines.example.yaml` 时都不采用、两份并存时只读默认清单、`--config` 相对调用目录，以及不探测 Tailscale、不改写既有 SSH 配置。延迟超过 500 秒及停止重试采用离散时间模型，不是真实 systemd 运行验收。有 `systemd-analyze` 时另做静态单元解析和加载路径核对；APT 仅模拟，不安装包或操作真实服务，也不验证实际画面/输入。
+维护时运行 `./tests/run.sh --fixtures-only`、`python3 ./tests/display_install.py` 及 `python3 ./tests/run_server.py`。companion 测试用真实构造的临时 synthetic deb、独立假 release 元数据和注入的 host 事实，覆盖 qualifier→schema2 decoder→实际协议请求、shim 名称解析/NSS 分派、零自动提权/无自动 enrollment、busy 拒绝、升级保留、publication race/多进程互斥与根阶段失败顺序；不运行实际 Sunshine、SSH、服务、设备或网络。`run.sh` 的历史 vendor root fixtures 显式注入伴随阶段，而独立的 `display_install.py` 验证真正的伴随实现，避免把旧版 vendor fixture 当作 pinned build。`--fixtures-only` 跳过旧 APT 原生模拟与两个 systemd 原生静态探针；无该参数的完整历史维护套件仍包含这些探针。
+
+`run.sh` 在临时 HOME/PATH 下实际执行启动检查，覆盖地址缺失、配置来源变化、归属与卸载顺序，以及 HOME/XDG 父目录链接下的安装、复装、doctor 和移除；根安装器的测试在只复制公开代码的临时模块副本中实际运行安装与生成：三种角色成功时只在模块目录缺失 `machines.yaml` 时新建中文模板，同版本重跑保留现有清单，`--help`、参数错误、依赖或安装阶段失败都不生成；任意 cwd 与带空格路径仍取模块目录；清单路径为符号链接、目录或非普通文件时显式拒绝并保留原有字节与链接；父目录不可写等写入失败时显式报错、不创建清单，并单独报告已完成的安装阶段；已存在的普通 `machines.yaml` 字节、权限和修改时间保持不变，发布时出现的新目标不会被覆盖，旧 `machines.local.yaml` 与遗留 `machines.example.yaml` 的字节与权限保持不动；真实 checkout 只对照运行前后的存在形态、类型、权限与时间戳，从不读取实际清单。`run_server.py` 在带空格的临时模块副本中实际执行 `run_server.sh`→Python→假 Moonlight/SSH，核对参数、stdin、退出码与无副作用拒绝，缺失清单由真实生成器（而非被追踪的成品文件）创建，覆盖默认清单取自模块目录且不受当前目录影响、尚未生成时提示先运行一次成功的 `./install.sh` 并直接编辑、只有旧文件名或遗留 `machines.example.yaml` 时都不采用、两份并存时只读默认清单、`--config` 相对调用目录，以及不探测 Tailscale、不改写既有 SSH 配置。延迟超过 500 秒及停止重试采用离散时间模型，不是真实 systemd 运行验收。完整历史套件有 `systemd-analyze` 时另做静态单元解析和加载路径核对，并用真实 APT 模拟文件名分类；`--fixtures-only` 不执行这些原生探针。两种门禁都不安装真实包、不操作真实服务，也不验证实际画面/输入。
 
 绑定解析测试使用已核对的原生解析结果。若本地有对应标签源码和 C++ 编译器，可额外运行 `python3 tests/binding.py --native-source /path/to/Sunshine-2026.906.222525/src/config.cpp`，离线编译该文件的原始解析函数，对照输入、重写结果和隔离安装器输出；不会构建或运行 Sunshine。
 

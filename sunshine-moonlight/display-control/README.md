@@ -2,7 +2,7 @@
 
 This companion owns screen selection and the managed session lifecycle without modifying Sunshine or Moonlight binaries. `host.py` accepts one bounded JSON request on stdin and writes one JSON response. An installer supplies the adjacent private `host-settings.json`; requests cannot supply filesystem paths, commands or authority claims.
 
-The implemented host-operation adapter currently uses Linux KMS and the pinned Sunshine build. Windows/macOS native enumeration exists, but their service and graphical-session lifecycle adapters are separate work. The root connector is not yet wired to this protocol.
+The implemented host-operation adapter uses Linux KMS and the pinned Sunshine build. The root connector now uses this protocol for live selection and supervised streaming. Windows/macOS native enumeration exists; their service/graphical-session adapters and native deployment acceptance remain pending.
 
 ## Ownership
 
@@ -39,8 +39,8 @@ Capabilities are secrets: carry them only in protected stdin/transport or privat
 
 ## Client contract
 
-1. Preserve official list → manual PIN/pair → fresh list confirmation.
-2. Present actual `list` screen facts. `selectable` with `selection_intent:"prepare"` permits a preparation attempt; it does not claim verified capture. Current screen Hz, requested FPS and measured video FPS differ.
+1. Present actual host `list` facts and acquire before interactive selection. `selectable` with `selection_intent:"prepare"` permits a preparation attempt; it does not claim verified capture. Current screen Hz, requested FPS and measured video FPS differ.
+2. Prepare the selected output, then preserve official list → manual PIN/pair when explicitly unpaired → fresh list confirmation, under the same reservation.
 3. After preparation, freshly resolve the paired app catalogue using stock Moonlight's case-insensitive first-title rule. Its selected ID must equal the host's inspected `desktop_app_id` before `launch`. The number is not a supported alternate CLI selector. Host also rejects Desktop title aliases and command/preparation hooks.
 4. Persist `launch` before issuing official `stream`; supervise the process and confirm `observe_active`. Hold the same reservation through reconnect. Launch preflight refusal preserves known ownership only after fresh validation; an issued unobserved attempt remains uncertain.
 5. Force `stream --no-quit-after`. After the stream ends, use `begin_release` while the owned Desktop remains positive, invoke official authenticated `quit -- HOST:PORT`, then call `finish_release`. Exit0 alone proves neither stream success nor closure.
@@ -48,6 +48,8 @@ Capabilities are secrets: carry them only in protected stdin/transport or privat
 
 ## Installation and evidence
 
-Settings schema2 pins the user service/config/apps/assets/state paths, host UUID/base port, qualified executable/source provenance and retry-guard digest. The installer must actually verify those bytes/provenance; hashing arbitrary installed files is not qualification. Private settings/receipts are0600 and state is0700. A controlled-start receipt is issued only after an owned restart, old-generation retirement, new matching endpoint, stable qualified files and completed source-matched probe.
+Settings schema2 pins the user service/config/apps/assets/state paths, host UUID/base port, qualified executable/source provenance and retry-guard digest. `commands/install-display-control.sh` verifies the exact reference package against installed bytes; hashing arbitrary installed files is not qualification. See [installation instructions](../README.md#在已安装的-a-独立安装显示控制伴随程序). Private settings/receipts are0600 and state is0700. Installation does not enroll or restart; fixed system shim publication requires explicit `--publish-shim`, and enrollment is a local interactive `quick-deploy-display-control --enroll` ceremony, unavailable through ordinary stdin RPC. Installed execution uses `-I -B`; complete RPC responses, including refusals, exit0 and must be interpreted from JSON. Local enrollment failures exit1.
+
+A controlled-start receipt is issued only after an owned restart, old-generation retirement, new matching endpoint, stable qualified files and completed source-matched probe.
 
 Native inventory, effective backend/encoder, selected connector correspondence and captured-image/live-frame evidence are distinct. Fixture suites exercise the real JSON/coordinator/state/config path using injected runtime/native/endpoint facts. They do not establish Windows/macOS runtime support or live selected-image acceptance. Real switching must use an explicitly available host; never interrupt an existing stream for testing.

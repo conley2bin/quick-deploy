@@ -11,15 +11,24 @@ SYSTEM_PYTHON="${QD_TEST_SYSTEM_PYTHON:-/usr/bin/python3}"
 INSTALL_HOST=true
 INSTALL_CLIENT=true
 ROLE_MODE=''
+PUBLISH_DISPLAY_SHIM=false
 
 usage() {
     cat <<USAGE
-用法: ./install.sh [--host-only | --client-only]
+用法: ./install.sh [--host-only | --client-only] [--publish-display-control-shim]
 
 默认依次检查最新稳定 Sunshine 与 Moonlight：缺失/较旧时更新，相同跳过载荷，本机较新不降级；主机成功后才查询客户端。
   --host-only    只安装本机 Sunshine 主机（--capture kms）
   --client-only  只安装本机 Moonlight 客户端
   -h, --help     显示帮助
+  --publish-display-control-shim
+                显式授权在主机伴随阶段 sudo 新建 /usr/bin/quick-deploy-display-control；不覆盖冲突
+
+原 Ubuntu vendor 包安装/最新/不降级逻辑不变；所选 host/client 成功后，host 角色再独立资格检查并安装
+显示控制伴随程序（当前仅支持官方 Sunshine 2026.914.233613/source63d35f7）。其它版本保留，伴随阶段
+明确失败，不声称 vendor 阶段回滚。固定 shim 未发布时 SSH RPC 不就绪；默认不会自动提权发布它。
+安装不自动 enrollment，不清除预约/receipt，不由伴随阶段 restart/reload。Windows/macOS lifecycle 发布仍待实现，
+此根入口仍是 Ubuntu vendor 安装器，不是可移植的 Windows/macOS 包安装器。
 
 所选安装阶段全部成功后，仅在模块根目录缺少 machines.yaml 时新建全字段中文占位清单；
 已有普通清单原样保留（内容、权限、修改时间不变）。占位模板不含真实地址，请新建后编辑它。
@@ -43,11 +52,15 @@ parse_args() {
                     || qd_die '--host-only 与 --client-only 不能同时使用'
                 ROLE_MODE=client
                 INSTALL_HOST=false ;;
+            --publish-display-control-shim)
+                PUBLISH_DISPLAY_SHIM=true ;;
             -h|--help) usage; exit 0 ;;
             *) qd_die "未知参数: $1（--help 查看用法）" ;;
         esac
         shift
     done
+    [ "$INSTALL_HOST" = true ] || [ "$PUBLISH_DISPLAY_SHIM" = false ] \
+        || qd_die '--publish-display-control-shim 只用于所选主机角色'
 }
 
 ensure_pyyaml() {
@@ -77,6 +90,15 @@ run_client() {
     qd_die 'Moonlight 客户端安装失败。此前成功的 Sunshine 主机安装不会自动回滚。'
 }
 
+run_display_control() {
+    local -a args=()
+    [ "$PUBLISH_DISPLAY_SHIM" = false ] || args+=(--publish-shim)
+    if "$SCRIPT_DIR/commands/install-display-control.sh" "${args[@]}"; then
+        return 0
+    fi
+    qd_die '所选 Sunshine/Moonlight vendor 阶段已成功，但显示控制伴随安装/资格或固定 SSH shim 未就绪；已有包和个人清单/预约状态保留。未执行清单新建，本次安装未全部完成。可单独核对 commands/install-display-control.sh --help 后重跑该阶段。'
+}
+
 # Create only after every selected stage succeeded, relative to the module
 # (never the caller's cwd). The generator itself reports created versus retained;
 # a refused path never receives a false install-complete message.
@@ -98,6 +120,7 @@ main() {
     ensure_pyyaml
     [ "$INSTALL_HOST" = false ] || run_host
     [ "$INSTALL_CLIENT" = false ] || run_client
+    [ "$INSTALL_HOST" = false ] || run_display_control
     generate_inventory
     qd_info '所选本机安装阶段已完成。配对和实际 Desktop 串流仍需分别验证。'
 }
