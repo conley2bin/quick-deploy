@@ -79,6 +79,7 @@ cat > "$SERVICE_FILE" <<EOF
 [Unit]
 Description=pi-remote-clipboard local clipboard provider
 After=graphical-session.target
+PartOf=graphical-session.target
 
 [Service]
 Type=simple
@@ -88,14 +89,42 @@ RestartSec=3
 Environment=PYTHONUNBUFFERED=1
 
 [Install]
-WantedBy=default.target
+WantedBy=graphical-session.target
 EOF
 
 systemctl --user daemon-reload
-if systemctl --user is-active --quiet "$MODULE_NAME.service"; then
-    systemctl --user restart "$MODULE_NAME.service"
+# The previous installer enabled this unit under default.target. Remove only
+# that known owned link, then enable the new graphical-session.target edge;
+# `reenable` would also delete unrelated user-added Wants links for this unit.
+legacy_link="$SYSTEMD_USER_DIR/default.target.wants/$MODULE_NAME.service"
+if [ -L "$legacy_link" ]; then
+    [ "$(readlink -f -- "$legacy_link")" = "$(readlink -f -- "$SERVICE_FILE")" ] || die "旧版 provider 启用链接指向别处: $legacy_link"
+    rm -- "$legacy_link"
+elif [ -e "$legacy_link" ]; then
+    die "旧版 provider 启用路径不是符号链接: $legacy_link"
+fi
+systemctl --user enable "$MODULE_NAME.service" || die "无法启用 provider 的 graphical-session.target 生命周期"
+if systemctl --user is-active --quiet graphical-session.target; then
+    manager_env="$(systemctl --user show-environment)"
+    if grep -Eq '^(WAYLAND_DISPLAY|DISPLAY)=.+' <<< "$manager_env"; then
+        if systemctl --user is-active --quiet "$MODULE_NAME.service"; then
+            systemctl --user restart "$MODULE_NAME.service" || warn "provider 重启失败；请检查 systemctl --user status $MODULE_NAME"
+        else
+            systemctl --user start "$MODULE_NAME.service" || warn "provider 启动失败；请检查 systemctl --user status $MODULE_NAME"
+        fi
+    else
+        # An already-running legacy provider inherited the old headless manager
+        # environment. Leaving it active would silently return an empty clipboard.
+        if systemctl --user is-active --quiet "$MODULE_NAME.service"; then
+            systemctl --user stop "$MODULE_NAME.service" || die "无法停止缺少图形环境的 provider"
+        fi
+        warn "图形会话已激活，但 user manager 尚无 WAYLAND_DISPLAY/DISPLAY；provider 未启动，请导入图形环境后手动启动"
+    fi
 else
-    systemctl --user enable --now "$MODULE_NAME.service" || warn "provider 启动失败；可稍后手动 systemctl --user start $MODULE_NAME"
+    if systemctl --user is-active --quiet "$MODULE_NAME.service"; then
+        systemctl --user stop "$MODULE_NAME.service" || die "无法停止图形会话外的旧 provider"
+    fi
+    echo "pi-remote-clipboard: provider 已启用，等待 graphical-session.target 激活后启动"
 fi
 
 # ---------- Pi 扩展 ----------

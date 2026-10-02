@@ -30,10 +30,12 @@ bash pi-agent/extensions/pi-remote-clipboard/install.sh
 
 安装器会：
 
-1. 安装本机 provider 为 systemd user service（`pi-remote-clipboard.service`）；
+1. 安装本机 provider 为 systemd user service（`pi-remote-clipboard.service`），绑定 `graphical-session.target`，不在 `default.target` 的无图形环境阶段启动；
 2. 安装 Pi 扩展 `pi-remote-clipboard` 到 `~/.pi/agent/extensions/`；
 3. 根据本机 `.ssh/config` 中的登录型 `Host` 别名生成托管块（也可用 `PI_REMOTE_CLIPBOARD_HOSTS` 指定），为这些 SSH 连接设置 `RemoteForward 127.0.0.1:37844 127.0.0.1:37843`；
 4. 不修改 `.zshrc`、`settings.json`、Pi bundle 或 tmux/Ghostty 配置。Pi 需在空闲时 `/reload` 或重启才能加载新扩展；安装器不会代替执行。
+
+安装器只在旧版 `default.target.wants` 链接确实指向本模块 unit 时删除它，再用 `systemctl --user enable` 增加 `graphical-session.target.wants` 链接；其他用户自定义的启用链接保留。图形 target 已激活且 user manager 有 `WAYLAND_DISPLAY` 或 `DISPLAY` 时，启动/重启 provider；尚未激活时停止旧的提前启动实例，等待图形会话启动。若 target 已激活但 manager 仍缺显示环境，安装器会停止无效实例并告警；导入图形环境后需手动启动 provider，或在下次图形会话启动时自动尝试。它不从 SSH 安装 shell 隐式导入环境变量。
 
 ## 使用
 
@@ -109,8 +111,10 @@ piox
 
 ```bash
 python3 pi-agent/extensions/pi-remote-clipboard/tests/test_all.py
+python3 pi-agent/extensions/pi-remote-clipboard/tests/test_installer.py
+python3 pi-agent/extensions/pi-remote-clipboard/tests/native_activation.py
 node --experimental-strip-types --test pi-agent/extensions/pi-remote-clipboard/tests/activation.test.mjs
 cd pi-agent/extensions/pi-remote-clipboard/pi-extension && ../../pi-copy-links/node_modules/.bin/tsc -p tsconfig.json --noEmit
 ```
 
-隔离测试使用合成上下文，不启动真实 provider、不读写真实剪贴板、不启动 SSH。TypeScript 检查使用仓库中 `pi-copy-links` 已安装的开发依赖。
+隔离测试使用合成上下文，不启动真实 provider、不读写真实剪贴板、不启动 SSH。native 测试在临时 Pi home 中执行已安装的真实 CLI：用假 Python 桥和图形剪贴板命令检测键盘路径，不连接活跃会话。Pi 的 bundled CLI 与 unbundled public package 的 class 对象不同；CLI 扩展加载器把包名导入映射到 **bundled** class，因此以真实 CLI 输入测试为准。TypeScript 检查使用仓库中 `pi-copy-links` 已安装的开发依赖。
