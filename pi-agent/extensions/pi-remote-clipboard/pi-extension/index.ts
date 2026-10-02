@@ -1,5 +1,6 @@
-import { InteractiveMode, VERSION, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { TuiAltScreen } from "@earendil-works/pi-tui";
+import * as PiAgent from "@earendil-works/pi-coding-agent";
+import * as PiTui from "@earendil-works/pi-tui";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { execFile } from "node:child_process";
 import { readFile } from "node:fs/promises";
 import { promisify } from "node:util";
@@ -11,7 +12,6 @@ const CTRLV_BIN = `${LIB_DIR}/ctrlv.py`;
 const PUSH_BIN = `${LIB_DIR}/push.py`;
 const TIMEOUT_MS = 8000;
 const MAX_OSC52_ENCODED = 100_000;
-const SUPPORTED_PI = ["0.86.1", "0.87.1"];
 /** pi-copy-links 等扩展查询的复制分流函数；返回 true 表示已写往对端剪贴板。 */
 const COPY_SINK_KEY = Symbol.for("pi-remote-clipboard:copy-sink");
 
@@ -91,8 +91,6 @@ async function copyToClientIfRemote(text: string): Promise<boolean> {
 }
 
 export default function piRemoteClipboard(pi: ExtensionAPI): void {
-  if (!SUPPORTED_PI.includes(VERSION)) return;
-
   let restoreCopy: (() => void) | undefined;
   let restorePaste: (() => void) | undefined;
 
@@ -101,7 +99,7 @@ export default function piRemoteClipboard(pi: ExtensionAPI): void {
     ui?: { requestRender?: () => void };
   }
 
-  /** 读取对端剪贴板并插入当前编辑器。返回 false 表示应当回退原生路径。 */
+  /** 读取对端剪贴板并插入当前编辑器；"local" 表示应回退原生路径。 */
   async function pasteFromBridge(host: PasteHost): Promise<"inserted" | "empty" | "local" | "error"> {
     try {
       const { stdout } = await execFileAsync("python3", [CTRLV_BIN], {
@@ -173,35 +171,41 @@ export default function piRemoteClipboard(pi: ExtensionAPI): void {
 
     // 复制方向分流：SSH 客户端在观看时，文本复制改走 OSC 52（经 tmux 到对端剪贴板）。
     // 本地会话完全走原生路径，一行行为不变。
-    const altProto = TuiAltScreen.prototype as unknown as {
+    const unavailable: string[] = [];
+    const altProto = PiTui.TuiAltScreen?.prototype as unknown as {
       copyTextToClipboard?: (this: { flash?: (msg: string) => void }, text: string) => Promise<boolean>;
-    };
-    if (typeof altProto.copyTextToClipboard !== "function") return;
-    const original = altProto.copyTextToClipboard;
-    altProto.copyTextToClipboard = async function (text: string): Promise<boolean> {
-      if (await copyToClientIfRemote(text)) {
-        try {
-          this.flash?.("已复制到对端剪贴板");
-        } catch {
-          // 提示失败不改变复制结果
+    } | undefined;
+    if (typeof altProto?.copyTextToClipboard === "function"
+      && Object.getOwnPropertyDescriptor(altProto, "copyTextToClipboard")?.writable) {
+      const original = altProto.copyTextToClipboard;
+      altProto.copyTextToClipboard = async function (text: string): Promise<boolean> {
+        if (await copyToClientIfRemote(text)) {
+          try {
+            this.flash?.("已复制到对端剪贴板");
+          } catch {
+            // 提示失败不改变复制结果
+          }
+          return true;
         }
-        return true;
-      }
-      return original.call(this, text);
-    };
-    restoreCopy = () => {
-      if (altProto.copyTextToClipboard !== undefined && altProto.copyTextToClipboard !== original) {
-        altProto.copyTextToClipboard = original;
-      }
-    };
+        return original.call(this, text);
+      };
+      restoreCopy = () => {
+        if (altProto.copyTextToClipboard !== undefined && altProto.copyTextToClipboard !== original) {
+          altProto.copyTextToClipboard = original;
+        }
+      };
+    } else {
+      unavailable.push("TuiAltScreen.copyTextToClipboard 不可用，未接管文本复制");
+    }
 
     // 粘贴方向分流：Ctrl+V 按键不变，包住 Pi 的粘贴入口。
-    // SSH 客户端在观看时走红桥（文本直接插入，图片落临时文件插路径）；
+    // SSH 客户端在观看时走剪贴板桥（文本直接插入，图片落临时文件插路径）；
     // 本地会话原样调用原生 handleClipboardPaste（图片优先语义不变）。
-    const modeProto = InteractiveMode.prototype as unknown as {
+    const modeProto = PiAgent.InteractiveMode?.prototype as unknown as {
       handleClipboardPaste?: (this: PasteHost) => Promise<void>;
-    };
-    if (typeof modeProto.handleClipboardPaste === "function") {
+    } | undefined;
+    if (typeof modeProto?.handleClipboardPaste === "function"
+      && Object.getOwnPropertyDescriptor(modeProto, "handleClipboardPaste")?.writable) {
       const originalPaste = modeProto.handleClipboardPaste;
       modeProto.handleClipboardPaste = async function (this: PasteHost): Promise<void> {
         if (!(await isRemoteClient())) {
@@ -217,11 +221,16 @@ export default function piRemoteClipboard(pi: ExtensionAPI): void {
           modeProto.handleClipboardPaste = originalPaste;
         }
       };
+    } else {
+      unavailable.push("InteractiveMode.handleClipboardPaste 不可用，Ctrl+V 未通过桥接管");
     }
 
     // 供 pi-copy-links 等扩展在点击时调用：返回 true 表示已写往对端。
     const sink: CopySink = copyToClientIfRemote;
     (globalThis as Record<symbol, unknown>)[COPY_SINK_KEY] = sink;
+    if (unavailable.length > 0) {
+      ctx.ui.notify(`pi-remote-clipboard: ${unavailable.join("；")}；Ctrl+Alt+V 和 /rpush 仍可用`, "warning");
+    }
   });
 
   pi.on("session_shutdown", () => {

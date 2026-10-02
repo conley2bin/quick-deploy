@@ -114,8 +114,8 @@ if [[ "$PWD" == "\${FAIL_NPM_DIR:-}" ]]; then echo 'controlled real leaf npm fai
 set -euo pipefail
 printf '%s\\n' "$*" >> "$SERVICE_LOG"
 case "$*" in
-  '--user is-active --quiet pi-remote-clipboard.service') exit 3 ;;
-  '--user daemon-reload'|'--user enable --now pi-remote-clipboard.service') exit 0 ;;
+  '--user is-active --quiet graphical-session.target'|'--user is-active --quiet pi-remote-clipboard.service') exit 3 ;;
+  '--user daemon-reload'|'--user enable pi-remote-clipboard.service') exit 0 ;;
   *) echo systemctl-unexpected >> "$EFFECTS"; exit 91 ;;
 esac
 `);
@@ -205,7 +205,8 @@ test("all real discovered installers succeed in a fresh non-Git home and rerun",
   ];
   assert.deepEqual(npmRecords, [...expected, ...expected]);
   assert.deepEqual(readFileSync(f.serviceLog, "utf8").trim().split("\n"), Array(2).fill([
-    "--user daemon-reload", "--user is-active --quiet pi-remote-clipboard.service", "--user enable --now pi-remote-clipboard.service",
+    "--user daemon-reload", "--user enable pi-remote-clipboard.service",
+    "--user is-active --quiet graphical-session.target", "--user is-active --quiet pi-remote-clipboard.service",
   ]).flat());
   t.diagnostic(JSON.stringify({ status: first.status,
     sdkTuiMode: SettingsManager.create(f.cwd, f.agent, { projectTrusted: false }).getTuiMode(),
