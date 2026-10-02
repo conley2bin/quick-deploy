@@ -184,11 +184,15 @@ def handle(raw, *, manifest=MANIFEST, platform=None, enumerate_native=collect, i
 def interactive_enrollment():
     # An operator ceremony, not an RPC flag. A later installer/shim must resolve
     # the host's interactive TTY deliberately. Never echo prompts on JSON stdout.
+    # Use raw os.read so this works on any TTY (PTYs are not seekable).
     try:
-        with open("/dev/tty", "r+", encoding="utf-8") as tty:
-            tty.write("Confirm exclusive controller use, no existing/in-flight unmanaged stream, and no concurrent admin edits. Type ENROLL: ")
-            tty.flush()
-            return tty.readline(32).strip() == "ENROLL"
+        fd = os.open("/dev/tty", os.O_RDWR)
+        try:
+            os.write(fd, b"Confirm exclusive controller use, no existing/in-flight unmanaged stream, and no concurrent admin edits. Type ENROLL: ")
+            data = os.read(fd, 64)
+        finally:
+            os.close(fd)
+        return data.decode("utf-8", "replace").strip() == "ENROLL"
     except OSError:
         return False
 
