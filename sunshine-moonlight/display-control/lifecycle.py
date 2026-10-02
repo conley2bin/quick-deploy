@@ -551,6 +551,24 @@ class HostController:
         """
         if ticket is None:
             return
+        if isinstance(failure, CapturePreflightRefusal) and req["action"] == "observe_active":
+            # A controlled launch makes the vendor re-run its capture/encoder
+            # probe; the bounded journal window can read that probe mid-write.
+            # While the same owner attempt is fresh and still unconfirmed, that
+            # read-only transient is "not yet confirmed", never owner loss: the
+            # client already retries launch_unconfirmed until its deadline.
+            try:
+                meta = self.meta()
+                latest = self.owner(req, meta)
+                lease = meta["lease"]
+                settling = (latest == ticket and latest.status.phase is rs.Phase.CONNECTING
+                            and latest.status.launch_attempted and not latest.status.active_observed
+                            and lease is not None and lease.get("stage") == "attested")
+            except Refusal:
+                settling = False
+            if settling:
+                raise Refusal("launch_unconfirmed",
+                              "capture evidence still settling after controlled launch") from failure
         known = False
         if isinstance(failure, CapturePreflightRefusal):
             try:
