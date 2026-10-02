@@ -30,6 +30,9 @@ const { InteractiveMode } = await import(coreUrl);
 const { TuiAltScreen } = await import(tuiUrl);
 const { default: piRemoteClipboard } = await import("../pi-extension/index.ts");
 
+// Exercise capability branches against the installed public package in-process.
+// native_activation.py separately proves those branches against Pi's bundled CLI
+// classes; the public and bundled constructors are distinct in Pi 0.99.2.
 const pasteOwner = InteractiveMode.prototype;
 const copyOwner = TuiAltScreen.prototype;
 const pasteKey = "handleClipboardPaste";
