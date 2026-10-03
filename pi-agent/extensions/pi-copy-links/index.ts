@@ -3,6 +3,7 @@ import type { TUI } from "@earendil-works/pi-tui";
 import { checkCompatibility, compatibilityDiagnostic, installAdapter, type CompatibilityStatus } from "./src/adapter.ts";
 import { remoteCopySink } from "./src/remote-copy.ts";
 import { dispatchOpenTarget } from "./src/dispatcher.ts";
+import { resolveInputTopology, type InputTopology } from "./src/receiver.ts";
 import { enableTmuxMouse } from "./src/tmux.ts";
 
 const WIDGET = "pi-copy-links:bridge";
@@ -15,6 +16,7 @@ export default function copyLinksExtension(pi: ExtensionAPI): void {
   let compatibility: CompatibilityStatus | undefined;
   let warnedFailure: string | undefined;
   let mouse: Awaited<ReturnType<typeof enableTmuxMouse>> | undefined;
+  let inputTopology: InputTopology | undefined;
   let mouseWarning: string | undefined;
   let rollbackNotes: unknown[] | undefined;
   // Detach every owner before any fallible cleanup or awaited mouse release.
@@ -22,6 +24,7 @@ export default function copyLinksExtension(pi: ExtensionAPI): void {
     const retiredAdapter = adapter, retiredMouse = mouse;
     adapter = undefined;
     mouse = undefined;
+    inputTopology = undefined;
     mouseWarning = undefined;
     const issues: unknown[] = [];
     try { retiredAdapter?.dispose(); } catch (error) { issues.push(error); }
@@ -46,6 +49,8 @@ export default function copyLinksExtension(pi: ExtensionAPI): void {
       });
       compatibility = await checkCompatibility(VERSION);
       if (!compatibility.compatible) throw new Error(compatibility.cause);
+      inputTopology = await resolveInputTopology();
+      const activatedTopology = inputTopology;
       // Re-capture the production descriptors after the isolated async probe;
       // installAdapter still commits the four real hooks as one transaction.
       adapter = installAdapter({
@@ -57,8 +62,10 @@ export default function copyLinksExtension(pi: ExtensionAPI): void {
           await copyToClipboard(text);
         },
         cwd: () => ctx.cwd,
-        requireTmuxOrigin: Boolean(process.env.TMUX),
-        open: (href, cwd, lifetime, origin) => dispatchOpenTarget(href, cwd, lifetime, origin),
+        requireTmuxOrigin: activatedTopology.kind === "tmux",
+        open: (href, cwd, lifetime, origin) => dispatchOpenTarget(
+          href, cwd, lifetime, origin, { topology: activatedTopology },
+        ),
         button: (text) => ctx.ui.theme.fg("accent", text),
         recoverTmuxRelease: () => mouse?.enabled === true && mouse.warnings.length === 0,
         requestRender: () => { tui?.invalidate(); tui?.requestRender(); },
@@ -79,7 +86,7 @@ export default function copyLinksExtension(pi: ExtensionAPI): void {
         },
       });
       try {
-        mouse = await enableTmuxMouse();
+        mouse = await enableTmuxMouse(activatedTopology);
         if (mouse.warnings.length) mouseWarning = `tmux 鼠标绑定缺少来源标记，未覆盖非受管绑定：${mouse.warnings.join(", ")}；缺标记的 Ctrl+点击会拒绝打开`;
       } catch (error) { mouseWarning = `tmux Ctrl+鼠标透传未就绪：${String(error)}`; }
       if (mouseWarning) ctx.ui.notify(mouseWarning, "warning");

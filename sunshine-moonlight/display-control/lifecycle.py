@@ -356,10 +356,15 @@ class HostController:
                 canonical_uuid(current.host_uniqueid) != self.host.uuid):
             raise Refusal("target_mismatch", "runtime bind address/base port/host differs from streaming target")
         info = self.info(target["address"], target["port"])
-        if (type(info) is not Endpoint or canonical_uuid(info.host_uniqueid) != self.host.uuid
-                or type(info.currentgame) is not int or not 0 <= info.currentgame < (1 << 31)
+        if (type(info) is not Endpoint or type(info.currentgame) is not int or not 0 <= info.currentgame < (1 << 31)
                 or info.state not in ("FREE", "BUSY") or (info.state == "FREE" and info.currentgame != 0)):
             raise Refusal("endpoint_unknown", "pinned Sunshine application state unavailable or contradictory")
+        # A valid endpoint serving another instance UUID is a definite fact, not
+        # "still starting": stock Sunshine generates a fresh random UUID at each
+        # start until a pairing persists one. Never adopt it here; only the local
+        # installer's --reconcile-host-identity ceremony may rebind.
+        if canonical_uuid(info.host_uniqueid) != self.host.uuid:
+            raise Refusal("host_identity_changed", "Sunshine instance UUID differs from the installed binding; local identity reconciliation required")
         return info
 
     def meta(self):
@@ -679,7 +684,8 @@ class HostController:
                 return verified
             except Refusal as exc:
                 last = exc
-                if exc.code in {"start_context_changed", "desktop_changed", "target_mismatch", "host_busy", "generation_changed"}:
+                if exc.code in {"start_context_changed", "desktop_changed", "target_mismatch", "host_busy",
+                                "generation_changed", "host_identity_changed"}:
                     raise
             self.sleep(0.5)
         raise Refusal("readiness_failed", "controlled restart did not establish new stable endpoint/probe readiness") from last

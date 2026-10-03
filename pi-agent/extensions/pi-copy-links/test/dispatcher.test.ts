@@ -11,11 +11,28 @@ import type { OpenLifetime } from "../src/browser.ts";
 import {
   dispatchOpenTarget, runClientHelper, type DispatcherDependencies, type HelperRequest, type HelperSpawn,
 } from "../src/dispatcher.ts";
-import type { InputReceiver } from "../src/receiver.ts";
+import type { InputReceiver, InputTopology } from "../src/receiver.ts";
 
 const client: Extract<InputReceiver, { kind: "remote" }> =
   { kind: "remote", peer: "192.0.2.64", port: 2222, user: "conley" };
 const tmux = { TMUX: "/fixture/tmux,1,0", TMUX_PANE: "%4" };
+const hop = Object.freeze({
+  tty: "/dev/pts/4",
+  leader: Object.freeze({ pid: 4100, starttime: "41000" }),
+  holder: Object.freeze({ pid: 4200, starttime: "42000", comm: "fixture-holder" }),
+  proof: "master" as const,
+  role: "terminal" as const,
+});
+const localTopology: InputTopology = Object.freeze({
+  kind: "local", basis: "terminal", hops: Object.freeze([hop]),
+});
+const remoteTopology: InputTopology = Object.freeze({ kind: "remote", receiver: client, hops: Object.freeze([hop]) });
+const tmuxTopology: InputTopology = Object.freeze({
+  kind: "tmux", socket: "/fixture/tmux", pane: "%4", inputTty: "/dev/pts/4", hops: Object.freeze([hop]),
+});
+const unknownTopology: InputTopology = Object.freeze({
+  kind: "unknown", diagnostic: "输入持有者 fixture-holder 无法归属到本机桌面或配对 SSH", hops: Object.freeze([hop]),
+});
 
 function lifetime(controller = new AbortController()): OpenLifetime & { current: boolean } {
   const value = { signal: controller.signal, current: true, isCurrent: () => value.current };
@@ -82,7 +99,15 @@ function fakeSsh(
 }
 
 function setup(invocations: Invocation[], extras: DispatcherDependencies = {}): DispatcherDependencies {
-  return { env: tmux, resolve: async () => client, spawn: fakeSsh(invocations), ...extras };
+  return {
+    env: tmux,
+    topology: tmuxTopology,
+    resolveTopology: async () => tmuxTopology,
+    revalidateTopology: async () => true,
+    resolve: async () => client,
+    spawn: fakeSsh(invocations),
+    ...extras,
+  };
 }
 
 function decoded(invocations: Invocation[]): HelperRequest[] {
@@ -106,37 +131,102 @@ function pinned(invocation: Invocation): void {
   assert.doesNotMatch(invocation.args.join(" "), /example\.org|work\/|L12/u);
 }
 
-test("non-tmux local and verified tmux-local keep the unchanged local opener", async () => {
+test("direct local with stale TMUX and verified tmux-local keep the unchanged local opener", async () => {
   const calls: unknown[][] = [], origins: unknown[] = [], invocations: Invocation[] = [];
   const local: NonNullable<DispatcherDependencies["local"]> = async (...args) => { calls.push(args); };
   const alive = lifetime();
   await dispatchOpenTarget("./file.ts#L12", "/work", alive, "unknown", {
-    env: {}, local, resolve: async (origin) => { origins.push(origin); throw Error("unexpected resolver"); },
+    env: tmux,
+    topology: localTopology,
+    resolveTopology: async () => localTopology,
+    revalidateTopology: async () => true,
+    local,
+    resolve: async (origin) => { origins.push(origin); throw Error("direct topology must not use tmux resolver"); },
     spawn: fakeSsh(invocations),
   });
-  await dispatchOpenTarget("https://example.org", "/work", alive, 802, {
-    env: tmux, local, resolve: async (origin) => { origins.push(origin); return "local"; },
-    spawn: fakeSsh(invocations),
-  });
+  await dispatchOpenTarget("https://example.org", "/work", alive, 802, setup(invocations, {
+    local, resolve: async (origin) => { origins.push(origin); return "local"; },
+  }));
   assert.deepEqual(calls, [["./file.ts#L12", "/work", alive], ["https://example.org", "/work", alive]]);
   assert.deepEqual(origins, [802]);
   assert.deepEqual(invocations, []);
 });
 
-test("direct SSH with no tmux and unknown/foreign/stale tmux origin fail closed", async () => {
+test("known activation route uses cheap revalidation without a full resolver scan", async () => {
+  let revalidations = 0, resolutions = 0, localCalls = 0;
+  await dispatchOpenTarget("https://example.org/local", "/work", lifetime(), "unknown", {
+    topology: localTopology,
+    resolveTopology: async () => { resolutions++; throw new Error("known route must not rescan"); },
+    revalidateTopology: async (topology) => { revalidations++; assert.equal(topology, localTopology); return true; },
+    local: async () => { localCalls++; },
+  });
+  assert.equal(revalidations, 1);
+  assert.equal(resolutions, 0);
+  assert.equal(localCalls, 1);
+});
+
+test("activation-unknown retries once; direct recovery works while late tmux requires reload", async () => {
+  let localCalls = 0;
+  await dispatchOpenTarget("https://example.org/local", "/work", lifetime(), "unknown", {
+    topology: unknownTopology,
+    resolveTopology: async () => localTopology,
+    local: async () => { localCalls++; },
+  });
+  assert.equal(localCalls, 1);
+
+  await assert.rejects(dispatchOpenTarget("https://example.org", "/work", lifetime(), "unknown", {
+    topology: unknownTopology,
+    resolveTopology: async () => tmuxTopology,
+    resolve: async () => assert.fail("late tmux must not use bindings that were never acquired"),
+  }), /现已进入 tmux.*\/reload/u);
+});
+
+test("direct paired SSH uses the existing pinned v2 helper without tmux", async () => {
+  const invocations: Invocation[] = [];
+  await dispatchOpenTarget("https://example.org/direct", "/work", lifetime(), "unknown", {
+    topology: remoteTopology,
+    resolveTopology: async () => remoteTopology,
+    revalidateTopology: async () => true,
+    spawn: fakeSsh(invocations),
+    local: async () => assert.fail("direct SSH must not use the company opener"),
+  });
+  assert.deepEqual(decoded(invocations), [{ version: 2, action: "open-web", url: "https://example.org/direct" }]);
+  pinned(invocations[0]!);
+});
+
+test("unpaired or unknown direct input refuses with its holder diagnostic", async () => {
   let localCalls = 0;
   const invocations: Invocation[] = [];
-  const local = async () => { localCalls++; };
-  for (const key of ["SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY"] as const) {
-    await assert.rejects(dispatchOpenTarget("https://example.org", "/work", lifetime(), "unknown",
-      { env: { [key]: "remote" }, local, spawn: fakeSsh(invocations) }), /SSH 输入未经过/u);
-  }
+  await assert.rejects(dispatchOpenTarget("https://example.org", "/work", lifetime(), "unknown", {
+    topology: unknownTopology,
+    resolveTopology: async () => unknownTopology,
+    local: async () => { localCalls++; },
+    spawn: fakeSsh(invocations),
+  }), /输入终端无法归属.*fixture-holder/u);
+  assert.equal(localCalls, 0);
+  assert.deepEqual(invocations, []);
+});
+
+test("tagged origin in a direct topology and changed holder identity both refuse", async () => {
+  await assert.rejects(dispatchOpenTarget("https://example.org", "/work", lifetime(), 9999, {
+    topology: localTopology,
+    revalidateTopology: async () => true,
+    local: async () => assert.fail("tagged direct input must not open locally"),
+  }), /直接终端收到 tmux 来源标记/u);
+  await assert.rejects(dispatchOpenTarget("https://example.org", "/work", lifetime(), "unknown", {
+    topology: localTopology,
+    revalidateTopology: async () => false,
+    local: async () => assert.fail("changed terminal identity must not open locally"),
+  }), /持有者或会话首进程.*变化/u);
+});
+
+test("foreign or stale tmux origin still fails closed", async () => {
+  const invocations: Invocation[] = [];
   for (const origin of ["unknown", 9999] as const) {
     await assert.rejects(dispatchOpenTarget("https://example.org", "/work", lifetime(), origin,
-      setup(invocations, { resolve: async () => { throw new Error("origin not attached or in wrong pane"); }, local })),
+      setup(invocations, { resolve: async () => { throw new Error("origin not attached or in wrong pane"); } })),
     /origin not attached/u);
   }
-  assert.equal(localCalls, 0);
   assert.deepEqual(invocations, []);
 });
 

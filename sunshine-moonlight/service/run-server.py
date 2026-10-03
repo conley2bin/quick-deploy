@@ -308,7 +308,9 @@ def print_pair_failure(
 def confirmed_catalogue(name: str, machine: dict[str, Any], program: str, official: Any) -> str:
     """Preserved list→explicit-unpaired→manual PIN/pair→fresh list confirmation.
 
-    The catalogue is freshly fetched AFTER host preparation. Plain `list` is
+    The managed session calls this after acquiring the host but BEFORE any
+    preparation restart (pairing is what makes Sunshine persist its instance
+    UUID), and freshly again after preparation before launch. Plain `list` is
     deliberate: `list --csv` starts a box-art fetch per app whose thread-pool
     join can deadlock CLI shutdown, so no CSV output is ever recoverable. The
     unambiguous first lowercase Desktop title is checked by the session BEFORE

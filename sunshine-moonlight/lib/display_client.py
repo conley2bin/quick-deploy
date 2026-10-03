@@ -46,13 +46,26 @@ class Cancelled(ClientError):
     pass
 
 
+# Fixed local text for validated host refusals that need an operator action.
+# Only the code selects a message; host detail text is never echoed.
+REFUSAL_MESSAGES = {
+    "host_identity_changed": (
+        "目标 Sunshine 当前实例 UUID 与主机控制器绑定的不同（Sunshine 只在配对时持久化实例 UUID，"
+        "未持久化时每次重启都会换新）；未继续操作，主机预约保留。恢复：先用官方 Moonlight 与当前 Sunshine "
+        "完成 PIN 配对并用 moonlight list 确认，再在目标主机本地交互终端运行 "
+        "commands/install-display-control.sh --reconcile-host-identity，最后运行 "
+        "quick-deploy-display-control --enroll。"),
+}
+
+
 class RpcFailure(ClientError):
     def __init__(self, action, code="unknown", remote_refusal=False):
         # Never include arbitrary exception text, reply objects or private fields.
         self.action = action
         self.code = code if type(code) is str else "unknown"
         self.remote_refusal = remote_refusal is True
-        super().__init__(f"控制器 {action} {'拒绝请求' if self.remote_refusal else '响应不确定'}。")
+        known = REFUSAL_MESSAGES.get(self.code) if self.remote_refusal else None
+        super().__init__(known or f"控制器 {action} {'拒绝请求' if self.remote_refusal else '响应不确定'}。")
 
 
 def check_desktop_catalogue(catalogue: str) -> None:
@@ -538,11 +551,20 @@ class Session:
         self.say("已确认本次受管 Desktop 关闭并释放预约。")
         return quit_code
 
+    def paired_catalogue(self):
+        # Official list -> explicit-unpaired PIN/pair -> fresh list, under the
+        # acquired SELECTING lease and BEFORE prepare: stock Sunshine persists
+        # its instance UUID only when a pairing saves state, so a controlled
+        # restart before pairing would replace the UUID the host pinned. A
+        # failure here leaves untouched selection, which the owner cleanly aborts.
+        self.interrupts.check()
+        check_desktop_catalogue(self.catalogue(self.program, self.official))
+
     def stream(self, prepared):
         self.interrupts.check()
-        # The final, fresh official catalogue is after preparation / pairing
-        # and before host launch intent or external stream dispatch. Plain list
-        # carries no IDs: one unambiguous Desktop title is the pre-launch gate.
+        # The final, fresh official catalogue is after preparation and before
+        # host launch intent or external stream dispatch. Plain list carries
+        # no IDs: one unambiguous Desktop title is the pre-launch gate.
         check_desktop_catalogue(self.catalogue(self.program, self.official))
         options = mode_argv(prepared["display"])
         self.interrupts.check()
@@ -601,6 +623,7 @@ class Session:
         result = 1
         try:
             screens, snapshot = self.acquire()
+            self.paired_catalogue()
             prepared = self.prepare(screens, snapshot)
             return self.stream(prepared)
         except Cancelled as exc:
@@ -640,8 +663,10 @@ def connect(name, machine, catalogue, *, binary=None, transport_factory=default_
     """Actual entrypoint with narrow injected seams for isolated orchestration tests.
 
     catalogue(program, official)->fresh official plain app list; it owns the
-    preserved list/unpaired/PIN/pair/fresh-list user workflow. No explicit
-    resume/adoption or automatic enrollment API is provided by this client.
+    preserved list/unpaired/PIN/pair/fresh-list user workflow and is called
+    after acquire but before prepare, then again after prepare before launch.
+    No explicit resume/adoption or automatic enrollment API is provided by
+    this client.
     """
     input_stream = sys.stdin if input_stream is None else input_stream
     output_stream = sys.stderr if output_stream is None else output_stream

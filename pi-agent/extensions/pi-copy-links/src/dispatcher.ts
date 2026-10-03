@@ -5,7 +5,10 @@ import { isIP, Socket } from "node:net";
 import type { OpenOrigin } from "./adapter.ts";
 import { webUrl, type OpenLifetime } from "./browser.ts";
 import { openTarget, parseOpenTarget, validateLocalTarget, type OpenTargetDependencies } from "./links.ts";
-import { resolveInputReceiver, type InputReceiver } from "./receiver.ts";
+import {
+  resolveInputReceiver, resolveInputTopology, revalidateInputTopology,
+  type InputReceiver, type InputTopology,
+} from "./receiver.ts";
 
 const REMOTE_ALIAS = "conley-Y9000p";
 const HELPER = "~/.local/bin/pi-client-link-helper";
@@ -38,6 +41,11 @@ export type HelperSpawn = (
 
 export interface DispatcherDependencies {
   readonly env?: NodeJS.ProcessEnv;
+  /** Frozen at extension activation; known routes are cheaply revalidated without a full proc scan. */
+  readonly topology?: InputTopology;
+  readonly resolveTopology?: () => Promise<InputTopology>;
+  readonly revalidateTopology?: (topology: InputTopology) => Promise<boolean>;
+  /** Resolve a marker-selected client only after the active topology is verified as tmux. */
   readonly resolve?: (origin: OpenOrigin) => Promise<InputReceiver>;
   readonly local?: (href: string, cwd: string, lifetime: OpenLifetime) => Promise<void>;
   readonly stat?: OpenTargetDependencies["stat"];
@@ -362,21 +370,39 @@ function verifySuccess(reply: Record<string, unknown>, request: HelperRequest,
   }
 }
 
-/** Preserve local Pi behavior; a direct SSH session has no attributable tmux client. */
+/** Route by the verified fd0 transport frozen at activation, never by inherited TMUX/SSH variables alone. */
 export async function dispatchOpenTarget(
   href: string, cwd: string, lifetime: OpenLifetime, origin: OpenOrigin,
   dependencies: DispatcherDependencies = {},
 ): Promise<void> {
   ensureCurrent(lifetime);
-  const env = dependencies.env ?? process.env;
-  if (!env.TMUX) {
-    if (origin !== "unknown" || env.SSH_CONNECTION || env.SSH_CLIENT || env.SSH_TTY) {
-      throw new Error("SSH 输入未经过带来源标记的 tmux，无法确定打开链接的客户端");
+  const receiverDependencies = { env: dependencies.env ?? process.env };
+  const resolveTopology = dependencies.resolveTopology ??
+    (() => resolveInputTopology(process.pid, receiverDependencies));
+  const revalidateTopology = dependencies.revalidateTopology ??
+    ((topology: InputTopology) => revalidateInputTopology(process.pid, topology, receiverDependencies));
+  const activated = dependencies.topology ?? await resolveTopology();
+  let current = activated;
+  if (activated.kind === "unknown") {
+    current = await resolveTopology();
+    ensureCurrent(lifetime);
+    if (current.kind === "tmux") {
+      throw new Error("输入终端现已进入 tmux；本次未安装来源绑定，请在 Pi 空闲时执行 /reload");
     }
-    await (dependencies.local ?? openTarget)(href, cwd, lifetime);
-    return;
+    if (current.kind === "unknown") throw new Error(`输入终端无法归属：${current.diagnostic}`);
+  } else {
+    if (!await revalidateTopology(activated)) {
+      throw new Error("输入终端持有者或会话首进程自扩展加载后已变化，已拒绝打开链接");
+    }
+    ensureCurrent(lifetime);
   }
-  const receiver = await (dependencies.resolve ?? resolveInputReceiver)(origin);
+  if (current.kind !== "tmux" && origin !== "unknown") {
+    throw new Error("直接终端收到 tmux 来源标记，已拒绝打开链接");
+  }
+
+  const receiver = current.kind === "tmux" ?
+    await (dependencies.resolve ?? resolveInputReceiver)(origin) :
+    current.kind === "remote" ? current.receiver : "local";
   ensureCurrent(lifetime);
   if (receiver === "local") {
     await (dependencies.local ?? openTarget)(href, cwd, lifetime);

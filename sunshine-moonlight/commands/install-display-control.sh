@@ -6,17 +6,24 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=../lib/common.sh
 . "$SCRIPT_DIR/lib/common.sh"
 PUBLISH=false
+RECONCILE=false
 usage() {
     cat <<'USAGE'
-用法: ./commands/install-display-control.sh [--publish-shim]
+用法: ./commands/install-display-control.sh [--publish-shim] [--reconcile-host-identity]
 只读资格检查已安装的 Sunshine v2026.914.233613/source63d35f7 的官方 Ubuntu deb、
 实际用户服务/配置/apps/assets 和公开 serverinfo UUID；独立发布私人控制器与持久状态。
 不安装/更新 Sunshine、不修改 unit/config、不 reload/restart/cancel、不收集管理员/TLS 凭据。
   --publish-shim 明确授权 sudo 原子新建 /usr/bin/quick-deploy-display-control；
                  不覆盖既有外来/不同内容路径，不在 RPC 内 sudo。
+  --reconcile-host-identity 仅在主机本地 /dev/tty 输入 REBIND，明确独占、没有非受管
+                 串流且已与当前 Sunshine 完成官方 PIN 配对。只接受本次预约未启动过串流的
+                 身份变化受控重启，资格/旧进程退休/config/新 UUID 等完整证据均须一致；
+                 保留旧记录原字节与 inode 的 .bak、锁 inode 和永久事务证据，重新发布
+                 UNENROLLED。不修改 Sunshine 配置，不新增 shim 参数，不自动登记。
 没有该固定 shim 时仍可完成私人发布，但返回失败并明确报告 SSH RPC 尚未就绪。
 用运行 Sunshine 的桌面用户操作；root 不创建其它用户的私人控制器。
-安装绝不自动 enrollment。空闲/独占时在主机交互终端运行：
+安装绝不自动 enrollment。受控准备重启前必须完成官方 PIN 配对（配对才持久化实例 UUID）；
+连接器会在取得预约后、准备前确认配对。空闲/独占时在主机交互终端运行：
   quick-deploy-display-control --enroll
 Windows/macOS 原生 lifecycle 发布仍待实现；不会伪造 Linux schema2 设置。
 USAGE
@@ -24,6 +31,7 @@ USAGE
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --publish-shim) PUBLISH=true;;
+        --reconcile-host-identity) RECONCILE=true;;
         -h|--help) usage; exit 0;;
         *) qd_die "未知参数: $1";;
     esac
@@ -67,6 +75,7 @@ qd_verify_sha256 "$deb" "${selected[2]}"
 args=(install --metadata "$metadata" --package "$deb" --ubuntu "$VERSION_ID"
       --architecture "$arch" --installed-version "$installed")
 [ "$PUBLISH" = false ] || args+=(--publish-shim)
+[ "$RECONCILE" = false ] || args+=(--reconcile-host-identity)
 # -I suppresses ambient Python path/user-site settings; -B explicitly prevents
 # cache writes (-I ignores PYTHONDONTWRITEBYTECODE). No token is needed
 # after metadata acquisition, including by an explicitly invoked sudo publisher.

@@ -201,18 +201,25 @@ class OwnedPTY:
                                         pass_fds=(child_result,), close_fds=True)
         os.close(child_result)
 
-    def collect_until(self, marker, timeout=3):
+    def collect_until(self, marker, timeout=3, since=0):
         deadline = time.monotonic() + timeout
-        while marker not in self.output:
+        while marker not in self.output[since:]:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise AssertionError(f"PTY never displayed {marker!r}; output {self.output[-1000:]!r}")
             ready = select.select([self.master, self.result], [], [], remaining)[0]
             if self.master in ready:
                 self.output += os.read(self.master, 16384)
-            if self.result in ready and marker not in self.output:
+            if self.result in ready and marker not in self.output[since:]:
                 raise AssertionError(f"child finished before display: {os.read(self.result, 4096)!r}")
         return self.output
+
+    def key_frame(self, keys, marker):
+        """Send keys and return the newest repainted frame once it shows marker."""
+        since = len(self.output)
+        self.send(keys)
+        self.collect_until(marker, since=since)
+        return self.output[since:].rsplit(b"\x1b[H\x1b[2J", 1)[-1].decode()
 
     def ready(self):
         return self.collect_until(b"Esc: cancel")
@@ -473,6 +480,80 @@ class PosixPTYTests(unittest.TestCase):
             for fd in (a, b, c, d):
                 os.close(fd)
 
+    def test_up_down_previous_next_row_wrap_and_refuse_unavailable(self):
+        # Rows are host record order: 1 eDP-1 (primary), 2 DP-3, 3 unavailable.
+        for up, down in ((b"\x1b[A", b"\x1b[B"), (b"\x1bOA", b"\x1bOB")):
+            with self.subTest(keys=(up, down)), OwnedPTY("disabled") as p:
+                self.assertIn("Up/Down (Left/Right): screen | Enter: select", p.ready().decode())
+                self.assertIn("> 2. 外接", p.key_frame(down, b"> 2."))
+                frame = p.key_frame(down, b"> 3.")
+                self.assertIn("UNAVAILABLE: inactive_display_path", frame)
+                self.assertIn("Enter refused: unavailable screen", p.key_frame(b"\r", b"Enter refused"))
+                self.assertFalse(select.select([p.result], [], [], 0.025)[0])
+                self.assertIn("Up/Down (Left/Right)", p.key_frame(down, b"> 1."))  # Wraps; refusal clears.
+                self.assertIn("> 3. Inactive", p.key_frame(up, b"> 3."))  # Wraps backward.
+                p.key_frame(up, b"> 2.")
+                p.send(b"\r")
+                self.assertEqual(p.finish()["result"], SCREENS[1]["id"])
+                self.assert_vt_restored(p)
+
+    def test_up_down_and_left_right_are_exact_aliases(self):
+        with OwnedPTY("disabled") as p:
+            p.ready()
+            p.key_frame(b"\x1b[B", b"> 2.")
+            p.key_frame(b"\x1b[C", b"> 3.")
+            p.key_frame(b"\x1bOD", b"> 2.")
+            p.key_frame(b"\x1b[A", b"> 1.")
+            p.key_frame(b"\x1b[D", b"> 3.")
+            p.key_frame(b"\x1bOC", b"> 1.")
+            p.send(b"\r")
+            self.assertEqual(p.finish()["result"], SCREENS[0]["id"])
+            self.assert_vt_restored(p)
+
+    def test_fragmented_up_down_bytes_do_not_cancel(self):
+        with OwnedPTY() as p:
+            p.ready()
+            for fragment in (b"\x1b", b"O", b"B"):
+                p.send(fragment)
+                self.assertFalse(select.select([p.result], [], [], 0.025)[0])
+            p.send(b"\r")
+            self.assertEqual(p.finish()["result"], SCREENS[1]["id"])
+            self.assert_vt_restored(p)
+
+    def test_up_down_then_cancel_interrupt_or_eof_restore(self):
+        for keys, outcome in ((b"\x1b", None), (b"\x03", "KeyboardInterrupt"), (b"\x04", "PickerEOF")):
+            with self.subTest(keys=keys), OwnedPTY("disabled") as p:
+                p.ready()
+                p.key_frame(b"\x1b[B", b"> 2.")
+                p.key_frame(b"\x1b[B", b"> 3.")
+                p.send(keys)
+                result = p.finish()  # Also asserts termios/handlers equal the pre-call state.
+                if outcome is None:
+                    self.assertIsNone(result["result"])
+                else:
+                    self.assertEqual(result["exception"], outcome)
+                    self.assertNotIn("result", result)
+                self.assert_vt_restored(p)
+
+    def test_small_terminal_reflow_keeps_unavailable_reason_inspectable(self):
+        with OwnedPTY("disabled") as p:
+            p.ready()
+            p.key_frame(b"\x1b[A", b"> 3.")
+            since = len(p.output)
+            p.resize(40, 9)  # Viewport now holds exactly one screen.
+            p.collect_until(b"rows 3-3", since=since)
+            frame = p.output[since:].rsplit(b"\x1b[H\x1b[2J", 1)[-1].decode()
+            self.assertIn("> 3. Inactive", frame)
+            self.assertIn("UNAVAILABLE: inactive_display_path", frame)
+            self.assertNotIn("> 1.", frame)
+            next_frame = p.key_frame(b"\x1b[B", b"> 1.")
+            self.assertIn("rows 1-1", next_frame)
+            self.assertIn("Up/Down: screen | Enter: select", next_frame)
+            self.assertIn("rows 2-2", p.key_frame(b"\x1b[B", b"> 2."))
+            p.send(b"\r")
+            self.assertEqual(p.finish()["result"], SCREENS[1]["id"])
+            self.assert_vt_restored(p)
+
     def test_unknown_and_truncated_escape_never_select(self):
         with OwnedPTY() as p:
             p.ready()
@@ -704,6 +785,23 @@ class WindowsConsoleFixtureTests(unittest.TestCase):
         self.restored(f)
         f = ConsoleFixture([win_key(0x1b)])
         self.assertIsNone(self.choose(f))
+        self.restored(f)
+
+    def test_up_down_virtual_keys_alias_left_right_with_repeat(self):
+        rows = fixture("disabled")
+        for events, expected in (([win_key(0x28), win_key(0x0d)], rows[1]["id"]),
+                                 ([win_key(0x26), win_key(0x0d), win_key(0x26), win_key(0x0d)], rows[1]["id"]),
+                                 ([win_key(0x28, repeat=3), win_key(0x0d)], rows[0]["id"]),
+                                 ([win_key(0x26, repeat=2), win_key(0x0d)], rows[1]["id"]),
+                                 ([win_key(0x28), win_key(0x25), win_key(0x26), win_key(0x27), win_key(0x0d)],
+                                  rows[0]["id"])):
+            f = ConsoleFixture(events)
+            with self.subTest(events=[(e.event.key.vk, e.event.key.repeat) for e in events]):
+                self.assertEqual(self.choose(f, rows), expected)
+                self.restored(f)
+        f = ConsoleFixture([win_key(0x26), win_key(0x0d), win_key(0x1b)])
+        self.assertIsNone(self.choose(f, rows))
+        self.assertIn("Enter refused: unavailable screen", "".join(f.output))
         self.restored(f)
 
     def test_ctrl_c_eof_and_disabled_enter_restore(self):

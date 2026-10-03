@@ -20,8 +20,10 @@ import select
 import shlex
 import shutil
 import signal
+import socket
 import struct
 import subprocess
+import sys
 import tempfile
 import termios
 import time
@@ -33,8 +35,47 @@ transport = args.add_mutually_exclusive_group()
 transport.add_argument('--osc52', action='store_true')
 transport.add_argument('--tmux', action='store_true')
 options = args.parse_args()
+# The process holding the harness PTY master is the input terminal under test.
+# Re-exec once so /proc/<holder>/environ contains deterministic initial values;
+# changing os.environ after exec would not update that kernel snapshot.
+parent_marker = '_PI_COPY_LINKS_NATIVE_PARENT_ENV'
+identity_dir_key = '_PI_COPY_LINKS_NATIVE_IDENTITY_DIR'
+if os.environ.get(parent_marker) != '1':
+    clean = dict(os.environ)
+    for key in ('TMUX', 'TMUX_PANE', 'SSH_CONNECTION', 'SSH_CLIENT', 'SSH_TTY',
+                'WAYLAND_DISPLAY', 'DISPLAY', 'XDG_RUNTIME_DIR'):
+        clean.pop(key, None)
+    clean[parent_marker] = '1'
+    executable = Path(sys.executable)
+    if not options.osc52:
+        identity_dir = Path(tempfile.mkdtemp(prefix='pi-copy-links-terminal-identity-'))
+        executable = identity_dir / 'ghostty'
+        try:
+            os.link(sys.executable, executable)
+        except OSError:
+            shutil.copy2(sys.executable, executable)
+        clean[identity_dir_key] = str(identity_dir)
+    os.execve(str(executable), [str(executable), *sys.argv], clean)
+identity_dir = Path(os.environ[identity_dir_key]) if identity_dir_key in os.environ else None
+if not options.osc52:
+    assert Path(os.readlink('/proc/self/exe')).name == 'ghostty'
 source = Path(__file__).resolve().parents[1]
 root = Path(tempfile.mkdtemp(prefix='pi-copy-links-native-'))
+# Local/tmux modes prove the harness PTY master has a real Unix connection to
+# a private display-server-shaped socket. OSC52 intentionally has no such peer.
+display_server = display_client = display_peer = None
+display_socket_path = None
+if not options.osc52:
+    display_dir = Path('/tmp/.X11-unix')
+    display_dir.mkdir(mode=0o1777, exist_ok=True)
+    display_socket_path = display_dir / f'X{os.getpid()}'
+    assert not display_socket_path.exists(), display_socket_path
+    display_server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    display_server.bind(str(display_socket_path))
+    display_server.listen(1)
+    display_client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    display_client.connect(str(display_socket_path))
+    display_peer, _ = display_server.accept()
 artifacts = options.artifacts or root
 artifacts.mkdir(parents=True, exist_ok=True)
 # Available even when startup/setup fails before the PTY fixture can snapshot.
@@ -102,8 +143,12 @@ env = dict(os.environ, PI_CODING_AGENT_DIR=str(agent), PI_COPY_LINKS_TEST_DIR=st
            PI_OFFLINE='1', PI_SKIP_VERSION_CHECK='1', TERM='xterm-256color', TERM_PROGRAM='',
            PATH=str(private_bin) + os.pathsep + os.environ['PATH'], DISPLAY='',
            WAYLAND_DISPLAY='' if options.osc52 else 'fixture', XDG_SESSION_TYPE='wayland',
-           SSH_CONNECTION='fixture' if options.osc52 else '', SSH_CLIENT='', MOSH_CONNECTION='')
-env.pop('TMUX', None)
+           MOSH_CONNECTION='')
+for key in ('TMUX', 'TMUX_PANE', 'SSH_CONNECTION', 'SSH_CLIENT', 'SSH_TTY'):
+    env.pop(key, None)
+if options.osc52:
+    env['SSH_CONNECTION'] = 'fixture'
+    env['SSH_CLIENT'] = ''
 pi = shutil.which('pi')
 assert pi, 'pi is missing from PATH'
 cli = [pi, '--offline', '--no-skills', '--no-prompt-templates', '--no-themes', '--session', str(session)]
@@ -135,7 +180,7 @@ if options.tmux:
     # Pass only test-specific non-secret environment overrides, not the parent's credentials.
     keys = ['PI_CODING_AGENT_DIR', 'PI_COPY_LINKS_TEST_DIR', 'PI_OFFLINE', 'PI_SKIP_VERSION_CHECK',
             'PATH', 'DISPLAY', 'WAYLAND_DISPLAY', 'XDG_SESSION_TYPE', 'SSH_CONNECTION', 'SSH_CLIENT', 'MOSH_CONNECTION']
-    command = shlex.join(['env', *[key + '=' + env[key] for key in keys], *cli])
+    command = shlex.join(['env', *[key + '=' + env[key] for key in keys if key in env], *cli])
     created = tmux('new-window', '-d', '-P', '-F', '#{window_id}:#{pane_id}', '-t', f'{project_session}:{slot}',
                    '-n', 'copy-links-native-' + identity, '-c', str(root), command).stdout.strip()
     window, pane = created.split(':')
@@ -237,10 +282,12 @@ try:
     assert records('google-chrome-stable') == [], 'unmodified click opened a browser'
     click(link, 16)
     if options.osc52:
-        # OSC52 fixture is a direct SSH-like input without a tmux origin. Copy
-        # still works; opening must now fail visibly instead of using company GUI.
-        wait_for(lambda: 'SSH 输入未经过带来源标记的 tmux'.encode() in wire,
-                 'direct SSH without origin refusal')
+        # The harness PTY master is an unknown Python holder. SSH environment
+        # alone cannot attribute it, so opening fails with the holder diagnostic.
+        refusal_prefix = '输入终端无法归属：输入持有者 '.encode()
+        refusal_body = '没有受支持的输入来源契'.encode()  # final diagnostic wraps before “约”
+        wait_for(lambda: refusal_prefix in wire and refusal_body in wire,
+                 'unattributed harness PTY refusal')
         for label in ('MODEL_3MF', 'DIAGRAM_SVG', 'DATA_JSON', 'SAMPLE_DIR'):
             click(target_by_label(after_copy, label), 16)
         drain(0.2)
@@ -359,3 +406,10 @@ finally:
             tmux('kill-pane', '-t', pane)
     if project_session and old_mouse is not None:
         tmux('set-option', '-t', project_session, 'mouse', old_mouse)
+    for display_socket in (display_peer, display_client, display_server):
+        if display_socket is not None:
+            display_socket.close()
+    if display_socket_path is not None:
+        display_socket_path.unlink(missing_ok=True)
+    if identity_dir is not None:
+        shutil.rmtree(identity_dir, ignore_errors=True)

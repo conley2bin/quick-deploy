@@ -575,6 +575,42 @@ class IntegrationTests(unittest.TestCase):
                 other.owner(releasing, "finish_release")
             self.assertEqual(other.status()["phase"], "reconciliation_required")
 
+    def test_identity_changed_immediate_readiness_failure_preserves_restart_and_status(self):
+        f = self.fixture
+        f.enroll()
+        ticket = f.acquire()
+        after_restart = []
+        endpoint = f.endpoint
+        def observed(address, port):
+            if f.transport.restarts:
+                after_restart.append(1)
+            return endpoint(address, port)
+        f.endpoint = observed
+        # Official pairing can succeed while vendor save_state silently fails.
+        # The existing ordinary prepare is the persistence proof and fails closed.
+        f.transport.on_restart = lambda _: setattr(f, "endpoint_id", "11223344-1234-4321-abcd-0123456789ab")
+        with self.assertRaises(protocol.Refusal) as caught:
+            f.prepare(ticket)
+        self.assertEqual(caught.exception.code, "host_identity_changed")
+        # Exactly one readiness sample plus the refused rollback's idle check;
+        # a generic starting/unknown failure would use all three readiness tries.
+        self.assertEqual(len(after_restart), 2)
+        meta = json.loads((f.state / "operation.json").read_bytes())
+        status = rs.ReservationStore(f.state, rs.HostIdentity(lc.canonical_uuid(HOST), 47989)).status()
+        self.assertEqual((status.revision, status.phase, status.uncertainty),
+                         (4, rs.Phase.RECONCILIATION_REQUIRED, rs.Uncertainty.RUNTIME_CHANGED))
+        self.assertEqual(meta["lease"]["stage"], "restart_intent")
+        self.assertIsNone(status.attempt_revision)
+        self.assertFalse(status.active_observed)
+        self.assertFalse((f.state / "start-receipt.json").exists())
+        self.assertEqual(config.get_settings(f.conf.read_bytes())["output_name"], "HDMI-A-2")
+        before = {p.name: (p.read_bytes(), p.stat().st_ino, p.stat().st_mtime_ns) for p in f.state.iterdir()}
+        for action in ("list", "status"):
+            with self.assertRaises(protocol.Refusal) as caught:
+                f.rpc(action)
+            self.assertEqual(caught.exception.code, "host_identity_changed")
+            self.assertEqual({p.name: (p.read_bytes(), p.stat().st_ino, p.stat().st_mtime_ns) for p in f.state.iterdir()}, before)
+
     def test_target_changes_during_readiness_and_duplicate_native_ids_refuse(self):
         f = self.fixture
         f.enroll()

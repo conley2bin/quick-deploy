@@ -47,7 +47,7 @@ class EntryTests(fixture.ConnectorFixture, unittest.TestCase):
         for _ in range(2):
             result = self.invoke("desktop")
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual(self.actions(), ["list", "stream", "quit"])
+            self.assertEqual(self.actions(), ["list", "list", "stream", "quit"])
             self.assertEqual(self.recorded()["argv"][1:], fixture.STREAM_ARGS)
             self.assertEqual(self.records()[-1]["argv"][1:], ["quit", "--", "100.64.0.2:47989"])
             self.assert_available()
@@ -98,7 +98,7 @@ class EntryTests(fixture.ConnectorFixture, unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("缺少 screen_picker", result.stderr)
         self.assert_available()
-        self.assert_no_program()
+        self.assertEqual(self.actions(), ["list"])
 
     def test_busy_unready_refusal_no_acquire_no_adoption(self):
         self.write_default()
@@ -116,7 +116,7 @@ class EntryTests(fixture.ConnectorFixture, unittest.TestCase):
             result = self.invoke("desktop", extra_env={"FAKE_PICK":mode})
             self.assertEqual(result.returncode, expected, result.stderr)
             self.assert_available()
-            self.assert_no_program()
+            self.assertEqual(self.actions(), ["list"])
             self.assertNotIn("prepare", self.control_actions())
         self.assertEqual(self.control_actions().count("abort"), 4)
 
@@ -144,7 +144,7 @@ class EntryTests(fixture.ConnectorFixture, unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.control_actions(), ["construct","list","acquire","prepare","status","refresh","status","abort"])
         self.assert_available()
-        self.assert_no_program()
+        self.assertEqual(self.actions(), ["list"])
 
     def test_refused_capture_preflight_cleans_only_fresh_known_owner(self):
         self.write_default()
@@ -156,7 +156,7 @@ class EntryTests(fixture.ConnectorFixture, unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(self.host()["phase"], "reconciliation_required")
         self.assertEqual(self.control_actions().count("abort"), 1)
-        self.assert_no_program()
+        self.assertEqual(self.actions(), ["list"])
 
     def test_unknown_mutations_never_clean_abort_retry_or_quit(self):
         for action, expected_phase in (("acquire","selecting"),("prepare","preparing"),("launch","connecting")):
@@ -170,7 +170,10 @@ class EntryTests(fixture.ConnectorFixture, unittest.TestCase):
                 self.assertEqual(self.control_actions().count(action), 1)
                 self.assertNotIn("abort", self.control_actions())
                 self.assertNotIn("control_lost", self.control_actions())
-                self.assert_no_program() if action != "launch" else self.assertEqual(self.actions(), ["list"])
+                if action == "acquire":
+                    self.assert_no_program()
+                else:
+                    self.assertEqual(self.actions(), ["list"] if action == "prepare" else ["list", "list"])
 
     def test_wrong_host_status_never_refreshes_or_aborts(self):
         self.write_default()
@@ -179,6 +182,72 @@ class EntryTests(fixture.ConnectorFixture, unittest.TestCase):
         self.assertEqual(self.host()["phase"], "selecting")
         self.assertNotIn("refresh", self.control_actions())
         self.assertNotIn("abort", self.control_actions())
+
+    def test_pairing_inside_selecting_before_prepare_and_fresh_gate_after(self):
+        self.write_default()
+        result = self.invoke("desktop", extra_env={"FAKE_INITIAL_PAIRED": "0"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.actions(), ["list", "pair", "list", "list", "stream", "quit"])
+        self.assertEqual([r["controller_phase"] for r in self.records()[:4]],
+                         ["selecting", "selecting", "selecting", "preparing"])
+        actions = self.control_actions()
+        self.assertGreaterEqual(actions.count("observe_active"), 1)
+        self.assertEqual([a for a in actions if a != "observe_active"],
+                         ["construct", "list", "acquire", "prepare", "launch", "begin_release", "finish_release"])
+        self.assert_available()
+
+    def test_initial_pair_and_qpa_failures_clean_abort_before_picker_prepare(self):
+        self.write_default()
+        cases = ({"FAKE_INITIAL_PAIRED": "0", "FAKE_PAIR_EFFECT": "none"},
+                 {"FAKE_INITIAL_PAIRED": "0", "FAKE_PAIR_EXIT": "1", "FAKE_PAIR_EFFECT": "none"},
+                 {"FAKE_LIST_MODE": "stdout-unknown"})
+        for env in cases:
+            with self.subTest(env=env):
+                start = len(self.control()) if self.control_log.exists() else 0
+                result = self.invoke("desktop", extra_env=env)
+                self.assertNotEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(self.control_actions()[start:], ["construct", "list", "acquire", "status", "abort"])
+                self.assertFalse(self.pick_log.exists())
+                self.assert_available()
+
+    def test_busy_refuses_unpaired_before_official_pair_no_extra_rpc(self):
+        self.write_default()
+        result = self.invoke("desktop", extra_env={"FAKE_BUSY": "1", "FAKE_INITIAL_PAIRED": "0"})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.control_actions(), ["construct", "list"])
+        self.assert_no_program()
+        self.assertFalse(self.pick_log.exists())
+
+    def test_postprepare_catalogue_failure_aborts_completed_prepare_not_launch(self):
+        self.write_default()
+        result = self.invoke("desktop", extra_env={"FAKE_LIST_SEQUENCE": "paired,network"})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.actions(), ["list", "list"])
+        self.assertEqual([r["controller_phase"] for r in self.records()], ["selecting", "preparing"])
+        self.assertEqual(self.control_actions(), ["construct", "list", "acquire", "prepare", "status", "abort"])
+        self.assert_available()
+
+    def test_initial_catalogue_failure_requires_fresh_owner_for_abort(self):
+        self.write_default()
+        result = self.invoke("desktop", extra_env={"FAKE_LIST_MODE": "stdout-unknown", "FAKE_WRONG_STATUS_HOST": "1"})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.host()["phase"], "selecting")
+        self.assertEqual(self.control_actions(), ["construct", "list", "acquire", "status"])
+        self.assertNotIn("abort", self.control_actions())
+
+    def test_identity_refusal_remediation_is_fixed_and_retains_dirty_lease(self):
+        self.write_default()
+        result = self.invoke("desktop", extra_env={"FAKE_REFUSE_ACTION": "prepare", "FAKE_REFUSE_DIRTY": "1",
+                                                   "FAKE_REFUSE_CODE": "host_identity_changed"})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.host()["phase"], "reconciliation_required")
+        self.assertIn("--reconcile-host-identity", result.stderr)
+        self.assertIn("官方 Moonlight", result.stderr)
+        self.assertNotIn("abort", self.control_actions())
+        self.assertNotIn("launch", self.control_actions())
+        message = str(client.RpcFailure("prepare", "host_identity_changed", True))
+        self.assertNotIn("sanitized fixture controller error", message)
+        self.assertNotIn("--reconcile-host-identity", str(client.RpcFailure("prepare", "host_identity_changed", False)))
 
     def test_stock_first_lowercase_title_uniqueness_gate(self):
         self.write_default()
@@ -193,7 +262,7 @@ class EntryTests(fixture.ConnectorFixture, unittest.TestCase):
         # One unambiguous Desktop title proceeds; long-s is not a match.
         result = self.invoke("desktop", extra_env={"FAKE_CATALOGUE":"De\u017ftop\nDesktop"})
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.actions(), ["list", "stream", "quit"])
+        self.assertEqual(self.actions(), ["list", "list", "stream", "quit"])
         self.assert_available()
 
     def test_malformed_or_missing_desktop_catalogue_fails_before_launch(self):
@@ -209,7 +278,7 @@ class EntryTests(fixture.ConnectorFixture, unittest.TestCase):
         self.write_default()
         result = self.invoke("desktop", extra_env={"FAKE_QUICK_EXIT":"1"})
         self.assertNotEqual(result.returncode, 0)
-        self.assertEqual(self.actions(), ["list","stream"])
+        self.assertEqual(self.actions(), ["list", "list", "stream"])
         self.assertEqual(self.host()["phase"], "reconciliation_required")
         self.assertIn("exit0", result.stderr)
         self.assertNotIn("begin_release", self.control_actions())
@@ -219,7 +288,7 @@ class EntryTests(fixture.ConnectorFixture, unittest.TestCase):
         self.write_default()
         result = self.invoke("desktop", extra_env={"FAKE_LOST_ACTION":"observe_active","FAKE_STREAM_HOLD":"10"})
         self.assertNotEqual(result.returncode, 0)
-        self.assertEqual(self.actions(), ["list","stream"])
+        self.assertEqual(self.actions(), ["list", "list", "stream"])
         self.assertEqual(self.host()["phase"], "active")
         self.assertNotIn("begin_release", self.control_actions())
         self.assertNotIn("abort", self.control_actions())
@@ -229,14 +298,14 @@ class EntryTests(fixture.ConnectorFixture, unittest.TestCase):
         result = self.invoke("desktop", extra_env={"FAKE_LOST_ACTION":"begin_release"})
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(self.host()["phase"], "releasing")
-        self.assertEqual(self.actions(), ["list","stream"])
+        self.assertEqual(self.actions(), ["list", "list", "stream"])
         self.assertNotIn("finish_release", self.control_actions())
 
     def test_quit_zero_without_confirmed_closure_retains(self):
         self.write_default()
         result = self.invoke("desktop", extra_env={"FAKE_QUIT_EFFECT":"none"})
         self.assertNotEqual(result.returncode, 0)
-        self.assertEqual(self.actions(), ["list","stream","quit"])
+        self.assertEqual(self.actions(), ["list", "list", "stream","quit"])
         self.assertEqual(self.host()["phase"], "reconciliation_required")
         self.assertEqual(self.control_actions().count("finish_release"), 1)
         self.assertNotIn("已确认本次受管 Desktop 关闭", result.stderr)
@@ -256,7 +325,8 @@ class EntryTests(fixture.ConnectorFixture, unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         records = self.records()
         self.assertEqual(records[0]["lc_all"], "C")
-        self.assertEqual(records[1]["lc_all"], "C.UTF-8")
+        self.assertEqual(records[1]["lc_all"], "C")
+        self.assertEqual(records[2]["lc_all"], "C.UTF-8")
         for record in records:
             self.assertEqual(record["argv"][0], str(path))
             self.assertEqual(record["display"],":fixture")
@@ -268,13 +338,13 @@ class EntryTests(fixture.ConnectorFixture, unittest.TestCase):
         result = self.invoke("desktop", extra_env={"FAKE_SIGNAL_ACTION":"prepare"})
         self.assertEqual(result.returncode, 143, result.stderr)
         self.assert_available()
-        self.assert_no_program()
+        self.assertEqual(self.actions(), ["list"])
 
     def test_signal_after_launch_ack_does_not_dispatch_or_clean_abort(self):
         self.write_default()
         result = self.invoke("desktop", extra_env={"FAKE_SIGNAL_ACTION":"launch"})
         self.assertNotEqual(result.returncode, 0)
-        self.assertEqual(self.actions(), ["list"])
+        self.assertEqual(self.actions(), ["list", "list"])
         self.assertEqual(self.host()["phase"], "reconciliation_required")
         self.assertNotIn("abort", self.control_actions())
 
@@ -311,7 +381,7 @@ class EntryTests(fixture.ConnectorFixture, unittest.TestCase):
             os.kill(child.pid,signal.SIGTERM)
             self.assertEqual(child.wait(timeout=10),143, captured.decode('utf-8','replace'))
             self.assert_available()
-            self.assertEqual(self.actions(),["list","stream","quit"])
+            self.assertEqual(self.actions(), ["list", "list", "stream","quit"])
             stream_pid = self.recorded()["pid"]
             with self.assertRaises(ProcessLookupError):
                 os.kill(stream_pid,0)
