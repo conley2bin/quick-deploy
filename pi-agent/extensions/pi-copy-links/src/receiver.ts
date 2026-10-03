@@ -63,6 +63,7 @@ export interface InputHop {
   readonly proof: "master" | "sshd";
   readonly role: "sshd" | "tmux" | "relay" | "terminal" | "unknown";
   readonly image?: ImageIdentity;
+  readonly relay?: "codoxear" | "script";
 }
 interface TopologyBase { readonly hops: readonly InputHop[] }
 export type InputTopology =
@@ -358,20 +359,32 @@ async function argv(pid: number, accessor: ProcAccess): Promise<readonly string[
 
 interface ExecutableImage { readonly path: string; readonly identity: ImageIdentity }
 
+function imageIdentity(image: { dev: bigint | number; ino: bigint | number }): ImageIdentity {
+  return Object.freeze({ dev: String(image.dev), ino: String(image.ino) });
+}
+
 async function executable(pid: number, accessor: ProcAccess): Promise<ExecutableImage | undefined> {
   const procPath = `/proc/${pid}/exe`;
   const rawPath = await link(accessor, procPath);
   if (!rawPath?.startsWith("/") || /[\x00-\x1f\x7f]/u.test(rawPath)) return undefined;
+  let running: ImageIdentity;
+  try { running = imageIdentity(await accessor.statPath(procPath)); }
+  catch { return undefined; }
+
   const deletedSuffix = " (deleted)";
-  const path = rawPath.endsWith(deletedSuffix) ? rawPath.slice(0, -deletedSuffix.length) : rawPath;
+  let path = rawPath;
+  if (rawPath.endsWith(deletedSuffix)) {
+    try {
+      const literal = imageIdentity(await accessor.statPath(rawPath));
+      if (!sameImage(literal, running)) path = rawPath.slice(0, -deletedSuffix.length);
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException | undefined)?.code;
+      if (code === "ENOENT" || code === "ENOTDIR") path = rawPath.slice(0, -deletedSuffix.length);
+      else return undefined;
+    }
+  }
   if (!path) return undefined;
-  try {
-    const image = await accessor.statPath(procPath);
-    return Object.freeze({
-      path,
-      identity: Object.freeze({ dev: String(image.dev), ino: String(image.ino) }),
-    });
-  } catch { return undefined; }
+  return Object.freeze({ path, identity: running });
 }
 
 function sameImage(a: ImageIdentity | undefined, b: ImageIdentity | undefined): boolean {
@@ -553,8 +566,12 @@ function executableName(path: string | undefined): string | undefined {
   return path ? basename(path) : undefined;
 }
 
+function tmuxServerComm(comm: string): boolean {
+  return comm === "tmux: server" || comm.startsWith("tmux: server");
+}
+
 function isTmuxServer(exe: string | undefined, comm: string): boolean {
-  return executableName(exe) === "tmux" && (comm === "tmux: server" || comm.startsWith("tmux: server"));
+  return executableName(exe) === "tmux" && tmuxServerComm(comm);
 }
 
 function isDeniedMultiplexer(exe: string | undefined, comm: string): boolean {
@@ -565,15 +582,19 @@ function pythonExecutable(exe: string | undefined): boolean {
   return /^python(?:\d+(?:\.\d+)*)?$/u.test(executableName(exe) ?? "");
 }
 
-function codoxearBrokerIdentity(
-  holder: ProcStat, exe: string | undefined, args: readonly string[] | undefined,
-): boolean {
-  if (!pythonExecutable(exe) || !args || !/^python(?:\d+(?:\.\d+)*)?$/u.test(basename(args[0] ?? ""))) return false;
+function codoxearBrokerEntrypoint(holder: ProcStat, args: readonly string[] | undefined): boolean {
+  if (!args || !/^python(?:\d+(?:\.\d+)*)?$/u.test(basename(args[0] ?? ""))) return false;
   const module = args.indexOf("-m");
   const moduleEntry = module >= 0 && (args[module + 1] === "codoxear.broker" ||
     args[module + 1] === "codoxear" && args[module + 2] === "broker");
   const consoleEntry = holder.comm === "codoxear-broker" && basename(args[1] ?? "") === "codoxear-broker";
   return moduleEntry || consoleEntry;
+}
+
+function codoxearBrokerIdentity(
+  holder: ProcStat, exe: string | undefined, args: readonly string[] | undefined,
+): boolean {
+  return pythonExecutable(exe) && codoxearBrokerEntrypoint(holder, args);
 }
 
 function relayIdentity(
@@ -627,8 +648,11 @@ function unknown(diagnostic: string, hops: readonly InputHop[] = []): InputTopol
   return Object.freeze({ kind: "unknown", diagnostic, hops: Object.freeze([...hops]) });
 }
 
-function withRole(hop: InputHop, role: InputHop["role"], image?: ImageIdentity): InputHop {
-  return Object.freeze({ ...hop, role, ...(image === undefined ? {} : { image }) });
+function withRole(
+  hop: InputHop, role: InputHop["role"], image?: ImageIdentity, relay?: InputHop["relay"],
+): InputHop {
+  return Object.freeze({ ...hop, role,
+    ...(image === undefined ? {} : { image }), ...(relay === undefined ? {} : { relay }) });
 }
 
 function withHop(topology: InputTopology, hop: InputHop): InputTopology {
@@ -636,7 +660,7 @@ function withHop(topology: InputTopology, hop: InputHop): InputTopology {
 }
 
 function identitiesEqual(a: InputHop, b: InputHop): boolean {
-  return a.tty === b.tty && a.proof === b.proof && a.role === b.role &&
+  return a.tty === b.tty && a.proof === b.proof && a.role === b.role && a.relay === b.relay &&
     (a.image === undefined && b.image === undefined || sameImage(a.image, b.image)) &&
     a.leader.pid === b.leader.pid && a.leader.starttime === b.leader.starttime &&
     a.holder.pid === b.holder.pid && a.holder.starttime === b.holder.starttime && a.holder.comm === b.holder.comm;
@@ -754,7 +778,7 @@ async function inspectInput(
 
   const relay = relayIdentity(holder, exe?.path, args);
   if (relay) {
-    const relayHop = withRole(hop, "relay", exe!.identity);
+    const relayHop = withRole(hop, "relay", exe!.identity, relay);
     const outerTty = await link(accessor, `/proc/${holder.pid}/fd/0`);
     if (!outerTty || ttyIndex(outerTty) === undefined || outerTty === tty) {
       return unknown(`输入中继 ${holderName(holder.comm)} 没有不同的外层 PTY，无法归属`, [relayHop]);
@@ -820,13 +844,15 @@ export async function revalidateInputTopology(
       if (!exe || !sameImage(hop.image, exe.identity)) return false;
       if (hop.role === "relay") {
         const next = topology.hops[hopIndex + 1];
-        if (!next || !relayIdentity(holder, exe.path, args) || !controlsTty(holder, next.tty) ||
+        const entrypointValid = hop.relay === "script" ||
+          hop.relay === "codoxear" && codoxearBrokerEntrypoint(holder, args);
+        if (!next || !entrypointValid || !controlsTty(holder, next.tty) ||
             holder.pgrp <= 0 || holder.tpgid !== holder.pgrp ||
             await link(accessor, `/proc/${holder.pid}/fd/0`) !== next.tty) return false;
       } else if (hop.role === "terminal") {
-        if (!terminalEmulatorIdentity(exe.path)) return false;
+        // Matching dev+ino retains the already admitted Ghostty role across path renames.
       } else if (hop.role === "tmux") {
-        if (!isTmuxServer(exe.path, holder.comm)) return false;
+        if (!tmuxServerComm(holder.comm)) return false;
       } else return false;
     }
     currentSubject = holder.pid;

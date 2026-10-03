@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { chmodSync, copyFileSync, mkdirSync, mkdtempSync, readlinkSync, rmSync, unlinkSync } from "node:fs";
+import { chmodSync, copyFileSync, mkdirSync, mkdtempSync, readlinkSync, renameSync, rmSync, unlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -64,6 +64,7 @@ class Fixture {
   readonly calls: Array<{ program: string; args: readonly string[] }> = [];
   readonly procPaths: string[] = [];
   readonly dirPaths: string[] = [];
+  readonly pathStats = new Map<string, { dev: bigint; ino: bigint }>();
   env: NodeJS.ProcessEnv = {};
   sshConfig = alias;
   paneTty = "/dev/pts/12";
@@ -209,10 +210,16 @@ class Fixture {
       },
       statPath: async (path) => {
         const match = /^\/proc\/(\d+)\/exe$/u.exec(path);
-        if (!match) throw new Error(`unexpected stat path ${path}`);
-        const process = this.processes.get(Number(match[1]));
-        if (!process) throw new Error("ENOENT");
-        return { dev: process.imageDev, ino: process.imageIno };
+        if (match) {
+          const process = this.processes.get(Number(match[1]));
+          if (!process) throw new Error("ENOENT");
+          return { dev: process.imageDev, ino: process.imageIno };
+        }
+        const literal = this.pathStats.get(path);
+        if (literal) return literal;
+        const error = new Error(`ENOENT: ${path}`) as NodeJS.ErrnoException;
+        error.code = "ENOENT";
+        throw error;
       },
     };
     return { ...base, ...extras };
@@ -332,6 +339,34 @@ async function firstOutputLine(stream: NodeJS.ReadableStream, timeoutMs = 5000):
     };
     stream.on("data", onData);
   });
+}
+
+const KERNEL_HOLDER_SCRIPT = [
+  "import json, os, pty, socket, time",
+  "path=f'/tmp/.X11-unix/X{os.getpid()}'",
+  "server=socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)",
+  "server.bind(path); server.listen(1)",
+  "client=socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); client.connect(path)",
+  "peer,_=server.accept()",
+  "pid,master=pty.fork()",
+  "if pid == 0: time.sleep(60); os._exit(0)",
+  "print(json.dumps({'subject':pid,'display':path}), flush=True)",
+  "time.sleep(60)",
+].join("\n");
+
+async function launchKernelHolder(
+  t: { after(callback: () => void): void }, executable: string, root: string,
+): Promise<{ holder: ReturnType<typeof spawn>; subject: number }> {
+  mkdirSync("/tmp/.X11-unix", { recursive: true, mode: 0o1777 });
+  const holder = spawn(executable, ["-c", KERNEL_HOLDER_SCRIPT], { stdio: ["ignore", "pipe", "pipe"] });
+  const record = JSON.parse(await firstOutputLine(holder.stdout!)) as { subject: number; display: string };
+  t.after(() => {
+    try { process.kill(record.subject, "SIGKILL"); } catch { /* exited */ }
+    try { holder.kill("SIGKILL"); } catch { /* exited */ }
+    try { unlinkSync(record.display); } catch { /* removed */ }
+    rmSync(root, { recursive: true, force: true });
+  });
+  return { holder, subject: record.subject };
 }
 
 async function receiverFails(f: Fixture, origin: number | "unknown", code: string): Promise<void> {
@@ -568,50 +603,53 @@ test("cheap frozen-chain revalidation never scans proc and detects holder replac
   assert.equal(await revalidateInputTopology(5000, route, f.dependencies()), false);
 });
 
-test("deleted executable suffix preserves admitted image identity in fake proc resolution and revalidation", async () => {
-  const f = localDisplay(true);
-  const route = await resolveInputTopology(5000, f.dependencies());
+test("deleted executable annotation preserves image identity while a literal suffix stays literal", async () => {
+  const deleted = localDisplay(true);
+  const route = await resolveInputTopology(5000, deleted.dependencies());
   assert.equal(route.kind, "local");
-  f.processes.get(3001)!.exeDeleted = true;
-  assert.equal(await revalidateInputTopology(5000, route, f.dependencies()), true);
-  const fresh = await resolveInputTopology(5000, f.dependencies());
+  deleted.processes.get(3001)!.exeDeleted = true;
+  assert.equal(await revalidateInputTopology(5000, route, deleted.dependencies()), true);
+  const fresh = await resolveInputTopology(5000, deleted.dependencies());
   assert.equal(fresh.kind, "local");
   assert.equal(sameInputTopology(route, fresh), true);
+
+  const literal = localDisplay(true);
+  const process = literal.processes.get(3001)!;
+  process.exe = "/tmp/ghostty";
+  process.exeDeleted = true;
+  literal.pathStats.set("/tmp/ghostty (deleted)", { dev: process.imageDev, ino: process.imageIno });
+  assertUnknown(await resolveInputTopology(5000, literal.dependencies()), /没有受支持的输入来源契约/u);
 });
 
-test("kernel executable replacement preserves fresh and cheap Ghostty classification", { timeout: 15_000 }, async (t) => {
+test("kernel literal ghostty (deleted) filename is not admitted", { timeout: 15_000 }, async (t) => {
+  const root = mkdtempSync(join(tmpdir(), "pi-copy-links-exe-literal-"));
+  const executable = join(root, "ghostty (deleted)");
+  copyFileSync("/usr/bin/python3", executable);
+  chmodSync(executable, 0o755);
+  const { subject } = await launchKernelHolder(t, executable, root);
+  assert.match(readlinkSync(`/proc/${subject}/exe`), /ghostty \(deleted\)$/u);
+  assertUnknown(await resolveInputTopology(subject, { env: {} }), /没有受支持的输入来源契约/u);
+});
+
+test("kernel rename-aside and replacement preserve cached admitted image", { timeout: 15_000 }, async (t) => {
   const root = mkdtempSync(join(tmpdir(), "pi-copy-links-exe-replace-"));
   const executable = join(root, "ghostty");
+  const aside = join(root, "ghostty.old");
   const python = "/usr/bin/python3";
   copyFileSync(python, executable);
   chmodSync(executable, 0o755);
-  mkdirSync("/tmp/.X11-unix", { recursive: true, mode: 0o1777 });
-  const script = [
-    "import json, os, pty, socket, time",
-    "path=f'/tmp/.X11-unix/X{os.getpid()}'",
-    "server=socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)",
-    "server.bind(path); server.listen(1)",
-    "client=socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); client.connect(path)",
-    "peer,_=server.accept()",
-    "pid,master=pty.fork()",
-    "if pid == 0: time.sleep(60); os._exit(0)",
-    "print(json.dumps({'subject':pid,'display':path}), flush=True)",
-    "time.sleep(60)",
-  ].join("\n");
-  const holder = spawn(executable, ["-c", script], { stdio: ["ignore", "pipe", "pipe"] });
-  let subject = 0, display = "";
-  t.after(() => {
-    if (subject > 0) { try { process.kill(subject, "SIGKILL"); } catch { /* exited */ } }
-    try { holder.kill("SIGKILL"); } catch { /* exited */ }
-    if (display) { try { unlinkSync(display); } catch { /* removed */ } }
-    rmSync(root, { recursive: true, force: true });
-  });
-  const record = JSON.parse(await firstOutputLine(holder.stdout!)) as { subject: number; display: string };
-  subject = record.subject; display = record.display;
+  const { holder, subject } = await launchKernelHolder(t, executable, root);
   assert.equal(holder.pid !== undefined && holder.pid > 0, true);
   const route = await resolveInputTopology(subject, { env: {} });
   assert.equal(route.kind, "local");
   assert.equal(route.hops[0]?.holder.pid, holder.pid);
+
+  renameSync(executable, aside);
+  assert.match(readlinkSync(`/proc/${holder.pid}/exe`), /ghostty\.old$/u);
+  assert.equal(await revalidateInputTopology(subject, route, { env: {} }), true);
+  assertUnknown(await resolveInputTopology(subject, { env: {} }), /没有受支持的输入来源契约/u);
+  renameSync(aside, executable);
+  assert.equal(await revalidateInputTopology(subject, route, { env: {} }), true);
 
   unlinkSync(executable);
   copyFileSync(python, executable);
@@ -621,6 +659,12 @@ test("kernel executable replacement preserves fresh and cheap Ghostty classifica
   const fresh = await resolveInputTopology(subject, { env: {} });
   assert.equal(fresh.kind, "local");
   assert.equal(sameInputTopology(route, fresh), true);
+
+  const fixture = localDisplay(true);
+  const frozen = await resolveInputTopology(5000, fixture.dependencies());
+  fixture.processes.get(3001)!.imageIno += 1n;
+  assert.equal(await revalidateInputTopology(5000, frozen, fixture.dependencies()), false,
+    "an actual image change must still invalidate the admitted role");
 });
 
 test("relay revalidation retains identity, fd0, controlling tty, and foreground requirements", async () => {
