@@ -10,7 +10,7 @@ usage() {
        ./run_server.sh [--config PATH] --ssh <机器名>
        ./run_server.sh [--config PATH] --list
 
-默认从交互终端连接：读取主机实时屏幕 → 获取预约 → 左右键选择、Enter 连接、Esc 取消。
+默认从交互终端连接：读取主机实时屏幕 → 获取预约 → 上下键（左右键同义）选择、Enter 连接、Esc 取消。
 主机需要已安装并明确登记的 quick-deploy-display-control；忙碌/未知状态拒绝，不接管已有串流。
 准备精确屏幕后，用 Moonlight 查询配对状态；明确未配对才打印随机 4 位 PIN 和
 目标 Sunshine Web UI https://<IP>:<基准端口+1> 的手工配对步骤。重新查询确认配对，

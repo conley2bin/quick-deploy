@@ -1,10 +1,12 @@
 """Bounded synchronous screen selector; no discovery, connection or default acceptance.
 
 choose_screen(screens, *, title=None, input_stream=None, output_stream=None)
-returns the ORIGINAL id on explicit Enter, or None on Esc. Arrows include disabled
-rows and wrap; Enter on those rows cannot accept. An all-unavailable list remains
-inspectable/cancellable. Input is a nonempty list/tuple of <=32 host presentation
-records; required fields are listed in _FIELDS. Extra host fields are ignored.
+returns the ORIGINAL id on explicit Enter, or None on Esc. Up/Left move to the
+previous row and Down/Right to the next, in host record order (no physical layout
+claim). Movement includes disabled rows and wraps; Enter on those rows cannot
+accept. An all-unavailable list remains inspectable/cancellable. Input is a
+nonempty list/tuple of <=32 host presentation records; required fields are listed
+in _FIELDS. Extra host fields are ignored.
 Unknown numeric facts are None/0, unknown boolean facts may be None. IDs are never
 rewritten. Labels/title/reasons are bounded, sanitized and clipped for display.
 
@@ -201,7 +203,9 @@ def _frame(screens, selected, title, columns, rows, blocked):
         lines.extend([f"{'>' if i == selected else ' '} {i + 1}. {s['label'] or '(label unknown)'}",
                       "  " + mode, "  " + status,
                       f"  request {s['requested_fps'] or '?'} FPS | primary {_yes(s['primary'])} | connected {_yes(s['connected'])}"])
-    lines.extend(["Enter refused: unavailable screen" if blocked else "Left/Right: screen | Enter: select",
+    movement_hint = ("Up/Down (Left/Right): screen | Enter: select" if columns >= 45
+                     else "Up/Down: screen | Enter: select")
+    lines.extend(["Enter refused: unavailable screen" if blocked else movement_hint,
                   "Esc: cancel | Hz = physical, FPS = request"])
     return "\x1b[H\x1b[2J" + "\r\n".join(_clip(line, columns) for line in lines)
 
@@ -305,9 +309,9 @@ class _PosixTerminal:
                 self.deadline = time.monotonic() + 0.2
             self.pending.extend(ch)
             seq = bytes(self.pending)
-            if seq in (b"\x1b[C", b"\x1bOC", b"\x1b[D", b"\x1bOD"):
+            if seq[:2] in (b"\x1b[", b"\x1bO") and len(seq) == 3 and seq[2:] in b"ABCD":
                 self.pending.clear()
-                return ("right" if seq[-1:] == b"C" else "left"), 1
+                return ("next" if seq[2:] in b"BC" else "previous"), 1
             if seq in (b"\x1b", b"\x1b[", b"\x1bO"):
                 continue
             if len(seq) == 2:
@@ -472,7 +476,8 @@ class _WindowsTerminal:
                 raise KeyboardInterrupt
             if key.char in (4, 26):
                 raise PickerEOF("console input ended")
-            action = {0x25: "left", 0x27: "right", 0x0d: "enter", 0x1b: "esc"}.get(key.vk)
+            action = {0x25: "previous", 0x26: "previous", 0x27: "next", 0x28: "next",
+                      0x0d: "enter", 0x1b: "esc"}.get(key.vk)
             if action:
                 return action, max(1, key.repeat)
 
@@ -564,8 +569,8 @@ def choose_screen(screens, *, title=None, input_stream=None, output_stream=None)
                 if screens[selected]["selectable"]:
                     return screens[selected]["id"]
                 blocked = True
-            elif action in ("left", "right"):
-                selected = (selected + (repeat if action == "right" else -repeat)) % len(screens)
+            elif action in ("previous", "next"):
+                selected = (selected + (repeat if action == "next" else -repeat)) % len(screens)
                 blocked = False
     except ScreenPickerError:
         raise
