@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { readdir, readFile, readlink } from "node:fs/promises";
+import { readdir, readFile, readlink, stat as fsStat } from "node:fs/promises";
 import { basename } from "node:path";
 import { isIP } from "node:net";
 import { promisify } from "node:util";
@@ -16,9 +16,10 @@ const DEFAULT_SCAN_TIMEOUT_MS = 750;
 const DENIED_MULTIPLEXERS = new Set([
   "screen", "zellij", "abduco", "dtach", "mosh-server", "dvtm",
 ]);
-const TERMINAL_EMULATORS = new Set([
-  "ghostty", "gnome-terminal-server", "kitty", "alacritty", "konsole",
-  "xterm", "foot", "tilix", "xfce4-terminal",
+const TERMINAL_EMULATORS = new Set(["ghostty"]);
+const UNVERIFIED_EMULATORS = new Set([
+  "gnome-terminal-server", "kitty", "alacritty", "konsole", "xterm", "foot",
+  "tilix", "xfce4-terminal", "wezterm-gui",
 ]);
 
 export type InputReceiver = "local" | Readonly<{
@@ -49,16 +50,19 @@ export interface ReceiverDependencies {
   readProc?: (path: string) => Promise<Buffer>;
   readDir?: (path: string) => Promise<readonly string[]>;
   readLink?: (path: string) => Promise<string>;
+  statPath?: (path: string) => Promise<{ dev: bigint | number; ino: bigint | number }>;
   scanTimeoutMs?: number;
 }
 
 export interface ProcessIdentity { readonly pid: number; readonly starttime: string }
+export interface ImageIdentity { readonly dev: string; readonly ino: string }
 export interface InputHop {
   readonly tty: string;
   readonly leader: ProcessIdentity;
   readonly holder: ProcessIdentity & { readonly comm: string };
   readonly proof: "master" | "sshd";
   readonly role: "sshd" | "tmux" | "relay" | "terminal" | "unknown";
+  readonly image?: ImageIdentity;
 }
 interface TopologyBase { readonly hops: readonly InputHop[] }
 export type InputTopology =
@@ -289,6 +293,7 @@ interface ProcAccess {
   readProc: NonNullable<ReceiverDependencies["readProc"]>;
   readDir: NonNullable<ReceiverDependencies["readDir"]>;
   readLink: NonNullable<ReceiverDependencies["readLink"]>;
+  statPath: NonNullable<ReceiverDependencies["statPath"]>;
   scanTimeoutMs: number;
   socketTable?: Promise<ReadonlyMap<string, UnixSocketEntry> | undefined>;
 }
@@ -301,6 +306,7 @@ function access(dependencies: ReceiverDependencies): ProcAccess {
     readProc: dependencies.readProc ?? readFile,
     readDir: dependencies.readDir ?? (async (path) => readdir(path)),
     readLink: dependencies.readLink ?? readlink,
+    statPath: dependencies.statPath ?? (async (path) => fsStat(path, { bigint: true })),
     scanTimeoutMs: typeof configured === "number" && Number.isFinite(configured) && configured > 0 ?
       configured : DEFAULT_SCAN_TIMEOUT_MS,
   };
@@ -350,9 +356,26 @@ async function argv(pid: number, accessor: ProcAccess): Promise<readonly string[
   } catch { return undefined; }
 }
 
-async function executable(pid: number, accessor: ProcAccess): Promise<string | undefined> {
-  const path = await link(accessor, `/proc/${pid}/exe`);
-  return path?.startsWith("/") && !path.endsWith(" (deleted)") && !/[\x00-\x1f\x7f]/u.test(path) ? path : undefined;
+interface ExecutableImage { readonly path: string; readonly identity: ImageIdentity }
+
+async function executable(pid: number, accessor: ProcAccess): Promise<ExecutableImage | undefined> {
+  const procPath = `/proc/${pid}/exe`;
+  const rawPath = await link(accessor, procPath);
+  if (!rawPath?.startsWith("/") || /[\x00-\x1f\x7f]/u.test(rawPath)) return undefined;
+  const deletedSuffix = " (deleted)";
+  const path = rawPath.endsWith(deletedSuffix) ? rawPath.slice(0, -deletedSuffix.length) : rawPath;
+  if (!path) return undefined;
+  try {
+    const image = await accessor.statPath(procPath);
+    return Object.freeze({
+      path,
+      identity: Object.freeze({ dev: String(image.dev), ino: String(image.ino) }),
+    });
+  } catch { return undefined; }
+}
+
+function sameImage(a: ImageIdentity | undefined, b: ImageIdentity | undefined): boolean {
+  return a !== undefined && b !== undefined && a.dev === b.dev && a.ino === b.ino;
 }
 
 async function genericMasterHolder(candidate: ProcStat, leaderUid: readonly number[], index: number,
@@ -604,8 +627,8 @@ function unknown(diagnostic: string, hops: readonly InputHop[] = []): InputTopol
   return Object.freeze({ kind: "unknown", diagnostic, hops: Object.freeze([...hops]) });
 }
 
-function withRole(hop: InputHop, role: InputHop["role"]): InputHop {
-  return Object.freeze({ ...hop, role });
+function withRole(hop: InputHop, role: InputHop["role"], image?: ImageIdentity): InputHop {
+  return Object.freeze({ ...hop, role, ...(image === undefined ? {} : { image }) });
 }
 
 function withHop(topology: InputTopology, hop: InputHop): InputTopology {
@@ -614,6 +637,7 @@ function withHop(topology: InputTopology, hop: InputHop): InputTopology {
 
 function identitiesEqual(a: InputHop, b: InputHop): boolean {
   return a.tty === b.tty && a.proof === b.proof && a.role === b.role &&
+    (a.image === undefined && b.image === undefined || sameImage(a.image, b.image)) &&
     a.leader.pid === b.leader.pid && a.leader.starttime === b.leader.starttime &&
     a.holder.pid === b.holder.pid && a.holder.starttime === b.holder.starttime && a.holder.comm === b.holder.comm;
 }
@@ -691,8 +715,8 @@ async function inspectInput(
     }
   }
 
-  if (isTmuxServer(exe, holder.comm)) {
-    const tmuxHop = withRole(hop, "tmux");
+  if (exe && isTmuxServer(exe.path, holder.comm)) {
+    const tmuxHop = withRole(hop, "tmux", exe.identity);
     const socket = /^(.+),\d+,\d+$/u.exec(accessor.env.TMUX ?? "")?.[1];
     const pane = accessor.env.TMUX_PANE;
     if (!socket?.startsWith("/") || /[\x00\r\n]/u.test(socket) || !pane || !/^%\d+$/u.test(pane)) {
@@ -708,8 +732,8 @@ async function inspectInput(
     return Object.freeze({ kind: "tmux", socket, pane, inputTty: tty, hops: Object.freeze([tmuxHop]) });
   }
 
-  if (terminalEmulatorIdentity(exe)) {
-    const terminalHop = withRole(hop, "terminal");
+  if (exe && terminalEmulatorIdentity(exe.path)) {
+    const terminalHop = withRole(hop, "terminal", exe.identity);
     const display = await ownDisplayEvidence(holder, accessor);
     if (display.unavailable) {
       return unknown("无法读取本机 Unix socket 连接，不能证明终端连接到本地显示服务", [terminalHop]);
@@ -723,9 +747,14 @@ async function inspectInput(
     return unknown(`终端 ${holderName(holder.comm)} 没有连接到可验证的本地显示服务，无法归属`, [terminalHop]);
   }
 
-  const relay = relayIdentity(holder, exe, args);
+  const unverifiedEmulator = executableName(exe?.path);
+  if (unverifiedEmulator && UNVERIFIED_EMULATORS.has(unverifiedEmulator)) {
+    return unknown(`终端 ${holderName(holder.comm)} 的逐窗口显示输入契约尚未验证，无法归属`, [hop]);
+  }
+
+  const relay = relayIdentity(holder, exe?.path, args);
   if (relay) {
-    const relayHop = withRole(hop, "relay");
+    const relayHop = withRole(hop, "relay", exe!.identity);
     const outerTty = await link(accessor, `/proc/${holder.pid}/fd/0`);
     if (!outerTty || ttyIndex(outerTty) === undefined || outerTty === tty) {
       return unknown(`输入中继 ${holderName(holder.comm)} 没有不同的外层 PTY，无法归属`, [relayHop]);
@@ -747,7 +776,7 @@ async function inspectInput(
     return withHop(relayed, relayHop);
   }
 
-  if (isDeniedMultiplexer(exe, holder.comm)) {
+  if (isDeniedMultiplexer(exe?.path, holder.comm)) {
     return unknown(`输入持有者 ${holderName(holder.comm)} 是不支持的多路复用器，无法归属点击来源`, [hop]);
   }
   return unknown(`输入持有者 ${holderName(holder.comm)} 没有受支持的输入来源契约，无法归属`, [hop]);
@@ -788,15 +817,16 @@ export async function revalidateInputTopology(
     if (hop.role !== "sshd") {
       const exe = await executable(holder.pid, accessor);
       const args = await argv(holder.pid, accessor);
+      if (!exe || !sameImage(hop.image, exe.identity)) return false;
       if (hop.role === "relay") {
         const next = topology.hops[hopIndex + 1];
-        if (!next || !relayIdentity(holder, exe, args) || !controlsTty(holder, next.tty) ||
+        if (!next || !relayIdentity(holder, exe.path, args) || !controlsTty(holder, next.tty) ||
             holder.pgrp <= 0 || holder.tpgid !== holder.pgrp ||
             await link(accessor, `/proc/${holder.pid}/fd/0`) !== next.tty) return false;
       } else if (hop.role === "terminal") {
-        if (!terminalEmulatorIdentity(exe)) return false;
+        if (!terminalEmulatorIdentity(exe.path)) return false;
       } else if (hop.role === "tmux") {
-        if (!isTmuxServer(exe, holder.comm)) return false;
+        if (!isTmuxServer(exe.path, holder.comm)) return false;
       } else return false;
     }
     currentSubject = holder.pid;

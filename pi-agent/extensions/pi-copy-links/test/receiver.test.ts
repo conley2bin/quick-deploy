@@ -1,4 +1,8 @@
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
+import { chmodSync, copyFileSync, mkdirSync, mkdtempSync, readlinkSync, rmSync, unlinkSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 import {
   ReceiverResolutionError, resolveInputReceiver, resolveInputTopology, revalidateInputTopology,
@@ -22,6 +26,9 @@ type FakeProcess = {
   uid: number;
   fd0?: string;
   exe: string;
+  exeDeleted: boolean;
+  imageDev: bigint;
+  imageIno: bigint;
   env: Record<string, string>;
   rawEnvironment?: Buffer;
   argv: string[];
@@ -80,7 +87,8 @@ class Fixture {
     const pgrp = value.pgrp ?? value.sid;
     const fd0Index = /^\/dev\/pts\/(\d+)$/u.exec(value.fd0 ?? "")?.[1];
     const process: FakeProcess = {
-      starttime: String(value.pid * 10), uid: 1000, exe: "/usr/bin/fixture-unknown", env: {}, argv: [value.comm],
+      starttime: String(value.pid * 10), uid: 1000, exe: "/usr/bin/fixture-unknown", exeDeleted: false,
+      imageDev: 1n, imageIno: BigInt(value.pid * 100), env: {}, argv: [value.comm],
       masters: new Map(), sockets: new Map(), fdReadable: true,
       ttyNr: value.ttyNr ?? (fd0Index === undefined ? 0 : ptsDevice(Number(fd0Index))),
       tpgid: value.tpgid ?? pgrp,
@@ -94,12 +102,17 @@ class Fixture {
     process.masters.set(fd, index);
   }
 
-  display(process: FakeProcess, path = `/run/user/${process.uid}/wayland-0`, fd = "20"): void {
-    const client = String(this.nextInode++), server = String(this.nextInode++);
+  display(
+    process: FakeProcess, path = `/run/user/${process.uid}/wayland-0`, fd = "20",
+    forcedInodes?: readonly [number, number],
+  ): void {
+    const [clientNumber, serverNumber] = forcedInodes ?? [this.nextInode++, this.nextInode++];
+    const client = String(clientNumber), server = String(serverNumber);
+    const ssInode = (value: number) => String(value > 0x7fff_ffff ? value - 0x1_0000_0000 : value);
     process.sockets.set(fd, client);
     this.ssRows.push(
-      `u_str ESTAB 0 0 * ${client} * ${server}`,
-      `u_str ESTAB 0 0 ${path} ${server} * ${client}`,
+      `u_str ESTAB 0 0 * ${ssInode(clientNumber)} * ${ssInode(serverNumber)}`,
+      `u_str ESTAB 0 0 ${path} ${ssInode(serverNumber)} * ${ssInode(clientNumber)}`,
     );
   }
 
@@ -182,7 +195,7 @@ class Fixture {
         if (match) {
           const process = this.processes.get(Number(match[1]));
           if (!process) throw new Error("ENOENT");
-          return process.exe;
+          return process.exe + (process.exeDeleted ? " (deleted)" : "");
         }
         match = /^\/proc\/(\d+)\/fd\/(\d+)$/u.exec(path);
         if (!match) throw new Error(`unexpected link ${path}`);
@@ -193,6 +206,13 @@ class Fixture {
         const inode = process.sockets.get(match[2]!);
         if (inode) return `socket:[${inode}]`;
         throw new Error("ENOENT");
+      },
+      statPath: async (path) => {
+        const match = /^\/proc\/(\d+)\/exe$/u.exec(path);
+        if (!match) throw new Error(`unexpected stat path ${path}`);
+        const process = this.processes.get(Number(match[1]));
+        if (!process) throw new Error("ENOENT");
+        return { dev: process.imageDev, ino: process.imageIno };
       },
     };
     return { ...base, ...extras };
@@ -275,7 +295,7 @@ function addTmuxClient(f: Fixture, holder: "ssh" | "display" | "tmux"): void {
     f.add({ pid: 3100, ppid: 1, sid: 3100, comm: "sshd", argv: ["sshd: conley@pts/20 "],
       fdReadable: false, tpgid: -1 });
   } else if (holder === "display") {
-    const terminal = f.add({ pid: 3100, ppid: 1, sid: 3100, comm: "kitty", exe: "/usr/bin/kitty", tpgid: -1 });
+    const terminal = f.add({ pid: 3100, ppid: 1, sid: 3100, comm: "ghostty", exe: "/usr/bin/ghostty", tpgid: -1 });
     f.master(terminal, 20);
     f.display(terminal, "@/tmp/.X11-unix/X8");
   } else {
@@ -294,6 +314,24 @@ function tmuxClient(holder: "ssh" | "display" | "tmux"): Fixture {
 function assertUnknown(topology: InputTopology, pattern: RegExp): void {
   assert.equal(topology.kind, "unknown");
   if (topology.kind === "unknown") assert.match(topology.diagnostic, pattern);
+}
+
+async function firstOutputLine(stream: NodeJS.ReadableStream, timeoutMs = 5000): Promise<string> {
+  return new Promise((resolve, reject) => {
+    let data = "";
+    const timer = setTimeout(() => finish(new Error("child output timeout")), timeoutMs);
+    const onData = (chunk: Buffer | string) => {
+      data += chunk.toString();
+      const end = data.indexOf("\n");
+      if (end >= 0) finish(data.slice(0, end));
+    };
+    const finish = (result: string | Error) => {
+      clearTimeout(timer);
+      stream.removeListener("data", onData);
+      result instanceof Error ? reject(result) : resolve(result);
+    };
+    stream.on("data", onData);
+  });
 }
 
 async function receiverFails(f: Fixture, origin: number | "unknown", code: string): Promise<void> {
@@ -363,6 +401,13 @@ test("recognized terminal's own Wayland peer proves local despite stale SSH ance
   assert.ok(f.calls.every(({ program }) => program !== "ssh"));
 });
 
+test("signed ss inode values above 2^31 map to owned display peers", async () => {
+  const f = localDisplay(false);
+  f.display(f.processes.get(3001)!, "/run/user/1000/wayland-0", "21",
+    [3_000_000_000, 3_000_000_001]);
+  assert.equal((await resolveInputTopology(5000, f.dependencies())).kind, "local");
+});
+
 test("forced-X11 forwarded Ghostty with stale WAYLAND_DISPLAY is not local without a display socket", async () => {
   const f = localDisplay(false);
   assertUnknown(await resolveInputTopology(5000, f.dependencies()), /ghostty.*没有连接到/u);
@@ -395,9 +440,12 @@ test("emulator authority is keyed by executable realpath, never comm alone", asy
   forged.processes.get(3001)!.exe = "/usr/bin/python3";
   assertUnknown(await resolveInputTopology(5000, forged.dependencies()), /ghostty.*没有受支持的输入来源契约/u);
 
-  const wezterm = localDisplay(true);
-  Object.assign(wezterm.processes.get(3001)!, { comm: "wezterm-gui", exe: "/usr/bin/wezterm-gui" });
-  assertUnknown(await resolveInputTopology(5000, wezterm.dependencies()), /wezterm-gui.*没有受支持的输入来源契约/u);
+  for (const name of ["gnome-terminal-server", "kitty", "alacritty", "konsole", "xterm", "foot",
+    "tilix", "xfce4-terminal", "wezterm-gui"]) {
+    const unsupported = localDisplay(true);
+    Object.assign(unsupported.processes.get(3001)!, { comm: name, exe: `/usr/bin/${name}` });
+    assertUnknown(await resolveInputTopology(5000, unsupported.dependencies()), /逐窗口显示输入契约尚未验证/u);
+  }
 });
 
 test("holder with no display socket and no SSH environment is unknown; there is no legacy fallback", async () => {
@@ -438,6 +486,21 @@ test("relay requires matching controlling tty and foreground pgrp", async () => 
   const redirected = relay("tmux");
   redirected.processes.get(3001)!.ttyNr = ptsDevice(99);
   assertUnknown(await resolveInputTopology(5000, redirected.dependencies()), /fd0 不是其前台控制 PTY/u);
+});
+
+test("relay controlling-tty decoding supports pts minor above 255", async () => {
+  const f = relay("tmux", "script");
+  const relayProcess = f.processes.get(3001)!;
+  relayProcess.fd0 = "/dev/pts/281";
+  relayProcess.ttyNr = ptsDevice(281);
+  f.processes.get(4001)!.fd0 = "/dev/pts/281";
+  const tmux = f.processes.get(2001)!;
+  tmux.masters.clear();
+  f.master(tmux, 281);
+  f.paneTty = "/dev/pts/281";
+  assert.equal((await resolveInputTopology(5000, f.dependencies())).kind, "tmux");
+  relayProcess.ttyNr = ptsDevice(280);
+  assertUnknown(await resolveInputTopology(5000, f.dependencies()), /fd0 不是其前台控制 PTY/u);
 });
 
 test("unknown foreground program, forged script comm, and arbitrary Python are not relays", async () => {
@@ -503,6 +566,61 @@ test("cheap frozen-chain revalidation never scans proc and detects holder replac
     "revalidation must not invoke ss again");
   f.processes.get(3001)!.starttime = "999999";
   assert.equal(await revalidateInputTopology(5000, route, f.dependencies()), false);
+});
+
+test("deleted executable suffix preserves admitted image identity in fake proc resolution and revalidation", async () => {
+  const f = localDisplay(true);
+  const route = await resolveInputTopology(5000, f.dependencies());
+  assert.equal(route.kind, "local");
+  f.processes.get(3001)!.exeDeleted = true;
+  assert.equal(await revalidateInputTopology(5000, route, f.dependencies()), true);
+  const fresh = await resolveInputTopology(5000, f.dependencies());
+  assert.equal(fresh.kind, "local");
+  assert.equal(sameInputTopology(route, fresh), true);
+});
+
+test("kernel executable replacement preserves fresh and cheap Ghostty classification", { timeout: 15_000 }, async (t) => {
+  const root = mkdtempSync(join(tmpdir(), "pi-copy-links-exe-replace-"));
+  const executable = join(root, "ghostty");
+  const python = "/usr/bin/python3";
+  copyFileSync(python, executable);
+  chmodSync(executable, 0o755);
+  mkdirSync("/tmp/.X11-unix", { recursive: true, mode: 0o1777 });
+  const script = [
+    "import json, os, pty, socket, time",
+    "path=f'/tmp/.X11-unix/X{os.getpid()}'",
+    "server=socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)",
+    "server.bind(path); server.listen(1)",
+    "client=socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); client.connect(path)",
+    "peer,_=server.accept()",
+    "pid,master=pty.fork()",
+    "if pid == 0: time.sleep(60); os._exit(0)",
+    "print(json.dumps({'subject':pid,'display':path}), flush=True)",
+    "time.sleep(60)",
+  ].join("\n");
+  const holder = spawn(executable, ["-c", script], { stdio: ["ignore", "pipe", "pipe"] });
+  let subject = 0, display = "";
+  t.after(() => {
+    if (subject > 0) { try { process.kill(subject, "SIGKILL"); } catch { /* exited */ } }
+    try { holder.kill("SIGKILL"); } catch { /* exited */ }
+    if (display) { try { unlinkSync(display); } catch { /* removed */ } }
+    rmSync(root, { recursive: true, force: true });
+  });
+  const record = JSON.parse(await firstOutputLine(holder.stdout!)) as { subject: number; display: string };
+  subject = record.subject; display = record.display;
+  assert.equal(holder.pid !== undefined && holder.pid > 0, true);
+  const route = await resolveInputTopology(subject, { env: {} });
+  assert.equal(route.kind, "local");
+  assert.equal(route.hops[0]?.holder.pid, holder.pid);
+
+  unlinkSync(executable);
+  copyFileSync(python, executable);
+  chmodSync(executable, 0o755);
+  assert.match(readlinkSync(`/proc/${holder.pid}/exe`), /ghostty \(deleted\)$/u);
+  assert.equal(await revalidateInputTopology(subject, route, { env: {} }), true);
+  const fresh = await resolveInputTopology(subject, { env: {} });
+  assert.equal(fresh.kind, "local");
+  assert.equal(sameInputTopology(route, fresh), true);
 });
 
 test("relay revalidation retains identity, fd0, controlling tty, and foreground requirements", async () => {
