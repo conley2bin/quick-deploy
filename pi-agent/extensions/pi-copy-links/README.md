@@ -3,7 +3,7 @@
 给 Pi **fullscreen 模式**的助手 Markdown 增加两类受控操作：
 
 - 代码块右下角 **[复制]**：左键复制逻辑源文，保留代码自身的缩进、Tab、空行和行尾空格；不复制围栏、Pi 显示缩进、右侧补空格或屏幕折行。
-- Markdown 链接：仅 **Ctrl + 鼠标左键**激活；普通点击不打开链接，拖选继续交给 Pi。公司本机点击让 Chrome/VS Code 显式请求新窗口；来自已验证 conley-Y9000p SSH/tmux 客户端的点击在 Y9000p 用 `xdg-open` 调用默认浏览器（可能复用已有窗口或标签），公司文件则在 Y9000p 的 VS Code Remote-SSH 新窗口打开。
+- Markdown 链接：仅 **Ctrl + 鼠标左键**激活；普通点击不打开链接，拖选继续交给 Pi。公司本机点击让 Chrome/VS Code 显式请求新窗口；来自已验证 conley-Y9000p SSH 输入（直接 PTY 或 tmux 客户端）的点击在 Y9000p 用 `xdg-open` 调用默认浏览器（可能复用已有窗口或标签），公司文件则在 Y9000p 的 VS Code Remote-SSH 新窗口打开。
 
 按下可执行目标时会反色，拖走、失焦、弹窗、滚动、尺寸变化或修饰键不匹配都会取消。不会承诺远端 X11/GNOME 窗口落在哪个 workspace。
 
@@ -12,9 +12,10 @@
 先确认公司侧扩展和 Y9000p 已安装的客户端助手使用匹配的 v2 协议；助手安装、checksum/软链接核验和隔离测试见 [客户端助手说明](client/README.md#install-and-version-check)。不要把 Y9000p 较旧的仓库 checkout 上的 `install.sh` 当作升级。匹配后：
 
 1. 在 Pi **空闲时**执行 `/reload`，确认 `/settings` 中 **TUI mode = fullscreen**；`/copy-links` 查看扩展状态。也可用 `pi --tui-mode fullscreen` 启动。
-2. 从 Y9000p 经 SSH 操作公司 Pi 时，Pi 必须运行在**公司 tmux pane** 里，鼠标事件才能带上确切的 SSH 客户端 PID。直接在 SSH/Codoxear PTY 里运行 Pi，即使有 `SSH_CONNECTION`，也会报“SSH 输入未经带来源标记的 tmux”，不会打开任何一端的 Code。迁移已有对话时先正常退出旧 Pi，在 Y9000p 的 SSH shell 登录公司，进入原工作目录后执行 `tmux new -A -s pi-video`，在 tmux pane 内用 `pi --tui-mode fullscreen --resume` 选回原会话；不要让两个 Pi 进程同时写同一个会话文件。
-3. 对仍有效的助手 Markdown 链接按 **Ctrl + 鼠标左键**；打开动作跟随发出点击的桌面。公司回环网址在 Y9000p 需要助手自有的 SSH 本地转发，浏览器仍收到原网址。
-4. 若报告 `port_conflict`，先在 Y9000p 查明占用原端口的监听器及其所有者。例如 `ss -H -ltnp '( sport = :8795 )'`，再将输出中的 PID 交给 `ps -fp` 辨认旧转发；确认有无依赖它的标签页，**取得所有者同意后**才显式关闭旧转发并重试原链接。已有手动 `ssh -N -L 8795:127.0.0.1:8795 ...` 会占用 Y9000p 的 8795；助手不会接管或自动终止它，也不会改端口打开替代网址。
+2. 直接在 Y9000p 的 SSH shell 中启动公司 Pi 即可，无需 tmux。扩展从 Pi 的 fd0 PTY 找到实际主端持有者；只有该 PTY 由匹配 `conley-Y9000p` 字面地址/端口的 sshd 会话持有时才走笔记本助手。直接从这个 SSH shell 启动 Codoxear 也可：broker 的终端 stdin 在其生命周期内固定，扩展会沿 broker fd0 继续解析实际终端；生产 `keys` 控制路径只发送 `Esc` 中断，Web 消息走 bracketed paste 且不生成终端鼠标事件，因此不需要修改 Codoxear。
+3. tmux 只用于一个 pane 可由多个客户端输入的场景。此时保留逐次鼠标事件的 client-PID 标记，并要求按下/松开来自同一已验证客户端。嵌套多路复用器无法把内层点击归属到外层客户端，明确不支持。无法验证的 PTY 主端、X 转发 GUI、未知且带 SSH 痕迹的终端会显示包含持有者名称的拒绝诊断，不会退回公司 GUI。即使遗留 `TMUX` 环境变量存在，只要实际 PTY 不由对应 pane 的 tmux server 持有，扩展也不会安装绑定或声明 pane owner。
+4. 对仍有效的助手 Markdown 链接按 **Ctrl + 鼠标左键**；打开动作跟随发出点击的桌面。公司回环网址在 Y9000p 需要助手自有的 SSH 本地转发，浏览器仍收到原网址。
+5. 若报告 `port_conflict`，先在 Y9000p 查明占用原端口的监听器及其所有者。例如 `ss -H -ltnp '( sport = :8795 )'`，再将输出中的 PID 交给 `ps -fp` 辨认旧转发；确认有无依赖它的标签页，**取得所有者同意后**才显式关闭旧转发并重试原链接。已有手动 `ssh -N -L 8795:127.0.0.1:8795 ...` 会占用 Y9000p 的 8795；助手不会接管或自动终止它，也不会改端口打开替代网址。
 
 ## 安装和启用
 
@@ -111,7 +112,8 @@ Pi 在 lexing 前把 Tab 展开成三个空格，native href 还可能保留 cha
 - 普通 local/private link 点击和拖选走 Pi 原生 viewport 状态机，但临时 opener filter 永远挡住所有 `pi-copy://`。只有 stored action kind 决定手势：copy 保留原行为；open/diagnostic/expired 必须是准确 Ctrl+左键，press/release 都满足且无 Shift/Alt/扩展按钮别名。
 - Overlay URL 只由准确 geometry 或 overlay-owned capture 授权。卸载先退役 action、失效 owner、强制同步 composed frame；仅证明 fullscreen 中无私有 URI 后才恢复 input hook。失败则保留单层最小被动 guard；后续实例吸收它，不保留前任闭包，也不覆盖后装 foreign wrapper。
 - tmux 3.4 的受管鼠标绑定在每个原始 SGR 事件前发送 `CSI 998;<client_pid>~`。仅在 `MouseDown1Pane` 等于已验证的 stock `select-pane -t = ; send-keys -M` 时接管它：先按原顺序选 pane，再对本扩展 pane 注入 marker、原样执行 `send-keys -M`；不带本扩展 owner 的 pane 仍依次执行 stock 的 `select-pane -t =` 和 `send-keys -M` 命令；真实双-pane 鼠标透传尚待单独验收。原本无绑定的 `MouseUp1Pane` 加入同样条件透传。旧版 Ctrl 绑定只在当前命令和记录的 receipt 完全一致、且属于已知旧版命令时升级；自定义/版本不符的绑定保留并在 `/copy-links` 告警。不改 `.tmux.conf`、`mouse` 设置或其他 pane。卸载只恢复 pane 所有权；共享绑定保持无主惰性状态，重载凭 receipt 复用。
-- 每个按下/松开都带相同 client PID 才能触发动作；窄 lost-press 恢复也要求先前普通 release 与 orphan Ctrl release 的 PID、cell、私有 URI/action kind 相同，并保持屏幕、尺寸、overlay ownership/snapshot 和无 motion。tmux Ctrl+点击缺失或畸形 marker 时报告错误，不打开链接。打开前再次枚举全部 tmux 客户端，校验准确 PID、当前 pane、完整 `/proc` 祖先链及 starttime；只有 sshd 祖先且 `SSH_CONNECTION` 对端匹配 `ssh -G conley-Y9000p` 的字面 IP/端口才路由远端。验证所得对端会钉在 SSH 命令行，避免 alias 在验证后变化时发往另一主机。公司本机来源沿用原 opener；无 tmux 的本机 Pi 沿用原行为，但没有 tmux 来源的直接 SSH 输入明确拒绝。
+- 扩展加载时从 Pi fd0 的 `/dev/pts/N` 出发，先验证会话首进程，再验证主端持有者的 `/dev/ptmx` `tty-index`；非 dumpable sshd 用 `sshd: <user>@pts/N` cmdline、父子关系和 UID 验证。Codoxear broker 作为固定-stdin relay 递归解析；已知 GUI terminal 只有初始环境含 Wayland 或 `:N` 本地 X display 才判本机。未知持有者仅在 Pi 无 SSH 环境且持有者祖先无 sshd 时保留旧本机行为，否则带持有者名称拒绝。动作派发前重算拓扑，holder/leader 的 PID 或 starttime 改变即拒绝；直接拓扑出现 marker 也拒绝。
+- 每个 tmux 按下/松开都带相同 client PID 才能触发动作；窄 lost-press 恢复也要求先前普通 release 与 orphan Ctrl release 的 PID、cell、私有 URI/action kind 相同，并保持屏幕、尺寸、overlay ownership/snapshot 和无 motion。tmux Ctrl+点击缺失或畸形 marker 时报告错误，不打开链接。打开前再次枚举全部 tmux 客户端，校验准确 PID、当前 pane、完整 `/proc` 祖先链及 starttime；随后对该 client 进程应用同一个最近 PTY 持有者分类器。sshd 直持 client PTY 才是远端，带本地 display 的 GUI terminal 才是本机；另一层多路复用器或未知终端拒绝。验证所得对端会钉在 SSH 命令行，避免 alias 在验证后变化时发往另一主机。
 
 ### Y9000p 输入、协议与隧道
 
@@ -154,6 +156,6 @@ PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s pi-agent/extensions/pi
 
 `--legacy-peer-deps` 只用于测试依赖安装，避免 npm 自动装入与正在运行的 Pi 不同身份的 peer；`npm run check` 中的 `test/setup-pi.mjs` 核验并链接本机已安装的 Pi/TUI，发现不匹配的第二份运行时会拒绝执行。验收以实际 `pi` 的 bundled CLI 和上面的离线 PTY/recorder 为准，不用未打包入口代替。
 
-单元/集成测试覆盖代码源文、typed action failure atomicity、poisoned-generation clipboard queue、live cwd snapshot、Markdown recursion/table/reference、显式 web entity/reference 语义与 autolink disagreement、完整目标语法、symlink/type/existence、browser default 检测、硬 subprocess deadline 与 TERM/KILL 升级、transactional unref handoff、Chrome/Code argv、来源 PID 解析与客户端地址钉住、fake SSH JSON 协议/失败/abort/no-fallback、async retirement、selection/overlay/opener descriptor/tmux exact-target recovery/reload/quiescence。Native smoke 使用临时 Pi profile、真实 CLI/PTY 和 recorder executables：`wl-copy`、`xdg-settings`、`google-chrome-stable`、`code`；`xdg-open` 是失败 tripwire。它创建真实临时 `.3mf`、`.svg`、`.json` 和目录，只按显示 label 选择目标，不假定每个 `pi-copy://` 都是复制按钮。`--osc52` 模拟没有 tmux 来源的直接 SSH：复制仍通过 OSC52，链接明确拒绝且无公司 GUI 启动；其余模式测试本机打开。四种模式还通过真实 PTY 拖选普通文字，核对原生 selection 写出的 `Native`，并核对普通链接点击和 Ctrl-drag 不打开浏览器、`/reload` 后 action URI 更换、窄屏复制字节不变。自动测试不会启动物理 Chrome/Code，也不会修改物理剪贴板。用 `--artifacts <目录>` 为每次 native 运行指定独立证据目录；默认也保留临时目录。失败时仍保存 `run.json`、PTY/input 原始流、已有 recorder JSONL、snapshot 和人工 fixture 的 session/settings，便于从实际输入/输出定位分歧；这些文件属于隔离测试 profile，不来自用户会话。
+单元/集成测试覆盖代码源文、typed action failure atomicity、poisoned-generation clipboard queue、live cwd snapshot、Markdown recursion/table/reference、显式 web entity/reference 语义与 autolink disagreement、完整目标语法、symlink/type/existence、browser default 检测、硬 subprocess deadline 与 TERM/KILL 升级、transactional unref handoff、Chrome/Code argv、PTY holder/relay/显示/SSH 分类、来源 PID 解析与客户端地址钉住、fake SSH JSON 协议/失败/abort/no-fallback、async retirement、selection/overlay/opener descriptor/tmux exact-target recovery/reload/quiescence。Native smoke 使用临时 Pi profile、真实 CLI/PTY 和 recorder executables：`wl-copy`、`xdg-settings`、`google-chrome-stable`、`code`；`xdg-open` 是失败 tripwire。它创建真实临时 `.3mf`、`.svg`、`.json` 和目录，只按显示 label 选择目标，不假定每个 `pi-copy://` 都是复制按钮。普通和 tmux 模式把测试自有 PTY master 标成带 Wayland display 的 Ghostty，验证本机打开；`--osc52` 则保留未知 Python holder、只注入 SSH 环境，验证环境变量不能冒充 sshd PTY、链接带 holder 诊断拒绝且无公司 GUI 启动。四种模式还通过真实 PTY 拖选普通文字，核对原生 selection 写出的 `Native`，并核对普通链接点击和 Ctrl-drag 不打开浏览器、`/reload` 后 action URI 更换、窄屏复制字节不变。自动测试不会启动物理 Chrome/Code，也不会修改物理剪贴板。用 `--artifacts <目录>` 为每次 native 运行指定独立证据目录；默认也保留临时目录。失败时仍保存 `run.json`、PTY/input 原始流、已有 recorder JSONL、snapshot 和人工 fixture 的 session/settings，便于从实际输入/输出定位分歧；这些文件属于隔离测试 profile，不来自用户会话。
 
 卸载前确认 `~/.pi/agent/extensions/pi-copy-links` 是本扩展 symlink，删除后 `/reload`。源码和依赖可保留。

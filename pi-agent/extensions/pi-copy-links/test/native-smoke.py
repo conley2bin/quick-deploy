@@ -9,6 +9,7 @@ All evidence is retained; no model requests or user session changes are made.
 """
 import argparse
 import base64
+import ctypes
 import fcntl
 import hashlib
 import json
@@ -22,6 +23,7 @@ import shutil
 import signal
 import struct
 import subprocess
+import sys
 import tempfile
 import termios
 import time
@@ -33,6 +35,25 @@ transport = args.add_mutually_exclusive_group()
 transport.add_argument('--osc52', action='store_true')
 transport.add_argument('--tmux', action='store_true')
 options = args.parse_args()
+# The process holding the harness PTY master is the input terminal under test.
+# Re-exec once so /proc/<holder>/environ contains deterministic initial values;
+# changing os.environ after exec would not update that kernel snapshot.
+parent_marker = '_PI_COPY_LINKS_NATIVE_PARENT_ENV'
+if os.environ.get(parent_marker) != '1':
+    clean = dict(os.environ)
+    for key in ('TMUX', 'TMUX_PANE', 'SSH_CONNECTION', 'SSH_CLIENT', 'SSH_TTY'):
+        clean.pop(key, None)
+    clean[parent_marker] = '1'
+    if options.osc52:
+        clean.pop('WAYLAND_DISPLAY', None)
+        clean.pop('DISPLAY', None)
+    else:
+        clean['WAYLAND_DISPLAY'] = 'fixture'
+        clean['DISPLAY'] = ''
+    os.execve(sys.executable, [sys.executable, *sys.argv], clean)
+if not options.osc52:
+    # Model the known local GUI terminal that owns the harness PTY master.
+    assert ctypes.CDLL(None).prctl(15, b'ghostty', 0, 0, 0) == 0
 source = Path(__file__).resolve().parents[1]
 root = Path(tempfile.mkdtemp(prefix='pi-copy-links-native-'))
 artifacts = options.artifacts or root
@@ -102,8 +123,12 @@ env = dict(os.environ, PI_CODING_AGENT_DIR=str(agent), PI_COPY_LINKS_TEST_DIR=st
            PI_OFFLINE='1', PI_SKIP_VERSION_CHECK='1', TERM='xterm-256color', TERM_PROGRAM='',
            PATH=str(private_bin) + os.pathsep + os.environ['PATH'], DISPLAY='',
            WAYLAND_DISPLAY='' if options.osc52 else 'fixture', XDG_SESSION_TYPE='wayland',
-           SSH_CONNECTION='fixture' if options.osc52 else '', SSH_CLIENT='', MOSH_CONNECTION='')
-env.pop('TMUX', None)
+           MOSH_CONNECTION='')
+for key in ('TMUX', 'TMUX_PANE', 'SSH_CONNECTION', 'SSH_CLIENT', 'SSH_TTY'):
+    env.pop(key, None)
+if options.osc52:
+    env['SSH_CONNECTION'] = 'fixture'
+    env['SSH_CLIENT'] = ''
 pi = shutil.which('pi')
 assert pi, 'pi is missing from PATH'
 cli = [pi, '--offline', '--no-skills', '--no-prompt-templates', '--no-themes', '--session', str(session)]
@@ -135,7 +160,7 @@ if options.tmux:
     # Pass only test-specific non-secret environment overrides, not the parent's credentials.
     keys = ['PI_CODING_AGENT_DIR', 'PI_COPY_LINKS_TEST_DIR', 'PI_OFFLINE', 'PI_SKIP_VERSION_CHECK',
             'PATH', 'DISPLAY', 'WAYLAND_DISPLAY', 'XDG_SESSION_TYPE', 'SSH_CONNECTION', 'SSH_CLIENT', 'MOSH_CONNECTION']
-    command = shlex.join(['env', *[key + '=' + env[key] for key in keys], *cli])
+    command = shlex.join(['env', *[key + '=' + env[key] for key in keys if key in env], *cli])
     created = tmux('new-window', '-d', '-P', '-F', '#{window_id}:#{pane_id}', '-t', f'{project_session}:{slot}',
                    '-n', 'copy-links-native-' + identity, '-c', str(root), command).stdout.strip()
     window, pane = created.split(':')
@@ -237,10 +262,12 @@ try:
     assert records('google-chrome-stable') == [], 'unmodified click opened a browser'
     click(link, 16)
     if options.osc52:
-        # OSC52 fixture is a direct SSH-like input without a tmux origin. Copy
-        # still works; opening must now fail visibly instead of using company GUI.
-        wait_for(lambda: 'SSH 输入未经过带来源标记的 tmux'.encode() in wire,
-                 'direct SSH without origin refusal')
+        # The harness PTY master is an unknown Python holder. SSH environment
+        # alone cannot attribute it, so opening fails with the holder diagnostic.
+        refusal_prefix = '输入终端无法归属：输入持有者 '.encode()
+        refusal_body = '无法归属到本机桌面或配'.encode()  # final text wraps before “对 SSH”
+        wait_for(lambda: refusal_prefix in wire and refusal_body in wire,
+                 'unattributed harness PTY refusal')
         for label in ('MODEL_3MF', 'DIAGRAM_SVG', 'DATA_JSON', 'SAMPLE_DIR'):
             click(target_by_label(after_copy, label), 16)
         drain(0.2)

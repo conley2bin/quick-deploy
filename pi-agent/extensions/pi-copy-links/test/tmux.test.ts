@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { enableTmuxMouse, MOUSE_KEYS, type TmuxRun } from "../src/tmux.ts";
+import type { InputTopology } from "../src/receiver.ts";
 
 const STOCK_DOWN = "bind-key -T root MouseDown1Pane select-pane -t = \\; send-keys -M";
 const STOCK_TAGGED = String.raw`bind-key -T root MouseDown1Pane select-pane -t = \; if-shell -F -t = "#{&&:#{@pi-copy-links-input},#{mouse_any_flag}}" "run-shell -C 'send-keys -l -t \"#{pane_id}\" \"\\e[998;#{client_pid}~\" ; send-keys -M'" "send-keys -M"`;
@@ -10,6 +11,11 @@ const taggedBinding = (key: string) => key === "MouseDown1Pane" ? STOCK_TAGGED :
   String.raw`bind-key -T root ${key} if-shell -F -t = "#{&&:#{@pi-copy-links-input},#{mouse_any_flag}}" "run-shell -C 'send-keys -l -t \"#{pane_id}\" \"\\e[998;#{client_pid}~\" ; send-keys -M'" ` +
     (key === "MouseUp1Pane" ? '"send-keys -M"' : "''");
 const env = { TMUX: "/fixture/socket,with-comma,100,2", TMUX_PANE: "%42" };
+const hop = Object.freeze({ tty: "/dev/pts/42", leader: Object.freeze({ pid: 1, starttime: "1" }),
+  holder: Object.freeze({ pid: 2, starttime: "2", comm: "tmux: server" }) });
+const topology: InputTopology = Object.freeze({ kind: "tmux", socket: "/fixture/socket,with-comma",
+  pane: "%42", inputTty: "/dev/pts/42", hops: Object.freeze([hop]) });
+const direct: InputTopology = Object.freeze({ kind: "local", basis: "gui", hops: Object.freeze([hop]) });
 
 function server(version = "tmux 3.4") {
   const keys = new Map<string, string>([["MouseDown1Pane", STOCK_DOWN]]);
@@ -41,7 +47,7 @@ function bindingCall(calls: string[][], key: string) {
 
 test("tmux 3.4 stock down is adopted after exact match; mouse marker follows selection", async () => {
   const f = server();
-  const first = await enableTmuxMouse(env, f.run);
+  const first = await enableTmuxMouse(topology, env, f.run);
   assert.equal(first.enabled, true); assert.deepEqual(first.warnings, []);
   assert.equal(f.keys.size, MOUSE_KEYS.length);
   assert.equal(f.options.get("@pi-copy-links-prior-MouseDown1Pane"), STOCK_DOWN);
@@ -55,7 +61,7 @@ test("tmux 3.4 stock down is adopted after exact match; mouse marker follows sel
   assert.ok([...f.keys.values()].every((value) => value.includes("MouseDown1Pane") || value.includes("@pi-copy-links-input")));
   await first.dispose(); assert.equal(f.options.has("@pi-copy-links-input"), false);
   const count = f.calls.filter((args) => args[2] === "bind-key").length;
-  const second = await enableTmuxMouse(env, f.run); assert.deepEqual(second.warnings, []);
+  const second = await enableTmuxMouse(topology, env, f.run); assert.deepEqual(second.warnings, []);
   assert.equal(f.calls.filter((args) => args[2] === "bind-key").length, count);
   await second.dispose();
   assert.equal(f.keys.size, MOUSE_KEYS.length, "shared guarded keys stay inert after unload");
@@ -69,7 +75,7 @@ test("receipt-owned legacy Ctrl bindings upgrade; forged and foreign bindings st
   f.keys.set(foreign, "foreign custom binding");
   f.keys.set(forged, "foreign command with forged receipt");
   f.options.set(`@pi-copy-links-binding-${forged}`, "foreign command with forged receipt");
-  const result = await enableTmuxMouse(env, f.run);
+  const result = await enableTmuxMouse(topology, env, f.run);
   assert.deepEqual(result.warnings, [foreign, forged]);
   assert.ok(bindingCall(f.calls, upgrade), "exact receipt-owned old command was upgraded");
   assert.ok(!bindingCall(f.calls, foreign));
@@ -82,7 +88,7 @@ test("non-stock mouse down and non-3.4 stock stay untouched and warn", async () 
   for (const [version, value] of [["tmux 3.3", STOCK_DOWN], ["tmux 3.4", "foreign pane binding"]]) {
     const f = server(version);
     f.keys.set("MouseDown1Pane", value!);
-    const result = await enableTmuxMouse(env, f.run);
+    const result = await enableTmuxMouse(topology, env, f.run);
     assert.deepEqual(result.warnings, ["MouseDown1Pane"]);
     assert.equal(f.keys.get("MouseDown1Pane"), value);
     await result.dispose();
@@ -91,14 +97,17 @@ test("non-stock mouse down and non-3.4 stock stay untouched and warn", async () 
 
 test("pane marker cleanup restores prior ownership but never removes a later owner", async () => {
   const f = server(); f.options.set("@pi-copy-links-input", "outer-owner");
-  const first = await enableTmuxMouse(env, f.run); await first.dispose();
+  const first = await enableTmuxMouse(topology, env, f.run); await first.dispose();
   assert.equal(f.options.get("@pi-copy-links-input"), "outer-owner");
-  const second = await enableTmuxMouse(env, f.run);
+  const second = await enableTmuxMouse(topology, env, f.run);
   f.options.set("@pi-copy-links-input", "later-owner"); await second.dispose();
   assert.equal(f.options.get("@pi-copy-links-input"), "later-owner");
 });
 
-test("non-tmux processes are untouched and command failures are not missing keys", async () => {
-  const f = server(); assert.equal((await enableTmuxMouse({}, f.run)).enabled, false); assert.equal(f.calls.length, 0);
-  await assert.rejects(() => enableTmuxMouse(env, async () => ({ code: 2, stdout: "", stderr: "server unavailable" })), /server unavailable/);
+test("direct topology ignores even stale TMUX env; command failures are not missing keys", async () => {
+  const f = server();
+  assert.equal((await enableTmuxMouse(direct, env, f.run)).enabled, false);
+  assert.equal(f.calls.length, 0, "direct topology must not inspect or claim tmux bindings/pane ownership");
+  await assert.rejects(() => enableTmuxMouse(topology, env,
+    async () => ({ code: 2, stdout: "", stderr: "server unavailable" })), /server unavailable/);
 });

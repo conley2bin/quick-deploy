@@ -1,6 +1,7 @@
 import { execFile } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { promisify } from "node:util";
+import type { InputTopology } from "./receiver.ts";
 
 const exec = promisify(execFile);
 const OPTION = "@pi-copy-links-input";
@@ -36,10 +37,18 @@ const runTmux: TmuxRun = async (args) => {
  * Older extension bindings are upgraded only with their exact stored receipt.
  * Shared guarded keys remain inert after the last pane owner unloads.
  */
-export async function enableTmuxMouse(env: NodeJS.ProcessEnv = process.env, run: TmuxRun = runTmux) {
+export async function enableTmuxMouse(
+  topology: InputTopology, env: NodeJS.ProcessEnv = process.env, run: TmuxRun = runTmux,
+) {
+  if (topology.kind !== "tmux") {
+    return { enabled: false, warnings: [] as string[], dispose: async () => {} };
+  }
   const socket = /^(.*),\d+,\d+$/u.exec(env.TMUX ?? "")?.[1];
   const pane = env.TMUX_PANE;
-  if (!socket || !pane || !/^%\d+$/u.test(pane)) return { enabled: false, warnings: [] as string[], dispose: async () => {} };
+  if (!socket || !pane || !/^%\d+$/u.test(pane) ||
+      socket !== topology.socket || pane !== topology.pane) {
+    return { enabled: false, warnings: [] as string[], dispose: async () => {} };
+  }
   const call = (args: string[]) => run(["-S", socket, ...args]);
   const checked = async (args: string[]) => {
     const result = await call(args);
