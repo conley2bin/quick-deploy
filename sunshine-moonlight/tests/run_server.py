@@ -83,8 +83,7 @@ if action == 'list':
         raise SystemExit(255)
     if forced == 'unpaired-zero':
         print('Computer 100.64.0.2 has not been paired. Please open Moonlight to pair before retrieving games list.', file=sys.stderr)
-        print('Name, ID, HDR Support, App Collection Game, Hidden, Direct Launch, Boxart URL')
-        print('"Desktop",123,false,false,false,false,"file:///box.png"')
+        print('Desktop')
         raise SystemExit(0)
     if forced in ('network', 'ambiguous', 'nonzero'):
         if forced == 'network':
@@ -100,10 +99,9 @@ if action == 'list':
         raise SystemExit(255)
     if paired:
         if setting('FAKE_NO_DESKTOP') == '1':
-            print('Name, ID, HDR Support, App Collection Game, Hidden, Direct Launch, Boxart URL')
-            print('"Steam Big Picture",456,false,false,false,false,"file:///box.png"')
+            print('Steam Big Picture')
         else:
-            print(setting('FAKE_CATALOGUE', 'Name, ID, HDR Support, App Collection Game, Hidden, Direct Launch, Boxart URL\\n"Desktop",123,false,false,false,false,"file:///box.png"'))
+            print(setting('FAKE_CATALOGUE', 'Desktop'))
     raise SystemExit(0)
 if action == 'pair':
     print('FAKE PAIR STARTED', file=sys.stderr)
@@ -935,7 +933,7 @@ machines:
         result = self.invoke("desktop", stdin="stream stdin\n", exit_code=23)
         self.assertEqual(result.returncode, 23, result.stderr)
         self.assertEqual(self.actions(), ["list", "stream", "quit"])
-        self.assertEqual(self.records()[0]["argv"][1:], ["list", "--csv", "--", "100.64.0.2:47989"])
+        self.assertEqual(self.records()[0]["argv"][1:], ["list", "--", "100.64.0.2:47989"])
         self.assertEqual(self.recorded()["argv"][1:], STREAM_ARGS)
         self.assertEqual(self.recorded()["stdin"], "stream stdin\n")
         self.assertNotIn("PIN", result.stdout + result.stderr)
@@ -981,7 +979,7 @@ machines:
         result = self.invoke("desktop", extra_env={"FAKE_INITIAL_PAIRED": "0"})
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.actions(), ["list", "pair", "list", "stream", "quit"])
-        self.assertEqual(self.records()[0]["argv"][1:], ["list", "--csv", "--", "100.64.0.2:47989"])
+        self.assertEqual(self.records()[0]["argv"][1:], ["list", "--", "100.64.0.2:47989"])
 
         match = PIN.search(result.stderr)
         self.assertIsNotNone(match, result.stderr)
@@ -990,7 +988,7 @@ machines:
         # Exact Qt6.1 grammar: pair host is positional after `--`, --pin carries the PIN.
         self.assertEqual(self.records()[1]["argv"][1:], ["pair", "--pin", pin, "--", "100.64.0.2:47989"])
         # The confirmation list is a fresh query after pair, before stream.
-        self.assertEqual(self.records()[2]["argv"][1:], ["list", "--csv", "--", "100.64.0.2:47989"])
+        self.assertEqual(self.records()[2]["argv"][1:], ["list", "--", "100.64.0.2:47989"])
         self.assertEqual(self.records()[3]["argv"][1:], STREAM_ARGS)
 
         # Terminal guidance: target, Web UI (base+1), PIN, numbered remote/local steps.
@@ -1013,7 +1011,7 @@ machines:
         result = self.invoke("laptop", extra_env={"FAKE_INITIAL_PAIRED": "0"})
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.actions(), ["list", "pair", "list", "stream", "quit"])
-        self.assertEqual(self.records()[0]["argv"][1:], ["list", "--csv", "--", "100.64.0.3:48000"])
+        self.assertEqual(self.records()[0]["argv"][1:], ["list", "--", "100.64.0.3:48000"])
         self.assertEqual(self.records()[1]["argv"][4:], ["--", "100.64.0.3:48000"])
         self.assertEqual(self.records()[3]["argv"][1:], STREAM_ARGS[:-2] + ["100.64.0.3:48000", "Desktop"])
         self.assertIn("https://100.64.0.3:48001", result.stderr)

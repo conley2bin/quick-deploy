@@ -7,8 +7,11 @@ live only in this process and protected controller stdin, never local lock files
 
 CLI/catalogue contract: Moonlight Qt 6.1.0, commit
 f786e94c7b2f943e24e65d7d74deb539b827fc84, app/cli/{commandlineparser,
-listapps,startstream}.cpp. CSV is deliberately strict: upstream quotes fields
-without escaping embedded quotes/newlines; ambiguous output is rejected intact.
+listapps,startstream}.cpp. The catalogue is plain `list`, never `list --csv`:
+printAppCSV starts a box-art fetch per app whose thread-pool join can deadlock
+CLI shutdown (a Sunshine that never answers appasset leaves the process alive
+with the CSV stuck in the stdout buffer, so no output is ever recoverable).
+Name resolution mirrors stock getAppIndex: first str.lower title match wins.
 """
 from __future__ import annotations
 
@@ -28,12 +31,11 @@ import threading
 import time
 import uuid
 
-CSV_HEADER = "Name, ID, HDR Support, App Collection Game, Hidden, Direct Launch, Boxart URL"
-CSV_ROW = re.compile(r'^"([^"\r\n]*)",([0-9]{1,10}),(true|false),(true|false),(true|false),(true|false),"([^"\r\n]*)"$')
 HEX = re.compile(r"[0-9a-f]{64}\Z")
 QUERY_LIMIT = 65536
 QUERY_TIMEOUT = 45  # stock computer search 30s + application search 10s
 ACTIVE_TIMEOUT = 45
+MAX_CATALOGUE_APPS = 128
 
 
 class ClientError(Exception):
@@ -53,30 +55,33 @@ class RpcFailure(ClientError):
         super().__init__(f"控制器 {action} {'拒绝请求' if self.remote_refusal else '响应不确定'}。")
 
 
-def desktop_id(catalogue: str) -> int:
-    """Resolve the FIRST lowercase Desktop exactly as stock getAppIndex does.
+def check_desktop_catalogue(catalogue: str) -> None:
+    """Validate a fresh plain-list catalogue for one unambiguous Desktop.
 
-    str.lower (not casefold) matches the Unicode lowercase rule for this ASCII
-    target, including Kelvin K but not long-s. No numeric CLI app selector exists.
+    Plain `list` prints one raw app title per line and carries no app IDs, so
+    the client cannot confirm the pinned ID before launch. Uniqueness of the
+    stock first-str.lower-match title is the pre-launch ambiguity gate; the
+    host then binds its inspected app ID to the observed currentgame at
+    observe_active before any stream is accepted, so a wrong application can
+    never be reported as the managed stream.
     """
-    lines = catalogue.splitlines()
-    if not lines or lines[0] != CSV_HEADER or len(lines) > 129:
-        raise ClientError("Moonlight 未返回 Qt6.1 的完整 ID-bearing CSV 应用列表；未启动串流。")
-    found, ids = None, set()
-    for line in lines[1:]:
-        match = CSV_ROW.fullmatch(line)
-        if not match:
-            raise ClientError("Moonlight CSV 应用列表存在无法可靠解析的行；未启动串流。")
-        name, raw_id = match.group(1, 2)
-        app_id = int(raw_id)
-        if not name or not 1 <= app_id < (1 << 31) or app_id in ids:
-            raise ClientError("Moonlight CSV 应用身份缺失、重复或超出正数 ID 范围。")
-        ids.add(app_id)
-        if found is None and name.lower() == "desktop":
-            found = app_id
-    if found is None:
+    lines = catalogue.split("\n")
+    if len(lines) > MAX_CATALOGUE_APPS + 1:
+        raise ClientError("Moonlight 应用列表超出可靠核对范围；未启动串流。")
+    matches = 0
+    for index, line in enumerate(lines):
+        if not line:
+            if index == len(lines) - 1 and len(lines) > 1:
+                continue  # one trailing newline from the final fprintf
+            raise ClientError("Moonlight 应用列表存在无法可靠解析的空行；未启动串流。")
+        if any(ord(char) < 32 or 127 <= ord(char) < 0xA1 for char in line):
+            raise ClientError("Moonlight 应用列表存在含控制字符的标题；未启动串流。")
+        if line.lower() == "desktop":
+            matches += 1
+    if matches == 0:
         raise ClientError("Moonlight 应用列表没有 Desktop；请在目标 Sunshine Applications 页面恢复无命令的 Desktop 后重试。")
-    return found
+    if matches > 1:
+        raise ClientError("Moonlight 应用列表存在多个大小写不敏感 Desktop，无法确认官方 stream 会启动哪一个；未启动串流。")
 
 
 def executable(explicit=None, *, platform=None, home=None, which=shutil.which) -> str:
@@ -535,17 +540,17 @@ class Session:
 
     def stream(self, prepared):
         self.interrupts.check()
-        # The final, fresh ID-bearing official catalogue is after preparation /
-        # pairing and before host launch intent or external stream dispatch.
-        resolved = desktop_id(self.catalogue(self.program, self.official))
-        if resolved != prepared["desktop_app_id"]:
-            raise ClientError("Moonlight 按首个大小写不敏感 Desktop 名称解析的 ID 与主机准备的 ID 不同；未发起 launch。")
+        # The final, fresh official catalogue is after preparation / pairing
+        # and before host launch intent or external stream dispatch. Plain list
+        # carries no IDs: one unambiguous Desktop title is the pre-launch gate.
+        check_desktop_catalogue(self.catalogue(self.program, self.official))
         options = mode_argv(prepared["display"])
         self.interrupts.check()
         launched = self.owned("launch")
         self.launch_issued = True  # acknowledged durable intent; not stream success
         self.take_ticket(launched, "connecting")
-        if (launched.get("desktop_app_id") != resolved or launched.get("desktop_title") != "Desktop"
+        if (launched.get("desktop_app_id") != prepared["desktop_app_id"]
+                or launched.get("desktop_title") != "Desktop"
                 or launched.get("quit_policy") != "explicit_quit" or
                 launched.get("display") != prepared["display"]):
             self.uncertain = True
@@ -634,9 +639,9 @@ def connect(name, machine, catalogue, *, binary=None, transport_factory=default_
             input_stream=None, output_stream=None):
     """Actual entrypoint with narrow injected seams for isolated orchestration tests.
 
-    catalogue(program, official)->fresh official CSV; it owns the preserved
-    list/unpaired/PIN/pair/fresh-list user workflow. No explicit resume/adoption
-    or automatic enrollment API is provided by this client.
+    catalogue(program, official)->fresh official plain app list; it owns the
+    preserved list/unpaired/PIN/pair/fresh-list user workflow. No explicit
+    resume/adoption or automatic enrollment API is provided by this client.
     """
     input_stream = sys.stdin if input_stream is None else input_stream
     output_stream = sys.stderr if output_stream is None else output_stream

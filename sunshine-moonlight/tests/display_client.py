@@ -26,10 +26,6 @@ spec.loader.exec_module(fixture)
 sys.path.insert(0, str(TESTS.parent / "lib"))
 import display_client as client
 
-HEADER = client.CSV_HEADER
-
-def csv(*apps):
-    return HEADER + "\n" + "\n".join(f'"{name}",{ident},false,false,false,false,"file:///box.png"' for name, ident in apps)
 
 
 class EntryTests(fixture.ConnectorFixture, unittest.TestCase):
@@ -184,21 +180,25 @@ class EntryTests(fixture.ConnectorFixture, unittest.TestCase):
         self.assertNotIn("refresh", self.control_actions())
         self.assertNotIn("abort", self.control_actions())
 
-    def test_stock_first_lowercase_title_id_alias_order(self):
+    def test_stock_first_lowercase_title_uniqueness_gate(self):
         self.write_default()
-        for apps in ((("desktop",456),("Desktop",123)), (("DesKtop",456),("Desktop",123)), (("Desktop",456),)):
-            result = self.invoke("desktop", extra_env={"FAKE_CATALOGUE":csv(*apps)})
+        # Stock resolves the first str.lower title match; duplicates (including
+        # Kelvin K, which str.lower maps to k) are ambiguous and refuse launch.
+        for catalogue in ("desktop\nDesktop", "DesKtop\nDesktop"):
+            result = self.invoke("desktop", extra_env={"FAKE_CATALOGUE":catalogue})
             self.assertNotEqual(result.returncode, 0)
             self.assertEqual(self.actions(), ["list"])
             self.assertNotIn("launch", self.control_actions())
             self.assert_available()
-        # Stock resolves the first LOWERCASE title, not casefold or exact-case search.
-        self.assertEqual(client.desktop_id(csv(("Deſktop",456),("Desktop",123))), 123)
-        self.assertEqual(client.desktop_id(csv(("Desktop",123),("desktop",456))), 123)
+        # One unambiguous Desktop title proceeds; long-s is not a match.
+        result = self.invoke("desktop", extra_env={"FAKE_CATALOGUE":"De\u017ftop\nDesktop"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.actions(), ["list", "stream", "quit"])
+        self.assert_available()
 
-    def test_non_id_catalogue_and_malformed_csv_fail_before_launch(self):
+    def test_malformed_or_missing_desktop_catalogue_fails_before_launch(self):
         self.write_default()
-        for catalogue in ("Desktop", "Name,ID\nDesktop,123", csv(("Desktop",0)), csv(("Desktop",123))+"\nQPA diagnostic"):
+        for catalogue in ("", "Steam Big Picture", "Desktop\n\nOther", "Desktop\r", "Desktop\n" + "x\n" * 200):
             result = self.invoke("desktop", extra_env={"FAKE_CATALOGUE":catalogue})
             self.assertNotEqual(result.returncode, 0)
             self.assertEqual(self.actions(), ["list"])
@@ -324,12 +324,16 @@ class EntryTests(fixture.ConnectorFixture, unittest.TestCase):
 
 
 class PureTests(unittest.TestCase):
-    def test_source_csv_title_lowercase_without_casefold_or_trim(self):
-        self.assertEqual(client.desktop_id(csv(("Desktop",123))),123)
-        self.assertEqual(client.desktop_id(csv((" unrelated, title ",456),("Desktop",123))),123)
-        for value in (HEADER, csv((" Desktop ",123)), csv(('Bad"name',456),("Desktop",123)), csv(("Desktop",123),("Same ID",123))):
+    def test_plain_catalogue_title_lowercase_without_casefold_or_trim(self):
+        client.check_desktop_catalogue("Desktop")
+        client.check_desktop_catalogue(" unrelated, title \nDesktop")
+        client.check_desktop_catalogue("De\u017ftop\nDesktop")  # long-s never matches
+        client.check_desktop_catalogue("DesKtop")  # Kelvin K str.lower == desktop
+        for value in ("", "\n", "Steam Big Picture", " Desktop", "Desktop\r",
+                      "Desktop\nDesktop", "DesKtop\nDesktop", "Desktop\n\nOther",
+                      "Desktop\n" + "x\n" * 200):
             with self.assertRaises(client.ClientError):
-                client.desktop_id(value)
+                client.check_desktop_catalogue(value)
 
     def test_current_mode_fps_and_bitrate_policy_bounds(self):
         mode = dict(width=3840,height=2160,refresh_num=60000,refresh_den=1001,requested_fps=60)

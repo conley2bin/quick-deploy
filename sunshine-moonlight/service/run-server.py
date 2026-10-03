@@ -308,12 +308,15 @@ def print_pair_failure(
 def confirmed_catalogue(name: str, machine: dict[str, Any], program: str, official: Any) -> str:
     """Preserved list→explicit-unpaired→manual PIN/pair→fresh list confirmation.
 
-    The ID-bearing CSV is freshly fetched AFTER host preparation. Its first
-    lowercase Desktop ID is checked by the session BEFORE launch/dispatch.
+    The catalogue is freshly fetched AFTER host preparation. Plain `list` is
+    deliberate: `list --csv` starts a box-art fetch per app whose thread-pool
+    join can deadlock CLI shutdown, so no CSV output is ever recoverable. The
+    unambiguous first lowercase Desktop title is checked by the session BEFORE
+    launch/dispatch; the host binds the inspected app ID at observe_active.
     """
     target = f"{machine['tailnet_ip']}:{machine['moonlight_port']}"
     web_ui = f"https://{machine['tailnet_ip']}:{machine['moonlight_port'] + 1}"
-    query = [program, "list", "--csv", "--", target]
+    query = [program, "list", "--", target]
 
     returncode, stdout, stderr = official.query(query)
     state = classify_list_result(returncode, stderr)

@@ -920,7 +920,7 @@ class IntegrationTests(unittest.TestCase):
         self.assertEqual(f.status()["phase"], "reconciliation_required")
 
     def test_incomplete_preparation_and_unobserved_attempts_stay_owned(self):
-        for pending in ("preparing", "launch", "resume"):
+        for pending in ("preparing", "resume"):
             with self.subTest(pending=pending), tempfile.TemporaryDirectory() as root:
                 f = Fixture(root)
                 f.enroll()
@@ -935,9 +935,6 @@ class IntegrationTests(unittest.TestCase):
                         f.prepare(ticket)
                     ticket = dict(ticket, revision=f.status()["revision"])
                     action = "launch"
-                elif pending == "launch":
-                    ticket = f.owner(f.prepare(), "launch")
-                    action = "observe_active"
                 else:
                     ticket = f.owner(f.active(), "resume")
                     action = "observe_active"
@@ -953,6 +950,46 @@ class IntegrationTests(unittest.TestCase):
                 f.inventory_hook = None
                 with self.assertRaises(protocol.Refusal):
                     f.owner(latest, "abort")
+
+    def test_connecting_capture_settling_is_retryable_without_poisoning(self):
+        # A controlled launch makes the vendor re-run its capture/encoder probe;
+        # the bounded journal window can read that probe mid-write. While the same
+        # owner attempt is fresh and unconfirmed, that read-only transient is a
+        # retryable launch_unconfirmed, never an ownership block. Non-capture
+        # refusals in the same window still block and retain.
+        with tempfile.TemporaryDirectory() as root:
+            f = Fixture(root)
+            f.enroll()
+            attempted = f.owner(f.prepare(), "launch")
+            before = (f.state / "reservation.json").read_bytes()
+            operation = (f.state / "operation.json").read_bytes()
+            def settling(_):
+                raise protocol.Refusal("backend_unavailable", "injected capture probe mid-write")
+            f.inventory_hook = settling
+            with self.assertRaises(protocol.Refusal) as error:
+                f.owner(attempted, "observe_active")
+            self.assertEqual(error.exception.code, "launch_unconfirmed")
+            self.assertEqual((f.state / "reservation.json").read_bytes(), before)
+            self.assertEqual((f.state / "operation.json").read_bytes(), operation)
+            self.assertEqual(f.status()["phase"], "connecting")
+            f.inventory_hook = None
+            f.app = attempted["desktop_app_id"]
+            active = f.owner(attempted, "observe_active")
+            self.assertEqual(active["phase"], "active")
+            releasing = f.owner(active, "begin_release")
+            f.app = 0
+            self.assertEqual(f.owner(releasing, "finish_release")["phase"], "available")
+        with tempfile.TemporaryDirectory() as root:
+            f = Fixture(root)
+            f.enroll()
+            attempted = f.owner(f.prepare(), "launch")
+            def unrelated(_):
+                raise protocol.Refusal("unclassified_failure", "not a capture contract refusal")
+            f.inventory_hook = unrelated
+            with self.assertRaises(protocol.Refusal) as blocked:
+                f.owner(attempted, "observe_active")
+            self.assertNotEqual(blocked.exception.code, "launch_unconfirmed")
+            self.assertEqual(f.status()["phase"], "reconciliation_required")
 
     def test_completed_preparation_cleanup_requires_actual_completion_record(self):
         f = self.fixture
