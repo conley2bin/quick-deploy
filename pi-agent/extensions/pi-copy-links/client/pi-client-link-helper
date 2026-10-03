@@ -10,6 +10,7 @@ import os
 from pathlib import Path, PurePosixPath
 import re
 import select
+import shutil
 import signal
 import socket
 import stat
@@ -26,11 +27,27 @@ MAX_INPUT = 65536
 MAX_PREPARE_MS = 45000
 MAX_INVENTORY_OUTPUT = 1024 * 1024
 MAX_DIAGNOSTIC_OUTPUT = 4096
+BROWSER_QUERY_TIMEOUT_SECONDS = 4
+BROWSER_LAUNCH_GRACE_SECONDS = 5
 GUI_KEYS = ("DISPLAY", "XAUTHORITY", "WAYLAND_DISPLAY", "XDG_RUNTIME_DIR",
             "DBUS_SESSION_BUS_ADDRESS", "XDG_CURRENT_DESKTOP", "XDG_SESSION_TYPE")
 PID_RE = re.compile(r"Master running \(pid=(\d+)\)")
 SS_PID_RE = re.compile(r"\bpid=(\d+)\b")
 SOCKET_NAME_RE = re.compile(r"m-[0-9a-f]{24}\.sock")
+DESKTOP_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\.desktop")
+BROWSER_COMMANDS = {
+    "google-chrome.desktop": ("google-chrome-stable", ("--new-window",)),
+    "google-chrome-beta.desktop": ("google-chrome-beta", ("--new-window",)),
+    "google-chrome-unstable.desktop": ("google-chrome-unstable", ("--new-window",)),
+    "chromium.desktop": ("chromium", ("--new-window",)),
+    "chromium-browser.desktop": ("chromium-browser", ("--new-window",)),
+    "chromium_chromium.desktop": ("chromium", ("--new-window",)),
+    "firefox.desktop": ("firefox", ("--new-window",)),
+    "firefox_firefox.desktop": ("firefox", ("--new-window",)),
+    "firefox-esr.desktop": ("firefox", ("--new-window",)),
+    "microsoft-edge.desktop": ("microsoft-edge-stable", ("--new-window",)),
+    "brave-browser.desktop": ("brave-browser", ("--new-window",)),
+}
 
 
 class LinkError(Exception):
@@ -109,6 +126,40 @@ def checked(argv, code, *, env=None, timeout=12, output_limit=MAX_DIAGNOSTIC_OUT
     if status:
         fail(code, f"{argv[0]} exited {status}: {text or 'no diagnostic'}")
     return text
+
+
+def browser_command(gui):
+    desktop_id = checked(["xdg-settings", "get", "default-web-browser"],
+                         "browser_unsupported", env=gui,
+                         timeout=BROWSER_QUERY_TIMEOUT_SECONDS)
+    if DESKTOP_ID_RE.fullmatch(desktop_id) is None:
+        fail("browser_unsupported", f"invalid default browser desktop id: {desktop_id[:200]!r}")
+    command = BROWSER_COMMANDS.get(desktop_id)
+    if command is None:
+        fail("browser_unsupported", f"unsupported default browser desktop id: {desktop_id}")
+    binary, arguments = command
+    executable = shutil.which(binary, path=gui.get("PATH", os.defpath))
+    if executable is None:
+        fail("browser_unsupported",
+             f"default browser {desktop_id} requires {binary}, which is missing from the GUI PATH")
+    return [executable, *arguments]
+
+
+def launch_browser(argv, *, env):
+    """Accept a forwarded request quickly or hand off a long-lived primary process."""
+    try:
+        process = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                   stderr=subprocess.DEVNULL, env=env, start_new_session=True)
+    except OSError as error:
+        fail("browser_failed", f"{argv[0]}: {error}")
+    try:
+        status = process.wait(timeout=BROWSER_LAUNCH_GRACE_SECONDS)
+    except subprocess.TimeoutExpired:
+        # The browser became the primary instance. Its process group is now
+        # application-owned and must survive this one-request helper.
+        return
+    if status:
+        fail("browser_failed", f"{argv[0]} exited {status}")
 
 
 def unique_pairs(pairs):
@@ -656,6 +707,8 @@ def main():
         peer.alive(deadline)
         gui, runtime = gui_environment()
         peer.alive(deadline)
+        browser = browser_command(gui) if data["action"] == "open-web" else None
+        peer.alive(deadline)
         response, ticket = (prepare_web(data, runtime, peer, deadline) if data["action"] == "open-web"
                             else (file_command(data)[1], None))
         peer.alive(deadline)
@@ -677,7 +730,7 @@ def main():
             if ticket is not None:
                 verified_record(*ticket)
             peer.alive(deadline)
-            checked(["xdg-open", response["openedUrl"]], "browser_failed", env=gui, timeout=12)
+            launch_browser([*browser, response["openedUrl"]], env=gui)
         else:
             checked(file_command(data)[0], "code_failed", env=gui, timeout=12)
         status = 0

@@ -3,9 +3,9 @@
 给 Pi **fullscreen 模式**的助手 Markdown 增加两类受控操作：
 
 - 代码块右下角 **[复制]**：左键复制逻辑源文，保留代码自身的缩进、Tab、空行和行尾空格；不复制围栏、Pi 显示缩进、右侧补空格或屏幕折行。
-- Markdown 链接：仅 **Ctrl + 鼠标左键**激活；普通点击不打开链接，拖选继续交给 Pi。公司本机点击让 Chrome/VS Code 显式请求新窗口；来自已验证 conley-Y9000p SSH 输入（直接 PTY 或 tmux 客户端）的点击在 Y9000p 用 `xdg-open` 调用默认浏览器（可能复用已有窗口或标签），公司文件则在 Y9000p 的 VS Code Remote-SSH 新窗口打开。
+- Markdown 链接：仅 **Ctrl + 鼠标左键**激活；普通点击不打开链接，拖选继续交给 Pi。公司本机点击让 Chrome/VS Code 显式请求新窗口；来自已验证 conley-Y9000p SSH 输入（直接 PTY 或 tmux 客户端）的网页点击解析 Y9000p 默认浏览器并显式请求新窗口，使 GNOME 把新 toplevel 放在用户当前 workspace；公司文件则在 Y9000p 的 VS Code Remote-SSH 新窗口打开。
 
-按下可执行目标时会反色，拖走、失焦、弹窗、滚动、尺寸变化或修饰键不匹配都会取消。不会承诺远端 X11/GNOME 窗口落在哪个 workspace。
+按下可执行目标时会反色，拖走、失焦、弹窗、滚动、尺寸变化或修饰键不匹配都会取消。只有上述 Y9000p 网页路径通过创建新 toplevel 来获得当前 workspace 放置；其他远端 X11/桌面路径不作 workspace 承诺。
 
 ## 使用：在点击来源的桌面打开
 
@@ -45,7 +45,18 @@ bash pi-agent/extensions/pi-copy-links/client/install.sh --replace
 
 接受绝对 `http://` 和 `https://` URL；查询参数和 fragment 原样作为浏览器数据，不解释为编辑器行号。空格、控制字符或无效 URL 会明确失败。
 
-**公司本机输入**核对默认浏览器是 `google-chrome.desktop` 后执行 `google-chrome-stable --new-window URL`，其他默认浏览器或非 Linux 平台会明确失败。**Y9000p SSH 输入**由笔记本的 `xdg-open URL` 交给其默认浏览器；这可能复用窗口或标签，不按公司侧 Chrome 新窗口策略运行。公司回环网址需先建立原端口、双回环地址都归助手所有的 SSH 转发；外部网址不需要转发。
+**公司本机输入**核对默认浏览器是 `google-chrome.desktop` 后执行 `google-chrome-stable --new-window URL`，其他默认浏览器或非 Linux 平台会明确失败。**Y9000p SSH 输入**在笔记本 GUI 环境执行 `xdg-settings get default-web-browser`，仅接受单个合法 desktop ID，并在 PREPARED 前确认对应可执行文件存在；COMMIT 后执行该浏览器的 `--new-window URL`，不会回退到 `xdg-open`。支持的 desktop ID/命令为：
+
+- `google-chrome.desktop` → `google-chrome-stable`
+- `google-chrome-beta.desktop` → `google-chrome-beta`
+- `google-chrome-unstable.desktop` → `google-chrome-unstable`
+- `chromium.desktop`、`chromium_chromium.desktop` → `chromium`
+- `chromium-browser.desktop` → `chromium-browser`
+- `firefox.desktop`、`firefox_firefox.desktop`、`firefox-esr.desktop` → `firefox`
+- `microsoft-edge.desktop` → `microsoft-edge-stable`
+- `brave-browser.desktop` → `brave-browser`
+
+未知/非法 desktop ID 或缺少映射后的可执行文件会在 PREPARED 前返回 `browser_unsupported`。浏览器进程在短暂 grace 内退出 0 表示请求已转交给运行中的实例；非零返回 `browser_failed`；grace 后仍运行表示它成为主浏览器进程，助手会交接而不会因超时杀死它。公司回环网址需先建立原端口、双回环地址都归助手所有的 SSH 转发；外部网址不需要转发。
 
 ### 公司文件和目录
 
@@ -86,7 +97,7 @@ code --new-window --goto -- /absolute/path:12:3
 
 **本机 MP4 预览需要单独安装 [VS Code 侧修复扩展](../../vscode-video-preview-repair/README.md)。** Code 1.135 的新建独立窗口可能先把 MP4 解析成二进制/文本编辑器；Pi 的通用启动参数不能指定自定义编辑器。修复扩展在目标 Code 窗口启动后仅对首个未修改的本地 MP4 文本标签调用 `vscode.openWith(..., 'vscode.videoPreview')`；它不随 Pi 扩展安装，不修改上述启动参数或 SSH 路由。
 
-在 Y9000p，文件与目录仍指向**公司机器**，由 `code --remote ssh-remote+conley-company --new-window` 配合明确的文件/目录 URI 打开；不会在笔记本本地查找同名路径。两侧的启动成功均只表示桌面接受请求，不保证窗口已经绘制或位于某个 workspace。
+在 Y9000p，文件与目录仍指向**公司机器**，由 `code --remote ssh-remote+conley-company --new-window` 配合明确的文件/目录 URI 打开；不会在笔记本本地查找同名路径。若同一文件夹已经在某个 VS Code 窗口中打开，VS Code 即使收到 `--new-window` 也可能聚焦那个已有窗口，因此它仍可能跳到该窗口所在的 workspace。两侧的启动成功均只表示桌面接受请求，不保证窗口已经绘制；Y9000p 网页的新 toplevel 由 GNOME 放到发起时的当前 workspace，最终可见性仍需用户实测。
 
 ### 源文分歧
 
@@ -125,7 +136,7 @@ Pi 在 lexing 前把 Tab 展开成三个空格，native href 还可能保留 cha
 
 公司回环网址保留原 URL、主机名和端口。`localhost` 源网址在发 SSH 前并行探测公司 `127.0.0.1`、`::1` 的原端口 TCP（不发 HTTP/TLS），共享 1.5 秒可中止期限；仅一边可达则选择该数字后端，两边可达按公司 OS 的 `localhost` 解析顺序选首个已验证地址，均不可达或解析不明确即失败。v2 请求只在 `localhost` 情况附加 `backendHost`；显式 `127.0.0.1`/`[::1]` 以其源 IP 为公司数字后端。助手用一个钉住 `ssh -G conley-company` 字面 IP/User/Port 的私有 SSH master，在 Y9000p 请求 **原端口**的 `-L localhost:<端口>:<数字公司后端>:<端口>`。对所有受支持的回环源，必须在同一次 `ss` 清单中证明 Y9000p 的 `127.0.0.1` 与 `::1` 原端口监听都归同一个 master PID；在 `PREPARED` 前和浏览器 handoff 前各复核一次。公司侧核对 `PREPARED`/最终回复的原 URL、数字后端和两端原端口。端口被其他监听器覆盖（包括任何单边占用）、无权绑定或 bind race 返回 `port_conflict`；不会接管、杀掉其他转发，不改写成替代端口/URL。旧单栈显式 IP record 不复用；无法覆盖同端口跳转目标的非标准 127/8、IPv4-mapped loopback 等地址会在打开前拒绝。
 
-这保证已验证的**初始端口**和同端口跳转到 `localhost` 时，两种标准浏览器回环地址都通往选定的公司后端；重定向到**其他端口或其他 authority** 尚不在这个所有权保证内。TCP 探测/隧道准备也不证明 HTTP 服务之后持续可用。外部网页不建公司回环隧道；文件/目录使用 VS Code Remote-SSH typed URI 与明确的 `--file-uri`/`--folder-uri`，请求 `--new-window`。公司本机 Chrome/Code 也只请求新窗口，不控制 GNOME Wayland 的最终 workspace；Y9000p 的默认浏览器由 `xdg-open` 在其 X11 桌面处理，可能复用已有窗口或标签，不能套用公司 Wayland 的窗口预期。
+这保证已验证的**初始端口**和同端口跳转到 `localhost` 时，两种标准浏览器回环地址都通往选定的公司后端；重定向到**其他端口或其他 authority** 尚不在这个所有权保证内。TCP 探测/隧道准备也不证明 HTTP 服务之后持续可用。外部网页不建公司回环隧道；文件/目录使用 VS Code Remote-SSH typed URI 与明确的 `--file-uri`/`--folder-uri`，请求 `--new-window`。公司本机 Chrome/Code 也只请求新窗口，不控制 GNOME Wayland 的最终 workspace。Y9000p 网页则由助手向受支持的默认浏览器显式发送 `--new-window`；Mutter 会把这个新 toplevel 放在当前 workspace，但是否获得焦点以及页面是否成功加载仍属于物理桌面验收边界。
 
 ## 开发者诊断与本地复现
 

@@ -33,6 +33,7 @@ from pathlib import Path
 import re
 import socket
 import sys
+import time
 
 name = Path(sys.argv[0]).name
 args = sys.argv[1:]
@@ -68,6 +69,12 @@ elif name == "xset":
     if state.get("xset_fail"):
         print("X11 authentication failed", file=sys.stderr)
         sys.exit(1)
+elif name == "xdg-settings":
+    assert args == ["get", "default-web-browser"]
+    if state.get("xdg_settings_fail"):
+        print("cannot read default browser", file=sys.stderr)
+        sys.exit(4)
+    print(state.get("default_browser", "google-chrome.desktop"))
 elif name == "ssh":
     if "-G" in args:
         if state.get("ssh_config_lines"):
@@ -178,9 +185,21 @@ elif name == "ss":
         process = 'users:(("ssh",pid=%s,fd=5))' % pid if pid else ""
         host = "[" + item["host"] + "]" if ":" in item["host"] else item["host"]
         print("LISTEN 0 128 %s:%d 0.0.0.0:* %s" % (host, item["port"], process))
-elif name in ("xdg-open", "code"):
+elif name == "xdg-open":
+    print("xdg-open must never be called", file=sys.stderr)
+    sys.exit(99)
+elif name in ("google-chrome-stable", "google-chrome-beta", "google-chrome-unstable",
+              "chromium", "chromium-browser", "firefox", "microsoft-edge-stable",
+              "brave-browser"):
     if state.get(name + "_fail"):
-        print(name + " GUI failure", file=sys.stderr)
+        sys.exit(5)
+    if state.get("browser_sleep"):
+        state["browser_pid"] = os.getpid()
+        save()
+        time.sleep(state["browser_sleep"])
+elif name == "code":
+    if state.get("code_fail"):
+        print("code GUI failure", file=sys.stderr)
         sys.exit(5)
 else:
     sys.exit(11)
@@ -199,8 +218,10 @@ class HelperCase(unittest.TestCase):
         fake = self.bin / "fake"
         fake.write_text(FAKE.replace("#!PYTHON", "#!" + sys.executable))
         fake.chmod(0o755)
-        for name in ("ssh", "ss", "systemctl", "loginctl", "xset", "xdg-open", "code"):
+        for name in ("ssh", "ss", "systemctl", "loginctl", "xset", "xdg-settings", "xdg-open",
+                     "google-chrome-stable", "firefox", "code"):
             (self.bin / name).symlink_to(fake)
+        (self.bin / "python3").symlink_to(sys.executable)
         self.state_path = self.root / "state.json"
         self.log_path = self.root / "log.jsonl"
         self.state = {"next_pid": 4001, "masters": {}, "listeners": []}
@@ -210,6 +231,9 @@ class HelperCase(unittest.TestCase):
                          "FAKE_STATE": str(self.state_path), "FAKE_LOG": str(self.log_path),
                          "TEST_RUNTIME": str(self.runtime), "DISPLAY": ":99",
                          "XAUTHORITY": "/wrong/ssh/authority", "HOME": str(self.root)})
+
+    def tearDown(self):
+        self.assertFalse(self.calls("xdg-open"), "xdg-open tripwire was called")
 
     def save(self):
         self.state_path.write_text(json.dumps(self.state))
@@ -223,8 +247,15 @@ class HelperCase(unittest.TestCase):
             found = [item for item in found if operation in item["args"]]
         return found
 
-    def start(self, request):
-        process = subprocess.Popen([str(HELPER)], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+    def start(self, request, *, browser_grace=None):
+        command = [str(HELPER)]
+        if browser_grace is not None:
+            wrapper = ("import runpy,sys; "
+                       f"module=runpy.run_path({str(HELPER)!r}); "
+                       f"module['launch_browser'].__globals__['BROWSER_LAUNCH_GRACE_SECONDS']={browser_grace!r}; "
+                       "sys.exit(module['main']())")
+            command = [sys.executable, "-c", wrapper]
+        process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                    stderr=subprocess.PIPE, env=self.env)
         data = {"phase": "request", "prepareDeadlineMs": 15000, **request, "version": 2}
         process.stdin.write(json.dumps(data).encode() + b"\n")
@@ -273,7 +304,7 @@ class HelperCase(unittest.TestCase):
         self.assertEqual(first["openedUrl"], original)
         self.assertEqual(first["tunnel"], {"remoteHost": "127.0.0.1", "remotePort": 8743,
                                             "localPort": 8743, "reused": False})
-        self.assertEqual(self.calls("xdg-open")[-1]["args"], [original])
+        self.assertEqual(self.calls("google-chrome-stable")[-1]["args"], ["--new-window", original])
         self.assertEqual(self.calls("xset")[-1]["display"], ":1")
         self.assertEqual(self.calls("xset")[-1]["authority"], str(self.runtime / "Xauthority"))
         status, again = self.web("http://127.0.0.1:8743/other?still=1#yes")
@@ -330,7 +361,7 @@ class HelperCase(unittest.TestCase):
                 status, result = self.web(f"http://127.0.0.1:{port}/start")
                 self.assertEqual((status, result["error"]["code"]), (1, "port_conflict"))
                 self.assertIn("remove the conflicting listener", result["error"]["message"])
-                self.assertFalse(self.calls("xdg-open"))
+                self.assertFalse(self.calls("google-chrome-stable"))
                 self.assertFalse(self.calls("ssh", "-M"))
                 self.assertFalse(self.calls("ssh", "forward"))
                 company_server.shutdown()
@@ -361,7 +392,7 @@ class HelperCase(unittest.TestCase):
         self.assertEqual((status, result["error"]["code"]), (1, "port_conflict"))
         self.assertEqual(len(self.calls("ssh", "forward")), 1)
         self.assertEqual(len(self.calls("ssh", "exit")), 1)
-        self.assertFalse(self.calls("xdg-open"))
+        self.assertFalse(self.calls("google-chrome-stable"))
 
     def test_simultaneous_requests_are_serialized(self):
         processes = [self.start({"action": "open-web", "url": "http://127.0.0.1:8743/same"}) for _ in range(2)]
@@ -380,7 +411,7 @@ class HelperCase(unittest.TestCase):
         status, result = self.web("http://127.0.0.1:8743/again")
         self.assertEqual(status, 1)
         self.assertEqual(result["error"]["code"], "port_conflict")
-        self.assertEqual(len(self.calls("xdg-open")), 1)
+        self.assertEqual(len(self.calls("google-chrome-stable")), 1)
         self.assertEqual(len(self.calls("ssh", "-M")), 1)
 
     def test_old_or_alternate_record_cannot_be_reused_as_original_origin(self):
@@ -397,7 +428,7 @@ class HelperCase(unittest.TestCase):
                 record.write_text(json.dumps({**original, **mutation}))
                 status, result = self.web("http://127.0.0.1:8743/reuse")
                 self.assertEqual((status, result["error"]["code"]), (1, code))
-        self.assertEqual(len(self.calls("xdg-open")), 1)
+        self.assertEqual(len(self.calls("google-chrome-stable")), 1)
         self.assertEqual(len(self.calls("ssh", "-M")), 1)
 
     def test_master_pins_snapshot_when_alias_changes_before_creation(self):
@@ -422,7 +453,8 @@ class HelperCase(unittest.TestCase):
         self.assertIn("\nstricthostkeychecking true\n", "\n" + effective)
         self.assertIn(f"\nidentityfile {identity_file}\n", "\n" + effective)
         self.assertIn("HostName 203.0.113.88", config.read_text())
-        self.assertEqual(self.calls("xdg-open")[-1]["args"], ["http://127.0.0.1:8743/pin"])
+        self.assertEqual(self.calls("google-chrome-stable")[-1]["args"],
+                         ["--new-window", "http://127.0.0.1:8743/pin"])
 
     def test_noncomparable_ssh_identity_fails_before_master_or_browser(self):
         for config in ("hostname company.example\nuser conley\nport 22",
@@ -435,20 +467,20 @@ class HelperCase(unittest.TestCase):
                 status, result = self.web("http://127.0.0.1:8743/no-identity")
                 self.assertEqual((status, result["error"]["code"]), (1, "ssh_config_failed"))
         self.assertFalse(self.calls("ssh", "-M"))
-        self.assertFalse(self.calls("xdg-open"))
+        self.assertFalse(self.calls("google-chrome-stable"))
 
     def test_ssh_failure_and_forward_failure_do_not_launch_browser(self):
         self.state["master_fail"] = True
         self.save()
         status, result = self.web("http://127.0.0.1:8743/")
         self.assertEqual((status, result["error"]["code"]), (1, "ssh_master_failed"))
-        self.assertFalse(self.calls("xdg-open"))
+        self.assertFalse(self.calls("google-chrome-stable"))
         self.state.pop("master_fail")
         self.state["forward_fail"] = True
         self.save()
         status, result = self.web("http://127.0.0.1:8743/")
         self.assertEqual((status, result["error"]["code"]), (1, "ssh_forward_failed"))
-        self.assertFalse(self.calls("xdg-open"))
+        self.assertFalse(self.calls("google-chrome-stable"))
         self.assertEqual(len(self.calls("ssh", "exit")), 1)
 
     def test_successful_mux_reply_without_listener_does_not_open_browser(self):
@@ -456,25 +488,104 @@ class HelperCase(unittest.TestCase):
         self.save()
         status, result = self.web("http://127.0.0.1:8743/")
         self.assertEqual((status, result["error"]["code"]), (1, "tunnel_unverified"))
-        self.assertFalse(self.calls("xdg-open"))
+        self.assertFalse(self.calls("google-chrome-stable"))
         self.assertEqual(len(self.calls("ssh", "exit")), 1)
 
-    def test_no_launch_without_gui_and_explicit_desktop_errors(self):
+    def test_no_launch_without_gui_and_explicit_code_error(self):
         self.state["gui_missing"] = True
         self.save()
         status, result = self.web("http://127.0.0.1:8743/")
         self.assertEqual((status, result["error"]["code"]), (1, "gui_unavailable"))
         self.assertFalse(self.calls("ssh"))
+        self.assertFalse(self.calls("xdg-settings"))
         self.state.pop("gui_missing")
-        self.state["xdg-open_fail"] = True
-        self.save()
-        status, result = self.web("https://example.org/")
-        self.assertEqual((status, result["error"]["code"]), (1, "browser_failed"))
-        self.state.pop("xdg-open_fail")
         self.state["code_fail"] = True
         self.save()
         status, result = self.invoke({"version": 1, "action": "open-file", "kind": "file", "path": "/srv/source.py"})
         self.assertEqual((status, result["error"]["code"]), (1, "code_failed"))
+
+    def test_default_chrome_opens_a_new_window_only_after_commit(self):
+        url = "https://example.org/chrome"
+        process = self.start({"action": "open-web", "url": url})
+        prepared = json.loads(process.stdout.readline())
+        self.assertEqual(prepared["phase"], "prepared", prepared)
+        self.assertEqual(self.calls("xdg-settings")[-1]["args"], ["get", "default-web-browser"])
+        self.assertFalse(self.calls("google-chrome-stable"))
+        status, result = self.finish(process, prepared)
+        self.assertEqual(status, 0, result)
+        self.assertEqual(self.calls("google-chrome-stable")[-1]["args"], ["--new-window", url])
+
+    def test_firefox_default_opens_a_new_window(self):
+        self.state["default_browser"] = "firefox.desktop"
+        self.save()
+        url = "https://example.org/firefox"
+        status, result = self.web(url)
+        self.assertEqual(status, 0, result)
+        self.assertEqual(self.calls("firefox")[-1]["args"], ["--new-window", url])
+        self.assertFalse(self.calls("google-chrome-stable"))
+
+    def test_unknown_missing_and_invalid_default_browser_fail_before_prepared(self):
+        cases = [
+            ("unknown", "org.gnome.Epiphany.desktop", False),
+            ("missing", "google-chrome.desktop", True),
+            ("empty", "", False),
+            ("multiple", "google-chrome.desktop\nfirefox.desktop", False),
+            ("invalid", "../google-chrome.desktop", False),
+        ]
+        for name, desktop_id, missing_binary in cases:
+            with self.subTest(name=name):
+                self.state["default_browser"] = desktop_id
+                self.save()
+                if missing_binary:
+                    (self.bin / "google-chrome-stable").unlink()
+                    self.env["PATH"] = str(self.bin)
+                try:
+                    status, result = self.web("https://example.org/unsupported")
+                    self.assertEqual((status, result["phase"], result["error"]["code"]),
+                                     (1, "result", "browser_unsupported"), result)
+                    self.assertIn(desktop_id[:20] if desktop_id else "desktop id",
+                                  result["error"]["message"])
+                    self.assertFalse(self.calls("google-chrome-stable"))
+                    self.assertFalse(self.calls("firefox"))
+                    self.assertFalse(self.calls("ssh"))
+                finally:
+                    if missing_binary:
+                        (self.bin / "google-chrome-stable").symlink_to(self.bin / "fake")
+                        self.env["PATH"] = str(self.bin) + ":" + os.environ["PATH"]
+
+    def test_browser_nonzero_exit_is_reported_after_commit(self):
+        self.state["google-chrome-stable_fail"] = True
+        self.save()
+        process = self.start({"action": "open-web", "url": "https://example.org/fail"})
+        prepared = json.loads(process.stdout.readline())
+        self.assertEqual(prepared["phase"], "prepared", prepared)
+        status, result = self.finish(process, prepared)
+        self.assertEqual((status, result["error"]["code"]), (1, "browser_failed"))
+        self.assertEqual(len(self.calls("google-chrome-stable")), 1)
+
+    def test_long_lived_browser_is_handed_off_without_being_killed(self):
+        self.state["browser_sleep"] = 30
+        self.save()
+        process = self.start({"action": "open-web", "url": "https://example.org/primary"},
+                             browser_grace=0.05)
+        prepared = json.loads(process.stdout.readline())
+        self.assertEqual(prepared["phase"], "prepared", prepared)
+        status, result = self.finish(process, prepared)
+        self.assertEqual(status, 0, result)
+        browser_pid = json.loads(self.state_path.read_text())["browser_pid"]
+        browser_stat = Path(f"/proc/{browser_pid}/stat")
+        try:
+            self.assertTrue(browser_stat.exists(), "browser was killed at the grace deadline")
+            process_state = browser_stat.read_text().split(") ", 1)[1].split()[0]
+            self.assertNotIn(process_state, ("Z", "X"), "browser was not alive after helper success")
+        finally:
+            try:
+                os.killpg(browser_pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            until = time.monotonic() + 2
+            while browser_stat.exists() and time.monotonic() < until:
+                time.sleep(0.01)
 
     def test_multiple_active_graphical_sessions_fail_before_launch(self):
         self.state["ambiguous_gui"] = True
@@ -482,7 +593,7 @@ class HelperCase(unittest.TestCase):
         status, result = self.web("http://127.0.0.1:8743/")
         self.assertEqual((status, result["error"]["code"]), (1, "gui_unavailable"))
         self.assertFalse(self.calls("ssh"))
-        self.assertFalse(self.calls("xdg-open"))
+        self.assertFalse(self.calls("google-chrome-stable"))
 
     def test_file_kind_uri_argv_preserves_remote_paths_and_location(self):
         prefix = "vscode-remote://ssh-remote+conley-company"
@@ -496,7 +607,7 @@ class HelperCase(unittest.TestCase):
                          ["--remote", "ssh-remote+conley-company", "--new-window", "--goto",
                           "--file-uri", prefix + quote(path, safe="/") + ":31:7"])
         self.assertFalse(self.calls("ssh"))
-        self.assertFalse(self.calls("xdg-open"))
+        self.assertFalse(self.calls("google-chrome-stable"))
         for name in ("Makefile", "Dockerfile", "README"):
             path = "/company/" + name
             status, _ = self.invoke({"version": 1, "action": "open-file", "kind": "file", "path": path})
@@ -569,10 +680,10 @@ class HelperCase(unittest.TestCase):
             self.assertEqual(result["tunnel"]["remotePort"], 80)
             self.assertEqual(result["tunnel"]["localPort"], 80)
             self.assertEqual(result["openedUrl"], original)
-            self.assertEqual(self.calls("xdg-open")[-1]["args"], [original])
+            self.assertEqual(self.calls("google-chrome-stable")[-1]["args"], ["--new-window", original])
         else:
             self.assertEqual((status, result["error"]["code"]), (1, "port_conflict"))
-            self.assertFalse(self.calls("xdg-open"))
+            self.assertFalse(self.calls("google-chrome-stable"))
 
     def test_ipv6_loopback_binds_both_families_to_ipv6_backend(self):
         status, result = self.web("http://[::1]:8743/hello?x=1#f")
@@ -622,12 +733,12 @@ class HelperCase(unittest.TestCase):
                 self.assertEqual({item["host"] for item in exact}, {"127.0.0.1", "::1"})
                 self.assertEqual({item["pid"] for item in exact}, {matching[0]["pid"]})
                 self.assertEqual({item["remote_host"] for item in exact}, {backend})
-                self.assertFalse(any(call["args"] == [url] for call in self.calls("xdg-open")))
+                self.assertFalse(any(call["args"] == ["--new-window", url] for call in self.calls("google-chrome-stable")))
                 status, result = self.finish(process, prepared)
                 self.assertEqual(status, 0, result)
                 self.assertEqual(result["openedUrl"], url)
                 self.assertEqual(result["tunnel"], prepared["tunnel"])
-                self.assertEqual(self.calls("xdg-open")[-1]["args"], [url])
+                self.assertEqual(self.calls("google-chrome-stable")[-1]["args"], ["--new-window", url])
                 expected = f"localhost:{port}:{'[' + backend + ']' if ':' in backend else backend}:{port}"
                 self.assertIn(expected, self.calls("ssh", "forward")[-1]["args"])
         self.assertEqual(len(self.calls("ssh", "-M")), 2)
@@ -684,7 +795,7 @@ class HelperCase(unittest.TestCase):
                                      (1, "result", "port_conflict"))
                     self.assertIn("remove the conflicting listener", result["error"]["message"])
                     self.assertFalse(self.calls("ssh", "-M"))
-                    self.assertFalse(self.calls("xdg-open"))
+                    self.assertFalse(self.calls("google-chrome-stable"))
                 finally:
                     company.shutdown(); thread.join(timeout=2)
 
@@ -695,7 +806,7 @@ class HelperCase(unittest.TestCase):
         self.assertEqual((status, result["phase"], result["error"]["code"]),
                          (1, "result", "port_conflict"))
         self.assertFalse(self.calls("ssh", "-M"))
-        self.assertFalse(self.calls("xdg-open"))
+        self.assertFalse(self.calls("google-chrome-stable"))
 
     def test_explicit_ip_opposite_family_bind_race_and_precommit_takeover(self):
         for source, other, port in (("127.0.0.1", "::1", 8761),
@@ -708,7 +819,7 @@ class HelperCase(unittest.TestCase):
                 status, result = self.web(url)
                 self.assertEqual((status, result["error"]["code"]), (1, "port_conflict"))
                 self.assertIn("remove the conflicting listener", result["error"]["message"])
-                self.assertFalse(self.calls("xdg-open"))
+                self.assertFalse(self.calls("google-chrome-stable"))
                 raced = json.loads(self.state_path.read_text())["listeners"]
                 self.assertEqual([(item["host"], item["port"], item["pid"]) for item in raced],
                                  [(other, port, 999)])
@@ -729,7 +840,7 @@ class HelperCase(unittest.TestCase):
                 self.save()
                 status, result = self.finish(process, prepared)
                 self.assertEqual((status, result["error"]["code"]), (1, "port_conflict"))
-                self.assertFalse(self.calls("xdg-open"))
+                self.assertFalse(self.calls("google-chrome-stable"))
 
     def test_explicit_ip_redirect_reaches_company_on_opposite_family(self):
         # Fake SSH attests its requested -L and PID ownership; these local HTTP
@@ -776,13 +887,13 @@ class HelperCase(unittest.TestCase):
                                 thread.start()
                             try:
                                 url = f"http://{source}:{port}/start"
-                                opened_before = len(self.calls("xdg-open"))
+                                opened_before = len(self.calls("google-chrome-stable"))
                                 process = self.start({"action": "open-web", "url": url})
                                 prepared = json.loads(process.stdout.readline())
                                 self.assertEqual(prepared["phase"], "prepared", prepared)
                                 self.assertEqual(prepared["openedUrl"], url)
                                 self.assertEqual(prepared["tunnel"]["remoteHost"], backend)
-                                self.assertEqual(len(self.calls("xdg-open")), opened_before)
+                                self.assertEqual(len(self.calls("google-chrome-stable")), opened_before)
                                 listener_state = json.loads(self.state_path.read_text())["listeners"]
                                 exact = [item for item in listener_state if item["port"] == port]
                                 self.assertEqual(len(exact), 2)
@@ -794,7 +905,7 @@ class HelperCase(unittest.TestCase):
                                 self.assertIn(f"localhost:{port}:{destination}:{port}", forward)
                                 status, result = self.finish(process, prepared)
                                 self.assertEqual(status, 0, result)
-                                self.assertEqual(self.calls("xdg-open")[-1]["args"], [url])
+                                self.assertEqual(self.calls("google-chrome-stable")[-1]["args"], ["--new-window", url])
 
                                 first = http.client.HTTPConnection(backend, port, timeout=2)
                                 first.request("GET", "/start", headers={"Host": f"{source}:{port}"})
@@ -830,7 +941,7 @@ class HelperCase(unittest.TestCase):
                 self.assertEqual(original["endpoint"], {"host": backend, "port": port,
                                                          "backendHost": backend})
                 self.assertEqual(self.web(f"http://{source}:{port}/again")[1]["tunnel"]["reused"], True)
-                opened = len(self.calls("xdg-open"))
+                opened = len(self.calls("google-chrome-stable"))
                 for mutation in ({"version": 2}, {"version": 3},
                                  {"endpoint": {"host": backend, "port": port}},
                                  {"endpoint": {**original["endpoint"],
@@ -839,7 +950,7 @@ class HelperCase(unittest.TestCase):
                     failed, reply = self.web(url)
                     self.assertEqual((failed, reply["error"]["code"]), (1, "tunnel_unverified"))
                 record.write_text(json.dumps(original))
-                self.assertEqual(len(self.calls("xdg-open")), opened)
+                self.assertEqual(len(self.calls("google-chrome-stable")), opened)
                 self.assertFalse(self.calls("ssh", "exit"))
 
     def test_explicit_ip_other_source_family_cannot_reuse_owned_pair(self):
@@ -848,7 +959,7 @@ class HelperCase(unittest.TestCase):
         self.assertEqual((status, result["error"]["code"]), (1, "port_conflict"))
         self.assertEqual(len(self.calls("ssh", "-M")), 1)
         self.assertEqual(len(self.calls("ssh", "forward")), 1)
-        self.assertEqual(len(self.calls("xdg-open")), 1)
+        self.assertEqual(len(self.calls("google-chrome-stable")), 1)
 
     def test_localhost_any_covered_family_collision_is_port_conflict(self):
         for host in ("127.0.0.1", "::1", "::ffff:7f00:1", "0.0.0.0", "::"):
@@ -857,7 +968,7 @@ class HelperCase(unittest.TestCase):
                 self.save()
                 status, result = self.web("http://localhost:8795/start", backend_host="::1")
                 self.assertEqual((status, result["error"]["code"]), (1, "port_conflict"))
-        self.assertFalse(self.calls("xdg-open"))
+        self.assertFalse(self.calls("google-chrome-stable"))
         self.assertFalse(self.calls("ssh", "-M"))
         self.assertFalse(self.calls("code"))
 
@@ -880,7 +991,7 @@ class HelperCase(unittest.TestCase):
                 state = json.loads(self.state_path.read_text())
                 self.assertTrue(all(not item["alive"] for item in state["masters"].values()))
                 self.assertFalse(list((self.runtime / "pi-client-link-helper").glob("e-*.json")))
-                self.assertFalse(self.calls("xdg-open"))
+                self.assertFalse(self.calls("google-chrome-stable"))
                 if "race_port" in mutation:
                     self.assertEqual(state["listeners"], [{"host": "::1", "port": 8744, "pid": 999}])
         self.assertFalse(self.calls("code"))
@@ -903,20 +1014,20 @@ class HelperCase(unittest.TestCase):
         self.assertEqual(len(self.calls("ssh", "-M")), 1)
         self.assertEqual(len(self.calls("ssh", "forward")), 1)
         self.assertFalse(self.calls("ssh", "exit"))
-        self.assertEqual(len(self.calls("xdg-open")), 2)
+        self.assertEqual(len(self.calls("google-chrome-stable")), 2)
 
     def test_localhost_precommit_cancel_and_listener_loss_never_launch(self):
         request = {"action": "open-web", "url": "https://localhost:8745/a?x=1#f", "backendHost": "::1"}
         process = self.start(request)
         prepared = json.loads(process.stdout.readline())
         self.assertEqual(prepared["phase"], "prepared", prepared)
-        self.assertFalse(self.calls("xdg-open"))
+        self.assertFalse(self.calls("google-chrome-stable"))
         process.stdin.close()
         aborted = json.loads(process.stdout.readline())
         self.assertEqual(aborted["error"]["code"], "request_aborted")
         self.assertNotEqual(process.wait(timeout=5), 0)
         process.stdout.close(); process.stderr.close()
-        self.assertFalse(self.calls("xdg-open"))
+        self.assertFalse(self.calls("google-chrome-stable"))
         process = self.start(request)
         prepared = json.loads(process.stdout.readline())
         self.assertTrue(prepared["tunnel"]["reused"])
@@ -926,7 +1037,7 @@ class HelperCase(unittest.TestCase):
         self.save()
         status, result = self.finish(process, prepared)
         self.assertEqual((status, result["error"]["code"]), (1, "tunnel_unverified"))
-        self.assertFalse(self.calls("xdg-open"))
+        self.assertFalse(self.calls("google-chrome-stable"))
         self.assertFalse(self.calls("ssh", "exit"))
 
     def test_browser_normalized_loopback_cannot_open_local_decoy(self):
@@ -939,7 +1050,7 @@ class HelperCase(unittest.TestCase):
                 status, result = self.web(url)
                 self.assertEqual(status, 1)
                 self.assertEqual(result["error"]["code"], "unsupported_target")
-        self.assertFalse(self.calls("xdg-open"))
+        self.assertFalse(self.calls("google-chrome-stable"))
         self.assertFalse(self.calls("ssh"))
         self.assertFalse(self.calls("systemctl"))
 
@@ -953,17 +1064,17 @@ class HelperCase(unittest.TestCase):
         self.state = json.loads(self.state_path.read_text())
         self.state["listeners"].append({"host": "127.0.0.1", "port": 8795, "pid": 999})
         self.save()
-        opened = len(self.calls("xdg-open"))
+        opened = len(self.calls("google-chrome-stable"))
         status, collision = self.web("http://127.0.0.1:8795/collision")
         self.assertEqual((status, collision["error"]["code"]), (1, "port_conflict"))
-        self.assertEqual(len(self.calls("xdg-open")), opened)
+        self.assertEqual(len(self.calls("google-chrome-stable")), opened)
         self.state = json.loads(self.state_path.read_text())
         self.state["environment_padding"] = 1_100_000
         self.save()
-        opened = len(self.calls("xdg-open"))
+        opened = len(self.calls("google-chrome-stable"))
         status, overflow = self.web("https://example.org/")
         self.assertEqual((status, overflow["error"]["code"]), (1, "command_output_overflow"))
-        self.assertEqual(len(self.calls("xdg-open")), opened)
+        self.assertEqual(len(self.calls("google-chrome-stable")), opened)
 
     def test_reject_malformed_targets_without_side_effect(self):
         requests = [
@@ -1039,11 +1150,11 @@ class HelperCase(unittest.TestCase):
             finally:
                 fcntl.flock(lock, fcntl.LOCK_UN)
                 process.wait(timeout=5)
-        self.assertFalse(self.calls("xdg-open"))
+        self.assertFalse(self.calls("google-chrome-stable"))
         self.assertFalse(self.calls("ssh", "forward"))
 
     def test_web_and_file_launch_exactly_once_only_after_matching_commit(self):
-        for request, opener in [({"action": "open-web", "url": "http://127.0.0.1:8743/commit"}, "xdg-open"),
+        for request, opener in [({"action": "open-web", "url": "http://127.0.0.1:8743/commit"}, "google-chrome-stable"),
                                 ({"action": "open-file", "kind": "file", "path": "/company/README"}, "code")]:
             with self.subTest(opener=opener):
                 before = len(self.calls(opener))
@@ -1058,7 +1169,7 @@ class HelperCase(unittest.TestCase):
                 self.assertEqual(len(self.calls(opener)), before + 1)
 
     def test_prepared_disconnect_and_bad_commit_never_launch_web_or_code(self):
-        for request, opener in [({"action": "open-web", "url": "http://127.0.0.1:8743/x"}, "xdg-open"),
+        for request, opener in [({"action": "open-web", "url": "http://127.0.0.1:8743/x"}, "google-chrome-stable"),
                                 ({"action": "open-file", "kind": "file", "path": "/company/file"}, "code")]:
             with self.subTest(opener=opener):
                 before = len(self.calls(opener))
@@ -1097,7 +1208,7 @@ class HelperCase(unittest.TestCase):
         self.assertEqual(result["error"]["code"], "invalid_commit")
         self.assertNotEqual(process.wait(timeout=5), 0)
         process.stdin.close(); process.stdout.close(); process.stderr.close()
-        self.assertFalse(self.calls("xdg-open"))
+        self.assertFalse(self.calls("google-chrome-stable"))
         # GUI preflight spawns several programs before PREPARED. Give it a
         # realistic budget, then let the helper's commit-wait deadline expire.
         process = self.start({**request, "prepareDeadlineMs": 5000})
@@ -1107,7 +1218,7 @@ class HelperCase(unittest.TestCase):
         self.assertEqual(result["error"]["code"], "request_timeout")
         self.assertNotEqual(process.wait(timeout=5), 0)
         process.stdin.close(); process.stdout.close(); process.stderr.close()
-        self.assertFalse(self.calls("xdg-open"))
+        self.assertFalse(self.calls("google-chrome-stable"))
         directory = self.runtime / "pi-client-link-helper"
         directory.mkdir(mode=0o700, exist_ok=True)
         with (directory / "lock").open("w") as lock:
@@ -1119,7 +1230,7 @@ class HelperCase(unittest.TestCase):
             self.assertEqual(result["error"]["code"], "request_timeout")
             self.assertNotEqual(process.wait(timeout=5), 0)
             process.stdin.close(); process.stdout.close(); process.stderr.close()
-        self.assertFalse(self.calls("xdg-open"))
+        self.assertFalse(self.calls("google-chrome-stable"))
 
     def test_installer_only_owns_a_symlink_and_refuses_foreign_target(self):
         installer = MODULE / "install.sh"
