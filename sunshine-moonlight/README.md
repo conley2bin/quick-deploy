@@ -71,7 +71,7 @@ quick-deploy-display-control --enroll
 
 | 路径 | 归属/含义 |
 |---|---|
-| `.local/share/quick-deploy/display-control/versions/v1-<source-sha256>/` | 当前用户0700；独立 controller 版本，代码与 `.owned.json` 为0600 |
+| `.local/share/quick-deploy/display-control/versions/v1-<code-and-settings-sha256>/` | 当前用户0700；独立 controller 版本，代码与 `.owned.json` 为0600 |
 | 版本内 `host-settings.json` | 当前用户0600；schema2 的 qualified build、config/apps/assets、UUID/base、runtime user/home/unit 和固定 state 路径 |
 | `.local/share/quick-deploy/display-control/active/00000001.json` 等 | 当前用户0600；连续、create-only active 记录，最后完整记录指向当前版本，无易被覆盖的 symlink |
 | `.local/share/quick-deploy/display-control/state/` | 唯一当前用户0700 state；永久 lock、reservation、operation、StartReceipt、prepare backup，跨版本保留 |
@@ -81,6 +81,19 @@ quick-deploy-display-control --enroll
 重新运行独立安装器会再次独立资格检查；相同代码不重写，代码更新发布新版本/active 记录，保留有效 settings 原始字节及 state 的 bytes/权限/mtime/inode，不重新 enrollment、不清除能力或 receipt。冲突、腐坏、不完整或未知的中断发布显式停止，等待可信人工核对，不自动迁移/重置。官方 Sunshine 更新不会覆盖这些 companion-owned 文件；改变 vendor bytes 后必须重新取得兼容资格，旧 receipt 不能冒充新进程的证明。安装器不读写个人 `machines.yaml` 或遗留清单。
 
 首次发布是 **UNENROLLED**：没有收养已有串流，也没有签发受控启动 receipt。`--enroll` 必须从主机用户的交互终端调用，使用 `/dev/tty` 的 `ENROLL` 独占确认与新鲜 idle 事实；busy/非受管串流阻止 enrollment。普通 stdin RPC 即使提交 `action=enroll` 也拒绝，FREE 不会自动 enrollment。重新安装不重演仪式。后续必要的 idle restart/receipt 属于已预约的准备操作，不属于安装阶段；不要在受管预约中并行运行下文的手动改输出/重启步骤。
+
+**实例 UUID 变化的本地对账**：Sunshine 在官方配对时保存实例 UUID；未保存时重启会生成另一个 UUID。控制器报告 `host_identity_changed` 会立即停止，保留原预约与准备证据，不自动接受新的 endpoint 身份。先在客户端用官方 Moonlight 与**当前** Sunshine 完成手工 PIN 配对，并用新的普通 `moonlight list` 确认唯一 Desktop；这只是配对确认，不是释放原预约的证明。随后由运行 Sunshine 的用户在主机本地终端执行：
+
+```bash
+./commands/install-display-control.sh --reconcile-host-identity
+# 按提示确认独占、无已有/在途非受管串流、无并行管理员改动、已完成官方配对，输入 REBIND。
+# 成功后仍需独占登记，不会自动接管：
+quick-deploy-display-control --enroll
+```
+
+此入口只接受 `reconciliation_required/runtime_changed`、已登记的 `restart_intent`、本次预约未 launch/观察 active、旧预约进程已退休、没有该重启的新 receipt 的窄情形。参考包和加载的 unit/argv/binary/config、当前进程出生证据、配置摘要与准备记录、新 UUID 的空闲公开 endpoint，以及旧/新 settings **仅 UUID 不同**均须验证；`/proc/exe` 和配置环境无法验证时拒绝。确认后完整重采样，任何不一致均不改记录。FREE/currentgame0 只是其中一项，不能单独释放。
+
+成功对账先持久化永久、绑定新旧 UUID/进程/文件的事务证据，再用 rename 把原 operation/reservation/backup/旧 receipt 保留为 `.bak`（原字节、inode、权限和 mtime），所有永久锁 inode 保留，发布新 UUID 的 **UNENROLLED** 基线。若在已持久化步骤间中断，显式重复同一命令只在事务绑定的精确事实不变时继续；漂移、未知/部分写入的文件或不同代码均停止，不删除记录。普通安装没有此 flag 仍严格拒绝 host/settings 冲突。对账和登记不重启、不修改 Sunshine 配置；后续正常受控准备重启保持相同 UUID 才证明官方配对的持久化生效，保存失败仍会再次拒绝。
 
 独立伴随安装不改 Sunshine 配置、vendor unit、retry 策略、sshd 或设备，不启动/reload/restart/cancel 服务。`NeedDaemonReload=yes` 是实际拒绝条件：本入口不发布 unit，因此不会为了通过资格检查而 reload。应先核实真正的待加载定义及维护权限；不能绕过 guard，更不能用服务重启伪造 readiness。现有 vendor 安装器本身仍可能因包/配置变化重启活动 Sunshine，使用它前须安排获准的维护窗口。
 
@@ -93,7 +106,7 @@ cd ~/quick-deploy/sunshine-moonlight
 
 首次使用 A 时，在浏览器打开它的 Web UI，核对地址后接受自签名证书提示并设置 Sunshine 管理员凭据。随后按第 3 节填写清单并运行连接器；不必先在 Moonlight GUI 添加主机或启动 Desktop。
 
-连接器在选屏、准备输出之后查询配对状态。只有官方客户端明确报告未配对时，才生成随机 4 位 PIN、打印 A 的 Web UI 地址与操作步骤，并运行官方 `pair`。你在 A 的 **PIN** 页面核对待配对客户端及来源地址，输入终端显示的 PIN。配对进程返回后再次查询确认；退出0不能替代确认。浏览器始终由你操作，连接器不打开或自动填写网页。
+连接器取得主机预约后、选屏和准备输出前查询配对状态，配对全过程留在 SELECTING 预约内；忙碌主机会在任何配对前拒绝。只有官方客户端明确报告未配对时，才生成随机 4 位 PIN、打印 A 的 Web UI 地址与操作步骤，并运行官方 `pair`。你在 A 的 **PIN** 页面核对待配对客户端及来源地址，输入终端显示的 PIN。配对进程返回后再次查询确认；退出0不能替代确认。浏览器始终由你操作，连接器不打开或自动填写网页。
 
 受管连接统一从连接器发起；不要同时用 Moonlight GUI、其它客户端或手工命令启动、恢复或切换串流。已有手工串流不会被收养或关闭；切换到受管流程前须由原操作者结束它，再在获准的空闲窗口登记主机控制器。
 
@@ -132,9 +145,9 @@ A 已完成伴随安装、固定 SSH shim 发布和本地独占登记后，在 B
 ```
 
 1. 通过正常系统 SSH 调用 A 的固定控制器，读取当次连接的屏幕身份、当前物理尺寸和刷新率。忙碌、未登记或预约不确定时停止，不接管其它会话。
-2. 取得主机预约后显示菜单：**上下箭头选择（左右箭头同义）、Enter 确认、Esc 取消**。菜单按主机返回的记录顺序循环移动，不代表物理摆放；不可用屏幕也可移到并查看原因，但不能确认；没有交互终端或数据失效时不默认选第一屏。拓扑变化会刷新菜单并要求重新选择。
+2. 取得主机预约后先执行官方 `list` → 明确未配对才手工 PIN/`pair` → 新 `list`，确认唯一大小写不敏感 Desktop 标题。官方配对会保存 Sunshine 实例 UUID，因此配对检查必须在准备重启前完成；配对/QPA 失败时以新鲜原所有权证据取消未改动的预约。随后显示菜单：**上下箭头选择（左右箭头同义）、Enter 确认、Esc 取消**。菜单按主机返回的记录顺序循环移动，不代表物理摆放；不可用屏幕也可移到并查看原因，但不能确认；没有交互终端或数据失效时不默认选第一屏。拓扑变化会刷新菜单并要求重新选择。
 3. 控制器为精确输出准备 Sunshine；需要改 `output_name` 或重新探测时，只在已证实空闲且属于本次预约的主机上受控重启。它不改变桌面分辨率、布局或电源策略。
-4. 用官方 `list` 查询配对状态与应用标题，按第 2 节处理明确未配对；确认应用列表中恰好一个大小写不敏感 Desktop 标题后才记录启动意图、运行官方串流。不使用 `list --csv`：CSV 模式会为每个应用启动封面图抓取，其线程池汇合可能死锁 CLI 退出，输出永远不可恢复。主机在 observe_active 把核对过的应用 ID 与实测 currentgame 绑定。网络错误、未知诊断或标题不符均停止。
+4. 准备后再用新鲜官方 `list` 核对应用标题；确认恰好一个大小写不敏感 Desktop 标题后才记录启动意图、运行官方串流。不使用 `list --csv`：CSV 模式会为每个应用启动封面图抓取，其线程池汇合可能死锁 CLI 退出，输出永远不可恢复。主机在 observe_active 把核对过的应用 ID 与实测 currentgame 绑定。网络错误、未知诊断或标题不符均停止。
 5. 预约覆盖准备、配对和整个串流子进程。当前官方 CLI 是单次连接，连接器没有自动重连循环；正常结束并确认释放后，可重新运行连接器。退出时先记录已拥有的正数 Desktop 的关闭意图，再调用官方 `quit`，确认同代关闭后释放。控制/启动/关闭结果不确定时保留预约，需要主机可信对账；不靠超时或进程退出强行清除。
 
 PIN 只打印在终端，不写入清单或持久配置。客户端不远程安装软件、不使用 sudo、不修补 `Moonlight.conf`；已安装的主机控制器可执行上面的输出配置与空闲重启。`pair`/`stream` 保留本机图形环境。官方进程退出0既不是配对确认，也不是收到正确画面的证明。

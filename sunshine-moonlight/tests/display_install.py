@@ -8,7 +8,7 @@ package install, credential, network or privileged publication is exercised.
 """
 from __future__ import annotations
 
-from dataclasses import replace
+from dataclasses import asdict, replace
 import hashlib
 import io
 import json
@@ -399,6 +399,419 @@ class InstallTests(unittest.TestCase):
         self.assertEqual(exc.exception.code, "installer_identity")
 
 
+class IdentityReconciliationTests(unittest.TestCase):
+    setUp = InstallTests.setUp
+    NEW_UUID = "11223344-1234-4321-abcd-0123456789ab"
+
+    def stranded(self, f=None, *, keep_old=False):
+        f = f or self.fixture
+        f.install(publish=True)
+        f.rpc("enroll", revision=f.rpc("status")["revision"])
+        menu = f.rpc("list")
+        owner = f.rpc("acquire", revision=menu["revision"], snapshot=menu["snapshot"])
+        f.t.keep_old = keep_old
+        f.t.on_restart = lambda _: setattr(f.f, "endpoint_id", self.NEW_UUID)
+        with self.assertRaises(Refusal) as caught:
+            f.rpc("prepare", revision=owner["revision"], capability=owner["capability"],
+                  snapshot=owner["snapshot"], display_id=lf.SECOND)
+        self.assertEqual(caught.exception.code, "host_identity_changed")
+        return f
+
+    def snapshot(self, f):
+        return {str(p.relative_to(f.controller)): (p.read_bytes(), p.stat().st_ino, p.stat().st_mode,
+                                                    p.stat().st_mtime_ns)
+                for p in f.controller.rglob("*") if p.is_file()}
+
+    def write_record(self, f, name, value):
+        path = f.controller / "state" / name
+        path.write_bytes(ic.document(value)); path.chmod(0o600)
+
+    def assert_refusal_unchanged(self, f, **kwargs):
+        before, config = self.snapshot(f), (f.f.conf.read_bytes(), f.f.conf.stat().st_ino)
+        with self.assertRaises(Refusal):
+            f.install(reconcile_host_identity=True, authorize_rebind=lambda: True, **kwargs)
+        self.assertEqual(self.snapshot(f), before)
+        self.assertEqual((f.f.conf.read_bytes(), f.f.conf.stat().st_ino), config)
+        self.assertEqual(f.t.restarts, 1)
+
+    def test_positive_archives_exact_bytes_inodes_locks_and_unenrolled_uuid(self):
+        f = self.stranded()
+        old_settings = json.loads(f.manifest().read_bytes())
+        before = {p.name: ic.record_identity(p) for p in (f.controller / "state").iterdir()}
+        config = (f.f.conf.read_bytes(), f.f.conf.stat().st_ino)
+        lock = ic.record_identity(f.controller / ".install.lock")
+        confirmations = []
+        result = f.install(reconcile_host_identity=True, authorize_rebind=lambda: confirmations.append("REBIND") or True)
+        self.assertEqual((result.status, result.rpc_ready, confirmations), ("UNENROLLED", True, ["REBIND"]))
+        state = f.controller / "state"
+        journal_path, = state.glob("identity-transition-*.bak")
+        journal = json.loads(journal_path.read_bytes())
+        for name, identity in before.items():
+            path = state / (name + "." + journal["id"] + ".bak") if name in ic.IDENTITY_RECORDS else state / name
+            self.assertEqual(ic.record_identity(path), identity)
+        self.assertEqual(ic.record_identity(f.controller / ".install.lock"), lock)
+        self.assertEqual((f.f.conf.read_bytes(), f.f.conf.stat().st_ino), config)
+        self.assertEqual(json.loads((state / "operation.json").read_bytes()), ic.BASELINE)
+        self.assertFalse((state / "reservation.json").exists())
+        self.assertFalse((state / "prepare-backup.conf").exists())
+        self.assertFalse((state / "start-receipt.json").exists())
+        old_settings["host_uniqueid"] = self.NEW_UUID
+        self.assertEqual(json.loads(f.manifest().read_bytes()), old_settings)
+        self.assertEqual((f.publishes, f.t.restarts, ic.active(f.controller)[1]), (1, 1, 2))
+        after = self.snapshot(f)
+        f.install(reconcile_host_identity=True, authorize_rebind=lambda: (_ for _ in ()).throw(AssertionError("already committed")))
+        self.assertEqual(self.snapshot(f), after)
+        self.assertEqual(f.rpc("status")["uncertainty"], "needs_onboarding")
+        f.rpc("enroll", revision=f.rpc("status")["revision"])
+        self.assertTrue(f.rpc("list")["selection_ready"])
+
+    def test_negative_e1_e2_e3_e4_e5_e6_without_any_mutation(self):
+        cases = ("phase", "uncertainty", "launch", "active", "enrollment", "stage", "birth", "owner",
+                 "prepared", "release", "receipt", "backup", "old_alive", "same_invocation", "config", "busy", "same_uuid",
+                 "route", "proc_exe_limited", "proc_env_limited", "qualification")
+        for case in cases:
+            with self.subTest(case=case):
+                f = self.stranded(Fixture(Path(self.temp.name) / case), keep_old=case == "old_alive")
+                state = json.loads((f.controller / "state/reservation.json").read_bytes())
+                meta = json.loads((f.controller / "state/operation.json").read_bytes())
+                if case in ("phase", "uncertainty", "launch", "active"):
+                    if case == "phase": state.update(phase="preparing", uncertainty=None)
+                    if case == "uncertainty": state["uncertainty"] = "control_lost"
+                    if case in ("launch", "active"):
+                        state.update(attempt_revision=state["revision"], desktop={"app_id": 123, "definition_digest": "f" * 64},
+                                     active_observed=case == "active")
+                    self.write_record(f, "reservation.json", state)
+                elif case in ("enrollment", "stage", "birth", "owner", "prepared", "release"):
+                    if case == "enrollment": meta["enrollment"] = None
+                    if case == "stage": meta["lease"]["stage"] = "config_written"
+                    if case == "birth": meta["lease"]["previous_generation"]["start_ticks"] += 1
+                    if case == "owner": meta["lease"]["owner_digest"] = "f" * 64
+                    if case == "prepared": meta["lease"]["prepared_revision"] = 3
+                    if case == "release": meta["lease"]["release_revision"] = 3
+                    self.write_record(f, "operation.json", meta)
+                elif case == "receipt":
+                    old = host.settings(f.manifest(), "linux")
+                    current = rt.LinuxRuntime(old.runtime, f.t).observe()
+                    receipt = rt.StartReceipt(old.host_uniqueid, current.generation, current.unit.ownership_digest,
+                                             current.config.path, current.config.root, current.config.file,
+                                             current.config.manager_environment_digest, current.binary.file, old.runtime.build)
+                    self.write_record(f, "start-receipt.json", {"schema": 1, "receipt": asdict(receipt),
+                        "desktop_digest": meta["lease"]["desktop_digest"], "issuance": {"operation": meta["lease"]["restart_id"],
+                        "previous_generation": meta["lease"]["previous_generation"], "enrollment_revision": 1}})
+                elif case == "backup":
+                    (f.controller / "state/prepare-backup.conf").write_bytes(b"changed backup")
+                elif case == "same_invocation":
+                    f.t.props["InvocationID"] = meta["lease"]["previous_generation"]["invocation_id"]
+                    f.t.current_trace()
+                elif case == "config": f.f.conf.write_bytes(f.f.conf.read_bytes() + b"# out of band\n")
+                elif case == "busy": f.f.app = 123
+                elif case == "same_uuid": f.f.endpoint_id = lf.HOST
+                elif case == "route":
+                    other = f.f.home / "other-apps.json"
+                    other.write_bytes(f.f.apps.read_bytes()); other.chmod(0o600)
+                    f.f.conf.write_bytes(f.f.conf.read_bytes() + f"file_apps = {other}\n".encode())
+                elif case == "qualification": f.t.put(rt.EXECUTABLE, b"wrong installed binary", uid=0)
+                if case in ("proc_exe_limited", "proc_env_limited"):
+                    original = f.t.identity if case == "proc_exe_limited" else f.t.read
+                    def limited(path, *args, **kwargs):
+                        if Path(path).name == ("exe" if case == "proc_exe_limited" else "environ") and str(path).startswith("/proc/"):
+                            raise PermissionError("synthetic restricted proc")
+                        return original(path, *args, **kwargs)
+                    with mock.patch.object(f.t, "identity" if case == "proc_exe_limited" else "read", side_effect=limited):
+                        self.assert_refusal_unchanged(f)
+                else:
+                    self.assert_refusal_unchanged(f)
+
+    def test_e7_confirmation_denied_and_e8_runtime_change_preserve_every_inode(self):
+        f = self.stranded()
+        before = self.snapshot(f)
+        with self.assertRaises(Refusal):
+            f.install(reconcile_host_identity=True, authorize_rebind=lambda: False)
+        self.assertEqual(self.snapshot(f), before)
+        def changed():
+            f.t.props["InvocationID"] = "9" * 32
+            f.t.current_trace()
+            return True
+        with self.assertRaises(Refusal):
+            f.install(reconcile_host_identity=True, authorize_rebind=changed)
+        self.assertEqual(self.snapshot(f), before)
+        self.assertEqual(f.t.restarts, 1)
+
+    def test_prior_clean_release_then_new_failed_lease_can_reconcile_and_keep_old_receipt(self):
+        f = self.fixture
+        f.install(publish=True)
+        f.rpc("enroll", revision=f.rpc("status")["revision"])
+        def acquire():
+            menu = f.rpc("list")
+            return f.rpc("acquire", revision=menu["revision"], snapshot=menu["snapshot"])
+        def owned(ticket, action, **fields):
+            return f.rpc(action, revision=ticket["revision"], capability=ticket["capability"], **fields)
+        owner = acquire()
+        prepared = owned(owner, "prepare", snapshot=owner["snapshot"], display_id=lf.SECOND)
+        attempted = owned(prepared, "launch")
+        f.f.app = attempted["desktop_app_id"]
+        active = owned(attempted, "observe_active")
+        releasing = owned(active, "begin_release")
+        f.f.app = 0
+        self.assertEqual(owned(releasing, "finish_release")["phase"], "available")
+        receipt_path = f.controller / "state/start-receipt.json"
+        receipt_identity = ic.record_identity(receipt_path)
+        owner = acquire()
+        owner = owned(owner, "refresh")  # Legitimate revisions also vary with selection refresh.
+        f.t.on_restart = lambda _: setattr(f.f, "endpoint_id", self.NEW_UUID)
+        with self.assertRaises(Refusal) as caught:
+            owned(owner, "prepare", snapshot=owner["snapshot"], display_id=lf.FIRST)
+        self.assertEqual(caught.exception.code, "host_identity_changed")
+        status = json.loads((f.controller / "state/reservation.json").read_bytes())
+        self.assertGreater(status["revision"], 4)
+        self.assertIsNone(status["attempt_revision"])
+        self.assertFalse(status["active_observed"])
+        result = f.install(reconcile_host_identity=True, authorize_rebind=lambda: True)
+        self.assertEqual(result.status, "UNENROLLED")
+        journal_path, = (f.controller / "state").glob("identity-transition-*.bak")
+        journal = json.loads(journal_path.read_bytes())
+        self.assertEqual(ic.record_identity(receipt_path.with_name("start-receipt.json." + journal["id"] + ".bak")), receipt_identity)
+        self.assertEqual(f.t.restarts, 2)  # Neither installation nor REBIND restarts.
+
+    def test_retirement_pid_reuse_and_boot_change_are_supported(self):
+        for case in ("pid_reuse", "reboot"):
+            with self.subTest(case=case):
+                f = self.stranded(Fixture(Path(self.temp.name) / case))
+                previous = json.loads((f.controller / "state/operation.json").read_bytes())["lease"]["previous_generation"]
+                if case == "pid_reuse":
+                    fields = ["S"] + ["0"] * 18 + [str(previous["start_ticks"] + 999)] + ["0"] * 30
+                    f.t.put(Path("/proc") / str(previous["pid"]) / "stat",
+                            (f'{previous["pid"]} (other process)) ' + " ".join(fields)).encode())
+                else:
+                    f.t.put(Path("/proc/sys/kernel/random/boot_id"), b"99999999-9999-9999-9999-999999999999\n")
+                    for row in f.t.entries: row["_BOOT_ID"] = "9" * 32
+                self.assertEqual(f.install(reconcile_host_identity=True, authorize_rebind=lambda: True).status, "UNENROLLED")
+
+    def test_interruptions_resume_only_exact_evidence_and_uuid(self):
+        # Interrupt after each durable rename, after baseline, and during version
+        # publication. Real old inodes move only once; the immutable journal binds
+        # recovery to the same generation/UUID/source/settings facts.
+        for point in ("journal", "operation.json", "reservation.json", "prepare-backup.conf", "baseline", "version", "marker", "active"):
+            with self.subTest(point=point):
+                f = self.stranded(Fixture(Path(self.temp.name) / point))
+                before = {p.name: ic.record_identity(p) for p in (f.controller / "state").iterdir()}
+                rename, create = ic.os.rename, ic.create
+                def cut_rename(src, dst, **kwargs):
+                    rename(src, dst, **kwargs)
+                    if src == point: raise RuntimeError("synthetic process interruption after rename")
+                def cut_create(path, data, mode=0o600):
+                    create(path, data, mode)
+                    if (point == "journal" and path.name.startswith("identity-transition-")
+                            or point == "baseline" and path.name == "operation.json"
+                            or point == "version" and path.name == "lifecycle.py"
+                            or point == "marker" and path.name == ".owned.json"
+                            or point == "active" and path.name == "00000002.json"):
+                        raise RuntimeError("synthetic process interruption after durable publication")
+                with mock.patch.object(ic.os, "rename", side_effect=cut_rename), mock.patch.object(ic, "create", side_effect=cut_create):
+                    with self.assertRaises(RuntimeError):
+                        f.install(reconcile_host_identity=True, authorize_rebind=lambda: True)
+                interrupted = self.snapshot(f)
+                if point != "active":
+                    f.f.endpoint_id = "22334455-1234-4321-abcd-0123456789ab"
+                    with self.assertRaises(Refusal):
+                        f.install(reconcile_host_identity=True, authorize_rebind=lambda: True)
+                    self.assertEqual(self.snapshot(f), interrupted)
+                    f.f.endpoint_id = self.NEW_UUID
+                result = f.install(reconcile_host_identity=True,
+                                   authorize_rebind=lambda: (_ for _ in ()).throw(AssertionError("journal already authorizes exact resume")))
+                self.assertEqual(result.status, "UNENROLLED")
+                journal_path, = (f.controller / "state").glob("identity-transition-*.bak")
+                journal = json.loads(journal_path.read_bytes())
+                for name, expected in before.items():
+                    path = f.controller / "state" / (name + "." + journal["id"] + ".bak" if name in ic.IDENTITY_RECORDS else name)
+                    self.assertEqual(ic.record_identity(path), expected)
+                self.assertEqual((ic.active(f.controller)[1], f.t.restarts), (2, 1))
+
+    def test_original_bak_history_is_sealed_on_pending_and_committed_replay(self):
+        for cut in ("journal", "active"):
+            with self.subTest(cut=cut):
+                f = self.stranded(Fixture(Path(self.temp.name) / cut))
+                history = f.controller / "state/historical-record.bak"
+                history.write_bytes(b"original retained historical bytes\n"); history.chmod(0o600)
+                original, identity = history.read_bytes(), history.stat()
+                create = ic.create
+                def interrupted(path, data, mode=0o600):
+                    create(path, data, mode)
+                    if (cut == "journal" and path.name.startswith("identity-transition-")
+                            or cut == "active" and path.name == "00000002.json"):
+                        raise RuntimeError("synthetic durable publication cut")
+                with mock.patch.object(ic, "create", side_effect=interrupted), self.assertRaises(RuntimeError):
+                    f.install(reconcile_host_identity=True, authorize_rebind=lambda: True)
+                history.write_bytes(b"changed but valid historical bytes\n")
+                before = self.snapshot(f)
+                with self.assertRaises(Refusal) as caught:
+                    f.install(reconcile_host_identity=True, authorize_rebind=lambda: True)
+                self.assertEqual(caught.exception.code, "identity_reconciliation_refused")
+                self.assertEqual(self.snapshot(f), before)
+                # Restore EXACT original bytes/inode/mode/mtime, then the same
+                # journal must converge without a fresh ceremony or state reset.
+                history.write_bytes(original)
+                os.utime(history, ns=(identity.st_atime_ns, identity.st_mtime_ns))
+                result = f.install(reconcile_host_identity=True,
+                                   authorize_rebind=lambda: (_ for _ in ()).throw(AssertionError("existing journal")))
+                self.assertEqual(result.status, "UNENROLLED")
+                self.assertEqual((ic.active(f.controller)[1], f.t.restarts), (2, 1))
+                # Later legitimate append/maintenance/new-lease records are NOT
+                # part of the original seal and must not be frozen by it.
+                source = Path(self.temp.name) / (cut + "-future-source")
+                shutil.copytree(f.source, source, ignore=shutil.ignore_patterns("__pycache__"))
+                with (source / "host.py").open("a") as stream: stream.write("\n# legitimate later companion revision\n")
+                f.source = source
+                f.install()
+                later = f.controller / "state/later-record.bak"
+                later.write_bytes(b"later legitimate maintenance record\n"); later.chmod(0o600)
+                f.rpc("enroll", revision=f.rpc("status")["revision"])
+                menu = f.rpc("list")
+                owner = f.rpc("acquire", revision=menu["revision"], snapshot=menu["snapshot"])
+                before = self.snapshot(f)
+                self.assertEqual(f.install(reconcile_host_identity=True, authorize_rebind=lambda: False).status, "selecting")
+                self.assertEqual(self.snapshot(f), before)
+                self.assertEqual(f.rpc("abort", revision=owner["revision"], capability=owner["capability"])["phase"], "available")
+                self.assertEqual((ic.active(f.controller)[1], f.t.restarts), (3, 1))
+
+    def test_original_active_prefix_is_sealed_before_journal_and_on_all_replay(self):
+        for cut in ("confirmation", "journal", "active"):
+            with self.subTest(cut=cut):
+                f = Fixture(Path(self.temp.name) / cut)
+                f.install(publish=True)
+                source = Path(self.temp.name) / (cut + "-upgrade-source")
+                shutil.copytree(f.source, source, ignore=shutil.ignore_patterns("__pycache__"))
+                with (source / "host.py").open("a") as stream: stream.write("\n# original second active publication\n")
+                f.source = source
+                f.install()
+                self.stranded(f)
+                self.assertEqual(ic.active(f.controller)[1], 2)
+                first = f.controller / "active/00000001.json"
+                original, identity = first.read_bytes(), first.stat()
+                replacement = (f.controller / "active/00000002.json").read_bytes()
+                self.assertNotEqual(original, replacement)
+                before_confirmation = self.snapshot(f)
+                def changed_confirmation():
+                    first.write_bytes(replacement)
+                    return True
+                if cut == "confirmation":
+                    with self.assertRaises(Refusal) as caught:
+                        f.install(reconcile_host_identity=True, authorize_rebind=changed_confirmation)
+                    self.assertEqual(caught.exception.code, "identity_reconciliation_refused")
+                    # Only the injected out-of-band edit may have changed: no
+                    # journal, version, state or new active reference is allowed.
+                    changed = self.snapshot(f)
+                    self.assertEqual({k: v for k, v in changed.items() if k != "active/00000001.json"},
+                                     {k: v for k, v in before_confirmation.items() if k != "active/00000001.json"})
+                    first.write_bytes(original)
+                    os.utime(first, ns=(identity.st_atime_ns, identity.st_mtime_ns))
+                    self.assertEqual(self.snapshot(f), before_confirmation)
+                    self.assertFalse(list((f.controller / "state").glob("identity-transition-*.bak")))
+                    self.assertEqual(ic.active(f.controller)[1], 2)
+                    continue
+                create = ic.create
+                def interrupted(path, data, mode=0o600):
+                    create(path, data, mode)
+                    if (cut == "journal" and path.name.startswith("identity-transition-")
+                            or cut == "active" and path.name == "00000003.json"):
+                        raise RuntimeError("synthetic durable publication cut")
+                with mock.patch.object(ic, "create", side_effect=interrupted), self.assertRaises(RuntimeError):
+                    f.install(reconcile_host_identity=True, authorize_rebind=lambda: True)
+                first.write_bytes(replacement)  # Still a valid earlier version; latest/serial unchanged.
+                before = self.snapshot(f)
+                with self.assertRaises(Refusal) as caught:
+                    f.install(reconcile_host_identity=True, authorize_rebind=lambda: True)
+                self.assertEqual(caught.exception.code, "identity_reconciliation_refused")
+                self.assertEqual(self.snapshot(f), before)
+                first.write_bytes(original)
+                os.utime(first, ns=(identity.st_atime_ns, identity.st_mtime_ns))
+                # Equal bytes/mode/mtime at a replacement inode also contradict
+                # the original prefix; a digest-only seal would miss this case.
+                saved = f.root / "saved-original-reference.json"
+                first.rename(saved)
+                first.write_bytes(original); first.chmod(0o600)
+                os.utime(first, ns=(identity.st_atime_ns, identity.st_mtime_ns))
+                before = self.snapshot(f)
+                with self.assertRaises(Refusal):
+                    f.install(reconcile_host_identity=True, authorize_rebind=lambda: True)
+                self.assertEqual(self.snapshot(f), before)
+                first.unlink(); saved.rename(first)
+                result = f.install(reconcile_host_identity=True,
+                                   authorize_rebind=lambda: (_ for _ in ()).throw(AssertionError("existing journal")))
+                self.assertEqual(result.status, "UNENROLLED")
+                self.assertEqual((ic.active(f.controller)[1], f.t.restarts), (3, 1))
+                journal_path, = (f.controller / "state").glob("identity-transition-*.bak")
+                journal = json.loads(journal_path.read_bytes())
+                self.assertEqual(set(journal["active_prefix"]), {"00000001.json", "00000002.json"})
+                self.assertEqual(journal["active_prefix"], ic.active_prefix(f.controller, 2))
+                with (source / "host.py").open("a") as stream: stream.write("\n# legitimate later active append\n")
+                f.install()
+                before = self.snapshot(f)
+                self.assertEqual(f.install(reconcile_host_identity=True, authorize_rebind=lambda: False).status, "UNENROLLED")
+                self.assertEqual(self.snapshot(f), before)
+                self.assertEqual(ic.active(f.controller)[1], 4)
+
+    def test_default_install_stays_strict_and_settings_hash_is_distinct(self):
+        f = self.stranded()
+        before, version = self.snapshot(f), ic.active(f.controller)[0]
+        with self.assertRaises(Refusal) as caught: f.install()
+        self.assertEqual(caught.exception.code, "host_mismatch")
+        self.assertEqual(self.snapshot(f), before)
+        self.assertNotIn("--reconcile-host-identity", ic.SHIM.decode())
+        self.assertEqual(cfg.digest(ic.SHIM), "ca7ee265568ead3da691752583d0472005566c325a5e8eac9b213b2687f0d913")
+        f.install(reconcile_host_identity=True, authorize_rebind=lambda: True)
+        new = ic.active(f.controller)[0]
+        self.assertNotEqual(new, version)
+        old_marker = json.loads((f.controller / "versions" / version / ".owned.json").read_bytes())
+        marker = json.loads((f.controller / "versions" / new / ".owned.json").read_bytes())
+        self.assertEqual({k for k in marker["files"] if marker["files"][k] != old_marker["files"][k]}, {"host-settings.json"})
+
+    def test_rebind_reads_typed_token_on_a_real_private_pty(self):
+        import pty
+        import select
+        master, slave = pty.openpty()
+        launcher = '''import fcntl, os, sys, termios
+os.setsid()
+fcntl.ioctl(0, termios.TIOCSCTTY, 0)
+sys.path.insert(0, sys.argv[1])
+import install_controller as ic
+print("CONFIRMED=" + str(ic.interactive_rebind()), flush=True)
+'''
+        try:
+            with mock.patch.object(subprocess, "Popen", FIXTURE_POPEN):
+                child = subprocess.Popen(("/usr/bin/python3", "-I", "-B", "-c", launcher, str(MODULE / "display-control")),
+                                         stdin=slave, stdout=slave, stderr=slave, cwd=self.temp.name,
+                                         env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"})
+            os.close(slave); slave = None
+            output = b""
+            while b"Type REBIND:" not in output:
+                self.assertTrue(select.select([master], [], [], 5)[0], "local TTY prompt not emitted")
+                output += os.read(master, 4096)
+            os.write(master, b"REBIND\n")
+            self.assertEqual(child.wait(timeout=5), 0)
+            while select.select([master], [], [], 0)[0]:
+                try: output += os.read(master, 4096)
+                except OSError: break
+            self.assertIn(b"CONFIRMED=True", output)
+            self.assertIn(b"no existing/in-flight unmanaged stream", output)
+        finally:
+            if slave is not None: os.close(slave)
+            os.close(master)
+            if 'child' in locals() and child.poll() is None:
+                child.kill(); child.wait(timeout=5)
+
+    def test_raw_tty_rebind_token_and_fixed_confirmation(self):
+        for data, tty, expected in ((b"REBIND\n", True, True), (b"ENROLL\n", True, False),
+                                    (b"REBIND later\n", True, False), (b"REBIND\n", False, False)):
+            with mock.patch.object(ic.os, "open", return_value=123), mock.patch.object(ic.os, "isatty", return_value=tty), \
+                    mock.patch.object(ic.os, "read", return_value=data) as read, mock.patch.object(ic.os, "write") as write, \
+                    mock.patch.object(ic.os, "close"):
+                self.assertEqual(ic.interactive_rebind(), expected)
+                if tty:
+                    read.assert_called_once_with(123, 64)
+                    self.assertIn(b"completed official PIN pairing", write.call_args.args[1])
+
+
 class RPCAndShimTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="qd-shim-test-")
@@ -694,6 +1107,18 @@ raise SystemExit(int(os.environ.get('COMPANION_FAIL', '0')))
                 self.assertNotIn("controller-install", self.log.read_text()[len(before):])
             self.env.pop("API_STATUS", None)
         self.assertNotIn("FORBIDDEN", self.log.read_text())
+
+    def test_shell_explicit_reconcile_flag_forwards_without_new_shim_or_service_verb(self):
+        help_result = self.run_command("commands/install-display-control.sh", "--help")
+        self.assertEqual(help_result.returncode, 0)
+        self.assertIn("--reconcile-host-identity", help_result.stdout.decode())
+        self.assertFalse(self.log.exists())
+        result = self.run_command("commands/install-display-control.sh", "--reconcile-host-identity")
+        self.assertEqual(result.returncode, 0, result.stderr.decode())
+        log = self.log.read_text()
+        self.assertIn("--reconcile-host-identity", log)
+        self.assertNotIn("--publish-shim", log)
+        self.assertNotIn("FORBIDDEN", log)
 
     def test_root_all_role_ordering_companion_optin_then_inventory(self):
         for args, expected in (([], ["host", "client"]), (["--host-only"], ["host"]), (["--client-only"], ["client"])):

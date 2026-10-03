@@ -61,6 +61,8 @@ record = {
     'display': os.environ.get('DISPLAY'),
     'wayland_display': os.environ.get('WAYLAND_DISPLAY'),
     'xauthority': os.environ.get('XAUTHORITY'),
+    'controller_phase': (json.loads(Path(os.environ['FAKE_CONTROL_STATE']).read_text()).get('phase')
+                         if Path(os.environ['FAKE_CONTROL_STATE']).exists() else None),
 }
 with Path(os.environ['FAKE_LOG']).open('a', encoding='utf-8') as handle:
     handle.write(json.dumps(record) + '\\n')
@@ -932,7 +934,7 @@ machines:
         self.write_default()
         result = self.invoke("desktop", stdin="stream stdin\n", exit_code=23)
         self.assertEqual(result.returncode, 23, result.stderr)
-        self.assertEqual(self.actions(), ["list", "stream", "quit"])
+        self.assertEqual(self.actions(), ["list", "list", "stream", "quit"])
         self.assertEqual(self.records()[0]["argv"][1:], ["list", "--", "100.64.0.2:47989"])
         self.assertEqual(self.recorded()["argv"][1:], STREAM_ARGS)
         self.assertEqual(self.recorded()["stdin"], "stream stdin\n")
@@ -978,7 +980,7 @@ machines:
         module_before = self.module_snapshot()
         result = self.invoke("desktop", extra_env={"FAKE_INITIAL_PAIRED": "0"})
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.actions(), ["list", "pair", "list", "stream", "quit"])
+        self.assertEqual(self.actions(), ["list", "pair", "list", "list", "stream", "quit"])
         self.assertEqual(self.records()[0]["argv"][1:], ["list", "--", "100.64.0.2:47989"])
 
         match = PIN.search(result.stderr)
@@ -989,7 +991,10 @@ machines:
         self.assertEqual(self.records()[1]["argv"][1:], ["pair", "--pin", pin, "--", "100.64.0.2:47989"])
         # The confirmation list is a fresh query after pair, before stream.
         self.assertEqual(self.records()[2]["argv"][1:], ["list", "--", "100.64.0.2:47989"])
-        self.assertEqual(self.records()[3]["argv"][1:], STREAM_ARGS)
+        self.assertEqual(self.records()[3]["argv"][1:], ["list", "--", "100.64.0.2:47989"])
+        self.assertEqual(self.records()[4]["argv"][1:], STREAM_ARGS)
+        self.assertEqual([r["controller_phase"] for r in self.records()[:4]],
+                         ["selecting", "selecting", "selecting", "preparing"])
 
         # Terminal guidance: target, Web UI (base+1), PIN, numbered remote/local steps.
         self.assertIn("100.64.0.2:47989", result.stderr)
@@ -1010,10 +1015,10 @@ machines:
         self.write_default()
         result = self.invoke("laptop", extra_env={"FAKE_INITIAL_PAIRED": "0"})
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.actions(), ["list", "pair", "list", "stream", "quit"])
+        self.assertEqual(self.actions(), ["list", "pair", "list", "list", "stream", "quit"])
         self.assertEqual(self.records()[0]["argv"][1:], ["list", "--", "100.64.0.3:48000"])
         self.assertEqual(self.records()[1]["argv"][4:], ["--", "100.64.0.3:48000"])
-        self.assertEqual(self.records()[3]["argv"][1:], STREAM_ARGS[:-2] + ["100.64.0.3:48000", "Desktop"])
+        self.assertEqual(self.records()[4]["argv"][1:], STREAM_ARGS[:-2] + ["100.64.0.3:48000", "Desktop"])
         self.assertIn("https://100.64.0.3:48001", result.stderr)
 
     def test_pair_without_confirmed_state_never_streams(self) -> None:
@@ -1043,13 +1048,13 @@ machines:
         self.write_default()
         result = self.invoke("desktop", extra_env={"FAKE_INITIAL_PAIRED": "0", "FAKE_PAIR_EXIT": "9"})
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.actions(), ["list", "pair", "list", "stream", "quit"])
+        self.assertEqual(self.actions(), ["list", "pair", "list", "list", "stream", "quit"])
 
     def test_zero_exit_with_unpaired_text_does_not_trigger_pair(self) -> None:
         self.write_default()
         result = self.invoke("desktop", extra_env={"FAKE_LIST_MODE": "unpaired-zero"})
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.actions(), ["list", "stream", "quit"])
+        self.assertEqual(self.actions(), ["list", "list", "stream", "quit"])
         self.assertNotIn("pair", result.stderr)
 
     def test_unclassified_list_results_stop_before_pair_and_stream(self) -> None:
@@ -1081,7 +1086,7 @@ machines:
         self.write_default()
         result = self.invoke("desktop", extra_env={"FAKE_LIST_MODE": "unpaired-zh", "FAKE_INITIAL_PAIRED": "0"})
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.actions(), ["list", "pair", "list", "stream", "quit"])
+        self.assertEqual(self.actions(), ["list", "pair", "list", "list", "stream", "quit"])
 
     def test_classification_query_is_locale_pinned_but_pair_and_stream_do_not_change_environment(self) -> None:
         self.write_default()
@@ -1090,7 +1095,9 @@ machines:
         records = self.records()
         self.assertEqual(records[0]["lc_all"], "C")
         self.assertEqual(records[1]["lc_all"], os.environ.get("LC_ALL"))
-        self.assertEqual(records[3]["lc_all"], os.environ.get("LC_ALL"))
+        self.assertEqual(records[2]["lc_all"], "C")
+        self.assertEqual(records[3]["lc_all"], "C")
+        self.assertEqual(records[4]["lc_all"], os.environ.get("LC_ALL"))
 
     def test_generated_pin_is_always_four_digits(self) -> None:
         self.write_default()

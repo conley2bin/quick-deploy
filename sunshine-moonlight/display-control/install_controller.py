@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import argparse
 from contextlib import contextmanager
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 import fcntl
 import hashlib
 import json
@@ -386,6 +386,365 @@ def validate_state(installed, desktop, files):
     return state.status.phase.value
 
 
+# This is an installer-only transfer of authority. The RPC ABI and root shim
+# deliberately have no rebind verb. Completed journals remain permanent evidence.
+IDENTITY_RECORDS = ("operation.json", "reservation.json", "prepare-backup.conf", "start-receipt.json")
+BASELINE = {"schema": 1, "enrollment": None, "lease": None}
+
+
+def interactive_rebind():
+    try:
+        fd = os.open("/dev/tty", os.O_RDWR | os.O_NOCTTY)
+        try:
+            if not os.isatty(fd):
+                return False
+            os.write(fd, b"Confirm exclusive controller use, no existing/in-flight unmanaged stream, no concurrent admin edits, and completed official PIN pairing with the CURRENT Sunshine. Type REBIND: ")
+            return os.read(fd, 64).strip() == b"REBIND"
+        finally:
+            os.close(fd)
+    except OSError:
+        return False
+
+
+def identity_refused(reason):
+    fail("identity_reconciliation_refused", "Identity reconciliation refused: " + reason)
+
+
+def record_identity(path):
+    data = private_read(path)
+    before = path.lstat()
+    # Rename changes ctime; bytes, inode, permissions and mtime must survive.
+    result = {"sha256": cfg.digest(data), "device": before.st_dev, "inode": before.st_ino,
+              "mode": before.st_mode, "uid": before.st_uid, "size": before.st_size,
+              "mtime_ns": before.st_mtime_ns}
+    if private_read(path) != data or stamp(path.lstat()) != stamp(before):
+        identity_refused("private record changed during evidence sampling")
+    return result
+
+
+class IdentityRecords:
+    """Read-only old operation view, including after its exact rename."""
+    def __init__(self, records):
+        self.records = records
+
+    def read(self, name, limit=lc.MAX_PRIVATE):
+        data = self.records.get(name)
+        if data is not None and len(data) > limit:
+            identity_refused("old record exceeds its schema bound")
+        return data
+
+    def document(self, name):
+        data = self.read(name)
+        return unique_json(data) if data is not None else None
+
+
+def identity_evidence(old, installed, desktop, records, ref, home, uid, transport, info):
+    """E1–E6, with no publication or state mutation, even on failure."""
+    old_obj, new_obj = settings_document(old), settings_document(installed)
+    old_obj["host_uniqueid"] = installed.host_uniqueid
+    if old.host_uniqueid == installed.host_uniqueid or old_obj != new_obj:
+        identity_refused("fresh qualification must change only host_uniqueid")
+    controller = lc.HostController(old, None, None, None, None)
+    controller.files = IdentityRecords(records)
+    meta = controller.meta()
+    raw = records.get("reservation.json")
+    if raw is None:
+        identity_refused("old reservation is required")
+    state = rs._decode(raw, controller.host)  # Never decode old state with the new UUID.
+    status, lease = state.status, meta["lease"]
+    if (status.phase is not rs.Phase.RECONCILIATION_REQUIRED
+            or status.uncertainty is not rs.Uncertainty.RUNTIME_CHANGED
+            or status.launch_attempted or status.active_observed or status.desktop is not None):
+        identity_refused("old reservation must be runtime_changed with no launch or active evidence in this lease")
+    if (meta["enrollment"] is None or meta["enrollment"]["revision"] > status.revision
+            or lease is None or lease["stage"] != "restart_intent"
+            or state.owner_digest is None or state.owner_digest != lease["owner_digest"]
+            or status.binding is None or "prepared_revision" in lease
+            or "release_revision" in lease or "cancel_transaction" in lease):
+        identity_refused("enrolled restart intent and reservation owner must agree")
+    try:
+        generation = rt.Generation(**lease["previous_generation"])
+        if (not re.fullmatch("[0-9a-f]{32}", generation.boot_id)
+                or not re.fullmatch("[0-9a-f]{32}", generation.invocation_id)
+                or generation.unit not in (rt.UNIT, rt.ALIAS) or generation.uid != uid
+                or any(type(v) is not int or v <= 0 for v in
+                       (generation.pid, generation.start_ticks, generation.start_monotonic_usec))
+                or not re.fullmatch("[0-9a-f-]{36}", lease["restart_id"])
+                or lc.canonical_uuid(lease["restart_id"]) != lease["restart_id"]
+                or lc.service_generation(generation) != status.binding.generation
+                or any(type(lease[k]) is not str or not re.fullmatch("[0-9a-f]{64}", lease[k])
+                       for k in ("before_digest", "after_digest"))):
+            raise ValueError("restart facts")
+    except (ValueError, TypeError, KeyError):
+        identity_refused("restart intent must name the reserved process birth")
+    backup = records.get("prepare-backup.conf")
+    if backup is None or cfg.digest(backup) != lease["before_digest"]:
+        identity_refused("preserved preparation backup must match the restart intent")
+    controller.receipt(desktop)  # Validate any older receipt before archiving it.
+    envelope = controller.files.document("start-receipt.json")
+    if envelope is not None and envelope["issuance"]["operation"] == lease["restart_id"]:
+        identity_refused("this restart already has an issued receipt")
+    runtime = rt.LinuxRuntime(installed.runtime, transport)
+    current = runtime.observe()
+    q.qualify(ref, current, transport)
+    if (current.binary.process_exe_status != "verified"
+            or current.config.process_environment_status != "verified"):
+        identity_refused("replacement loaded executable and configuration require verified proc access")
+    if (current.generation == generation or current.generation.unit != generation.unit
+            or current.config.file.sha256 != lease["after_digest"]
+            or lease["before_digest"] != status.binding.config_digest
+            or lease["topology"] != status.binding.topology_digest
+            or current.config.configured_output != lease["selector"]
+            or desktop.definition_digest != lease["desktop_digest"]):
+        identity_refused("qualified replacement generation and prepared config must agree")
+    if envelope is not None and lc.receipt_from_json(envelope["receipt"]).generation == current.generation:
+        identity_refused("replacement already has an issued receipt")
+    # A missing PID is usable only together with a qualified DIFFERENT unit
+    # invocation/process birth on the recorded boot. A reboot retires the entire
+    # old boot. A present PID is compared by start ticks (PID reuse is allowed).
+    if generation.boot_id != current.generation.boot_id:
+        retirement = {"kind": "previous_boot"}
+    else:
+        if (generation.invocation_id == current.generation.invocation_id
+                or current.generation.start_monotonic_usec <= generation.start_monotonic_usec):
+            identity_refused("replacement unit invocation does not retire the old invocation")
+        try:
+            data = transport.read(Path("/proc") / str(generation.pid) / "stat", limit=4096)
+        except FileNotFoundError:
+            retirement = {"kind": "absent_old_process", "new_invocation": current.generation.invocation_id}
+        except OSError:
+            identity_refused("old process retirement cannot be observed")
+        else:
+            try:
+                if type(data) is not bytes or len(data) > 4096:
+                    raise ValueError("stat bound")
+                text = data.decode("ascii")
+                fields = text[text.rfind(")") + 2:].split()
+                if not text.startswith(str(generation.pid) + " (") or len(fields) < 20:
+                    raise ValueError("stat")
+                ticks = int(fields[19])
+                if ticks == generation.start_ticks and fields[0] not in ("Z", "X"):
+                    identity_refused("reserved old process is still alive")
+                retirement = {"kind": "pid_reused" if ticks != generation.start_ticks else "dead_process",
+                              "start_ticks": ticks, "state": fields[0]}
+            except (ValueError, UnicodeError):
+                identity_refused("old process birth evidence is invalid")
+    endpoint = info(current.config.bind_address, current.config.base_port)
+    if (type(endpoint) is not lc.Endpoint or endpoint.state != "FREE"
+            or type(endpoint.currentgame) is not int or endpoint.currentgame != 0
+            or lc.canonical_uuid(endpoint.host_uniqueid) != installed.host_uniqueid):
+        identity_refused("replacement public endpoint must be the new idle UUID")
+    # Fresh official metadata/package qualification and discovery must repeat,
+    # including apps/assets/unit/binary, not merely the public FREE bit.
+    fresh, fresh_desktop = discover(ref, home, uid, transport, info)
+    if settings_document(fresh) != new_obj or fresh_desktop != desktop:
+        identity_refused("fresh qualification changed during reconciliation")
+    after = runtime.observe()
+    q.qualify(ref, after, transport)
+    if (lc.authority(after) != lc.authority(current)
+            or after.binary.process_exe_status != "verified"
+            or after.config.process_environment_status != "verified"):
+        identity_refused("replacement runtime changed during evidence sampling")
+    return {"old_uuid": old.host_uniqueid, "new_uuid": installed.host_uniqueid,
+            "previous_generation": asdict(generation), "current_generation": asdict(current.generation),
+            "unit": asdict(current.unit), "config": asdict(current.config), "binary": asdict(current.binary),
+            "desktop": asdict(desktop), "endpoint": {"uuid": installed.host_uniqueid, "state": "FREE", "currentgame": 0},
+            "retirement": retirement, "restart_id": lease["restart_id"], "reservation_revision": status.revision}
+
+
+def transition_records(files, journal=None):
+    records, identities = {}, {}
+    for name in IDENTITY_RECORDS:
+        archived = name + "." + journal["id"] + ".bak" if journal else None
+        data = files.read(archived, 1024 * 1024) if archived else None
+        live = files.read(name, 1024 * 1024)
+        path = files.path / (archived if data is not None else name)
+        if data is not None:
+            if live is not None and not (name == "operation.json" and live == document(BASELINE)):
+                identity_refused("both old and replacement live records exist")
+        else:
+            data = live
+        if data is not None:
+            records[name], identities[name] = data, record_identity(path)
+    if journal and identities != journal["records"]:
+        identity_refused("old records differ from the durable transition")
+    return records, identities
+
+
+def active_prefix(root, serial):
+    """The original reference prefix stays sealed; later appends are unrelated."""
+    return {f"{n:08d}.json": record_identity(root / "active" / f"{n:08d}.json")
+            for n in range(1, serial + 1)}
+
+
+def identity_journal(path):
+    """Validate journal structure before it can name a resumable publication."""
+    try:
+        value = unique_json(private_read(path, lc.MAX_PRIVATE))
+        if (type(value) is not dict or set(value) != {"schema", "id", "old_version", "serial", "new_manifest",
+                                                   "evidence", "records", "permanent", "history", "active_prefix", "confirmation"}
+                or type(value["schema"]) is not int or value["schema"] != 1
+                or type(value["id"]) is not str or not re.fullmatch("[0-9a-f]{32}", value["id"])
+                or path.name != "identity-transition-" + value["id"] + ".bak"
+                or type(value["old_version"]) is not str
+                or not re.fullmatch(r"v[1-9][0-9]*-[0-9a-f]{64}", value["old_version"])
+                or type(value["serial"]) is not int or not 1 <= value["serial"] < 512
+                or value["confirmation"] != "REBIND:exclusive:no_unmanaged_stream:official_pair_completed"):
+            raise ValueError("journal")
+        marker = value["new_manifest"]
+        if (type(marker) is not dict or set(marker) != {"schema", "release", "version", "files"}
+                or type(marker["schema"]) is not int or marker["schema"] != 1
+                or type(marker["release"]) is not int or marker["release"] != RELEASE
+                or type(marker["version"]) is not str
+                or not re.fullmatch(r"v[1-9][0-9]*-[0-9a-f]{64}", marker["version"])
+                or type(marker["files"]) is not dict or set(marker["files"]) != set(SOURCES) | {"host-settings.json"}
+                or any(type(v) is not str or not re.fullmatch("[0-9a-f]{64}", v) for v in marker["files"].values())
+                or marker["version"] != f"v{RELEASE}-" + cfg.digest(document(marker["files"]))):
+            raise ValueError("manifest")
+        if (type(value["records"]) is not dict or not {"operation.json", "reservation.json", "prepare-backup.conf"} <= set(value["records"])
+                or set(value["records"]) - set(IDENTITY_RECORDS)
+                or type(value["permanent"]) is not dict
+                or set(value["permanent"]) != {".install.lock", "state/operation.lock", "state/reservation.lock"}
+                or type(value["history"]) is not dict
+                or any(type(k) is not str or "/" in k or not k.endswith(".bak") for k in value["history"])
+                or type(value["active_prefix"]) is not dict
+                or set(value["active_prefix"]) != {f"{n:08d}.json" for n in range(1, value["serial"] + 1)}
+                or type(value["evidence"]) is not dict
+                or lc.canonical_uuid(value["evidence"]["old_uuid"]) == lc.canonical_uuid(value["evidence"]["new_uuid"])):
+            raise ValueError("evidence")
+        for identities in (value["records"], value["permanent"], value["history"], value["active_prefix"]):
+            for record in identities.values():
+                if (type(record) is not dict or set(record) != {"sha256", "device", "inode", "mode", "uid", "size", "mtime_ns"}
+                        or type(record["sha256"]) is not str or not re.fullmatch("[0-9a-f]{64}", record["sha256"])
+                        or any(type(v) is not int or v < 0 for k, v in record.items() if k != "sha256")):
+                    raise ValueError("record")
+        return value
+    except (ValueError, TypeError, KeyError, UnicodeError, RecursionError, Refusal):
+        identity_refused("identity transition journal is invalid")
+
+
+def reconcile_identity(root, old_version, serial, installed, desktop, files, ref, home, uid,
+                       transport, info, marker, authorize):
+    old = host.settings(root / "versions" / old_version / "host-settings.json", "linux")
+    journals = []
+    for path in sorted(files.path.glob("identity-transition-*.bak")):
+        value = identity_journal(path)
+        # An already committed transition is a normal installation from here on.
+        references = sorted((root / "active").iterdir())
+        n = value["serial"]
+        if type(n) is not int or not 1 <= n < 512 or n > serial:
+            identity_refused("transition active reference is invalid")
+        # These original records stay immutable in BOTH pending and committed
+        # paths, including the same-UUID idempotent return below. Only the bound
+        # prefix/history is checked; later legitimate appends/leases may evolve.
+        if active_prefix(root, n) != value["active_prefix"]:
+            identity_refused("original active reference prefix differs")
+        if any(record_identity(files.path / name) != expected for name, expected in value["history"].items()):
+            identity_refused("original historical record differs")
+        if unique_json(private_read(references[n - 1], 1024))["version"] != value["old_version"]:
+            identity_refused("transition old active reference differs")
+        if n < serial:
+            if unique_json(private_read(references[n], 1024))["version"] != value["new_manifest"]["version"]:
+                identity_refused("transition committed reference differs")
+            for name, expected in value["records"].items():
+                if record_identity(files.path / (name + "." + value["id"] + ".bak")) != expected:
+                    identity_refused("committed transition archive differs")
+            if value["permanent"] != {str(p.relative_to(root)): record_identity(p) for p in
+                                      (root / ".install.lock", files.path / "operation.lock", files.path / "reservation.lock")}:
+                identity_refused("committed transition permanent lock differs")
+        else:
+            journals.append(value)
+    if len(journals) > 1:
+        identity_refused("multiple uncommitted identity transitions")
+    journal = journals[0] if journals else None
+    if not journal and old.host_uniqueid == installed.host_uniqueid:
+        # Explicit flag is idempotent after the transition, but never resets a
+        # same-identity stale lease. Require a completed journal for this UUID.
+        if not any(identity_journal(p)["evidence"]["new_uuid"] == installed.host_uniqueid
+                   for p in files.path.glob("identity-transition-*.bak")):
+            identity_refused("no changed host identity or completed transition")
+        return False
+    records, identities = transition_records(files, journal)
+    prefix = active_prefix(root, serial)
+    permanent = {str(p.relative_to(root)): record_identity(p) for p in
+                 (root / ".install.lock", files.path / "operation.lock", files.path / "reservation.lock")}
+    excluded = set(IDENTITY_RECORDS) | {"operation.lock", "reservation.lock"}
+    if journal:
+        excluded |= {"identity-transition-" + journal["id"] + ".bak"}
+        excluded |= {name + "." + journal["id"] + ".bak" for name in journal["records"]}
+    history = {}
+    for path in files.path.iterdir():
+        if path.name not in excluded:
+            if not path.name.endswith(".bak"):
+                identity_refused("state contains an unknown or incomplete publication")
+            history[path.name] = record_identity(path)
+    if private_read(files.path / "operation.lock", 1) != b"" or private_read(files.path / "reservation.lock", 1) != b"\0":
+        identity_refused("permanent state lock content differs")
+    evidence = identity_evidence(old, installed, desktop, records, ref, home, uid, transport, info)
+    if journal:
+        if (journal["old_version"] != old_version or journal["serial"] != serial
+                or journal["new_manifest"] != marker or journal["evidence"] != evidence
+                or journal["permanent"] != permanent or journal["history"] != history
+                or journal["active_prefix"] != prefix):
+            identity_refused("resume facts differ from the exact UUID-bound durable transition")
+    else:
+        if serial >= 512:
+            identity_refused("active reference history is full")
+        if authorize() is not True:
+            identity_refused("local exclusive REBIND and official pairing confirmation required")
+    # E8 repeats all stable evidence AFTER confirmation (also on resume).
+    again, again_ids = transition_records(files, journal)
+    if (again_ids != identities or identity_evidence(old, installed, desktop, again, ref, home, uid, transport, info) != evidence
+            or permanent != {str(p.relative_to(root)): record_identity(p) for p in
+                             (root / ".install.lock", files.path / "operation.lock", files.path / "reservation.lock")}
+            or history != {p.name: record_identity(p) for p in files.path.iterdir() if p.name not in excluded}
+            or active_prefix(root, serial) != prefix or active(root) != (old_version, serial)):
+        identity_refused("facts changed after REBIND confirmation")
+    if journal is None:
+        journal = {"schema": 1, "id": os.urandom(16).hex(), "old_version": old_version, "serial": serial,
+                   "new_manifest": marker, "evidence": evidence, "records": identities,
+                   "permanent": permanent, "history": history, "active_prefix": prefix,
+                   "confirmation": "REBIND:exclusive:no_unmanaged_stream:official_pair_completed"}
+        path = files.path / ("identity-transition-" + journal["id"] + ".bak")
+        if len(document(journal)) > lc.MAX_PRIVATE:
+            identity_refused("transition evidence exceeds the bounded private journal")
+        create(path, document(journal))  # Durable and verified BEFORE the first rename.
+        if unique_json(private_read(path)) != journal:
+            identity_refused("durable transition verification failed")
+    for name in IDENTITY_RECORDS:
+        if name not in journal["records"]:
+            continue
+        archive = name + "." + journal["id"] + ".bak"
+        if files.read(archive, 1024 * 1024) is None:
+            if record_identity(files.path / name) != journal["records"][name]:
+                identity_refused("old record changed before archival")
+            # Cooperative install+operation locks exclude every controller writer.
+            # Destinations were checked absent; rename retains the original inode.
+            files.anchor()
+            os.rename(name, archive, src_dir_fd=files.fd, dst_dir_fd=files.fd)
+            os.fsync(files.fd)
+        if record_identity(files.path / archive) != journal["records"][name]:
+            identity_refused("archive does not preserve the original record")
+    if files.read("operation.json") is None:
+        create(files.path / "operation.json", document(BASELINE))
+    elif files.read("operation.json") != document(BASELINE):
+        identity_refused("replacement operation baseline differs")
+    return True
+
+
+def validate_transition_version(path, marker):
+    """Only a journal-bound, exact subset may resume an interrupted version."""
+    private_directory(path)
+    names = {p.name for p in path.iterdir()}
+    if names - (set(marker["files"]) | {".owned.json"}):
+        identity_refused("interrupted version has unknown publications")
+    for name in names - {".owned.json"}:
+        if cfg.digest(private_read(path / name)) != marker["files"][name]:
+            identity_refused("interrupted version differs from the bound manifest")
+    if ".owned.json" in names:
+        validate_version(path, marker)
+
+
 def shim_ready(path=SHIM_PATH):
     try:
         data, info = lc.read_owned(path, 32768, asset=True)
@@ -458,7 +817,7 @@ class Result:
 
 def install(metadata, package, ubuntu, architecture, installed_version, *, source=None, home=None,
             transport=None, info=host.serverinfo, publish=False, check_shim=shim_ready, publisher=publish_shim,
-            platform=None):
+            platform=None, reconcile_host_identity=False, authorize_rebind=interactive_rebind):
     if (platform or sys.platform) != "linux":
         fail("platform_runtime_unavailable", "Windows/macOS lifecycle publication is pending; no Linux settings were created")
     uid = os.geteuid()
@@ -475,12 +834,18 @@ def install(metadata, package, ubuntu, architecture, installed_version, *, sourc
     ready = check_shim()  # Reject foreign global publications BEFORE private writes.
     # HOME/.local/share ancestors may be normal parent links, but the controller
     # publication itself must be canonical. No env-selected alternate state root.
+    if reconcile_host_identity and (not root.exists() or root.is_symlink()):
+        identity_refused("identity reconciliation requires an existing installed controller")
     root.parent.mkdir(parents=True, exist_ok=True)
     if root.parent.resolve(strict=True) != root.parent:
         fail("publication_unsafe", "private installation parents below canonical HOME must not redirect the fixed lookup")
     fresh = not root.exists() and not root.is_symlink()
+    if fresh and reconcile_host_identity:
+        identity_refused("identity reconciliation requires an existing installed controller")
     if fresh:
         make_directory(root)
+    if reconcile_host_identity:
+        private_read(root / ".install.lock", 1)  # Never recreate a missing permanent lock.
     with installation_lock(root):
         if fresh:
             for name in ("versions", "active", "state"):
@@ -493,37 +858,58 @@ def install(metadata, package, ubuntu, architecture, installed_version, *, sourc
         old, serial = active(root)
         if (old is None) != fresh:
             fail("publication_unsafe", "installation lacks a complete active reference; trusted repair required")
-        for path in (root / "versions").iterdir():
-            validate_version(path)
         # Do not create a missing operation lock on upgrades or erase interrupted state.
         private_read(root / "state/operation.lock", 1)
         with lc.PrivateFiles(root / "state").locked() as files:
-            status = validate_state(installed, desktop, files)
+            bound_versions = {}
+            if reconcile_host_identity:
+                for path in files.path.glob("identity-transition-*.bak"):
+                    value = identity_journal(path)
+                    bound = value["new_manifest"]
+                    bound_versions[bound["version"]] = bound
+            for path in (root / "versions").iterdir():
+                if path.name in bound_versions:
+                    validate_transition_version(path, bound_versions[path.name])
+                else:
+                    validate_version(path)
             data = document(settings_document(installed))
+            if not reconcile_host_identity:
+                status = validate_state(installed, desktop, files)  # Keep strict host_mismatch.
             if old is not None:
                 old_data = private_read(root / "versions" / old / "host-settings.json", 8192)
                 old_obj, new_obj = unique_json(old_data), unique_json(data)
                 old_obj["host_uniqueid"] = lc.canonical_uuid(old_obj["host_uniqueid"])
-                if old_obj != new_obj:
+                if old_obj == new_obj:
+                    data = old_data  # Preserve valid formatting/UUID spelling on ordinary updates.
+                elif not reconcile_host_identity:
                     fail("settings_conflict", "existing settings/routes/build differ from fresh qualification; preserved without automatic migration")
-                data = old_data  # Preserve even formatting/UUID spelling from valid installed settings.
             payload = {name: source_read(source / name) for name in SOURCES}
-            version_hash = cfg.digest(document({name: cfg.digest(content) for name, content in payload.items()}))
-            version = f"v{RELEASE}-{version_hash}"
             payload["host-settings.json"] = data
-            marker = {"schema": 1, "release": RELEASE, "version": version,
-                      "files": {name: cfg.digest(content) for name, content in payload.items()}}
+            hashes = {name: cfg.digest(content) for name, content in payload.items()}
+            # UUID-only settings changes must identify a DISTINCT immutable version.
+            version = f"v{RELEASE}-" + cfg.digest(document(hashes))
+            marker = {"schema": 1, "release": RELEASE, "version": version, "files": hashes}
             target = root / "versions" / version
+            resuming = version in bound_versions
             if target.exists() or target.is_symlink():
-                validate_version(target, marker)
-            else:
+                if resuming:
+                    validate_transition_version(target, marker)
+                else:
+                    validate_version(target, marker)
+            if reconcile_host_identity:
+                reconcile_identity(root, old, serial, installed, desktop, files, ref, home, uid,
+                                   transport, info, marker, authorize_rebind)
+                status = validate_state(installed, desktop, files)
+            if not target.exists():
                 make_directory(target)
-                for name, content in payload.items():
+            for name, content in payload.items():
+                if not (target / name).exists():
                     create(target / name, content)
-                # Ownership completion marker is LAST. An interrupted version is
-                # retained and explicitly refused, never silently repaired/adopted.
+            if not (target / ".owned.json").exists():
+                # Marker LAST. Only the explicit UUID-bound journal permits
+                # resuming exact partial bytes; ordinary upgrades remain strict.
                 create(target / ".owned.json", document(marker))
-                validate_version(target, marker)
+            validate_version(target, marker)
             if any(private_directory(p) != identity for p, identity in anchors.items()) or active(root) != (old, serial):
                 fail("publication_race", "active reference or private directories changed before publication")
             if old != version:
@@ -586,6 +972,8 @@ def main():
     parser.add_argument("--package", type=Path)
     parser.add_argument("--installed-version")
     parser.add_argument("--publish-shim", action="store_true")
+    parser.add_argument("--reconcile-host-identity", action="store_true",
+                        help="explicit local REBIND ceremony for a qualified identity-changing prelaunch restart")
     args = parser.parse_args()
     try:
         metadata, _ = lc.read_owned(args.metadata, 1024 * 1024)
@@ -596,14 +984,15 @@ def main():
         if args.package is None or args.installed_version is None:
             fail("installation_unavailable", "reference package and installed package version are required")
         result = install(metadata, args.package, args.ubuntu, args.architecture,
-                         args.installed_version, publish=args.publish_shim)
+                         args.installed_version, publish=args.publish_shim,
+                         reconcile_host_identity=args.reconcile_host_identity)
         print(f"Private display controller: {result.root}; status={result.status}. Settings/state preserved on updates.")
         if not result.rpc_ready:
             print("Shim NOT PUBLISHED: noninteractive SSH RPC is not ready. Locally authorize the new system-wide /usr/bin/quick-deploy-display-control via commands/install-display-control.sh --publish-shim.", file=sys.stderr)
             return 1
         print("Fixed RPC shim ready: /usr/bin/quick-deploy-display-control (SSH PATH must include /usr/bin).")
         if result.status == "UNENROLLED":
-            print("UNENROLLED: no stream adopted and no StartReceipt issued. When idle/exclusive, run quick-deploy-display-control --enroll from this user's interactive host terminal.")
+            print("UNENROLLED: no stream adopted and no StartReceipt issued. Complete official Moonlight PIN pairing before any controlled preparation restart; when idle/exclusive, run quick-deploy-display-control --enroll from this user's interactive host terminal.")
         return 0
     except Refusal as exc:
         print(f"Display controller refused [{exc.code}]: {exc.detail}", file=sys.stderr)
