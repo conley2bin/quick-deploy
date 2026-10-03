@@ -101,7 +101,7 @@ Pi 在 lexing 前把 Tab 展开成三个空格，native href 还可能保留 cha
 - **Pi 版本号只用于诊断，不作为启用名单。** 每次 TUI 会话启动先检查实际运行时接口与行为；未知版本标签只要契约成立也会启用，普通升级不需要用户修改版本列表或逐版执行验收脚本。缺少/不可替换的 `Markdown.render`、`renderToken`、`renderInlineTokens`、`TuiAltScreen.handleViewportInput`，或具名行为检查失败时，仅停用复制/链接增强，保留原生 Markdown/Pi。同一扩展实例的同一首要失败只自动提示一次有界、具体的原因；`/copy-links` 显示兼容检查、探针耗时和当前动作登记是否可用。启动后半段 UI/渲染失败也会先摘除并退役 adapter、释放鼠标 owner，再报告停用；清理继续尝试全部步骤，次要错误不替换首要原因。仍含私有 URI 的旧 frame 只保留既有最小被动 input guard，不保留活动 transformer/动作登记。
 - 启动探针复用生产 adapter 与当前 Pi 的类身份，但只安装到自有 Markdown/fullscreen 子类 prototype；不会在异步等待时临时改写共享 live prototype。自有 hook-owner 标记阻止已有 adapter 经 foreign wrapper 接管探针对象；复制使用独立的内存队列，所有 clipboard/opener/terminal 端点均为假实现，不启动终端、不调用 GUI/进程/tmux、不修改全局 theme/capabilities。退出时退役自有动作、取消 timer、恢复自有原始 descriptor，并核对真实运行时 descriptor 未变。通过后才重新捕获生产 hooks，执行原有四方法原子安装。
 - 有界探针覆盖 Tab/中文/行尾空格的精确代码、显式/引用网页及本地链接语义、动作和原生点击/拖选/wheel/overlay 路由、未知私有 URI containment 与清理；不会在启动时运行完整回归套件。先只将 Tab 换成三个空格，保持整份归一化源文不变并核对复制数据，再独立修改 href，最后改变宽度；不读取 token cache 字段。构造时尚未使用的 cache 值不参与准入，自有空白 fixture 建立 frame/尺寸/overlay 状态后检查实际原生 input 消费行为，允许真实 host 延迟初始化缓存。
-- 启动 fixture 使用真实 Markdown 渲染和 viewport input，frame/overlay 几何由自有 fixture 提供；它不验证真实 compositor 的缓存生产。原生 fullscreen start 会在部分图片能力分支修改进程级 capabilities，因此探针不启动终端，也不引入私有运行标志。完整原生 composition/lifecycle、懒初始化及能力分支由隔离回归/维护者 CI 验证。非 TUI 的 RPC/JSON/print 模式不探针、不安装 hooks。每次真实源文渲染仍重新对齐代码块/链接，有限 fixture 不能证明所有未来解析/布局变化；原生滚轮与 overlay 焦点仍交给 Pi。
+- 启动 fixture 使用真实 Markdown 渲染和 viewport input，frame/overlay 几何由自有 fixture 提供；它不验证真实 compositor 的缓存生产。原生 fullscreen start 会在部分图片能力分支修改进程级 capabilities，因此探针不启动终端，也不引入私有运行标志。完整原生 composition/lifecycle、懒初始化及能力分支由下述本地隔离回归验证。非 TUI 的 RPC/JSON/print 模式不探针、不安装 hooks。每次真实源文渲染仍重新对齐代码块/链接，有限 fixture 不能证明所有未来解析/布局变化；原生滚轮与 overlay 焦点仍交给 Pi。
 - 公司本机网页启动先以自有 `spawn`（`shell: false`、有界输出、2.5 秒硬 deadline）执行 `xdg-settings get default-web-browser`，要求单个合法 desktop ID，再以 `xdg-settings check default-web-browser <id>` 确认 `yes`；只接受 `google-chrome.desktop` 并执行 `google-chrome-stable --new-window URL`。不读取 `BROWSER`、desktop entry `Exec`，不调用 `xdg-open`/`gio open` 或备用启动器。deadline/abort/输出溢出独立结算，detached 进程组先 TERM、200 ms 内 KILL；leader `exit` 不代表继承管道的 descendants 已完成，正常结算等待 child `close` 或两个输出流关闭。
 - 公司本机 Chrome/Code 使用参数数组、`shell: false`、`stdio: "ignore"`、detached 子进程。监听器安装、abort 脱钩与 `unref()` 成功才交接；spawn 后同步 handoff 失败先移除 observer，再 TERM+KILL 尚属扩展的组。已接受应用独立于后来代际 abort；可观测 lookup/权限/非零退出在动作仍有效时报告。
 - 一个 mounted Markdown 拥有其全部 copy/open/diagnostic action。所有动作都使用同一随机 `pi-copy://<nonce>/<sequence>` 内存命名空间；URI 不包含路径、命令或代码内容。
@@ -126,14 +126,6 @@ Pi 在 lexing 前把 Tab 展开成三个空格，native href 还可能保留 cha
 公司回环网址保留原 URL、主机名和端口。`localhost` 源网址在发 SSH 前并行探测公司 `127.0.0.1`、`::1` 的原端口 TCP（不发 HTTP/TLS），共享 1.5 秒可中止期限；仅一边可达则选择该数字后端，两边可达按公司 OS 的 `localhost` 解析顺序选首个已验证地址，均不可达或解析不明确即失败。v2 请求只在 `localhost` 情况附加 `backendHost`；显式 `127.0.0.1`/`[::1]` 以其源 IP 为公司数字后端。助手用一个钉住 `ssh -G conley-company` 字面 IP/User/Port 的私有 SSH master，在 Y9000p 请求 **原端口**的 `-L localhost:<端口>:<数字公司后端>:<端口>`。对所有受支持的回环源，必须在同一次 `ss` 清单中证明 Y9000p 的 `127.0.0.1` 与 `::1` 原端口监听都归同一个 master PID；在 `PREPARED` 前和浏览器 handoff 前各复核一次。公司侧核对 `PREPARED`/最终回复的原 URL、数字后端和两端原端口。端口被其他监听器覆盖（包括任何单边占用）、无权绑定或 bind race 返回 `port_conflict`；不会接管、杀掉其他转发，不改写成替代端口/URL。旧单栈显式 IP record 不复用；无法覆盖同端口跳转目标的非标准 127/8、IPv4-mapped loopback 等地址会在打开前拒绝。
 
 这保证已验证的**初始端口**和同端口跳转到 `localhost` 时，两种标准浏览器回环地址都通往选定的公司后端；重定向到**其他端口或其他 authority** 尚不在这个所有权保证内。TCP 探测/隧道准备也不证明 HTTP 服务之后持续可用。外部网页不建公司回环隧道；文件/目录使用 VS Code Remote-SSH typed URI 与明确的 `--file-uri`/`--folder-uri`，请求 `--new-window`。公司本机 Chrome/Code 也只请求新窗口，不控制 GNOME Wayland 的最终 workspace；Y9000p 的默认浏览器由 `xdg-open` 在其 X11 桌面处理，可能复用已有窗口或标签，不能套用公司 Wayland 的窗口预期。
-
-## 维护者自动回归
-
-[兼容 workflow](../../../.github/workflows/pi-copy-links-compat.yml) 在扩展目录、`pi-agent/README.md` 或 workflow 本身的 push/PR 变更时运行，也支持手动触发；每周一 **05:17 UTC** 重新检查 npm Pi latest，包括仓库未改动时发布的 Pi 新版。
-
-它只在临时 Ubuntu 24.04 runner 安装 Node 22 和 npm Pi latest，以 `npm ci --ignore-scripts --legacy-peer-deps` 安装测试依赖，再由现有 `test/setup-pi.mjs` 链接并核对实际 host 的 Pi/TUI 身份。随后执行完整 `npm run check`、下述四种 bundled CLI/PTY recorder，并在自有源码副本中删除测试 peer 链接、验证生产加载。各 native 模式即使前面的回归失败也分别运行，日志与 recorder 证据保存为 14 天的 CI artifact；不会创建新的用户升级/重放脚本，也不会升级操作员机器或修改 Pi bundles/settings。
-
-这是**维护者持续回归**，不是普通用户每次升级后的验证步骤。用户仍只需正常升级/启动；扩展按实际启动契约自动启用或解释具体拒绝原因。Workflow 必须先推送到启用了 GitHub Actions 的远端仓库才会执行；周期任务使用默认分支的文件。本地提交、YAML 检查或本机 recorder 通过都不表示远端 runner 已运行。
 
 ## 开发者诊断与本地复现
 
