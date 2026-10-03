@@ -20,8 +20,11 @@ const hop = Object.freeze({
   tty: "/dev/pts/4",
   leader: Object.freeze({ pid: 4100, starttime: "41000" }),
   holder: Object.freeze({ pid: 4200, starttime: "42000", comm: "fixture-holder" }),
+  proof: "master" as const,
 });
-const localTopology: InputTopology = Object.freeze({ kind: "local", basis: "gui", hops: Object.freeze([hop]) });
+const localTopology: InputTopology = Object.freeze({
+  kind: "local", basis: "display", displayOwner: hop.holder, hops: Object.freeze([hop]),
+});
 const remoteTopology: InputTopology = Object.freeze({ kind: "remote", receiver: client, hops: Object.freeze([hop]) });
 const tmuxTopology: InputTopology = Object.freeze({
   kind: "tmux", socket: "/fixture/tmux", pane: "%4", inputTty: "/dev/pts/4", hops: Object.freeze([hop]),
@@ -99,6 +102,7 @@ function setup(invocations: Invocation[], extras: DispatcherDependencies = {}): 
     env: tmux,
     topology: tmuxTopology,
     resolveTopology: async () => tmuxTopology,
+    revalidateTopology: async () => true,
     resolve: async () => client,
     spawn: fakeSsh(invocations),
     ...extras,
@@ -134,6 +138,7 @@ test("direct local with stale TMUX and verified tmux-local keep the unchanged lo
     env: tmux,
     topology: localTopology,
     resolveTopology: async () => localTopology,
+    revalidateTopology: async () => true,
     local,
     resolve: async (origin) => { origins.push(origin); throw Error("direct topology must not use tmux resolver"); },
     spawn: fakeSsh(invocations),
@@ -146,11 +151,41 @@ test("direct local with stale TMUX and verified tmux-local keep the unchanged lo
   assert.deepEqual(invocations, []);
 });
 
+test("known activation route uses cheap revalidation without a full resolver scan", async () => {
+  let revalidations = 0, resolutions = 0, localCalls = 0;
+  await dispatchOpenTarget("https://example.org/local", "/work", lifetime(), "unknown", {
+    topology: localTopology,
+    resolveTopology: async () => { resolutions++; throw new Error("known route must not rescan"); },
+    revalidateTopology: async (topology) => { revalidations++; assert.equal(topology, localTopology); return true; },
+    local: async () => { localCalls++; },
+  });
+  assert.equal(revalidations, 1);
+  assert.equal(resolutions, 0);
+  assert.equal(localCalls, 1);
+});
+
+test("activation-unknown retries once; direct recovery works while late tmux requires reload", async () => {
+  let localCalls = 0;
+  await dispatchOpenTarget("https://example.org/local", "/work", lifetime(), "unknown", {
+    topology: unknownTopology,
+    resolveTopology: async () => localTopology,
+    local: async () => { localCalls++; },
+  });
+  assert.equal(localCalls, 1);
+
+  await assert.rejects(dispatchOpenTarget("https://example.org", "/work", lifetime(), "unknown", {
+    topology: unknownTopology,
+    resolveTopology: async () => tmuxTopology,
+    resolve: async () => assert.fail("late tmux must not use bindings that were never acquired"),
+  }), /现已进入 tmux.*\/reload/u);
+});
+
 test("direct paired SSH uses the existing pinned v2 helper without tmux", async () => {
   const invocations: Invocation[] = [];
   await dispatchOpenTarget("https://example.org/direct", "/work", lifetime(), "unknown", {
     topology: remoteTopology,
     resolveTopology: async () => remoteTopology,
+    revalidateTopology: async () => true,
     spawn: fakeSsh(invocations),
     local: async () => assert.fail("direct SSH must not use the company opener"),
   });
@@ -174,17 +209,12 @@ test("unpaired or unknown direct input refuses with its holder diagnostic", asyn
 test("tagged origin in a direct topology and changed holder identity both refuse", async () => {
   await assert.rejects(dispatchOpenTarget("https://example.org", "/work", lifetime(), 9999, {
     topology: localTopology,
-    resolveTopology: async () => localTopology,
+    revalidateTopology: async () => true,
     local: async () => assert.fail("tagged direct input must not open locally"),
   }), /直接终端收到 tmux 来源标记/u);
-  const changed: InputTopology = Object.freeze({
-    kind: "local", basis: "gui", hops: Object.freeze([Object.freeze({
-      ...hop, holder: Object.freeze({ ...hop.holder, starttime: "changed" }),
-    })]),
-  });
   await assert.rejects(dispatchOpenTarget("https://example.org", "/work", lifetime(), "unknown", {
     topology: localTopology,
-    resolveTopology: async () => changed,
+    revalidateTopology: async () => false,
     local: async () => assert.fail("changed terminal identity must not open locally"),
   }), /持有者或会话首进程.*变化/u);
 });

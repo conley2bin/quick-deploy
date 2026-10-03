@@ -9,7 +9,6 @@ All evidence is retained; no model requests or user session changes are made.
 """
 import argparse
 import base64
-import ctypes
 import fcntl
 import hashlib
 import json
@@ -21,6 +20,7 @@ import select
 import shlex
 import shutil
 import signal
+import socket
 import struct
 import subprocess
 import sys
@@ -41,21 +41,28 @@ options = args.parse_args()
 parent_marker = '_PI_COPY_LINKS_NATIVE_PARENT_ENV'
 if os.environ.get(parent_marker) != '1':
     clean = dict(os.environ)
-    for key in ('TMUX', 'TMUX_PANE', 'SSH_CONNECTION', 'SSH_CLIENT', 'SSH_TTY'):
+    for key in ('TMUX', 'TMUX_PANE', 'SSH_CONNECTION', 'SSH_CLIENT', 'SSH_TTY',
+                'WAYLAND_DISPLAY', 'DISPLAY', 'XDG_RUNTIME_DIR'):
         clean.pop(key, None)
     clean[parent_marker] = '1'
-    if options.osc52:
-        clean.pop('WAYLAND_DISPLAY', None)
-        clean.pop('DISPLAY', None)
-    else:
-        clean['WAYLAND_DISPLAY'] = 'fixture'
-        clean['DISPLAY'] = ''
     os.execve(sys.executable, [sys.executable, *sys.argv], clean)
-if not options.osc52:
-    # Model the known local GUI terminal that owns the harness PTY master.
-    assert ctypes.CDLL(None).prctl(15, b'ghostty', 0, 0, 0) == 0
 source = Path(__file__).resolve().parents[1]
 root = Path(tempfile.mkdtemp(prefix='pi-copy-links-native-'))
+# Local/tmux modes prove the harness PTY master has a real Unix connection to
+# a private display-server-shaped socket. OSC52 intentionally has no such peer.
+display_server = display_client = display_peer = None
+display_socket_path = None
+if not options.osc52:
+    display_dir = Path('/tmp/.X11-unix')
+    display_dir.mkdir(mode=0o1777, exist_ok=True)
+    display_socket_path = display_dir / f'X{os.getpid()}'
+    assert not display_socket_path.exists(), display_socket_path
+    display_server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    display_server.bind(str(display_socket_path))
+    display_server.listen(1)
+    display_client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    display_client.connect(str(display_socket_path))
+    display_peer, _ = display_server.accept()
 artifacts = options.artifacts or root
 artifacts.mkdir(parents=True, exist_ok=True)
 # Available even when startup/setup fails before the PTY fixture can snapshot.
@@ -265,7 +272,7 @@ try:
         # The harness PTY master is an unknown Python holder. SSH environment
         # alone cannot attribute it, so opening fails with the holder diagnostic.
         refusal_prefix = '输入终端无法归属：输入持有者 '.encode()
-        refusal_body = '无法归属到本机桌面或配'.encode()  # final text wraps before “对 SSH”
+        refusal_body = '没有连接到可验证的本地'.encode()  # final diagnostic wraps before “显示服务”
         wait_for(lambda: refusal_prefix in wire and refusal_body in wire,
                  'unattributed harness PTY refusal')
         for label in ('MODEL_3MF', 'DIAGRAM_SVG', 'DATA_JSON', 'SAMPLE_DIR'):
@@ -386,3 +393,8 @@ finally:
             tmux('kill-pane', '-t', pane)
     if project_session and old_mouse is not None:
         tmux('set-option', '-t', project_session, 'mouse', old_mouse)
+    for display_socket in (display_peer, display_client, display_server):
+        if display_socket is not None:
+            display_socket.close()
+    if display_socket_path is not None:
+        display_socket_path.unlink(missing_ok=True)

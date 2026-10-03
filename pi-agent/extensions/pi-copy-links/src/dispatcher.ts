@@ -6,7 +6,7 @@ import type { OpenOrigin } from "./adapter.ts";
 import { webUrl, type OpenLifetime } from "./browser.ts";
 import { openTarget, parseOpenTarget, validateLocalTarget, type OpenTargetDependencies } from "./links.ts";
 import {
-  resolveInputReceiver, resolveInputTopology, sameInputTopology,
+  resolveInputReceiver, resolveInputTopology, revalidateInputTopology,
   type InputReceiver, type InputTopology,
 } from "./receiver.ts";
 
@@ -41,9 +41,10 @@ export type HelperSpawn = (
 
 export interface DispatcherDependencies {
   readonly env?: NodeJS.ProcessEnv;
-  /** Frozen at extension activation; dispatch re-resolves and compares its terminal incarnation. */
+  /** Frozen at extension activation; known routes are cheaply revalidated without a full proc scan. */
   readonly topology?: InputTopology;
   readonly resolveTopology?: () => Promise<InputTopology>;
+  readonly revalidateTopology?: (topology: InputTopology) => Promise<boolean>;
   /** Resolve a marker-selected client only after the active topology is verified as tmux. */
   readonly resolve?: (origin: OpenOrigin) => Promise<InputReceiver>;
   readonly local?: (href: string, cwd: string, lifetime: OpenLifetime) => Promise<void>;
@@ -375,15 +376,26 @@ export async function dispatchOpenTarget(
   dependencies: DispatcherDependencies = {},
 ): Promise<void> {
   ensureCurrent(lifetime);
+  const receiverDependencies = { env: dependencies.env ?? process.env };
   const resolveTopology = dependencies.resolveTopology ??
-    (() => resolveInputTopology(process.pid, { env: dependencies.env ?? process.env }));
+    (() => resolveInputTopology(process.pid, receiverDependencies));
+  const revalidateTopology = dependencies.revalidateTopology ??
+    ((topology: InputTopology) => revalidateInputTopology(process.pid, topology, receiverDependencies));
   const activated = dependencies.topology ?? await resolveTopology();
-  const current = await resolveTopology();
-  ensureCurrent(lifetime);
-  if (!sameInputTopology(activated, current)) {
-    throw new Error("输入终端持有者或会话首进程自扩展加载后已变化，已拒绝打开链接");
+  let current = activated;
+  if (activated.kind === "unknown") {
+    current = await resolveTopology();
+    ensureCurrent(lifetime);
+    if (current.kind === "tmux") {
+      throw new Error("输入终端现已进入 tmux；本次未安装来源绑定，请在 Pi 空闲时执行 /reload");
+    }
+    if (current.kind === "unknown") throw new Error(`输入终端无法归属：${current.diagnostic}`);
+  } else {
+    if (!await revalidateTopology(activated)) {
+      throw new Error("输入终端持有者或会话首进程自扩展加载后已变化，已拒绝打开链接");
+    }
+    ensureCurrent(lifetime);
   }
-  if (current.kind === "unknown") throw new Error(`输入终端无法归属：${current.diagnostic}`);
   if (current.kind !== "tmux" && origin !== "unknown") {
     throw new Error("直接终端收到 tmux 来源标记，已拒绝打开链接");
   }

@@ -12,9 +12,10 @@ const PANE_TTY_FORMAT = "#{pane_tty}";
 const REMOTE_ALIAS = "conley-Y9000p";
 const REMOTE_USER = "conley";
 const MAX_RELAY_DEPTH = 4;
-const GUI_TERMINALS = new Set([
-  "ghostty", "gnome-terminal-server", "kitty", "alacritty", "konsole",
-  "wezterm-gui", "xterm", "foot", "tilix", "terminator",
+const MAX_DISPLAY_ANCESTORS = 8;
+const DEFAULT_SCAN_TIMEOUT_MS = 750;
+const DENIED_MULTIPLEXERS = new Set([
+  "screen", "zellij", "abduco", "dtach", "mosh-server", "dvtm",
 ]);
 
 export type InputReceiver = "local" | Readonly<{
@@ -45,17 +46,21 @@ export interface ReceiverDependencies {
   readProc?: (path: string) => Promise<Buffer>;
   readDir?: (path: string) => Promise<readonly string[]>;
   readLink?: (path: string) => Promise<string>;
+  scanTimeoutMs?: number;
 }
 
-interface ProcessIdentity { readonly pid: number; readonly starttime: string }
+export interface ProcessIdentity { readonly pid: number; readonly starttime: string }
 export interface InputHop {
   readonly tty: string;
   readonly leader: ProcessIdentity;
   readonly holder: ProcessIdentity & { readonly comm: string };
+  readonly proof: "master" | "sshd";
 }
 interface TopologyBase { readonly hops: readonly InputHop[] }
 export type InputTopology =
-  | (TopologyBase & { readonly kind: "local"; readonly basis: "gui" | "legacy" })
+  | (TopologyBase & {
+      readonly kind: "local"; readonly basis: "display"; readonly displayOwner: ProcessIdentity;
+    })
   | (TopologyBase & { readonly kind: "remote"; readonly receiver: Exclude<InputReceiver, "local"> })
   | (TopologyBase & {
       readonly kind: "tmux"; readonly socket: string; readonly pane: string; readonly inputTty: string;
@@ -64,7 +69,10 @@ export type InputTopology =
 
 const runDefault: NonNullable<ReceiverDependencies["run"]> = async (program, args) => {
   const { stdout, stderr } = await exec(program, [...args], {
-    encoding: "utf8", timeout: 2500, maxBuffer: 1024 * 1024,
+    encoding: "utf8",
+    timeout: program === "ss" ? 600 : 2500,
+    maxBuffer: program === "ss" ? 4 * 1024 * 1024 : 1024 * 1024,
+    shell: false,
   });
   return { code: 0, stdout, stderr };
 };
@@ -128,11 +136,12 @@ interface ProcStat {
   ppid: number;
   pgrp: number;
   sid: number;
+  tpgid: number;
   comm: string;
   starttime: string;
 }
 
-/** /proc stat fields 4, 5, 6 and 22 follow the final ')' ending field 2. */
+/** /proc stat fields 4, 5, 6, 8 and 22 follow the final ')' ending field 2. */
 function parseStat(pid: number, bytes: Buffer): ProcStat {
   const line = bytes.toString("utf8").trimEnd();
   const open = line.indexOf(" (");
@@ -142,17 +151,24 @@ function parseStat(pid: number, bytes: Buffer): ProcStat {
   }
   const comm = line.slice(open + 2, close);
   const fields = line.slice(close + 1).trim().split(/\s+/u);
-  const [ppidRaw, pgrpRaw, sidRaw] = [fields[1], fields[2], fields[3]];
+  const [ppidRaw, pgrpRaw, sidRaw, tpgidRaw] = [fields[1], fields[2], fields[3], fields[5]];
   const starttime = fields[19];
   if (!comm || fields.length < 50 || !/^[A-Za-z]$/u.test(fields[0] ?? "") ||
       ["Z", "X", "x"].includes(fields[0]!) ||
       ![ppidRaw, pgrpRaw, sidRaw].every((value) => /^(0|[1-9]\d*)$/u.test(value ?? "")) ||
+      !/^-?(0|[1-9]\d*)$/u.test(tpgidRaw ?? "") ||
       !/^[1-9]\d*$/u.test(starttime ?? "") ||
-      ![ppidRaw, pgrpRaw, sidRaw].every((value) => Number.isSafeInteger(Number(value)))) {
+      ![ppidRaw, pgrpRaw, sidRaw, tpgidRaw].every((value) => Number.isSafeInteger(Number(value)))) {
     reject("proc-incomplete", `process ${pid} has incomplete stat fields`);
   }
   return {
-    pid, ppid: Number(ppidRaw), pgrp: Number(pgrpRaw), sid: Number(sidRaw), comm, starttime: starttime!,
+    pid,
+    ppid: Number(ppidRaw),
+    pgrp: Number(pgrpRaw),
+    sid: Number(sidRaw),
+    tpgid: Number(tpgidRaw),
+    comm,
+    starttime: starttime!,
   };
 }
 
@@ -183,7 +199,11 @@ async function ancestry(pid: number, readProc: NonNullable<ReceiverDependencies[
 
 function sameStat(a: ProcStat, b: ProcStat): boolean {
   return a.pid === b.pid && a.ppid === b.ppid && a.pgrp === b.pgrp && a.sid === b.sid &&
-    a.comm === b.comm && a.starttime === b.starttime;
+    a.tpgid === b.tpgid && a.comm === b.comm && a.starttime === b.starttime;
+}
+
+function sameIdentity(identity: ProcessIdentity, value: ProcStat): boolean {
+  return identity.pid === value.pid && identity.starttime === value.starttime;
 }
 
 function sameAncestry(a: ProcStat[], b: ProcStat[]): boolean {
@@ -258,21 +278,27 @@ function sshAlias(output: string): { hostname: string; port: number } {
   return { hostname, port: remotePort };
 }
 
+interface UnixSocketEntry { readonly path: string; readonly peerInode: string }
 interface ProcAccess {
   env: NodeJS.ProcessEnv;
   run: NonNullable<ReceiverDependencies["run"]>;
   readProc: NonNullable<ReceiverDependencies["readProc"]>;
   readDir: NonNullable<ReceiverDependencies["readDir"]>;
   readLink: NonNullable<ReceiverDependencies["readLink"]>;
+  scanTimeoutMs: number;
+  socketTable?: Promise<ReadonlyMap<string, UnixSocketEntry> | undefined>;
 }
 
 function access(dependencies: ReceiverDependencies): ProcAccess {
+  const configured = dependencies.scanTimeoutMs;
   return {
     env: dependencies.env ?? process.env,
     run: dependencies.run ?? runDefault,
     readProc: dependencies.readProc ?? readFile,
     readDir: dependencies.readDir ?? (async (path) => readdir(path)),
     readLink: dependencies.readLink ?? readlink,
+    scanTimeoutMs: typeof configured === "number" && Number.isFinite(configured) && configured > 0 ?
+      configured : DEFAULT_SCAN_TIMEOUT_MS,
   };
 }
 
@@ -345,32 +371,56 @@ async function sshdHolder(candidate: ProcStat, leader: ProcStat, leaderUid: read
 }
 
 interface HolderProof { stat: ProcStat; proof: "master" | "sshd" }
+interface HolderSearch { holder?: HolderProof; timedOut: boolean }
 
-async function findHolder(leader: ProcStat, tty: string, accessor: ProcAccess): Promise<HolderProof | undefined> {
+async function fallbackHolderScan(
+  leaderUid: readonly number[], index: number, accessor: ProcAccess,
+): Promise<HolderSearch> {
+  let expired = false;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<HolderSearch>((resolve) => {
+    timer = setTimeout(() => { expired = true; resolve({ timedOut: true }); }, accessor.scanTimeoutMs);
+  });
+  const scan = (async (): Promise<HolderSearch> => {
+    let entries: readonly string[];
+    try { entries = await accessor.readDir("/proc"); }
+    catch { return { timedOut: false }; }
+    const found = new Map<number, HolderProof>();
+    for (const entry of entries) {
+      if (expired) return { timedOut: true };
+      const pid = positivePid(entry);
+      if (pid === undefined) continue;
+      try {
+        const candidate = await stat(pid, accessor.readProc);
+        if (expired) return { timedOut: true };
+        if (await genericMasterHolder(candidate, leaderUid, index, accessor)) {
+          found.set(candidate.pid, { stat: candidate, proof: "master" });
+          if (found.size > 1) return { timedOut: false };
+        }
+      } catch { /* Processes may exit or be unreadable during the bounded scan. */ }
+    }
+    return { holder: found.size === 1 ? [...found.values()][0] : undefined, timedOut: false };
+  })();
+  try { return await Promise.race([scan, timeout]); }
+  finally { if (timer) clearTimeout(timer); expired = true; }
+}
+
+async function findHolder(leader: ProcStat, tty: string, accessor: ProcAccess): Promise<HolderSearch> {
   const index = ttyIndex(tty);
   const leaderUid = await uid(leader.pid, accessor);
-  if (index === undefined || !leaderUid) return undefined;
+  if (index === undefined || !leaderUid) return { timedOut: false };
   if (leader.ppid > 0) {
     try {
       const candidate = await stat(leader.ppid, accessor.readProc);
-      if (await sshdHolder(candidate, leader, leaderUid, tty, accessor)) return { stat: candidate, proof: "sshd" };
-      if (await genericMasterHolder(candidate, leaderUid, index, accessor)) return { stat: candidate, proof: "master" };
-    } catch { /* The exact fallback scan decides whether another readable holder is unique. */ }
+      if (await sshdHolder(candidate, leader, leaderUid, tty, accessor)) {
+        return { holder: { stat: candidate, proof: "sshd" }, timedOut: false };
+      }
+      if (await genericMasterHolder(candidate, leaderUid, index, accessor)) {
+        return { holder: { stat: candidate, proof: "master" }, timedOut: false };
+      }
+    } catch { /* The bounded fallback scan decides whether another readable holder is unique. */ }
   }
-  let entries: readonly string[];
-  try { entries = await accessor.readDir("/proc"); }
-  catch { return undefined; }
-  const found: HolderProof[] = [];
-  for (const entry of entries) {
-    const pid = positivePid(entry);
-    if (pid === undefined) continue;
-    try {
-      const candidate = await stat(pid, accessor.readProc);
-      if (await genericMasterHolder(candidate, leaderUid, index, accessor)) found.push({ stat: candidate, proof: "master" });
-    } catch { /* Processes may exit or be unreadable during the fallback scan. */ }
-  }
-  const unique = new Map(found.map((item) => [item.stat.pid, item]));
-  return unique.size === 1 ? [...unique.values()][0] : undefined;
+  return fallbackHolderScan(leaderUid, index, accessor);
 }
 
 async function stillHolds(proof: HolderProof, leader: ProcStat, tty: string, accessor: ProcAccess): Promise<boolean> {
@@ -383,6 +433,131 @@ async function stillHolds(proof: HolderProof, leader: ProcStat, tty: string, acc
   if (!leaderUid || index === undefined) return false;
   return proof.proof === "sshd" ? sshdHolder(current, leader, leaderUid, tty, accessor) :
     genericMasterHolder(current, leaderUid, index, accessor);
+}
+
+function normalizeSocketInode(raw: string): string | undefined {
+  if (!/^-?\d+$/u.test(raw)) return undefined;
+  try {
+    let value = BigInt(raw);
+    if (value < 0n) value += 1n << 32n;
+    return value >= 0n ? value.toString() : undefined;
+  } catch { return undefined; }
+}
+
+function parseUnixSockets(output: string): ReadonlyMap<string, UnixSocketEntry> {
+  const sockets = new Map<string, UnixSocketEntry>();
+  for (const line of output.split("\n")) {
+    if (!line.trim()) continue;
+    const fields = line.trim().split(/\s+/u);
+    if (fields.length < 8 || !fields[0]!.startsWith("u_")) continue;
+    const inode = normalizeSocketInode(fields[5]!);
+    const peerInode = normalizeSocketInode(fields[7]!);
+    if (!inode || !peerInode) continue;
+    sockets.set(inode, { path: fields[4]!, peerInode });
+  }
+  return sockets;
+}
+
+async function unixSockets(accessor: ProcAccess): Promise<ReadonlyMap<string, UnixSocketEntry> | undefined> {
+  accessor.socketTable ??= (async () => {
+    let result: ReceiverRunResult;
+    try { result = await accessor.run("ss", ["-xH", "-a", "-n"]); }
+    catch { return undefined; }
+    if (result.code !== 0 || typeof result.stdout !== "string") return undefined;
+    return parseUnixSockets(result.stdout);
+  })();
+  return accessor.socketTable;
+}
+
+async function ownedSocketInodes(pid: number, accessor: ProcAccess): Promise<readonly string[]> {
+  let fds: readonly string[];
+  try { fds = await accessor.readDir(`/proc/${pid}/fd`); }
+  catch { return []; }
+  const inodes = new Set<string>();
+  for (const fd of fds) {
+    if (!/^\d+$/u.test(fd)) continue;
+    const target = await link(accessor, `/proc/${pid}/fd/${fd}`);
+    const match = /^socket:\[(\d+)\]$/u.exec(target ?? "");
+    if (match) inodes.add(match[1]!);
+  }
+  return [...inodes];
+}
+
+function safeSocketPath(value: string): boolean {
+  return value.startsWith("/") && !/[\x00-\x1f\x7f]/u.test(value);
+}
+
+async function displayPaths(pid: number, _processUid: readonly number[], accessor: ProcAccess): Promise<ReadonlySet<string>> {
+  const paths = new Set<string>();
+  try {
+    const values = await environment(pid, accessor.readProc);
+    const runtime = values.get("XDG_RUNTIME_DIR");
+    const wayland = values.get("WAYLAND_DISPLAY");
+    if (runtime && safeSocketPath(runtime) && wayland && !/[\x00-\x1f\x7f]/u.test(wayland)) {
+      const path = wayland.startsWith("/") ? wayland : `${runtime.replace(/\/$/u, "")}/${wayland}`;
+      if (safeSocketPath(path)) paths.add(path);
+    }
+  } catch { /* Environment paths are optional; a canonical live peer still proves the display. */ }
+  return paths;
+}
+
+function isDisplayServerPath(path: string, processUid: readonly number[], extra: ReadonlySet<string>): boolean {
+  const realUid = processUid[0];
+  if (realUid !== undefined && new RegExp(`^/run/user/${realUid}/wayland-[^/\\s]+$`, "u").test(path)) return true;
+  if (/^@?\/tmp\/\.X11-unix\/X\d+$/u.test(path)) return true;
+  return extra.has(path);
+}
+
+function executableName(args: readonly string[] | undefined, comm: string): string {
+  const first = args?.[0];
+  return first ? basename(first) : comm;
+}
+
+function isTmuxServer(args: readonly string[] | undefined, comm: string): boolean {
+  return comm === "tmux: server" || comm.startsWith("tmux: server") ||
+    executableName(args, comm) === "tmux" && comm.includes("server");
+}
+
+function isDeniedMultiplexer(args: readonly string[] | undefined, comm: string): boolean {
+  return [comm, executableName(args, comm)].some((name) => DENIED_MULTIPLEXERS.has(name.toLowerCase()));
+}
+
+interface DisplayEvidence {
+  owner?: ProcessIdentity;
+  unavailable?: true;
+  changed?: true;
+}
+
+async function displayEvidence(holder: ProcStat, accessor: ProcAccess): Promise<DisplayEvidence> {
+  const sockets = await unixSockets(accessor);
+  if (!sockets) return { unavailable: true };
+  const visited = new Set<number>();
+  let current = holder;
+  for (let depth = 0; depth < MAX_DISPLAY_ANCESTORS && !visited.has(current.pid); depth++) {
+    visited.add(current.pid);
+    const args = await argv(current.pid, accessor);
+    if (sshdComm(current.comm) || isTmuxServer(args, current.comm) || isDeniedMultiplexer(args, current.comm)) return {};
+    const processUid = await uid(current.pid, accessor);
+    if (processUid) {
+      const extraPaths = await displayPaths(current.pid, processUid, accessor);
+      const inodes = await ownedSocketInodes(current.pid, accessor);
+      for (const inode of inodes) {
+        const peerInode = sockets.get(inode)?.peerInode;
+        const peerPath = peerInode ? sockets.get(peerInode)?.path : undefined;
+        if (peerPath && isDisplayServerPath(peerPath, processUid, extraPaths)) {
+          let after: ProcStat;
+          try { after = await stat(current.pid, accessor.readProc); }
+          catch { return { changed: true }; }
+          if (!sameStat(current, after)) return { changed: true };
+          return { owner: processIdentity(current) };
+        }
+      }
+    }
+    if (current.pid === 1 || current.ppid < 1) return {};
+    try { current = await stat(current.ppid, accessor.readProc); }
+    catch { return { changed: true }; }
+  }
+  return {};
 }
 
 function processIdentity(value: ProcStat): ProcessIdentity {
@@ -402,35 +577,9 @@ function withHop(topology: InputTopology, hop: InputHop): InputTopology {
   return Object.freeze({ ...topology, hops: Object.freeze([hop, ...topology.hops]) });
 }
 
-function executableName(args: readonly string[] | undefined, comm: string): string {
-  const first = args?.[0];
-  return first ? basename(first) : comm;
-}
-
-function isBroker(args: readonly string[] | undefined, comm: string): boolean {
-  if (executableName(args, comm) === "codoxear-broker" || comm === "codoxear-broker") return true;
-  if (!args || !/^python(?:\d+(?:\.\d+)*)?$/u.test(basename(args[0] ?? ""))) return false;
-  const module = args.indexOf("-m");
-  return module >= 0 && (args[module + 1] === "codoxear.broker" ||
-    args[module + 1] === "codoxear" && args[module + 2] === "broker");
-}
-
-function guiName(args: readonly string[] | undefined, comm: string): string | undefined {
-  const names = [comm, executableName(args, comm)];
-  return names.find((name) => GUI_TERMINALS.has(name));
-}
-
-function isTmuxServer(args: readonly string[] | undefined, comm: string): boolean {
-  return comm === "tmux: server" || comm.startsWith("tmux: server") ||
-    executableName(args, comm) === "tmux" && comm.includes("server");
-}
-
-function hasSshAncestor(chain: readonly ProcStat[]): boolean {
-  return chain.some((entry) => sshdComm(entry.comm));
-}
-
 function identitiesEqual(a: InputHop, b: InputHop): boolean {
-  return a.tty === b.tty && a.leader.pid === b.leader.pid && a.leader.starttime === b.leader.starttime &&
+  return a.tty === b.tty && a.proof === b.proof &&
+    a.leader.pid === b.leader.pid && a.leader.starttime === b.leader.starttime &&
     a.holder.pid === b.holder.pid && a.holder.starttime === b.holder.starttime && a.holder.comm === b.holder.comm;
 }
 
@@ -438,7 +587,10 @@ function identitiesEqual(a: InputHop, b: InputHop): boolean {
 export function sameInputTopology(a: InputTopology, b: InputTopology): boolean {
   if (a.kind !== b.kind || a.hops.length !== b.hops.length ||
       !a.hops.every((hop, index) => identitiesEqual(hop, b.hops[index]!))) return false;
-  if (a.kind === "local" && b.kind === "local") return a.basis === b.basis;
+  if (a.kind === "local" && b.kind === "local") {
+    return a.basis === b.basis && a.displayOwner.pid === b.displayOwner.pid &&
+      a.displayOwner.starttime === b.displayOwner.starttime;
+  }
   if (a.kind === "remote" && b.kind === "remote") {
     return a.receiver.peer === b.receiver.peer && a.receiver.port === b.receiver.port &&
       a.receiver.user === b.receiver.user;
@@ -450,9 +602,9 @@ export function sameInputTopology(a: InputTopology, b: InputTopology): boolean {
 }
 
 async function inspectInput(
-  subjectPid: number, rootPid: number, accessor: ProcAccess, depth: number, visited: ReadonlySet<number>,
+  subjectPid: number, accessor: ProcAccess, depth: number, visited: ReadonlySet<number>,
 ): Promise<InputTopology> {
-  if (depth > MAX_RELAY_DEPTH) return unknown("Codoxear 输入中继层级超过限制，无法归属");
+  if (depth > MAX_RELAY_DEPTH) return unknown("输入终端透明中继层级超过限制，无法归属");
   let subject: ProcStat;
   try { subject = await stat(subjectPid, accessor.readProc); }
   catch { return unknown(`无法读取输入进程 ${subjectPid} 的身份`); }
@@ -465,13 +617,16 @@ async function inspectInput(
       return unknown(`${tty} 的会话首进程无法验证`);
     }
   } catch { return unknown(`${tty} 的会话首进程无法读取`); }
-  const proof = await findHolder(leader, tty, accessor);
-  if (!proof) return unknown(`${tty} 的 PTY 主端持有者不唯一或不可验证`);
+  const search = await findHolder(leader, tty, accessor);
+  if (search.timedOut) return unknown(`${tty} 的 PTY 主端扫描超过 ${accessor.scanTimeoutMs} ms，无法归属`);
+  if (!search.holder) return unknown(`${tty} 的 PTY 主端持有者不唯一或不可验证`);
+  const proof = search.holder;
   const holder = proof.stat;
   const hop: InputHop = Object.freeze({
     tty,
     leader: processIdentity(leader),
     holder: Object.freeze({ ...processIdentity(holder), comm: holderName(holder.comm) }),
+    proof: proof.proof,
   });
   try {
     const afterSubject = await stat(subjectPid, accessor.readProc);
@@ -501,32 +656,6 @@ async function inspectInput(
     }
   }
 
-  if (isBroker(args, holder.comm)) {
-    if (visited.has(holder.pid)) return unknown("Codoxear 输入中继形成循环，无法归属", [hop]);
-    const nextVisited = new Set(visited);
-    nextVisited.add(holder.pid);
-    const relayed = await inspectInput(holder.pid, rootPid, accessor, depth + 1, nextVisited);
-    try {
-      if (!await stillHolds(proof, leader, tty, accessor)) {
-        return unknown(`输入持有者 ${holderName(holder.comm)} 在中继检查期间发生变化`, [hop]);
-      }
-    } catch { return unknown(`输入持有者 ${holderName(holder.comm)} 在中继检查期间消失`, [hop]); }
-    return withHop(relayed, hop);
-  }
-
-  const gui = guiName(args, holder.comm);
-  if (gui) {
-    try {
-      const values = await environment(holder.pid, accessor.readProc);
-      const wayland = values.get("WAYLAND_DISPLAY");
-      const display = values.get("DISPLAY");
-      if (wayland || display && /^:\d+(?:\.\d+)?$/u.test(display)) {
-        return Object.freeze({ kind: "local", basis: "gui", hops: Object.freeze([hop]) });
-      }
-      return unknown(`输入持有者 ${gui} 没有可验证的本地 Wayland/X 显示`, [hop]);
-    } catch { return unknown(`输入持有者 ${gui} 的初始显示环境不可读`, [hop]); }
-  }
-
   if (isTmuxServer(args, holder.comm)) {
     const socket = /^(.+),\d+,\d+$/u.exec(accessor.env.TMUX ?? "")?.[1];
     const pane = accessor.env.TMUX_PANE;
@@ -543,23 +672,79 @@ async function inspectInput(
     return Object.freeze({ kind: "tmux", socket, pane, inputTty: tty, hops: Object.freeze([hop]) });
   }
 
-  try {
-    const rootEnvironment = await environment(rootPid, accessor.readProc);
-    const rootHasSsh = ["SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY"].some((key) => rootEnvironment.has(key));
-    const chain = await ancestry(holder.pid, accessor.readProc);
-    if (!rootHasSsh && !hasSshAncestor(chain)) {
-      return Object.freeze({ kind: "local", basis: "legacy", hops: Object.freeze([hop]) });
+  if (isDeniedMultiplexer(args, holder.comm)) {
+    return unknown(`输入持有者 ${holderName(holder.comm)} 是不支持的多路复用器，无法归属点击来源`, [hop]);
+  }
+
+  const outerTty = await link(accessor, `/proc/${holder.pid}/fd/0`);
+  if (outerTty && ttyIndex(outerTty) !== undefined && outerTty !== tty) {
+    if (holder.pgrp <= 0 || holder.tpgid !== holder.pgrp) {
+      return unknown(`输入持有者 ${holderName(holder.comm)} 不在外层 PTY 的前台进程组，不能作为透明中继`, [hop]);
     }
-  } catch { /* Local fallback requires positive proof that both SSH signals are absent. */ }
-  return unknown(`输入持有者 ${holderName(holder.comm)} 无法归属到本机桌面或配对 SSH`, [hop]);
+    if (visited.has(holder.pid)) return unknown("输入终端透明中继形成循环，无法归属", [hop]);
+    const nextVisited = new Set(visited);
+    nextVisited.add(holder.pid);
+    const relayed = await inspectInput(holder.pid, accessor, depth + 1, nextVisited);
+    try {
+      const current = await stat(holder.pid, accessor.readProc);
+      if (!sameStat(holder, current) || await link(accessor, `/proc/${holder.pid}/fd/0`) !== outerTty ||
+          !await stillHolds(proof, leader, tty, accessor)) {
+        return unknown(`输入持有者 ${holderName(holder.comm)} 在中继检查期间发生变化`, [hop]);
+      }
+    } catch { return unknown(`输入持有者 ${holderName(holder.comm)} 在中继检查期间消失`, [hop]); }
+    return withHop(relayed, hop);
+  }
+
+  const display = await displayEvidence(holder, accessor);
+  if (display.unavailable) return unknown("无法读取本机 Unix socket 连接，不能证明输入持有者连接到本地显示服务", [hop]);
+  if (display.changed) return unknown(`输入持有者 ${holderName(holder.comm)} 的显示证据在检查期间发生变化`, [hop]);
+  if (display.owner) {
+    return Object.freeze({
+      kind: "local", basis: "display", displayOwner: display.owner, hops: Object.freeze([hop]),
+    });
+  }
+  return unknown(`输入持有者 ${holderName(holder.comm)} 没有连接到可验证的本地显示服务，无法归属`, [hop]);
 }
 
-/** Resolve the actual fd0 PTY transport. Unknown input is returned explicitly and never falls back remotely. */
+/** Resolve the actual fd0 PTY transport. Unknown input is returned explicitly and never falls back locally/remotely. */
 export async function resolveInputTopology(
   subjectPid: number = process.pid, dependencies: ReceiverDependencies = {},
 ): Promise<InputTopology> {
   if (!Number.isSafeInteger(subjectPid) || subjectPid < 1) return unknown("输入进程 PID 无效");
-  return inspectInput(subjectPid, subjectPid, access(dependencies), 0, new Set([subjectPid]));
+  return inspectInput(subjectPid, access(dependencies), 0, new Set([subjectPid]));
+}
+
+/** Cheaply revalidate one activation-time chain without rescanning /proc or rerunning ss/ssh/tmux. */
+export async function revalidateInputTopology(
+  subjectPid: number, topology: InputTopology, dependencies: ReceiverDependencies = {},
+): Promise<boolean> {
+  if (topology.kind === "unknown" || !Number.isSafeInteger(subjectPid) || subjectPid < 1) return false;
+  const accessor = access(dependencies);
+  let currentSubject = subjectPid;
+  for (const hop of topology.hops) {
+    if (await link(accessor, `/proc/${currentSubject}/fd/0`) !== hop.tty) return false;
+    let leader: ProcStat, holder: ProcStat;
+    try {
+      leader = await stat(hop.leader.pid, accessor.readProc);
+      holder = await stat(hop.holder.pid, accessor.readProc);
+    } catch { return false; }
+    if (!sameIdentity(hop.leader, leader) || !sameIdentity(hop.holder, holder) ||
+        await link(accessor, `/proc/${leader.pid}/fd/0`) !== hop.tty) return false;
+    const leaderUid = await uid(leader.pid, accessor);
+    const index = ttyIndex(hop.tty);
+    if (!leaderUid || index === undefined) return false;
+    const valid = hop.proof === "sshd" ? await sshdHolder(holder, leader, leaderUid, hop.tty, accessor) :
+      await genericMasterHolder(holder, leaderUid, index, accessor);
+    if (!valid) return false;
+    currentSubject = holder.pid;
+  }
+  if (topology.kind === "local") {
+    try {
+      const owner = await stat(topology.displayOwner.pid, accessor.readProc);
+      if (!sameIdentity(topology.displayOwner, owner)) return false;
+    } catch { return false; }
+  }
+  return true;
 }
 
 /** Resolve one frozen, source-verified tmux mouse origin. No fallback receiver exists. */
@@ -593,9 +778,9 @@ export async function resolveInputReceiver(
   }
   let receiver: InputReceiver;
   if (topology.kind === "remote") receiver = topology.receiver;
-  else if (topology.kind === "local" && topology.basis === "gui") receiver = "local";
+  else if (topology.kind === "local") receiver = "local";
   else reject("input-unattributed", topology.kind === "unknown" ? topology.diagnostic :
-    "origin tmux client is behind another multiplexer or an unrecognized terminal");
+    "origin tmux client is behind another multiplexer");
 
   const last = attachedClient(await inventory(), origin);
   if (last.tty !== first.tty || last.session !== first.session || last.flags !== first.flags) {

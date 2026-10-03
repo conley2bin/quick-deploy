@@ -12,10 +12,12 @@ const taggedBinding = (key: string) => key === "MouseDown1Pane" ? STOCK_TAGGED :
     (key === "MouseUp1Pane" ? '"send-keys -M"' : "''");
 const env = { TMUX: "/fixture/socket,with-comma,100,2", TMUX_PANE: "%42" };
 const hop = Object.freeze({ tty: "/dev/pts/42", leader: Object.freeze({ pid: 1, starttime: "1" }),
-  holder: Object.freeze({ pid: 2, starttime: "2", comm: "tmux: server" }) });
+  holder: Object.freeze({ pid: 2, starttime: "2", comm: "tmux: server" }), proof: "master" as const });
 const topology: InputTopology = Object.freeze({ kind: "tmux", socket: "/fixture/socket,with-comma",
   pane: "%42", inputTty: "/dev/pts/42", hops: Object.freeze([hop]) });
-const direct: InputTopology = Object.freeze({ kind: "local", basis: "gui", hops: Object.freeze([hop]) });
+const direct: InputTopology = Object.freeze({
+  kind: "local", basis: "display", displayOwner: hop.holder, hops: Object.freeze([hop]),
+});
 
 function server(version = "tmux 3.4") {
   const keys = new Map<string, string>([["MouseDown1Pane", STOCK_DOWN]]);
