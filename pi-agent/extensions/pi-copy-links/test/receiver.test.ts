@@ -342,14 +342,25 @@ async function firstOutputLine(stream: NodeJS.ReadableStream, timeoutMs = 5000):
 }
 
 const KERNEL_HOLDER_SCRIPT = [
-  "import json, os, pty, socket, time",
+  "import json, os, pty, select, socket, time",
   "path=f'/tmp/.X11-unix/X{os.getpid()}'",
   "server=socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)",
   "server.bind(path); server.listen(1)",
   "client=socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); client.connect(path)",
   "peer,_=server.accept()",
+  "ready_r,ready_w=os.pipe()",
   "pid,master=pty.fork()",
-  "if pid == 0: time.sleep(60); os._exit(0)",
+  "if pid == 0:",
+  "  os.close(ready_r)",
+  "  ready=os.isatty(0) and os.ttyname(0).startswith('/dev/pts/') and os.getsid(0)==os.getpid()",
+  "  os.write(ready_w, b'R' if ready else b'E'); os.close(ready_w)",
+  "  if not ready: os._exit(2)",
+  "  time.sleep(60); os._exit(0)",
+  "os.close(ready_w)",
+  "readable,_,_=select.select([ready_r],[],[],5.0)",
+  "if not readable: raise TimeoutError('forkpty child readiness timeout')",
+  "marker=os.read(ready_r,1); os.close(ready_r)",
+  "if marker != b'R': raise RuntimeError('forkpty child tty/session setup failed')",
   "print(json.dumps({'subject':pid,'display':path}), flush=True)",
   "time.sleep(60)",
 ].join("\n");
