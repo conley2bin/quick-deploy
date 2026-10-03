@@ -39,13 +39,26 @@ options = args.parse_args()
 # Re-exec once so /proc/<holder>/environ contains deterministic initial values;
 # changing os.environ after exec would not update that kernel snapshot.
 parent_marker = '_PI_COPY_LINKS_NATIVE_PARENT_ENV'
+identity_dir_key = '_PI_COPY_LINKS_NATIVE_IDENTITY_DIR'
 if os.environ.get(parent_marker) != '1':
     clean = dict(os.environ)
     for key in ('TMUX', 'TMUX_PANE', 'SSH_CONNECTION', 'SSH_CLIENT', 'SSH_TTY',
                 'WAYLAND_DISPLAY', 'DISPLAY', 'XDG_RUNTIME_DIR'):
         clean.pop(key, None)
     clean[parent_marker] = '1'
-    os.execve(sys.executable, [sys.executable, *sys.argv], clean)
+    executable = Path(sys.executable)
+    if not options.osc52:
+        identity_dir = Path(tempfile.mkdtemp(prefix='pi-copy-links-terminal-identity-'))
+        executable = identity_dir / 'ghostty'
+        try:
+            os.link(sys.executable, executable)
+        except OSError:
+            shutil.copy2(sys.executable, executable)
+        clean[identity_dir_key] = str(identity_dir)
+    os.execve(str(executable), [str(executable), *sys.argv], clean)
+identity_dir = Path(os.environ[identity_dir_key]) if identity_dir_key in os.environ else None
+if not options.osc52:
+    assert Path(os.readlink('/proc/self/exe')).name == 'ghostty'
 source = Path(__file__).resolve().parents[1]
 root = Path(tempfile.mkdtemp(prefix='pi-copy-links-native-'))
 # Local/tmux modes prove the harness PTY master has a real Unix connection to
@@ -272,7 +285,7 @@ try:
         # The harness PTY master is an unknown Python holder. SSH environment
         # alone cannot attribute it, so opening fails with the holder diagnostic.
         refusal_prefix = '输入终端无法归属：输入持有者 '.encode()
-        refusal_body = '没有连接到可验证的本地'.encode()  # final diagnostic wraps before “显示服务”
+        refusal_body = '没有受支持的输入来源契'.encode()  # final diagnostic wraps before “约”
         wait_for(lambda: refusal_prefix in wire and refusal_body in wire,
                  'unattributed harness PTY refusal')
         for label in ('MODEL_3MF', 'DIAGRAM_SVG', 'DATA_JSON', 'SAMPLE_DIR'):
@@ -398,3 +411,5 @@ finally:
             display_socket.close()
     if display_socket_path is not None:
         display_socket_path.unlink(missing_ok=True)
+    if identity_dir is not None:
+        shutil.rmtree(identity_dir, ignore_errors=True)

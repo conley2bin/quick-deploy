@@ -12,10 +12,13 @@ const PANE_TTY_FORMAT = "#{pane_tty}";
 const REMOTE_ALIAS = "conley-Y9000p";
 const REMOTE_USER = "conley";
 const MAX_RELAY_DEPTH = 4;
-const MAX_DISPLAY_ANCESTORS = 8;
 const DEFAULT_SCAN_TIMEOUT_MS = 750;
 const DENIED_MULTIPLEXERS = new Set([
   "screen", "zellij", "abduco", "dtach", "mosh-server", "dvtm",
+]);
+const TERMINAL_EMULATORS = new Set([
+  "ghostty", "gnome-terminal-server", "kitty", "alacritty", "konsole",
+  "xterm", "foot", "tilix", "xfce4-terminal",
 ]);
 
 export type InputReceiver = "local" | Readonly<{
@@ -55,12 +58,11 @@ export interface InputHop {
   readonly leader: ProcessIdentity;
   readonly holder: ProcessIdentity & { readonly comm: string };
   readonly proof: "master" | "sshd";
+  readonly role: "sshd" | "tmux" | "relay" | "terminal" | "unknown";
 }
 interface TopologyBase { readonly hops: readonly InputHop[] }
 export type InputTopology =
-  | (TopologyBase & {
-      readonly kind: "local"; readonly basis: "display"; readonly displayOwner: ProcessIdentity;
-    })
+  | (TopologyBase & { readonly kind: "local"; readonly basis: "terminal" })
   | (TopologyBase & { readonly kind: "remote"; readonly receiver: Exclude<InputReceiver, "local"> })
   | (TopologyBase & {
       readonly kind: "tmux"; readonly socket: string; readonly pane: string; readonly inputTty: string;
@@ -136,6 +138,7 @@ interface ProcStat {
   ppid: number;
   pgrp: number;
   sid: number;
+  ttyNr: number;
   tpgid: number;
   comm: string;
   starttime: string;
@@ -151,14 +154,14 @@ function parseStat(pid: number, bytes: Buffer): ProcStat {
   }
   const comm = line.slice(open + 2, close);
   const fields = line.slice(close + 1).trim().split(/\s+/u);
-  const [ppidRaw, pgrpRaw, sidRaw, tpgidRaw] = [fields[1], fields[2], fields[3], fields[5]];
+  const [ppidRaw, pgrpRaw, sidRaw, ttyNrRaw, tpgidRaw] = [fields[1], fields[2], fields[3], fields[4], fields[5]];
   const starttime = fields[19];
   if (!comm || fields.length < 50 || !/^[A-Za-z]$/u.test(fields[0] ?? "") ||
       ["Z", "X", "x"].includes(fields[0]!) ||
       ![ppidRaw, pgrpRaw, sidRaw].every((value) => /^(0|[1-9]\d*)$/u.test(value ?? "")) ||
-      !/^-?(0|[1-9]\d*)$/u.test(tpgidRaw ?? "") ||
+      ![ttyNrRaw, tpgidRaw].every((value) => /^-?(0|[1-9]\d*)$/u.test(value ?? "")) ||
       !/^[1-9]\d*$/u.test(starttime ?? "") ||
-      ![ppidRaw, pgrpRaw, sidRaw, tpgidRaw].every((value) => Number.isSafeInteger(Number(value)))) {
+      ![ppidRaw, pgrpRaw, sidRaw, ttyNrRaw, tpgidRaw].every((value) => Number.isSafeInteger(Number(value)))) {
     reject("proc-incomplete", `process ${pid} has incomplete stat fields`);
   }
   return {
@@ -166,6 +169,7 @@ function parseStat(pid: number, bytes: Buffer): ProcStat {
     ppid: Number(ppidRaw),
     pgrp: Number(pgrpRaw),
     sid: Number(sidRaw),
+    ttyNr: Number(ttyNrRaw),
     tpgid: Number(tpgidRaw),
     comm,
     starttime: starttime!,
@@ -199,7 +203,7 @@ async function ancestry(pid: number, readProc: NonNullable<ReceiverDependencies[
 
 function sameStat(a: ProcStat, b: ProcStat): boolean {
   return a.pid === b.pid && a.ppid === b.ppid && a.pgrp === b.pgrp && a.sid === b.sid &&
-    a.tpgid === b.tpgid && a.comm === b.comm && a.starttime === b.starttime;
+    a.ttyNr === b.ttyNr && a.tpgid === b.tpgid && a.comm === b.comm && a.starttime === b.starttime;
 }
 
 function sameIdentity(identity: ProcessIdentity, value: ProcStat): boolean {
@@ -307,6 +311,15 @@ function ttyIndex(tty: string): number | undefined {
   return match && Number.isSafeInteger(Number(match[1])) ? Number(match[1]) : undefined;
 }
 
+function controlsTty(process: ProcStat, tty: string): boolean {
+  const index = ttyIndex(tty);
+  if (index === undefined) return false;
+  const device = BigInt.asUintN(32, BigInt(process.ttyNr));
+  const major = Number((device >> 8n) & 0xfffn);
+  const minor = Number((device & 0xffn) | ((device >> 12n) & 0xfff00n));
+  return major === 136 && minor === index;
+}
+
 async function link(accessor: ProcAccess, path: string): Promise<string | undefined> {
   try { return await accessor.readLink(path); }
   catch { return undefined; }
@@ -335,6 +348,11 @@ async function argv(pid: number, accessor: ProcAccess): Promise<readonly string[
     const decoded = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
     return decoded.slice(0, -1).split("\0");
   } catch { return undefined; }
+}
+
+async function executable(pid: number, accessor: ProcAccess): Promise<string | undefined> {
+  const path = await link(accessor, `/proc/${pid}/exe`);
+  return path?.startsWith("/") && !path.endsWith(" (deleted)") && !/[\x00-\x1f\x7f]/u.test(path) ? path : undefined;
 }
 
 async function genericMasterHolder(candidate: ProcStat, leaderUid: readonly number[], index: number,
@@ -508,54 +526,67 @@ function isDisplayServerPath(path: string, processUid: readonly number[], extra:
   return extra.has(path);
 }
 
-function executableName(args: readonly string[] | undefined, comm: string): string {
-  const first = args?.[0];
-  return first ? basename(first) : comm;
+function executableName(path: string | undefined): string | undefined {
+  return path ? basename(path) : undefined;
 }
 
-function isTmuxServer(args: readonly string[] | undefined, comm: string): boolean {
-  return comm === "tmux: server" || comm.startsWith("tmux: server") ||
-    executableName(args, comm) === "tmux" && comm.includes("server");
+function isTmuxServer(exe: string | undefined, comm: string): boolean {
+  return executableName(exe) === "tmux" && (comm === "tmux: server" || comm.startsWith("tmux: server"));
 }
 
-function isDeniedMultiplexer(args: readonly string[] | undefined, comm: string): boolean {
-  return [comm, executableName(args, comm)].some((name) => DENIED_MULTIPLEXERS.has(name.toLowerCase()));
+function isDeniedMultiplexer(exe: string | undefined, comm: string): boolean {
+  return [comm, executableName(exe)].some((name) => name !== undefined && DENIED_MULTIPLEXERS.has(name.toLowerCase()));
+}
+
+function pythonExecutable(exe: string | undefined): boolean {
+  return /^python(?:\d+(?:\.\d+)*)?$/u.test(executableName(exe) ?? "");
+}
+
+function codoxearBrokerIdentity(
+  holder: ProcStat, exe: string | undefined, args: readonly string[] | undefined,
+): boolean {
+  if (!pythonExecutable(exe) || !args || !/^python(?:\d+(?:\.\d+)*)?$/u.test(basename(args[0] ?? ""))) return false;
+  const module = args.indexOf("-m");
+  const moduleEntry = module >= 0 && (args[module + 1] === "codoxear.broker" ||
+    args[module + 1] === "codoxear" && args[module + 2] === "broker");
+  const consoleEntry = holder.comm === "codoxear-broker" && basename(args[1] ?? "") === "codoxear-broker";
+  return moduleEntry || consoleEntry;
+}
+
+function relayIdentity(
+  holder: ProcStat, exe: string | undefined, args: readonly string[] | undefined,
+): "codoxear" | "script" | undefined {
+  if (exe === "/usr/bin/script") return "script";
+  if (codoxearBrokerIdentity(holder, exe, args)) return "codoxear";
+  return undefined;
+}
+
+function terminalEmulatorIdentity(exe: string | undefined): boolean {
+  return TERMINAL_EMULATORS.has(executableName(exe) ?? "");
 }
 
 interface DisplayEvidence {
-  owner?: ProcessIdentity;
+  connected?: true;
   unavailable?: true;
   changed?: true;
 }
 
-async function displayEvidence(holder: ProcStat, accessor: ProcAccess): Promise<DisplayEvidence> {
+async function ownDisplayEvidence(holder: ProcStat, accessor: ProcAccess): Promise<DisplayEvidence> {
   const sockets = await unixSockets(accessor);
   if (!sockets) return { unavailable: true };
-  const visited = new Set<number>();
-  let current = holder;
-  for (let depth = 0; depth < MAX_DISPLAY_ANCESTORS && !visited.has(current.pid); depth++) {
-    visited.add(current.pid);
-    const args = await argv(current.pid, accessor);
-    if (sshdComm(current.comm) || isTmuxServer(args, current.comm) || isDeniedMultiplexer(args, current.comm)) return {};
-    const processUid = await uid(current.pid, accessor);
-    if (processUid) {
-      const extraPaths = await displayPaths(current.pid, processUid, accessor);
-      const inodes = await ownedSocketInodes(current.pid, accessor);
-      for (const inode of inodes) {
-        const peerInode = sockets.get(inode)?.peerInode;
-        const peerPath = peerInode ? sockets.get(peerInode)?.path : undefined;
-        if (peerPath && isDisplayServerPath(peerPath, processUid, extraPaths)) {
-          let after: ProcStat;
-          try { after = await stat(current.pid, accessor.readProc); }
-          catch { return { changed: true }; }
-          if (!sameStat(current, after)) return { changed: true };
-          return { owner: processIdentity(current) };
-        }
-      }
+  const processUid = await uid(holder.pid, accessor);
+  if (!processUid) return {};
+  const extraPaths = await displayPaths(holder.pid, processUid, accessor);
+  const inodes = await ownedSocketInodes(holder.pid, accessor);
+  for (const inode of inodes) {
+    const peerInode = sockets.get(inode)?.peerInode;
+    const peerPath = peerInode ? sockets.get(peerInode)?.path : undefined;
+    if (peerPath && isDisplayServerPath(peerPath, processUid, extraPaths)) {
+      let after: ProcStat;
+      try { after = await stat(holder.pid, accessor.readProc); }
+      catch { return { changed: true }; }
+      return sameStat(holder, after) ? { connected: true } : { changed: true };
     }
-    if (current.pid === 1 || current.ppid < 1) return {};
-    try { current = await stat(current.ppid, accessor.readProc); }
-    catch { return { changed: true }; }
   }
   return {};
 }
@@ -573,12 +604,16 @@ function unknown(diagnostic: string, hops: readonly InputHop[] = []): InputTopol
   return Object.freeze({ kind: "unknown", diagnostic, hops: Object.freeze([...hops]) });
 }
 
+function withRole(hop: InputHop, role: InputHop["role"]): InputHop {
+  return Object.freeze({ ...hop, role });
+}
+
 function withHop(topology: InputTopology, hop: InputHop): InputTopology {
   return Object.freeze({ ...topology, hops: Object.freeze([hop, ...topology.hops]) });
 }
 
 function identitiesEqual(a: InputHop, b: InputHop): boolean {
-  return a.tty === b.tty && a.proof === b.proof &&
+  return a.tty === b.tty && a.proof === b.proof && a.role === b.role &&
     a.leader.pid === b.leader.pid && a.leader.starttime === b.leader.starttime &&
     a.holder.pid === b.holder.pid && a.holder.starttime === b.holder.starttime && a.holder.comm === b.holder.comm;
 }
@@ -587,10 +622,7 @@ function identitiesEqual(a: InputHop, b: InputHop): boolean {
 export function sameInputTopology(a: InputTopology, b: InputTopology): boolean {
   if (a.kind !== b.kind || a.hops.length !== b.hops.length ||
       !a.hops.every((hop, index) => identitiesEqual(hop, b.hops[index]!))) return false;
-  if (a.kind === "local" && b.kind === "local") {
-    return a.basis === b.basis && a.displayOwner.pid === b.displayOwner.pid &&
-      a.displayOwner.starttime === b.displayOwner.starttime;
-  }
+  if (a.kind === "local" && b.kind === "local") return a.basis === b.basis;
   if (a.kind === "remote" && b.kind === "remote") {
     return a.receiver.peer === b.receiver.peer && a.receiver.port === b.receiver.port &&
       a.receiver.user === b.receiver.user;
@@ -627,6 +659,7 @@ async function inspectInput(
     leader: processIdentity(leader),
     holder: Object.freeze({ ...processIdentity(holder), comm: holderName(holder.comm) }),
     proof: proof.proof,
+    role: "unknown",
   });
   try {
     const afterSubject = await stat(subjectPid, accessor.readProc);
@@ -639,49 +672,68 @@ async function inspectInput(
   } catch { return unknown(`${tty} 的输入持有者在检查期间消失`, [hop]); }
 
   const args = await argv(holder.pid, accessor);
+  const exe = await executable(holder.pid, accessor);
   if (proof.proof === "sshd") {
+    const sshHop = withRole(hop, "sshd");
     try {
       const connection = await sshConnection(leader.pid, accessor.readProc);
       const alias = sshAlias(await command(accessor.run, "ssh", ["-G", REMOTE_ALIAS], "ssh -G"));
       if (connection.peer !== alias.hostname || connection.serverPort !== alias.port) {
-        return unknown(`输入持有者 ${holderName(holder.comm)} 的 SSH 对端不是 ${REMOTE_ALIAS}`, [hop]);
+        return unknown(`输入持有者 ${holderName(holder.comm)} 的 SSH 对端不是 ${REMOTE_ALIAS}`, [sshHop]);
       }
       return Object.freeze({
         kind: "remote",
         receiver: Object.freeze({ kind: "remote", peer: alias.hostname, port: alias.port, user: REMOTE_USER }),
-        hops: Object.freeze([hop]),
+        hops: Object.freeze([sshHop]),
       });
     } catch {
-      return unknown(`输入持有者 ${holderName(holder.comm)} 的 SSH 对端无法验证为 ${REMOTE_ALIAS}`, [hop]);
+      return unknown(`输入持有者 ${holderName(holder.comm)} 的 SSH 对端无法验证为 ${REMOTE_ALIAS}`, [sshHop]);
     }
   }
 
-  if (isTmuxServer(args, holder.comm)) {
+  if (isTmuxServer(exe, holder.comm)) {
+    const tmuxHop = withRole(hop, "tmux");
     const socket = /^(.+),\d+,\d+$/u.exec(accessor.env.TMUX ?? "")?.[1];
     const pane = accessor.env.TMUX_PANE;
     if (!socket?.startsWith("/") || /[\x00\r\n]/u.test(socket) || !pane || !/^%\d+$/u.test(pane)) {
-      return unknown(`输入持有者 ${holderName(holder.comm)} 缺少匹配的 tmux socket/pane`, [hop]);
+      return unknown(`输入持有者 ${holderName(holder.comm)} 缺少匹配的 tmux socket/pane`, [tmuxHop]);
     }
     try {
       const output = await command(accessor.run, "tmux",
         ["-S", socket, "display-message", "-p", "-t", pane, "-F", PANE_TTY_FORMAT], "tmux pane_tty");
       if (output.trimEnd() !== tty || output.includes("\r")) {
-        return unknown(`输入持有者 ${holderName(holder.comm)} 与 ${pane} 的 pane_tty 不匹配`, [hop]);
+        return unknown(`输入持有者 ${holderName(holder.comm)} 与 ${pane} 的 pane_tty 不匹配`, [tmuxHop]);
       }
-    } catch { return unknown(`输入持有者 ${holderName(holder.comm)} 的 ${pane} 无法验证`, [hop]); }
-    return Object.freeze({ kind: "tmux", socket, pane, inputTty: tty, hops: Object.freeze([hop]) });
+    } catch { return unknown(`输入持有者 ${holderName(holder.comm)} 的 ${pane} 无法验证`, [tmuxHop]); }
+    return Object.freeze({ kind: "tmux", socket, pane, inputTty: tty, hops: Object.freeze([tmuxHop]) });
   }
 
-  if (isDeniedMultiplexer(args, holder.comm)) {
-    return unknown(`输入持有者 ${holderName(holder.comm)} 是不支持的多路复用器，无法归属点击来源`, [hop]);
-  }
-
-  const outerTty = await link(accessor, `/proc/${holder.pid}/fd/0`);
-  if (outerTty && ttyIndex(outerTty) !== undefined && outerTty !== tty) {
-    if (holder.pgrp <= 0 || holder.tpgid !== holder.pgrp) {
-      return unknown(`输入持有者 ${holderName(holder.comm)} 不在外层 PTY 的前台进程组，不能作为透明中继`, [hop]);
+  if (terminalEmulatorIdentity(exe)) {
+    const terminalHop = withRole(hop, "terminal");
+    const display = await ownDisplayEvidence(holder, accessor);
+    if (display.unavailable) {
+      return unknown("无法读取本机 Unix socket 连接，不能证明终端连接到本地显示服务", [terminalHop]);
     }
-    if (visited.has(holder.pid)) return unknown("输入终端透明中继形成循环，无法归属", [hop]);
+    if (display.changed) {
+      return unknown(`输入持有者 ${holderName(holder.comm)} 的显示证据在检查期间发生变化`, [terminalHop]);
+    }
+    if (display.connected) {
+      return Object.freeze({ kind: "local", basis: "terminal", hops: Object.freeze([terminalHop]) });
+    }
+    return unknown(`终端 ${holderName(holder.comm)} 没有连接到可验证的本地显示服务，无法归属`, [terminalHop]);
+  }
+
+  const relay = relayIdentity(holder, exe, args);
+  if (relay) {
+    const relayHop = withRole(hop, "relay");
+    const outerTty = await link(accessor, `/proc/${holder.pid}/fd/0`);
+    if (!outerTty || ttyIndex(outerTty) === undefined || outerTty === tty) {
+      return unknown(`输入中继 ${holderName(holder.comm)} 没有不同的外层 PTY，无法归属`, [relayHop]);
+    }
+    if (!controlsTty(holder, outerTty) || holder.pgrp <= 0 || holder.tpgid !== holder.pgrp) {
+      return unknown(`输入中继 ${holderName(holder.comm)} 的 fd0 不是其前台控制 PTY，无法归属`, [relayHop]);
+    }
+    if (visited.has(holder.pid)) return unknown("输入终端中继形成循环，无法归属", [relayHop]);
     const nextVisited = new Set(visited);
     nextVisited.add(holder.pid);
     const relayed = await inspectInput(holder.pid, accessor, depth + 1, nextVisited);
@@ -689,21 +741,16 @@ async function inspectInput(
       const current = await stat(holder.pid, accessor.readProc);
       if (!sameStat(holder, current) || await link(accessor, `/proc/${holder.pid}/fd/0`) !== outerTty ||
           !await stillHolds(proof, leader, tty, accessor)) {
-        return unknown(`输入持有者 ${holderName(holder.comm)} 在中继检查期间发生变化`, [hop]);
+        return unknown(`输入中继 ${holderName(holder.comm)} 在检查期间发生变化`, [relayHop]);
       }
-    } catch { return unknown(`输入持有者 ${holderName(holder.comm)} 在中继检查期间消失`, [hop]); }
-    return withHop(relayed, hop);
+    } catch { return unknown(`输入中继 ${holderName(holder.comm)} 在检查期间消失`, [relayHop]); }
+    return withHop(relayed, relayHop);
   }
 
-  const display = await displayEvidence(holder, accessor);
-  if (display.unavailable) return unknown("无法读取本机 Unix socket 连接，不能证明输入持有者连接到本地显示服务", [hop]);
-  if (display.changed) return unknown(`输入持有者 ${holderName(holder.comm)} 的显示证据在检查期间发生变化`, [hop]);
-  if (display.owner) {
-    return Object.freeze({
-      kind: "local", basis: "display", displayOwner: display.owner, hops: Object.freeze([hop]),
-    });
+  if (isDeniedMultiplexer(exe, holder.comm)) {
+    return unknown(`输入持有者 ${holderName(holder.comm)} 是不支持的多路复用器，无法归属点击来源`, [hop]);
   }
-  return unknown(`输入持有者 ${holderName(holder.comm)} 没有连接到可验证的本地显示服务，无法归属`, [hop]);
+  return unknown(`输入持有者 ${holderName(holder.comm)} 没有受支持的输入来源契约，无法归属`, [hop]);
 }
 
 /** Resolve the actual fd0 PTY transport. Unknown input is returned explicitly and never falls back locally/remotely. */
@@ -721,7 +768,8 @@ export async function revalidateInputTopology(
   if (topology.kind === "unknown" || !Number.isSafeInteger(subjectPid) || subjectPid < 1) return false;
   const accessor = access(dependencies);
   let currentSubject = subjectPid;
-  for (const hop of topology.hops) {
+  for (let hopIndex = 0; hopIndex < topology.hops.length; hopIndex++) {
+    const hop = topology.hops[hopIndex]!;
     if (await link(accessor, `/proc/${currentSubject}/fd/0`) !== hop.tty) return false;
     let leader: ProcStat, holder: ProcStat;
     try {
@@ -736,13 +784,22 @@ export async function revalidateInputTopology(
     const valid = hop.proof === "sshd" ? await sshdHolder(holder, leader, leaderUid, hop.tty, accessor) :
       await genericMasterHolder(holder, leaderUid, index, accessor);
     if (!valid) return false;
+
+    if (hop.role !== "sshd") {
+      const exe = await executable(holder.pid, accessor);
+      const args = await argv(holder.pid, accessor);
+      if (hop.role === "relay") {
+        const next = topology.hops[hopIndex + 1];
+        if (!next || !relayIdentity(holder, exe, args) || !controlsTty(holder, next.tty) ||
+            holder.pgrp <= 0 || holder.tpgid !== holder.pgrp ||
+            await link(accessor, `/proc/${holder.pid}/fd/0`) !== next.tty) return false;
+      } else if (hop.role === "terminal") {
+        if (!terminalEmulatorIdentity(exe)) return false;
+      } else if (hop.role === "tmux") {
+        if (!isTmuxServer(exe, holder.comm)) return false;
+      } else return false;
+    }
     currentSubject = holder.pid;
-  }
-  if (topology.kind === "local") {
-    try {
-      const owner = await stat(topology.displayOwner.pid, accessor.readProc);
-      if (!sameIdentity(topology.displayOwner, owner)) return false;
-    } catch { return false; }
   }
   return true;
 }

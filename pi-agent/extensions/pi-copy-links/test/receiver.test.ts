@@ -15,11 +15,13 @@ type FakeProcess = {
   ppid: number;
   pgrp: number;
   sid: number;
+  ttyNr: number;
   tpgid: number;
   comm: string;
   starttime: string;
   uid: number;
   fd0?: string;
+  exe: string;
   env: Record<string, string>;
   rawEnvironment?: Buffer;
   argv: string[];
@@ -29,12 +31,17 @@ type FakeProcess = {
 };
 type Client = { pid: number; tty: string; session: string; flags: string; pane: string };
 
+function ptsDevice(index: number): number {
+  return (136 << 8) | (index & 0xff) | ((index & 0xfff00) << 12);
+}
+
 function statBytes(process: FakeProcess): Buffer {
   const fields = Array.from({ length: 50 }, () => "0");
   fields[0] = "S";
   fields[1] = String(process.ppid);
   fields[2] = String(process.pgrp);
   fields[3] = String(process.sid);
+  fields[4] = String(process.ttyNr);
   fields[5] = String(process.tpgid);
   fields[19] = process.starttime;
   return Buffer.from(`${process.pid} (${process.comm}) ${fields.join(" ")}\n`);
@@ -71,9 +78,12 @@ class Fixture {
 
   add(value: Partial<FakeProcess> & Pick<FakeProcess, "pid" | "ppid" | "sid" | "comm">): FakeProcess {
     const pgrp = value.pgrp ?? value.sid;
+    const fd0Index = /^\/dev\/pts\/(\d+)$/u.exec(value.fd0 ?? "")?.[1];
     const process: FakeProcess = {
-      starttime: String(value.pid * 10), uid: 1000, env: {}, argv: [value.comm],
-      masters: new Map(), sockets: new Map(), fdReadable: true, tpgid: value.tpgid ?? pgrp,
+      starttime: String(value.pid * 10), uid: 1000, exe: "/usr/bin/fixture-unknown", env: {}, argv: [value.comm],
+      masters: new Map(), sockets: new Map(), fdReadable: true,
+      ttyNr: value.ttyNr ?? (fd0Index === undefined ? 0 : ptsDevice(Number(fd0Index))),
+      tpgid: value.tpgid ?? pgrp,
       ...value, pgrp,
     };
     this.processes.set(process.pid, process);
@@ -168,7 +178,13 @@ class Fixture {
         ])];
       },
       readLink: async (path) => {
-        const match = /^\/proc\/(\d+)\/fd\/(\d+)$/u.exec(path);
+        let match = /^\/proc\/(\d+)\/exe$/u.exec(path);
+        if (match) {
+          const process = this.processes.get(Number(match[1]));
+          if (!process) throw new Error("ENOENT");
+          return process.exe;
+        }
+        match = /^\/proc\/(\d+)\/fd\/(\d+)$/u.exec(path);
         if (!match) throw new Error(`unexpected link ${path}`);
         const process = this.processes.get(Number(match[1]));
         if (!process) throw new Error("ENOENT");
@@ -200,7 +216,7 @@ function localDisplay(withSocket = true): Fixture {
   f.add({ pid: 5000, ppid: 4001, sid: 4001, comm: "pi", fd0: "/dev/pts/12",
     env: { SSH_CONNECTION: "stale value", SSH_CLIENT: "stale", SSH_TTY: "/dev/pts/99" } });
   f.add({ pid: 4001, ppid: 3001, sid: 4001, comm: "zsh", fd0: "/dev/pts/12" });
-  const terminal = f.add({ pid: 3001, ppid: 2500, sid: 2500, comm: "ghostty", env: {
+  const terminal = f.add({ pid: 3001, ppid: 2500, sid: 2500, comm: "ghostty", exe: "/usr/bin/ghostty", env: {
     GDK_BACKEND: "x11", DISPLAY: "localhost:10.0", WAYLAND_DISPLAY: "stale-wayland",
   } });
   f.master(terminal, 12);
@@ -214,7 +230,7 @@ function unknownHolder(): Fixture {
   const f = new Fixture();
   f.add({ pid: 5000, ppid: 4001, sid: 4001, comm: "pi", fd0: "/dev/pts/12" });
   f.add({ pid: 4001, ppid: 3001, sid: 4001, comm: "zsh", fd0: "/dev/pts/12" });
-  const holder = f.add({ pid: 3001, ppid: 1, sid: 3001, comm: "mystery-terminal", tpgid: -1 });
+  const holder = f.add({ pid: 3001, ppid: 1, sid: 3001, comm: "ttyd-like", exe: "/usr/bin/ttyd", tpgid: -1 });
   f.master(holder, 12);
   return f;
 }
@@ -223,7 +239,13 @@ function relay(outer: "ssh" | "display" | "tmux", relayName = "script"): Fixture
   const f = new Fixture();
   f.add({ pid: 5000, ppid: 3001, sid: 5000, comm: "pi", fd0: "/dev/pts/13" });
   const transparent = f.add({ pid: 3001, ppid: 4001, sid: 4001, pgrp: 4001, tpgid: 4001,
-    comm: relayName, fd0: "/dev/pts/12" });
+    comm: relayName, fd0: "/dev/pts/12",
+    ...(relayName === "script" ? { exe: "/usr/bin/script", argv: ["/usr/bin/script"] } :
+      relayName === "codoxear-broker" ? {
+        exe: "/usr/bin/python3.12",
+        argv: ["/fixture/venv/bin/python", "/fixture/venv/bin/codoxear-broker", "--"],
+      } : {}),
+  });
   f.master(transparent, 13);
   f.add({ pid: 4001, ppid: 2001, sid: 4001, pgrp: 4001, tpgid: 4001,
     comm: "zsh", fd0: "/dev/pts/12", env: outer === "ssh" ? { SSH_CONNECTION: connection } : {} });
@@ -231,11 +253,11 @@ function relay(outer: "ssh" | "display" | "tmux", relayName = "script"): Fixture
     f.add({ pid: 2001, ppid: 1, sid: 2001, comm: "sshd", argv: ["sshd: conley@pts/12 "],
       fdReadable: false, tpgid: -1 });
   } else if (outer === "display") {
-    const terminal = f.add({ pid: 2001, ppid: 1, sid: 2001, comm: "electron", tpgid: -1 });
+    const terminal = f.add({ pid: 2001, ppid: 1, sid: 2001, comm: "ghostty", exe: "/usr/bin/ghostty", tpgid: -1 });
     f.master(terminal, 12);
     f.display(terminal);
   } else {
-    const tmux = f.add({ pid: 2001, ppid: 1, sid: 2001, comm: "tmux: server", tpgid: -1 });
+    const tmux = f.add({ pid: 2001, ppid: 1, sid: 2001, comm: "tmux: server", exe: "/usr/bin/tmux", tpgid: -1 });
     f.master(tmux, 12);
     f.env = tmuxEnv;
     f.paneTty = "/dev/pts/12";
@@ -253,11 +275,11 @@ function addTmuxClient(f: Fixture, holder: "ssh" | "display" | "tmux"): void {
     f.add({ pid: 3100, ppid: 1, sid: 3100, comm: "sshd", argv: ["sshd: conley@pts/20 "],
       fdReadable: false, tpgid: -1 });
   } else if (holder === "display") {
-    const terminal = f.add({ pid: 3100, ppid: 1, sid: 3100, comm: "electron", tpgid: -1 });
+    const terminal = f.add({ pid: 3100, ppid: 1, sid: 3100, comm: "kitty", exe: "/usr/bin/kitty", tpgid: -1 });
     f.master(terminal, 20);
     f.display(terminal, "@/tmp/.X11-unix/X8");
   } else {
-    const outer = f.add({ pid: 3100, ppid: 1, sid: 3100, comm: "tmux: server", tpgid: -1 });
+    const outer = f.add({ pid: 3100, ppid: 1, sid: 3100, comm: "tmux: server", exe: "/usr/bin/tmux", tpgid: -1 });
     f.master(outer, 20);
   }
 }
@@ -325,14 +347,18 @@ test("unpaired peer and malformed SSH environment/config stay unknown without le
   }
 });
 
-test("actual Wayland socket peer proves local despite stale SSH env and sshd ancestor", async () => {
+test("recognized terminal's own Wayland peer proves local despite stale SSH ancestry and foreground SSH fd0", async () => {
   const f = localDisplay(true);
+  const terminal = f.processes.get(3001)!;
+  terminal.comm = "not-a-trusted-name"; // Executable realpath, not comm, owns the contract.
+  terminal.fd0 = "/dev/pts/20";
+  terminal.ttyNr = ptsDevice(20);
+  terminal.pgrp = 3001;
+  terminal.tpgid = 3001;
   const route = await resolveInputTopology(5000, f.dependencies());
   assert.equal(route.kind, "local");
-  if (route.kind === "local") {
-    assert.equal(route.basis, "display");
-    assert.equal(route.displayOwner.pid, 3001);
-  }
+  if (route.kind === "local") assert.equal(route.basis, "terminal");
+  assert.equal(route.hops[0]?.role, "terminal");
   assert.equal(f.calls.filter(({ program }) => program === "ss").length, 1);
   assert.ok(f.calls.every(({ program }) => program !== "ssh"));
 });
@@ -342,30 +368,58 @@ test("forced-X11 forwarded Ghostty with stale WAYLAND_DISPLAY is not local witho
   assertUnknown(await resolveInputTopology(5000, f.dependencies()), /ghostty.*没有连接到/u);
 });
 
-test("display evidence may come from an ancestor before sshd/tmux and does not depend on names", async () => {
+test("ttyd-style network holder cannot inherit a launching terminal's display authority and stays unknown after reparenting", async () => {
   const f = unknownHolder();
   const holder = f.processes.get(3001)!;
+  holder.fd0 = "/dev/null";
+  holder.ttyNr = 0;
   holder.ppid = 2500;
-  const electron = f.add({ pid: 2500, ppid: 1, sid: 2500, comm: "arbitrary-electron", tpgid: -1 });
-  f.display(electron, "@/tmp/.X11-unix/X17");
-  const route = await resolveInputTopology(5000, f.dependencies());
-  assert.equal(route.kind, "local");
-  if (route.kind === "local") assert.equal(route.displayOwner.pid, 2500);
+  const ghostty = f.add({ pid: 2500, ppid: 1, sid: 2500, comm: "ghostty", exe: "/usr/bin/ghostty", tpgid: -1 });
+  f.display(ghostty, "@/tmp/.X11-unix/X17");
+  const before = await resolveInputTopology(5000, f.dependencies());
+  assertUnknown(before, /ttyd-like.*没有受支持的输入来源契约/u);
+  assert.equal(f.calls.filter(({ program }) => program === "ss").length, 0,
+    "an unrelated ancestor's display sockets must not even be inspected");
+  holder.ppid = 1;
+  const after = await resolveInputTopology(5000, f.dependencies());
+  assertUnknown(after, /ttyd-like.*没有受支持的输入来源契约/u);
+  assert.equal(await revalidateInputTopology(5000, before, f.dependencies()), false);
+});
+
+test("emulator authority is keyed by executable realpath, never comm alone", async () => {
+  const allowed = localDisplay(true);
+  allowed.processes.get(3001)!.comm = "arbitrary-comm";
+  assert.equal((await resolveInputTopology(5000, allowed.dependencies())).kind, "local");
+
+  const forged = localDisplay(true);
+  forged.processes.get(3001)!.exe = "/usr/bin/python3";
+  assertUnknown(await resolveInputTopology(5000, forged.dependencies()), /ghostty.*没有受支持的输入来源契约/u);
+
+  const wezterm = localDisplay(true);
+  Object.assign(wezterm.processes.get(3001)!, { comm: "wezterm-gui", exe: "/usr/bin/wezterm-gui" });
+  assertUnknown(await resolveInputTopology(5000, wezterm.dependencies()), /wezterm-gui.*没有受支持的输入来源契约/u);
 });
 
 test("holder with no display socket and no SSH environment is unknown; there is no legacy fallback", async () => {
   const route = await resolveInputTopology(5000, unknownHolder().dependencies());
-  assertUnknown(route, /mystery-terminal.*没有连接到/u);
+  assertUnknown(route, /ttyd-like.*没有受支持的输入来源契约/u);
 });
 
-test("generic foreground relay unwraps to SSH, display, and tmux including script-in-tmux", async () => {
+test("identity-bound script/Codoxear relays unwrap to SSH, display, and tmux", async () => {
   const ssh = await resolveInputTopology(5000, relay("ssh").dependencies());
   assert.equal(ssh.kind, "remote");
-  assert.deepEqual(ssh.hops.map((hop) => hop.holder.comm), ["script", "sshd"]);
+  assert.deepEqual(ssh.hops.map((hop) => [hop.holder.comm, hop.role]), [["script", "relay"], ["sshd", "sshd"]]);
 
   const local = await resolveInputTopology(5000, relay("display", "codoxear-broker").dependencies());
   assert.equal(local.kind, "local");
-  assert.deepEqual(local.hops.map((hop) => hop.holder.comm), ["codoxear-broker", "electron"]);
+  assert.deepEqual(local.hops.map((hop) => [hop.holder.comm, hop.role]),
+    [["codoxear-broker", "relay"], ["ghostty", "terminal"]]);
+
+  const moduleBroker = relay("tmux", "codoxear-broker");
+  Object.assign(moduleBroker.processes.get(3001)!, {
+    comm: "python3", exe: "/usr/bin/python3.12", argv: ["python3", "-m", "codoxear", "broker"],
+  });
+  assert.equal((await resolveInputTopology(5000, moduleBroker.dependencies())).kind, "tmux");
 
   const shared = relay("tmux", "script");
   const multiplexed = await resolveInputTopology(5000, shared.dependencies());
@@ -376,10 +430,28 @@ test("generic foreground relay unwraps to SSH, display, and tmux including scrip
     { kind: "remote", peer: "100.123.34.64", port: 22, user: "conley" });
 });
 
-test("relay not in the foreground process group is not followed", async () => {
-  const f = relay("tmux");
-  f.processes.get(3001)!.tpgid = 9999;
-  assertUnknown(await resolveInputTopology(5000, f.dependencies()), /不在外层 PTY 的前台进程组/u);
+test("relay requires matching controlling tty and foreground pgrp", async () => {
+  const background = relay("tmux");
+  background.processes.get(3001)!.tpgid = 9999;
+  assertUnknown(await resolveInputTopology(5000, background.dependencies()), /fd0 不是其前台控制 PTY/u);
+
+  const redirected = relay("tmux");
+  redirected.processes.get(3001)!.ttyNr = ptsDevice(99);
+  assertUnknown(await resolveInputTopology(5000, redirected.dependencies()), /fd0 不是其前台控制 PTY/u);
+});
+
+test("unknown foreground program, forged script comm, and arbitrary Python are not relays", async () => {
+  const unknown = relay("tmux", "unknown-forwarder");
+  assertUnknown(await resolveInputTopology(5000, unknown.dependencies()), /unknown-forwarder.*没有受支持的输入来源契约/u);
+  assert.equal(unknown.calls.filter(({ program }) => program === "tmux").length, 0);
+
+  const forgedScript = relay("tmux", "script");
+  forgedScript.processes.get(3001)!.exe = "/tmp/not-util-linux-script";
+  assertUnknown(await resolveInputTopology(5000, forgedScript.dependencies()), /script.*没有受支持的输入来源契约/u);
+
+  const arbitraryPython = relay("tmux", "codoxear-broker");
+  arbitraryPython.processes.get(3001)!.argv = ["python3", "arbitrary.py"];
+  assertUnknown(await resolveInputTopology(5000, arbitraryPython.dependencies()), /codoxear-broker.*没有受支持的输入来源契约/u);
 });
 
 test("known non-tmux multiplexers are denied before relay recursion", async () => {
@@ -389,8 +461,8 @@ test("known non-tmux multiplexers are denied before relay recursion", async () =
   }
 });
 
-test("ss failure leaves an otherwise unknown holder unknown", async () => {
-  const f = unknownHolder();
+test("ss failure leaves a recognized terminal unknown", async () => {
+  const f = localDisplay(true);
   f.fail = (program) => program === "ss" ? { code: 1, stdout: "secret", stderr: "TOKEN" } : undefined;
   assertUnknown(await resolveInputTopology(5000, f.dependencies()), /无法读取本机 Unix socket/u);
 });
@@ -408,7 +480,7 @@ test("candidate failure uses a unique bounded scan and scan deadline returns unk
   f.master(actual, 12);
   const route = await resolveInputTopology(5000, f.dependencies());
   assert.equal(route.hops[0]?.holder.pid, 3002);
-  assertUnknown(route, /actual-holder.*没有连接到/u);
+  assertUnknown(route, /actual-holder.*没有受支持的输入来源契约/u);
 
   const slow = unknownHolder();
   slow.processes.get(3001)!.masters.clear();
@@ -430,6 +502,18 @@ test("cheap frozen-chain revalidation never scans proc and detects holder replac
   assert.equal(f.calls.filter(({ program }) => program === "ss").length, 1,
     "revalidation must not invoke ss again");
   f.processes.get(3001)!.starttime = "999999";
+  assert.equal(await revalidateInputTopology(5000, route, f.dependencies()), false);
+});
+
+test("relay revalidation retains identity, fd0, controlling tty, and foreground requirements", async () => {
+  const f = relay("tmux", "script");
+  const route = await resolveInputTopology(5000, f.dependencies());
+  assert.equal(route.kind, "tmux");
+  assert.equal(await revalidateInputTopology(5000, route, f.dependencies()), true);
+  f.processes.get(3001)!.tpgid = 9999;
+  assert.equal(await revalidateInputTopology(5000, route, f.dependencies()), false);
+  f.processes.get(3001)!.tpgid = 4001;
+  f.processes.get(3001)!.ttyNr = ptsDevice(99);
   assert.equal(await revalidateInputTopology(5000, route, f.dependencies()), false);
 });
 
@@ -527,7 +611,7 @@ test("tmux/ssh/ss command failures remain fail closed and redact outputs", async
   await receiverFails(display, 6000, "input-unattributed");
 });
 
-test("frozen topology equality detects route, holder, leader, and display-owner replacement", async () => {
+test("frozen topology equality detects route, holder, and leader replacement", async () => {
   const f = localDisplay(true);
   const first = await resolveInputTopology(5000, f.dependencies());
   assert.equal(sameInputTopology(first, await resolveInputTopology(5000, f.dependencies())), true);

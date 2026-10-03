@@ -21,9 +21,10 @@ const hop = Object.freeze({
   leader: Object.freeze({ pid: 4100, starttime: "41000" }),
   holder: Object.freeze({ pid: 4200, starttime: "42000", comm: "fixture-holder" }),
   proof: "master" as const,
+  role: "terminal" as const,
 });
 const localTopology: InputTopology = Object.freeze({
-  kind: "local", basis: "display", displayOwner: hop.holder, hops: Object.freeze([hop]),
+  kind: "local", basis: "terminal", hops: Object.freeze([hop]),
 });
 const remoteTopology: InputTopology = Object.freeze({ kind: "remote", receiver: client, hops: Object.freeze([hop]) });
 const tmuxTopology: InputTopology = Object.freeze({
