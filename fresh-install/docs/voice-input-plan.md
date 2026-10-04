@@ -1,6 +1,6 @@
 # 客户端语音输入方案
 
-**当前按“现成软件优先”推荐先试 [Nextalk](voice-input-software.md)。** 下文保留的是自行包装 Fcitx5-vinput 的备选集成设计，不是使用 Nextalk 的前置步骤；其中 Qwen 模型和源码补丁也不是 Nextalk 的默认配置。
+**现成软件及新增交互的能力边界见 [说明](voice-input-software.md)。** Nextalk 的试用只覆盖此前 Toggle 流程，不自动满足新的 Ctrl长按3秒/实时进入Pi要求。下文保留的 Fcitx5-vinput 备选设计同样基于旧交互，不是现成完整解；其中 Qwen 模型和源码补丁不是 Nextalk 默认配置。
 
 本文是待实施的备选方案，当前仓库尚无语音安装模块。目标是在面前的电脑短按一个键开始说话，再按同键结束；识别文字进入 Pi 输入框，由用户自行按回车发送。
 

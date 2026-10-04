@@ -66,7 +66,7 @@ bash fresh-install/modules/tmux/install.sh
 
 ## 语音输入（现成软件与备选集成）
 
-优先按[现成软件说明](docs/voice-input-software.md)试用 Nextalk：现有 Ubuntu 安装包、本地中文识别、同键开始/结束，以及 Fcitx5 向终端输入文字；不要求先搭建模型服务或修改 Pi。
+[现成软件说明](docs/voice-input-software.md)比较 Nextalk 与 Handy，并给出 Nextalk 的旧 Toggle 流程试用步骤。新增的“Ctrl长按3秒、松手停止、文字边说边进入Pi”不能仅靠这两款已核查版本的原生设置完成；文档区分实时浮窗预览与目标输入框投递，列出必要适配。
 
 [客户端集成方案](docs/voice-input-plan.md)保留自行包装 Fcitx5-vinput 的备选设计，包含模块归属、版本与文本过滤要求、平台边界和验收顺序。
 
