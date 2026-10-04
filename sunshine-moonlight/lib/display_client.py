@@ -46,6 +46,10 @@ class Cancelled(ClientError):
     pass
 
 
+class QuitTimeout(ClientError):
+    """The one official quit was issued, but its local process did not exit."""
+
+
 # Fixed local text for validated host refusals that need an operator action.
 # Only the code selects a message; host detail text is never echoed.
 REFUSAL_MESSAGES = {
@@ -250,7 +254,7 @@ class OfficialClient:
                 if not cleanup:
                     self.check()
                 if deadline is not None and time.monotonic() >= deadline:
-                    raise ClientError("Moonlight quit 超时；主机预约保留，需要可信对账。")
+                    raise QuitTimeout("Moonlight quit 本地进程超时；等待主机关闭证据。")
                 time.sleep(0.05)
             return child.returncode
         finally:
@@ -432,9 +436,14 @@ class Session:
 
     def status_unchanged(self):
         status = self.rpc("status")  # ownership ONLY; never used as a screen menu
+        try:
+            observed_revision = revision(status.get("revision"))
+        except RpcFailure:
+            self.uncertain = True
+            raise ClientError("预约状态无法证明原票据；需要可信对账，未重试操作。") from None
         if (status.get("host_uniqueid") != self.host_id or status.get("target") != self.target
                 or status.get("sampling") != "ownership" or
-                revision(status.get("revision")) != self.ticket.revision or
+                observed_revision != self.ticket.revision or
                 status.get("phase") != self.ticket.phase or status.get("uncertainty") is not None
                 or status.get("attempt_revision") != self.ticket.attempt):
             self.uncertain = True
@@ -538,17 +547,37 @@ class Session:
     def release(self):
         release = self.owned("begin_release")  # positive owned app BEFORE official quit
         self.take_ticket(release, "releasing")
-        quit_code = self.official.foreground(
-            [self.program, "quit", "--", self.address], cleanup=True, timeout=QUERY_TIMEOUT)
-        closed = self.owned("finish_release")  # same-generation closure, NOT quit exit status
+        try:
+            quit_code = self.official.foreground(
+                [self.program, "quit", "--", self.address], cleanup=True, timeout=QUERY_TIMEOUT)
+        except QuitTimeout:
+            # The single issued quit may have reached the host even if its
+            # local CLI never exited. Do not retry quit or infer closure from
+            # stdout/exit/timeout. First obtain fresh, exact owned status;
+            # finish_release itself verifies receipt/generation/Desktop/FREE.
+            status = self.status_unchanged()
+            if status.get("activity") != "idle_application" or status.get("receipt_status") != "current_candidate":
+                raise QuitTimeout("Moonlight quit 本地进程超时；主机预约保留，需要可信对账。") from None
+            quit_code = None
+        closed = self.owned("finish_release")  # host validates closure, NOT quit exit status
+        try:
+            closed_revision = revision(closed.get("revision"))
+        except RpcFailure:
+            self.uncertain = True
+            raise RpcFailure("finish_release") from None
         if (closed.get("phase") != "available" or closed.get("uncertainty") is not None
                 or closed.get("attempt_revision") is not None
                 or closed.get("closure_basis") != "same_generation_owned_desktop_cancelled"
-                or revision(closed.get("revision")) <= self.ticket.revision):
+                or closed_revision <= self.ticket.revision):
             self.uncertain = True
             raise RpcFailure("finish_release")
         self.ticket = None
-        self.say("已确认本次受管 Desktop 关闭并释放预约。")
+        if quit_code is None:
+            self.say("Moonlight quit 本地进程超时；主机确认 Desktop 已关闭并释放预约。")
+        elif quit_code != 0:
+            self.say("Moonlight quit 本地进程返回非零；主机确认 Desktop 已关闭并释放预约。")
+        else:
+            self.say("已确认本次受管 Desktop 关闭并释放预约。")
         return quit_code
 
     def paired_catalogue(self):
@@ -615,6 +644,8 @@ class Session:
             return 128 + self.interrupts.signum
         if child_code != 0:
             return child_code if child_code > 0 else 128 - child_code
+        if quit_code is None:
+            return 1  # local CLI timed out, although host closure was confirmed
         return 0 if quit_code == 0 else (quit_code if quit_code > 0 else 128 - quit_code)
 
     def run(self, program):

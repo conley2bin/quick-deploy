@@ -95,6 +95,15 @@ quick-deploy-display-control --enroll
 
 成功对账先持久化永久、绑定新旧 UUID/进程/文件的事务证据，再用 rename 把原 operation/reservation/backup/旧 receipt 保留为 `.bak`（原字节、inode、权限和 mtime），所有永久锁 inode 保留，发布新 UUID 的 **UNENROLLED** 基线。若在已持久化步骤间中断，显式重复同一命令只在事务绑定的精确事实不变时继续；漂移、未知/部分写入的文件或不同代码均停止，不删除记录。普通安装没有此 flag 仍严格拒绝 host/settings 冲突。对账和登记不重启、不修改 Sunshine 配置；后续正常受控准备重启保持相同 UUID 才证明官方配对的持久化生效，保存失败仍会再次拒绝。
 
+**受管释放后失去客户端能力的本地对账**：若控制器保存了正数 Desktop 的 `begin_release` 意图和官方 quit 已发出、但本地 Moonlight quit 超时或客户端退出后无法完成 `finish_release`，主机可能处于 `reconciliation_required/owner_lost`。FREE/currentgame0 不能单独证明原预约能释放。由主机用户确认已经发出那唯一一次官方 quit、没有非受管或在途串流与并发管理员改动，在本地交互终端运行：
+
+```bash
+./commands/install-display-control.sh --reconcile-owned-release
+# 按提示输入 RELEASE；不要重发 quit、清空 state、重新 enroll 或调用 RPC force。
+```
+
+该入口仍做完整官方参考包、unit/进程/配置/Desktop/收据资格检查；必须是同一 UUID、进程出生、配置与 Desktop，旧预约有正数尝试和活跃观察，`releasing` 的 release revision/取消事务与 `owner_lost` 的下一 revision、owner digest 一致，并重复检查 fresh idle/currentgame0 和这些稳定证据。原 operation/reservation/receipt/backup 的字节和 inode 在 `.bak` 保存，永久锁不更换；旧 reservation 到最终原子发布前始终不可 acquire/enroll，遇到后续 busy/资格漂移时保留阻断及持久 journal，待事实恢复后只凭原证据续接。提交前封存的证据与新 reservation 的 revision 下限共同约束重复运行；已提交后允许合法更高 revision 预约及跳过本次控制器版本的后续合格源码发布。新 reservation revision 单调递增到 available、清除本次 lease，**保留 enrollment、当前有效 receipt 和可供后续无重启准备使用的 backup**，无需重新登记，也不改变 UUID。首次证据不足则不改记录；本地 CLI 超时但主机严格确认关闭的未来受管流程将直接用原 ticket 完成释放，仍报告 CLI 本地失败而不误称其退出成功。
+
 独立伴随安装不改 Sunshine 配置、vendor unit、retry 策略、sshd 或设备，不启动/reload/restart/cancel 服务。`NeedDaemonReload=yes` 是实际拒绝条件：本入口不发布 unit，因此不会为了通过资格检查而 reload。应先核实真正的待加载定义及维护权限；不能绕过 guard，更不能用服务重启伪造 readiness。现有 vendor 安装器本身仍可能因包/配置变化重启活动 Sunshine，使用它前须安排获准的维护窗口。
 
 ## 2. 在 B 安装 Moonlight

@@ -125,6 +125,9 @@ if action == 'quit':
         state = read_state()
         state['active'] = False
         Path(os.environ['FAKE_STATE']).write_text(json.dumps(state))
+    if setting('FAKE_QUIT_HOLD'):
+        import time
+        time.sleep(float(setting('FAKE_QUIT_HOLD')))
     raise SystemExit(int(setting('FAKE_QUIT_EXIT', '0')))
 raise SystemExit(int(setting('FAKE_EXIT', '0')))
 """
@@ -243,6 +246,7 @@ class ControllerTransport:
                     result.update(phase='reconciliation_required',uncertainty='needs_onboarding',selection_ready=False)
             else:
                 result['sampling'] = 'ownership'
+                result['receipt_status'] = 'current_candidate'
                 if os.environ.get('FAKE_WRONG_STATUS_HOST') == '1':
                     result['host_uniqueid'] = '00000000-0000-0000-0000-000000000002'
         elif action == 'acquire':
@@ -313,6 +317,8 @@ class ControllerTransport:
             os.kill(os.getpid(), signal.SIGTERM)
         if os.environ.get('FAKE_LOST_ACTION') == action:
             raise ControllerError('timeout',False)
+        if os.environ.get('FAKE_MALFORM_REV_ACTION') == action:
+            result['revision'] = 'not-an-int'
         return {'version':1,'ok':True,'action':action,**result}
 '''
 

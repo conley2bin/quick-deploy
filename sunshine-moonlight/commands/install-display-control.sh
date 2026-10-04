@@ -7,9 +7,10 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 . "$SCRIPT_DIR/lib/common.sh"
 PUBLISH=false
 RECONCILE=false
+RELEASE=false
 usage() {
     cat <<'USAGE'
-用法: ./commands/install-display-control.sh [--publish-shim] [--reconcile-host-identity]
+用法: ./commands/install-display-control.sh [--publish-shim] [--reconcile-host-identity | --reconcile-owned-release]
 只读资格检查已安装的 Sunshine v2026.914.233613/source63d35f7 的官方 Ubuntu deb、
 实际用户服务/配置/apps/assets 和公开 serverinfo UUID；独立发布私人控制器与持久状态。
 不安装/更新 Sunshine、不修改 unit/config、不 reload/restart/cancel、不收集管理员/TLS 凭据。
@@ -20,6 +21,11 @@ usage() {
                  身份变化受控重启，资格/旧进程退休/config/新 UUID 等完整证据均须一致；
                  保留旧记录原字节与 inode 的 .bak、锁 inode 和永久事务证据，重新发布
                  UNENROLLED。不修改 Sunshine 配置，不新增 shim 参数，不自动登记。
+  --reconcile-owned-release 仅在主机本地 /dev/tty 输入 RELEASE，确认已发出唯一一次官方 quit、
+                 控制器独占、无非受管/进行中的串流和并发管理编辑。只接受同 UUID/进程/配置/有效
+                 收据的 releasing→owner_lost、既有正数 Desktop 与取消意图、fresh FREE/currentgame0；
+                 保留原记录 .bak 与锁 inode，持久证据可精确续接，登记、收据及有效backup保留，预约revision单调递增。
+                 不执行 quit、重启、配置更新或 RPC force；不能与身份重绑定同时使用。
 没有该固定 shim 时仍可完成私人发布，但返回失败并明确报告 SSH RPC 尚未就绪。
 用运行 Sunshine 的桌面用户操作；root 不创建其它用户的私人控制器。
 安装绝不自动 enrollment。受控准备重启前必须完成官方 PIN 配对（配对才持久化实例 UUID）；
@@ -32,11 +38,14 @@ while [ "$#" -gt 0 ]; do
     case "$1" in
         --publish-shim) PUBLISH=true;;
         --reconcile-host-identity) RECONCILE=true;;
+        --reconcile-owned-release) RELEASE=true;;
         -h|--help) usage; exit 0;;
         *) qd_die "未知参数: $1";;
     esac
     shift
 done
+[ "$RECONCILE" = false ] || [ "$RELEASE" = false ] || qd_die '两种本地对账仪式不可同时选择'
+[ "$RELEASE" = false ] || [ "$PUBLISH" = false ] || qd_die '受管释放对账不可发布系统 shim'
 qd_require_not_root
 qd_require_ubuntu
 for command in python3 curl sha256sum dpkg-deb dpkg-query systemctl busctl journalctl stat; do
@@ -76,6 +85,7 @@ args=(install --metadata "$metadata" --package "$deb" --ubuntu "$VERSION_ID"
       --architecture "$arch" --installed-version "$installed")
 [ "$PUBLISH" = false ] || args+=(--publish-shim)
 [ "$RECONCILE" = false ] || args+=(--reconcile-host-identity)
+[ "$RELEASE" = false ] || args+=(--reconcile-owned-release)
 # -I suppresses ambient Python path/user-site settings; -B explicitly prevents
 # cache writes (-I ignores PYTHONDONTWRITEBYTECODE). No token is needed
 # after metadata acquisition, including by an explicitly invoked sudo publisher.

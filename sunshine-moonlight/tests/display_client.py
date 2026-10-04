@@ -314,7 +314,87 @@ class EntryTests(fixture.ConnectorFixture, unittest.TestCase):
         self.write_default()
         result = self.invoke("desktop", extra_env={"FAKE_QUIT_EXIT":"9"})
         self.assertEqual(result.returncode, 9, result.stderr)
+        self.assertIn("本地进程返回非零；主机确认", result.stderr)
         self.assert_available()
+
+    def test_nonzero_quit_without_host_cancel_retains(self):
+        self.write_default()
+        result = self.invoke("desktop", extra_env={"FAKE_QUIT_EXIT": "9", "FAKE_QUIT_EFFECT": "none"})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.actions(), ["list", "list", "stream", "quit"])
+        self.assertEqual(self.control_actions().count("finish_release"), 1)
+        self.assertEqual(self.host()["phase"], "reconciliation_required")
+        self.assertNotIn("主机确认 Desktop 已关闭", result.stderr)
+
+    def short_quit_deadline(self):
+        # Only the private copied fixture client has a short deadline. The real
+        # command's stock 45s deadline remains untouched.
+        path = self.module / "lib/display_client.py"
+        original = path.read_text()
+        self.assertIn("QUERY_TIMEOUT = 45  # stock", original)
+        path.write_text(original.replace("QUERY_TIMEOUT = 45  # stock", "QUERY_TIMEOUT = 0.25  # stock"))
+
+    def test_quit_timeout_after_actual_cancel_uses_fresh_host_closure_once(self):
+        self.write_default()
+        self.short_quit_deadline()
+        result = self.invoke("desktop", extra_env={"FAKE_QUIT_HOLD": "3"})
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assert_available()
+        self.assertEqual(self.actions(), ["list", "list", "stream", "quit"])
+        self.assertEqual(self.control_actions()[-3:], ["begin_release", "status", "finish_release"])
+        self.assertIn("本地进程超时；主机确认", result.stderr)
+        self.assertNotIn("需要主机可信对账后再连接", result.stderr)
+
+    def test_quit_timeout_without_cancel_retains_and_never_reissues_quit(self):
+        self.write_default()
+        self.short_quit_deadline()
+        result = self.invoke("desktop", extra_env={"FAKE_QUIT_HOLD": "3", "FAKE_QUIT_EFFECT": "none"})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.actions(), ["list", "list", "stream", "quit"])
+        self.assertEqual(self.control_actions()[-3:], ["begin_release", "status", "control_lost"])
+        self.assertNotIn("finish_release", self.control_actions())
+        self.assertEqual((self.host()["phase"], self.host()["uncertainty"]),
+                         ("reconciliation_required", "owner_lost"))
+
+    def test_quit_timeout_status_or_finish_uncertainty_never_guesses_cleanup(self):
+        self.short_quit_deadline()
+        for action in ("status", "finish_release"):
+            with self.subTest(action=action):
+                self.control_state.unlink(missing_ok=True)
+                self.control_log.unlink(missing_ok=True)
+                self.state.unlink(missing_ok=True)
+                self.write_default()
+                result = self.invoke("desktop", extra_env={"FAKE_QUIT_HOLD": "3", "FAKE_LOST_ACTION": action})
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(self.actions(), ["list", "list", "stream", "quit"])
+                self.assertEqual(self.control_actions().count("status"), 1)
+                self.assertEqual(self.control_actions().count("finish_release"), 0 if action == "status" else 1)
+                self.assertNotIn("control_lost", self.control_actions())
+                self.assertIn("未确认释放主机预约", result.stderr)
+
+    def test_quit_timeout_malformed_status_or_finish_revision_retains_without_extra_rpc(self):
+        self.short_quit_deadline()
+        for action in ("status", "finish_release"):
+            with self.subTest(action=action):
+                self.control_state.unlink(missing_ok=True)
+                self.control_log.unlink(missing_ok=True)
+                self.state.unlink(missing_ok=True)
+                self.write_default()
+                result = self.invoke("desktop", extra_env={"FAKE_QUIT_HOLD": "3", "FAKE_MALFORM_REV_ACTION": action})
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(self.actions(), ["list", "list", "stream", "quit"])
+                self.assertEqual(self.control_actions().count(action), 1)
+                self.assertNotIn("control_lost", self.control_actions())
+                self.assertIn("未确认释放主机预约", result.stderr)
+
+    def test_quit_timeout_changed_host_status_retains_without_finish(self):
+        self.write_default()
+        self.short_quit_deadline()
+        result = self.invoke("desktop", extra_env={"FAKE_QUIT_HOLD": "3", "FAKE_WRONG_STATUS_HOST": "1"})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.control_actions()[-2:], ["begin_release", "status"])
+        self.assertNotIn("finish_release", self.control_actions())
+        self.assertNotIn("control_lost", self.control_actions())
 
     def test_explicit_binary_path_and_gui_environment_preserved(self):
         self.write_default()
