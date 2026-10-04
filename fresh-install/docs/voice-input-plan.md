@@ -58,9 +58,13 @@ v2.4.0 的源码在最大 `context_lines <= 0` 时停止记录普通输入和转
 
 ## 模型选择
 
-**默认候选是本地 Qwen3-ASR 0.6B int8，模型约 867 MB。** 它支持中文与英文，有标点输出；当前数据不足以保证用户本人的工程术语准确率或客户端延迟。
+**保留 Qwen3-ASR 0.6B INT8 为首选试用候选，本地模型包约 867 MB。** [作者评估](https://github.com/QwenLM/Qwen3-ASR#evaluation)包含会议与普通话对话，中文口语能力有公开依据；尚无本人的自然改口、Pi/SSH/tmux 等工程词听写证据。作者的 bfloat16/vLLM 结果不能直接当作此处 INT8 运行效果。
 
-若纯 CPU 机器资源受限，或专有名词错误较多，以较小的中文模型及热词能力作对照。实施后用同一组用户本人录音比较默认模型与候选模型，按修改量、英文术语保留、漏字/添加和停止后延迟选择，不根据不同网页的速度榜或厂商成绩直接下结论。
+[sherpa-onnx 上游](https://k2-fsa.github.io/sherpa/onnx/qwen3-asr/pretrained.html)提供该模型的 CPU INT8 路线。当前 vinput 使用缓存录音、停止后推理的方式；这符合按键结束后填字的需求，但不是边说边上屏。2026-10-04 读取的模型注册表默认为 CPU、`num_threads=1`，不能据包可运行就承诺客户端响应速度，也不能据电脑有 GPU 就假定这条路线用了 GPU。实施时明确选择运行配置并测冷/热停止到上屏延迟。
+
+**术语提示需要先接通，不能许诺安装后即生效。** [v2.4.0 后端](https://github.com/xifan2333/fcitx5-vinput/blob/v2.4.0/src/daemon/asr/backends/sherpa_offline_backend.cpp)已有 `qwen3_asr.hotwords` 接口，传的是提示词而不是强制词替换；但2026-10-04读取的[注册表](https://github.com/xifan2333/vinput-registry/blob/main/registry/models.json)将这个0.6B INT8条目标为 `supports_hotwords=false`，默认也没有提示词配置。实施时须确认模型元数据、配置入口和实际识别器一致后，再测试短工程词表。不为提示术语开启普通输入历史记录或 LLM 改写。
+
+选择方式：重用约20句本人录音，包含自然口述、受控读句、中英术语、数字、停顿与改口；比较0.6B无提示词与接通后的短词表，并加入词表中未实际说出的词检查误补。若速度不足，以SenseVoice作轻量对照；提示词接通后仍明显识别错误，再核对1.7B本地包作精度对照。以最终修改时间、关键实体、漏字/添加和延迟选择，不根据厂商榜单直接保证商业语音输入体验。
 
 ## 安装与平台范围
 
