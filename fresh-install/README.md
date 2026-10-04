@@ -64,11 +64,13 @@ bash fresh-install/modules/tmux/install.sh
 
 各模块自行定位仓库共享库，不依赖从哪个工作目录启动。Ghostty 模块只保留 `modules/ghostty/install.sh` 一个 shell 源文件；zsh 运行时 hook 从它生成，Wayland C 源码与它一起打包，测试放在 `fresh-install/tests/ghostty/`。Ghostty 的库编译、启动器和桌面集成都由该安装入口一次完成。Ghostty 和 tmux 的参数、持久配置及恢复语义见各自目录中的 `README.md`。
 
-## 语音输入方案（尚未实现）
+## 语音输入（现成软件与备选集成）
 
-[客户端语音输入方案](docs/voice-input-plan.md)建议复用 Fcitx5：按一下开始录音，再按一下结束，本机识别后直接把文字送进终端输入框；本地 Pi 与 SSH Pi 使用同一操作，不增加远端语音配置。该文档包含模块归属、版本与文本过滤要求、平台边界和验收顺序。
+优先按[现成软件说明](docs/voice-input-software.md)试用 Nextalk：现有 Ubuntu 安装包、本地中文识别、同键开始/结束，以及 Fcitx5 向终端输入文字；不要求先搭建模型服务或修改 Pi。
 
-目前没有语音安装模块，`setup.sh` 也未增加语音步骤；本文链接不代表已经安装或可用。
+[客户端集成方案](docs/voice-input-plan.md)保留自行包装 Fcitx5-vinput 的备选设计，包含模块归属、版本与文本过滤要求、平台边界和验收顺序。
+
+目前本仓库没有语音安装模块，`setup.sh` 也未增加语音步骤；现成应用可按其说明单独试用，文档链接不代表已经部署或验收。
 
 ## 共享实现
 
