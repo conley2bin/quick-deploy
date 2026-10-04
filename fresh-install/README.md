@@ -64,6 +64,12 @@ bash fresh-install/modules/tmux/install.sh
 
 各模块自行定位仓库共享库，不依赖从哪个工作目录启动。Ghostty 模块只保留 `modules/ghostty/install.sh` 一个 shell 源文件；zsh 运行时 hook 从它生成，Wayland C 源码与它一起打包，测试放在 `fresh-install/tests/ghostty/`。Ghostty 的库编译、启动器和桌面集成都由该安装入口一次完成。Ghostty 和 tmux 的参数、持久配置及恢复语义见各自目录中的 `README.md`。
 
+## 语音输入方案（尚未实现）
+
+[客户端语音输入方案](docs/voice-input-plan.md)建议复用 Fcitx5：按一下开始录音，再按一下结束，本机识别后直接把文字送进终端输入框；本地 Pi 与 SSH Pi 使用同一操作，不增加远端语音配置。该文档包含模块归属、版本与文本过滤要求、平台边界和验收顺序。
+
+目前没有语音安装模块，`setup.sh` 也未增加语音步骤；本文链接不代表已经安装或可用。
+
 ## 共享实现
 
 `lib/apt-lock-wait.sh` 被一键入口和所有执行 APT 操作的模块共同加载。它只等待真实持锁进程结束，不删除锁文件、不终止系统更新。保留模块自己的加载逻辑，是为了让模块脱离 `setup.sh` 单独运行时仍具备相同的首开机可靠性。
