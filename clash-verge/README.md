@@ -22,6 +22,41 @@
 已登记的全局 Script，以及只读的 `profiles.yaml`/订阅文件。输入空行等于选项 1；
 EOF 直接退出且不写任何文件；某个动作失败会打印原因并回到菜单，不会假装成功。
 
+## `tun.stack` 被应用设置接管
+
+如果 Verge 提示：
+
+> 扩展配置或脚本写入了由应用设置接管的字段 tun.stack，这些值已被丢弃
+
+说明扩展执行后得到的栈值与应用设置不同。带此提示的版本在生成末尾恢复应用拥有的值，
+但**不会删除扩展文件中的赋值**。当前 `tun-fix.sh` 生成的 Script 只赋值 `config.rules`，
+不写 `tun.stack`；更新规则不会清理其它 Merge/Script。旧优化器被移除时也没有清空
+已安装的扩展，因此需要定位实际输入，不能凭这条提示认定是本工具或某个旧 Merge。
+
+在**实际报错的机器**上处理：
+
+1. 先核对实际运行的 Verge 版本与它使用的配置目录。打开 **设置 → 系统设置 →
+   虚拟网卡模式旁的齿轮 → TUN 模式堆栈**；保留当前选择，无需为消除提示而保存。
+   如果确实需要更换栈，在这里设置目标值并保存，不把扩展中被丢弃的值自动搬过来。
+   保存的栈属于应用 `config.yaml` 的 `tun.stack`，TUN 开关另由应用设置管理。
+2. 定位并备份确定写入该字段的全局或订阅级扩展。若是 Merge，**只删除 `tun` 下的
+   `stack` 叶**，保留其它 TUN、DNS、规则和注释；不要删除整个 `tun` 块或清空 Merge。
+   若是自定义 Script，只手动修改确认写栈的赋值，不执行或批量重写未知 JS。
+   找不到来源时先核对输入，缺失的 Merge 文件不需要为了消除提示而创建。
+3. 在 Verge 中**重新生成/重载配置**，核对应用栈选择、TUN 开关和运行配置。
+   不改订阅、注册表或运行 YAML；重生成前不能声称核心已加载新配置。
+   后续自定义 Script 若读取被删除的值，需要同时检查其逻辑。重复相同字段的提示可能被
+   抑制，所以第二次没有提示不能单独证明扩展已清理。
+
+版本边界：官方 v2.5.5–v2.5.7 有这条提示与生成末尾的 TUN 字段接管；仓库内置的
+官方 **2.5.2 没有这条提示，也没有新版的 TUN 接管**。在 2.5.2 删除扩展栈值可能改变
+有效栈，不能照搬上述操作。包版本、运行产物与截图来源需分别核实。
+
+上游依据（固定 v2.5.7 源码）：[提示原文](https://github.com/clash-verge-rev/clash-verge-rev/blob/ea509b82363a40c3c32e951d7ce9d66d66da411f/src/locales/zh/profiles.json#L54)、
+[生成末尾提示与接管](https://github.com/clash-verge-rev/clash-verge-rev/blob/ea509b82363a40c3c32e951d7ce9d66d66da411f/src-tauri/src/enhance/mod.rs#L938-L963)、
+[GUI 保存栈设置](https://github.com/clash-verge-rev/clash-verge-rev/blob/ea509b82363a40c3c32e951d7ce9d66d66da411f/src/components/setting/mods/tun-viewer.tsx#L102-L134)。
+2.5.2 的扩展顺序见[旧版本实现](https://github.com/clash-verge-rev/clash-verge-rev/blob/28f2efc504059b1dc75c793618b775c8e1b2a5f1/src-tauri/src/enhance/mod.rs#L685-L773)。
+
 ## 日常修改路由
 
 只有两个文件需要编辑：
