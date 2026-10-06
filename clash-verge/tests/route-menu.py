@@ -333,6 +333,46 @@ class RouteMenuTests(unittest.TestCase):
             self.assertEqual(digest(self.profiles / sentinel),
                              before[str(self.profiles / sentinel)]["sha256"], sentinel)
 
+    def test_route_apply_does_not_clean_extension_stack_or_change_app_choice(self) -> None:
+        """A routing update cannot repair an independently owned Merge input."""
+        (self.profiles / "Merge.yaml").write_bytes(
+            "# 保留注释与 CRLF\r\ntun:\r\n  stack: system\r\n  enable: true\r\n"
+            "  mtu: 1400\r\ndns:\r\n  enable: true\r\n".encode("utf-8")
+        )
+        (self.profiles / "Merge.yaml").chmod(0o640)
+        (self.profiles / "subscription-merge.yaml").write_text(
+            "tun:\n  stack: mixed\n  auto-route: true\n", encoding="utf-8",
+        )
+        (self.state / "config.yaml").write_text("tun:\n  stack: gvisor\n", encoding="utf-8")
+        (self.state / "verge.yaml").write_text("enable_tun_mode: true\n", encoding="utf-8")
+        (self.state / "clash-verge.yaml").write_text(
+            "tun:\n  stack: gvisor\n  enable: true\ndns:\n  enable: true\n", encoding="utf-8",
+        )
+        before = self.snapshot(include_mtime=True)
+        result = self.run_entry("rules", "apply")
+        allowed = {str(self.script)} | {str(path) for path in self.backups()}
+        self.assertEqual(self.changed_paths(before, self.snapshot(include_mtime=True)), allowed)
+        self.assertEqual(len(self.backups()), 1)
+        generated = self.script.read_text()
+        self.assertNotIn("config.tun", generated)
+        self.assertNotIn("tun.stack", generated)
+        node = shutil.which("node")
+        self.assertIsNotNone(node, "node is required for the routing preservation fixture")
+        base = {
+            "tun": {"stack": "gvisor", "enable": True, "mtu": 1400},
+            "dns": {"enable": True, "enhanced-mode": "fake-ip"},
+            "proxy-groups": [], "rules": ["MATCH,DIRECT"],
+        }
+        self.assertEqual(self.host_wrapped_js(node, generated, base), {
+            **base, "rules": ["DOMAIN,force.example,DIRECT", "DOMAIN-SUFFIX,cn,DIRECT", "MATCH,DIRECT"],
+        })
+        self.assertNotIn("已生效", result.stdout)
+        before_noop = self.snapshot(include_mtime=True)
+        self.assertIn("无需更新", self.run_entry("rules", "apply").stdout)
+        self.assertEqual(self.changed_paths(before_noop, self.snapshot(include_mtime=True)), set())
+        self.assertFalse(self.ssh_log.exists())
+        self.assertFalse(self.probe_log.exists())
+
     def test_registry_merge_registration_is_not_required_for_routing(self) -> None:
         self.declare_wechat_proxy()
         (self.state / "profiles.yaml").write_text(
@@ -900,6 +940,29 @@ console.log(JSON.stringify(returned));
         return result.stdout + result.stderr
 
     # ---- retained CLI entrypoints ---------------------------------------
+    def test_help_explains_stack_ownership_without_writes_or_registry_dependency(self) -> None:
+        (self.state / "profiles.yaml").write_text("items: [\n", encoding="utf-8")
+        (self.profiles / "Merge.yaml").write_text(
+            "# private fixture sentinel\ntun:\n  stack: system\n  enable: true\n", encoding="utf-8",
+        )
+        (self.state / "config.yaml").write_text("tun:\n  stack: gvisor\n", encoding="utf-8")
+        before = self.snapshot(include_mtime=True)
+        for argument in ("--help", "-h"):
+            result = self.run_entry(argument)
+            self.assertIn("只写路由规则，不写 tun.stack", result.stdout)
+            self.assertIn("更新规则不会清理其它扩展", result.stdout)
+            self.assertIn("设置 → 系统设置 → 虚拟网卡模式旁的齿轮 → TUN 模式堆栈", result.stdout)
+            self.assertIn("只删除该 Merge 的 tun.stack 叶", result.stdout)
+            self.assertIn("2.5.2", result.stdout)
+            self.assertIn("不能照搬", result.stdout)
+            self.assertIn("重新生成配置", result.stdout)
+            self.assertNotIn("private fixture sentinel", result.stdout + result.stderr)
+            self.assertEqual(result.stderr, "")
+            self.assertEqual(self.changed_paths(before, self.snapshot(include_mtime=True)), set())
+        self.assertFalse(self.dpkg_log.exists())
+        self.assertFalse(self.ssh_log.exists())
+        self.assertFalse(self.probe_log.exists())
+
     def test_rules_check_and_render_stay_read_only_and_registry_free(self) -> None:
         no_registry = dict(self.environment())
         (self.state / "profiles.yaml").unlink()

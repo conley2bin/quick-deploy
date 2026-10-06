@@ -399,6 +399,564 @@ class InstallTests(unittest.TestCase):
         self.assertEqual(exc.exception.code, "installer_identity")
 
 
+class OwnedReleaseReconciliationTests(unittest.TestCase):
+    setUp = InstallTests.setUp
+
+    def releasing_lost(self, f=None, *, prior_prepared=False):
+        f = f or self.fixture
+        f.install(publish=True)
+        f.rpc("enroll", revision=f.rpc("status")["revision"])
+        listed = f.rpc("list")
+        owner = f.rpc("acquire", revision=listed["revision"], snapshot=listed["snapshot"])
+        def call(ticket, action, **kwargs):
+            return f.rpc(action, revision=ticket["revision"], capability=ticket["capability"], **kwargs)
+        if prior_prepared:
+            first = call(owner, "prepare", snapshot=owner["snapshot"], display_id=lf.SECOND)
+            self.assertTrue(first["restarted"])
+            self.assertEqual(call(first, "abort")["revision"], 5)
+            listed = f.rpc("list")
+            owner = f.rpc("acquire", revision=listed["revision"], snapshot=listed["snapshot"])
+        prepared = call(owner, "prepare", snapshot=owner["snapshot"], display_id=lf.SECOND)
+        if prior_prepared:
+            self.assertFalse(prepared["restarted"])
+            self.assertEqual(prepared["revision"], 8)
+        attempted = call(prepared, "launch")
+        f.f.app = attempted["desktop_app_id"]
+        active = call(attempted, "observe_active")
+        releasing = call(active, "begin_release")
+        f.f.app = 0  # Synthetic effect of the ONE already-issued authenticated quit.
+        lost = call(releasing, "control_lost")
+        self.assertEqual((lost["revision"], lost["phase"], lost["uncertainty"]),
+                         (releasing["revision"] + 1, "reconciliation_required", "owner_lost"))
+        if prior_prepared:
+            self.assertEqual((attempted["revision"], active["revision"], releasing["revision"], lost["revision"]),
+                             (9, 10, 11, 12))
+            lease = json.loads((f.controller / "state/operation.json").read_bytes())["lease"]
+            self.assertEqual((lease["stage"], lease["prepared_revision"], lease["release_revision"]),
+                             ("releasing", 8, 11))
+            self.assertNotIn("restart_id", lease)
+            self.assertNotIn("after_digest", lease)
+        return f
+
+    def snapshot(self, f):
+        return {str(p.relative_to(f.controller)): (p.read_bytes(), p.stat().st_ino,
+                                                    p.stat().st_mode, p.stat().st_mtime_ns)
+                for p in f.controller.rglob("*") if p.is_file()}
+
+    def test_positive_monotonic_release_archives_and_retains_enrollment_receipt(self):
+        f = self.releasing_lost(prior_prepared=True)
+        state_dir = f.controller / "state"
+        original = {name: ic.record_identity(state_dir / name) for name in ic.RELEASE_RECORDS}
+        locks = {name: ic.record_identity(path) for name, path in (
+            ("install", f.controller / ".install.lock"), ("operation", state_dir / "operation.lock"),
+            ("reservation", state_dir / "reservation.lock"))}
+        old = json.loads((state_dir / "reservation.json").read_bytes())
+        enrollment = json.loads((state_dir / "operation.json").read_bytes())["enrollment"]
+        result = f.install(reconcile_owned_release=True, authorize_release=lambda: True)
+        self.assertEqual((result.status, f.t.restarts), ("available", 1))
+        journal, = state_dir.glob("release-transition-*.bak")
+        transaction = json.loads(journal.read_bytes())
+        for name, identity in original.items():
+            self.assertEqual(ic.record_identity(state_dir / (name + "." + transaction["id"] + ".bak")), identity)
+        self.assertEqual(json.loads((state_dir / "reservation.json").read_bytes())["revision"], old["revision"] + 1)
+        self.assertEqual(json.loads((state_dir / "operation.json").read_bytes()),
+                         {"schema": 1, "enrollment": enrollment, "lease": None})
+        self.assertEqual((state_dir / "start-receipt.json").read_bytes(),
+                         (state_dir / ("start-receipt.json." + transaction["id"] + ".bak")).read_bytes())
+        for name, path in (("install", f.controller / ".install.lock"),
+                           ("operation", state_dir / "operation.lock"), ("reservation", state_dir / "reservation.lock")):
+            self.assertEqual(ic.record_identity(path), locks[name])
+        before = self.snapshot(f)
+        f.install(reconcile_owned_release=True, authorize_release=lambda: (_ for _ in ()).throw(AssertionError("committed")))
+        self.assertEqual(self.snapshot(f), before)
+        menu = f.rpc("list")
+        self.assertTrue(menu["selection_ready"])
+        acquired = f.rpc("acquire", revision=menu["revision"], snapshot=menu["snapshot"])
+        self.assertEqual(f.rpc("abort", revision=acquired["revision"],
+                               capability=acquired["capability"])["phase"], "available")
+        self.assertEqual(f.t.restarts, 1)
+        source = f.root / "later-source"
+        shutil.copytree(f.source, source, ignore=shutil.ignore_patterns("__pycache__"))
+        with (source / "host.py").open("a") as stream:
+            stream.write("\n# future ordinary publication\n")
+        f.source = source
+        f.install()
+        before = self.snapshot(f)
+        self.assertEqual(f.install(reconcile_owned_release=True,
+                                   authorize_release=lambda: False).status, "available")
+        self.assertEqual(self.snapshot(f), before)
+
+    def test_postcommit_later_source_can_occupy_skipped_repair_reference(self):
+        f = self.releasing_lost(prior_prepared=True)
+        repair_source = f.root / "repair-source"
+        shutil.copytree(f.source, repair_source, ignore=shutil.ignore_patterns("__pycache__"))
+        with (repair_source / "host.py").open("a") as stream:
+            stream.write("\n# intended release-controller publication\n")
+        f.source = repair_source
+        write = lc.PrivateFiles.write
+        def cut_after_available(files, name, data, limit=lc.MAX_PRIVATE):
+            write(files, name, data, limit=limit)
+            if name == "reservation.json" and json.loads(data)["phase"] == "available":
+                raise RuntimeError("durable availability before code publication")
+        with mock.patch.object(lc.PrivateFiles, "write", cut_after_available), self.assertRaises(RuntimeError):
+            f.install(reconcile_owned_release=True, authorize_release=lambda: True)
+        self.assertEqual((f.rpc("status")["revision"], ic.active(f.controller)[1]), (13, 1))
+        menu = f.rpc("list")
+        owner = f.rpc("acquire", revision=menu["revision"], snapshot=menu["snapshot"])
+        self.assertEqual(f.rpc("abort", revision=owner["revision"], capability=owner["capability"])["revision"], 15)
+        later_source = f.root / "later-source"
+        shutil.copytree(repair_source, later_source, ignore=shutil.ignore_patterns("__pycache__"))
+        with (later_source / "host.py").open("a") as stream:
+            stream.write("# legitimate postcommit source\n")
+        f.source = later_source
+        f.install()  # ordinary qualified append occupies serial2, not the skipped repair source
+        self.assertEqual(ic.active(f.controller)[1], 2)
+        before = self.snapshot(f)
+        self.assertEqual(f.install(reconcile_owned_release=True, authorize_release=lambda: False).status, "available")
+        self.assertEqual(self.snapshot(f), before)
+        menu = f.rpc("list")
+        owner = f.rpc("acquire", revision=menu["revision"], snapshot=menu["snapshot"])
+        def call(ticket, action, **fields):
+            value = f.rpc(action, revision=ticket["revision"], capability=ticket["capability"], **fields)
+            self.assertTrue(value.get("ok"), value)
+            return value
+        prepared = call(owner, "prepare", snapshot=owner["snapshot"], display_id=lf.SECOND)
+        self.assertFalse(prepared["restarted"])
+        attempted = call(prepared, "launch")
+        f.f.app = attempted["desktop_app_id"]
+        active = call(attempted, "observe_active")
+        releasing = call(active, "begin_release")
+        f.f.app = 0
+        self.assertEqual(call(releasing, "control_lost")["revision"], 22)
+        self.assertEqual(f.install(reconcile_owned_release=True, authorize_release=lambda: True).status, "available")
+        self.assertEqual((f.rpc("status")["revision"], f.t.restarts), (23, 1))
+
+    def test_same_lease_controlled_restart_remains_accepted(self):
+        f = self.releasing_lost()
+        self.assertEqual(f.install(reconcile_owned_release=True, authorize_release=lambda: True).status, "available")
+        journal, = (f.controller / "state").glob("release-transition-*.bak")
+        self.assertEqual(json.loads(journal.read_bytes())["evidence"]["preparation"], "restarted")
+
+    def test_noop_prior_backup_and_receipt_drift_refuse_without_mutation(self):
+        for case in ("backup", "receipt"):
+            with self.subTest(case=case):
+                f = self.releasing_lost(Fixture(Path(self.temp.name) / case), prior_prepared=True)
+                path = f.controller / "state" / ("prepare-backup.conf" if case == "backup" else "start-receipt.json")
+                path.write_bytes(b"different old evidence\n")
+                before = self.snapshot(f)
+                with self.assertRaises(Refusal):
+                    f.install(reconcile_owned_release=True, authorize_release=lambda: True)
+                self.assertEqual(self.snapshot(f), before)
+
+    def test_interruption_replays_exact_old_inodes_without_new_ceremony(self):
+        for point in ("journal", *ic.RELEASE_RECORDS, "new-operation", "new-reservation", "new-receipt", "seal"):
+            with self.subTest(point=point):
+                f = self.releasing_lost(Fixture(Path(self.temp.name) / point))
+                old = {name: ic.record_identity(f.controller / "state" / name) for name in ic.RELEASE_RECORDS}
+                rename, create = ic.os.rename, ic.create
+                def cut_rename(src, dst, **kwargs):
+                    rename(src, dst, **kwargs)
+                    if src == point: raise RuntimeError("synthetic cut after durable rename")
+                targets = {"journal": "release-transition-", "new-operation": "operation.json",
+                           "new-reservation": "reservation.json", "new-receipt": "start-receipt.json",
+                           "seal": "release-committed-"}
+                def cut_create(path, data, mode=0o600):
+                    create(path, data, mode)
+                    if point in targets and path.name.startswith(targets[point]):
+                        raise RuntimeError("synthetic cut after durable create")
+                with mock.patch.object(ic.os, "rename", side_effect=cut_rename), mock.patch.object(ic, "create", side_effect=cut_create):
+                    with self.assertRaises(RuntimeError):
+                        f.install(reconcile_owned_release=True, authorize_release=lambda: True)
+                interrupted = self.snapshot(f)
+                if point != "seal":
+                    f.f.app = 123  # IDLE is not enough after a drift; no replay writes.
+                    with self.assertRaises(Refusal):
+                        f.install(reconcile_owned_release=True, authorize_release=lambda: True)
+                    self.assertEqual(self.snapshot(f), interrupted)
+                    f.f.app = 0
+                result = f.install(reconcile_owned_release=True,
+                                   authorize_release=lambda: (_ for _ in ()).throw(AssertionError("journal already confirmed")))
+                self.assertEqual(result.status, "available")
+                transaction, = (f.controller / "state").glob("release-transition-*.bak")
+                journal = json.loads(transaction.read_bytes())
+                self.assertEqual(ic.active(f.controller)[1], 1)
+                self.assertEqual(f.t.restarts, 1)
+                for name, expected in old.items():
+                    self.assertEqual(ic.record_identity(f.controller / "state" / (name + "." + journal["id"] + ".bak")), expected)
+
+    def test_pending_release_journal_refuses_source_change_before_commit(self):
+        f = self.releasing_lost(prior_prepared=True)
+        source = f.root / "pending-source"
+        shutil.copytree(f.source, source, ignore=shutil.ignore_patterns("__pycache__"))
+        with (source / "host.py").open("a") as stream:
+            stream.write("\n# journal-bound source\n")
+        f.source = source
+        create = ic.create
+        def cut(path, data, mode=0o600):
+            create(path, data, mode)
+            if path.name.startswith("release-transition-"):
+                raise RuntimeError("journal durable before state commit")
+        with mock.patch.object(ic, "create", side_effect=cut), self.assertRaises(RuntimeError):
+            f.install(reconcile_owned_release=True, authorize_release=lambda: True)
+        before = self.snapshot(f)
+        with (source / "host.py").open("a") as stream:
+            stream.write("# different pending source\n")
+        with self.assertRaises(Refusal):
+            f.install(reconcile_owned_release=True, authorize_release=lambda: True)
+        self.assertEqual(self.snapshot(f), before)
+        data = (source / "host.py").read_bytes()
+        (source / "host.py").write_bytes(data.removesuffix(b"# different pending source\n"))
+        self.assertEqual(f.install(reconcile_owned_release=True,
+                                   authorize_release=lambda: (_ for _ in ()).throw(AssertionError("existing journal"))).status,
+                         "available")
+
+    def test_interrupted_source_publication_replays_journal_bound_version(self):
+        for point in ("version", "marker", "active"):
+            with self.subTest(point=point):
+                f = self.releasing_lost(Fixture(Path(self.temp.name) / point))
+                source = f.root / "next-source"
+                shutil.copytree(f.source, source, ignore=shutil.ignore_patterns("__pycache__"))
+                with (source / "host.py").open("a") as stream:
+                    stream.write("\n# private next qualified controller version\n")
+                f.source = source
+                create = ic.create
+                def cut(path, data, mode=0o600):
+                    create(path, data, mode)
+                    if (point == "version" and path.name == "lifecycle.py"
+                            or point == "marker" and path.name == ".owned.json"
+                            or point == "active" and path.name == "00000002.json"):
+                        raise RuntimeError("synthetic durable publication cut")
+                with mock.patch.object(ic, "create", side_effect=cut), self.assertRaises(RuntimeError):
+                    f.install(reconcile_owned_release=True, authorize_release=lambda: True)
+                self.assertEqual(f.install(reconcile_owned_release=True,
+                    authorize_release=lambda: (_ for _ in ()).throw(AssertionError("already journalled"))).status, "available")
+                self.assertEqual(ic.active(f.controller)[1], 2)
+                self.assertEqual(f.t.restarts, 1)
+
+    def test_history_and_active_reference_seals_refuse_drift_without_mutation(self):
+        for stage in ("journal", "committed"):
+            for target in ("history", "active"):
+                with self.subTest(stage=stage, target=target):
+                    f = self.releasing_lost(Fixture(Path(self.temp.name) / stage / target))
+                    historical = f.controller / "state/earlier.bak"
+                    historical.write_bytes(b"previous retained record\n"); historical.chmod(0o600)
+                    path = historical if target == "history" else f.controller / "active/00000001.json"
+                    if stage == "journal":
+                        create = ic.create
+                        def cut(dest, data, mode=0o600):
+                            create(dest, data, mode)
+                            if dest.name.startswith("release-transition-"):
+                                raise RuntimeError("synthetic cut after journal")
+                        with mock.patch.object(ic, "create", side_effect=cut), self.assertRaises(RuntimeError):
+                            f.install(reconcile_owned_release=True, authorize_release=lambda: True)
+                    else:
+                        f.install(reconcile_owned_release=True, authorize_release=lambda: True)
+                    original = path.read_bytes()
+                    if target == "active":
+                        saved = f.root / "original-reference.json"
+                        path.rename(saved)
+                        path.write_bytes(original); path.chmod(0o600)  # valid bytes, wrong inode
+                    else:
+                        path.write_bytes(b"altered retained evidence\n")
+                    before = self.snapshot(f)
+                    with self.assertRaises(Refusal):
+                        f.install(reconcile_owned_release=True, authorize_release=lambda: True)
+                    self.assertEqual(self.snapshot(f), before)
+                    if target == "active":
+                        path.unlink(); saved.rename(path)
+                    else:
+                        path.write_bytes(original)
+
+    def test_release_repair_never_publishes_shim_or_rebinds_uuid(self):
+        f = self.releasing_lost()
+        before = self.snapshot(f)
+        with self.assertRaises(Refusal):
+            f.install(reconcile_owned_release=True, publish=True, authorize_release=lambda: True)
+        self.assertEqual(self.snapshot(f), before)
+        with self.assertRaises(Refusal):
+            f.install(reconcile_owned_release=True, reconcile_host_identity=True,
+                      authorize_release=lambda: True, authorize_rebind=lambda: True)
+        self.assertEqual(self.snapshot(f), before)
+        self.assertEqual(f.publishes, 1)
+        self.assertNotIn("--reconcile-owned-release", ic.SHIM.decode())
+        self.assertEqual(cfg.digest(ic.SHIM), "ca7ee265568ead3da691752583d0472005566c325a5e8eac9b213b2687f0d913")
+
+    def test_release_reads_typed_token_on_private_controlling_pty(self):
+        import pty
+        import select
+        master, slave = pty.openpty()
+        launcher = '''import fcntl, os, sys, termios
+os.setsid()
+fcntl.ioctl(0, termios.TIOCSCTTY, 0)
+sys.path.insert(0, sys.argv[1])
+import install_controller as ic
+print("CONFIRMED=" + str(ic.interactive_release()), flush=True)
+'''
+        try:
+            with mock.patch.object(subprocess, "Popen", FIXTURE_POPEN):
+                child = subprocess.Popen(("/usr/bin/python3", "-I", "-B", "-c", launcher,
+                                          str(MODULE / "display-control")),
+                                         stdin=slave, stdout=slave, stderr=slave, cwd=self.temp.name,
+                                         env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"})
+            os.close(slave); slave = None
+            output = b""
+            while b"Type RELEASE:" not in output:
+                self.assertTrue(select.select([master], [], [], 5)[0], "local RELEASE prompt not emitted")
+                output += os.read(master, 4096)
+            os.write(master, b"RELEASE\n")
+            self.assertEqual(child.wait(timeout=5), 0)
+            while select.select([master], [], [], 0)[0]:
+                try: output += os.read(master, 4096)
+                except OSError: break
+            self.assertIn(b"CONFIRMED=True", output)
+            self.assertIn(b"no concurrent admin edits", output)
+        finally:
+            if slave is not None: os.close(slave)
+            os.close(master)
+            if "child" in locals() and child.poll() is None:
+                child.kill(); child.wait(timeout=5)
+
+    def test_release_token_is_raw_local_ownership_ceremony(self):
+        for data, tty, expected in ((b"RELEASE\n", True, True), (b"FREE\n", True, False),
+                                    (b"RELEASE now\n", True, False), (b"RELEASE\n", False, False)):
+            with mock.patch.object(ic.os, "open", return_value=123), mock.patch.object(ic.os, "isatty", return_value=tty), \
+                    mock.patch.object(ic.os, "read", return_value=data), mock.patch.object(ic.os, "write") as write, \
+                    mock.patch.object(ic.os, "close"):
+                self.assertEqual(ic.interactive_release(), expected)
+                if tty:
+                    self.assertIn(b"official Moonlight quit was issued", write.call_args.args[1])
+                    self.assertIn(b"no unmanaged/in-flight stream", write.call_args.args[1])
+
+    def test_negative_release_facts_leave_every_file_unchanged(self):
+        cases = ("busy", "phase", "uncertainty", "active", "attempt", "revision", "owner", "stage",
+                 "cancel", "desktop", "config", "generation", "receipt", "backup", "settings", "ceremony",
+                 "qualification", "proc_exe_limited", "proc_env_limited")
+        for case in cases:
+            with self.subTest(case=case):
+                f = self.releasing_lost(Fixture(Path(self.temp.name) / case))
+                state = json.loads((f.controller / "state/reservation.json").read_bytes())
+                meta = json.loads((f.controller / "state/operation.json").read_bytes())
+                if case == "busy": f.f.app = state["desktop"]["app_id"]
+                elif case == "phase": state["phase"] = "releasing"; state["uncertainty"] = None
+                elif case == "uncertainty": state["uncertainty"] = "closure_unconfirmed"
+                elif case == "active": state["active_observed"] = False
+                elif case == "attempt": state["attempt_revision"] = None
+                elif case == "revision": meta["lease"]["release_revision"] -= 1
+                elif case == "owner": meta["lease"]["owner_digest"] = "f" * 64
+                elif case == "stage": meta["lease"]["stage"] = "attested"
+                elif case == "cancel": meta["lease"]["cancel_transaction"] = "not-a-uuid"
+                elif case == "desktop": state["desktop"]["definition_digest"] = "f" * 64
+                elif case == "config": f.f.conf.write_bytes(f.f.conf.read_bytes() + b"# drift\n")
+                elif case == "generation": f.t.props["InvocationID"] = "9" * 32; f.t.current_trace()
+                elif case == "receipt": (f.controller / "state/start-receipt.json").write_bytes(b"{}\n")
+                elif case == "backup": (f.controller / "state/prepare-backup.conf").write_bytes(b"wrong")
+                elif case == "settings": f.f.endpoint_id = "11223344-1234-4321-abcd-0123456789ab"
+                elif case == "qualification": f.t.put(rt.EXECUTABLE, b"unqualified binary", uid=0)
+                elif case == "ceremony": pass
+                if case in ("phase", "uncertainty", "active", "attempt", "desktop"):
+                    path = f.controller / "state/reservation.json"; path.write_bytes(ic.document(state))
+                if case in ("revision", "owner", "stage", "cancel"):
+                    path = f.controller / "state/operation.json"; path.write_bytes(ic.document(meta))
+                before = self.snapshot(f)
+                if case in ("proc_exe_limited", "proc_env_limited"):
+                    attr = "identity" if case == "proc_exe_limited" else "read"
+                    original = getattr(f.t, attr)
+                    def limited(path, *args, **kwargs):
+                        if str(path).startswith("/proc/") and Path(path).name == ("exe" if attr == "identity" else "environ"):
+                            raise PermissionError("synthetic restricted proc")
+                        return original(path, *args, **kwargs)
+                    with mock.patch.object(f.t, attr, side_effect=limited), self.assertRaises(Refusal):
+                        f.install(reconcile_owned_release=True, authorize_release=lambda: True)
+                else:
+                    with self.assertRaises(Refusal):
+                        f.install(reconcile_owned_release=True, authorize_release=lambda: case != "ceremony")
+                self.assertEqual(self.snapshot(f), before)
+                self.assertEqual(f.t.restarts, 1)
+
+    def test_confirmation_rechecks_fresh_endpoint_and_preserves_state_on_drift(self):
+        f = self.releasing_lost()
+        before = self.snapshot(f)
+        def drift():
+            f.f.app = 123
+            return True
+        with self.assertRaises(Refusal):
+            f.install(reconcile_owned_release=True, authorize_release=drift)
+        self.assertEqual(self.snapshot(f), before)
+        self.assertFalse(list((f.controller / "state").glob("release-transition-*.bak")))
+
+
+    # Independent reviewer findings are canonical here, not optional scratch
+    # probes: these exercise the actual HostController behind Fixture.rpc.
+    def denied_rpc(self, f, action, **fields):
+        try:
+            response = f.rpc(action, **fields)
+        except Refusal:
+            return  # direct fixture host.handle may propagate a typed refusal
+        self.assertFalse(response.get("ok"), response)
+    def test_invalid_lock_bytes_refuse_without_archiving(self):
+        for name in ("operation.lock", "reservation.lock"):
+            with self.subTest(name=name):
+                f = self.releasing_lost(Fixture(Path(self.temp.name) / name), prior_prepared=True)
+                (f.controller / "state" / name).write_bytes(b"x")
+                before = self.snapshot(f)
+                with self.assertRaises(Refusal):
+                    f.install(reconcile_owned_release=True, authorize_release=lambda: True)
+                self.assertEqual(self.snapshot(f), before)
+                self.assertFalse(list((f.controller / "state").glob("release-transition-*.bak")))
+
+    def test_second_genuine_noop_owned_release_retains_backup(self):
+        f = self.releasing_lost(prior_prepared=True)
+        self.assertEqual(f.install(reconcile_owned_release=True, authorize_release=lambda: True).status, "available")
+        self.assertEqual(f.rpc("status")["revision"], 13)
+        menu = f.rpc("list")
+        owner = f.rpc("acquire", revision=menu["revision"], snapshot=menu["snapshot"])
+        def call(ticket, action, **fields):
+            result = f.rpc(action, revision=ticket["revision"], capability=ticket["capability"], **fields)
+            self.assertTrue(result.get("ok"), result)
+            return result
+        prepared = call(owner, "prepare", snapshot=owner["snapshot"], display_id=lf.SECOND)
+        self.assertFalse(prepared["restarted"])
+        attempted = call(prepared, "launch")
+        f.f.app = attempted["desktop_app_id"]
+        active = call(attempted, "observe_active")
+        releasing = call(active, "begin_release")
+        f.f.app = 0
+        self.assertEqual(call(releasing, "control_lost")["revision"], 20)
+        self.assertTrue((f.controller / "state/prepare-backup.conf").is_file())
+        self.assertEqual(f.install(reconcile_owned_release=True, authorize_release=lambda: True).status, "available")
+        self.assertEqual((f.rpc("status")["revision"], f.t.restarts), (21, 1))
+
+    def test_late_config_refusal_keeps_old_controller_unacquirable(self):
+        f = self.releasing_lost(prior_prepared=True)
+        original = ic.create
+        def drift(path, data, mode=0o600):
+            original(path, data, mode)
+            if path.name == "start-receipt.json" and path.parent.name == "state":
+                f.f.conf.write_bytes(f.f.conf.read_bytes() + b"# independent late drift\n")
+        with mock.patch.object(ic, "create", side_effect=drift), self.assertRaises(Refusal):
+            f.install(reconcile_owned_release=True, authorize_release=lambda: True)
+        self.assertFalse(list((f.controller / "state").glob("release-committed-*.bak")))
+        before = self.snapshot(f)
+        self.assertNotEqual(json.loads((f.controller / "state/reservation.json").read_bytes())["phase"], "available")
+        self.assertFalse(f.rpc("list")["selection_ready"])
+        self.denied_rpc(f, "acquire", revision=12, snapshot="a" * 64)
+        self.assertEqual(self.snapshot(f), before)
+
+    def test_receipt_cut_blocks_old_dispatcher_then_replays(self):
+        f = self.releasing_lost(prior_prepared=True)
+        original = ic.create
+        def cut(path, data, mode=0o600):
+            original(path, data, mode)
+            if path.name == "start-receipt.json" and path.parent.name == "state":
+                raise RuntimeError("durable cut after receipt")
+        with mock.patch.object(ic, "create", side_effect=cut), self.assertRaises(RuntimeError):
+            f.install(reconcile_owned_release=True, authorize_release=lambda: True)
+        before = self.snapshot(f)
+        menu = f.rpc("list")
+        self.assertFalse(menu["selection_ready"])
+        self.denied_rpc(f, "acquire", revision=menu["revision"], snapshot=menu["snapshot"])
+        self.denied_rpc(f, "enroll", revision=menu["revision"])
+        self.assertEqual(self.snapshot(f), before)
+        self.assertEqual(f.install(reconcile_owned_release=True,
+                                   authorize_release=lambda: (_ for _ in ()).throw(AssertionError("journal already authorizes"))).status,
+                         "available")
+
+    def test_initial_discovery_busy_cannot_begin_release_repair(self):
+        f = self.releasing_lost(prior_prepared=True)
+        f.f.app = 123
+        before = self.snapshot(f)
+        with self.assertRaises(Refusal):
+            f.install(reconcile_owned_release=True, authorize_release=lambda: True)
+        self.assertEqual(self.snapshot(f), before)
+        self.assertFalse(list((f.controller / "state").glob("release-transition-*.bak")))
+
+    def test_seventh_endpoint_sample_busy_cannot_release(self):
+        f = self.releasing_lost(prior_prepared=True)
+        original, calls = f.f.endpoint, []
+        def endpoint(*args):
+            if len(calls) == 6:
+                f.f.app = 123
+            value = original(*args)
+            calls.append((value.state, value.currentgame))
+            return value
+        f.f.endpoint = endpoint
+        with self.assertRaises(Refusal):
+            f.install(reconcile_owned_release=True, authorize_release=lambda: True)
+        self.assertEqual(calls[6], ("BUSY", 123))
+        self.assertNotEqual(json.loads((f.controller / "state/reservation.json").read_bytes())["phase"], "available")
+        self.assertFalse(f.rpc("list")["selection_ready"])
+
+    def test_committed_journal_rejects_genuine_older_available_snapshot(self):
+        f = self.fixture
+        original, earlier = f.rpc, {}
+        def capture(action, **fields):
+            result = original(action, **fields)
+            if action == "abort" and result.get("revision") == 5:
+                for name in ("operation.json", "reservation.json"):
+                    earlier[name] = (f.controller / "state" / name).read_bytes()
+            return result
+        f.rpc = capture
+        self.releasing_lost(f, prior_prepared=True)
+        f.install(reconcile_owned_release=True, authorize_release=lambda: True)
+        self.assertEqual(f.rpc("status")["revision"], 13)
+        self.assertEqual(set(earlier), {"operation.json", "reservation.json"})
+        for name, data in earlier.items():
+            (f.controller / "state" / name).write_bytes(data)
+        before = self.snapshot(f)
+        with self.assertRaises(Refusal):
+            f.install(reconcile_owned_release=True, authorize_release=lambda: False)
+        self.assertEqual(self.snapshot(f), before)
+
+    def test_all_precommit_cuts_block_byte_identical_old_controller(self):
+        # Installed host/lifecycle/reservation code has not been modified by
+        # this repair. Their exact published bytes and Fixture.rpc prove even
+        # the old dispatcher cannot acquire/enroll during a durable cut.
+        for cutpoint in ("archive", "sentinel", "blocked", "receipt", "seal", "commit"):
+            with self.subTest(cutpoint=cutpoint):
+                f = self.releasing_lost(Fixture(Path(self.temp.name) / cutpoint), prior_prepared=True)
+                published = f.manifest().parent
+                for name in ("host.py", "lifecycle.py", "reservation.py", "protocol.py"):
+                    self.assertEqual((published / name).read_bytes(), (MODULE / "display-control" / name).read_bytes())
+                rename, create, write = ic.os.rename, ic.create, lc.PrivateFiles.write
+                def cut_rename(src, dst, **kwargs):
+                    rename(src, dst, **kwargs)
+                    if cutpoint == "archive" and src == "reservation.json":
+                        raise RuntimeError("old reservation archived")
+                def cut_create(path, data, mode=0o600):
+                    create(path, data, mode)
+                    if (cutpoint == "sentinel" and path.name == "reservation.json"
+                            or cutpoint == "receipt" and path.name == "start-receipt.json"
+                            or cutpoint == "seal" and path.name.startswith("release-committed-")):
+                        raise RuntimeError("durable precommit publication")
+                def cut_write(private, name, data, limit=lc.MAX_PRIVATE):
+                    write(private, name, data, limit=limit)
+                    if name == "reservation.json":
+                        status = rs._decode(data, rs.HostIdentity(lc.canonical_uuid(lf.HOST), lf.TARGET["port"])).status
+                        if ((cutpoint == "blocked" and status.phase is rs.Phase.SELECTING)
+                                or (cutpoint == "commit" and status.phase is rs.Phase.AVAILABLE)):
+                            raise RuntimeError("atomic reservation publication")
+                with mock.patch.object(ic.os, "rename", side_effect=cut_rename), \
+                        mock.patch.object(ic, "create", side_effect=cut_create), \
+                        mock.patch.object(lc.PrivateFiles, "write", cut_write), self.assertRaises(RuntimeError):
+                    f.install(reconcile_owned_release=True, authorize_release=lambda: True)
+                before = self.snapshot(f)
+                try:
+                    menu = f.rpc("list")
+                except Refusal:
+                    menu = {"ok": False}
+                if cutpoint != "commit":
+                    self.assertFalse(menu.get("selection_ready"))
+                    if menu.get("ok"):
+                        self.denied_rpc(f, "acquire", revision=menu["revision"], snapshot=menu["snapshot"])
+                        self.denied_rpc(f, "enroll", revision=menu["revision"])
+                    self.assertEqual(self.snapshot(f), before)
+                else:
+                    self.assertTrue(menu["selection_ready"])
+                self.assertEqual(f.install(reconcile_owned_release=True,
+                    authorize_release=lambda: (_ for _ in ()).throw(AssertionError("journal already confirmed"))).status,
+                    "available")
+
+
 class IdentityReconciliationTests(unittest.TestCase):
     setUp = InstallTests.setUp
     NEW_UUID = "11223344-1234-4321-abcd-0123456789ab"
@@ -1119,6 +1677,22 @@ raise SystemExit(int(os.environ.get('COMPANION_FAIL', '0')))
         self.assertIn("--reconcile-host-identity", log)
         self.assertNotIn("--publish-shim", log)
         self.assertNotIn("FORBIDDEN", log)
+
+    def test_shell_owned_release_flag_is_local_only_and_mutually_exclusive(self):
+        help_result = self.run_command("commands/install-display-control.sh", "--help")
+        self.assertEqual(help_result.returncode, 0)
+        self.assertIn("--reconcile-owned-release", help_result.stdout.decode())
+        result = self.run_command("commands/install-display-control.sh", "--reconcile-owned-release")
+        self.assertEqual(result.returncode, 0, result.stderr.decode())
+        self.assertIn("--reconcile-owned-release", self.log.read_text())
+        self.log.unlink()
+        refused = self.run_command("commands/install-display-control.sh", "--reconcile-host-identity", "--reconcile-owned-release")
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertFalse(self.log.exists())
+        refused = self.run_command("commands/install-display-control.sh", "--reconcile-owned-release", "--publish-shim")
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertFalse(self.log.exists())
+        self.assertNotIn("--reconcile-owned-release", ic.SHIM.decode())
 
     def test_root_all_role_ordering_companion_optin_then_inventory(self):
         for args, expected in (([], ["host", "client"]), (["--host-only"], ["host"]), (["--client-only"], ["client"])):

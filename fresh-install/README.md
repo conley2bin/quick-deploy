@@ -64,6 +64,14 @@ bash fresh-install/modules/tmux/install.sh
 
 各模块自行定位仓库共享库，不依赖从哪个工作目录启动。Ghostty 模块只保留 `modules/ghostty/install.sh` 一个 shell 源文件；zsh 运行时 hook 从它生成，Wayland C 源码与它一起打包，测试放在 `fresh-install/tests/ghostty/`。Ghostty 的库编译、启动器和桌面集成都由该安装入口一次完成。Ghostty 和 tmux 的参数、持久配置及恢复语义见各自目录中的 `README.md`。
 
+## 语音输入（现成软件与备选集成）
+
+[现成软件说明](docs/voice-input-software.md)比较 Nextalk 与 Handy，并给出 Nextalk 的旧 Toggle 流程试用步骤。新增的“Ctrl长按3秒、松手停止、文字边说边进入Pi”不能仅靠这两款已核查版本的原生设置完成；文档区分实时浮窗预览与目标输入框投递，列出必要适配。
+
+[客户端集成方案](docs/voice-input-plan.md)保留自行包装 Fcitx5-vinput 的备选设计，包含模块归属、版本与文本过滤要求、平台边界和验收顺序。
+
+目前本仓库没有语音安装模块，`setup.sh` 也未增加语音步骤；现成应用可按其说明单独试用，文档链接不代表已经部署或验收。
+
 ## 共享实现
 
 `lib/apt-lock-wait.sh` 被一键入口和所有执行 APT 操作的模块共同加载。它只等待真实持锁进程结束，不删除锁文件、不终止系统更新。保留模块自己的加载逻辑，是为了让模块脱离 `setup.sh` 单独运行时仍具备相同的首开机可靠性。

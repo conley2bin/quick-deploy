@@ -410,6 +410,24 @@ def identity_refused(reason):
     fail("identity_reconciliation_refused", "Identity reconciliation refused: " + reason)
 
 
+def release_refused(reason):
+    fail("owned_release_reconciliation_refused", "Owned release reconciliation refused: " + reason)
+
+
+def interactive_release():
+    try:
+        fd = os.open("/dev/tty", os.O_RDWR | os.O_NOCTTY)
+        try:
+            if not os.isatty(fd):
+                return False
+            os.write(fd, b"Confirm the recorded official Moonlight quit was issued, exclusive controller use, no unmanaged/in-flight stream and no concurrent admin edits. Type RELEASE: ")
+            return os.read(fd, 64).strip() == b"RELEASE"
+        finally:
+            os.close(fd)
+    except OSError:
+        return False
+
+
 def record_identity(path):
     data = private_read(path)
     before = path.lstat()
@@ -732,6 +750,385 @@ def reconcile_identity(root, old_version, serial, installed, desktop, files, ref
     return True
 
 
+# This separate local repair NEVER transfers host identity. It retains enrollment
+# and the current receipt while archiving the complete old release transaction.
+# Reservation is archived first; an invalid private sentinel blocks OLD and new
+# dispatchers until the final atomic availability publication.
+RELEASE_RECORDS = ("reservation.json", "operation.json", "start-receipt.json", "prepare-backup.conf")
+RELEASE_BLOCKED = b"\0"
+
+
+def release_records(files, journal=None):
+    records, identities = {}, {}
+    for name in RELEASE_RECORDS:
+        archive = name + "." + journal["id"] + ".bak" if journal else None
+        archived = files.read(archive, 1024 * 1024) if archive else None
+        live = files.read(name, 1024 * 1024)
+        if archived is not None:
+            if live is not None and (name not in journal["replacement"]
+                                     or (live != bytes.fromhex(journal["replacement"][name])
+                                         and not (name == "reservation.json" and live == RELEASE_BLOCKED)
+                                         and not (name == "reservation.json" and live == bytes.fromhex(journal["blocked"])))
+                                     or (live != RELEASE_BLOCKED and record_identity(files.path / name) == journal["records"][name])):
+                release_refused("old and unexpected live records coexist")
+            path, data = files.path / archive, archived
+        else:
+            path, data = files.path / name, live
+        if data is None:
+            release_refused("original owned release record is missing")
+        records[name], identities[name] = data, record_identity(path)
+    if journal and identities != journal["records"]:
+        release_refused("old release records differ from the durable journal")
+    return records, identities
+
+
+def release_evidence(old, installed, desktop, records, ref, home, uid, transport, info):
+    """Only the documented positive Desktop -> release intent -> owner loss."""
+    if settings_document(old) != settings_document(installed):
+        release_refused("installed identity/settings differ from fresh qualification")
+    controller = lc.HostController(old, rt.LinuxRuntime(old.runtime, transport), None, info, None)
+    controller.files = IdentityRecords(records)
+    meta = controller.meta()
+    state = rs._decode(records["reservation.json"], controller.host)
+    status, lease = state.status, meta["lease"]
+    if (status.phase is not rs.Phase.RECONCILIATION_REQUIRED
+            or status.uncertainty is not rs.Uncertainty.OWNER_LOST
+            or not status.active_observed or not status.launch_attempted
+            or status.desktop is None or status.binding is None):
+        release_refused("positive owned Desktop and owner_lost release are required")
+    fields = {"owner_digest", "stage", "selection_desktop", "display_id", "selector", "topology",
+              "desktop_digest", "prepared_revision", "release_revision", "cancel_transaction"}
+    restart_fields = {"before_digest", "after_digest", "restart_id", "previous_generation"}
+    if (meta["enrollment"] is None or lease is None or lease.get("stage") != "releasing"
+            or lease.get("owner_digest") != state.owner_digest or state.owner_digest is None
+            or set(lease) not in (fields, fields | restart_fields)
+            or type(lease.get("prepared_revision")) is not int
+            or type(lease.get("release_revision")) is not int
+            or not (meta["enrollment"]["revision"] < lease["prepared_revision"]
+                    < status.attempt_revision < lease["release_revision"]
+                    and status.revision == lease["release_revision"] + 1)
+            or type(lease.get("cancel_transaction")) is not str):
+        release_refused("release intent, attempt, owner and revisions do not agree")
+    restarted = set(lease) == fields | restart_fields
+    try:
+        if (lc.canonical_uuid(lease["cancel_transaction"]) != lease["cancel_transaction"]
+                or lease["selection_desktop"] != asdict(status.desktop)
+                or lease["desktop_digest"] != status.desktop.definition_digest
+                or lease["topology"] != status.binding.topology_digest):
+            raise ValueError("lease")
+        if restarted and (lc.canonical_uuid(lease["restart_id"]) != lease["restart_id"]
+                          or lease["after_digest"] != status.binding.config_digest
+                          or cfg.digest(records["prepare-backup.conf"]) != lease["before_digest"]):
+            raise ValueError("restart")
+    except (ValueError, KeyError, TypeError, Refusal):
+        release_refused("recorded selection/restart/cancel facts do not match the owner")
+    try:
+        envelope = controller.files.document("start-receipt.json")
+        receipt = controller.receipt(desktop)
+        matches = (receipt is not None and receipt.host_uniqueid == old.host_uniqueid
+                   and envelope["issuance"]["enrollment_revision"] == meta["enrollment"]["revision"]
+                   and (not restarted or (envelope["issuance"]["operation"] == lease["restart_id"]
+                                          and envelope["issuance"]["previous_generation"] == lease["previous_generation"])))
+    except (ValueError, UnicodeError, RecursionError, TypeError, KeyError):
+        release_refused("current controlled-start receipt is malformed")
+    if not matches:
+        release_refused("current controlled-start receipt does not belong to this release")
+    current = controller.runtime.observe(receipt=receipt)
+    q.qualify(ref, current, transport)
+    target = {"address": current.config.bind_address, "port": old.base_port}
+    owned = controller.sample_ownership(target, require_receipt=True)
+    if (owned.endpoint.state != "FREE" or owned.endpoint.currentgame != 0
+            or owned.binding != rs.OwnershipBinding.from_runtime(status.binding)
+            or owned.desktop != status.desktop or owned.desktop != desktop
+            or owned.current.generation != receipt.generation
+            or owned.current.config.configured_output != lease["selector"]
+            or owned.current.binary.process_exe_status != "verified"
+            or owned.current.config.process_environment_status != "verified"):
+        release_refused("fresh idle owned generation/config/Desktop/receipt do not agree")
+    if not restarted:
+        # This is the real rev8 path: a prior controlled preparation/abort left
+        # a valid receipt and selected config, so the new preparation is a no-op.
+        # Its lease has NO restart_id/after_digest. Require the preserved backup
+        # to project byte-exactly to the currently receipt-bound selected config.
+        try:
+            if cfg.select_output(records["prepare-backup.conf"], lease["selector"]) != owned.content:
+                release_refused("prior preparation backup does not produce the owned config")
+        except Refusal:
+            release_refused("prior preparation backup is not qualified")
+    def qualified_idle_info(address, port):
+        endpoint = info(address, port)
+        if (type(endpoint) is not lc.Endpoint or lc.canonical_uuid(endpoint.host_uniqueid) != old.host_uniqueid
+                or endpoint.state != "FREE" or type(endpoint.currentgame) is not int or endpoint.currentgame != 0):
+            release_refused("later qualification observed a busy or different endpoint")
+        return endpoint
+
+    fresh, fresh_desktop = discover(ref, home, uid, transport, qualified_idle_info)
+    if settings_document(fresh) != settings_document(installed) or fresh_desktop != desktop:
+        release_refused("qualified settings or Desktop changed during release observation")
+    again = controller.runtime.observe(receipt=receipt)
+    q.qualify(ref, again, transport)
+    if lc.authority(again) != lc.authority(owned.current):
+        release_refused("qualified host changed during release observation")
+    return {"reservation_revision": status.revision, "preparation": "restarted" if restarted else "same_generation_noop",
+            "release_revision": lease["release_revision"],
+            "attempt_revision": status.attempt_revision, "prepared_revision": lease["prepared_revision"],
+            "cancel_transaction": lease["cancel_transaction"], "owner_digest": state.owner_digest,
+            "generation": asdict(current.generation), "unit": asdict(current.unit),
+            "config": asdict(current.config), "binary": asdict(current.binary),
+            "desktop": asdict(desktop), "receipt": cfg.digest(records["start-receipt.json"]),
+            "endpoint": {"uuid": old.host_uniqueid, "state": "FREE", "currentgame": 0}}
+
+
+def release_journal(path):
+    try:
+        value = unique_json(private_read(path, lc.MAX_PRIVATE))
+        if (type(value) is not dict
+                or set(value) != {"schema", "id", "version", "serial", "manifest", "evidence", "records", "replacement",
+                                  "blocked", "permanent", "history", "active_prefix", "confirmation"}
+                or value["schema"] != 1 or type(value["id"]) is not str
+                or not re.fullmatch("[0-9a-f]{32}", value["id"])
+                or path.name != "release-transition-" + value["id"] + ".bak"
+                or type(value["serial"]) is not int or not 1 <= value["serial"] <= 512
+                or type(value["version"]) is not str
+                or not re.fullmatch(r"v[1-9][0-9]*-[0-9a-f]{64}", value["version"])
+                or value["confirmation"] != "RELEASE:exclusive:official_quit_issued:no_unmanaged_stream"
+                or type(value["manifest"]) is not dict
+                or set(value["manifest"]) != {"schema", "release", "version", "files"}
+                or value["manifest"]["schema"] != 1 or value["manifest"]["release"] != RELEASE
+                or type(value["manifest"]["version"]) is not str
+                or type(value["manifest"]["files"]) is not dict
+                or set(value["manifest"]["files"]) != set(SOURCES) | {"host-settings.json"}
+                or any(type(v) is not str or not re.fullmatch("[0-9a-f]{64}", v)
+                       for v in value["manifest"]["files"].values())
+                or value["manifest"]["version"] != f"v{RELEASE}-" + cfg.digest(document(value["manifest"]["files"]))
+                or type(value["evidence"]) is not dict
+                or type(value["records"]) is not dict or set(value["records"]) != set(RELEASE_RECORDS)
+                or type(value["replacement"]) is not dict
+                or set(value["replacement"]) != {"operation.json", "reservation.json", "start-receipt.json", "prepare-backup.conf"}
+                or any(type(v) is not str or not re.fullmatch("(?:[0-9a-f]{2})+", v)
+                       for v in value["replacement"].values())
+                or type(value["blocked"]) is not str or not re.fullmatch("(?:[0-9a-f]{2})+", value["blocked"])
+                or type(value["permanent"]) is not dict
+                or set(value["permanent"]) != {".install.lock", "state/operation.lock", "state/reservation.lock"}
+                or type(value["history"]) is not dict
+                or any(type(k) is not str or "/" in k or not k.endswith(".bak") for k in value["history"])
+                or type(value["active_prefix"]) is not dict
+                or set(value["active_prefix"]) != {f"{n:08d}.json" for n in range(1, value["serial"] + 1)}):
+            raise ValueError("journal")
+        for identities in (value["records"], value["permanent"], value["history"], value["active_prefix"]):
+            for record in identities.values():
+                if (type(record) is not dict or set(record) != {"sha256", "device", "inode", "mode", "uid", "size", "mtime_ns"}
+                        or type(record["sha256"]) is not str or not re.fullmatch("[0-9a-f]{64}", record["sha256"])
+                        or any(type(v) is not int or v < 0 for k, v in record.items() if k != "sha256")):
+                    raise ValueError("record")
+        return value
+    except (ValueError, KeyError, TypeError, UnicodeError, RecursionError, Refusal):
+        release_refused("durable owned-release journal is invalid")
+
+
+def repair_owned_release(root, version, serial, installed, desktop, files, ref, home, uid,
+                         transport, info, marker, authorize):
+    """Installer-only exact release repair; never issues quit or accepts raw FREE."""
+    # The operation lock is already held; neither permanent lock may be
+    # rewritten as a side effect of discovering bad content.
+    if private_read(files.path / "operation.lock", 1) != b"" or private_read(files.path / "reservation.lock", 1) != b"\0":
+        release_refused("permanent lock contents are invalid")
+    journals = [release_journal(p) for p in sorted(files.path.glob("release-transition-*.bak"))]
+    permanent_paths = (root / ".install.lock", files.path / "operation.lock", files.path / "reservation.lock")
+    permanent = {str(p.relative_to(root)): record_identity(p) for p in permanent_paths}
+    try:
+        journals.sort(key=lambda item: item["evidence"]["reservation_revision"])
+        revisions = [item["evidence"]["reservation_revision"] for item in journals]
+        if any(type(rev) is not int or rev < 1 for rev in revisions) or len(set(revisions)) != len(revisions):
+            raise ValueError("journal revisions")
+    except (KeyError, TypeError, ValueError):
+        release_refused("release journal revision evidence is invalid")
+    for index, item in enumerate(journals):
+        if (item["serial"] > serial or active_prefix(root, item["serial"]) != item["active_prefix"]
+                or any(record_identity(files.path / name) != identity for name, identity in item["history"].items())
+                or permanent != item["permanent"]):
+            release_refused("original history, references or permanent locks differ")
+        seal = files.read("release-committed-" + item["id"] + ".bak")
+        for name, identity in item["records"].items():
+            archive = name + "." + item["id"] + ".bak"
+            if files.read(archive) is not None:
+                if record_identity(files.path / archive) != identity:
+                    release_refused("original release archive differs")
+            elif (index != len(journals) - 1 or seal is not None or files.read(name) is None
+                  or record_identity(files.path / name) != identity):
+                release_refused("original release record differs")
+        if seal is not None and seal != document({"schema": 1, "journal_sha256": cfg.digest(
+                private_read(files.path / ("release-transition-" + item["id"] + ".bak")))}):
+            release_refused("completion seal differs from journal")
+        if index < len(journals) - 1:
+            if seal is None or revisions[index + 1] < revisions[index] + 1:
+                release_refused("prior release is not sealed before the later transaction")
+        # Seal only the original active prefix here. The next reference is a
+        # code publication, not the release commit: after available is durable,
+        # a qualified later source may legitimately occupy that serial. The
+        # still-pending transition is source/serial-bound below, after the live
+        # reservation has been classified against its committed revision floor.
+    journal = journals[-1] if journals else None
+    if journal:
+        floor = journal["evidence"]["reservation_revision"] + 1
+        promised_raw = bytes.fromhex(journal["replacement"]["reservation.json"])
+        try:
+            promised = rs._decode(promised_raw, rs.HostIdentity(installed.host_uniqueid, installed.base_port)).status
+        except Refusal:
+            release_refused("journal replacement reservation is invalid")
+        if promised.phase is not rs.Phase.AVAILABLE or promised.revision != floor:
+            release_refused("journal availability revision floor is invalid")
+        live = files.read("reservation.json", rs.MAX_STATE)
+        if live is None or live in (RELEASE_BLOCKED, bytes.fromhex(journal["blocked"])):
+            pending = True
+        else:
+            current = rs._decode(live, rs.HostIdentity(installed.host_uniqueid, installed.base_port)).status
+            if current.revision < floor:
+                # Only the still-live original owner_lost record may precede
+                # the commit. Older available snapshots are detectable rollback.
+                original = files.path / "reservation.json"
+                if (files.read("reservation.json." + journal["id"] + ".bak") is not None
+                        or record_identity(original) != journal["records"]["reservation.json"]):
+                    release_refused("current reservation predates the journal revision floor")
+                pending = True
+            else:
+                if seal is None or (current.revision == floor and live != promised_raw):
+                    release_refused("available reservation contradicts the committed journal")
+                pending = False
+        if pending and (journal["version"], journal["serial"], journal["manifest"]) != (version, serial, marker):
+            release_refused("pending release active version/source changed")
+        if not pending:
+            phase = validate_state(installed, desktop, files)
+            if phase != rs.Phase.RECONCILIATION_REQUIRED.value:
+                return False
+            journal = None  # A distinct later owner_lost release needs a new journal.
+    old = host.settings(root / "versions" / version / "host-settings.json", "linux")
+    if settings_document(old) != settings_document(installed):
+        release_refused("installed settings/UUID changed")
+    records, identities = release_records(files, journal)
+    prefix = active_prefix(root, serial)
+    excluded = set(RELEASE_RECORDS) | {"operation.lock", "reservation.lock"}
+    if journal:
+        excluded |= {"release-transition-" + journal["id"] + ".bak"}
+        excluded |= {name + "." + journal["id"] + ".bak" for name in RELEASE_RECORDS}
+        excluded |= {"release-committed-" + journal["id"] + ".bak"}
+    history = {}
+    for path in files.path.iterdir():
+        if path.name not in excluded:
+            if not path.name.endswith(".bak"):
+                release_refused("unknown or incomplete private publication")
+            history[path.name] = record_identity(path)
+    evidence = release_evidence(old, installed, desktop, records, ref, home, uid, transport, info)
+    state = rs._decode(records["reservation.json"], rs.HostIdentity(old.host_uniqueid, old.base_port))
+    meta = unique_json(records["operation.json"])
+    new_meta = document({"schema": 1, "enrollment": meta["enrollment"], "lease": None})
+    new_status = rs.Status(state.status.host, state.status.revision + 1, rs.Phase.AVAILABLE,
+                           state.status.binding)  # historical topology, refreshed on next list/acquire
+    new_state = rs._encode(rs._State(new_status))
+    replacement = {"operation.json": new_meta.hex(), "reservation.json": new_state.hex(),
+                   "start-receipt.json": records["start-receipt.json"].hex(),
+                   "prepare-backup.conf": records["prepare-backup.conf"].hex()}
+    # A valid-but-unacquirable state is published only after the old operation
+    # lease has been archived. Until then the invalid sentinel blocks every
+    # dispatcher, including versions unaware of this installer journal.
+    blocked_state = rs._encode(rs._State(rs.Status(state.status.host, state.status.revision,
+                                 rs.Phase.SELECTING, state.status.binding), state.owner_digest))
+    if journal:
+        if (journal["evidence"] != evidence or journal["records"] != identities
+                or journal["replacement"] != replacement or journal["blocked"] != blocked_state.hex()
+                or journal["permanent"] != permanent
+                or journal["history"] != history or journal["active_prefix"] != prefix):
+            release_refused("pending repair differs from exact qualified release evidence")
+    else:
+        if authorize() is not True:
+            release_refused("local RELEASE/exclusivity/official-quit confirmation required")
+    again, again_ids = release_records(files, journal)
+    if (again_ids != identities
+            or release_evidence(old, installed, desktop, again, ref, home, uid, transport, info) != evidence
+            or permanent != {str(p.relative_to(root)): record_identity(p) for p in permanent_paths}
+            or history != {p.name: record_identity(p) for p in files.path.iterdir() if p.name not in excluded}
+            or active_prefix(root, serial) != prefix or active(root) != (version, serial)):
+        release_refused("facts changed after RELEASE confirmation")
+    if journal is None:
+        journal = {"schema": 1, "id": os.urandom(16).hex(), "version": version, "serial": serial,
+                   "manifest": marker, "evidence": evidence, "records": identities, "replacement": replacement,
+                   "blocked": blocked_state.hex(),
+                   "permanent": permanent, "history": history, "active_prefix": prefix,
+                   "confirmation": "RELEASE:exclusive:official_quit_issued:no_unmanaged_stream"}
+        path = files.path / ("release-transition-" + journal["id"] + ".bak")
+        if len(document(journal)) > lc.MAX_PRIVATE:
+            release_refused("owned release journal exceeds private bound")
+        create(path, document(journal))
+        if unique_json(private_read(path)) != journal:
+            release_refused("owned release journal publication is uncertain")
+        excluded |= {path.name, "release-committed-" + journal["id"] + ".bak"}
+        excluded |= {name + "." + journal["id"] + ".bak" for name in RELEASE_RECORDS}
+    for name in RELEASE_RECORDS:
+        archive = name + "." + journal["id"] + ".bak"
+        if files.read(archive, 1024 * 1024) is None:
+            if record_identity(files.path / name) != journal["records"][name]:
+                release_refused("old release record changed before archival")
+            files.anchor()
+            os.rename(name, archive, src_dir_fd=files.fd, dst_dir_fd=files.fd)
+            os.fsync(files.fd)
+        if record_identity(files.path / archive) != journal["records"][name]:
+            release_refused("archive differs from original release record")
+        if name == "reservation.json" and files.read(name) is None:
+            # During this one missing-state cut, the OLD operation lease is
+            # still present: old enroll/acquire cannot pass. Publish an invalid
+            # private record before changing that operation lease. Every old
+            # and new dispatcher then rejects reservation reads until commit.
+            if (files.read("operation.json") != records["operation.json"]
+                    or record_identity(files.path / "operation.json") != journal["records"]["operation.json"]):
+                release_refused("old owner was lost before blocking reservation publication")
+            create(files.path / name, RELEASE_BLOCKED)
+    for name in ("operation.json", "start-receipt.json", "prepare-backup.conf"):
+        data = bytes.fromhex(replacement[name])
+        if files.read(name, 1024 * 1024) is None:
+            create(files.path / name, data)
+        elif files.read(name, 1024 * 1024) != data:
+            release_refused("replacement release record differs from journal")
+        if name == "operation.json":
+            # Only after the old lease is gone may this valid, unacquirable
+            # SELECTING record replace the invalid sentinel. A cut after any
+            # subsequent receipt/backup write is still readable and blocked.
+            if files.read("reservation.json") == RELEASE_BLOCKED:
+                files.write("reservation.json", blocked_state, limit=rs.MAX_STATE)
+            elif files.read("reservation.json") != blocked_state:
+                release_refused("blocked precommit reservation differs from journal")
+    # Validate the *prospective* records without exposing availability. This
+    # remains SELECTING with no operation lease: old/new enroll and acquire both
+    # refuse, and owner actions cannot authenticate. The final reservation write
+    # below is the sole observable availability commit point.
+    prospective = {name: bytes.fromhex(encoded) for name, encoded in replacement.items()}
+    controller = lc.HostController(installed, None, None, None, None)
+    controller.files = IdentityRecords(prospective)
+    if (controller.meta()["lease"] is not None or controller.meta()["enrollment"] is None
+            or controller.receipt(desktop) is None
+            or rs._decode(prospective["reservation.json"], controller.host).status != new_status):
+        release_refused("prospective release records are inconsistent")
+    again, again_ids = release_records(files, journal)
+    if (again_ids != identities or again != records
+            or release_evidence(old, installed, desktop, again, ref, home, uid, transport, info) != evidence
+            or permanent != {str(p.relative_to(root)): record_identity(p) for p in permanent_paths}
+            or history != {p.name: record_identity(p) for p in files.path.iterdir() if p.name not in excluded}
+            or active_prefix(root, serial) != prefix or active(root) != (version, serial)):
+        release_refused("facts changed before release commit")
+    seal = files.path / ("release-committed-" + journal["id"] + ".bak")
+    seal_data = document({"schema": 1, "journal_sha256": cfg.digest(private_read(
+        files.path / ("release-transition-" + journal["id"] + ".bak")))})
+    if files.read(seal.name) is None:
+        create(seal, seal_data)
+    elif files.read(seal.name) != seal_data:
+        release_refused("release commitment descriptor differs")
+    # A seal alone is NOT a commit: a cut here retains the blocked reservation.
+    # Replay checks the actual live revision floor and tolerates later leases.
+    if release_evidence(old, installed, desktop, records, ref, home, uid, transport, info) != evidence:
+        release_refused("host changed before availability publication")
+    files.write("reservation.json", new_state, limit=rs.MAX_STATE)
+    return True
+
+
 def validate_transition_version(path, marker):
     """Only a journal-bound, exact subset may resume an interrupted version."""
     private_directory(path)
@@ -817,9 +1214,14 @@ class Result:
 
 def install(metadata, package, ubuntu, architecture, installed_version, *, source=None, home=None,
             transport=None, info=host.serverinfo, publish=False, check_shim=shim_ready, publisher=publish_shim,
-            platform=None, reconcile_host_identity=False, authorize_rebind=interactive_rebind):
+            platform=None, reconcile_host_identity=False, authorize_rebind=interactive_rebind,
+            reconcile_owned_release=False, authorize_release=interactive_release):
     if (platform or sys.platform) != "linux":
         fail("platform_runtime_unavailable", "Windows/macOS lifecycle publication is pending; no Linux settings were created")
+    if reconcile_host_identity and reconcile_owned_release:
+        fail("installation_unavailable", "choose exactly one local reconciliation ceremony")
+    if reconcile_owned_release and publish:
+        release_refused("owned release repair never publishes a system shim")
     uid = os.geteuid()
     if uid == 0 or os.getuid() != uid:
         fail("installer_identity", "run as the Sunshine desktop user, never root/sudo or a mismatched UID")
@@ -829,22 +1231,31 @@ def install(metadata, package, ubuntu, architecture, installed_version, *, sourc
     source = Path(source or Path(__file__).resolve().parent)
     transport = transport or rt.LocalTransport()
     ref = q.reference(metadata, package, ubuntu, architecture, installed_version, transport)
-    installed, desktop = discover(ref, home, uid, transport, info)
+    if reconcile_owned_release:
+        def initial_idle_info(address, port):
+            endpoint = info(address, port)
+            if (type(endpoint) is not lc.Endpoint or endpoint.state != "FREE"
+                    or type(endpoint.currentgame) is not int or endpoint.currentgame != 0):
+                release_refused("initial qualification observed a busy or unknown endpoint")
+            return endpoint
+        installed, desktop = discover(ref, home, uid, transport, initial_idle_info)
+    else:
+        installed, desktop = discover(ref, home, uid, transport, info)
     root = home / RELATIVE_ROOT
     ready = check_shim()  # Reject foreign global publications BEFORE private writes.
     # HOME/.local/share ancestors may be normal parent links, but the controller
     # publication itself must be canonical. No env-selected alternate state root.
-    if reconcile_host_identity and (not root.exists() or root.is_symlink()):
-        identity_refused("identity reconciliation requires an existing installed controller")
+    if (reconcile_host_identity or reconcile_owned_release) and (not root.exists() or root.is_symlink()):
+        fail("reconciliation_refused", "local reconciliation requires an existing installed controller")
     root.parent.mkdir(parents=True, exist_ok=True)
     if root.parent.resolve(strict=True) != root.parent:
         fail("publication_unsafe", "private installation parents below canonical HOME must not redirect the fixed lookup")
     fresh = not root.exists() and not root.is_symlink()
-    if fresh and reconcile_host_identity:
-        identity_refused("identity reconciliation requires an existing installed controller")
+    if fresh and (reconcile_host_identity or reconcile_owned_release):
+        fail("reconciliation_refused", "local reconciliation requires an existing installed controller")
     if fresh:
         make_directory(root)
-    if reconcile_host_identity:
+    if reconcile_host_identity or reconcile_owned_release:
         private_read(root / ".install.lock", 1)  # Never recreate a missing permanent lock.
     with installation_lock(root):
         if fresh:
@@ -867,13 +1278,18 @@ def install(metadata, package, ubuntu, architecture, installed_version, *, sourc
                     value = identity_journal(path)
                     bound = value["new_manifest"]
                     bound_versions[bound["version"]] = bound
+            if reconcile_owned_release:
+                for path in files.path.glob("release-transition-*.bak"):
+                    value = release_journal(path)
+                    bound = value["manifest"]
+                    bound_versions[bound["version"]] = bound
             for path in (root / "versions").iterdir():
                 if path.name in bound_versions:
                     validate_transition_version(path, bound_versions[path.name])
                 else:
                     validate_version(path)
             data = document(settings_document(installed))
-            if not reconcile_host_identity:
+            if not (reconcile_host_identity or reconcile_owned_release):
                 status = validate_state(installed, desktop, files)  # Keep strict host_mismatch.
             if old is not None:
                 old_data = private_read(root / "versions" / old / "host-settings.json", 8192)
@@ -881,7 +1297,7 @@ def install(metadata, package, ubuntu, architecture, installed_version, *, sourc
                 old_obj["host_uniqueid"] = lc.canonical_uuid(old_obj["host_uniqueid"])
                 if old_obj == new_obj:
                     data = old_data  # Preserve valid formatting/UUID spelling on ordinary updates.
-                elif not reconcile_host_identity:
+                elif not (reconcile_host_identity or reconcile_owned_release):
                     fail("settings_conflict", "existing settings/routes/build differ from fresh qualification; preserved without automatic migration")
             payload = {name: source_read(source / name) for name in SOURCES}
             payload["host-settings.json"] = data
@@ -900,6 +1316,10 @@ def install(metadata, package, ubuntu, architecture, installed_version, *, sourc
                 reconcile_identity(root, old, serial, installed, desktop, files, ref, home, uid,
                                    transport, info, marker, authorize_rebind)
                 status = validate_state(installed, desktop, files)
+            elif reconcile_owned_release:
+                repaired = repair_owned_release(root, old, serial, installed, desktop, files, ref, home, uid,
+                                                transport, info, marker, authorize_release)
+                status = rs.Phase.AVAILABLE.value if repaired else validate_state(installed, desktop, files)
             if not target.exists():
                 make_directory(target)
             for name, content in payload.items():
@@ -974,6 +1394,8 @@ def main():
     parser.add_argument("--publish-shim", action="store_true")
     parser.add_argument("--reconcile-host-identity", action="store_true",
                         help="explicit local REBIND ceremony for a qualified identity-changing prelaunch restart")
+    parser.add_argument("--reconcile-owned-release", action="store_true",
+                        help="explicit local RELEASE ceremony for a qualified owner_lost releasing lease")
     args = parser.parse_args()
     try:
         metadata, _ = lc.read_owned(args.metadata, 1024 * 1024)
@@ -985,7 +1407,8 @@ def main():
             fail("installation_unavailable", "reference package and installed package version are required")
         result = install(metadata, args.package, args.ubuntu, args.architecture,
                          args.installed_version, publish=args.publish_shim,
-                         reconcile_host_identity=args.reconcile_host_identity)
+                         reconcile_host_identity=args.reconcile_host_identity,
+                         reconcile_owned_release=args.reconcile_owned_release)
         print(f"Private display controller: {result.root}; status={result.status}. Settings/state preserved on updates.")
         if not result.rpc_ready:
             print("Shim NOT PUBLISHED: noninteractive SSH RPC is not ready. Locally authorize the new system-wide /usr/bin/quick-deploy-display-control via commands/install-display-control.sh --publish-shim.", file=sys.stderr)
