@@ -1545,8 +1545,8 @@ add-zsh-hook precmd _quick_deploy_ghostty_ssh_precmd
 ZSH_MOUSE_HOOK
 }
 
-# Ctrl+Shift+V 和 Ctrl+V 都到达原始 ^V；只有 ZLE 正在编辑本地 Wayland
-# shell 提示符时才读取剪贴板。Pi 等 raw-mode 程序不经过 ZLE。
+# Ctrl+Shift+V 和 Ctrl+V 都到达原始 ^V；ZLE 只插入文本，不提交命令。
+# 共享 tmux 的 SSH 客户端读已有剪贴板桥，本地读 wl-paste；Pi 不经过 ZLE。
 render_local_paste_hook() {
     cat <<'ZSH_LOCAL_PASTE_HEADER'
 # Local Wayland zsh prompt paste for Ghostty's raw Ctrl+V key route.
@@ -1568,7 +1568,7 @@ ZSH_LOCAL_PASTE_HEADER
 [[ -z ${SSH_TTY:-} ]] || return 0
 ZSH_LOCAL_PASTE_GUARD_V2
             ;;
-        current)
+        v3|current)
             cat <<'ZSH_LOCAL_PASTE_GUARD'
 # tmux replaces TERM_PROGRAM but inherits Ghostty's local shell resources.
 # These markers allow reading the shell host clipboard, not routing by client.
@@ -1594,6 +1594,145 @@ _quick_deploy_ghostty_local_wayland || return 0
 # At source time verify BOTH keys in the active `main` ZLE map before binding.
 _quick_deploy_ghostty_ctrlv_widget="${$(bindkey -M main '^V')##* }"
 _quick_deploy_ghostty_quote_widget="${$(bindkey -M main '^[^V')##* }"
+ZSH_LOCAL_PASTE_HOOK
+    if [ "${1:-current}" = current ]; then
+        cat <<'ZSH_LOCAL_PASTE_RELOAD'
+if [[ $_quick_deploy_ghostty_ctrlv_widget == _quick_deploy_ghostty_paste &&
+      ( $_quick_deploy_ghostty_quote_widget == quoted-insert ||
+        $_quick_deploy_ghostty_quote_widget == vi-quoted-insert ) ]]; then
+    # Refresh owned function definitions on source, retaining literal insertion.
+    _quick_deploy_ghostty_ctrlv_widget=$_quick_deploy_ghostty_quote_widget
+elif [[ ( $_quick_deploy_ghostty_ctrlv_widget != quoted-insert &&
+          $_quick_deploy_ghostty_ctrlv_widget != vi-quoted-insert ) ||
+        $_quick_deploy_ghostty_quote_widget != undefined-key ]]; then
+    print -u2 'Ghostty local paste: ^V or Esc Ctrl+V already has a custom ZLE binding; refusing to override it.'
+    unset _quick_deploy_ghostty_ctrlv_widget _quick_deploy_ghostty_quote_widget
+    return 1
+fi
+
+_quick_deploy_ghostty_remote_paste() {
+    timeout 8s python3 - <<'GHOSTTY_REMOTE_PASTE_PY'
+import json
+import os
+from pathlib import Path
+import socket
+import subprocess
+import sys
+
+
+def ssh_client(pid):
+    # A disappeared/uninspectable client is unknown, never a local fallback.
+    for _ in range(32):
+        if pid == 1:
+            return False
+        if pid < 1:
+            raise RuntimeError('invalid client ancestry')
+        stat = Path(f'/proc/{pid}/stat').read_text()
+        close = stat.rindex(')')
+        if stat[stat.index('(') + 1:close] == 'sshd':
+            return True
+        pid = int(stat[close + 2:].split()[1])
+    raise RuntimeError('client ancestry exceeds limit')
+
+
+def remote_route():
+    tmux, pane = os.environ.get('TMUX'), os.environ.get('TMUX_PANE')
+    if not tmux:
+        return False
+    if not pane:
+        raise RuntimeError('TMUX_PANE is missing')
+    listing = subprocess.run(
+        ['tmux', '-S', tmux.split(',')[0], 'list-clients', '-F',
+         '#{client_pid}\t#{client_activity}\t#{pane_id}'],
+        check=True, capture_output=True, text=True, timeout=2,
+    ).stdout
+    clients = []
+    for line in listing.splitlines():
+        pid, activity, current_pane = line.split('\t')
+        if current_pane == pane:
+            pid, activity = int(pid), int(activity)
+            if pid <= 1 or activity < 0:
+                raise RuntimeError('invalid tmux client')
+            clients.append((pid, activity))
+    if not clients:
+        raise RuntimeError('no client is displaying this pane')
+    newest = max(activity for _, activity in clients)
+    latest = [pid for pid, activity in clients if activity == newest]
+    origins = [ssh_client(pid) for pid in latest]
+    # tmux activity has one-second resolution: never guess a remote tie.
+    if len(latest) > 1 and any(origins):
+        raise RuntimeError('multiple clients active in the same second; retry with one active client')
+    return any(origins)
+
+
+def read_remote_text():
+    port = int(os.environ.get('PI_REMOTE_CLIPBOARD_REMOTE_PORT', '37844'))
+    # JSON may escape every text byte. Bound the wire before decoding too.
+    limit = 6 * 1024 * 1024 + 1024
+    with socket.create_connection(('127.0.0.1', port), timeout=5) as connection:
+        connection.sendall(b'{"action":"read"}\n')
+        with connection.makefile('rb') as reader:
+            line = reader.readline(limit + 1)
+    if not line or len(line) > limit or not line.endswith(b'\n'):
+        raise RuntimeError('clipboard bridge response missing or oversized')
+    payload = json.loads(line)
+    if not isinstance(payload, dict):
+        raise RuntimeError('invalid clipboard bridge response')
+    kind = payload.get('kind')
+    if kind == 'empty':
+        return ''
+    if kind != 'text':
+        raise RuntimeError(str(payload.get('message') or 'client clipboard does not contain plain text'))
+    text = payload.get('text')
+    if not isinstance(text, str) or '\0' in text:
+        raise RuntimeError('invalid clipboard text')
+    if len(text.encode('utf-8')) > 1024 * 1024:
+        raise RuntimeError('clipboard text exceeds 1 MiB')
+    return text
+
+
+def main():
+    try:
+        if not remote_route():
+            return 2  # Confirmed local: let ZLE use its existing wl-paste path.
+        text = read_remote_text()
+        sys.stdout.write(text)
+        return 0
+    except Exception as error:
+        print(f'SSH clipboard paste failed: {error}', file=sys.stderr)
+        return 1  # Never substitute the server clipboard after a remote failure.
+
+
+if __name__ == '__main__':
+    sys.exit(main())
+GHOSTTY_REMOTE_PASTE_PY
+}
+
+_quick_deploy_ghostty_paste() {
+    local clipboard result
+    # Only successful reads append the sentinel, preserving trailing newlines.
+    # stderr remains diagnostic output, never part of a successful clipboard.
+    clipboard="$(_quick_deploy_ghostty_remote_paste && printf '\001')"
+    result=$?
+    if (( result == 2 )); then
+        if clipboard="$(timeout 2s wl-paste --no-newline --type text && printf '\001')"; then
+            result=0
+        else
+            zle -M 'Clipboard paste failed or timed out (wl-paste); editor unchanged'
+            return 1
+        fi
+    elif (( result != 0 )); then
+        clipboard='SSH clipboard bridge or client-origin lookup failed; see diagnostic'
+        (( result == 124 )) && clipboard='SSH clipboard reader timed out'
+        zle -M "Clipboard paste failed: $clipboard; editor unchanged"
+        return 1
+    fi
+    LBUFFER+="${clipboard%$'\001'}"
+}
+ZSH_LOCAL_PASTE_RELOAD
+    else
+        # Preserve exact deployed v1/v2/v3 bytes for guarded migrations.
+        cat <<'ZSH_LOCAL_PASTE_LEGACY'
 if [[ $_quick_deploy_ghostty_ctrlv_widget == _quick_deploy_ghostty_paste &&
       ( $_quick_deploy_ghostty_quote_widget == quoted-insert ||
         $_quick_deploy_ghostty_quote_widget == vi-quoted-insert ) ]]; then
@@ -1621,6 +1760,9 @@ _quick_deploy_ghostty_paste() {
         return 1
     fi
 }
+ZSH_LOCAL_PASTE_LEGACY
+    fi
+    cat <<'ZSH_LOCAL_PASTE_HOOK'
 zle -N _quick_deploy_ghostty_paste
 bindkey -M main '^[^V' "$_quick_deploy_ghostty_ctrlv_widget"
 bindkey -M main '^V' _quick_deploy_ghostty_paste
@@ -1754,7 +1896,7 @@ else:
 PY
 }
 
-# Only exact deployed v1/v2 bytes and the current hook may be replaced.
+# Only exact deployed v1/v2/v3 bytes and the current hook may be replaced.
 # Pin the historical digests independently of the renderer's shared body so
 # future edits cannot silently redefine which installed files are managed.
 local_paste_hook_state() {
@@ -1773,6 +1915,7 @@ local_paste_hook_state() {
         case "${digest%% *}" in
             6d53e9c81646f1ebb72872df4ec9f014117957042bce2ccd33fa2bfcc43423eb) echo v1 ;;
             f6e9f1b772c21c82b99ce922fd819ec9f2a1f006a6255f31b8399c6679ea9fc2) echo v2 ;;
+            855df8af1c438ddeaa8eb6dc94d832f729b59dc33e084319beac7f5a7d6a9677) echo v3 ;;
             *) die "shell 粘贴 hook 含非基准内容，拒绝覆盖: $LOCAL_PASTE_HOOK_CONFIG" ;;
         esac
     fi
@@ -1853,7 +1996,7 @@ PY
     [ "$(local_paste_zshrc_state)" = current ] &&
         cmp -s "$LOCAL_PASTE_HOOK_CONFIG" <(render_local_paste_hook) \
         || die "shell 粘贴 hook 或 .zshrc 托管块写入后校验失败"
-    echo "OK: 本地 Wayland zsh 的 ^V 从当前剪贴板插入；Esc Ctrl+V 保留 quoted-insert"
+    echo "OK: zsh 的 ^V 本地读取 Wayland、tmux SSH 输入读取客户端剪贴板桥；Esc Ctrl+V 保留 quoted-insert"
 }
 
 ssh_mouse_hook_state() {
@@ -2051,7 +2194,7 @@ main() {
     fi
     if [ "$SHELL_PASTE_ONLY" = true ]; then
         install_local_paste_hook
-        echo "已安装本地 Wayland zsh 提示符粘贴；请开启新的交互式 shell"
+        echo '已安装 zsh 提示符粘贴；已有 shell 执行 source "$HOME/.config/ghostty/ghostty-local-paste.zsh"，或开启新 shell'
         return 0
     fi
     check_supported_system

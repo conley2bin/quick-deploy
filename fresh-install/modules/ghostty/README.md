@@ -172,12 +172,13 @@ SSH 中的 Pi 若启用了已安装的剪贴板桥，则继续由该桥处理 Ct
 Ghostty 配置不改变远端 Pi 本身的剪贴板能力。
 
 本地 Wayland **交互式 zsh 提示符（含本机 tmux pane）**加载模块托管的
-ZLE widget：`Ctrl+V` 和 `Ctrl+Shift+V` 都以原始 `^V` 到达 zsh，然后每次由 `wl-paste
---no-newline --type text` 读取**当前**系统 CLIPBOARD，用 2 秒上限将完整
-文本直接插入 ZLE 编辑缓冲区。真实结尾换行会保留；粘贴中的换行、分号、
-命令替换等不会在粘贴时执行，只有用户之后主动提交编辑缓冲区才可能运行
-其中命令。读取失败或超时会在提示符报错，保持原缓冲区，不用 tmux 历史
-缓冲区或过期结果回退。原有 quoted-insert 搬到 **Esc 再按 Ctrl+V**
+ZLE widget：`Ctrl+V` 和 `Ctrl+Shift+V` 都以原始 `^V` 到达 zsh。本地输入用
+`wl-paste --no-newline --type text` 在 2 秒内读取当前系统 CLIPBOARD；共享
+tmux pane 的 SSH 输入则读取客户端剪贴板桥。完整文本直接插入 ZLE 编辑
+缓冲区，保留光标后的内容和真实结尾换行。粘贴中的换行、分号、命令替换
+不会在粘贴时执行，只有用户之后主动提交编辑缓冲区才可能运行其中命令。
+读取失败或超时会在提示符报错，保持原缓冲区，不用 tmux 历史缓冲区或
+另一台机器的剪贴板回退。原有 quoted-insert 搬到 **Esc 再按 Ctrl+V**
 （`^[^V`）；载入时先核对该序列未被占用以及 `^V` 是 zsh 默认
 `quoted-insert` / `vi-quoted-insert`，冲突会报错而不抢用户自有按键。
 
@@ -186,17 +187,26 @@ hook 只在**具备原生 Ghostty 子 shell 标记**、有本地 Wayland socket 
 `TERM_PROGRAM=tmux` **且 `TMUX` 非空**；两者都须有可用的
 `GHOSTTY_RESOURCES_DIR` 目录、Wayland socket，且无 `SSH_TTY`。tmux 会将
 子 shell 的 `TERM_PROGRAM` 改成 `tmux`，所以仅检查 `ghostty` 的已部署 v2
-会跳过真正的本机 tmux 提示符，让 `^V` 留在 quoted-insert；本次只补上该
-tmux 子 shell 条件。Ghostty 若从先前的 Pi/tmux 进程启动，可能继承过期的
-`SSH_CONNECTION`/`SSH_CLIENT`；这两个变量不作为远端判据，否则真实本地
-提示符会被错误跳过。SSH 分配了 PTY 的远端 zsh 被 `SSH_TTY` 守卫拦住。
+会跳过真正的本机 tmux 提示符，让 `^V` 留在 quoted-insert。Ghostty 若从
+先前的 Pi/tmux 进程启动，可能继承过期的 `SSH_CONNECTION`/`SSH_CLIENT`；
+这两个变量不作为远端判据，否则真实本地提示符会被错误跳过。SSH 分配了 PTY 的远端 zsh 被 `SSH_TTY` 守卫拦住。
 
-**剪贴板属于 zsh 所在的主机/Wayland 会话**：在 tmux 中，`wl-paste` 读取
-shell/server 主机的剪贴板，不是发送此按键的远端客户端剪贴板。另一台机器
-附着同一 pane 不会改变已运行 shell 的环境；这些标记不能判定共享 pane 中
-每次输入的实际来源，hook 不做按客户端路由或“最近活动客户端”推断。
-粘贴时还须已退出 tmux copy-mode，让原始 `^V` 到达 ZLE；本次不改变
-copy-mode、复制绑定或 tmux 鼠标行为。
+**共享 tmux 的粘贴目的地在按键时选择**：只枚举当前显示这个 pane 的
+clients，取 `client_activity` 最新者，再检查其 `/proc` 祖先链。最新者来自
+SSH 时，通过已有 [pi-remote-clipboard 桥](../../../pi-agent/extensions/pi-remote-clipboard/README.md)
+的 `127.0.0.1:37844`（可用 `PI_REMOTE_CLIPBOARD_REMOTE_PORT` 覆盖）读取
+客户端文本，整个读取有 8 秒上限；本地客户端仍读 server 的 Wayland
+剪贴板。因此，从 SSH Pi 点击 `[复制]` 后，在同一客户端的 executor
+提示符粘贴，会读取复制所写入的客户端剪贴板，而不是 server 的旧文本。
+
+桥须已配置并指向该 SSH 客户端主机；这沿用现有单一客户端主机的 forward，
+没有新增逐连接身份配对。shell 仅接受文本，不将图片保存成临时路径。
+客户端消失、tmux 查询失败、桥不可用或返回图片时明确报错，不回退本地。
+`client_activity` 只有秒级精度，仍是最近活动推断；最新时间并列且包含
+SSH client 时拒绝猜测。暂停另一客户端的键盘/鼠标输入，隔一秒重试。
+其他客户端在读取期间继续输入也可能改变来源，精确逐键归属不在此路径内。
+原始 `^V` 必须先到达 ZLE；受管 tmux 的 copy-mode 粘贴 handoff 不变，
+复制绑定、tmux 鼠标和 Pi 的复制/图片粘贴都不修改。
 
 Pi 等 raw-mode 程序不经过 ZLE，仍由自己的 Ctrl+V 处理器读图片/文本，
 SSH 剪贴板桥和 OSC 52 写入路径不变。其他 TUI 仍自行解释原始 `^V`；
@@ -236,7 +246,7 @@ bash fresh-install/modules/ghostty/install.sh --shell-paste-only
 
 该窄模式先逐字节核对当前受管 Ghostty 配置（必须仍是
 `ctrl+shift+v=text:\x16`）、SSH 鼠标 hook 和已有 `.zshrc` 标记块。粘贴
-hook 仅接受不存在、**已部署 v1/v2 的精确字节**、或本次基准；历史内容
+hook 仅接受不存在、**已部署 v1/v2/v3 的精确字节**、或本次基准；历史内容
 由安装器和测试中固定的 SHA-256 核对，不能因改动渲染器而重新定义旧版本。
 自定义配置、hook 内用户改动、块内用户改动、符号链接、缺失的前置文件会
 **在写入前拒绝**。首次安装新增 `~/.config/ghostty/ghostty-local-paste.zsh`，
@@ -247,8 +257,14 @@ hook 仅接受不存在、**已部署 v1/v2 的精确字节**、或本次基准�
 内容和文件权限保持原样。
 不会执行 apt、重建背压库、
 更改全局 Ghostty 绑定/启动器/桌面入口/字体、启动 GUI，也不读取或改动
-真实剪贴板。升级后开启新的本地 zsh 提示符，也在本机 tmux 普通 pane
-中开启新 zsh（已有 shell 不会自动重载 hook）。复制一段文本，分别试两种
+真实剪贴板。升级后开启新 zsh，或在已有 **shell 提示符**执行：
+
+```zsh
+source "$HOME/.config/ghostty/ghostty-local-paste.zsh"
+```
+
+已由本模块持有的按键会保留并更新函数定义，重复 source 不会覆盖
+Esc Ctrl+V 的 quoted-insert；Pi 不需要 `/reload`。复制一段文本，分别试两种
 粘贴键；再试含换行的文本，确认它进入编辑缓冲区但未自动执行。
 `Esc Ctrl+V` 应能逐字插入下一个控制字符。
 
@@ -491,7 +507,7 @@ GTK/libwayland 符号进入库；事故原始负载没有复现，不能许诺�
 离线回归测试（不安装软件、不联网、不改真实 HOME）：
 
 ```bash
-bash ../../tests/ghostty/run.sh
+env -u LD_PRELOAD bash ../../tests/ghostty/run.sh
 ```
 
 粘贴测试使用私有 HOME、假的 `wl-paste` 和私有 Wayland socket；真实 tmux
@@ -581,7 +597,9 @@ Ghostty 模块目录里只有 **`install.sh` 一个 shell 源文件**。其中�
 `~/.config/ghostty/ghostty-local-paste.zsh`，并让 `.zshrc` 加载它们。安装器退出
 以后，SSH 返回提示符和本地 ZLE 粘贴仍需这些运行时文件。测试脚本位于模块
 外的 `fresh-install/tests/ghostty/`，会渲染 hook 并用 `zsh -n` / 私有
-交互式 PTY、假的 `wl-paste` 验证。打包这个模块只需 `install.sh` 与非 shell 的
+交互式 PTY、假的 `wl-paste`、私有 tmux/客户端剪贴板桥验证。回归入口清除
+继承的 `LD_PRELOAD`，让 Wayland 的未修复负对照不受已安装背压库影响；
+正对照仍显式加载自己的测试库。打包这个模块只需 `install.sh` 与非 shell 的
 `wayland-backpressure.c`；C 源码缺失时 `--check` 与安装都会在写入前失败。
 
 本模块采用两层处理：

@@ -24,7 +24,8 @@ mapfile -t module_shell_files < <(find "$MODULE_DIR" -type f \
 sed '/^main "\$@"$/,$d' "$INSTALLER" > "$WORK/functions.sh"
 HOME="$WORK/render-hook-home" bash -c 'source "$1"; render_ssh_mouse_hook' _ "$WORK/functions.sh" > "$HOOK_SOURCE"
 HOME="$WORK/render-hook-home" bash -c 'source "$1"; render_local_paste_hook' _ "$WORK/functions.sh" > "$PASTE_HOOK_SOURCE"
-for version in v1 v2; do
+python3 "$(dirname "${BASH_SOURCE[0]}")/test_shell_paste.py" || fail "shell clipboard reader regressions failed"
+for version in v1 v2 v3; do
     HOME="$WORK/render-hook-home" bash -c 'source "$1"; render_local_paste_hook "$2"' \
         _ "$WORK/functions.sh" "$version" > "$WORK/ghostty-local-paste-$version.zsh"
 done
@@ -33,8 +34,10 @@ done
         "$WORK/ghostty-local-paste-v1.zsh"
     printf 'f6e9f1b772c21c82b99ce922fd819ec9f2a1f006a6255f31b8399c6679ea9fc2  %s\n' \
         "$WORK/ghostty-local-paste-v2.zsh"
+    printf '855df8af1c438ddeaa8eb6dc94d832f729b59dc33e084319beac7f5a7d6a9677  %s\n' \
+        "$WORK/ghostty-local-paste-v3.zsh"
 } | sha256sum --check --status \
-    || fail "历史 v1/v2 粘贴 hook 渲染不再是已部署的精确字节"
+    || fail "历史 v1/v2/v3 粘贴 hook 渲染不再是已部署的精确字节"
 # 真正打包的模块副本只含 install.sh + C 源码：没有独立 .zsh/.sh 资源。
 # 源码渲染应与原模块等同，并在 --check/正式安装共用的预检下完整。
 mkdir -p "$WORK/packaged-module"
@@ -59,7 +62,7 @@ if command -v zsh >/dev/null 2>&1; then
     HAVE_ZSH=true
     zsh -n "$HOOK_SOURCE" || fail "zsh SSH hook 语法错误"
     zsh -n "$PASTE_HOOK_SOURCE" || fail "zsh 粘贴 hook 语法错误"
-    for version in v1 v2; do
+    for version in v1 v2 v3; do
         zsh -n "$WORK/ghostty-local-paste-$version.zsh" || fail "历史 $version hook 语法错误"
     done
 else
@@ -572,9 +575,9 @@ cmp -s "$WORK/shell-after" "$WORK/shell-rerun" || fail "zsh 粘贴窄模式重�
 test "$(find "$SHELL_ONLY_HOME" -name '.zshrc.bak.*' | wc -l)" -eq 1 \
     || fail "zsh 粘贴窄模式重跑生成了额外备份"
 
-# Deployed v1 and v2 both use the already-migrated .zshrc block. Upgrade only
+# Deployed v1/v2/v3 use the already-migrated .zshrc block. Upgrade only
 # the exact historical hook; preserve .zshrc bytes/inode and all other files.
-for version in v1 v2; do
+for version in v1 v2 v3; do
     private_home="$WORK/shell-migrate-$version"
     prepare_shell_paste_home "$private_home"
     run_shell_only "$private_home" --shell-paste-only > "$WORK/shell-$version-prepare.log"
@@ -618,7 +621,7 @@ PY
     cmp -s "$WORK/shell-$version-after" "$WORK/shell-$version-rerun" \
         || fail "$version→current 窄迁移重跑修改了文件"
 done
-echo 'PASS: exact v1/v2/current hook migrations, .zshrc bytes/inode preservation, narrow-mode idempotence'
+echo 'PASS: exact v1/v2/v3/current hook migrations, .zshrc bytes/inode preservation, narrow-mode idempotence'
 
 for other in --check --ppa-only --deb-only --default-terminal --no-default-terminal --paste-keybind-only --pi-launcher-only; do
     if run_shell_only "$SHELL_ONLY_HOME" --shell-paste-only "$other" > "$WORK/shell-args.log" 2>&1; then
@@ -628,7 +631,7 @@ for other in --check --ppa-only --deb-only --default-terminal --no-default-termi
         || fail "zsh 粘贴窄模式未明确拒绝冲突选项 $other"
 done
 
-for scenario in old-global custom-global custom-zshrc symlink-zshrc malformed-zshrc custom-hook custom-v1-hook custom-v2-hook symlink-hook custom-mouse; do
+for scenario in old-global custom-global custom-zshrc symlink-zshrc malformed-zshrc custom-hook custom-v1-hook custom-v2-hook custom-v3-hook symlink-hook custom-mouse; do
     private_home="$WORK/shell-refuse-$scenario"
     prepare_shell_paste_home "$private_home"
     config="$private_home/.config/ghostty/config.ghostty"
@@ -641,7 +644,7 @@ for scenario in old-global custom-global custom-zshrc symlink-zshrc malformed-zs
         symlink-zshrc) mv "$zshrc" "$private_home/real-zshrc"; ln -s "$private_home/real-zshrc" "$zshrc" ;;
         malformed-zshrc) sed -i '/^# <<< fresh-install ghostty: ssh 鼠标复位 hook <<</d' "$zshrc" ;;
         custom-hook) printf 'KEEP\n' > "$paste_hook" ;;
-        custom-v1-hook|custom-v2-hook)
+        custom-v1-hook|custom-v2-hook|custom-v3-hook)
             version="${scenario#custom-}"; version="${version%-hook}"
             cp "$WORK/ghostty-local-paste-$version.zsh" "$paste_hook"
             printf '# user addition\n' >> "$paste_hook"
@@ -1085,11 +1088,15 @@ import subprocess
 import sys
 import termios
 import time
+import ctypes
+import json
+import threading
 
 work, hook, fake_bin, home = map(Path, sys.argv[1:5])
 transport = sys.argv[5]
 use_tmux = transport.startswith("tmux")
-expect_paste = transport in ("direct", "tmux")
+remote = transport == "tmux-remote"
+expect_paste = transport in ("direct", "tmux", "tmux-remote")
 # This HOME is a private --shell-paste-only result, including its migrated
 # managed .zshrc block; the PTY loads the actual installed source lines.
 run = home / ".run"
@@ -1118,6 +1125,55 @@ if transport == "tmux-ssh":
     env["SSH_TTY"] = "/dev/pts/test-ssh"
 if transport == "unknown":
     env["TERM_PROGRAM"] = "vscode"
+
+bridge = None
+bridge_thread = None
+bridge_requests = []
+stop_bridge = threading.Event()
+if remote:
+    # Kernel-backed synthetic SSH ancestry for THIS private tmux client only.
+    # Its provider and clipboards are independent temporary files/sockets.
+    assert ctypes.CDLL(None).prctl(15, b"sshd", 0, 0, 0) == 0
+    clip.write_bytes(b"SERVER-OLD-must-never-paste")
+    clip = home / "fake-client-clipboard"
+    clip.write_bytes(b"00000000-0000-4000-8000-000000000001")
+    bridge = socket.socket()
+    bridge.bind(("127.0.0.1", 0))
+    bridge.listen(1)
+    bridge.settimeout(0.1)
+    env["PI_REMOTE_CLIPBOARD_REMOTE_PORT"] = str(bridge.getsockname()[1])
+    # Simulate a harmless Python/loader warning. stderr must never prefix text.
+    warning_bin = home / "warning-bin"
+    warning_bin.mkdir()
+    python_wrapper = warning_bin / "python3"
+    python_wrapper.write_text("#!/bin/sh\nprintf 'synthetic helper warning\\n' >&2\n"
+                              + f'exec "{sys.executable}" "$@"\n')
+    python_wrapper.chmod(0o755)
+    env["PATH"] = f"{warning_bin}:{env['PATH']}"
+
+    def serve_bridge():
+        while not stop_bridge.is_set():
+            try:
+                connection, _ = bridge.accept()
+            except socket.timeout:
+                continue
+            with connection:
+                connection.settimeout(2)
+                with connection.makefile("rb") as reader:
+                    request = json.loads(reader.readline())
+                assert request == {"action": "read"}, request
+                bridge_requests.append(request)
+                current_mode = mode.read_text()
+                if current_mode == "timeout":
+                    stop_bridge.wait(6)
+                    continue
+                payload = ({"kind": "error", "message": "synthetic bridge failure"}
+                           if current_mode == "fail" else
+                           {"kind": "text", "text": clip.read_text()})
+                connection.sendall(json.dumps(payload).encode() + b"\n")
+
+    bridge_thread = threading.Thread(target=serve_bridge, daemon=True)
+    bridge_thread.start()
 
 # Probe each guard with otherwise usable local resources, including a tmux
 # marker. Actual tmux-created variables and key delivery are tested below.
@@ -1165,6 +1221,11 @@ if transport == "direct":
         check_binding(context, f'bindkey -e; bindkey -M main "^V" backward-char; '
                       f'source "{hook}"; bindkey -M main "^V"',
                       '"^V" backward-char', 'refusing to override')
+    for keymap, quoted in (("-e", "quoted-insert"), ("-v", "vi-quoted-insert")):
+        check_binding({}, f'bindkey {keymap}; source "{work / "ghostty-local-paste-v3.zsh"}"; '
+                      f'source "{hook}"; source "{hook}"; '
+                      '(( $+functions[_quick_deploy_ghostty_remote_paste] )) || exit 1; '
+                      'bindkey -M main "^[^V"', f'"^[^V" {quoted}')
     noninteractive = subprocess.run(["zsh", "-f", "-c", 'source "$1"; print INERT',
                                       "_", str(hook)], env=env, capture_output=True,
                                      text=True, timeout=5)
@@ -1246,7 +1307,8 @@ try:
     assert binding == '"^V" _quick_deploy_ghostty_paste', binding
     output.clear()
     os.write(master, b"\x16")
-    assert capture() == b"FIRST-current", bytes(output[-500:])
+    first = b"00000000-0000-4000-8000-000000000001" if remote else b"FIRST-current"
+    assert capture() == first, bytes(output[-500:])
     clear()
 
     # Same PTY byte represents either physical key under the unchanged global
@@ -1255,7 +1317,11 @@ try:
     os.write(master, b"\x16")
     assert capture() == b"SECOND-now"
     clear()
-    assert log.read_text().splitlines() == ["read", "read"]
+    if remote:
+        assert len(bridge_requests) == 2, bridge_requests
+        assert log.read_bytes() == b"", "remote paste read stale server clipboard"
+    else:
+        assert log.read_text().splitlines() == ["read", "read"]
 
     clip.write_bytes(b"-INSERT-")
     os.write(master, b"leftRIGHT" + b"\x02" * 5 + b"\x16")
@@ -1284,10 +1350,12 @@ try:
 
     mode.write_text("timeout")
     os.write(master, b"stay-\x16")
-    wait_for(b"Clipboard paste failed", seconds=4)
+    wait_for(b"Clipboard paste failed", seconds=8 if remote else 4)
     assert capture() == b"stay-", "timed-out read inserted data"
     clear()
     assert not executed.exists(), "some pasted command ran"
+    if remote:
+        assert log.read_bytes() == b"", "failed remote read fell back to server clipboard"
 finally:
     # Never send Enter during teardown: even a failed assertion must not
     # submit pasted commands. This socket/server belongs only to this test.
@@ -1298,13 +1366,19 @@ finally:
     proc.wait(timeout=3)
     os.close(master)
     display.close()
+    if bridge:
+        stop_bridge.set()
+        bridge_thread.join(3)
+        assert not bridge_thread.is_alive(), "private bridge thread did not stop"
+        bridge.close()
+        assert ctypes.CDLL(None).prctl(15, b"python3", 0, 0, 0) == 0
 print(f"PASS: {transport}: actual TERM_PROGRAM={actual_term.decode()}, exact ZLE text/cursor/multiline/3 trailing newlines, no autoexecution, quoted-insert, read errors")
 PY
 if [ "$HAVE_ZSH" = true ]; then
     python3 "$WORK/paste-pty-check.py" "$WORK" "$PASTE_INSTALLED" "$WORK/paste-fake-bin" "$SHELL_ONLY_HOME" direct \
         || fail "私有 direct PTY 未验证当前剪贴板文本/多行不自动执行、quoted-insert 或读取失败"
     if command -v tmux >/dev/null 2>&1; then
-        for transport in tmux tmux-v2 tmux-ssh; do
+        for transport in tmux tmux-v2 tmux-ssh tmux-remote; do
             private_home="$WORK/pty-$transport-home"
             prepare_shell_paste_home "$private_home"
             run_shell_only "$private_home" --shell-paste-only > "$WORK/pty-$transport-install.log"
