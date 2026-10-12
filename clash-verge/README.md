@@ -200,8 +200,10 @@ GitHub SSH 走 `ssh.github.com:443`，`DST-PORT,22` 不会匹配它，所以
 
 ## 安装 Clash Verge Rev
 
-仓库内置 2.5.2 的 amd64 安装包，`./install.sh` 会校验架构、用 dpkg 安装并回查结果。
-其他架构请用官方安装包。
+仓库内置 Clash Verge Rev 离线安装包，`./install.sh` 会查找匹配当前 `dpkg`
+架构的 `Clash.Verge_*_<架构>.deb`，按包元数据中的 Debian 版本选择最高版本，
+校验后用 apt 安装并回查 dpkg。更新安装包时只替换仓库里的 deb 文件，不需要改脚本；
+没有匹配架构的包时请用官方安装包。
 
 配置文件常见位置：
 
@@ -238,6 +240,7 @@ rules/*.yaml        # 日常编辑的路由来源
 ## 离线回归检查
 
 ```bash
+python3 clash-verge/tests/install-package-selection.py # 离线安装包架构/版本选择
 python3 clash-verge/tests/route-menu.py       # 菜单、更新、恢复、SSH 隔离与写入边界
 python3 clash-verge/tests/app-integration.py  # 规则语法、registry、应用展开、Script 守卫
 python3 clash-verge/tests/discover-apps.py    # 原生应用发现
