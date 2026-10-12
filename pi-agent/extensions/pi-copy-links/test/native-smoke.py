@@ -259,7 +259,7 @@ def clipboard():
 exited = False
 try:
     if options.regular_start:
-        wait_for(lambda: '已加载'.encode() in wire, 'regular-mode activation notice')
+        wait_for(lambda: 'pi-copy-links loaded'.encode() in wire, 'regular-mode activation notice')
         send('/settings\r')
         send('tui mode')
         send('\r')

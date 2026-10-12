@@ -66,7 +66,7 @@ if (kind === 'width-drift' || kind === 'tab-cache-drift') {
   const terminal = {
     columns:64, rows:20, kittyProtocolActive:false, input() {},
     start(input) { this.input=input; }, stop() {}, async drainInput() {}, write() {}, moveBy() {},
-    hideCursor() {}, showCursor() {}, clearLine() {}, clearFromCursor() {}, clearScreen() {}, setTitle() {}, setProgress() {},
+    hideCursor() {}, showCursor() {}, clearLine() {}, clearFromCursor() {}, clearScreen() {}, setTitle() {}, setProgress() {}, setProgramStatus() {},
   };
   let tui;
   const copies=[], opens=[], nativeOpens=[], errors=[];

@@ -24,7 +24,7 @@ const surfaces = [[Markdown.prototype,'render'],[Markdown.prototype,'renderToken
 const baseline = surfaces.map(([owner,key])=>Object.getOwnPropertyDescriptor(owner,key));
 const identity = text=>text;
 const theme=Object.fromEntries(['heading','link','linkUrl','code','codeBlock','codeBlockBorder','quote','quoteBorder','hr','listBullet','bold','italic','strikethrough','underline'].map(key=>[key,identity]));
-const terminal={columns:64,rows:20,kittyProtocolActive:false,start(){assert.fail('not a terminal-start fixture');},stop(){},async drainInput(){},write(){},moveBy(){},hideCursor(){},showCursor(){},clearLine(){},clearFromCursor(){},clearScreen(){},setTitle(){},setProgress(){}};
+const terminal={columns:64,rows:20,kittyProtocolActive:false,start(){assert.fail('not a terminal-start fixture');},stop(){},async drainInput(){},write(){},moveBy(){},hideCursor(){},showCursor(){},clearLine(){},clearFromCursor(){},clearScreen(){},setTitle(){},setProgress(){},setProgramStatus(){}};
 const nativeOpens=[];
 const tui=new TuiAltScreen(terminal,false,undefined,{openUrl:url=>nativeOpens.push(url),copyOnSelect:false,copySelection:async()=>true});
 if(kind==='notify') Object.defineProperty(tui,'mode',{value:'regular'});

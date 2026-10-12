@@ -21,6 +21,13 @@ let weakRefAlwaysFails = false;
 let weakRefsAreDead = false;
 globalThis.WeakRef = new Proxy(realWeakRef, {
   construct(target, args: [object]) {
+    // Pi 1.1.0 also caches parsed Markdown tokens in a WeakRef. The regression
+    // being measured here is the adapter's bookkeeping, so let only that exact
+    // host cache record pass and count adapter probe/owner registrations.
+    const candidate = args[0] as { source?: unknown; tokens?: unknown };
+    if (typeof candidate.source === "string" && Array.isArray(candidate.tokens)) {
+      return Reflect.construct(target, args);
+    }
     weakRefCalls += 1;
     if (weakRefAlwaysFails || weakRefFailureCalls.delete(weakRefCalls)) {
       throw new RangeError("Set maximum size exceeded");
@@ -39,7 +46,7 @@ class FakeTerminal implements Terminal {
   start(input: (data: string) => void) { this.input = input; }
   stop() {} async drainInput() {} write(data: string) { this.output += data; }
   moveBy() {} hideCursor() {} showCursor() {} clearLine() {} clearFromCursor() {}
-  clearScreen() {} setTitle() {} setProgress() {}
+  clearScreen() {} setTitle() {} setProgress() {} setProgramStatus() {}
 }
 
 function message(text: string) {

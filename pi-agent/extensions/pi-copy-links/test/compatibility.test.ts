@@ -28,7 +28,7 @@ function terminal() {
     columns: 64, rows: 40, kittyProtocolActive: false,
     start() { assert.fail("probe must not start a terminal"); }, stop() {},
     async drainInput() {}, write() {}, moveBy() {}, hideCursor() {}, showCursor() {},
-    clearLine() {}, clearFromCursor() {}, clearScreen() {}, setTitle() {}, setProgress() {},
+    clearLine() {}, clearFromCursor() {}, clearScreen() {}, setTitle() {}, setProgress() {}, setProgramStatus() {},
   } satisfies Terminal;
 }
 
@@ -276,11 +276,11 @@ test("success and behavior failures retire stores, restore owned descriptors and
   }
 });
 
-function startupFixture(mode: string) {
+function startupFixture(mode: string, tuiMode: "fullscreen" | "regular" = "fullscreen") {
   const events = new Map<string, (event: unknown, ctx: unknown) => Promise<unknown>>();
   const commands = new Map<string, { handler: (args: string, ctx: unknown) => Promise<unknown> }>();
   const notices: Array<{ text: string; level: string }> = [];
-  const tui = { mode: "fullscreen", previousScreen: [], invalidate() {}, requestRender() {}, renderNow() {} };
+  const tui = { mode: tuiMode, previousScreen: [], invalidate() {}, requestRender() {}, renderNow() {} };
   let transforms = 0, widgets = 0;
   const pi = {
     registerMarkdownTransformer() { transforms += 1; },
@@ -341,6 +341,24 @@ test("/copy-links reports measured real compatibility after successful TUI start
     await f.commands.get("copy-links")!.handler("", f.ctx);
     assert.match(f.notices.at(-1)!.text, /已启用.*\n实际兼容检查通过.*隔离探针 [\d.]+ ms/s);
     assert.equal(f.notices.at(-1)!.level, "info");
+  } finally {
+    await f.events.get("session_shutdown")!({}, f.ctx);
+    if (savedTmux === undefined) delete process.env.TMUX; else process.env.TMUX = savedTmux;
+  }
+  assert.deepEqual(descriptors(), before);
+});
+
+test("regular TUI startup reports English fullscreen guidance", async () => {
+  const savedTmux = process.env.TMUX;
+  delete process.env.TMUX;
+  const f = startupFixture("tui", "regular"), before = descriptors();
+  try {
+    await f.events.get("session_start")!({}, f.ctx);
+    assert.deepEqual(f.notices, [{
+      text: "pi-copy-links loaded. Set TUI mode to fullscreen in /settings: left-click the copy button in the lower-right corner of a code block, or Ctrl+left-click a Markdown web/file link to open it in a new Chrome/VS Code window. Regular mode leaves history scrolling to the terminal, so these actions are unavailable.",
+      level: "info",
+    }]);
+    assert.doesNotMatch(f.notices[0]!.text, /[\u3400-\u9fff]/);
   } finally {
     await f.events.get("session_shutdown")!({}, f.ctx);
     if (savedTmux === undefined) delete process.env.TMUX; else process.env.TMUX = savedTmux;

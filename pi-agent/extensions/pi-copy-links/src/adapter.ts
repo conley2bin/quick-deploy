@@ -1463,7 +1463,7 @@ export async function checkCompatibility(version: string): Promise<Compatibility
       columns: 64, rows: 40, kittyProtocolActive: false,
       start() {}, stop() {}, async drainInput() {}, write() {}, moveBy() {},
       hideCursor() {}, showCursor() {}, clearLine() {}, clearFromCursor() {},
-      clearScreen() {}, setTitle() {}, setProgress() {},
+      clearScreen() {}, setTitle() {}, setProgress() {}, setProgramStatus() {},
     } satisfies Terminal;
     const copies: string[] = [], opens: string[] = [], nativeOpens: string[] = [];
     const tui = new ProbeViewport(terminal, false, undefined, {

@@ -7,7 +7,7 @@ import { resolveInputTopology, type InputTopology } from "./src/receiver.ts";
 import { enableTmuxMouse } from "./src/tmux.ts";
 
 const WIDGET = "pi-copy-links:bridge";
-const HELP = "在 /settings 将 TUI mode 设为 fullscreen：代码块右下角左键复制，Markdown 网页/文件链接用 Ctrl+左键在 Chrome/VS Code 新窗口打开。普通模式的历史滚动由终端接管，不支持这些操作。";
+const HELP = "Set TUI mode to fullscreen in /settings: left-click the copy button in the lower-right corner of a code block, or Ctrl+left-click a Markdown web/file link to open it in a new Chrome/VS Code window. Regular mode leaves history scrolling to the terminal, so these actions are unavailable.";
 
 export default function copyLinksExtension(pi: ExtensionAPI): void {
   let adapter: ReturnType<typeof installAdapter> | undefined;
@@ -92,7 +92,7 @@ export default function copyLinksExtension(pi: ExtensionAPI): void {
       if (mouseWarning) ctx.ui.notify(mouseWarning, "warning");
       tui?.invalidate();
       tui?.requestRender();
-      if (tui?.mode !== "fullscreen") ctx.ui.notify(`pi-copy-links 已加载。${HELP}`, "info");
+      if (tui?.mode !== "fullscreen") ctx.ui.notify(`pi-copy-links loaded. ${HELP}`, "info");
       failure = undefined;
     } catch (error) {
       // Preserve the original startup failure while retiring hooks/actions and

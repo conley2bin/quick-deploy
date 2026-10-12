@@ -19,13 +19,21 @@
 
 ## 安装和启用
 
-在 quick-deploy 仓库根目录执行：
+在 quick-deploy 仓库根目录执行主安装器：
+
+```bash
+bash pi-agent/install.sh
+```
+
+主安装器发现并执行本扩展的叶安装器；全部安装成功后，它会把全局 `settings.json` 的 `tuiMode` 保存为 `fullscreen`，新 Pi 会话无需另做 `/settings`。项目/CLI 模式覆盖仍有效，运行中的 Pi 不会自动切换模式或重载；已有会话在空闲时执行 `/reload`。
+
+只有有意单独维护这一个扩展时，才直接执行叶安装器：
 
 ```bash
 bash pi-agent/extensions/pi-copy-links/install.sh
 ```
 
-这个单独的叶安装器把整个源码目录软链接到 `~/.pi/agent/extensions/pi-copy-links`，也已纳入 `pi-agent/install.sh` 的扩展发现流程。可用 `PI_CODING_AGENT_DIR` 指定其他 Pi home。叶安装器不修改 `settings.json`、Pi bundle 或桌面关联；主入口 `pi-agent/install.sh` 在全部安装成功后保存全局 `tuiMode=fullscreen`，新 Pi 会话无需另做 `/settings`。项目/CLI 模式覆盖仍有效，运行中的 Pi 不会自动切换模式或重载。
+叶安装器把整个源码目录软链接到 `~/.pi/agent/extensions/pi-copy-links`，可用 `PI_CODING_AGENT_DIR` 指定其他 Pi home；它不修改 `settings.json`、Pi bundle 或桌面关联，因此单独使用时需自行确认 fullscreen。
 
 客户端助手源码位于本扩展的 `client/`，在 **Y9000p** 的匹配已审阅 checkout 根目录单独运行：
 

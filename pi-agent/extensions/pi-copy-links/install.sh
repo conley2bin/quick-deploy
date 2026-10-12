@@ -38,5 +38,5 @@ fi
 [[ -L "$TARGET" ]] || ln -s -- "$SOURCE_DIR" "$TARGET"
 [[ $(readlink -f -- "$TARGET") == "$SOURCE_DIR" ]] || die "link verification failed"
 echo "pi-copy-links: installed $TARGET -> $SOURCE_DIR"
-echo 'Run /reload, then /settings → TUI mode → fullscreen. Use /copy-links to check.'
-echo 'Settings and the running Pi session were not changed.'
+echo 'Run /reload to load this extension. When installed through pi-agent/install.sh, fullscreen is configured automatically; otherwise use /settings → TUI mode → fullscreen. Use /copy-links to check.'
+echo 'This leaf installer changed neither settings nor the running Pi session.'

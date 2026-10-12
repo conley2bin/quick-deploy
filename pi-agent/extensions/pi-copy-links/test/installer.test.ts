@@ -23,7 +23,11 @@ function setup(git = true) {
 test('installer creates an idempotent symlink and a name-specific local exclude; no settings changes', () => {
   const f = setup();
   try {
-    assert.equal(f.run().status, 0); assert.equal(f.run().status, 0);
+    const first = f.run(); assert.equal(first.status, 0, first.stderr); assert.equal(f.run().status, 0);
+    assert.match(first.stdout, /pi-copy-links: installed/);
+    assert.match(first.stdout, /When installed through pi-agent\/install\.sh, fullscreen is configured automatically/);
+    assert.match(first.stdout, /changed neither settings nor the running Pi session/);
+    assert.doesNotMatch(first.stdout, /[\u3400-\u9fff]/);
     assert.equal(realpathSync(f.target), source);
     assert.equal(readFileSync(join(f.home, 'settings.json'), 'utf8'), '{"custom":42}\n');
     assert.equal(readFileSync(join(f.home, '.git/info/exclude'), 'utf8').split('\n').filter(x => x === '/extensions/pi-copy-links').length, 1);
