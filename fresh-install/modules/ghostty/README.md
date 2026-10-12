@@ -171,119 +171,144 @@ keybind = ctrl+shift+v=text:\x16
 SSH 中的 Pi 若启用了已安装的剪贴板桥，则继续由该桥处理 Ctrl+V；这项
 Ghostty 配置不改变远端 Pi 本身的剪贴板能力。
 
-本地 Wayland **交互式 zsh 提示符（含本机 tmux pane）**加载模块托管的
-ZLE widget：`Ctrl+V` 和 `Ctrl+Shift+V` 都以原始 `^V` 到达 zsh。本地输入用
-`wl-paste --no-newline --type text` 在 2 秒内读取当前系统 CLIPBOARD；共享
-tmux pane 的 SSH 输入则读取客户端剪贴板桥。完整文本直接插入 ZLE 编辑
-缓冲区，保留光标后的内容和真实结尾换行。粘贴中的换行、分号、命令替换
-不会在粘贴时执行，只有用户之后主动提交编辑缓冲区才可能运行其中命令。
-读取失败或超时会在提示符报错，保持原缓冲区，不用 tmux 历史缓冲区或
-另一台机器的剪贴板回退。原有 quoted-insert 搬到 **Esc 再按 Ctrl+V**
-（`^[^V`）；载入时先核对该序列未被占用以及 `^V` 是 zsh 默认
-`quoted-insert` / `vi-quoted-insert`，冲突会报错而不抢用户自有按键。
+The managed zsh widget on local Wayland **interactive prompts (including local
+tmux panes)** receives raw `^V` from both `Ctrl+V` and `Ctrl+Shift+V`. Local
+input reads the current system CLIPBOARD through
+`wl-paste --no-newline --type text` within two seconds; input from an SSH
+client viewing a shared tmux pane reads the client's clipboard bridge instead.
+Complete text is inserted into the ZLE editing buffer, preserving text after
+the cursor and genuine trailing newlines. Newlines, semicolons, or command
+substitutions inside pasted text do not execute during insertion; only an
+explicit user submission may run the resulting buffer. A failed or timed-out
+read reports at the prompt, leaves the buffer unchanged, and never falls back
+to a tmux buffer or the other machine's clipboard. Literal quoted insertion
+moved to **Esc then Ctrl+V** (`^[^V`). At load time the widget verifies that
+this sequence is free and that `^V` uses zsh's default `quoted-insert` or
+`vi-quoted-insert`; a conflict reports an error rather than taking a custom key.
 
-hook 只在**具备原生 Ghostty 子 shell 标记**、有本地 Wayland socket 的
-交互式 zsh 中绑定 ZLE 键。终端上下文仅接受 `TERM_PROGRAM=ghostty`，或
-`TERM_PROGRAM=tmux` **且 `TMUX` 非空**；两者都须有可用的
-`GHOSTTY_RESOURCES_DIR` 目录、Wayland socket，且无 `SSH_TTY`。tmux 会将
-子 shell 的 `TERM_PROGRAM` 改成 `tmux`，所以仅检查 `ghostty` 的已部署 v2
-会跳过真正的本机 tmux 提示符，让 `^V` 留在 quoted-insert。Ghostty 若从
-先前的 Pi/tmux 进程启动，可能继承过期的 `SSH_CONNECTION`/`SSH_CLIENT`；
-这两个变量不作为远端判据，否则真实本地提示符会被错误跳过。SSH 分配了 PTY 的远端 zsh 被 `SSH_TTY` 守卫拦住。
+The hook binds ZLE keys only in interactive zsh with native Ghostty child-shell
+markers and a local Wayland socket. The terminal context must be
+`TERM_PROGRAM=ghostty`, or `TERM_PROGRAM=tmux` **and a non-empty `TMUX`**;
+both require a usable `GHOSTTY_RESOURCES_DIR`, a Wayland socket, and no
+`SSH_TTY`. Tmux changes a child shell's `TERM_PROGRAM` to `tmux`, so a guard
+that only accepts `ghostty` skipped real local tmux prompts and left `^V` as
+quoted-insert. When Ghostty starts from an earlier Pi/tmux process, it can
+inherit stale `SSH_CONNECTION`/`SSH_CLIENT`; those variables are not remote
+proof, otherwise real local prompts would be skipped. A remote zsh allocated
+an SSH PTY is excluded by `SSH_TTY`.
 
-**共享 tmux 的粘贴目的地在按键时选择**：只枚举当前显示这个 pane 的
-clients，取 `client_activity` 最新者，再检查其 `/proc` 祖先链。最新者来自
-SSH 时，通过已有 [pi-remote-clipboard 桥](../../../pi-agent/extensions/pi-remote-clipboard/README.md)
-的 `127.0.0.1:37844`（可用 `PI_REMOTE_CLIPBOARD_REMOTE_PORT` 覆盖）读取
-客户端文本，整个读取有 8 秒上限；本地客户端仍读 server 的 Wayland
-剪贴板。因此，从 SSH Pi 点击 `[复制]` 后，在同一客户端的 executor
-提示符粘贴，会读取复制所写入的客户端剪贴板，而不是 server 的旧文本。
+**A shared tmux paste chooses its clipboard when the key is pressed**: it lists
+only clients currently displaying this pane, takes the newest `client_activity`,
+then inspects that client's `/proc` ancestry. When the newest client came over
+SSH, it reads text through the existing [pi-remote-clipboard
+bridge](../../../pi-agent/extensions/pi-remote-clipboard/README.md) at
+`127.0.0.1:37844` (override with `PI_REMOTE_CLIPBOARD_REMOTE_PORT`) within
+eight seconds; a local client still reads the server's Wayland clipboard.
+Therefore, after clicking `[copy]` in Pi over SSH, pasting at an executor
+prompt from that same client reads the client clipboard written by the copy
+rather than stale server text.
 
-桥须已配置并指向该 SSH 客户端主机；这沿用现有单一客户端主机的 forward，
-没有新增逐连接身份配对。shell 仅接受文本，不将图片保存成临时路径。
-客户端消失、tmux 查询失败、桥不可用或返回图片时明确报错，不回退本地。
-`client_activity` 只有秒级精度，仍是最近活动推断；最新时间并列且包含
-SSH client 时拒绝猜测。暂停另一客户端的键盘/鼠标输入，隔一秒重试。
-其他客户端在读取期间继续输入也可能改变来源，精确逐键归属不在此路径内。
-原始 `^V` 必须先到达 ZLE；受管 tmux 的 copy-mode 粘贴 handoff 不变，
-复制绑定、tmux 鼠标和 Pi 的复制/图片粘贴都不修改。
+The configured bridge must point at that SSH client host; this reuses the
+existing single client-host forward and adds no per-connection pairing. The
+shell accepts only text and does not save images as temporary paths. A missing
+client, failed tmux query, unavailable bridge, or image response reports an
+error without falling back locally. `client_activity` has one-second precision
+and remains newest-activity inference; if the newest time is tied by any SSH
+client, the reader refuses to guess. Keep another client's keyboard/mouse idle
+and retry after a second. Input from another client during the read can still
+change the inferred origin; exact per-key provenance is outside this path. Raw
+`^V` must first reach ZLE; the managed tmux copy-mode paste handoff, copy
+bindings, tmux mouse behavior, and Pi copy/image paste are unchanged.
 
-Pi 等 raw-mode 程序不经过 ZLE，仍由自己的 Ctrl+V 处理器读图片/文本，
-SSH 剪贴板桥和 OSC 52 写入路径不变。其他 TUI 仍自行解释原始 `^V`；
-非 Wayland、SSH PTY zsh、其他 shell 和不满足上述 Ghostty 子 shell 条件的
-终端不安装该 ZLE 按键，可继续用右键或 `Shift+Insert` 的 Ghostty 原生入口。
+Raw-mode programs such as Pi do not use ZLE and keep their own Ctrl+V handlers
+for image/text reads; the SSH clipboard bridge and OSC 52 write path are
+unchanged. Other TUIs interpret raw `^V` themselves. Non-Wayland sessions,
+remote SSH-PTY zsh, other shells, and terminals without the Ghostty child-shell
+conditions do not receive this ZLE key; right-click or Ghostty's native
+`Shift+Insert` paste remains available.
 
-### 现有安装只迁移这一个按键
+### Migrate only this key in an existing installation
 
-从仓库根目录运行：
+From the repository root, run:
 
 ```bash
 bash fresh-install/modules/ghostty/install.sh --paste-keybind-only
 ```
 
-窄模式只接受已存在、非符号链接、**逐字节等于旧版受管基准**的
-`~/.config/ghostty/config.ghostty`，将其原子替换为仅按键行不同的新基准；
-已是新基准则不重写。若文件有自定义内容，或旧安装以来字体/起始目录
-环境已改变使基准不再吻合，就明确拒绝，保留原文件供人工处理。
-不会调用 apt、重建 Wayland 背压库、更新字体/桌面入口/默认终端或启动 GUI，
-也不会修改已安装的 `ghostty-pi` 或普通启动器。不要为这次迁移运行无参数的
-完整 `install.sh`，因为完整模式会重置整份配置并执行以上其它步骤。
+The narrow mode accepts an existing non-symlink
+`~/.config/ghostty/config.ghostty` only when it **byte-exactly equals the old
+managed baseline**, then atomically replaces it with the new baseline that
+differs only in this key; a current file is not rewritten. Custom content, or
+changed fonts/start-directory settings since the old install, fails explicitly
+and preserves the file for manual handling. It does not call apt, rebuild the
+Wayland backpressure library, update fonts/desktop/default-terminal state,
+start the GUI, or modify `ghostty-pi` or the ordinary launcher. Do not run the
+full argument-free `install.sh` for this migration: it resets the whole
+configuration and performs the other steps above.
 
-**当前运行中的 Ghostty 进程**需要正常重载 Ghostty 配置（Ghostty 1.3.1
-默认 `Ctrl+Shift+,`，动作为 `reload_config`），或从受管入口开启新进程，
-才能获得新绑定；仅在旧窗口里新建 Pi pane 不构成进程级重载。重新进入
-Pi 后可先后按 `Ctrl+V` 与 `Ctrl+Shift+V` 验证相同当前
-文本，再试图片。专用 `ghostty-pi` 仍可运行，仍在新进程用同一
-`--keybind=ctrl+shift+v=text:\x16` 参数覆盖这条键。
+**A currently running Ghostty process** must reload its configuration normally
+(Ghostty 1.3.1 defaults to `Ctrl+Shift+,`, action `reload_config`) or start a
+new process from a managed entry before it receives the new binding; creating a
+new Pi pane in an old window is not a process-level reload. After returning to
+Pi, verify that `Ctrl+V` and `Ctrl+Shift+V` paste the same current text, then
+try an image. The dedicated `ghostty-pi` still runs and applies the same
+`--keybind=ctrl+shift+v=text:\x16` override in its new process.
 
-### 现有机器只补装 zsh 提示符粘贴
+### Add only the zsh prompt paste on an existing machine
 
-全局键已迁移后，从仓库根目录运行：
+After the global key migration, run from the repository root:
 
 ```bash
 bash fresh-install/modules/ghostty/install.sh --shell-paste-only
 ```
 
-该窄模式先逐字节核对当前受管 Ghostty 配置（必须仍是
-`ctrl+shift+v=text:\x16`）、SSH 鼠标 hook 和已有 `.zshrc` 标记块。粘贴
-hook 仅接受不存在、**已部署 v1/v2/v3 的精确字节**、或本次基准；历史内容
-由安装器和测试中固定的 SHA-256 核对，不能因改动渲染器而重新定义旧版本。
-自定义配置、hook 内用户改动、块内用户改动、符号链接、缺失的前置文件会
-**在写入前拒绝**。首次安装新增 `~/.config/ghostty/ghostty-local-paste.zsh`，
-并在现有 `.zshrc` 托管块中增加一条 source（更改前备份
-`.zshrc.bak.<时间戳>`）。已装 v1/v2 的机器只将 hook 原子替换为本次基准，
-并留存 `ghostty-local-paste.zsh.bak.<时间戳>`；已有新 `.zshrc` 托管块的
-整个文件原字节/原 inode 保持不变。重复运行不重写同样内容；块外 `.zshrc`
-内容和文件权限保持原样。
-不会执行 apt、重建背压库、
-更改全局 Ghostty 绑定/启动器/桌面入口/字体、启动 GUI，也不读取或改动
-真实剪贴板。升级后开启新 zsh，或在已有 **shell 提示符**执行：
+This narrow mode first byte-checks the current managed Ghostty configuration
+(which must remain `ctrl+shift+v=text:\x16`), the SSH mouse hook, and the
+existing `.zshrc` marker block. The paste hook must be absent, a
+**byte-exact deployed v1/v2/v3**, or the current baseline; historical content
+is pinned by independent SHA-256 values in the installer and tests, so renderer
+changes cannot redefine old versions. Customized configurations, hook edits,
+block edits, symlinks, or missing prerequisites are refused **before writing**.
+The first install adds `~/.config/ghostty/ghostty-local-paste.zsh` and one
+source line inside the existing `.zshrc` managed block (creating
+`.zshrc.bak.<timestamp>` first). A machine with v1/v2 only atomically replaces
+the hook with this baseline and preserves `ghostty-local-paste.zsh.bak.
+<timestamp>`; a current `.zshrc` managed block keeps the entire file's bytes and
+inode unchanged. Re-running does not rewrite identical content; `.zshrc`
+outside the block and its file mode remain unchanged. It does not call apt,
+rebuild backpressure, change global Ghostty bindings/launchers/desktop
+entries/fonts, start the GUI, or read/modify the real clipboard. After upgrade,
+open a new zsh or run this at an existing **shell prompt**:
 
 ```zsh
 source "$HOME/.config/ghostty/ghostty-local-paste.zsh"
 ```
 
-已由本模块持有的按键会保留并更新函数定义，重复 source 不会覆盖
-Esc Ctrl+V 的 quoted-insert；Pi 不需要 `/reload`。复制一段文本，分别试两种
-粘贴键；再试含换行的文本，确认它进入编辑缓冲区但未自动执行。
-`Esc Ctrl+V` 应能逐字插入下一个控制字符。
+An already-owned key is preserved while its function definition refreshes;
+sourcing repeatedly does not overwrite Esc Ctrl+V's quoted-insert. Pi does not
+need `/reload`. Copy text and try both paste keys; then try text containing
+newlines and confirm it enters the editing buffer without executing. `Esc
+Ctrl+V` should insert the next control character literally.
 
-无参数的完整 `install.sh` 也会在安装 Ghostty 时渲染这份 hook，写入同一
-托管块；模块中依然只有 `install.sh` 一个 shell 源文件。
+The argument-free full `install.sh` also renders this hook and writes the same
+managed block while installing Ghostty; the module still has `install.sh` as
+its only shell source file.
 
-若只在尚未安装专用入口的机器补装 `ghostty-pi`，仍可运行
-`install.sh --pi-launcher-only`；它只核对受保护启动器及背压库并安装该入口，
-**不会**迁移全局配置。三种窄模式不可组合。保留的专用入口仍可直接启动，
-也可附着原有 Pi 会话：
+To add only the dedicated `ghostty-pi` entry on a machine lacking it, run
+`install.sh --pi-launcher-only`; it verifies the protected launcher and
+backpressure library and installs that entry, but **does not** migrate global
+configuration. The three narrow modes cannot be combined. The retained
+dedicated entry can start directly or attach an existing Pi session:
 
 ```bash
 ~/.local/bin/ghostty-pi
 ~/.local/bin/ghostty-pi -e tmux attach-session -t quick-deploy_pi-agent
 ```
 
-第二条 `-e` 后的参数原样交给 Ghostty。若同一 tmux session 有其他客户端，
-切换窗口会影响它们；可使用 tmux grouped session 独立选窗，避免
-`tmux attach -d` 断开原客户端。
+Arguments after the second `-e` reach Ghostty unchanged. When other clients
+attach the same tmux session, switching windows affects them; use a tmux
+grouped session to select windows independently instead of `tmux attach -d`,
+which would disconnect the original client.
 
 ## 字体
 
