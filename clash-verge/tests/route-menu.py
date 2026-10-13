@@ -356,7 +356,7 @@ class RouteMenuTests(unittest.TestCase):
         generated = self.script.read_text()
         self.assertNotIn("tun.stack", generated)
         self.assertNotIn('"stack"', generated)
-        self.assertIn('"exclude-uid"', generated)
+        self.assertNotIn("exclude-uid", generated)
         self.assertIn('"route-exclude-address"', generated)
         node = shutil.which("node")
         self.assertIsNotNone(node, "node is required for the routing preservation fixture")
