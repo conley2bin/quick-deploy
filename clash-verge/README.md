@@ -140,11 +140,10 @@ socket/路由才能确认；自建 DERP 域名不在覆盖范围内。
 出口转发，对端看到的来源不再是本机真实地址，NAT 打洞必然失败，tailnet 流量只能
 绕远端 DERP 中继（实测国内互访被绕到洛杉矶，340ms+ 且大抖动）。
 
-因此生成的全局 Script 在规则之外还会向运行配置的 `tun` 段并集注入两个字段：
+因此生成的全局 Script 在规则之外还会向运行配置的 `tun` 段并集注入路由排除字段：
 
 ```yaml
 tun:
-  exclude-uid: [0]                              # tailscaled 以 root 运行；root 流量不进 TUN
   route-exclude-address:                        # tailnet 网段与 LAN/内网网段不进 TUN
     - 100.64.0.0/10
     - fd7a:115c:a1e0::/48
@@ -153,10 +152,14 @@ tun:
     - 192.168.0.0/16
 ```
 
-两点都是 Linux 路由排除（需要 `auto-route`，本工具不写 `auto-route` 本身），不属于
+这是 Linux 路由排除（需要 `auto-route`，本工具不写 `auto-route` 本身），不属于
 Verge 应用设置接管的字段（接管的只有 TUN 堆栈选择）。注入采用并集合并：Merge 或
-订阅里已有的排除条目会被保留。代价是所有 root 进程（如 `sudo apt`）的流量绕过代理；
-需要 root 进程走代理时不要依赖这条路径。
+订阅里已有的排除条目会被保留。
+
+注意两个已验证的边界：tailscaled 的底层流量自带 fwmark 规则，优先级高于 mihomo
+的策略路由，从来不进 TUN，所以**不需要** `exclude-uid`；而且 `exclude-uid: [0]`
+有过实际危害——它曾把公司 VPN 的内核 WireGuard 底层流量从代理路径挤到跨网直连
+UDP，晚高峰丢包 26%，隧道内的 TCP 会话随之间歇性卡死。
 
 改动在 Verge 重载/重新生成配置后才生效；生效后 `tailscale ping <对端>` 应在数包内
 从 `via DERP(...)` 升级为 `via <对端公网地址>` 直连。两台机器需要各自应用一次。
