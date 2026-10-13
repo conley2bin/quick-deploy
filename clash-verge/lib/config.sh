@@ -11,6 +11,44 @@ require_profiles() {
 
 # `rules check` / `rules render` operate solely on repository sources, so they
 # deliberately do not require a live Verge profile registry.
+# WireGuard peer endpoints must bypass the TUN at the routing layer (see README
+# 「TUN 与 Tailscale 共存」). Discover them here with sudo — running tunnels via
+# `wg show all endpoints`, down tunnels via Endpoint= in /etc/wireguard/*.conf —
+# and hand rules.py a comma-separated host:port list via TUN_FIX_WG_ENDPOINTS.
+# sudo 在这台机器按 ppid 记账，sudo 必须在 tun-fix.sh 进程内直接调用，不能
+# 下沉到 python 子进程。预设的 TUN_FIX_WG_ENDPOINTS（测试用 off / 手动列表）
+# 优先，跳过发现和 sudo。没有 /etc/wireguard 的机器（非 wg 客户端）无需 sudo。
+discover_wg_endpoints() {
+    if [ -n "${TUN_FIX_WG_ENDPOINTS+x}" ]; then
+        return 0
+    fi
+    if [ ! -d /etc/wireguard ]; then
+        TUN_FIX_WG_ENDPOINTS=""
+        export TUN_FIX_WG_ENDPOINTS
+        return 0
+    fi
+    if ! sudo -n true 2>/dev/null; then
+        if [ -t 0 ]; then
+            echo "读取 WireGuard 端点需要 sudo（/etc/wireguard 仅 root 可读）。"
+            sudo -v || return 1
+        else
+            echo "无法读取 WireGuard 端点：/etc/wireguard 仅 root 可读且当前无 sudo 时间戳；" >&2
+            echo "请先运行 sudo -v，或显式设置 TUN_FIX_WG_ENDPOINTS=<host:port,host:port>。" >&2
+            return 1
+        fi
+    fi
+    local raw
+    raw=$(sudo -n sh -c 'wg show all endpoints 2>/dev/null; grep -hE "^[[:space:]]*Endpoint" /etc/wireguard/*.conf 2>/dev/null; true') || {
+        echo "WireGuard 端点发现失败；已中止，未改动任何文件。" >&2
+        return 1
+    }
+    # wg show 行: <if>\t<pubkey>\t<host:port>；配置行: Endpoint = <host:port>
+    TUN_FIX_WG_ENDPOINTS=$(printf '%s\n' "$raw" \
+        | awk '$1 == "Endpoint" {print $NF; next} NF >= 3 {print $NF}' \
+        | grep -v '(none)' | sort -u | paste -sd,)
+    export TUN_FIX_WG_ENDPOINTS
+}
+
 check_route_sources() {
     python3 "$RULES_READER" \
         --direct "$RULES_DIR/direct.yaml" \
@@ -19,6 +57,7 @@ check_route_sources() {
 }
 
 render_route_script() {
+    discover_wg_endpoints || return 1
     python3 "$RULES_READER" \
         --direct "$RULES_DIR/direct.yaml" \
         --proxy "$RULES_DIR/proxy.yaml" \
@@ -170,6 +209,10 @@ prepare_route_target() {
         return 1
     fi
     candidate=$(mktemp "$target_dir/.${script_file##*/}.candidate.XXXXXX") || return 1
+    if ! discover_wg_endpoints; then
+        rm -f -- "$candidate"
+        return 1
+    fi
     if ! python3 "$RULES_READER" \
         --direct "$RULES_DIR/direct.yaml" \
         --proxy "$RULES_DIR/proxy.yaml" \

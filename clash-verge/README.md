@@ -150,7 +150,7 @@ tun:
     - 10.0.0.0/8
     - 172.16.0.0/12
     - 192.168.0.0/16
-    - 183.195.186.154/32                        # 公司 WireGuard 端点（见下）
+    # 另会并集注入生成时发现的 WireGuard 端点（见下）
 ```
 
 这是 Linux 路由排除（需要 `auto-route`，本工具不写 `auto-route` 本身），不属于
@@ -165,6 +165,16 @@ Verge 应用设置接管的字段（接管的只有 TUN 堆栈选择）。注入
 （机场 UDP 回程绕路，见 rules/proxy.yaml 注记），不可用。跨网直连晚高峰丢包
 26−94% 是运营商 UDP QoS，只能错峰；隧道内 ping 丢包率另有一个假象来源——公司
 网关会代理应答/过滤 ICMP，ping 不通不代表隧道数据面断了，要用 ssh 实测。
+
+端点地址不硬编码：`rules render/apply` 在生成时用 sudo 自动发现——运行中的隧道
+读 `wg show all endpoints`（已解析为 IP），未启动的隧道读 `/etc/wireguard/*.conf`
+的 `Endpoint=` 行（域名在此解析为 v4/v6），转成 `/32`、`/128` 注入
+`discoveredWgEndpoints`。所以 VPN 没开也能排除；换端点只需重跑一次 apply。
+`/etc/wireguard` 仅 root 可读：交互运行时按提示输密码，非交互运行前先 `sudo -v`，
+或用 `TUN_FIX_WG_ENDPOINTS=<host:port,...>` 显式指定（`off` 关闭发现，测试用）。
+没有 `/etc/wireguard` 的机器（非 wg 客户端，如公司那台）自动跳过、不需要 sudo。
+排除的语义只是「不进 TUN、按物理路由表直连」，即使端点 IP 与局域网某台机器重合
+也无害——与不加这条规则时的物理网络行为完全一致。
 
 注意两个已验证的边界：tailscaled 的底层流量自带 fwmark 规则，优先级高于 mihomo
 的策略路由，从来不进 TUN，所以**不需要** `exclude-uid`；而且 `exclude-uid: [0]`

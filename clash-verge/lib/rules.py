@@ -5,7 +5,9 @@ from __future__ import annotations
 import argparse
 import ipaddress
 import json
+import os
 import re
+import socket
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -467,7 +469,54 @@ def migration_check(registry: Path, local_rules: dict[str, list[Rule]]) -> None:
         )
 
 
-def render(rules: dict[str, list[Rule]]) -> str:
+def endpoint_host(value: str) -> str:
+    if value.startswith("[") and "]" in value:
+        return value[1:value.index("]")]
+    host, _, _ = value.rpartition(":")
+    return host or value
+
+
+def endpoint_cidrs(values: list[str]) -> list[str]:
+    cidrs: set[str] = set()
+    unresolved: list[str] = []
+    for value in values:
+        host = endpoint_host(value)
+        try:
+            ip = ipaddress.ip_address(host)
+            hosts = [str(ip)]
+        except ValueError:
+            try:
+                hosts = [info[4][0] for info in socket.getaddrinfo(host, None)]
+            except socket.gaierror:
+                unresolved.append(host)
+                continue
+        for resolved in hosts:
+            ip = ipaddress.ip_address(resolved)
+            cidrs.add(f"{ip}/{32 if ip.version == 4 else 128}")
+    if unresolved:
+        raise SourceError(
+            "WireGuard 端点域名无法解析: " + ", ".join(sorted(set(unresolved)))
+        )
+    return sorted(cidrs)
+
+
+def discover_wg_endpoints() -> list[str]:
+    """CIDRs of WireGuard peer endpoints that must bypass the TUN.
+
+    tun-fix.sh discovers endpoints with sudo (running tunnels via
+    `wg show all endpoints`, down tunnels via Endpoint= in /etc/wireguard/*.conf)
+    and passes them here as TUN_FIX_WG_ENDPOINTS, a comma-separated host:port
+    list; hostnames are resolved here. Empty/unset means the machine has no
+    WireGuard endpoints to exclude; "off" disables injection (tests).
+    """
+    override = os.environ.get("TUN_FIX_WG_ENDPOINTS", "")
+    values = [item.strip() for item in override.split(",") if item.strip()]
+    if not values or (len(values) == 1 and values[0].lower() == "off"):
+        return []
+    return endpoint_cidrs(values)
+
+
+def render(rules: dict[str, list[Rule]], wg_endpoints: list[str] | None = None) -> str:
     packed = {phase: [rule.text for rule in rules[phase]] for phase in ("pre", "post")}
     proxy_targets = sorted({rule.target for phase in ("pre", "post") for rule in rules[phase]
                             if rule.target != "DIRECT"})
@@ -475,7 +524,7 @@ def render(rules: dict[str, list[Rule]]) -> str:
   // physical gateway (tailscaled's own underlay already bypasses policy routing
   // via its fwmark rules; this covers uid-1000 traffic to tailnet/LAN peers).
   // These are Linux routing exclusions (they require auto-route), not app-owned
-  // Verge settings such as the TUN stack choice; union-merge keeps exclusions set elsewhere.\n  // 183.195.186.154 = company WireGuard endpoint. A clash-rule DIRECT is not\n  // enough: once the underlay enters the TUN (Meta mtu 9000), wg-quick derives\n  // wg0's MTU as 9000-80=8920 and bulk TCP output blackholes (ssh freezes on\n  // large output). Routing the endpoint around the TUN keeps wg0 at 1420 and\n  // the underlay on the physical NIC. Proxying the underlay was measured worse\n  // (0%% loss but 340-460ms RTT hairpin; see rules/proxy.yaml).\n  const tunExclusions = {\n    // No exclude-uid: tailscaled marks its own underlay packets (its fwmark\n    // rules precede the TUN's policy rules, so it was never captured), and\n    // excluding uid 0 forced the company VPN's kernel WireGuard underlay off\n    // the proxied path onto lossy direct cross-carrier UDP.\n    \"route-exclude-address\": [\"100.64.0.0/10\", \"fd7a:115c:a1e0::/48\", \"10.0.0.0/8\", \"172.16.0.0/12\", \"192.168.0.0/16\", \"183.195.186.154/32\"],\n  };\n  const tun = (config.tun && typeof config.tun === \"object\" && !Array.isArray(config.tun)) ? config.tun : {};\n  for (const key of Object.keys(tunExclusions)) {\n    const prior = Array.isArray(tun[key]) ? tun[key] : [];\n    tun[key] = [...new Set([...prior, ...tunExclusions[key]])];\n  }\n  config.tun = tun;\n  return config;\n}\n""" % (json.dumps(packed, ensure_ascii=False, indent=2), json.dumps(proxy_targets, ensure_ascii=False))
+  // Verge settings such as the TUN stack choice; union-merge keeps exclusions set elsewhere.\n  // WireGuard peer endpoints are discovered at generation time (wg show all\n  // endpoints plus Endpoint= lines in /etc/wireguard/*.conf, hostnames resolved)\n  // and baked into discoveredWgEndpoints. They must bypass the TUN at the\n  // routing layer: a clash-rule DIRECT is not enough, because once the underlay\n  // enters the TUN (Meta mtu 9000), wg-quick derives the wg interface MTU as\n  // 9000-80=8920 and bulk TCP output blackholes (ssh freezes on large output).\n  // Proxying the underlay was measured worse (0%% loss but 340-460ms RTT\n  // hairpin; see rules/proxy.yaml).\n  const discoveredWgEndpoints = %s;\n  const tunExclusions = {\n    // No exclude-uid: tailscaled marks its own underlay packets (its fwmark\n    // rules precede the TUN's policy rules, so it was never captured), and\n    // excluding uid 0 forced the company VPN's kernel WireGuard underlay off\n    // the proxied path onto lossy direct cross-carrier UDP.\n    \"route-exclude-address\": [\"100.64.0.0/10\", \"fd7a:115c:a1e0::/48\", \"10.0.0.0/8\", \"172.16.0.0/12\", \"192.168.0.0/16\"].concat(discoveredWgEndpoints),\n  };\n  const tun = (config.tun && typeof config.tun === \"object\" && !Array.isArray(config.tun)) ? config.tun : {};\n  for (const key of Object.keys(tunExclusions)) {\n    const prior = Array.isArray(tun[key]) ? tun[key] : [];\n    tun[key] = [...new Set([...prior, ...tunExclusions[key]])];\n  }\n  config.tun = tun;\n  return config;\n}\n""" % (json.dumps(packed, ensure_ascii=False, indent=2), json.dumps(proxy_targets, ensure_ascii=False), json.dumps(wg_endpoints or []))
 
 
 def parsed_sources(direct: Path, proxy: Path) -> dict[str, list[Rule]]:
@@ -519,14 +568,14 @@ def main() -> int:
                 parser.error("--prepare requires --prepared-script")
             resolved = resolve_app_rules(rules)
             migration_check(args.registry, resolved)
-            args.prepared_script.write_text(render(resolved), encoding="utf-8")
+            args.prepared_script.write_text(render(resolved, discover_wg_endpoints()), encoding="utf-8")
         elif args.migration_check:
             if not args.registry:
                 parser.error("--migration-check requires --registry")
             migration_check(args.registry, rules)
             print("no bound local Rules duplicates")
         elif args.render:
-            print(render(resolve_app_rules(rules)), end="")
+            print(render(resolve_app_rules(rules), discover_wg_endpoints()), end="")
         else:
             app_count = sum(
                 1 for phase in ("pre", "post") for rule in rules[phase] if rule.selector[0] == "APP"

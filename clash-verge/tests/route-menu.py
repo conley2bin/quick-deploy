@@ -171,6 +171,7 @@ class RouteMenuTests(unittest.TestCase):
             "DPKG_MAP": str(self.manifest),
             "SSH_LOG": str(self.ssh_log),
             "PROBE_LOG": str(self.probe_log),
+            "TUN_FIX_WG_ENDPOINTS": "off",
         })
         environment.update({key: str(value) for key, value in overrides.items()})
         return environment
@@ -372,7 +373,6 @@ class RouteMenuTests(unittest.TestCase):
                 "route-exclude-address": [
                     "100.64.0.0/10", "fd7a:115c:a1e0::/48",
                     "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
-                    "183.195.186.154/32",
                 ],
             },
             "rules": ["DOMAIN,force.example,DIRECT", "DOMAIN-SUFFIX,cn,DIRECT", "MATCH,DIRECT"],
@@ -876,6 +876,42 @@ class RouteMenuTests(unittest.TestCase):
         self.assertEqual(len(list(self.ssh_config.parent.glob(f"{self.ssh_config.name}.backup.*"))), 1)
 
     # ---- generated artifact guards --------------------------------------
+    def test_wg_endpoint_env_override_injects_discovered_cidrs(self) -> None:
+        result = self.run_entry(
+            "rules", "render",
+            environment=self.environment(
+                TUN_FIX_WG_ENDPOINTS="203.0.113.7:51820,[2001:db8::10]:51820",
+            ),
+        )
+        self.assertIn('"203.0.113.7/32"', result.stdout)
+        self.assertIn('"2001:db8::10/128"', result.stdout)
+        node = shutil.which("node")
+        self.assertIsNotNone(node, "node is required for the routing preservation fixture")
+        generated = result.stdout
+        base = {
+            "tun": {"stack": "gvisor", "enable": True, "mtu": 1400},
+            "dns": {"enable": True, "enhanced-mode": "fake-ip"},
+            "proxy-groups": [], "rules": ["MATCH,DIRECT"],
+        }
+        merged = self.host_wrapped_js(node, generated, base)
+        exclusions = merged["tun"]["route-exclude-address"]
+        self.assertIn("203.0.113.7/32", exclusions)
+        self.assertIn("2001:db8::10/128", exclusions)
+        self.assertIn("100.64.0.0/10", exclusions)
+
+    def test_wg_endpoint_env_override_resolves_hostnames(self) -> None:
+        result = self.run_entry(
+            "rules", "render",
+            environment=self.environment(TUN_FIX_WG_ENDPOINTS="localhost:51820"),
+        )
+        self.assertIn('"127.0.0.1/32"', result.stdout)
+
+    def test_wg_endpoint_env_override_off_discovers_nothing(self) -> None:
+        result = self.run_entry("rules", "render")
+        self.assertIn('"route-exclude-address"', result.stdout)
+        self.assertNotIn("183.195.186.154", result.stdout)
+        self.assertIn('discoveredWgEndpoints=[];', result.stdout.replace(" ", ""))
+
     def test_generated_script_preserves_guard_and_exact_policy_identity(self) -> None:
         node = shutil.which("node")
         if node is None:
