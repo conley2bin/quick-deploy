@@ -370,7 +370,10 @@ class RouteMenuTests(unittest.TestCase):
             "tun": {
                 **base["tun"],
                 "exclude-uid": [0],
-                "route-exclude-address": ["100.64.0.0/10", "fd7a:115c:a1e0::/48"],
+                "route-exclude-address": [
+                    "100.64.0.0/10", "fd7a:115c:a1e0::/48",
+                    "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
+                ],
             },
             "rules": ["DOMAIN,force.example,DIRECT", "DOMAIN-SUFFIX,cn,DIRECT", "MATCH,DIRECT"],
         })

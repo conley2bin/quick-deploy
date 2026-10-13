@@ -145,7 +145,12 @@ socket/路由才能确认；自建 DERP 域名不在覆盖范围内。
 ```yaml
 tun:
   exclude-uid: [0]                              # tailscaled 以 root 运行；root 流量不进 TUN
-  route-exclude-address: [100.64.0.0/10, fd7a:115c:a1e0::/48]  # tailnet 网段不进 TUN
+  route-exclude-address:                        # tailnet 网段与 LAN/内网网段不进 TUN
+    - 100.64.0.0/10
+    - fd7a:115c:a1e0::/48
+    - 10.0.0.0/8
+    - 172.16.0.0/12
+    - 192.168.0.0/16
 ```
 
 两点都是 Linux 路由排除（需要 `auto-route`，本工具不写 `auto-route` 本身），不属于
