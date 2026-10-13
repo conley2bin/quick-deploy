@@ -75,6 +75,9 @@ usage() {
 
 菜单是日常入口：回车等价于选项 1。更新只写已登记的全局 Script 及其同目录备份；
 订阅、Merge、DNS、TUN、运行 YAML 和 ~/.ssh 都不会被这条路径改动。
+生成的 Script 除路由规则外还会并集注入 TUN 排除字段（exclude-uid/route-exclude-address，
+用于 Tailscale 与 TUN 共存，详见 README「TUN 与 Tailscale 共存」）；字段注入在
+Verge 重载后才进入运行配置。
 生成成功后需在 Verge 中手动重载/重新生成配置。
 
 遇到“由应用设置接管的字段 tun.stack，这些值已被丢弃”：

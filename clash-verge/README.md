@@ -133,6 +133,29 @@ ULA 对端地址。这组规则只说明规则表会把之后的连接判给 `DI
 流量已经直连」的运行证据：重载前已建立的连接可能继续沿用旧出口，要重连或看实际
 socket/路由才能确认；自建 DERP 域名不在覆盖范围内。
 
+### TUN 与 Tailscale 共存
+
+规则层的 `DIRECT` 救不了 Tailscale 打洞：tailscaled 的底层 UDP（STUN 探测、DERP、
+对端 WireGuard 流量）走的是对端公网 IP，这些包一旦进入 mihomo 的 TUN 就会被代理
+出口转发，对端看到的来源不再是本机真实地址，NAT 打洞必然失败，tailnet 流量只能
+绕远端 DERP 中继（实测国内互访被绕到洛杉矶，340ms+ 且大抖动）。
+
+因此生成的全局 Script 在规则之外还会向运行配置的 `tun` 段并集注入两个字段：
+
+```yaml
+tun:
+  exclude-uid: [0]                              # tailscaled 以 root 运行；root 流量不进 TUN
+  route-exclude-address: [100.64.0.0/10, fd7a:115c:a1e0::/48]  # tailnet 网段不进 TUN
+```
+
+两点都是 Linux 路由排除（需要 `auto-route`，本工具不写 `auto-route` 本身），不属于
+Verge 应用设置接管的字段（接管的只有 TUN 堆栈选择）。注入采用并集合并：Merge 或
+订阅里已有的排除条目会被保留。代价是所有 root 进程（如 `sudo apt`）的流量绕过代理；
+需要 root 进程走代理时不要依赖这条路径。
+
+改动在 Verge 重载/重新生成配置后才生效；生效后 `tailscale ping <对端>` 应在数包内
+从 `via DERP(...)` 升级为 `via <对端公网地址>` 直连。两台机器需要各自应用一次。
+
 ### 迁移：清掉旧的订阅级重复规则
 
 如果之前用订阅级 Rules 扩展手工加过同一条本地规则（例如

@@ -354,8 +354,10 @@ class RouteMenuTests(unittest.TestCase):
         self.assertEqual(self.changed_paths(before, self.snapshot(include_mtime=True)), allowed)
         self.assertEqual(len(self.backups()), 1)
         generated = self.script.read_text()
-        self.assertNotIn("config.tun", generated)
         self.assertNotIn("tun.stack", generated)
+        self.assertNotIn('"stack"', generated)
+        self.assertIn('"exclude-uid"', generated)
+        self.assertIn('"route-exclude-address"', generated)
         node = shutil.which("node")
         self.assertIsNotNone(node, "node is required for the routing preservation fixture")
         base = {
@@ -364,7 +366,13 @@ class RouteMenuTests(unittest.TestCase):
             "proxy-groups": [], "rules": ["MATCH,DIRECT"],
         }
         self.assertEqual(self.host_wrapped_js(node, generated, base), {
-            **base, "rules": ["DOMAIN,force.example,DIRECT", "DOMAIN-SUFFIX,cn,DIRECT", "MATCH,DIRECT"],
+            **base,
+            "tun": {
+                **base["tun"],
+                "exclude-uid": [0],
+                "route-exclude-address": ["100.64.0.0/10", "fd7a:115c:a1e0::/48"],
+            },
+            "rules": ["DOMAIN,force.example,DIRECT", "DOMAIN-SUFFIX,cn,DIRECT", "MATCH,DIRECT"],
         })
         self.assertNotIn("已生效", result.stdout)
         before_noop = self.snapshot(include_mtime=True)
