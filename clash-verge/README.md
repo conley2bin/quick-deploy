@@ -90,6 +90,20 @@ post: []
 改完执行菜单回车（或 `./clash-verge/tun-fix.sh rules apply`），然后在 Verge 中重载/重新
 生成配置。**重载前运行中的核心仍是旧规则**；工具只报告写入成功，不会声称已经生效。
 
+### 可选自建 VPS 节点
+
+若已用 [`../vps/`](../vps/README.md) 生成私有
+`~/.local/state/quick-deploy-private/vps/generated/clash-nodes.json`，规则生成器会把
+`SELF-Reality`、`SELF-Hy2` 和 `🛰️ 自建 VPS` select 组内联进生成的 Script，并把三者加入
+现有 `🚀 节点选择` select 的选项。订阅节点和其它组保持；缺少该 select 组会通过现有
+core 校验 guard 显式报错。不存在私有文件时，生成结果逐字节保持原样；损坏、非0600
+或链接文件不会静默忽略。两 PC 各自 `vps/setup.sh render --device company|home`，不要共用
+手机身份。Hy2使用SHA256证书pin，不跳过校验。
+
+只在显式规则 render/apply 时读取私有输出；`vps/setup.sh render/deploy` 不自动写 Script
+或重载 Verge。无外部 file provider，不需要放宽 mihomo SAFE_PATHS。生成的Script和备份
+含凭据，不能提交Git或分享。新增离线回归：`RM_GUARD_CONFIRM=1 python3 clash-verge/tests/vps-integration.py`。
+
 ### 应用声明
 
 受支持的 ID 只有 `baidunetdisk`（百度网盘）、`wemeet`（腾讯会议）、`feishu`（飞书）、
