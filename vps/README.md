@@ -60,7 +60,7 @@ bash ~/quick-deploy/vps/setup.sh deploy --host <VPS数字IP> --device company --
 # 在家里PC执行时用 --device home；可加 --user ubuntu --port 2222
 ```
 
-部署先确认目标，安装 sing-box 官方签名 APT 包、Tailscale 官方安装器；已有 sing-box 不自动升级。新包安装期间临时 mask，避免默认配置自动启动。只接受 Ubuntu24.04，Tailscale 现场检查 CLI flags。默认 `tailscale up` 打印登录 URL，等待最多10分钟；在浏览器登录并批准标签。然后设置 `--relay-server-port=40000`，不提供 exit node 或子网路由。
+部署先确认目标，安装 sing-box 官方签名APT包，固定为[稳定版1.13.12](https://github.com/SagerNet/sing-box/releases/tag/v1.13.12)（`vps.py:SING_BOX_VERSION`），并`apt-mark hold`；版本写入上传params。已有版本必须精确匹配，否则明确停止，不自动升/降级。APT仓库若已不保留该版本也失败，不退回latest。版本变更须先修改固定值并重新审查/验收。Tailscale用官方安装器。新包安装期间临时 mask，避免默认配置自动启动。只接受 Ubuntu24.04，Tailscale 现场检查 CLI flags。默认 `tailscale up` 打印登录 URL，等待最多10分钟；在浏览器登录并批准标签。然后设置 `--relay-server-port=40000`，不提供 exit node 或子网路由。
 
 可选用 `--auth-key-file /private/auth-key`（当前用户0600）或 `TS_AUTHKEY` 环境变量。密钥通过 SSH stdin 的 root-only 临时文件传输，CLI 只传 `file:` 路径，不打印密钥；用后删除。不保存 auth key 为长期恢复凭据，换机通常新建一次性 tagged key。
 
@@ -130,7 +130,7 @@ bash ~/quick-deploy/vps/setup.sh backup            # 使用 inventory backup_ali
 # 或 backup --alias 已有SSH别名
 ```
 
-status/check 检查 sing-box、Tailscale运行/标签、443 TCP+UDP及40000UDP监听、本模块nft表。check 再在临时目录启动独立 mihomo（可 `--mihomo /path/to/binary`），绑定临时127.0.0.1 mixed端口，不开TUN、控制器、系统代理或DNS监听，不碰Verge。每节点请求 OpenAI/Anthropic/Gemini models endpoint，TLS验证启用，不发送密钥。收到HTTP状态即可证明该HTTPS端点可达（401/403/400正常）；逐节点、逐服务输出PASS/FAIL。它不能证明账号额度、地域资格或模型权限。端口竞争或启动失败显式失败并清理进程，没有直连fallback。
+status/check 检查 sing-box、Tailscale运行/标签、443 TCP+UDP及40000UDP监听；用数字化nft输出核对真实proxy UID guard、检查UID drop-in/加载User，并通过MainPID的实际EUID确认进程不以root运行。candidate阶段也核对UID替换成功。check 再在临时目录启动独立 mihomo（可 `--mihomo /path/to/binary`），绑定临时127.0.0.1 mixed端口，不开TUN、控制器、系统代理或DNS监听，不碰Verge。每节点请求 OpenAI/Anthropic/Gemini models endpoint，TLS验证启用，不发送密钥。收到HTTP状态即可证明该HTTPS端点可达（401/403/400正常）；逐节点、逐服务输出PASS/FAIL。它不能证明账号额度、地域资格或模型权限。端口竞争或启动失败显式失败并清理进程，没有直连fallback。
 
 rollback也使用独立180秒timer：先保存当前状态用于撤销，再恢复最近一次成功deploy之前的配置与本模块nft表，通过新鲜公钥登录并输入YES才保留；否则恢复到rollback前。pristine目标必须保持sing-box停用且无配置。重复确认的rollback恢复同一checkpoint，不来回切换。abort等待操作锁直至取得，timer设置RemainAfterElapse=no；应用前与abort/commit都会清理旧timer，timer缺失不妨碍恢复。不轮换身份、不删除软件、不退网。backup用已有SSH别名和rsync写入对端独立的 `~/.local/state/quick-deploy-private/vps-backups/<来源hostname>/`，绝不覆盖对端live `vps/` 中的inventory、device或generated。保留0700/0600，不用`--delete`，不复制活动锁。备份未做磁盘文件加密，但通过SSH加密传输；请另存离机加密副本。
 

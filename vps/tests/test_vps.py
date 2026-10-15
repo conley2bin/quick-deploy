@@ -186,6 +186,7 @@ class VPS(unittest.TestCase):
             self.assertEqual(set(archive.getnames()), {"remote.sh", "config.json", "params.json", "authorized_keys", "firewall.template", "auth-key"})
             self.assertTrue(all(m.mode == 0o600 for m in archive.getmembers()))
             self.assertEqual(archive.extractfile("auth-key").read(), b"secret-auth-fixture")
+            self.assertEqual(json.load(archive.extractfile("params.json"))["sing_box_version"], vps.SING_BOX_VERSION)
             self.assertNotIn(b"secret-auth-fixture", archive.extractfile("remote.sh").read())
 
     def test_fresh_ssh_forces_publickey_and_disables_multiplex_proxy(self):

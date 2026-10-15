@@ -96,7 +96,18 @@ restore() {
 health() {
     systemctl is-active --quiet sing-box
     systemctl is-active --quiet tailscaled
-    nft list table inet qd_vps >/dev/null
+    local proxy_uid table pid process_uid loaded_user
+    proxy_uid=$(id -u qd-vps-proxy)
+    table=$(nft --numeric list table inet qd_vps)
+    grep -qF "meta skuid $proxy_uid jump proxy_output" <<<"$table" \
+        || { echo 'nft proxy UID guard is missing or substituted incorrectly' >&2; return 1; }
+    grep -qx 'User=qd-vps-proxy' /etc/systemd/system/sing-box.service.d/90-quick-deploy-vps.conf
+    loaded_user=$(systemctl show -p User --value sing-box)
+    [[ $loaded_user == qd-vps-proxy ]] || { echo 'Loaded sing-box User override is missing' >&2; return 1; }
+    pid=$(systemctl show -p MainPID --value sing-box)
+    [[ $pid =~ ^[0-9]+$ && $pid -gt 1 ]] || { echo 'Invalid sing-box MainPID' >&2; return 1; }
+    process_uid=$(ps -o euid= -p "$pid")
+    [[ ${process_uid//[[:space:]]/} == "$proxy_uid" ]] || { echo 'sing-box MainPID does not run as proxy UID' >&2; return 1; }
     local listeners
     listeners=$(ss -H -ltn 'sport = :443'); grep -q . <<<"$listeners"
     listeners=$(ss -H -lun 'sport = :443'); grep -q . <<<"$listeners"
@@ -157,13 +168,15 @@ Components: *
 Enabled: yes
 Signed-By: /etc/apt/keyrings/sagernet.asc
 EOF
+    version=$(param sing_box_version)
+    [[ $version =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo 'Invalid pinned sing-box version' >&2; exit 1; }
     if ! command -v sing-box >/dev/null; then
         # Never let a package post-install start an unconfigured proxy before
         # the destination guard exists. Existing installations are not upgraded.
         systemctl mask --runtime sing-box.service
         masked=true
         apt-get update
-        apt-get install -y sing-box
+        apt-get install -y "sing-box=$version"
         # Upstream ships a public example password. It must NEVER enter the
         # pristine recovery checkpoint or become boot-enabled unguarded.
         rm -f "$CONF"
@@ -171,6 +184,9 @@ EOF
         systemctl unmask --runtime sing-box.service
         masked=false
     fi
+    installed_version=$(dpkg-query -W -f='${Version}' sing-box)
+    [[ $installed_version == "$version" ]] || { echo "sing-box version mismatch: expected $version, installed $installed_version; no automatic downgrade/upgrade" >&2; exit 1; }
+    apt-mark hold sing-box
     if ! command -v tailscale >/dev/null; then
         curl -fsSL https://tailscale.com/install.sh -o "$ROOT/install-tailscale.sh"
         sh "$ROOT/install-tailscale.sh"
@@ -213,6 +229,8 @@ EOF
     uid=$(id -u qd-vps-proxy)
     [[ $uid -gt 0 && $uid -lt 1000 ]] || { echo 'qd-vps-proxy must be an isolated system UID' >&2; exit 1; }
     sed "s/meta skuid 999 /meta skuid $uid /" "$ROOT/incoming/firewall.template" >"$ROOT/candidate.nft"
+    grep -qF "meta skuid $uid jump proxy_output" "$ROOT/candidate.nft" \
+        || { echo 'Candidate nft UID substitution failed' >&2; exit 1; }
     sing-box check -c "$ROOT/incoming/config.json"
     # nft check needs an atomic delete/create batch on subsequent deployments.
     : >"$ROOT/candidate-transaction.nft"

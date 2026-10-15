@@ -40,14 +40,17 @@ class RemoteTransaction(unittest.TestCase):
         self.env = dict(os.environ, PATH=f"{self.bin}:{os.environ['PATH']}", QD_LOG=str(self.log), SSH_CONNECTION="198.51.100.5 12345 203.0.113.1 22")
         (self.state / "incoming/params.json").write_text(json.dumps({"ssh_user": "root"}))
         self.stub("systemctl", '''printf 'systemctl %s\\n' "$*" >>"$QD_LOG"
+case "$*" in 'show -p User --value sing-box') echo qd-vps-proxy;; 'show -p MainPID --value sing-box') echo 4242;; esac
 if [ "${QD_FAIL_RESTART:-}" = yes ] && [ "$*" = 'restart sing-box' ]; then exit 73; fi
 exit 0
 ''')
         self.stub("nft", '''printf 'nft %s\\n' "$*" >>"$QD_LOG"
-if [ "$1" = list ]; then printf 'table inet qd_vps {}\\n'; fi
+if [[ " $* " == *' list '* ]]; then printf 'table inet qd_vps { meta skuid 998 jump proxy_output; }\\n'; fi
 exit 0
 ''')
         self.stub("sing-box", 'printf "sing-box %s\\n" "$*" >>"$QD_LOG"\nexit 0\n')
+        self.stub("id", 'if [ "${1:-}" = -u ] && [ "${2:-}" = qd-vps-proxy ]; then echo 998; else exec /usr/bin/id "$@"; fi\n')
+        self.stub("ps", 'echo "${QD_PROCESS_UID:-998}"\n')
         self.stub("ss", 'echo listening\n')
         self.stub("sleep", 'exit 0\n')
         self.stub("tailscale", 'echo \'{"BackendState":"Running","Self":{"Tags":["tag:relay"]}}\'\n')
@@ -82,6 +85,7 @@ exec /usr/bin/install "${args[@]}"
         (self.state / "candidate-transaction.nft").write_text('delete table inet qd_vps\ntable inet qd_vps {}\n')
         (self.state / "incoming/config.json").write_text('new configuration\n')
         (self.etc / "sing-box/config.json").write_text('old configuration\n')
+        (self.etc / "systemd/system/sing-box.service.d/90-quick-deploy-vps.conf").write_text('[Service]\nUser=qd-vps-proxy\n')
 
     def stub(self, name, body):
         path = self.bin / name
@@ -147,6 +151,8 @@ exec /usr/bin/install "${args[@]}"
         self.stub("systemctl", '''printf 'systemctl %s\\n' "$*" >>"$QD_LOG"
 root=$(dirname "$QD_LOG")
 case "$*" in
+'show -p User --value sing-box') echo qd-vps-proxy;;
+'show -p MainPID --value sing-box') echo 4242;;
 'enable sing-box') touch "$root/enabled";;
 'disable --now sing-box') rm -f "$root/enabled" "$root/running";;
 'reboot') if [ -f "$root/enabled" ]; then touch "$root/running"; fi;;
@@ -172,7 +178,7 @@ exit 0
     def test_enabled_state_and_fresh_package_cleanup_order(self):
         source = self.script.read_text()
         self.assertIn('systemctl is-enabled --quiet sing-box', source)
-        fresh = source.split('apt-get install -y sing-box', 1)[1].split('masked=false', 1)[0]
+        fresh = source.split('apt-get install -y "sing-box=$version"', 1)[1].split('masked=false', 1)[0]
         self.assertLess(fresh.index('rm -f "$CONF"'), fresh.index('systemctl unmask'))
         restore = source.split('restore() {', 1)[1].split('health() {', 1)[0]
         self.assertLess(restore.index('disable --now sing-box'), restore.index('nft -f'))
@@ -182,6 +188,7 @@ exit 0
     def test_timer_absence_is_tolerated_and_elapsed_timer_does_not_linger(self):
         self.stub("systemctl", '''printf 'systemctl %s\\n' "$*" >>"$QD_LOG"
 if [ "$*" = 'stop quick-deploy-vps-revert.timer' ]; then exit 5; fi
+case "$*" in 'show -p User --value sing-box') echo qd-vps-proxy;; 'show -p MainPID --value sing-box') echo 4242;; esac
 exit 0
 ''')
         self.assertEqual(self.action("apply").returncode, 0)
@@ -213,6 +220,21 @@ exit 0
     def test_no_early_exit_pipeline_consumers_under_pipefail(self):
         for path in MODULE.rglob("*.sh"):
             self.assertIsNone(re.search(r"\|\s*(?:grep\s+-[^\n]*q|head\b)", path.read_text()), str(path))
+
+    def test_health_rejects_unsubstituted_uid_or_root_proxy_process(self):
+        self.assertEqual(self.action("health").returncode, 0)
+        result = self.action("health", QD_PROCESS_UID="0")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('MainPID does not run as proxy UID', result.stderr)
+        self.stub("nft", 'echo "table inet qd_vps { meta skuid 999 jump proxy_output; }"\n')
+        result = self.action("health")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('nft proxy UID guard', result.stderr)
+
+    def test_pinned_version_is_required_before_hold(self):
+        source = self.script.read_text()
+        self.assertIn('apt-get install -y "sing-box=$version"', source)
+        self.assertLess(source.index('installed_version == "$version"'), source.index('apt-mark hold sing-box'))
 
     def test_health_tag_failure_is_explicit(self):
         self.stub("tailscale", 'echo \'{"BackendState":"Running","Self":{"Tags":[]}}\'\n')

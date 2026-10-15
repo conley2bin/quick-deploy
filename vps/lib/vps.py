@@ -28,6 +28,8 @@ from urllib.parse import quote, urlencode
 
 MODULE = Path(__file__).resolve().parents[1]
 DEVICES = ("company", "home", "phone")
+# Audited stable release; replacement hosts must not drift to latest.
+SING_BOX_VERSION = "1.13.12"
 # Explicitly cover shared, benchmark, documentation, multicast and transition
 # ranges as well as RFC1918. Keep this list shared with the kernel output guard.
 BLOCKED4 = ["0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8",
@@ -424,7 +426,8 @@ def bundle(ident, company, record, keys, auth=None):
     files = {"remote.sh": (MODULE / "lib/remote.sh").read_bytes(),
              "config.json": dumps(server_config(ident, company, record["host"])).encode(),
              "params.json": dumps({"company": company, "host": record["host"], "ssh_port": record["port"],
-                                   "ssh_user": record["user"], "target": ident["reality_target"]}).encode(),
+                                   "ssh_user": record["user"], "target": ident["reality_target"],
+                                   "sing_box_version": SING_BOX_VERSION}).encode(),
              "authorized_keys": ("\n".join(keys) + "\n").encode(),
              "firewall.template": firewall(company, record["port"], 999).encode()}
     if auth:
