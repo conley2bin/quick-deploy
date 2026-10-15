@@ -219,13 +219,31 @@ class VPS(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_backup_uses_existing_alias_preserves_modes_without_delete(self):
-        with mock.patch.object(vps, "run") as run:
+        with mock.patch.object(vps, "run") as run, mock.patch.object(vps.socket, "gethostname", return_value="source-fixture"):
             vps.backup(self.state, {"backup_alias": "other-pc"}, None)
         commands = [call.args[0] for call in run.call_args_list]
         self.assertEqual(commands[0][0:2], ["ssh", "other-pc"])
         self.assertIn("--chmod=D700,F600", commands[1])
         self.assertNotIn("--delete", commands[1])
         self.assertIn("--exclude=.lock", commands[1])
+        self.assertEqual(commands[1][-1], "other-pc:.local/state/quick-deploy-private/vps-backups/source-fixture/")
+
+    def test_backup_does_not_replace_peer_inventory_or_generated_identity(self):
+        peer = self.state.parent / "peer"
+        live = peer / ".local/state/quick-deploy-private/vps"
+        (live / "generated").mkdir(parents=True)
+        (live / "inventory.json").write_text('home inventory')
+        (live / "generated/clash-nodes.json").write_text('home nodes')
+        (self.state / "inventory.json").write_text('company inventory')
+        def execute(argv):
+            if argv[0] == "rsync":
+                target = peer / argv[-1].split(":", 1)[1]
+                shutil.copytree(self.state, target, dirs_exist_ok=True)
+        with mock.patch.object(vps, "run", side_effect=execute), mock.patch.object(vps.socket, "gethostname", return_value="source-fixture"):
+            vps.backup(self.state, {"backup_alias": "other-pc"}, None)
+        self.assertEqual((live / "inventory.json").read_text(), 'home inventory')
+        self.assertEqual((live / "generated/clash-nodes.json").read_text(), 'home nodes')
+        self.assertEqual((peer / ".local/state/quick-deploy-private/vps-backups/source-fixture/inventory.json").read_text(), 'company inventory')
 
     def test_server_transaction_contract_order_and_no_global_flush(self):
         source = (MODULE / "lib/remote.sh").read_text()

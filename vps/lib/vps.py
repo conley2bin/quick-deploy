@@ -556,12 +556,15 @@ def backup(state, inv, alias):
     alias = alias or inv.get("backup_alias")
     if not alias or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", alias):
         raise Error("Set backup_alias in private inventory, or --alias (existing SSH alias)")
-    target = ".local/state/quick-deploy-private/vps"
+    source_host = socket.gethostname()
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,252}", source_host):
+        raise Error("Cannot use this source hostname as an isolated backup directory")
+    target = f".local/state/quick-deploy-private/vps-backups/{source_host}"
     run(["ssh", alias, f"umask 077; mkdir -p ~/{target}; chmod 700 ~/{target}"])
     # No --delete; an interrupted source cannot erase the second copy. Lock is
     # local coordination, not recovery state, and must not replace a peer lock.
     run(["rsync", "-a", "--chmod=D700,F600", "--exclude=.lock", "-e", "ssh", str(state) + "/", f"{alias}:{target}/"])
-    print("Private state copied over existing SSH alias; verify restore on the other PC.")
+    print(f"Private backup: {alias}:~/{target}/ (peer live VPS state unchanged). Verify a staged restore before use.")
 
 
 def parser():
