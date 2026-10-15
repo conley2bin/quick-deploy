@@ -287,6 +287,49 @@ fi
         self.assertNotIn('apt-mark hold', self.log.read_text())
         self.assertFalse(key.exists())
 
+    def fresh_prepare_tools(self):
+        self.prepare_tools()
+        # Choose the fresh-install branch in this fixture copy even on hosts
+        # that already have sing-box; the package/service tools remain stubs.
+        source = self.script.read_text().replace('if ! command -v sing-box >/dev/null; then', 'if true; then', 1)
+        self.script.write_text(source)
+        (self.state / "incoming/remote.sh").write_text(source)
+        self.stub("systemctl", '''printf 'systemctl %s\\n' "$*" >>"$QD_LOG"
+case "$*" in
+'is-enabled --quiet sing-box'|'is-active --quiet sing-box') exit 1;;
+'unmask --runtime sing-box.service') test ! -e "$QD_CONF";;
+esac
+''')
+        self.stub("apt-get", '''printf 'apt-get %s\\n' "$*" >>"$QD_LOG"
+if [[ "$*" == *sing-box=* ]]; then
+ echo public-example >"$QD_CONF"
+ if [[ "${QD_APT_PIPE:-}" == yes ]]; then kill -PIPE "$PPID"; exit 1; fi
+fi
+''')
+
+    def test_fresh_package_example_is_removed_while_masked_and_not_snapshotted(self):
+        self.fresh_prepare_tools()
+        result = self.action("prepare")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        checkpoint = Path((self.state / "prepared").read_text().strip())
+        self.assertFalse((checkpoint / "config.json").exists())
+        self.assertFalse((checkpoint / "was-enabled").exists())
+        self.assertFalse((self.state / "mask-owned").exists())
+        log = self.log.read_text()
+        self.assertLess(log.index('mask --runtime sing-box.service'), log.index('apt-get install -y sing-box=1.13.12'))
+        self.assertLess(log.index('disable --now sing-box'), log.index('unmask --runtime sing-box.service'))
+
+    def test_fresh_package_sigpipe_cleans_example_key_and_mask(self):
+        self.fresh_prepare_tools()
+        key = self.state / "incoming/auth-key"
+        key.write_text('secret fixture')
+        result = self.action("prepare", QD_APT_PIPE="yes")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(key.exists())
+        self.assertFalse((self.etc / "sing-box/config.json").exists())
+        self.assertFalse((self.state / "mask-owned").exists())
+        self.assertIn('unmask --runtime sing-box.service', self.log.read_text())
+
     def test_pruning_keeps_last_good_and_recent_checkpoints_only(self):
         checkpoints = []
         for number in range(7):
