@@ -201,6 +201,55 @@ class VPS(unittest.TestCase):
             self.assertEqual(json.load(archive.extractfile("params.json"))["sing_box_version"], vps.SING_BOX_VERSION)
             self.assertNotIn(b"secret-auth-fixture", archive.extractfile("remote.sh").read())
 
+    def test_staged_bundles_keep_proxy_bytes_identical_and_skip_auth(self):
+        record = {"host": "203.0.113.1", "user": "root", "port": 22}
+        configs = []
+        for without in (True, False):
+            data = vps.bundle(self.ident, "100.70.0.1", record, ["fixture"], "auth-fixture", without)
+            with tarfile.open(fileobj=io.BytesIO(data)) as archive:
+                self.assertEqual('auth-key' in archive.getnames(), not without)
+                self.assertEqual(json.load(archive.extractfile('params.json'))['without_tailscale'], without)
+                configs.append(archive.extractfile('config.json').read())
+        self.assertEqual(configs[0], configs[1])
+
+    def test_without_then_with_deploy_preserves_identity_and_client_outputs(self):
+        vps.write_private(self.state / 'identity.json', vps.dumps(self.ident))
+        vps.write_private(self.state / 'inventory.json', vps.dumps(self.inv))
+        original_identity = (self.state / 'identity.json').read_bytes()
+        original_inode = (self.state / 'identity.json').stat().st_ino
+        uploads = []
+        def upload(argv, **kwargs):
+            uploads.append(kwargs['input'])
+        with mock.patch.object(vps, 'public_keys', return_value=['one', 'two']), mock.patch.object(vps, 'confirm'), \
+                mock.patch.object(vps, 'run', side_effect=upload), mock.patch.object(vps, 'remote', return_value=subprocess.CompletedProcess([], 0, b'checkpoint')), \
+                mock.patch.object(vps.shutil, 'which', return_value=None), mock.patch.dict(vps.os.environ, TS_AUTHKEY='auth-fixture'), \
+                mock.patch.object(vps, 'new_identity', side_effect=AssertionError('rotated')):
+            first = vps.parser().parse_args(['deploy', '--host', '203.0.113.1', '--device', 'home', '--without-tailscale', '--provider', 'provider-fixture', '--auth-key-file', str(self.state / 'absent-auth')])
+            vps.deploy(self.state, first)
+            before = (self.state / 'generated/clash-nodes.json').read_bytes()
+            self.assertTrue(vps.load(self.state / 'inventory.json')['without_tailscale'])
+            second = vps.parser().parse_args(['deploy', '--host', '203.0.113.1', '--device', 'home'])
+            vps.deploy(self.state, second)
+        self.assertEqual(original_identity, (self.state / 'identity.json').read_bytes())
+        self.assertEqual(original_inode, (self.state / 'identity.json').stat().st_ino)
+        self.assertEqual(before, (self.state / 'generated/clash-nodes.json').read_bytes())
+        inv = vps.load(self.state / 'inventory.json')
+        self.assertFalse(inv['without_tailscale'])
+        self.assertEqual(inv['previous'], [])
+        self.assertEqual(inv['current']['provider'], 'provider-fixture')
+        for without, data in zip((True, False), uploads):
+            with tarfile.open(fileobj=io.BytesIO(data)) as archive:
+                self.assertEqual(json.load(archive.extractfile('params.json'))['without_tailscale'], without)
+                self.assertEqual('auth-key' in archive.getnames(), not without)
+
+    def test_without_tailscale_dryrun_is_explicit_and_offline(self):
+        with mock.patch('sys.stdout', new_callable=io.StringIO) as output, mock.patch.object(vps, 'run', side_effect=AssertionError('contact')):
+            result = vps.main(['--state-dir', str(self.state / 'missing'), 'deploy', '--host', '203.0.113.1', '--device', 'home', '--without-tailscale', '--dry-run'])
+        self.assertEqual(result, 0)
+        self.assertIn('SKIP Tailscale', output.getvalue())
+        self.assertNotIn('tailscale up', output.getvalue())
+        self.assertFalse((self.state / 'missing').exists())
+
     def test_fresh_ssh_forces_publickey_and_disables_multiplex_proxy(self):
         argv = vps.ssh_args({"host": "203.0.113.1", "user": "root", "port": 2222}, fresh=True)
         for option in ("ControlPath=none", "ControlMaster=no", "ProxyCommand=none", "ProxyJump=none", "BatchMode=yes", "PreferredAuthentications=publickey"):
@@ -376,6 +425,19 @@ class VPS(unittest.TestCase):
         self.assertEqual(remote.call_args.args[0]["host"], "203.0.113.2")
         self.assertEqual(remote.call_args.args[1], "tailnet-ip")
         run.assert_called_once_with(["tailscale", "ping", "100.70.0.99"])
+
+    def test_check_and_ping_report_skipped_overlay_without_local_tailscale_call(self):
+        vps.write_private(self.state / 'identity.json', vps.dumps(self.ident))
+        inv = dict(self.inv, current={'host': '203.0.113.1', 'user': 'root', 'port': 22}, device='home', without_tailscale=True)
+        vps.write_private(self.state / 'inventory.json', vps.dumps(inv))
+        with mock.patch.object(vps, 'remote', return_value=subprocess.CompletedProcess([], 0, 'skipped\n')), \
+                mock.patch.object(vps, 'check_clients') as clients, mock.patch.object(vps, 'run') as run, \
+                mock.patch('sys.stdout', new_callable=io.StringIO) as output:
+            result = vps.main(['--state-dir', str(self.state), 'check', '--ping'])
+        self.assertEqual(result, 0)
+        clients.assert_called_once()
+        run.assert_not_called()
+        self.assertIn('SKIP Tailscale ping', output.getvalue())
 
     def test_check_report_requires_provider_status_and_never_changes_tun(self):
         config = vps.client_config(vps.nodes(self.ident, "203.0.113.1", "company")[0], 18791)

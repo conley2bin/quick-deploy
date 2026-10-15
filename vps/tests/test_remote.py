@@ -230,7 +230,7 @@ exit 0
         (self.etc / "apt/sources.list.d").mkdir(parents=True)
         self.env["QD_ACCOUNT"] = str(home)
         self.env["QD_CONF"] = str(self.etc / "sing-box/config.json")
-        (self.state / "incoming/params.json").write_text(json.dumps({"ssh_user": "root", "sing_box_version": "1.13.12", "target": "example.net"}))
+        (self.state / "incoming/params.json").write_text(json.dumps({"ssh_user": "root", "sing_box_version": "1.13.12", "target": "example.net", "without_tailscale": False}))
         (self.state / "incoming/authorized_keys").write_text('ssh-ed25519 fixture\n')
         (self.state / "incoming/firewall.template").write_text('table inet qd_vps { meta skuid 999 jump proxy_output; }\n')
         (self.state / "incoming/remote.sh").write_text(self.script.read_text())
@@ -243,9 +243,13 @@ if [[ "${QD_APT_FAIL:-}" == yes ]]; then exit 8; fi
         self.stub("dpkg-query", 'printf "%s" "${QD_INSTALLED_VERSION:-1.13.12}"\n')
         self.stub("getent", 'if [ "${2:-}" = root ]; then printf "root:x:0:0::%s:/bin/bash\\n" "$QD_ACCOUNT"; else echo qd-vps-proxy:x:998:998::/nonexistent:/usr/sbin/nologin; fi\n')
         self.stub("chown", 'exit 0\n')
-        self.stub("tailscale", '''if [[ "${QD_PREPARE_SIGNAL:-}" != "" && "${1:-}" == up ]]; then kill -"$QD_PREPARE_SIGNAL" "$PPID"; exit 1; fi
+        self.stub("tailscale", '''printf 'tailscale %s\\n' "$*" >>"$QD_LOG"
+if [[ "${QD_PREPARE_SIGNAL:-}" != "" && "${1:-}" == up ]]; then kill -"$QD_PREPARE_SIGNAL" "$PPID"; exit 1; fi
 if [[ "${2:-}" == --help ]]; then
  echo '--advertise-tags --accept-dns --accept-routes --hostname --timeout --auth-key file: --relay-server-port'
+elif [[ "${1:-}" == status ]]; then
+ echo '{"BackendState":"Running","Self":{"Tags":["tag:relay"]}}'
+elif [[ "${1:-}" == ip ]]; then echo 100.70.0.99
 fi
 ''')
         self.stub("openssl", 'printf "TLSv1.3\\nALPN protocol: h2\\n"\n')
@@ -329,6 +333,87 @@ fi
         self.assertFalse((self.etc / "sing-box/config.json").exists())
         self.assertFalse((self.state / "mask-owned").exists())
         self.assertIn('unmask --runtime sing-box.service', self.log.read_text())
+
+    def test_without_then_with_tailscale_preserves_running_proxy_idempotently(self):
+        self.prepare_tools()
+        # Force the missing-install branch in the safe fixture: stage1 must
+        # not even download the installer, while stage2 can install/enroll.
+        source = self.script.read_text().replace('if ! command -v tailscale >/dev/null; then', 'if true; then', 1)
+        self.script.write_text(source)
+        (self.state / 'incoming/remote.sh').write_text(source)
+        params_path = self.state / "incoming/params.json"
+        params = json.loads(params_path.read_text())
+        params['without_tailscale'] = True
+        params_path.write_text(json.dumps(params))
+        first = self.action("prepare")
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertNotIn('tailscale ', self.log.read_text())
+        self.assertNotIn('tailscaled', self.log.read_text())
+        self.assertFalse((self.state / 'install-tailscale.sh').exists())
+        self.assertEqual(self.action("apply").returncode, 0)
+        health = self.action("health")
+        self.assertEqual(health.returncode, 0, health.stderr)
+        self.assertIn('SKIP Tailscale', health.stdout)
+        self.assertEqual(self.action("tailnet-ip").stdout.strip(), 'skipped')
+        self.assertEqual(self.action("commit").returncode, 0)
+        config = self.etc / "sing-box/config.json"
+        before = config.read_bytes(), config.stat().st_ino, config.stat().st_mtime_ns
+        firewall = (self.etc / "quick-deploy-vps.nft").read_bytes()
+        # Repeat proxy-only, enable overlay, repeat full stage: none may restart
+        # or rewrite the already-correct proxy, or reapply its nft table.
+        for without in (True, False, False):
+            params['without_tailscale'] = without
+            params_path.write_text(json.dumps(params))
+            self.log.write_text('')
+            result = self.action("prepare")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            applied = self.action("apply")
+            self.assertEqual(applied.returncode, 0, applied.stderr)
+            self.assertIn('Proxy unchanged', applied.stdout)
+            checked = self.action("health")
+            self.assertEqual(checked.returncode, 0, checked.stderr)
+            self.assertEqual('SKIP Tailscale' in checked.stdout, without)
+            self.assertEqual(self.action("commit").returncode, 0)
+            self.assertEqual((config.read_bytes(), config.stat().st_ino, config.stat().st_mtime_ns), before)
+            self.assertEqual((self.etc / "quick-deploy-vps.nft").read_bytes(), firewall)
+            log = self.log.read_text()
+            self.assertNotIn('restart sing-box', log)
+            self.assertNotIn('disable --now sing-box', log)
+            self.assertNotIn('nft -f ', log)
+            self.assertIn('apt-get install -y --no-upgrade ca-certificates', log)
+            self.assertEqual('tailscale up ' in log, not without)
+            self.assertEqual('tailscale set --relay-server-port=40000' in log, not without)
+            self.assertEqual('systemctl enable --now tailscaled' in log, not without)
+            self.assertEqual((self.state / 'install-tailscale.sh').exists(), not without)
+
+    def test_corrupt_stage_mode_never_silently_skips_or_enables_overlay_checks(self):
+        (self.state / 'active-params.json').write_text('{"without_tailscale":"false"}')
+        result = self.action('health')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('must be boolean', result.stderr)
+        self.assertNotIn('SKIP Tailscale', result.stdout)
+        self.assertNotEqual(self.action('tailnet-ip').returncode, 0)
+
+    def test_failed_overlay_health_restores_stage_without_stopping_proxy(self):
+        self.prepare_tools()
+        params_path = self.state / "incoming/params.json"
+        params = json.loads(params_path.read_text())
+        params['without_tailscale'] = True
+        params_path.write_text(json.dumps(params))
+        for action in ('prepare', 'apply', 'commit'):
+            self.assertEqual(self.action(action).returncode, 0)
+        params['without_tailscale'] = False
+        params_path.write_text(json.dumps(params))
+        self.assertEqual(self.action('prepare').returncode, 0)
+        self.log.write_text('')
+        self.stub('tailscale', 'echo \'{"BackendState":"Running","Self":{"Tags":[]}}\'\n')
+        result = self.action('apply')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertTrue(json.loads((self.state / 'active-params.json').read_text())['without_tailscale'])
+        self.assertNotIn('disable --now sing-box', self.log.read_text())
+        self.assertNotIn('restart sing-box', self.log.read_text())
+        self.assertFalse((self.state / 'pending').exists())
+        self.assertIn('SKIP Tailscale', self.action('health').stdout)
 
     def test_pruning_keeps_last_good_and_recent_checkpoints_only(self):
         checkpoints = []

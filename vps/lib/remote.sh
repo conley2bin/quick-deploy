@@ -44,11 +44,47 @@ fi
 
 param() { python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))[sys.argv[2]])' "$ROOT/incoming/params.json" "$1"; }
 
+tailscale_mode() {
+    python3 - "$ROOT/active-params.json" <<'PY'
+import json, pathlib, sys
+path = pathlib.Path(sys.argv[1])
+# Legacy full deployments have no active marker and retain full checks.
+params = json.loads(path.read_text()) if path.exists() else {}
+without = params.get('without_tailscale', False)
+if not isinstance(without, bool):
+    raise ValueError('active without_tailscale must be boolean')
+print('skipped' if without else 'enabled')
+PY
+}
+
+restore_params() {
+    local source=$1
+    if [[ -f $source/active-params.json ]]; then
+        cp -p "$source/active-params.json" "$ROOT/active-params.json.restore"
+        mv -f "$ROOT/active-params.json.restore" "$ROOT/active-params.json"
+    else
+        rm -f "$ROOT/active-params.json"
+    fi
+}
+
+restore_sshd() {
+    local source=$1 ssh=/etc/ssh/sshd_config.d/00-quick-deploy-vps.conf
+    if [[ -f $source/sshd.conf ]]; then cp -p "$source/sshd.conf" "$ssh"; else rm -f "$ssh"; fi
+    sshd -t
+    systemctl reload ssh
+}
+
+activate_params() {
+    install -m 600 "$ROOT/incoming/params.json" "$ROOT/active-params.json.candidate"
+    mv -f "$ROOT/active-params.json.candidate" "$ROOT/active-params.json"
+}
+
 snapshot() {
     # Snapshot only module-owned nft state; never flush other tables (Tailscale).
     local destination=$1
     install -d -m 700 "$destination"
     if [[ -f $CONF ]]; then cp -p "$CONF" "$destination/config.json"; fi
+    if [[ -f $ROOT/active-params.json ]]; then cp -p "$ROOT/active-params.json" "$destination/active-params.json"; fi
     if nft list table inet qd_vps >"$destination/table.nft" 2>/dev/null; then
         touch "$destination/had-table"
     else
@@ -69,6 +105,13 @@ snapshot() {
 restore() {
     local source=$1
     [[ -d $source ]] || { echo 'No prior checkpoint' >&2; return 1; }
+    if [[ ${2:-false} == true ]]; then
+        # The proxy/firewall were byte-identical and never changed. Recover
+        # stage/SSH metadata without interrupting existing proxy connections.
+        restore_params "$source"
+        restore_sshd "$source"
+        return
+    fi
     # Disable FIRST: a crash/reboot during restore must not start a proxy
     # after its firewall or isolated-UID override has been removed.
     systemctl disable --now sing-box
@@ -93,10 +136,8 @@ restore() {
     else
         systemctl disable quick-deploy-vps-firewall.service 2>/dev/null || true
     fi
-    local ssh=/etc/ssh/sshd_config.d/00-quick-deploy-vps.conf
-    if [[ -f $source/sshd.conf ]]; then cp -p "$source/sshd.conf" "$ssh"; else rm -f "$ssh"; fi
-    sshd -t
-    systemctl reload ssh
+    restore_params "$source"
+    restore_sshd "$source"
     local override=/etc/systemd/system/sing-box.service.d/90-quick-deploy-vps.conf
     if [[ -f $source/service.conf ]]; then cp -p "$source/service.conf" "$override"; else rm -f "$override"; fi
     systemctl daemon-reload
@@ -114,9 +155,8 @@ restore() {
     fi
 }
 
-health() {
+proxy_health() {
     systemctl is-active --quiet sing-box
-    systemctl is-active --quiet tailscaled
     local proxy_uid table pid process_uid loaded_user
     proxy_uid=$(id -u qd-vps-proxy)
     table=$(nft --numeric list table inet qd_vps)
@@ -132,6 +172,19 @@ health() {
     local listeners
     listeners=$(ss -H -ltn 'sport = :443'); grep -q . <<<"$listeners"
     listeners=$(ss -H -lun 'sport = :443'); grep -q . <<<"$listeners"
+    echo 'PASS sing-box proxy UID/guard and TCP443 + UDP443 listening'
+}
+
+health() {
+    proxy_health
+    local mode
+    mode=$(tailscale_mode)
+    if [[ $mode == skipped ]]; then
+        echo 'SKIP Tailscale install/enrollment/relay health (--without-tailscale)'
+        return
+    fi
+    systemctl is-active --quiet tailscaled
+    local listeners
     listeners=$(ss -H -lun 'sport = :40000'); grep -q . <<<"$listeners"
     timeout 10 tailscale status --json | python3 -c '
 import json,sys
@@ -171,6 +224,7 @@ stop_timer() {
 arm_transaction() {
     local checkpoint=$1 kind=$2 target=${3:-}
     stop_timer
+    rm -f "$ROOT/pending-no-proxy-change"
     printf '%s\n' "$checkpoint" >"$ROOT/pending"
     printf '%s\n' "$kind" >"$ROOT/pending-kind"
     printf '%s\n' "$target" >"$ROOT/pending-target"
@@ -203,7 +257,9 @@ prepare)
     # Install signed packages via current official routes. No curl | sh on
     # unchecked downloads: download must complete before executing installer.
     apt-get update
-    apt-get install -y ca-certificates curl gnupg nftables openssl python3 rsync
+    # Stage2 must not upgrade already-present proxy dependencies and trigger
+    # unrelated service restarts through package maintenance hooks.
+    apt-get install -y --no-upgrade ca-certificates curl gnupg nftables openssl python3 rsync
     install -d -m 755 /etc/apt/keyrings
     curl -fsSL https://sing-box.app/gpg.key -o /etc/apt/keyrings/sagernet.asc
     chmod 644 /etc/apt/keyrings/sagernet.asc
@@ -234,18 +290,24 @@ EOF
     installed_version=$(dpkg-query -W -f='${Version}' sing-box)
     [[ $installed_version == "$version" ]] || { echo "sing-box version mismatch: expected $version, installed $installed_version; no automatic downgrade/upgrade" >&2; exit 1; }
     apt-mark hold sing-box
-    if ! command -v tailscale >/dev/null; then
-        curl -fsSL https://tailscale.com/install.sh -o "$ROOT/install-tailscale.sh"
-        sh "$ROOT/install-tailscale.sh"
+    without_tailscale=$(param without_tailscale)
+    [[ $without_tailscale == True || $without_tailscale == False ]] || { echo 'without_tailscale must be boolean' >&2; exit 1; }
+    if [[ $without_tailscale == False ]]; then
+        if ! command -v tailscale >/dev/null; then
+            curl -fsSL https://tailscale.com/install.sh -o "$ROOT/install-tailscale.sh"
+            sh "$ROOT/install-tailscale.sh"
+        fi
+        # Live CLI capability gates apply only to the enrollment stage.
+        up_help=$(tailscale up --help 2>&1)
+        set_help=$(tailscale set --help 2>&1)
+        for flag in advertise-tags accept-dns accept-routes hostname timeout auth-key; do
+            grep -q -- "--$flag" <<<"$up_help" || { echo "Unsupported tailscale up --$flag" >&2; exit 1; }
+        done
+        grep -q -- --relay-server-port <<<"$set_help" || { echo 'Tailscale >=1.86 with relay-server-port required' >&2; exit 1; }
+        grep -q -- 'file:' <<<"$up_help" || { echo 'Tailscale auth-key file support required' >&2; exit 1; }
+    else
+        echo 'SKIP Tailscale installation and CLI/enrollment (--without-tailscale)'
     fi
-    # Live installed CLI capability gates, rather than assuming a version string.
-    up_help=$(tailscale up --help 2>&1)
-    set_help=$(tailscale set --help 2>&1)
-    for flag in advertise-tags accept-dns accept-routes hostname timeout auth-key; do
-        grep -q -- "--$flag" <<<"$up_help" || { echo "Unsupported tailscale up --$flag" >&2; exit 1; }
-    done
-    grep -q -- --relay-server-port <<<"$set_help" || { echo 'Tailscale >=1.86 with relay-server-port required' >&2; exit 1; }
-    grep -q -- 'file:' <<<"$up_help" || { echo 'Tailscale auth-key file support required' >&2; exit 1; }
     install -d -m 700 "$LIB"
     install -m 700 "$ROOT/incoming/remote.sh" "$LIB/remote.sh"
     # Keys are appended without replacing unrelated authorized_keys entries.
@@ -260,13 +322,15 @@ EOF
     done <"$ROOT/incoming/authorized_keys"
     chown "$user" "$user_home/.ssh/authorized_keys"
     chmod 600 "$user_home/.ssh/authorized_keys"
-    systemctl enable --now tailscaled
-    auth=()
-    if [[ -s $ROOT/incoming/auth-key ]]; then auth=(--auth-key="file:$ROOT/incoming/auth-key"); fi
-    # No shell trace or secret-valued arguments. URL goes straight to terminal.
-    tailscale up --advertise-tags=tag:relay --accept-dns=false --accept-routes=false --hostname=qd-vps-relay --timeout=10m "${auth[@]}"
-    rm -f "$ROOT/incoming/auth-key"
-    tailscale set --relay-server-port=40000
+    if [[ $without_tailscale == False ]]; then
+        systemctl enable --now tailscaled
+        auth=()
+        if [[ -s $ROOT/incoming/auth-key ]]; then auth=(--auth-key="file:$ROOT/incoming/auth-key"); fi
+        # No shell trace or secret-valued arguments. URL goes straight to terminal.
+        tailscale up --advertise-tags=tag:relay --accept-dns=false --accept-routes=false --hostname=qd-vps-relay --timeout=10m "${auth[@]}"
+        rm -f "$ROOT/incoming/auth-key"
+        tailscale set --relay-server-port=40000
+    fi
     target=$(param target)
     # A real TLS1.3 + h2 handshake FROM the VPS is required at deploy time.
     timeout 20 openssl s_client -connect "$target:443" -servername "$target" -tls1_3 -alpn h2 </dev/null >"$ROOT/target-check.txt" 2>&1
@@ -299,6 +363,18 @@ apply)
     [[ -d $checkpoint ]] || exit 1
     # Same independently timed transaction is used for updates and rollback.
     arm_transaction "$checkpoint" apply
+    if cmp -s "$ROOT/incoming/config.json" "$CONF" && cmp -s "$ROOT/candidate.nft" "$FW" \
+            && [[ -f /etc/systemd/system/sing-box.service.d/90-quick-deploy-vps.conf ]] \
+            && systemctl is-enabled --quiet sing-box; then
+        # Enrollment in prepare adds the overlay without touching proxy state.
+        proxy_health
+        touch "$ROOT/pending-no-proxy-change"
+        activate_params
+        health
+        trap - EXIT
+        echo 'Proxy unchanged: no stop/restart, config swap or nft reload; stage confirmation pending.'
+        exit 0
+    fi
     systemctl disable --now sing-box
     install -d -m 755 /etc/systemd/system/sing-box.service.d
     cat >/etc/systemd/system/sing-box.service.d/90-quick-deploy-vps.conf <<'EOF'
@@ -347,6 +423,7 @@ EOF
     systemctl daemon-reload
     systemctl start quick-deploy-vps-firewall.service
     systemctl restart sing-box
+    activate_params
     sleep 2
     health
     trap - EXIT
@@ -383,7 +460,7 @@ commit)
     prune_checkpoints
     stop_timer
     systemctl reset-failed quick-deploy-vps-revert.service 2>/dev/null || true
-    rm -f "$ROOT/pending" "$ROOT/pending-kind" "$ROOT/pending-target" "$ROOT/prepared"
+    rm -f "$ROOT/pending" "$ROOT/pending-kind" "$ROOT/pending-target" "$ROOT/pending-no-proxy-change" "$ROOT/prepared"
     # Rollback preserves the target's enabled state (including pristine OFF).
     # An apply enables only after its guarded config and firewall are durable.
     if [[ $kind == apply ]]; then systemctl enable sing-box; fi
@@ -393,8 +470,10 @@ abort)
     stop_timer
     if [[ -f $ROOT/pending ]]; then
         checkpoint=$(cat "$ROOT/pending")
-        restore "$checkpoint"
-        rm -f "$ROOT/pending" "$ROOT/pending-kind" "$ROOT/pending-target" "$ROOT/prepared"
+        preserve_proxy=false
+        if [[ -f $ROOT/pending-no-proxy-change ]]; then preserve_proxy=true; fi
+        restore "$checkpoint" "$preserve_proxy"
+        rm -f "$ROOT/pending" "$ROOT/pending-kind" "$ROOT/pending-target" "$ROOT/pending-no-proxy-change" "$ROOT/prepared"
         prune_checkpoints
         echo 'Restored pre-deployment config, owned nft table and sshd settings.'
     elif [[ -f $ROOT/prepared ]]; then
@@ -419,7 +498,7 @@ rollback)
     echo 'Rollback pending: fresh key SSH and YES required within 180s; otherwise undo rollback.'
     ;;
 transaction-health) transaction_health ;;
-tailnet-ip) tailscale ip -4 ;;
+tailnet-ip) mode=$(tailscale_mode); if [[ $mode == skipped ]]; then echo skipped; else tailscale ip -4; fi ;;
 health) health ;;
 *) echo "Unknown remote action: $ACTION" >&2; exit 2 ;;
 esac

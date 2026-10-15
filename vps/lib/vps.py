@@ -426,15 +426,15 @@ def remote(record, action, fresh=False, **kwargs):
     return run(ssh_args(record, fresh) + [elevated(record, command)], **kwargs)
 
 
-def bundle(ident, company, record, keys, auth=None):
+def bundle(ident, company, record, keys, auth=None, without_tailscale=False):
     files = {"remote.sh": (MODULE / "lib/remote.sh").read_bytes(),
              "config.json": dumps(server_config(ident, company, record["host"])).encode(),
              "params.json": dumps({"company": company, "host": record["host"], "ssh_port": record["port"],
                                    "ssh_user": record["user"], "target": ident["reality_target"],
-                                   "sing_box_version": SING_BOX_VERSION}).encode(),
+                                   "sing_box_version": SING_BOX_VERSION, "without_tailscale": without_tailscale}).encode(),
              "authorized_keys": ("\n".join(keys) + "\n").encode(),
              "firewall.template": firewall(company, record["port"], 999).encode()}
-    if auth:
+    if auth and not without_tailscale:
         files["auth-key"] = auth.encode()
     data = io.BytesIO()
     with tarfile.open(fileobj=data, mode="w") as archive:
@@ -468,20 +468,30 @@ def deploy(state, args):
         # and even DNS: this command works on a pristine, disconnected PC.
         print(f"DRY RUN: {record['user']}@{record['host']}:{record['port']} (NO CONTACT / NO WRITES)")
         print("1. Verify Ubuntu 24.04; require root or passwordless sudo; acquire remote deployment lock.")
-        print("2. Install official sing-box APT and Tailscale; verify CLI flags; install both PC public keys.")
-        print("3. tailscale up --advertise-tags=tag:relay --accept-dns=false --accept-routes=false --hostname=qd-vps-relay")
-        print("   Interactive login URL by default; optional private TS_AUTHKEY/--auth-key-file (never printed).")
-        print("4. tailscale set --relay-server-port=40000; verify Reality target TLS1.3 + ALPN h2.")
+        print("2. Install pinned official sing-box; firewall + both PC public keys + verified sshd hardening.")
+        if args.without_tailscale:
+            print("3. SKIP Tailscale installation, CLI, enrollment and relay (--without-tailscale).")
+        else:
+            print("3. Install Tailscale; tailscale up --advertise-tags=tag:relay --accept-dns=false --accept-routes=false --hostname=qd-vps-relay")
+            print("   Interactive URL or private auth file; tailscale set --relay-server-port=40000.")
+        print("4. Verify Reality target TLS1.3 + ALPN h2; preserve a healthy unchanged proxy without restart.")
         print("5. Back up config and owned nft table locally/remotely; sing-box check candidate; arm 180s auto-revert.")
-        print("6. Atomic config + nft swap; restart + health check; NEW publickey SSH connection; explicit YES confirmation.")
+        print("6. Swap/restart ONLY changed proxy; unchanged proxy stays running. Health + NEW key SSH + explicit YES.")
         print("7. Persist owned firewall; harden sshd AFTER key login, fresh login again, cancel revert; save inventory/render.")
         return
     ident, inv = identity(state), load(state / "inventory.json")
+    current = inv.get("current") or {}
+    if current.get("host") == record["host"] and not args.provider:
+        record["provider"] = current.get("provider", "")
     company, home = peers(inv, args.company_ip, args.home_ip)
     keys = public_keys(inv)
-    auth = os.environ.get("TS_AUTHKEY")
-    if args.auth_key_file:
-        auth = read_private(args.auth_key_file).strip()
+    auth = None
+    if args.without_tailscale:
+        print("SKIP Tailscale auth input/install/enrollment (--without-tailscale).")
+    else:
+        auth = os.environ.get("TS_AUTHKEY")
+        if args.auth_key_file:
+            auth = read_private(args.auth_key_file).strip()
     confirm(f"Will install/update ONLY VPS {record['host']}; inspect provider firewall and SSH host fingerprint first.")
     # A fixed trusted extraction path, root-only; upload in a single SSH session.
     # remote lock protects the fixed staging directory across all deployers.
@@ -493,7 +503,7 @@ def deploy(state, args):
         "rm -f /var/lib/quick-deploy-vps/incoming/auth-key; "
         "tar -xf - -C /var/lib/quick-deploy-vps/incoming; "
         "bash /var/lib/quick-deploy-vps/incoming/remote.sh prepare")
-    run(ssh_args(record) + [upload], input=bundle(ident, company, record, keys, auth))
+    run(ssh_args(record) + [upload], input=bundle(ident, company, record, keys, auth, args.without_tailscale))
     # Fetch the exact remote checkpoint (contains private previous config) before
     # applying any data-plane changes; local state inherits restrictive modes.
     try:
@@ -512,7 +522,7 @@ def deploy(state, args):
         recover_abort(record)
         raise
     inv = updated_inventory(inv, record)
-    inv.update(company_ip=company, home_ip=home, device=args.device)
+    inv.update(company_ip=company, home_ip=home, device=args.device, without_tailscale=args.without_tailscale)
     write_private(state / "inventory.json", dumps(inv))
     render_outputs(state, ident, inv, args.device, ident.get("hostname") or record["host"], company, home)
 
@@ -607,6 +617,7 @@ def parser():
     a.add_argument("--port", type=int, default=22)
     a.add_argument("--provider", default="")
     a.add_argument("--dry-run", action="store_true")
+    a.add_argument("--without-tailscale", action="store_true", help="stage1: proxy/firewall/sshd only; skip Tailscale")
     a.add_argument("--auth-key-file", type=Path)
     a.add_argument("--company-ip")
     a.add_argument("--home-ip")
@@ -699,7 +710,10 @@ def main(argv=None):
                         # Read from this exact inventory host, never a colliding
                         # MagicDNS name still held by the replacement's old node.
                         address = remote(record, "tailnet-ip", fresh=True, capture_output=True, text=True).stdout.strip()
-                        run(["tailscale", "ping", tail_ip(address)])
+                        if address == "skipped":
+                            print("SKIP Tailscale ping (--without-tailscale on this VPS).")
+                        else:
+                            run(["tailscale", "ping", tail_ip(address)])
         return 0
     except (Error, OSError, ValueError, EOFError) as exc:
         print(f"vps: {exc}", file=sys.stderr)

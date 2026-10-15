@@ -28,7 +28,7 @@ bash ~/quick-deploy/vps/setup.sh init
 
 - `identity.json`：三个用户、Reality X25519 密钥与 short_id、Hy2 自签证书/私钥、可选 hostname。
 - `inventory.json`：current、previous、两 PC 地址/名称、另一台 PC 公钥、backup_alias、本机 device。
-- `generated/`：客户端凭据、二维码、策略片段；`backups/`：远端配置与本模块防火墙 checkpoint。
+- `generated/`：客户端凭据、二维码、策略片段；`backups/`：远端配置与本模块防火墙 checkpoint。VPS的`active-params.json`随checkpoint保存/恢复，用于已提交阶段的health语义，prepare不会提前覆盖。
 
 `init` 遇到已有身份只校验并保留，不轮换；损坏或权限过宽会显式失败。先备份再人工修复。修改现有 hostname/Reality 目标须编辑私有 identity 后重跑部署；不要删除 identity 来换 VPS。
 
@@ -52,16 +52,29 @@ bash ~/quick-deploy/vps/setup.sh init
 
 1. 安装 Ubuntu24.04，确认服务商防火墙放行 TCP22/443、UDP443/40000/41641；自定义 SSH 端口也须放行。VPS 账号须 root 或有 `sudo -n` 权限。
 2. 用服务商控制台核对 SSH host key，先完成可用的 OpenSSH 登录。脚本不跳过 known_hosts 检查，管理 SSH 禁用 ProxyCommand/ProxyJump；PC现有TUN仍可能截获底层连接，默认22由现有Clash规则直连，自定义端口须自行核对。
-3. 管理控制台先备份 Tailnet policy，添加 `tag:relay` 的 tagOwners，并收紧旧 allow-all（策略章节）。准备批准登录和标签。
+3. 按下面两个阶段逐项验收。代理阶段不需要VPS加入Tailnet；第二阶段才备份/合并policy、添加`tag:relay` tagOwners并收紧allow-all，准备批准登录和标签。
 4. 先看完全离线的计划；此模式不读身份、SSH、Tailscale、DNS，不创建状态目录：
 
 ```bash
-bash ~/quick-deploy/vps/setup.sh deploy --host <VPS数字IP> --device company --dry-run
-bash ~/quick-deploy/vps/setup.sh deploy --host <VPS数字IP> --device company --provider Evoxt
+# 阶段1：仅代理、nft防火墙、公钥与sshd；完全跳过VPS Tailscale安装/CLI/入网/relay。
+bash ~/quick-deploy/vps/setup.sh deploy --host <VPS数字IP> --device company --without-tailscale --dry-run
+bash ~/quick-deploy/vps/setup.sh deploy --host <VPS数字IP> --device company --without-tailscale --provider Evoxt
+bash ~/quick-deploy/vps/setup.sh check
+# 本阶段check仍检查两代理节点/API；Tailscale显示SKIP，不视为失败。
+# 自行更新Clash并验收真实API后，再进行下一阶段。
+
+# 阶段2：同一host普通deploy（不带--without-tailscale），安装/入网/启用UDP40000 relay。
+# 先按策略章节合并policy，再准备批准登录和tag。
+bash ~/quick-deploy/vps/setup.sh deploy --host <VPS数字IP> --device company
+bash ~/quick-deploy/vps/setup.sh check --ping
 # --device 必填；在家里PC执行时用 --device home；可加 --user ubuntu --port 2222
 ```
 
-部署先确认目标，安装 sing-box 官方签名APT包，固定为[稳定版1.13.12](https://github.com/SagerNet/sing-box/releases/tag/v1.13.12)（`vps.py:SING_BOX_VERSION`），并`apt-mark hold`；版本写入上传params。已有版本必须精确匹配，否则明确停止，不自动升/降级。APT仓库若已不保留该版本也失败，不退回latest。版本变更须先修改固定值并重新审查/验收。Tailscale用官方安装器。新包安装期间临时 mask，避免默认配置自动启动。只接受 Ubuntu24.04，Tailscale 现场检查 CLI flags。默认 `tailscale up` 打印登录 URL，等待最多10分钟；在浏览器登录并批准标签。然后设置 `--relay-server-port=40000`，不提供 exit node 或子网路由。
+两阶段复用同一identity，第二阶段不会轮换凭据；同host省略provider会保留原标签，不新增虚假换机历史。代理config和防火墙未变且UID/监听健康时，第二阶段及重复deploy不stop/restart sing-box、不交换其配置、不重载nft表。只更新事务化的`active-params.json`阶段状态，仍经新鲜SSH登录和YES确认；未确认/新增relay健康失败会恢复原阶段状态，不打断未改动的代理。
+
+`--without-tailscale`不读取/上传Tailscale auth key，不执行VPS任何Tailscale命令，也不停止已有Tailscale服务；它表示本次不管理该功能。UDP40000/41641两阶段都可在防火墙放行，第一阶段没有本模块relay监听。health/status/check从VPS已提交的阶段状态判定SKIP；`check --ping`也会显示跳过，不误ping旧节点。第一阶段还不能通过VPS到公司8743，也没有Peer Relay；手机桥和中继只在第二阶段及policy验收后使用。
+
+部署先确认目标，安装 sing-box 官方签名APT包，固定为[稳定版1.13.12](https://github.com/SagerNet/sing-box/releases/tag/v1.13.12)（`vps.py:SING_BOX_VERSION`），并`apt-mark hold`；版本写入上传params。已有版本必须精确匹配，否则明确停止，不自动升/降级。APT仓库若已不保留该版本也失败，不退回latest。版本变更须先修改固定值并重新审查/验收。Tailscale用官方安装器。新包安装期间临时 mask，避免默认配置自动启动。只接受 Ubuntu24.04，Tailscale 现场检查 CLI flags。第二阶段默认 `tailscale up` 打印登录 URL，等待最多10分钟；在浏览器登录并批准标签。然后设置 `--relay-server-port=40000`，不提供 exit node 或子网路由。
 
 可选用 `--auth-key-file /private/auth-key`（当前用户0600）或 `TS_AUTHKEY` 环境变量。密钥通过 SSH stdin 的 root-only 临时文件传输，CLI 只传 `file:` 路径，不打印密钥；用后删除。不保存 auth key 为长期恢复凭据，换机通常新建一次性 tagged key。
 
