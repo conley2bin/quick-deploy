@@ -185,7 +185,7 @@ def init(state, args):
         load(inventory)
     else:
         write_private(inventory, dumps({"version": 1, "current": None, "previous": [],
-                                        "company_name": "conley-company", "home_name": "conley-y9000p",
+                                        "company_name": getattr(args, "company_name", None), "home_name": getattr(args, "home_name", None),
                                         "ssh_public_keys": [], "backup_alias": None}))
 
 
@@ -202,10 +202,13 @@ def peers(inventory, company=None, home=None):
     company = company or inventory.get("company_ip")
     home = home or inventory.get("home_ip")
     if not (company and home):
+        for role, address in (("company", company), ("home", home)):
+            if not address and not inventory.get(role + "_name"):
+                raise Error(f"Set private inventory {role}_ip or {role}_name (or init --{role}-name)")
         document = json.loads(run(["tailscale", "status", "--json"], capture_output=True, text=True).stdout)
         nodes = [document.get("Self", {})] + list((document.get("Peer") or {}).values())
         def find(role):
-            name = inventory.get(role + "_name", "").lower().rstrip(".")
+            name = (inventory.get(role + "_name") or "").lower().rstrip(".")
             matches = [n for n in nodes if n.get("HostName", "").lower() == name or n.get("DNSName", "").split(".")[0].lower() == name]
             if len(matches) != 1:
                 raise Error(f"Cannot uniquely discover {role}; set {role}_ip in private inventory")
@@ -595,6 +598,8 @@ def parser():
     a = sub.add_parser("init")
     a.add_argument("--hostname")
     a.add_argument("--reality-target", default="www.microsoft.com")
+    a.add_argument("--company-name", help="private Tailscale hostname for discovery")
+    a.add_argument("--home-name", help="private Tailscale hostname for discovery")
     a = sub.add_parser("deploy")
     a.add_argument("--host", required=True)
     a.add_argument("--user", default="root")
@@ -604,7 +609,7 @@ def parser():
     a.add_argument("--auth-key-file", type=Path)
     a.add_argument("--company-ip")
     a.add_argument("--home-ip")
-    a.add_argument("--device", choices=("company", "home"), default="company")
+    a.add_argument("--device", choices=("company", "home"), required=True)
     a = sub.add_parser("render")
     a.add_argument("--device", choices=("company", "home"))
     a.add_argument("--host", help="offline render address override; does not update inventory")
@@ -685,8 +690,10 @@ def main(argv=None):
                         recover_abort(record)
                         raise
                 else:
+                    if not device:
+                        raise Error("Select check --device company|home or save the device with render first")
                     remote(record, "health", fresh=True)
-                    check_clients(ident, inv, device or "company", args.mihomo)
+                    check_clients(ident, inv, device, args.mihomo)
                     if args.ping:
                         run(["tailscale", "ping", "qd-vps-relay"])
         return 0

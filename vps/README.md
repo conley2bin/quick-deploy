@@ -19,6 +19,7 @@ TCP443 是 VLESS + Reality + Vision；UDP443 是 Hysteria2。两个节点手工�
 
 ```bash
 bash ~/quick-deploy/vps/setup.sh init
+# 首次init可加 --company-name <公司Tailnet名> --home-name <家Tailnet名>；无机器名默认值
 # 有稳定域名时首次 init 可加 --hostname relay.example.net
 # 选其它 Reality 目标：init --reality-target www.example.net
 ```
@@ -38,8 +39,8 @@ bash ~/quick-deploy/vps/setup.sh init
   "version": 1,
   "current": null,
   "previous": [],
-  "company_name": "conley-company",
-  "home_name": "conley-y9000p",
+  "company_name": "公司实际Tailnet名称",
+  "home_name": "家里实际Tailnet名称",
   "ssh_public_keys": ["ssh-ed25519 AAAA... 另一台PC公钥的完整一行"],
   "backup_alias": "另一台PC已有的SSH别名"
 }
@@ -55,9 +56,9 @@ bash ~/quick-deploy/vps/setup.sh init
 4. 先看完全离线的计划；此模式不读身份、SSH、Tailscale、DNS，不创建状态目录：
 
 ```bash
-bash ~/quick-deploy/vps/setup.sh deploy --host <VPS数字IP> --dry-run
+bash ~/quick-deploy/vps/setup.sh deploy --host <VPS数字IP> --device company --dry-run
 bash ~/quick-deploy/vps/setup.sh deploy --host <VPS数字IP> --device company --provider Evoxt
-# 在家里PC执行时用 --device home；可加 --user ubuntu --port 2222
+# --device 必填；在家里PC执行时用 --device home；可加 --user ubuntu --port 2222
 ```
 
 部署先确认目标，安装 sing-box 官方签名APT包，固定为[稳定版1.13.12](https://github.com/SagerNet/sing-box/releases/tag/v1.13.12)（`vps.py:SING_BOX_VERSION`），并`apt-mark hold`；版本写入上传params。已有版本必须精确匹配，否则明确停止，不自动升/降级。APT仓库若已不保留该版本也失败，不退回latest。版本变更须先修改固定值并重新审查/验收。Tailscale用官方安装器。新包安装期间临时 mask，避免默认配置自动启动。只接受 Ubuntu24.04，Tailscale 现场检查 CLI flags。默认 `tailscale up` 打印登录 URL，等待最多10分钟；在浏览器登录并批准标签。然后设置 `--relay-server-port=40000`，不提供 exit node 或子网路由。

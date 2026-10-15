@@ -144,10 +144,21 @@ class VPS(unittest.TestCase):
         self.assertNotIn("acls", result)
 
     def test_peer_discovery_checks_both_self_and_peers(self):
-        status = {"Self": {"HostName": "conley-company", "TailscaleIPs": ["100.70.0.1", "fd7a::1"]},
-                  "Peer": {"a": {"HostName": "conley-Y9000P", "TailscaleIPs": ["100.70.0.2"]}}}
+        status = {"Self": {"HostName": "office-fixture", "TailscaleIPs": ["100.70.0.1", "fd7a::1"]},
+                  "Peer": {"a": {"HostName": "HOME-fixture", "TailscaleIPs": ["100.70.0.2"]}}}
         with mock.patch.object(vps, "run", return_value=subprocess.CompletedProcess([], 0, json.dumps(status))):
-            self.assertEqual(vps.peers({"company_name": "conley-company", "home_name": "conley-y9000p"}), ("100.70.0.1", "100.70.0.2"))
+            self.assertEqual(vps.peers({"company_name": "office-fixture", "home_name": "home-fixture"}), ("100.70.0.1", "100.70.0.2"))
+
+    def test_deploy_requires_device_and_init_has_no_machine_name_defaults(self):
+        with mock.patch("sys.stderr", new_callable=io.StringIO), self.assertRaises(SystemExit):
+            vps.parser().parse_args(["deploy", "--host", "203.0.113.1", "--dry-run"])
+        args = vps.parser().parse_args(["init"])
+        vps.init(self.state, args)
+        inv = vps.load(self.state / "inventory.json")
+        self.assertIsNone(inv["company_name"])
+        self.assertIsNone(inv["home_name"])
+        with mock.patch.object(vps, "run", side_effect=AssertionError("must refuse before discovery")), self.assertRaisesRegex(vps.Error, "private inventory"):
+            vps.peers(inv)
 
     def test_explicit_peer_ips_never_contact_local_daemon(self):
         with mock.patch.object(vps, "run", side_effect=AssertionError("daemon contact")):
@@ -160,13 +171,13 @@ class VPS(unittest.TestCase):
 
     def test_dryrun_requires_no_identity_and_never_calls_ssh_or_tailscale(self):
         with mock.patch.object(vps, "run", side_effect=AssertionError("network contact")):
-            rc = vps.main(["--state-dir", str(self.state / "missing"), "deploy", "--host", "203.0.113.1", "--dry-run"])
+            rc = vps.main(["--state-dir", str(self.state / "missing"), "deploy", "--host", "203.0.113.1", "--device", "home", "--dry-run"])
         self.assertEqual(rc, 0)
         self.assertFalse((self.state / "missing").exists())
 
     def test_dryrun_cli_has_no_side_effects(self):
         child = subprocess.run(["bash", str(MODULE / "setup.sh"), "--state-dir", str(self.state / "missing"),
-                                "deploy", "--host", "203.0.113.1", "--dry-run"], capture_output=True, text=True)
+                                "deploy", "--host", "203.0.113.1", "--device", "home", "--dry-run"], capture_output=True, text=True)
         self.assertEqual(child.returncode, 0, child.stderr)
         self.assertIn("NO CONTACT / NO WRITES", child.stdout)
         self.assertFalse((self.state / "missing").exists())
@@ -268,7 +279,7 @@ class VPS(unittest.TestCase):
     def test_deploy_failure_requests_rollback_without_inventory_update(self):
         vps.write_private(self.state / "identity.json", vps.dumps(self.ident))
         vps.write_private(self.state / "inventory.json", vps.dumps(self.inv))
-        args = vps.parser().parse_args(["deploy", "--host", "203.0.113.1"])
+        args = vps.parser().parse_args(["deploy", "--host", "203.0.113.1", "--device", "home"])
         original = (self.state / "inventory.json").read_bytes()
         def remote(record, action, **kwargs):
             if action == "export-backup":
