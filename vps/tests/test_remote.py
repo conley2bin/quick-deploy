@@ -122,7 +122,9 @@ exec /usr/bin/install "${args[@]}"
         self.assertEqual(self.action("abort").returncode, 0)
         self.assertFalse((self.etc / "ssh/sshd_config.d/00-quick-deploy-vps.conf").exists())
         self.assertEqual((self.etc / "sing-box/config.json").read_text(), 'old configuration\n')
-        self.assertEqual(self.action("abort").returncode, 0)
+        repeated = self.action("abort")
+        self.assertNotEqual(repeated.returncode, 0)
+        self.assertIn('Refusing abort: no pending', repeated.stderr)
         self.assertNotEqual(self.action("commit").returncode, 0)
 
     def test_rollback_is_repeatable_and_does_not_toggle(self):
@@ -178,7 +180,7 @@ exit 0
     def test_enabled_state_and_fresh_package_cleanup_order(self):
         source = self.script.read_text()
         self.assertIn('systemctl is-enabled --quiet sing-box', source)
-        fresh = source.split('apt-get install -y "sing-box=$version"', 1)[1].split('masked=false', 1)[0]
+        fresh = source.split('apt-get install -y "sing-box=$version"', 1)[1].split('rm -f "$ROOT/mask-owned"', 1)[0]
         self.assertLess(fresh.index('rm -f "$CONF"'), fresh.index('systemctl unmask'))
         restore = source.split('restore() {', 1)[1].split('health() {', 1)[0]
         self.assertLess(restore.index('disable --now sing-box'), restore.index('nft -f'))
@@ -220,6 +222,70 @@ exit 0
     def test_no_early_exit_pipeline_consumers_under_pipefail(self):
         for path in MODULE.rglob("*.sh"):
             self.assertIsNone(re.search(r"\|\s*(?:grep\s+-[^\n]*q|head\b)", path.read_text()), str(path))
+
+    def prepare_tools(self):
+        # Exercise full prepare without apt/network/root account mutations.
+        home = self.root / "account"
+        home.mkdir()
+        (self.etc / "apt/sources.list.d").mkdir(parents=True)
+        self.env["QD_ACCOUNT"] = str(home)
+        self.env["QD_CONF"] = str(self.etc / "sing-box/config.json")
+        (self.state / "incoming/params.json").write_text(json.dumps({"ssh_user": "root", "sing_box_version": "1.13.12", "target": "example.net"}))
+        (self.state / "incoming/authorized_keys").write_text('ssh-ed25519 fixture\n')
+        (self.state / "incoming/firewall.template").write_text('table inet qd_vps { meta skuid 999 jump proxy_output; }\n')
+        (self.state / "incoming/remote.sh").write_text(self.script.read_text())
+        self.stub("curl", 'while [ "$#" -gt 0 ]; do if [ "$1" = -o ]; then touch "$2"; exit 0; fi; shift; done\n')
+        self.stub("apt-get", '''printf 'apt-get %s frontend=%s\\n' "$*" "${DEBIAN_FRONTEND:-}" >>"$QD_LOG"
+if [[ "$*" == *sing-box=* ]]; then echo public-example >"$QD_CONF"; fi
+if [[ "${QD_APT_FAIL:-}" == yes ]]; then exit 8; fi
+''')
+        self.stub("apt-mark", 'printf "apt-mark %s\\n" "$*" >>"$QD_LOG"\n')
+        self.stub("dpkg-query", 'printf "%s" "${QD_INSTALLED_VERSION:-1.13.12}"\n')
+        self.stub("getent", 'if [ "${2:-}" = root ]; then printf "root:x:0:0::%s:/bin/bash\\n" "$QD_ACCOUNT"; else echo qd-vps-proxy:x:998:998::/nonexistent:/usr/sbin/nologin; fi\n')
+        self.stub("chown", 'exit 0\n')
+        self.stub("tailscale", '''if [[ "${QD_PREPARE_SIGNAL:-}" != "" && "${1:-}" == up ]]; then kill -"$QD_PREPARE_SIGNAL" "$PPID"; exit 1; fi
+if [[ "${2:-}" == --help ]]; then
+ echo '--advertise-tags --accept-dns --accept-routes --hostname --timeout --auth-key file: --relay-server-port'
+fi
+''')
+        self.stub("openssl", 'printf "TLSv1.3\\nALPN protocol: h2\\n"\n')
+
+    def test_prepare_replaces_stale_marker_and_cleans_auth_on_success_and_signal(self):
+        self.prepare_tools()
+        key = self.state / "incoming/auth-key"
+        key.write_text('secret fixture')
+        result = self.action("prepare")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('Replacing stale prepared candidate', result.stdout)
+        self.assertFalse(key.exists())
+        self.assertIn('apt-mark hold sing-box', self.log.read_text())
+        self.assertIn('frontend=noninteractive', self.log.read_text())
+        key.write_text('secret fixture')
+        result = self.action("prepare", QD_PREPARE_SIGNAL="PIPE")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(key.exists())
+
+    def test_prepare_failure_cleans_owned_mask_and_package_example(self):
+        self.prepare_tools()
+        key = self.state / "incoming/auth-key"
+        key.write_text('secret fixture')
+        (self.state / "mask-owned").touch()
+        result = self.action("prepare", QD_APT_FAIL="yes")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(key.exists())
+        self.assertFalse((self.state / "mask-owned").exists())
+        self.assertFalse((self.etc / "sing-box/config.json").exists())
+        self.assertIn('unmask --runtime sing-box.service', self.log.read_text())
+
+    def test_prepare_version_mismatch_fails_before_hold_and_removes_auth(self):
+        self.prepare_tools()
+        key = self.state / "incoming/auth-key"
+        key.write_text('secret fixture')
+        result = self.action("prepare", QD_INSTALLED_VERSION="1.99.0")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('version mismatch', result.stderr)
+        self.assertNotIn('apt-mark hold', self.log.read_text())
+        self.assertFalse(key.exists())
 
     def test_health_rejects_unsubstituted_uid_or_root_proxy_process(self):
         self.assertEqual(self.action("health").returncode, 0)

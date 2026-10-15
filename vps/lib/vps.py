@@ -446,6 +446,17 @@ def confirm(message):
         raise Error("Not confirmed; pending transaction will automatically revert")
 
 
+def recover_abort(record):
+    for fresh in (True, False):
+        try:
+            remote(record, "abort", fresh=fresh)
+            return
+        except (Error, OSError):
+            if fresh:
+                print("Fresh abort login failed; trying existing ControlMaster connection.", file=sys.stderr)
+    print("Abort SSH paths failed; independent revert waits for the operation lock. Inspect the provider console if needed.", file=sys.stderr)
+
+
 def deploy(state, args):
     record = host_record(args)
     if args.dry_run:
@@ -473,7 +484,7 @@ def deploy(state, args):
     upload = elevated(record, "bash -c ") + shlex.quote(
         "set -euo pipefail; umask 077; install -d -m 700 /var/lib/quick-deploy-vps; "
         "exec 9>/var/lib/quick-deploy-vps/upload.lock; flock -n 9; "
-        "test ! -e /var/lib/quick-deploy-vps/pending; test ! -e /var/lib/quick-deploy-vps/prepared; "
+        "if test -e /var/lib/quick-deploy-vps/pending; then echo 'Refusing upload: transaction pending; use setup.sh abort' >&2; exit 1; fi; "
         "install -d -m 700 /var/lib/quick-deploy-vps/incoming; "
         "rm -f /var/lib/quick-deploy-vps/incoming/auth-key; "
         "tar -xf - -C /var/lib/quick-deploy-vps/incoming; "
@@ -492,12 +503,9 @@ def deploy(state, args):
         remote(record, "harden", fresh=True)
         remote(record, "health", fresh=True)
         remote(record, "commit", fresh=True)
-    except (Error, EOFError, KeyboardInterrupt):
-        print("Deployment failed/not confirmed; requesting rollback (180s timer also remains armed).", file=sys.stderr)
-        try:
-            remote(record, "abort", fresh=True)
-        except Error:
-            print("Rollback SSH failed; wait for independent timer, then inspect provider console.", file=sys.stderr)
+    except (Error, OSError, EOFError, KeyboardInterrupt):
+        print("Deployment failed/not confirmed; requesting recovery.", file=sys.stderr)
+        recover_abort(record)
         raise
     inv = updated_inventory(inv, record)
     inv.update(company_ip=company, home_ip=home, device=args.device)
@@ -609,6 +617,11 @@ def parser():
     a = sub.add_parser("backup")
     a.add_argument("--alias")
     sub.add_parser("rollback")
+    a = sub.add_parser("abort", help="recover pending/prepared transaction; --host works before inventory commit")
+    a.add_argument("--host")
+    a.add_argument("--user", default="root")
+    a.add_argument("--port", type=int, default=22)
+    a.set_defaults(provider="")
     sub.add_parser("status")
     return p
 
@@ -627,6 +640,13 @@ def main(argv=None):
                 return 0
             if args.command == "deploy":
                 deploy(state, args)
+                return 0
+            if args.command == "abort":
+                inventory_path = state / "inventory.json"
+                record = host_record(args) if args.host else (load(inventory_path).get("current") if inventory_path.exists() else None)
+                if not record:
+                    raise Error("Refusing abort: no current VPS; supply abort --host <IP> --user <user> --port <port>")
+                remote(record, "abort")
                 return 0
             ident, inv = identity(state), load(state / "inventory.json")
             device = getattr(args, "device", None) or inv.get("device")
@@ -661,8 +681,8 @@ def main(argv=None):
                         remote(record, "transaction-health", fresh=True)
                         confirm("Fresh key SSH verified rollback. Keep restored configuration?")
                         remote(record, "commit", fresh=True)
-                    except (Error, EOFError, KeyboardInterrupt):
-                        remote(record, "abort", fresh=True)
+                    except (Error, OSError, EOFError, KeyboardInterrupt):
+                        recover_abort(record)
                         raise
                 else:
                     remote(record, "health", fresh=True)

@@ -8,6 +8,27 @@ CONF=/etc/sing-box/config.json
 FW=/etc/quick-deploy-vps.nft
 ACTION=${1:?remote action required}
 [[ $EUID == 0 ]] || { echo 'VPS requires root/passwordless sudo' >&2; exit 1; }
+cleanup_prepare() {
+    local status=$?
+    trap - EXIT HUP INT TERM PIPE
+    rm -f "$ROOT/incoming/auth-key" || status=1
+    if [[ -f $ROOT/mask-owned ]]; then
+        # Even a failed package installation may have created/enabled the
+        # public sample. Remove it BEFORE releasing our runtime mask.
+        rm -f "$CONF" || status=1
+        systemctl disable --now sing-box || status=1
+        systemctl unmask --runtime sing-box.service || status=1
+        rm -f "$ROOT/mask-owned" || status=1
+    fi
+    exit "$status"
+}
+if [[ $ACTION == prepare ]]; then
+    trap cleanup_prepare EXIT
+    trap 'exit 129' HUP
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    trap 'exit 141' PIPE
+fi
 # Refuse other OSes before installing anything.
 . /etc/os-release
 [[ $ID == ubuntu && $VERSION_ID == 24.04 ]] || { echo 'Only Ubuntu 24.04 is supported; nothing installed.' >&2; exit 1; }
@@ -151,8 +172,11 @@ transaction_health() {
 
 case "$ACTION" in
 prepare)
-    trap 'rm -f "$ROOT/incoming/auth-key"; if [[ ${masked:-false} == true ]]; then systemctl unmask --runtime sing-box.service; fi' EXIT
-    [[ ! -e $ROOT/pending && ! -e $ROOT/prepared ]] || { echo 'Pending/prepared deployment; wait for timer or abort it first' >&2; exit 1; }
+    [[ ! -e $ROOT/pending ]] || { echo 'Refusing prepare: live transaction pending; run setup.sh abort or wait for revert' >&2; exit 1; }
+    # A prepared candidate has never changed the data plane. Replace it under
+    # the operation/upload locks instead of permanently blocking redeployment.
+    if [[ -f $ROOT/prepared ]]; then echo 'Replacing stale prepared candidate'; rm -f "$ROOT/prepared"; fi
+    export DEBIAN_FRONTEND=noninteractive
     # Install signed packages via current official routes. No curl | sh on
     # unchecked downloads: download must complete before executing installer.
     apt-get update
@@ -173,8 +197,8 @@ EOF
     if ! command -v sing-box >/dev/null; then
         # Never let a package post-install start an unconfigured proxy before
         # the destination guard exists. Existing installations are not upgraded.
+        touch "$ROOT/mask-owned"
         systemctl mask --runtime sing-box.service
-        masked=true
         apt-get update
         apt-get install -y "sing-box=$version"
         # Upstream ships a public example password. It must NEVER enter the
@@ -182,7 +206,7 @@ EOF
         rm -f "$CONF"
         systemctl disable --now sing-box
         systemctl unmask --runtime sing-box.service
-        masked=false
+        rm -f "$ROOT/mask-owned"
     fi
     installed_version=$(dpkg-query -W -f='${Version}' sing-box)
     [[ $installed_version == "$version" ]] || { echo "sing-box version mismatch: expected $version, installed $installed_version; no automatic downgrade/upgrade" >&2; exit 1; }
@@ -351,6 +375,9 @@ abort)
     elif [[ -f $ROOT/prepared ]]; then
         rm -f "$ROOT/prepared"
         echo 'Cleared prepared candidate; live config was not changed.'
+    else
+        echo 'Refusing abort: no pending transaction or prepared candidate on this host' >&2
+        exit 1
     fi
     ;;
 rollback)

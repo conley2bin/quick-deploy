@@ -341,6 +341,18 @@ class VPS(unittest.TestCase):
         self.assertTrue(all(c.kwargs["fresh"] for c in remote.call_args_list))
         self.assertEqual(confirm.call_count, 2)
 
+    def test_recovery_tries_fresh_then_controlmaster_connection(self):
+        with mock.patch.object(vps, "remote", side_effect=[vps.Error("new login blocked"), None]) as remote:
+            vps.recover_abort({"host": "203.0.113.1"})
+        self.assertEqual([c.kwargs["fresh"] for c in remote.call_args_list], [True, False])
+
+    def test_abort_explicit_host_works_before_identity_or_inventory(self):
+        with mock.patch.object(vps, "remote") as remote:
+            result = vps.main(["--state-dir", str(self.state), "abort", "--host", "203.0.113.1"])
+        self.assertEqual(result, 0)
+        self.assertEqual(remote.call_args.args[1], 'abort')
+        self.assertFalse((self.state / "identity.json").exists())
+
     def test_check_report_requires_provider_status_and_never_changes_tun(self):
         config = vps.client_config(vps.nodes(self.ident, "203.0.113.1", "company")[0], 18791)
         self.assertEqual(config["bind-address"], "127.0.0.1")

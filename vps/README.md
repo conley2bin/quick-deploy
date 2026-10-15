@@ -70,7 +70,7 @@ bash ~/quick-deploy/vps/setup.sh deploy --host <VPS数字IP> --device company --
 
 新装包的公开示例配置在unit仍mask时删除，并禁用unit；pristine checkpoint不含代理配置。snapshot记录原有启用状态；恢复首先disable --now sing-box，只有同时具备配置、UID drop-in和持久防火墙的完整checkpoint才允许重新启动/启用。commit最后才enable sing-box，避免回滚后重启跑起无guard代理。
 
-180秒内未确认或检查失败，会恢复之前的配置、nft表、sshd片段与服务 override。失败不会静默降级。包安装、Tailscale 入网、追加公钥不在回滚范围内。遇到断线等待 timer；上传/prepare完成但尚未apply时没有改运行配置，遗留prepared标记也可用abort清除。必要时从服务商控制台执行：
+180秒内未确认或检查失败，会恢复之前的配置、nft表、sshd片段与服务 override。失败不会静默降级。包安装、Tailscale 入网、追加公钥不在回滚范围内。遇到断线等待 timer；上传/prepare完成但尚未apply时没有改运行配置，遗留prepared标记会在下一次prepare时替换，也可用`setup.sh abort --host <IP>`清除（未提交inventory也能用）。没有待处理状态时abort明确拒绝，不假装执行了恢复。自动fallback先尝试新登录，再尝试现有ControlMaster连接。prepare对成功、失败及HUP/INT/TERM/PIPE都清理auth-key和本模块拥有的runtime mask；APT显式noninteractive。必要时从服务商控制台执行：
 
 ```bash
 sudo /usr/local/lib/quick-deploy-vps/remote.sh abort
@@ -126,6 +126,7 @@ bash ~/quick-deploy/vps/setup.sh status
 bash ~/quick-deploy/vps/setup.sh check             # 此命令会访问VPS和三家API，无API key
 bash ~/quick-deploy/vps/setup.sh check --ping      # 额外可选 tailscale ping qd-vps-relay
 bash ~/quick-deploy/vps/setup.sh rollback
+bash ~/quick-deploy/vps/setup.sh abort             # 当前inventory目标；或 --host <IP> --user root --port 22
 bash ~/quick-deploy/vps/setup.sh backup            # 使用 inventory backup_alias
 # 或 backup --alias 已有SSH别名
 ```
