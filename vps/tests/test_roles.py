@@ -124,6 +124,21 @@ fi
         self.assertIn('existing proxy configuration', result.stderr)
         self.assertFalse(self.f.log.exists())
 
+    def test_live_pending_role_is_exclusive_but_abort_does_not_claim_host(self):
+        f = self.f
+        self.assertEqual(f.action('prepare').returncode, 0)
+        self.assertFalse((f.state / 'role').exists())
+        self.assertEqual(f.action('apply').returncode, 0)
+        self.assertEqual((f.state / 'pending-role').read_text().strip(), 'relay')
+        f.role = 'proxy'
+        result = f.action('prepare')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('another role', result.stderr)
+        f.role = 'relay'
+        self.assertEqual(f.action('abort').returncode, 0)
+        self.assertFalse((f.state / 'role').exists())
+        self.assertFalse((f.state / 'pending-role').exists())
+
     def test_role_conflict_refused_without_proxy_service_access(self):
         self.deploy()
         self.f.role = 'proxy'

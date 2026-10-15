@@ -239,6 +239,46 @@ exit 0
         self.assertIn('PermitRootLogin no\n', Path(self.env['QD_SSH_CONFIG']).read_text())
         self.assertIn('user=ubuntu,host=x,addr=', self.log.read_text())
 
+    def wrong_relay_prepare_payload(self):
+        self.prepare_tools()
+        self.role = 'relay'
+        (self.etc / 'sing-box/config.json').unlink()
+        (self.etc / 'systemd/system/sing-box.service.d/90-quick-deploy-vps.conf').unlink()
+        (self.state / 'incoming/config.json').unlink()
+        (self.state / 'incoming/params.json').write_text(json.dumps({'role': 'relay', 'host': '93.184.216.34', 'relay_endpoint': '93.184.216.34:40000', 'ssh_user': 'ubuntu', 'without_tailscale': False}))
+        self.stub('getent', 'printf "%s:x:1000:1000::%s:/bin/bash\\n" "${2:-ubuntu}" "$QD_ACCOUNT"\n')
+
+    def correct_proxy_prepare_payload(self):
+        self.role = 'proxy'
+        (self.state / 'incoming/config.json').write_text('proxy config fixture\n')
+        (self.state / 'incoming/params.json').write_text(json.dumps({'role': 'proxy', 'ssh_user': 'root', 'sing_box_version': '1.14.3', 'target': 'example.net', 'without_tailscale': True}))
+
+    def test_failed_wrong_role_prepare_does_not_claim_fresh_host(self):
+        self.wrong_relay_prepare_payload()
+        result = self.action('prepare', QD_APT_FAIL='yes')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse((self.state / 'role').exists())
+        self.correct_proxy_prepare_payload()
+        result = self.action('prepare')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse((self.state / 'role').exists())
+
+    def test_aborted_wrong_role_prepare_and_legacy_stale_marker_can_be_reused(self):
+        self.wrong_relay_prepare_payload()
+        self.assertEqual(self.action('prepare').returncode, 0)
+        self.assertFalse((self.state / 'role').exists())
+        self.assertEqual(self.action('abort').returncode, 0)
+        # Old54d20f7 could leave this marker after an interrupted prepare.
+        (self.state / 'role').write_text('relay\n')
+        self.correct_proxy_prepare_payload()
+        result = self.action('prepare')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse((self.state / 'role').exists())
+        self.assertEqual(self.action('apply').returncode, 0)
+        self.assertFalse((self.state / 'role').exists())
+        self.assertEqual(self.action('commit').returncode, 0)
+        self.assertEqual((self.state / 'role').read_text().strip(), 'proxy')
+
     def test_no_early_exit_pipeline_consumers_under_pipefail(self):
         for path in MODULE.rglob("*.sh"):
             self.assertIsNone(re.search(r"\|\s*(?:grep\s+-[^\n]*q|head\b)", path.read_text()), str(path))

@@ -29,7 +29,7 @@ bash ~/quick-deploy/vps/setup.sh init --role relay
 - `identity.json`：仅proxy使用，company/home/phone各自UUID和Hy2密码、Reality密钥/short_id、自签证书及可选hostname。损坏/权限过宽明确失败，不重生。
 - `inventory.json`：共享PC地址/公钥输入，**两个独立role slot**各自current/previous。旧单主机inventory只迁入proxy，绝不猜成relay；不允许两个角色指向同一IP。
 - `generated/`：仅proxy的客户端输出。`tailnet-policy.json`可独立在入网前渲染。
-- `backups/proxy/`与`backups/relay/`：各角色的服务器checkpoint。远端`active-params.json`保存已应用角色/阶段，随checkpoint恢复；远端role所有权标记拒绝误用另一角色。
+- `backups/proxy/`与`backups/relay/`：各角色的服务器checkpoint。远端`active-params.json`保存已应用角色/阶段，随checkpoint恢复；远端role所有权标记仅在commit时持久化；未提交的prepare（包括失败/abort）不永久占用角色。live pending有独立pending-role锁定角色，另一个角色必须先等恢复；旧版本仅prepare留下、没有commit证据的标记会清除。已提交的role仍拒绝误用另一角色。
 
 编辑私有inventory（示意；公钥和名称必须换成真实值）：
 

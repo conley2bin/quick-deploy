@@ -608,7 +608,7 @@ def deploy(state, args):
         "set -euo pipefail; umask 077; install -d -m 700 /var/lib/quick-deploy-vps; "
         "exec 9>/var/lib/quick-deploy-vps/upload.lock; flock -n 9; "
         "if test -e /var/lib/quick-deploy-vps/pending; then echo 'Refusing upload: transaction pending; use setup.sh abort' >&2; exit 1; fi; "
-        f"if test -f /var/lib/quick-deploy-vps/role && test \"$(cat /var/lib/quick-deploy-vps/role)\" != {role}; then echo 'Refusing upload: other host role' >&2; exit 1; fi; "
+        f"if test -f /var/lib/quick-deploy-vps/previous && test -f /var/lib/quick-deploy-vps/role && test \"$(cat /var/lib/quick-deploy-vps/role)\" != {role}; then echo 'Refusing upload: other host role' >&2; exit 1; fi; "
         + ("if test -e /etc/sing-box/config.json; then echo 'Refusing relay upload: proxy config already exists' >&2; exit 1; fi; " if role == 'relay' else '') +
         "install -d -m 700 /var/lib/quick-deploy-vps/incoming; "
         "rm -f /var/lib/quick-deploy-vps/incoming/auth-key; "

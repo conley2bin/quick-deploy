@@ -10,6 +10,14 @@ ACTION=${1:?remote action required}
 ROLE=${3:-proxy}
 [[ $ROLE == proxy || $ROLE == relay ]] || { echo 'Invalid role (proxy|relay)' >&2; exit 1; }
 [[ $EUID == 0 ]] || { echo 'VPS requires root/passwordless sudo' >&2; exit 1; }
+drop_uncommitted_claim() {
+    # Legacy prepares wrote role before any commit. A previous checkpoint is
+    # durable evidence of a commit; a pending transaction owns its own role.
+    if [[ ! -f $ROOT/previous && ! -f $ROOT/pending ]]; then
+        rm -f "$ROOT/role" "$ROOT/role.candidate"
+    fi
+}
+
 cleanup_prepare() {
     local status=$?
     trap - EXIT HUP INT TERM PIPE
@@ -27,6 +35,7 @@ cleanup_prepare() {
         systemctl unmask --runtime sing-box.service || status=1
         rm -f "$ROOT/mask-owned" || status=1
     fi
+    drop_uncommitted_claim || status=1
     exit "$status"
 }
 if [[ $ACTION == prepare ]]; then
@@ -49,13 +58,19 @@ else
     flock -w 30 8 || { echo 'Another VPS operation is running' >&2; exit 1; }
 fi
 
-if [[ -f $ROOT/role && $(cat "$ROOT/role") != "$ROLE" ]]; then
+if [[ -f $ROOT/role && -f $ROOT/previous && $(cat "$ROOT/role") != "$ROLE" ]]; then
     echo 'Refusing ambiguous host: this machine belongs to the other VPS role' >&2; exit 1
 fi
-if [[ $ROLE == relay && ! -f $ROOT/role && ( -e $CONF || -e /etc/systemd/system/sing-box.service.d/90-quick-deploy-vps.conf ) ]]; then
+if [[ -f $ROOT/pending ]]; then
+    if [[ -f $ROOT/pending-role ]]; then pending_owner=$(cat "$ROOT/pending-role");
+    elif [[ -f $ROOT/role ]]; then pending_owner=$(cat "$ROOT/role");
+    else echo 'Refusing ambiguous pending transaction without a role' >&2; exit 1; fi
+    [[ $pending_owner == "$ROLE" ]] || { echo 'Refusing live pending transaction of another role' >&2; exit 1; }
+fi
+if [[ $ROLE == relay && ( -e $CONF || -e /etc/systemd/system/sing-box.service.d/90-quick-deploy-vps.conf ) ]]; then
     echo 'Refusing relay ownership: existing proxy configuration on this host' >&2; exit 1
 fi
-if [[ $ACTION == prepare ]]; then printf '%s\n' "$ROLE" >"$ROOT/role"; fi
+if [[ $ACTION == prepare && ! -f $ROOT/pending ]]; then drop_uncommitted_claim; fi
 
 param() { python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))[sys.argv[2]])' "$ROOT/incoming/params.json" "$1"; }
 
@@ -334,6 +349,7 @@ arm_transaction() {
     local checkpoint=$1 kind=$2 target=${3:-}
     stop_timer
     rm -f "$ROOT/pending-no-proxy-change"
+    printf '%s\n' "$ROLE" >"$ROOT/pending-role"
     printf '%s\n' "$checkpoint" >"$ROOT/pending"
     printf '%s\n' "$kind" >"$ROOT/pending-kind"
     printf '%s\n' "$target" >"$ROOT/pending-target"
@@ -620,11 +636,13 @@ commit)
     if [[ $kind == apply ]]; then
         systemctl enable quick-deploy-vps-firewall.service
         cp "$ROOT/pending" "$ROOT/previous"
+        printf '%s\n' "$ROLE" >"$ROOT/role.candidate"
+        mv -f "$ROOT/role.candidate" "$ROOT/role"
     fi
     prune_checkpoints
     stop_timer
     systemctl reset-failed quick-deploy-vps-revert.service 2>/dev/null || true
-    rm -f "$ROOT/pending" "$ROOT/pending-kind" "$ROOT/pending-target" "$ROOT/pending-no-proxy-change" "$ROOT/prepared"
+    rm -f "$ROOT/pending" "$ROOT/pending-role" "$ROOT/pending-kind" "$ROOT/pending-target" "$ROOT/pending-no-proxy-change" "$ROOT/prepared"
     # Rollback preserves the target's enabled state (including pristine OFF).
     # An apply enables only after its guarded config and firewall are durable.
     if [[ $kind == apply && $ROLE == proxy ]]; then systemctl enable sing-box; fi
@@ -637,14 +655,17 @@ abort)
         preserve_proxy=false
         if [[ -f $ROOT/pending-no-proxy-change ]]; then preserve_proxy=true; fi
         restore "$checkpoint" "$preserve_proxy"
-        rm -f "$ROOT/pending" "$ROOT/pending-kind" "$ROOT/pending-target" "$ROOT/pending-no-proxy-change" "$ROOT/prepared"
+        rm -f "$ROOT/pending" "$ROOT/pending-role" "$ROOT/pending-kind" "$ROOT/pending-target" "$ROOT/pending-no-proxy-change" "$ROOT/prepared"
+        drop_uncommitted_claim
         prune_checkpoints
         echo 'Restored pre-deployment config, owned nft table and sshd settings.'
     elif [[ -f $ROOT/prepared ]]; then
-        rm -f "$ROOT/prepared"
+        rm -f "$ROOT/prepared" "$ROOT/pending-role"
+        drop_uncommitted_claim
         prune_checkpoints
         echo 'Cleared prepared candidate; live config was not changed.'
     else
+        drop_uncommitted_claim
         echo 'Refusing abort: no pending transaction or prepared candidate on this host' >&2
         exit 1
     fi
