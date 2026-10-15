@@ -287,6 +287,27 @@ fi
         self.assertNotIn('apt-mark hold', self.log.read_text())
         self.assertFalse(key.exists())
 
+    def test_pruning_keeps_last_good_and_recent_checkpoints_only(self):
+        checkpoints = []
+        for number in range(7):
+            path = self.state / f"checkpoint-{number}"
+            path.mkdir()
+            (path / "secret").write_text('fixture secret')
+            os.utime(path, (number, number))
+            checkpoints.append(path)
+        (self.state / "previous").write_text(str(checkpoints[0]) + "\n")
+        foreign = self.state / "unrelated"
+        foreign.mkdir()
+        link = self.state / "checkpoint-link"
+        link.symlink_to(foreign, target_is_directory=True)
+        result = self.action("abort")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(checkpoints[0].exists())
+        self.assertTrue(all(path.exists() for path in checkpoints[-3:]))
+        self.assertTrue(all(not path.exists() for path in checkpoints[1:4]))
+        self.assertTrue(foreign.exists())
+        self.assertTrue(link.is_symlink())
+
     def test_health_rejects_unsubstituted_uid_or_root_proxy_process(self):
         self.assertEqual(self.action("health").returncode, 0)
         result = self.action("health", QD_PROCESS_UID="0")

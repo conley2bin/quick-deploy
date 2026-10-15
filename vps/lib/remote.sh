@@ -142,6 +142,28 @@ assert "tag:relay" in s.get("Self",{}).get("Tags",[]), "tag:relay not approved"
     echo 'PASS sing-box active, TCP443 + UDP443/40000 listening, owned firewall, tagged Tailscale running'
 }
 
+prune_checkpoints() {
+    # Retain three newest plus every referenced recovery point. Only private
+    # module checkpoint directories are eligible; never follow a symlink.
+    python3 - "$ROOT" <<'PY'
+import pathlib, shutil, sys
+root = pathlib.Path(sys.argv[1])
+protected = set()
+for name in ('previous', 'prepared', 'pending', 'pending-target'):
+    marker = root / name
+    if marker.is_file():
+        value = marker.read_text().strip()
+        if value:
+            protected.add(pathlib.Path(value).absolute())
+checkpoints = sorted((p for p in root.glob('checkpoint-*') if p.is_dir() and not p.is_symlink()),
+                     key=lambda p: p.stat().st_mtime_ns, reverse=True)
+protected.update(checkpoints[:3])
+for path in checkpoints:
+    if path not in protected:
+        shutil.rmtree(path)
+PY
+}
+
 stop_timer() {
     systemctl stop quick-deploy-vps-revert.timer 2>/dev/null || true
 }
@@ -176,6 +198,7 @@ prepare)
     # A prepared candidate has never changed the data plane. Replace it under
     # the operation/upload locks instead of permanently blocking redeployment.
     if [[ -f $ROOT/prepared ]]; then echo 'Replacing stale prepared candidate'; rm -f "$ROOT/prepared"; fi
+    prune_checkpoints
     export DEBIAN_FRONTEND=noninteractive
     # Install signed packages via current official routes. No curl | sh on
     # unchecked downloads: download must complete before executing installer.
@@ -357,6 +380,7 @@ commit)
         systemctl enable quick-deploy-vps-firewall.service
         cp "$ROOT/pending" "$ROOT/previous"
     fi
+    prune_checkpoints
     stop_timer
     systemctl reset-failed quick-deploy-vps-revert.service 2>/dev/null || true
     rm -f "$ROOT/pending" "$ROOT/pending-kind" "$ROOT/pending-target" "$ROOT/prepared"
@@ -371,9 +395,11 @@ abort)
         checkpoint=$(cat "$ROOT/pending")
         restore "$checkpoint"
         rm -f "$ROOT/pending" "$ROOT/pending-kind" "$ROOT/pending-target" "$ROOT/prepared"
+        prune_checkpoints
         echo 'Restored pre-deployment config, owned nft table and sshd settings.'
     elif [[ -f $ROOT/prepared ]]; then
         rm -f "$ROOT/prepared"
+        prune_checkpoints
         echo 'Cleared prepared candidate; live config was not changed.'
     else
         echo 'Refusing abort: no pending transaction or prepared candidate on this host' >&2

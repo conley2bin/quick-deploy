@@ -134,7 +134,7 @@ bash ~/quick-deploy/vps/setup.sh backup            # 使用 inventory backup_ali
 
 status/check 检查 sing-box、Tailscale运行/标签、443 TCP+UDP及40000UDP监听；用数字化nft输出核对真实proxy UID guard、检查UID drop-in/加载User，并通过MainPID的实际EUID确认进程不以root运行。candidate阶段也核对UID替换成功。check 再在临时目录启动独立 mihomo（可 `--mihomo /path/to/binary`），绑定临时127.0.0.1 mixed端口，不开TUN、控制器、系统代理或DNS监听，不碰Verge。每节点请求 OpenAI/Anthropic/Gemini models endpoint，TLS验证启用，不发送密钥。收到HTTP状态即可证明该HTTPS端点可达（401/403/400正常）；逐节点、逐服务输出PASS/FAIL。它不能证明账号额度、地域资格或模型权限。端口竞争或启动失败显式失败并清理进程，没有直连fallback。
 
-rollback也使用独立180秒timer：先保存当前状态用于撤销，再恢复最近一次成功deploy之前的配置与本模块nft表，通过新鲜公钥登录并输入YES才保留；否则恢复到rollback前。pristine目标必须保持sing-box停用且无配置。重复确认的rollback恢复同一checkpoint，不来回切换。abort等待操作锁直至取得，timer设置RemainAfterElapse=no；应用前与abort/commit都会清理旧timer，timer缺失不妨碍恢复。不轮换身份、不删除软件、不退网。backup用已有SSH别名和rsync写入对端独立的 `~/.local/state/quick-deploy-private/vps-backups/<来源hostname>/`，绝不覆盖对端live `vps/` 中的inventory、device或generated。保留0700/0600，不用`--delete`，不复制活动锁。备份未做磁盘文件加密，但通过SSH加密传输；请另存离机加密副本。
+rollback也使用独立180秒timer：先保存当前状态用于撤销，再恢复最近一次成功deploy之前的配置与本模块nft表，通过新鲜公钥登录并输入YES才保留；否则恢复到rollback前。pristine目标必须保持sing-box停用且无配置。重复确认的rollback恢复同一checkpoint，不来回切换。abort等待操作锁直至取得，timer设置RemainAfterElapse=no；应用前与abort/commit都会清理旧timer，timer缺失不妨碍恢复。不轮换身份、不删除软件、不退网。远端checkpoint保留最近3个，以及previous/prepared/pending/pending-target指向的恢复点；只清理本模块私有checkpoint目录，永远保留last-good引用，不跟随符号链接。backup用已有SSH别名和rsync写入对端独立的 `~/.local/state/quick-deploy-private/vps-backups/<来源hostname>/`，绝不覆盖对端live `vps/` 中的inventory、device或generated。保留0700/0600，不用`--delete`，不复制活动锁。备份未做磁盘文件加密，但通过SSH加密传输；请另存离机加密副本。
 
 恢复时先取到独立临时目录，不直接覆盖本机live身份：
 
