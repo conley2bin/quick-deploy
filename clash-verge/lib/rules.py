@@ -516,15 +516,6 @@ def discover_wg_endpoints() -> list[str]:
     return endpoint_cidrs(values)
 
 
-# One source of truth for model API + CLI authentication routing. Deliberately
-# exact-match Google service names; never route all google.com/googleapis.com.
-VPS_MODEL_DOMAINS = {
-    "DOMAIN-SUFFIX": ("openai.com", "chatgpt.com", "anthropic.com", "claude.ai", "claude.com"),
-    "DOMAIN": ("generativelanguage.googleapis.com", "cloudcode-pa.googleapis.com", "aistudio.google.com"),
-}
-VPS_GROUP = "🛰️ 自建 VPS"
-
-
 def load_vps_output() -> dict[str, Any]:
     """Optional private artifact; absent means exactly the historical output.
 
@@ -594,24 +585,22 @@ def render(rules: dict[str, list[Rule]], wg_endpoints: list[str] | None = None,
         for address in sorted(addresses):
             ip = ipaddress.ip_address(address)
             self_rules.append(f"{'IP-CIDR' if ip.version == 4 else 'IP-CIDR6'},{ip}/{ip.max_prefixlen},DIRECT,no-resolve")
-        self_rules.extend(f"{kind},{name},{VPS_GROUP}" for kind, names in VPS_MODEL_DOMAINS.items() for name in names)
         injection = """  const selfNodes = %s;
   const selfRules = %s;
   const selfNames = selfNodes.map(node => node.name);
-  const selfGroup = %s;
   const priorGroups = Array.isArray(config["proxy-groups"]) ? config["proxy-groups"].filter(Boolean) : [];
-  const entry = priorGroups.find(group => group && group.name === "🚀 节点选择");
   const priorNodes = Array.isArray(config.proxies) ? config.proxies : [];
-  config.proxies = priorNodes.filter(node => node && !selfNames.includes(node.name)).concat(selfNodes);
-  config["proxy-groups"] = priorGroups.filter(group => group && group.name !== selfGroup);
-  // One-way fallback: self -> entry. entry -> self would be a rejected cycle.
-  const selfChoices = entry ? selfNames.concat([entry.name]) : selfNames;
-  config["proxy-groups"].push({name: selfGroup, type: "select", proxies: selfChoices});
-  if (entry) {
-    const choices = Array.isArray(entry.proxies) ? entry.proxies : [];
-    entry.proxies = [...new Set(choices.filter(name => name && name !== selfGroup).concat(selfNames))];
+  const subscriptionNodes = priorNodes.filter(node => node && !selfNames.includes(node.name));
+  const leafNames = new Set(subscriptionNodes.map(node => node.name));
+  config.proxies = subscriptionNodes.concat(selfNodes);
+  config["proxy-groups"] = priorGroups;
+  for (const group of priorGroups) {
+    const choices = Array.isArray(group.proxies) ? group.proxies : [];
+    if (group.type !== "select" || !choices.some(name => leafNames.has(name))) continue;
+    // Append only. Existing order/default and selection fields remain intact.
+    group.proxies = choices.concat(selfNames.filter(name => !choices.includes(name)));
   }
-""" % (json.dumps(vps_nodes, ensure_ascii=False), json.dumps(self_rules, ensure_ascii=False), json.dumps(VPS_GROUP, ensure_ascii=False))
+""" % (json.dumps(vps_nodes, ensure_ascii=False), json.dumps(self_rules, ensure_ascii=False))
         script = script.replace("function main(config) {\n", "function main(config) {\n" + injection, 1)
         assignment = "  config.rules = [...pre, ...beforeMatch, ...missingPost, ...fromMatch];"
         script = script.replace(assignment, assignment + "\n  const selfSet = new Set(selfRules.map(norm));\n  config.rules = selfRules.concat(config.rules.filter(rule => !selfSet.has(norm(rule))));", 1)

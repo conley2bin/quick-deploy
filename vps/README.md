@@ -107,7 +107,7 @@ bash ~/quick-deploy/vps/setup.sh render --device home --host <VPS数字IP> \
 
 `generated/clash-nodes.json` 只包含本机选择的 company 或 home 两节点。`clash-company.json`、`clash-home.json` 供人工核对/分发，不能让手机使用PC身份访问8743。恢复同一私有目录到另一台PC后，先 `render --device home`（反之 company），再更新规则。
 
-现有 `clash-verge/tun-fix.sh rules render/apply` 在私有文件存在时把节点与 `🛰️ 自建 VPS` select 组**内联**进生成的 Script。self组选项为Reality（默认）、Hy2、存在时的`🚀 节点选择`；🚀仅添加两SELF叶节点，不能反向引用self组，否则mihomo检测组循环。缺少🚀时仍保留所有本地规则/TUN exclusions。先注入VPS所有已知数字IP的DIRECT规则，再注入API/认证域名到self组的规则，保证API不随🚀普通选择而变化。清单唯一维护在`clash-verge/lib/rules.py:VPS_MODEL_DOMAINS`，Google不使用宽泛后缀。
+现有`clash-verge/tun-fix.sh rules render/apply`把SELF两节点内联为普通可选节点，只追加到已经提供订阅单节点的select组；自动测速/故障转移/负载均衡组及纯策略组不加入。既有默认项、顺序和选中状态不变。不创建自建组、不强制API或认证域名走VPS，海外流量由用户手工选择节点。VPS已知IPv4/IPv6 DIRECT规则仍在最前面。
 
 `server_ips`随私有输出携带数字IP；稳定hostname从inventory current.host取得主IP，额外已知IPv4/IPv6可填私有`vps_ips`列表。无已知IP就明确失败，不联网猜DNS。不使用外部file provider，不涉及SAFE_PATHS外读。文件不存在时输出与原版逐字节一致；文件损坏或权限过宽显式失败。订阅节点和其他选择保留。
 
@@ -123,7 +123,7 @@ Hy2 节点启用 SHA256证书指纹 pin，并保持 `skip-cert-verify: false`；
 2. `[Proxy Group]` 添加 `SELF = select,policy-regex-filter=^SELF-`。
 3. `[Rule]` 最前面添加 `IP-CIDR,<公司TailnetIP>/32,SELF,no-resolve`。
 
-完整中文指令与指纹在 `generated/手机和策略说明.txt`。只导入节点不会带上规则。随后浏览器访问 `http://<公司TailnetIP>:8743`，继续用现有 Codoxear 密码；不公网开放8743。
+海外/API出口由用户在Shadowrocket手工选择，不默认或强制走VPS。上述SELF组只供公司8743的私有访问规则选择。完整中文指令与指纹在 `generated/手机和策略说明.txt`。只导入节点不会带上规则。随后浏览器访问 `http://<公司TailnetIP>:8743`，继续用现有 Codoxear 密码；不公网开放8743。
 
 Hy2 URI按[Hysteria2官方URI Scheme](https://v2.hysteria.network/docs/developers/URI-Scheme/)输出大小写敏感的 `pinSHA256=<小写十六进制>`，默认不带 `insecure=1`。**手机必须把pin故意改错并确认无法连接，再恢复正确pin**；这验证当前Shadowrocket真正执行证书绑定。若正确pin仍因自签CA被拒，才手工加 `insecure=1` 兼容，并保留pin、再验错pin失败。错pin仍能连接时不要用Hy2，改用Reality。开发者网站未说明Shadowrocket的具体导入行为，不能把官方协议支持视为App已验收。
 

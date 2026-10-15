@@ -334,6 +334,7 @@ def render_outputs(state, ident, inventory, device, host, company, home):
     write_private(output / "hy2-sha256.txt", fingerprint(ident) + "\n")
     write_private(output / "手机和策略说明.txt", f"""先导出备份当前 Shadowrocket 配置和 Tailnet policy，再修改。
 节点订阅不包含规则。节点名均以 SELF- 开头，使用 phone 独立身份。
+海外/API流量由你自己选择节点，不默认或强制走VPS；下面SELF组仅用于公司8743私有访问。
 1. 从 [General] tun-excluded-routes 删除 100.64.0.0/10，并确认 skip-proxy 不含它。
 2. 添加 [Proxy Group] 下的行：
 SELF = select,policy-regex-filter=^SELF-
