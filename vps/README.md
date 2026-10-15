@@ -1,178 +1,180 @@
-# VPS 网络出口与 Tailscale Peer Relay
+# 两个 VPS 角色：首尔代理、上海 Tailscale Peer Relay
 
-`vps/setup.sh` 把**一台 Ubuntu 24.04 VPS** 配置成海外 API 代理出口、Tailscale Peer Relay，以及手机访问公司 Codoxear 的桥。两台 PC 继续使用现有 Tailscale IP、OpenSSH、剪贴板 RemoteForward 和 Sunshine；本模块不改 PC 的网络设置。手机只开 Shadowrocket，路径为：
+本模块只改变**明确指定的 Ubuntu24.04 VPS**，不改两PC的Clash运行配置、Tailscale设置、SSH别名、tmux、Codoxear、Sunshine或WireGuard。海外节点由用户自己选择；不按模型/API域名强制分流。
 
-```text
-iPhone → SELF-Reality / SELF-Hy2 → VPS → tailscale0 → 公司 PC:8743
-PC ↔ PC：Tailscale 自动选择 direct → peer-relay → DERP
-```
+| 角色 | 主机职责 | Tailscale身份 | 默认SSH用户 |
+|---|---|---|---|
+| `proxy`（默认） | 首尔Evoxt：Reality TCP443、Hy2 UDP443；第二阶段桥接手机→公司TCP8743 | `tag:egress`，**禁用Peer Relay** | root（可`--user ubuntu`等） |
+| `relay` | 上海腾讯Lighthouse：只做PC↔PC Peer Relay，无sing-box、无代理身份或客户端输出 | `tag:relay`，UDP40000 | ubuntu（通常有免密sudo） |
 
-TCP443 是 VLESS + Reality + Vision；UDP443 是 Hysteria2。两个节点手工选择，不自动切换。每台设备有独立 UUID、Hy2 密码。**只有 phone 身份能访问公司 Tailnet IPv4 的 TCP8743**；其余私网、CGNAT、保留地址、本机服务均拒绝。默认 Reality 目标 `www.microsoft.com`；部署前从 VPS 检查 TLS1.3 和 H2，检查失败就停止。
+PC之间仍用原Tailscale IP：能直接连就direct，否则使用获授权的上海Peer Relay，官方DERP最后兜底。策略只给两PC使用`tag:relay`，不给`tag:egress`中继权限。手机只开Shadowrocket：手机节点→首尔→tailscale0→公司8743；不需要手机SSH。
 
-## 当前验收边界
+**离线交付边界：**测试使用临时目录/假VPS和真实mihomo配置检查，没有实际部署或访问任何VPS。内核nft、真实sshd/systemd/软件安装、Relay路径、手机pin及真实API仍需逐项验收。不要并发操作同一VPS；保留服务商控制台恢复入口。
 
-实现与测试均离线完成，**尚未连接任何 VPS**。官方字段核对不等于实机互通：sing-box 本机未安装，远端 `sing-box check`、nft 内核加载、systemd 定时回滚、Tailscale 入网、手机导入、真实 API 可达性仍须首次部署验证。请准备服务商控制台恢复通道；确认前不要重启 VPS。不会修改 Clash Verge 运行配置、PC Tailscale、Codoxear、Sunshine 或 `/etc/wireguard`。
+## 1. 私有状态和身份
 
-## 1. 初始化私有身份
-
-在普通桌面用户下运行，不要 sudo 整个入口。PC 依赖 Python3 标准库、OpenSSL、OpenSSH、rsync；QR 可选依赖 `qrencode`，端到端检查依赖 `verge-mihomo`/`mihomo` 和 curl。
+在普通PC用户下运行，不要sudo整个setup。依赖Python3、OpenSSL、OpenSSH；backup需rsync；QR可选qrencode；代理check需mihomo/verge-mihomo及curl。远端先装Python等依赖再解析配置；所有本模块APT命令等待dpkg锁最多300秒，noninteractive且不升级已有依赖包。
 
 ```bash
+# 需要代理时初始化业务身份；重跑绝不轮换已有身份。
 bash ~/quick-deploy/vps/setup.sh init
-# 首次init可加 --company-name <公司Tailnet名> --home-name <家Tailnet名>；无机器名默认值
-# 有稳定域名时首次 init 可加 --hostname relay.example.net
-# 选其它 Reality 目标：init --reality-target www.example.net
+# 仅配置relay的PC也可这样初始化私有inventory，不创建/读取proxy identity：
+bash ~/quick-deploy/vps/setup.sh init --role relay
+# 首次init可加 --company-name <公司Tailnet名> --home-name <家Tailnet名>
+# proxy首次init还可加 --hostname relay.example.net --reality-target www.microsoft.com
 ```
 
-私有目录固定默认在 `~/.local/state/quick-deploy-private/vps/`，目录0700、文件0600。高级离线测试可在子命令**之前**传 `--state-dir /private/path`。内容：
+状态在`~/.local/state/quick-deploy-private/vps/`，目录0700、文件0600，永不入Git。测试可在子命令前用`--state-dir /private/path`。
 
-- `identity.json`：三个用户、Reality X25519 密钥与 short_id、Hy2 自签证书/私钥、可选 hostname。
-- `inventory.json`：current、previous、两 PC 地址/名称、另一台 PC 公钥、backup_alias、本机 device。
-- `generated/`：客户端凭据、二维码、策略片段；`backups/`：远端配置与本模块防火墙 checkpoint。VPS的`active-params.json`随checkpoint保存/恢复，用于已提交阶段的health语义，prepare不会提前覆盖。
+- `identity.json`：仅proxy使用，company/home/phone各自UUID和Hy2密码、Reality密钥/short_id、自签证书及可选hostname。损坏/权限过宽明确失败，不重生。
+- `inventory.json`：共享PC地址/公钥输入，**两个独立role slot**各自current/previous。旧单主机inventory只迁入proxy，绝不猜成relay；不允许两个角色指向同一IP。
+- `generated/`：仅proxy的客户端输出。`tailnet-policy.json`可独立在入网前渲染。
+- `backups/proxy/`与`backups/relay/`：各角色的服务器checkpoint。远端`active-params.json`保存已应用角色/阶段，随checkpoint恢复；远端role所有权标记拒绝误用另一角色。
 
-`init` 遇到已有身份只校验并保留，不轮换；损坏或权限过宽会显式失败。先备份再人工修复。修改现有 hostname/Reality 目标须编辑私有 identity 后重跑部署；不要删除 identity 来换 VPS。
-
-编辑私有 `inventory.json`，保留已有字段，并填入另一台 PC 公钥和现有 SSH alias：
+编辑私有inventory（示意；公钥和名称必须换成真实值）：
 
 ```json
 {
-  "version": 1,
-  "current": null,
-  "previous": [],
+  "version": 2,
+  "roles": {
+    "proxy": {"current": null, "previous": []},
+    "relay": {"current": null, "previous": []}
+  },
   "company_name": "公司实际Tailnet名称",
   "home_name": "家里实际Tailnet名称",
-  "ssh_public_keys": ["ssh-ed25519 AAAA... 另一台PC公钥的完整一行"],
-  "backup_alias": "另一台PC已有的SSH别名"
+  "ssh_public_keys": ["ssh-ed25519 AAAA... 另一PC完整公钥"],
+  "backup_alias": "对端PC已有SSH别名"
 }
 ```
 
-本机公钥读取 `~/.ssh/conley.pub`，部署要求至少两把不同且通过 `ssh-keygen` 验证的公钥；初次/新鲜登录使用 `~/.ssh/conley`。**不要把私钥放 inventory**。公司/家地址默认只读发现 `tailscale status --json` 的 Self 和 Peer，按上述名称匹配；不唯一就失败，不猜本机就是公司。可填 `company_ip`、`home_ip` 或给 deploy/render 传 `--company-ip`、`--home-ip`。必须是两个不同的 `100.64.0.0/10` IPv4。离线 render 需显式提供地址。
+本机公钥固定读`~/.ssh/conley.pub`，要求两把不同且通过ssh-keygen验证的公钥；初次/新鲜登录使用`~/.ssh/conley`。不把私钥放inventory。PC地址从本机`tailscale status --json`的Self/Peer按私有名称只读发现；可填`company_ip`、`home_ip`或传对应IP flags。必须为不同的100.64/10 IPv4，不猜本机角色。替换一个role只更新它自己的current/previous，不动另一role。
 
-## 2. 首次部署（拿到 VPS 后才运行）
+## 2. 首尔proxy：先验代理，再加手机桥
 
-1. 安装 Ubuntu24.04，确认服务商防火墙放行 TCP22/443、UDP443/40000/41641；自定义 SSH 端口也须放行。VPS 账号须 root 或有 `sudo -n` 权限。
-2. 用服务商控制台核对 SSH host key，先完成可用的 OpenSSH 登录。脚本不跳过 known_hosts 检查，管理 SSH 禁用 ProxyCommand/ProxyJump；PC现有TUN仍可能截获底层连接，默认22由现有Clash规则直连，自定义端口须自行核对。
-3. 按下面两个阶段逐项验收。代理阶段不需要VPS加入Tailnet；第二阶段才备份/合并policy、添加`tag:relay` tagOwners并收紧allow-all，准备批准登录和标签。
-4. 先看完全离线的计划；此模式不读身份、SSH、Tailscale、DNS，不创建状态目录：
+先用服务商控制台核对SSH host key，保证OpenSSH可登录。默认root；若镜像禁root，明确`--user`指定实际免密sudo用户。脚本保留known_hosts验证，禁止ProxyCommand/ProxyJump；不修改PC路由。服务商防火墙先放TCP22（或实际SSH端口）、TCP443、UDP443；桥接阶段还需UDP41641。proxy不监听或开放UDP40000。
 
 ```bash
-# 阶段1：仅代理、nft防火墙、公钥与sshd；完全跳过VPS Tailscale安装/CLI/入网/relay。
-bash ~/quick-deploy/vps/setup.sh deploy --host <VPS数字IP> --device company --without-tailscale --dry-run
-bash ~/quick-deploy/vps/setup.sh deploy --host <VPS数字IP> --device company --without-tailscale --provider Evoxt
-bash ~/quick-deploy/vps/setup.sh check
-# 本阶段check仍检查两代理节点/API；Tailscale显示SKIP，不视为失败。
-# 自行更新Clash并验收真实API后，再进行下一阶段。
-
-# 阶段2：同一host普通deploy（不带--without-tailscale），安装/入网/启用UDP40000 relay。
-# 先按策略章节合并policy，再准备批准登录和tag。
-bash ~/quick-deploy/vps/setup.sh deploy --host <VPS数字IP> --device company
-bash ~/quick-deploy/vps/setup.sh check --ping
-# --device 必填；在家里PC执行时用 --device home；可加 --user ubuntu --port 2222
+# 第一阶段：只装代理、防火墙、公钥/sshd；跳过VPS所有Tailscale安装/CLI/入网。
+bash ~/quick-deploy/vps/setup.sh deploy --role proxy --host <首尔IP> --device company --without-tailscale --dry-run
+bash ~/quick-deploy/vps/setup.sh deploy --role proxy --host <首尔IP> --device company --without-tailscale --provider Evoxt
+bash ~/quick-deploy/vps/setup.sh check --role proxy
 ```
 
-两阶段复用同一identity，第二阶段不会轮换凭据；同host省略provider会保留原标签，不新增虚假换机历史。代理config和防火墙未变、UID/监听健康且`/proc/MainPID/exe`精确指向当前`/usr/bin/sing-box`时，第二阶段及重复deploy不stop/restart sing-box、不交换其配置、不重载nft表。只更新事务化的`active-params.json`阶段状态，仍经新鲜SSH登录和YES确认；未确认/新增relay健康失败会恢复原阶段状态，不打断未改动的代理。
+`--device company|home`对proxy必填；render/check选本机独立凭据。第一阶段health/status/check显示Tailscale **SKIP**，check仍逐节点探测三家API，无API key。自行更新Clash、手选节点并验收，随后再做桥接。
 
-`--without-tailscale`不读取/上传Tailscale auth key，不执行VPS任何Tailscale命令，也不停止已有Tailscale服务；它表示本次不管理该功能。UDP40000/41641两阶段都可在防火墙放行，第一阶段没有本模块relay监听。health/status/check从VPS已提交的阶段状态判定SKIP；`check --ping`也会显示跳过，不误ping旧节点。第一阶段还不能通过VPS到公司8743，也没有Peer Relay；手机桥和中继只在第二阶段及policy验收后使用。
-
-部署先确认目标，安装 sing-box 官方签名APT包，固定为[稳定版1.14.3](https://github.com/SagerNet/sing-box/releases/tag/v1.14.3)（`vps.py:SING_BOX_VERSION`），并`apt-mark hold`；版本写入上传params。已有版本不匹配时默认停止；明确加`deploy --upgrade`并额外输入YES，才执行unhold → 精确安装pin → hold（失败也重新hold），包版本不属于配置回滚。1.13.x的Reality目标TLS记录上限不足以处理Microsoft证书链，不能继续使用。APT仓库若已不保留该版本也失败，不退回latest。版本变更须先修改固定值并重新审查/验收。Tailscale用官方安装器。新包安装期间临时 mask，避免默认配置自动启动。只接受 Ubuntu24.04，Tailscale 现场检查 CLI flags。第二阶段默认 `tailscale up` 打印登录 URL，等待最多10分钟；在浏览器登录并批准标签。然后设置 `--relay-server-port=40000`，不提供 exit node 或子网路由。
-
-可选用 `--auth-key-file /private/auth-key`（当前用户0600）或 `TS_AUTHKEY` 环境变量。密钥通过 SSH stdin 的 root-only 临时文件传输，CLI 只传 `file:` 路径，不打印密钥；用后删除。不保存 auth key 为长期恢复凭据，换机通常新建一次性 tagged key。
-
-### 配置事务
-
-本地渲染 → SSH 上传 → 远端 `sing-box check` 和 `nft -c` → 私有远端/本地 checkpoint → 启动独立 **180秒自动恢复 timer** → 停 proxy、原子替换配置与本模块表 → 重启/监听/标签检查 → **禁用 SSH multiplex 的全新公钥登录** → 输入 `YES` → sshd 禁密码/键盘交互、root仅公钥 → 再次新登录检查 → 持久化并取消 timer。
-
-新装包的公开示例配置在unit仍mask时删除，并禁用unit；pristine checkpoint不含代理配置。snapshot记录原有启用状态；恢复首先disable --now sing-box，只有同时具备配置、UID drop-in和持久防火墙的完整checkpoint才允许重新启动/启用。commit最后才enable sing-box，避免回滚后重启跑起无guard代理。
-
-180秒内未确认或检查失败，会恢复之前的配置、nft表、sshd片段与服务 override。失败不会静默降级。包安装、Tailscale 入网、追加公钥不在回滚范围内。遇到断线等待 timer；上传/prepare完成但尚未apply时没有改运行配置，遗留prepared标记会在下一次prepare时替换，也可用`setup.sh abort --host <IP>`清除（未提交inventory也能用）。没有待处理状态时abort明确拒绝，不假装执行了恢复。自动fallback先尝试新登录，再尝试现有ControlMaster连接。prepare对成功、失败及HUP/INT/TERM/PIPE都清理auth-key和本模块拥有的runtime mask；APT显式noninteractive且等待dpkg锁最长300秒；Python等依赖先安装再运行参数解析/清理。rollback健康检查最多轮询20次，避免服务刚启动尚未监听的竞态。必要时从服务商控制台执行：
+**第二阶段先导出并合并Tailnet策略，后入网**（下节）；tag必须已存在。再运行：
 
 ```bash
-sudo /usr/local/lib/quick-deploy-vps/remote.sh abort
+bash ~/quick-deploy/vps/setup.sh deploy --role proxy --host <同一首尔IP> --device company
+bash ~/quick-deploy/vps/setup.sh check --role proxy --ping
 ```
 
-nft只管理 `table inet qd_vps`，不清空其他表或改 `/etc/nftables.conf`；独立 systemd unit 在重启时加载。输入默认drop，仅允许既有连接、lo、ICMP、DHCPv6客户端回复（仅fe80::/10来源的UDP547→546）、管理端口和代理/relay UDP端口，拒绝新的 tailscale0 入站服务连接；公司8743的回包按 conntrack 放行。sing-box 使用独立 `qd-vps-proxy` UID，OUTPUT 对该 UID 拒绝本机（含自身公网地址）和保留目的地，仅允许 tailscale0 → company:8743；协议层 `auth_user` 再限制为 phone。先 DNS resolve 再按目的 IP 拒绝，避免域名绕过范围规则。DNS使用公共1.1.1.1，VPS 本地解析器不需要私网例外。
+此阶段请求`tag:egress`、accept-dns=false、accept-routes=false，且显式将`--relay-server-port`设为空，关闭旧版本可能留下的relay。不提供exit node或子网路由。默认打印登录URL等最多10分钟；可用0600的`--auth-key-file`或`TS_AUTHKEY`，密钥只经SSH stdin到root私有文件、用file:路径传给CLI，用后删除。without阶段不读取/上传auth输入，也不停止现有Tailscale。
 
-## 3. 客户端输出
+两阶段复用身份。配置/防火墙相同、UID/监听健康且`readlink /proc/MainPID/exe`精确为`/usr/bin/sing-box`时，不stop/restart代理、不换配置、不重载nft；只事务化更新阶段状态。已删除/旧二进制不走此捷径，必须正常重启并检查。失败或未确认的纯阶段变化只恢复阶段/sshd，不打断未改动的代理。包安装与Tailscale入网不是配置回滚的一部分。
 
-部署成功自动 render，也可单独执行：
+### 固定版本与明确升级
+
+固定[sing-box1.14.3](https://github.com/SagerNet/sing-box/releases/tag/v1.14.3)，官方签名APT安装并hold，版本写入params。1.13.x的utls限制可使Microsoft目标Reality全部失败，不能继续使用。1.14.3的[go.mod](https://github.com/SagerNet/sing-box/blob/v1.14.3/go.mod)使用utls1.8.7。
+
+已有版本不符默认拒绝；只有`deploy --upgrade ...`并额外YES确认才unhold→安装精确`sing-box=1.14.3`→hold，失败也重新hold。不退回latest，包升级不降级回滚。新装包的公开示例配置在unit仍mask时删除，pristine checkpoint无配置，unit禁用，避免回滚后重启暴露示例代理。
+
+## 3. 上海relay：腾讯Lighthouse
+
+新建**Ubuntu24.04** Lighthouse实例。通常用户`ubuntu`且免密sudo，root SSH可能禁用，故relay默认ubuntu。先核对控制台host key和SSH登录。
+
+**Lighthouse还有独立的控制台防火墙：必须放行TCP22（或实际SSH端口）、UDP40000、UDP41641。** 不开放443；relay不安装sing-box，不读取/创建代理身份，不生成Clash/Shadowrocket输出。
+
+先按下一节备份并合并策略，再部署：
+
+```bash
+bash ~/quick-deploy/vps/setup.sh deploy --role relay --host <上海IP> --dry-run
+bash ~/quick-deploy/vps/setup.sh deploy --role relay --host <上海IP> --user ubuntu --provider Tencent
+bash ~/quick-deploy/vps/setup.sh check --role relay
+```
+
+Tailscale请求`tag:relay`，relay UDP40000只在已武装timer的apply阶段开启。官方安装前检查`pkgs.tailscale.com`，不可达则明确停止，不换非官方镜像；安装器后续失败也明确提示。policy/login批准需要Tailscale控制面可达。
+
+服务器check验证tailscaled运行、tag:relay、40000UDP监听和模块nft表。PC侧ping该**role当前主机的数字Tailnet IP**，再只读status JSON，报告另一PC当前direct / peer-relay / DERP；若没有活动流量则明确idle/unknown，不编造路径。flags可覆盖PC IP。不会改PC配置、强制断开direct或删DERP；请在两PC实际通信时观察peer-relay是否为上海地址。
+
+## 4. Tailnet策略：先备份/合并，再enroll
+
+不需要proxy identity即可提前生成：
+
+```bash
+bash ~/quick-deploy/vps/setup.sh render --policy-only --company-ip <公司100.x> --home-ip <家100.y>
+# 输出私有 ~/.local/state/quick-deploy-private/vps/tailnet-policy.json
+```
+
+片段包含：
+- tagOwners：tag:relay及tag:egress归admin；
+- 私有输入填充的company/home host aliases；
+- member→self `*`，替换原allow-all；
+- company+home→tag:relay，app `tailscale.com/cap/relay`；
+- tag:egress→company `tcp:8743`，不给relay访问Codoxear的授权。
+
+**先导出当前完整policy备份，合并并通过admin console校验，才部署enroll。** 工具在任何enroll上传前额外要求YES确认；不会替你修改控制台策略。 grant允许是累加的，必须移除旧allow-all、过宽relay授权；只让上海实例持有tag:relay，首尔改为tag:egress，清理旧中继节点。保留不相关精细授权。autogroup:self只涵盖同一用户自己的未打标签设备，两PC不同拥有者须另外明确授权。DERP仍是最后回退，不删控制面；10%丢包不保证触发换路。
+
+## 5. 客户端：手动选节点
 
 ```bash
 bash ~/quick-deploy/vps/setup.sh render --device company
-# 离线示例（使用自己的真实Tailnet IP替换占位）：
-bash ~/quick-deploy/vps/setup.sh render --device home --host <VPS数字IP> \
-  --company-ip <公司100.x> --home-ip <家100.y>
+# 无部署记录时可离线指定 --host <首尔IP> --company-ip <公司100.x> --home-ip <家100.y>
 ```
 
-### Clash Verge（两台 PC 各自执行）
+`generated/clash-nodes.json`为本机company/home；两PC各自render。恢复备份到另一PC后必须换本机device。稳定hostname的已知数字IP来自proxy current.host；额外IPv4/IPv6可填私有`vps_ips`。不联网猜DNS，没有已知数字IP就失败。
 
-`generated/clash-nodes.json` 只包含本机选择的 company 或 home 两节点。`clash-company.json`、`clash-home.json` 供人工核对/分发，不能让手机使用PC身份访问8743。恢复同一私有目录到另一台PC后，先 `render --device home`（反之 company），再更新规则。
+Clash生成器把SELF-Reality/SELF-Hy2加为普通可选节点，只追加到已有订阅单节点的select组；url-test/fallback/load-balance及纯DIRECT/REJECT/组策略不增加。保留所有已有选项顺序、默认项、selection。**没有专用self组，没有API/认证域名强制路由。** VPS /32、/128 DIRECT规则仍最先，避免非22SSH/临时check客户端绕回VPS。无私有文件时Script逐字节不变；节点内联，不需放宽SAFE_PATHS。
 
-现有`clash-verge/tun-fix.sh rules render/apply`把SELF两节点内联为普通可选节点，只追加到已经提供订阅单节点的select组；自动测速/故障转移/负载均衡组及纯策略组不加入。既有默认项、顺序和选中状态不变。不创建自建组、不强制API或认证域名走VPS，海外流量由用户手工选择节点。VPS已知IPv4/IPv6 DIRECT规则仍在最前面。
+本模块不自动调用tun-fix apply、不改live Script或重载Verge。手动查看候选、更新已登记Script后再GUI重载；Script/备份含凭据，不能入Git。Hy2使用证书fingerprint pin、skip-cert-verify=false。
 
-`server_ips`随私有输出携带数字IP；稳定hostname从inventory current.host取得主IP，额外已知IPv4/IPv6可填私有`vps_ips`列表。无已知IP就明确失败，不联网猜DNS。不使用外部file provider，不涉及SAFE_PATHS外读。文件不存在时输出与原版逐字节一致；文件损坏或权限过宽显式失败。订阅节点和其他选择保留。
+### Shadowrocket：仅Codoxear需要私网规则
 
-本模块的 render/deploy **不执行** `tun-fix apply` 或重载 Verge。请自行查看候选输出后更新已登记 Script，再在 GUI 重载。生成 Script/备份包含凭据，不能提交到 Git 或分享日志。
+导入`shadowrocket.txt`的两URI，或base64订阅文本`shadowrocket-subscription.txt`；不自动托管URL。qrencode存在才生成QR，否则明确提示。海外/API流量自己选节点，不默认走VPS。
 
-Hy2 节点启用 SHA256证书指纹 pin，并保持 `skip-cert-verify: false`；SNI为证书SAN `qd-vps.invalid`。不人为设置带宽上限，让 Hysteria2 默认拥塞控制工作。
+第二阶段桥接验收后，一次性手工编辑：
+1. 从tun-excluded-routes移除100.64/10，并确认skip-proxy没有它；
+2. `[Proxy Group]`添加`SELF = select,policy-regex-filter=^SELF-`（仅供此手机私网目的地）；
+3. `[Rule]`第一行`IP-CIDR,<公司IP>/32,SELF,no-resolve`。
 
-### iPhone Shadowrocket
+浏览器访问`http://<公司IP>:8743`并使用已有Codoxear密码。不改Codoxear或开放公网8743；手机不配置SSH。服务端仅phone身份可到该TCP端口，其他身份及私网/CGNAT/本机目的地拒绝；独立proxy UID的nft OUTPUT guard补充DNS重绑定/本机公网IP防护。
 
-`shadowrocket.txt` 有两条 URI；`shadowrocket-subscription.txt` 是相同内容的 base64订阅文本，**不自动托管为公网URL**。有 qrencode 时输出每节点二维码，否则明确提示。导入二维码或粘贴 URI 后，一次性修改自己的配置：
+Hy2 URI按[官方URI Scheme](https://v2.hysteria.network/docs/developers/URI-Scheme/)带`pinSHA256=<小写hex>`，默认不带insecure。**手机故意改错pin必须连接失败**；正确pin因自签CA被拒时才可加insecure=1，但保留pin并重做错pin测试。错pin仍能连接时不要使用Hy2，改Reality。Shadowrocket实际导入/pin/规则仍待实机验收，不能从协议规范推断App已执行。
 
-1. `[General]` 的 `tun-excluded-routes` 删除 `100.64.0.0/10`，确认 `skip-proxy` 不含它。
-2. `[Proxy Group]` 添加 `SELF = select,policy-regex-filter=^SELF-`。
-3. `[Rule]` 最前面添加 `IP-CIDR,<公司TailnetIP>/32,SELF,no-resolve`。
+## 6. 事务、check、回滚和按角色备份
 
-海外/API出口由用户在Shadowrocket手工选择，不默认或强制走VPS。上述SELF组只供公司8743的私有访问规则选择。完整中文指令与指纹在 `generated/手机和策略说明.txt`。只导入节点不会带上规则。随后浏览器访问 `http://<公司TailnetIP>:8743`，继续用现有 Codoxear 密码；不公网开放8743。
-
-Hy2 URI按[Hysteria2官方URI Scheme](https://v2.hysteria.network/docs/developers/URI-Scheme/)输出大小写敏感的 `pinSHA256=<小写十六进制>`，默认不带 `insecure=1`。**手机必须把pin故意改错并确认无法连接，再恢复正确pin**；这验证当前Shadowrocket真正执行证书绑定。若正确pin仍因自签CA被拒，才手工加 `insecure=1` 兼容，并保留pin、再验错pin失败。错pin仍能连接时不要用Hy2，改用Reality。开发者网站未说明Shadowrocket的具体导入行为，不能把官方协议支持视为App已验收。
-
-### Tailnet policy
-
-**先导出当前完整策略备份**，再在管理控制台合并 `tailnet-policy.json`，不要覆盖不相关授权。片段包含 tagOwners、company/home hosts、member→self、relay→company TCP8743、company+home→relay capability。
-
-必须移除/收紧旧的 allow-all ACL/grant；规则是累加允许，新增狭窄 grant 不会撤销旧允许。`autogroup:self` 只授权同一用户自己的未标记设备，两PC若属不同用户须另行明确授权。让控制台校验通过后，验证VPS能到8743、不能到公司22或Sunshine。relay capability只授权中继，不授予VPS其他overlay服务权限。
-
-## 4. check / status / rollback / backup
+所有管理操作默认proxy，另一角色必须显式选：
 
 ```bash
-bash ~/quick-deploy/vps/setup.sh status
-bash ~/quick-deploy/vps/setup.sh check             # 此命令会访问VPS和三家API，无API key
-bash ~/quick-deploy/vps/setup.sh check --ping      # 从当前VPS读取数字Tailnet IPv4再ping，不使用可能重名的MagicDNS
-bash ~/quick-deploy/vps/setup.sh rollback
-bash ~/quick-deploy/vps/setup.sh abort             # 当前inventory目标；或 --host <IP> --user root --port 22
-bash ~/quick-deploy/vps/setup.sh backup            # 使用 inventory backup_alias
-# 或 backup --alias 已有SSH别名
+bash ~/quick-deploy/vps/setup.sh status --role relay
+bash ~/quick-deploy/vps/setup.sh check --role proxy --ping
+bash ~/quick-deploy/vps/setup.sh rollback --role relay
+bash ~/quick-deploy/vps/setup.sh abort --role relay
+# 首次inventory尚未commit时：abort --role relay --host <上海IP> --user ubuntu
+bash ~/quick-deploy/vps/setup.sh backup --role proxy --alias <对端PC已有SSH别名>
+bash ~/quick-deploy/vps/setup.sh backup --role relay --alias <对端PC已有SSH别名>
 ```
 
-status/check 检查 sing-box、Tailscale运行/标签、443 TCP+UDP及40000UDP监听；用数字化nft输出核对真实proxy UID guard、检查UID drop-in/加载User，并通过MainPID的实际EUID确认进程不以root运行。candidate阶段也核对UID替换成功。check 再在临时目录启动独立 mihomo（可 `--mihomo /path/to/binary`），绑定临时127.0.0.1 mixed端口，不开TUN、控制器、系统代理或DNS监听，不碰Verge。每节点请求 OpenAI/Anthropic/Gemini models endpoint，TLS验证启用，不发送密钥。收到HTTP状态即可证明该HTTPS端点可达（401/403/400正常）；逐节点、逐服务输出PASS/FAIL。它不能证明账号额度、地域资格或模型权限。端口竞争或启动失败显式失败并清理进程，没有直连fallback。
+缺少该role current明确拒绝，不回退到另一台；同IP两角色或服务器role不符也拒绝。relay操作不要求代理identity。
 
-rollback也使用独立180秒timer：先保存当前状态用于撤销，再恢复最近一次成功deploy之前的配置与本模块nft表，通过新鲜公钥登录并输入YES才保留；否则恢复到rollback前。pristine目标必须保持sing-box停用且无配置。重复确认的rollback恢复同一checkpoint，不来回切换。abort等待操作锁直至取得，timer设置RemainAfterElapse=no；应用前与abort/commit都会清理旧timer，timer缺失不妨碍恢复。不轮换身份、不删除软件、不退网。远端checkpoint保留最近3个，以及previous/prepared/pending/pending-target指向的恢复点；只清理本模块私有checkpoint目录，永远保留last-good引用，不跟随符号链接。backup用已有SSH别名和rsync写入对端独立的 `~/.local/state/quick-deploy-private/vps-backups/<来源hostname>/`，绝不覆盖对端live `vps/` 中的inventory、device或generated。保留0700/0600，不用`--delete`，不复制活动锁。备份未做磁盘文件加密，但通过SSH加密传输；请另存离机加密副本。
+本地render→上传→候选检查→checkpoint（本地/服务器）→独立180秒timer→原子nft/config操作→健康检查→全新非multiplex公钥登录→YES→sshd禁密码/键盘交互、root仅公钥→再新登录→commit。relay同样执行timer/新登录/sshd流程，只没有proxy操作。SSH有效配置捕获`sshd -T -C`完整输出再grep，不用pipefail下早退出管道。rollback也有undo timer和新登录/确认，服务最多轮询20次等就绪。
 
-恢复时先取到独立临时目录，不直接覆盖本机live身份：
+只有模块表inet qd_vps，绝不flush其他nft/Tailscale表。输入默认drop，保留lo、established、ICMP、link-local DHCPv6回复。relay仅放实际SSH端口和UDP40000/41641。proxy有独立UID guard、443节点及41641；不开放新tailscale0入站服务连接，8743回包按conntrack允许。FW独立unit重启加载。
+
+abort无限等待操作锁；timer使用RemainAfterElapse=no并清理stale timer。恢复proxy先disable/stop，完整guarded checkpoint才重新启用；pristine保持OFF/configless。relay恢复之前的relay广告/daemon激活状态，pristine不再监听40000；**包安装、添加公钥、Tailscale节点入网不撤销，不克隆daemon身份**。需要时在管理台删除失效节点。prepare清理auth-key/拥有的runtime mask，替换stale prepared；恢复fallback先新登录再试既有ControlMaster。保留服务商控制台，pending时不要重启。
+
+每角色backup去对端`vps-backups/<来源hostname>/<role>/`，不覆盖对端live状态，也不备份另一role的inventory/history/秘密。无--delete，不复制锁。先恢复到独立目录，核对role/current/identity，再手工合并所选role，不能把空的另一slot覆盖正在使用的另一角色。proxy恢复后重新render本机device。旧单主机本地archive不删除；新checkpoint按role分目录。
 
 ```bash
 umask 077
 restore_dir=$(mktemp -d /tmp/qd-vps-restore.XXXXXX)
-rsync -a --chmod=D700,F600 '对端别名:.local/state/quick-deploy-private/vps-backups/来源hostname/' "$restore_dir/"
-# 核对 identity 指纹、inventory current/previous 和所有权；另备份本机已有vps目录。
-# 仅确认需要恢复该业务身份后，手工复制到自己的private vps目录；不能覆盖一份不同的既有identity。
-# 恢复后先更新本机角色与清单，再运行 render --device home（或company），才更新Clash。
+rsync -a --chmod=D700,F600 '<对端别名>:.local/state/quick-deploy-private/vps-backups/<来源hostname>/<role>/' "$restore_dir/"
+# 替换占位后使用；先核对，不直接覆盖live vps/。
 ```
 
-恢复源的inventory只是备份快照，不能当成本机最新host事实；务必核对目标IP，做独立恢复演练。
+远端保留最新3个checkpoint及previous/prepared/pending/target引用；不跟随symlink清理其他目录。备份通过SSH加密传输，本地文件未额外加密，另存离机加密副本并做恢复演练。
 
-## 5. 更换 VPS
-
-1. 先 backup，停止旧VPS提供服务，保留原 identity 和新机SSH host key的带外核对；不克隆 Tailscale daemon 状态。
-2. 新Ubuntu24.04上执行相同 `deploy --host 新IP --device 本机角色`；默认交互重新入网或用新的一次性tagged auth key。
-3. 有稳定hostname则更新DNS；无hostname则刷新各PC生成Script和手机两节点地址。UUID、Reality公私钥、Hy2密码与证书均复用。
-4. 合并/核对策略，运行check，并在手机Wi-Fi和蜂窝下分别验证8743及拒绝用例；验PC双向SSH/剪贴板/Moonlight，观察`tailscale status`是否peer-relay。
-5. 全部验收后在Tailscale管理控制台删旧节点、销毁旧VPS。原host保留在private inventory previous中；不恢复/跳过旧host key验证。
-
-## 6. 链路限制与离线测试
-
-家里电信国际出口晚高峰实测11–21%丢包，IPv4/IPv6都存在。Hy2可改善有损代理链路的使用体验，不能创造带宽或保证低延迟；Peer Relay不因一般丢包自动切DERP。首尔中继PC↔PC约两段70ms，晚高峰SSH仍可能因重传停顿。**家里申请可达公网IPv4、恢复国内直接路径才是PC↔PC低延迟的根本改进**，不是换一台同线路VPS。
+## 7. 离线测试和边界
 
 ```bash
 RM_GUARD_CONFIRM=1 python3 -m unittest discover -s vps/tests -v
@@ -184,11 +186,8 @@ RM_GUARD_CONFIRM=1 python3 clash-verge/tests/install-package-selection.py
 bash -n vps/setup.sh vps/lib/remote.sh
 ```
 
-单元测试验证身份/权限/不重生、inventory、路由/URI/policy、隔离临时client配置、干跑和部署失败路径；远端shell在重写到临时目录的假VPS里运行事务/故障注入，系统服务与联网命令均为stub。已安装mihomo以`-t -d 临时目录`核验节点schema；这些都不等于真实防火墙、relay或手机端验收。
+假VPS测试执行shell流程但stub服务/包/网络，不能证明内核或真实云主机行为。native mihomo -t验证代理节点和真实形态订阅生成结果；不碰live Verge。proxy check用临时loopback mihomo分别访问三家API，无API key；HTTP401/403/400代表可达，不代表账户权限。relay check只ping数字relay IP和读取当前PC路径。
 
-## 官方字段核对来源
+家里电信国际出口高峰11–21%丢包仍可能影响首尔代理；Hy2不是带宽保证。上海relay把PC流量留在国内，实际性能必须在新实例上测；direct优先、官方DERP最后回退。家里公网IPv4是可选直连改进，不替代旅行时的relay。
 
-- sing-box：[官方APT安装](https://sing-box.sagernet.org/installation/package-manager/)、[VLESS inbound](https://sing-box.sagernet.org/configuration/inbound/vless/)、[Hysteria2 inbound](https://sing-box.sagernet.org/configuration/inbound/hysteria2/)、[TLS/Reality](https://sing-box.sagernet.org/configuration/shared/tls/)、[auth_user/ip_cidr/ip_is_private](https://sing-box.sagernet.org/configuration/route/rule/)、[resolve/route/reject动作](https://sing-box.sagernet.org/configuration/route/rule_action/)。Context7 `/sagernet/sing-box` 与官方网站交叉核对；不使用废弃block outbound/geosite/geoip字段。
-- mihomo：[VLESS](https://wiki.metacubex.one/en/config/proxies/vless/)、[Hysteria2](https://wiki.metacubex.one/en/config/proxies/hysteria2/)、[TLS fingerprint/SNI](https://wiki.metacubex.one/en/config/proxies/tls/)。使用`flow: xtls-rprx-vision`、`client-fingerprint: chrome`、`reality-opts.public-key/short-id`、`fingerprint`证书pin。
-- Tailscale：[Linux安装](https://tailscale.com/kb/1031/install-linux)、[Peer Relay](https://tailscale.com/docs/features/peer-relay)、[CLI](https://tailscale.com/kb/1080/cli)。官方要求≥1.86，确认`tailscale.com/cap/relay`及`--relay-server-port`；本机只读`up/set --help`另确认`--auth-key=file:`、`--timeout`等，部署时再核对远端版本。
-- Hysteria2：[官方URI Scheme](https://v2.hysteria.network/docs/developers/URI-Scheme/)确认 `pinSHA256` 与 `insecure`；本模块默认输出pin，不默认降级。Shadowrocket [开发者官网](https://shadowlaunch.com/)没有完整配置规范；**其对pin的实际执行、VLESS pbk/sid/fp、tun-excluded-routes/skip-proxy、policy-regex-filter和IP-CIDR规则仍须实机验收**。
+官方依据：[sing-box安装](https://sing-box.sagernet.org/installation/package-manager/)、[TLS/Reality](https://sing-box.sagernet.org/configuration/shared/tls/)、[route](https://sing-box.sagernet.org/configuration/route/rule/)、[mihomo VLESS](https://wiki.metacubex.one/en/config/proxies/vless/)、[Hy2](https://wiki.metacubex.one/en/config/proxies/hysteria2/)、[Tailscale Peer Relay/grants](https://tailscale.com/docs/features/peer-relay)、[官方Linux安装](https://tailscale.com/kb/1031/install-linux)。当前路径字段CurAddr/PeerRelay/Relay参考官方Tailscale1.102.3 ipnstate源码；idle不等于当前DERP。

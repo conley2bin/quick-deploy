@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import base64
 import contextlib
+import copy
 import fcntl
 import hashlib
 import io
@@ -172,9 +173,51 @@ def identity(state):
     return value
 
 
+def inventory_document(value=None):
+    """One source of truth: global PC inputs plus independent role slots.
+
+    The old single-host schema can only mean proxy; never guess it is relay.
+    """
+    value = copy.deepcopy(value or {})
+    if value.get('version') not in (None, 1, 2):
+        raise Error('Unknown inventory version; refusing implicit migration')
+    if 'roles' in value and any(key in value for key in ('current', 'previous', 'device', 'without_tailscale')):
+        raise Error('Ambiguous mixed single-host and role inventory')
+    if 'roles' not in value:
+        slot = {key: value.pop(key) for key in ('current', 'previous', 'device', 'without_tailscale') if key in value}
+        value['roles'] = {'proxy': slot, 'relay': {}}
+    if not isinstance(value['roles'], dict) or set(value['roles']) - {'proxy', 'relay'}:
+        raise Error('Invalid/ambiguous role inventory')
+    value['version'] = 2
+    for role in ('proxy', 'relay'):
+        slot = value['roles'].setdefault(role, {})
+        if not isinstance(slot, dict):
+            raise Error('Role slot must be an object')
+        slot.setdefault('current', None)
+        slot.setdefault('previous', [])
+        if slot['current'] is not None and not isinstance(slot['current'], dict):
+            raise Error('Role current target must be an object or null')
+        if not isinstance(slot['previous'], list):
+            raise Error('Role history must be a list')
+        for record in ([slot['current']] if slot['current'] else []) + slot['previous']:
+            if not isinstance(record, dict) or record.get('role', role) != role:
+                raise Error('Ambiguous host role in inventory')
+            record['role'] = role
+    a, b = (value['roles'][role]['current'] for role in ('proxy', 'relay'))
+    if a and b and ipaddress.ip_address(a['host']) == ipaddress.ip_address(b['host']):
+        raise Error('Ambiguous target: proxy and relay cannot share the same host')
+    return value
+
+
+def role_slot(inventory, role='proxy'):
+    return inventory_document(inventory)['roles'][role]
+
+
 def init(state, args):
     path = state / "identity.json"
-    if path.exists() or path.is_symlink():
+    if getattr(args, 'role', 'proxy') == 'relay':
+        print('Relay init: no proxy identity created or read.')
+    elif path.exists() or path.is_symlink():
         identity(state)
         print("Existing identity preserved; init never rotates credentials.")
     else:
@@ -184,9 +227,9 @@ def init(state, args):
     if inventory.exists() or inventory.is_symlink():
         load(inventory)
     else:
-        write_private(inventory, dumps({"version": 1, "current": None, "previous": [],
-                                        "company_name": getattr(args, "company_name", None), "home_name": getattr(args, "home_name", None),
-                                        "ssh_public_keys": [], "backup_alias": None}))
+        write_private(inventory, dumps(inventory_document({
+            "company_name": getattr(args, "company_name", None), "home_name": getattr(args, "home_name", None),
+            "ssh_public_keys": [], "backup_alias": None})))
 
 
 def tail_ip(value):
@@ -273,13 +316,29 @@ def uris(ident, host):
 
 
 def policy(company, home):
-    return {"tagOwners": {"tag:relay": ["autogroup:admin"]}, "hosts": {"company": tail_ip(company), "home": tail_ip(home)},
+    return {"tagOwners": {"tag:relay": ["autogroup:admin"], "tag:egress": ["autogroup:admin"]}, "hosts": {"company": tail_ip(company), "home": tail_ip(home)},
             "grants": [{"src": ["autogroup:member"], "dst": ["autogroup:self"], "ip": ["*"]},
-                       {"src": ["tag:relay"], "dst": ["company"], "ip": ["tcp:8743"]},
+                       {"src": ["tag:egress"], "dst": ["company"], "ip": ["tcp:8743"]},
                        {"src": ["company", "home"], "dst": ["tag:relay"], "app": {"tailscale.com/cap/relay": []}}]}
 
 
-def firewall(company, ssh_port=22, uid=999):
+def firewall(company=None, ssh_port=22, uid=999, role='proxy'):
+    if role == 'relay':
+        if not 1 <= int(ssh_port) <= 65535:
+            raise Error('Invalid SSH port')
+        return f'''table inet qd_vps {{
+  chain input {{
+    type filter hook input priority 10; policy drop;
+    ct state established,related accept
+    iifname "lo" accept
+    meta l4proto {{ icmp, ipv6-icmp }} accept
+    ip6 saddr fe80::/10 udp sport 547 udp dport 546 accept
+    iifname "tailscale0" drop
+    tcp dport {int(ssh_port)} accept
+    udp dport {{ 40000, 41641 }} accept
+  }}
+}}
+'''
     tail_ip(company)
     if not 1 <= int(ssh_port) <= 65535 or int(uid) < 1:
         raise Error("Invalid firewall port/UID")
@@ -294,7 +353,7 @@ def firewall(company, ssh_port=22, uid=999):
     # No new tailnet connections to VPS services. Replies use conntrack above.
     iifname "tailscale0" drop
     tcp dport {{ {ports} }} accept
-    udp dport {{ 443, 40000, 41641 }} accept
+    udp dport {{ 443, 41641 }} accept
   }}
   chain output {{
     type filter hook output priority 10; policy accept;
@@ -318,7 +377,7 @@ def render_outputs(state, ident, inventory, device, host, company, home):
     try:
         addresses.append(str(ipaddress.ip_address(host)))
     except ValueError:
-        current = inventory.get("current") or {}
+        current = role_slot(inventory)['current'] or {}
         if current.get("host"):
             addresses.append(current["host"])
     addresses = sorted({str(ipaddress.ip_address(address)) for address in addresses})
@@ -349,7 +408,8 @@ Hysteria2 URI 使用官方 pinSHA256={fingerprint(ident).lower()}，默认不跳
 先导出当前 Tailnet policy。合并 tailnet-policy.json；删除原有 allow-all ACL/grant，
 否则新增限制不会抵消旧全放行规则。不要覆盖不相关成员授权。admin console 必须校验通过。
 member -> self 只涵盖同一拥有者的未打标签设备；两台PC若属于不同用户须另授权。
-先验证 VPS -> company:8743 可达且 -> company:22 不可达，再验手机。
+先合并策略再入网（tag必须已存在）。只有tag:egress可到公司tcp:8743；PC relay grant只指向tag:relay。
+先验证代理VPS -> company:8743 可达且 -> company:22 不可达，再验手机。
 """)
     if shutil.which("qrencode"):
         for link, name in zip(links, ("reality", "hy2")):
@@ -387,19 +447,25 @@ def public_keys(inventory):
 
 def host_record(args):
     address = str(ipaddress.ip_address(args.host))
-    if not re.fullmatch(r"[a-z_][a-z0-9_-]*", args.user) or not 1 <= args.port <= 65535:
+    role = getattr(args, 'role', 'proxy')
+    user = args.user or ('ubuntu' if role == 'relay' else 'root')
+    if not re.fullmatch(r"[a-z_][a-z0-9_-]*", user) or not 1 <= args.port <= 65535:
         raise Error("Invalid SSH user/port")
-    return {"host": address, "user": args.user, "port": args.port, "provider": args.provider}
+    return {"host": address, "user": user, "port": args.port, "provider": args.provider, "role": role}
 
 
-def updated_inventory(inventory, record):
-    result = dict(inventory)
-    old = result.get("current")
+def updated_inventory(inventory, record, role='proxy'):
+    result = inventory_document(inventory)
+    slot = result['roles'][role]
+    record = dict(record, role=role)
+    other = result['roles']['relay' if role == 'proxy' else 'proxy']['current']
+    if other and ipaddress.ip_address(other['host']) == ipaddress.ip_address(record['host']):
+        raise Error('Refusing ambiguous same-host proxy/relay ownership')
+    old = slot['current']
     if old != record:
-        previous = list(result.get("previous", []))
-        if old and old not in previous:
-            previous.append(old)
-        result.update(current=record, previous=previous)
+        if old and old not in slot['previous']:
+            slot['previous'].append(old)
+        slot['current'] = record
     return result
 
 
@@ -424,17 +490,23 @@ def remote(record, action, fresh=False, **kwargs):
     if action == "harden":
         # Expand in the SSH shell before sudo can filter SSH_CONNECTION.
         command += ' "${SSH_CONNECTION%% *}"'
+    else:
+        command += " ''"
+    command += ' ' + shlex.quote(record.get('role', 'proxy'))
     return run(ssh_args(record, fresh) + [elevated(record, command)], **kwargs)
 
 
 def bundle(ident, company, record, keys, auth=None, without_tailscale=False, upgrade=False):
-    files = {"remote.sh": (MODULE / "lib/remote.sh").read_bytes(),
-             "config.json": dumps(server_config(ident, company, record["host"])).encode(),
-             "params.json": dumps({"company": company, "host": record["host"], "ssh_port": record["port"],
-                                   "ssh_user": record["user"], "target": ident["reality_target"],
-                                   "sing_box_version": SING_BOX_VERSION, "without_tailscale": without_tailscale, "allow_upgrade": upgrade}).encode(),
-             "authorized_keys": ("\n".join(keys) + "\n").encode(),
-             "firewall.template": firewall(company, record["port"], 999).encode()}
+    role = record.get('role', 'proxy')
+    params = {'role': role, 'host': record['host'], 'ssh_port': record['port'], 'ssh_user': record['user'],
+              'without_tailscale': without_tailscale, 'allow_upgrade': upgrade}
+    files = {'remote.sh': (MODULE / 'lib/remote.sh').read_bytes(),
+             'authorized_keys': ('\n'.join(keys) + '\n').encode(),
+             'firewall.template': firewall(company, record['port'], 999, role).encode()}
+    if role == 'proxy':
+        params.update(company=company, target=ident['reality_target'], sing_box_version=SING_BOX_VERSION)
+        files['config.json'] = dumps(server_config(ident, company, record['host'])).encode()
+    files['params.json'] = dumps(params).encode()
     if auth and not without_tailscale:
         files["auth-key"] = auth.encode()
     data = io.BytesIO()
@@ -463,28 +535,43 @@ def recover_abort(record):
 
 
 def deploy(state, args):
+    role = args.role
+    if role == 'relay' and (args.without_tailscale or args.upgrade):
+        raise Error('Relay role requires Tailscale and never installs/upgrades sing-box')
+    if role == 'proxy' and not args.device:
+        raise Error('Proxy deploy requires --device company|home')
     record = host_record(args)
     if args.dry_run:
         # Deliberately before identity, inventory, keys, daemon discovery, locks
         # and even DNS: this command works on a pristine, disconnected PC.
         print(f"DRY RUN: {record['user']}@{record['host']}:{record['port']} (NO CONTACT / NO WRITES)")
         print("1. Verify Ubuntu 24.04; require root or passwordless sudo; acquire remote deployment lock.")
-        print("2. Install pinned official sing-box; firewall + both PC public keys + verified sshd hardening.")
-        if args.without_tailscale:
-            print("3. SKIP Tailscale installation, CLI, enrollment and relay (--without-tailscale).")
+        print(f"2. Role={role}: firewall + PC public keys + verified sshd hardening.")
+        if role == 'relay':
+            print('3. Official Tailscale only; tag:relay + UDP40000. NO sing-box, identity or client outputs.')
+        elif args.without_tailscale:
+            print('3. Pinned sing-box; SKIP Tailscale installation/CLI/enrollment (--without-tailscale).')
         else:
-            print("3. Install Tailscale; tailscale up --advertise-tags=tag:relay --accept-dns=false --accept-routes=false --hostname=qd-vps-relay")
-            print("   Interactive URL or private auth file; tailscale set --relay-server-port=40000.")
-        print("4. Verify Reality target TLS1.3 + ALPN h2; preserve a healthy unchanged proxy without restart.")
-        print("5. Back up config and owned nft table locally/remotely; sing-box check candidate; arm 180s auto-revert.")
-        print("6. Swap/restart ONLY changed proxy; unchanged proxy stays running. Health + NEW key SSH + explicit YES.")
-        print("7. Persist owned firewall; harden sshd AFTER key login, fresh login again, cancel revert; save inventory/render.")
+            print('3. Pinned sing-box + Tailscale tag:egress phone bridge; relay-server-port is disabled.')
+        print('4. Merge backed-up tailnet policy BEFORE enrollment; verify candidates and preserve unchanged proxy.')
+        if role == 'proxy':
+            print('5. sing-box check + nft -c; private checkpoints; arm180s auto-revert.')
+            print('6. Restart ONLY changed/stale proxy; otherwise preserve it. Health + NEW key SSH + YES.')
+        else:
+            print('5. nft -c + private relay checkpoint; arm180s auto-revert BEFORE port40000 activation.')
+            print('6. Apply relay firewall and port; health + NEW key SSH + explicit YES.')
+        print('7. Persist role firewall; harden sshd AFTER key login; confirm fresh login and save only this role inventory.')
         return
-    ident, inv = identity(state), load(state / "inventory.json")
-    current = inv.get("current") or {}
+    inv = inventory_document(load(state / 'inventory.json'))
+    ident = identity(state) if role == 'proxy' else None
+    current = inv['roles'][role]['current'] or {}
     if current.get("host") == record["host"] and not args.provider:
         record["provider"] = current.get("provider", "")
-    company, home = peers(inv, args.company_ip, args.home_ip)
+    updated_inventory(inv, record, role)  # Refuse another role's host BEFORE contact.
+    if role == 'proxy':
+        company, home = peers(inv, args.company_ip, args.home_ip)
+    else:
+        company = home = None
     keys = public_keys(inv)
     auth = None
     if args.without_tailscale:
@@ -496,22 +583,26 @@ def deploy(state, args):
     confirm(f"Will install/update ONLY VPS {record['host']}; inspect provider firewall and SSH host fingerprint first.")
     if args.upgrade:
         confirm(f"Authorize unhold and exact sing-box={SING_BOX_VERSION} installation if version differs? Package changes are not rolled back.")
+    if not args.without_tailscale:
+        confirm('Exported the current policy backup and merged/validated tagOwners + scoped grants BEFORE enrollment?')
     # A fixed trusted extraction path, root-only; upload in a single SSH session.
     # remote lock protects the fixed staging directory across all deployers.
     upload = elevated(record, "bash -c ") + shlex.quote(
         "set -euo pipefail; umask 077; install -d -m 700 /var/lib/quick-deploy-vps; "
         "exec 9>/var/lib/quick-deploy-vps/upload.lock; flock -n 9; "
         "if test -e /var/lib/quick-deploy-vps/pending; then echo 'Refusing upload: transaction pending; use setup.sh abort' >&2; exit 1; fi; "
+        f"if test -f /var/lib/quick-deploy-vps/role && test \"$(cat /var/lib/quick-deploy-vps/role)\" != {role}; then echo 'Refusing upload: other host role' >&2; exit 1; fi; "
+        + ("if test -e /etc/sing-box/config.json; then echo 'Refusing relay upload: proxy config already exists' >&2; exit 1; fi; " if role == 'relay' else '') +
         "install -d -m 700 /var/lib/quick-deploy-vps/incoming; "
         "rm -f /var/lib/quick-deploy-vps/incoming/auth-key; "
         "tar -xf - -C /var/lib/quick-deploy-vps/incoming; "
-        "bash /var/lib/quick-deploy-vps/incoming/remote.sh prepare")
+        "bash /var/lib/quick-deploy-vps/incoming/remote.sh prepare '' " + shlex.quote(role))
     run(ssh_args(record) + [upload], input=bundle(ident, company, record, keys, auth, args.without_tailscale, args.upgrade))
     # Fetch the exact remote checkpoint (contains private previous config) before
     # applying any data-plane changes; local state inherits restrictive modes.
     try:
         backup = remote(record, "export-backup", capture_output=True).stdout
-        checkpoint = private_dir(state / "backups") / (time.strftime("%Y%m%dT%H%M%S") + "-" + secrets.token_hex(4) + ".tar")
+        checkpoint = private_dir(state / "backups" / role) / (time.strftime("%Y%m%dT%H%M%S") + "-" + secrets.token_hex(4) + ".tar")
         write_private(checkpoint, "")
         checkpoint.write_bytes(backup)
         remote(record, "apply")
@@ -524,10 +615,16 @@ def deploy(state, args):
         print("Deployment failed/not confirmed; requesting recovery.", file=sys.stderr)
         recover_abort(record)
         raise
-    inv = updated_inventory(inv, record)
-    inv.update(company_ip=company, home_ip=home, device=args.device, without_tailscale=args.without_tailscale)
-    write_private(state / "inventory.json", dumps(inv))
-    render_outputs(state, ident, inv, args.device, ident.get("hostname") or record["host"], company, home)
+    inv = updated_inventory(inv, record, role)
+    inv['roles'][role].update(without_tailscale=args.without_tailscale)
+    if role == 'proxy':
+        inv.update(company_ip=company, home_ip=home)
+        inv['roles']['proxy']['device'] = args.device
+    write_private(state / 'inventory.json', dumps(inv))
+    if role == 'proxy':
+        render_outputs(state, ident, inv, args.device, ident.get('hostname') or record['host'], company, home)
+    else:
+        print('Relay committed; no proxy identity or Clash/Shadowrocket outputs created.')
 
 
 def client_config(node, port):
@@ -540,9 +637,9 @@ def check_clients(ident, inv, device, binary=None):
     binary = binary or shutil.which("verge-mihomo") or shutil.which("mihomo")
     if not binary:
         raise Error("Install mihomo/verge-mihomo first, or supply --mihomo; no silent client fallback")
-    record = inv.get("current")
+    record = role_slot(inv)['current']
     if not record:
-        raise Error("No current host in inventory")
+        raise Error("No current proxy host in inventory")
     failed = False
     for node in nodes(ident, ident.get("hostname") or record["host"], device):
         with tempfile.TemporaryDirectory(prefix="qd-vps-check-") as directory:
@@ -590,19 +687,64 @@ def check_clients(ident, inv, device, binary=None):
         raise Error("One or more node/API reachability checks failed")
 
 
-def backup(state, inv, alias):
+def relay_path(document, company, home):
+    local = set((document.get('Self') or {}).get('TailscaleIPs') or [])
+    if company in local:
+        other = home
+    elif home in local:
+        other = company
+    else:
+        raise Error('This PC is neither private inventory company nor home; refusing to guess the other PC')
+    matches = [peer for peer in (document.get('Peer') or {}).values() if other in (peer.get('TailscaleIPs') or [])]
+    if len(matches) != 1:
+        raise Error('Other PC has no unique status entry')
+    peer = matches[0]
+    if not peer.get('Active'):
+        return other, 'unavailable (idle; generate peer traffic and check again)'
+    if peer.get('CurAddr'):
+        return other, 'direct'
+    if peer.get('PeerRelay'):
+        return other, 'peer-relay'
+    if peer.get('Relay'):
+        return other, 'DERP'
+    return other, 'unavailable (no current endpoint)'
+
+
+def check_relay(record, inventory, company=None, home=None):
+    address = remote(record, 'tailnet-ip', fresh=True, capture_output=True, text=True).stdout.strip()
+    run(['tailscale', 'ping', tail_ip(address)])
+    company, home = peers(inventory, company, home)
+    document = json.loads(run(['tailscale', 'status', '--json'], capture_output=True, text=True).stdout)
+    other, path = relay_path(document, company, home)
+    print(f'PC -> {other}: {path} (read-only current status; no routing/settings changed)')
+
+
+def backup(state, inv, alias, role='proxy'):
     alias = alias or inv.get("backup_alias")
     if not alias or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", alias):
         raise Error("Set backup_alias in private inventory, or --alias (existing SSH alias)")
     source_host = socket.gethostname()
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,252}", source_host):
         raise Error("Cannot use this source hostname as an isolated backup directory")
-    target = f".local/state/quick-deploy-private/vps-backups/{source_host}"
-    run(["ssh", alias, f"umask 077; mkdir -p ~/{target}; chmod 700 ~/{target}"])
-    # No --delete; an interrupted source cannot erase the second copy. Lock is
-    # local coordination, not recovery state, and must not replace a peer lock.
-    run(["rsync", "-a", "--chmod=D700,F600", "--exclude=.lock", "-e", "ssh", str(state) + "/", f"{alias}:{target}/"])
-    print(f"Private backup: {alias}:~/{target}/ (peer live VPS state unchanged). Verify a staged restore before use.")
+    target = f'.local/state/quick-deploy-private/vps-backups/{source_host}/{role}'
+    document = inventory_document(inv)
+    document['roles']['relay' if role == 'proxy' else 'proxy'] = {'current': None, 'previous': []}
+    run(['ssh', alias, f'umask 077; mkdir -p ~/{target}; chmod 700 ~/{target}'])
+    with tempfile.TemporaryDirectory(prefix=f'.backup-{role}-', dir=state) as directory:
+        stage = Path(directory)
+        write_private(stage / 'inventory.json', dumps(document))
+        if role == 'proxy':
+            for name in ('identity.json', 'generated'):
+                source = state / name
+                if source.is_dir():
+                    shutil.copytree(source, stage / name)
+                elif source.exists():
+                    shutil.copy2(source, stage / name)
+        source = state / 'backups' / role
+        if source.is_dir():
+            shutil.copytree(source, stage / 'backups' / role)
+        run(['rsync', '-a', '--chmod=D700,F600', '-e', 'ssh', str(stage) + '/', f'{alias}:{target}/'])
+    print(f'Private {role} backup: {alias}:~/{target}/ (other role/live peer state untouched).')
 
 
 def parser():
@@ -610,13 +752,15 @@ def parser():
     p.add_argument("--state-dir", type=Path, default=Path.home() / ".local/state/quick-deploy-private/vps")
     sub = p.add_subparsers(dest="command", required=True)
     a = sub.add_parser("init")
+    a.add_argument('--role', choices=('proxy', 'relay'), default='proxy')
     a.add_argument("--hostname")
     a.add_argument("--reality-target", default="www.microsoft.com")
     a.add_argument("--company-name", help="private Tailscale hostname for discovery")
     a.add_argument("--home-name", help="private Tailscale hostname for discovery")
     a = sub.add_parser("deploy")
+    a.add_argument('--role', choices=('proxy', 'relay'), default='proxy')
     a.add_argument("--host", required=True)
-    a.add_argument("--user", default="root")
+    a.add_argument("--user", help='default root for proxy, ubuntu for relay')
     a.add_argument("--port", type=int, default=22)
     a.add_argument("--provider", default="")
     a.add_argument("--dry-run", action="store_true")
@@ -625,30 +769,41 @@ def parser():
     a.add_argument("--auth-key-file", type=Path)
     a.add_argument("--company-ip")
     a.add_argument("--home-ip")
-    a.add_argument("--device", choices=("company", "home"), required=True)
+    a.add_argument("--device", choices=("company", "home"))
     a = sub.add_parser("render")
+    a.add_argument('--policy-only', action='store_true', help='render shared policy before enrollment; no identity needed')
     a.add_argument("--device", choices=("company", "home"))
     a.add_argument("--host", help="offline render address override; does not update inventory")
     a.add_argument("--company-ip")
     a.add_argument("--home-ip")
     a = sub.add_parser("check")
+    a.add_argument('--role', choices=('proxy', 'relay'), default='proxy')
+    a.add_argument('--company-ip')
+    a.add_argument('--home-ip')
     a.add_argument("--mihomo")
     a.add_argument("--device", choices=("company", "home"))
     a.add_argument("--ping", action="store_true")
     a = sub.add_parser("backup")
+    a.add_argument('--role', choices=('proxy', 'relay'), default='proxy')
     a.add_argument("--alias")
-    sub.add_parser("rollback")
+    a = sub.add_parser("rollback")
+    a.add_argument('--role', choices=('proxy', 'relay'), default='proxy')
     a = sub.add_parser("abort", help="recover pending/prepared transaction; --host works before inventory commit")
+    a.add_argument('--role', choices=('proxy', 'relay'), default='proxy')
     a.add_argument("--host")
-    a.add_argument("--user", default="root")
+    a.add_argument("--user")
     a.add_argument("--port", type=int, default=22)
     a.set_defaults(provider="")
-    sub.add_parser("status")
+    a = sub.add_parser("status")
+    a.add_argument('--role', choices=('proxy', 'relay'), default='proxy')
     return p
 
 
 def main(argv=None):
-    args = parser().parse_args(argv)
+    p = parser()
+    args = p.parse_args(argv)
+    if args.command == 'deploy' and args.role == 'proxy' and not args.device:
+        p.error('proxy deploy requires --device company|home')
     os.umask(0o077)
     state = args.state_dir.expanduser()
     try:
@@ -662,20 +817,34 @@ def main(argv=None):
             if args.command == "deploy":
                 deploy(state, args)
                 return 0
-            if args.command == "abort":
-                inventory_path = state / "inventory.json"
-                record = host_record(args) if args.host else (load(inventory_path).get("current") if inventory_path.exists() else None)
+            role = getattr(args, 'role', 'proxy')
+            inventory_path = state / 'inventory.json'
+            inv = inventory_document(load(inventory_path)) if inventory_path.exists() else inventory_document()
+            slot = inv['roles'][role]
+            if args.command == 'abort':
+                record = host_record(args) if args.host else slot['current']
                 if not record:
-                    raise Error("Refusing abort: no current VPS; supply abort --host <IP> --user <user> --port <port>")
-                remote(record, "abort")
+                    raise Error(f'Refusing abort: no current {role} VPS; supply abort --role {role} --host <IP>')
+                if args.host:
+                    other = inv['roles']['relay' if role == 'proxy' else 'proxy']['current']
+                    if other and other['host'] == record['host']:
+                        raise Error('Refusing abort: host belongs to the other role')
+                remote(record, 'abort')
                 return 0
-            ident, inv = identity(state), load(state / "inventory.json")
-            device = getattr(args, "device", None) or inv.get("device")
+            device = getattr(args, 'device', None) or slot.get('device')
             if args.command == "render":
+                company, home = peers(inv, args.company_ip, args.home_ip)
+                if args.policy_only:
+                    write_private(state / 'tailnet-policy.json', dumps(policy(company, home)))
+                    inv.update(company_ip=company, home_ip=home)
+                    write_private(inventory_path, dumps(inv))
+                    print(f'Export current policy backup, then merge {state / "tailnet-policy.json"} BEFORE enrollment.')
+                    return 0
+                ident = identity(state)
                 if not device:
                     raise Error("Select this PC identity with render --device company|home")
                 company, home = peers(inv, args.company_ip, args.home_ip)
-                current = inv.get("current") or {}
+                current = slot['current'] or {}
                 host = args.host or ident.get("hostname") or current.get("host")
                 if not host:
                     raise Error("No current VPS; supply render --host for offline rendering")
@@ -684,16 +853,17 @@ def main(argv=None):
                 except ValueError:
                     domain(host)
                 render_outputs(state, ident, inv, device, host, company, home)
-                inv.update(company_ip=company, home_ip=home, device=device)
-                write_private(state / "inventory.json", dumps(inv))
-            elif args.command == "backup":
-                backup(state, inv, args.alias)
+                inv.update(company_ip=company, home_ip=home)
+                inv['roles']['proxy']['device'] = device
+                write_private(state / 'inventory.json', dumps(inv))
+            elif args.command == 'backup':
+                backup(state, inv, args.alias, role)
             else:
-                record = inv.get("current")
+                record = slot['current']
                 if not record:
-                    raise Error("No current VPS in inventory")
+                    raise Error(f'No current {role} VPS in private inventory; refusing to use another role')
                 if args.command == "status":
-                    print(f"Current host: {record['host']}; prior hosts: {len(inv.get('previous', []))}")
+                    print(f"Role {role}, current host: {record['host']}; prior hosts: {len(slot['previous'])}")
                     remote(record, "health", fresh=True)
                 elif args.command == "rollback":
                     confirm("Begin timed rollback of previous VPS config and owned nft table?")
@@ -706,10 +876,13 @@ def main(argv=None):
                         recover_abort(record)
                         raise
                 else:
+                    remote(record, 'health', fresh=True)
+                    if role == 'relay':
+                        check_relay(record, inv, args.company_ip, args.home_ip)
+                        return 0
                     if not device:
-                        raise Error("Select check --device company|home or save the device with render first")
-                    remote(record, "health", fresh=True)
-                    check_clients(ident, inv, device, args.mihomo)
+                        raise Error('Select check --device company|home or save the device with render first')
+                    check_clients(identity(state), inv, device, args.mihomo)
                     if args.ping:
                         # Read from this exact inventory host, never a colliding
                         # MagicDNS name still held by the replacement's old node.

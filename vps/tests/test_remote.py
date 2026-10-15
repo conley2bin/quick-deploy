@@ -38,7 +38,7 @@ class RemoteTransaction(unittest.TestCase):
         self.script.chmod(0o700)
         self.log = self.root / "commands.log"
         self.env = dict(os.environ, PATH=f"{self.bin}:{os.environ['PATH']}", QD_LOG=str(self.log), SSH_CONNECTION="198.51.100.5 12345 203.0.113.1 22")
-        (self.state / "incoming/params.json").write_text(json.dumps({"ssh_user": "root"}))
+        (self.state / "incoming/params.json").write_text(json.dumps({"role": "proxy", "ssh_user": "root", "without_tailscale": False}))
         self.stub("systemctl", '''printf 'systemctl %s\\n' "$*" >>"$QD_LOG"
 case "$*" in 'show -p User --value sing-box') echo qd-vps-proxy;; 'show -p MainPID --value sing-box') echo 4242;; esac
 if [ "${QD_FAIL_RESTART:-}" = yes ] && [ "$*" = 'restart sing-box' ]; then exit 73; fi
@@ -54,7 +54,7 @@ exit 0
         self.stub("readlink", 'echo /usr/bin/sing-box\n')
         self.stub("ss", 'echo listening\n')
         self.stub("sleep", 'exit 0\n')
-        self.stub("tailscale", 'echo \'{"BackendState":"Running","Self":{"Tags":["tag:relay"]}}\'\n')
+        self.stub("tailscale", 'echo \'{"BackendState":"Running","Self":{"Tags":["tag:egress"]}}\'\n')
         self.stub("sshd", '''printf 'sshd %s\\n' "$*" >>"$QD_LOG"
 if [ "${1:-}" = -T ]; then
 printf 'passwordauthentication no\\npermitrootlogin without-password\\n'
@@ -94,7 +94,7 @@ exec /usr/bin/install "${args[@]}"
         path.chmod(0o700)
 
     def action(self, action, **env):
-        return subprocess.run(["bash", str(self.script), action], env=dict(self.env, **env), capture_output=True, text=True)
+        return subprocess.run(["bash", str(self.script), action, '', getattr(self, 'role', 'proxy')], env=dict(self.env, **env), capture_output=True, text=True)
 
     def test_apply_requires_confirmation_then_commit_persists(self):
         apply = self.action("apply")
@@ -231,7 +231,7 @@ exit 0
         (self.etc / "apt/sources.list.d").mkdir(parents=True)
         self.env["QD_ACCOUNT"] = str(home)
         self.env["QD_CONF"] = str(self.etc / "sing-box/config.json")
-        (self.state / "incoming/params.json").write_text(json.dumps({"ssh_user": "root", "sing_box_version": "1.14.3", "target": "example.net", "without_tailscale": False}))
+        (self.state / "incoming/params.json").write_text(json.dumps({"role": "proxy", "ssh_user": "root", "sing_box_version": "1.14.3", "target": "example.net", "without_tailscale": False}))
         (self.state / "incoming/authorized_keys").write_text('ssh-ed25519 fixture\n')
         (self.state / "incoming/firewall.template").write_text('table inet qd_vps { meta skuid 999 jump proxy_output; }\n')
         (self.state / "incoming/remote.sh").write_text(self.script.read_text())
@@ -249,7 +249,7 @@ if [[ "${QD_PREPARE_SIGNAL:-}" != "" && "${1:-}" == up ]]; then kill -"$QD_PREPA
 if [[ "${2:-}" == --help ]]; then
  echo '--advertise-tags --accept-dns --accept-routes --hostname --timeout --auth-key file: --relay-server-port'
 elif [[ "${1:-}" == status ]]; then
- echo '{"BackendState":"Running","Self":{"Tags":["tag:relay"]}}'
+ echo '{"BackendState":"Running","Self":{"Tags":["tag:egress"]}}'
 elif [[ "${1:-}" == ip ]]; then echo 100.70.0.99
 fi
 ''')
@@ -383,7 +383,8 @@ fi
             self.assertNotIn('nft -f ', log)
             self.assertIn('apt-get -o DPkg::Lock::Timeout=300 install -y --no-upgrade ca-certificates', log)
             self.assertEqual('tailscale up ' in log, not without)
-            self.assertEqual('tailscale set --relay-server-port=40000' in log, not without)
+            self.assertEqual('tailscale set --relay-server-port=' in log, not without)
+            self.assertNotIn('tailscale set --relay-server-port=40000', log)
             self.assertEqual('systemctl enable --now tailscaled' in log, not without)
             self.assertEqual((self.state / 'install-tailscale.sh').exists(), not without)
 
@@ -497,7 +498,7 @@ fi
         self.stub("tailscale", 'echo \'{"BackendState":"Running","Self":{"Tags":[]}}\'\n')
         result = self.action("health")
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn('tag:relay not approved', result.stderr)
+        self.assertIn('tag:egress not approved', result.stderr)
 
 
 if __name__ == "__main__":

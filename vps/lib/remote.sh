@@ -7,16 +7,18 @@ LIB=/usr/local/lib/quick-deploy-vps
 CONF=/etc/sing-box/config.json
 FW=/etc/quick-deploy-vps.nft
 ACTION=${1:?remote action required}
+ROLE=${3:-proxy}
+[[ $ROLE == proxy || $ROLE == relay ]] || { echo 'Invalid role (proxy|relay)' >&2; exit 1; }
 [[ $EUID == 0 ]] || { echo 'VPS requires root/passwordless sudo' >&2; exit 1; }
 cleanup_prepare() {
     local status=$?
     trap - EXIT HUP INT TERM PIPE
     rm -f "$ROOT/incoming/auth-key" || status=1
-    if [[ -f $ROOT/upgrade-unheld ]]; then
+    if [[ $ROLE == proxy && -f $ROOT/upgrade-unheld ]]; then
         apt-mark hold sing-box || status=1
         rm -f "$ROOT/upgrade-unheld" || status=1
     fi
-    if [[ -f $ROOT/mask-owned ]]; then
+    if [[ $ROLE == proxy && -f $ROOT/mask-owned ]]; then
         # Even a failed package installation may have created/enabled the
         # public sample. Remove it BEFORE releasing our runtime mask.
         rm -f "$CONF" || status=1
@@ -45,6 +47,14 @@ if [[ $ACTION == abort ]]; then
 else
     flock -w 30 8 || { echo 'Another VPS operation is running' >&2; exit 1; }
 fi
+
+if [[ -f $ROOT/role && $(cat "$ROOT/role") != "$ROLE" ]]; then
+    echo 'Refusing ambiguous host: this machine belongs to the other VPS role' >&2; exit 1
+fi
+if [[ $ROLE == relay && ! -f $ROOT/role && ( -e $CONF || -e /etc/systemd/system/sing-box.service.d/90-quick-deploy-vps.conf ) ]]; then
+    echo 'Refusing relay ownership: existing proxy configuration on this host' >&2; exit 1
+fi
+if [[ $ACTION == prepare ]]; then printf '%s\n' "$ROLE" >"$ROOT/role"; fi
 
 param() { python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))[sys.argv[2]])' "$ROOT/incoming/params.json" "$1"; }
 
@@ -87,7 +97,7 @@ snapshot() {
     # Snapshot only module-owned nft state; never flush other tables (Tailscale).
     local destination=$1
     install -d -m 700 "$destination"
-    if [[ -f $CONF ]]; then cp -p "$CONF" "$destination/config.json"; fi
+    if [[ $ROLE == proxy && -f $CONF ]]; then cp -p "$CONF" "$destination/config.json"; fi
     if [[ -f $ROOT/active-params.json ]]; then cp -p "$ROOT/active-params.json" "$destination/active-params.json"; fi
     if nft list table inet qd_vps >"$destination/table.nft" 2>/dev/null; then
         touch "$destination/had-table"
@@ -98,18 +108,23 @@ snapshot() {
     if [[ -f /etc/ssh/sshd_config.d/00-quick-deploy-vps.conf ]]; then
         cp -p /etc/ssh/sshd_config.d/00-quick-deploy-vps.conf "$destination/sshd.conf"
     fi
-    if [[ -f /etc/systemd/system/sing-box.service.d/90-quick-deploy-vps.conf ]]; then
+    if [[ $ROLE == proxy && -f /etc/systemd/system/sing-box.service.d/90-quick-deploy-vps.conf ]]; then
         cp -p /etc/systemd/system/sing-box.service.d/90-quick-deploy-vps.conf "$destination/service.conf"
     fi
-    systemctl is-enabled --quiet sing-box && touch "$destination/was-enabled" || true
-    systemctl is-active --quiet sing-box && touch "$destination/was-active" || true
+    if [[ $ROLE == proxy ]]; then
+        systemctl is-enabled --quiet sing-box && touch "$destination/was-enabled" || true
+        systemctl is-active --quiet sing-box && touch "$destination/was-active" || true
+    else
+        systemctl is-enabled --quiet tailscaled && touch "$destination/ts-enabled" || true
+        systemctl is-active --quiet tailscaled && touch "$destination/ts-active" || true
+    fi
     systemctl is-enabled --quiet quick-deploy-vps-firewall.service && touch "$destination/fw-enabled" || true
 }
 
 restore() {
     local source=$1
     [[ -d $source ]] || { echo 'No prior checkpoint' >&2; return 1; }
-    if [[ ${2:-false} == true ]]; then
+    if [[ $ROLE == proxy && ${2:-false} == true ]]; then
         # The proxy/firewall were byte-identical and never changed. Recover
         # stage/SSH metadata without interrupting existing proxy connections.
         restore_params "$source"
@@ -118,17 +133,19 @@ restore() {
     fi
     # Disable FIRST: a crash/reboot during restore must not start a proxy
     # after its firewall or isolated-UID override has been removed.
-    systemctl disable --now sing-box
+    if [[ $ROLE == proxy ]]; then systemctl disable --now sing-box; fi
     local transaction="$ROOT/restore.nft"
     : >"$transaction"
     if nft list table inet qd_vps >/dev/null 2>&1; then echo 'delete table inet qd_vps' >>"$transaction"; fi
     if [[ -f $source/had-table ]]; then cat "$source/table.nft" >>"$transaction"; fi
     nft -f "$transaction"
-    if [[ -f $source/config.json ]]; then
-        cp -p "$source/config.json" "$CONF.restore"
-        mv -f "$CONF.restore" "$CONF"
-    else
-        rm -f "$CONF"
+    if [[ $ROLE == proxy ]]; then
+        if [[ -f $source/config.json ]]; then
+            cp -p "$source/config.json" "$CONF.restore"
+            mv -f "$CONF.restore" "$CONF"
+        else
+            rm -f "$CONF"
+        fi
     fi
     if [[ -f $source/persistent.nft ]]; then
         cp -p "$source/persistent.nft" "$FW"
@@ -142,6 +159,19 @@ restore() {
     fi
     restore_params "$source"
     restore_sshd "$source"
+    if [[ $ROLE == relay ]]; then
+        # Enrollment is not cloned/undone. Relay advertisement and daemon
+        # activation are restored to the module checkpoint.
+        systemctl start tailscaled
+        if [[ -f $source/active-params.json ]]; then
+            tailscale set --relay-server-port=40000
+        else
+            tailscale set --relay-server-port=""
+        fi
+        if [[ ! -f $source/ts-active ]]; then systemctl stop tailscaled; fi
+        if [[ -f $source/ts-enabled ]]; then systemctl enable tailscaled; else systemctl disable tailscaled; fi
+        return
+    fi
     local override=/etc/systemd/system/sing-box.service.d/90-quick-deploy-vps.conf
     if [[ -f $source/service.conf ]]; then cp -p "$source/service.conf" "$override"; else rm -f "$override"; fi
     systemctl daemon-reload
@@ -200,7 +230,7 @@ proxy_health() {
 }
 
 health() {
-    proxy_health || return 1
+    if [[ $ROLE == proxy ]]; then proxy_health || return 1; else nft list table inet qd_vps >/dev/null || return 1; fi
     local mode
     mode=$(tailscale_mode) || return 1
     if [[ $mode == skipped ]]; then
@@ -209,14 +239,19 @@ health() {
     fi
     systemctl is-active --quiet tailscaled || return 1
     local listeners
-    listeners=$(ss -H -lun 'sport = :40000') || return 1; grep -q . <<<"$listeners" || return 1
+    if [[ $ROLE == relay ]]; then
+        listeners=$(ss -H -lun 'sport = :40000') || return 1; grep -q . <<<"$listeners" || return 1
+        tag=tag:relay
+    else
+        tag=tag:egress
+    fi
     timeout 10 tailscale status --json | python3 -c '
 import json,sys
 s=json.load(sys.stdin)
 assert s.get("BackendState") == "Running", "Tailscale is not Running"
-assert "tag:relay" in s.get("Self",{}).get("Tags",[]), "tag:relay not approved"
-' || return 1
-    echo 'PASS sing-box active, TCP443 + UDP443/40000 listening, owned firewall, tagged Tailscale running'
+assert sys.argv[1] in s.get("Self",{}).get("Tags",[]), sys.argv[1] + " not approved"
+' "$tag" || return 1
+    echo "PASS $ROLE owned firewall and Tailscale $tag running (relay UDP40000 only for relay role)"
 }
 
 prune_checkpoints() {
@@ -252,13 +287,18 @@ arm_transaction() {
     printf '%s\n' "$checkpoint" >"$ROOT/pending"
     printf '%s\n' "$kind" >"$ROOT/pending-kind"
     printf '%s\n' "$target" >"$ROOT/pending-target"
-    trap 'flock -u 8; "$LIB/remote.sh" abort || true' EXIT
-    systemd-run --collect --unit=quick-deploy-vps-revert --timer-property=RemainAfterElapse=no --on-active=180s "$LIB/remote.sh" abort
+    trap 'flock -u 8; "$LIB/remote.sh" abort "" "$ROLE" || true' EXIT
+    systemd-run --collect --unit=quick-deploy-vps-revert --timer-property=RemainAfterElapse=no --on-active=180s "$LIB/remote.sh" abort '' "$ROLE"
 }
 
 transaction_health() {
     [[ -f $ROOT/pending ]] || { echo 'No pending transaction; it may already have reverted' >&2; return 1; }
-    if [[ $(cat "$ROOT/pending-kind") == rollback && ! -f $(cat "$ROOT/pending-target")/config.json ]]; then
+    if [[ $ROLE == relay && $(cat "$ROOT/pending-kind") == rollback && ! -f $(cat "$ROOT/pending-target")/active-params.json ]]; then
+        local listeners
+        listeners=$(ss -H -lun 'sport = :40000') || return 1
+        [[ -z $listeners ]] || { echo 'Pristine relay rollback still listens on40000' >&2; return 1; }
+        echo 'PASS pristine relay rollback: no relay listener'
+    elif [[ $ROLE == proxy && $(cat "$ROOT/pending-kind") == rollback && ! -f $(cat "$ROOT/pending-target")/config.json ]]; then
         # Pristine rollback deliberately has no proxy to probe.
         if systemctl is-active --quiet sing-box || systemctl is-enabled --quiet sing-box; then
             echo 'Pristine rollback must be stopped and disabled' >&2; return 1
@@ -268,6 +308,36 @@ transaction_health() {
     else
         health
     fi
+}
+
+install_firewall() {
+    cat >"$LIB/load-firewall.sh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+umask 077
+candidate=$(mktemp /run/qd-vps-nft.XXXXXX)
+trap 'rm -f "$candidate"' EXIT
+if nft list table inet qd_vps >/dev/null 2>&1; then echo 'delete table inet qd_vps' >"$candidate"; fi
+cat /etc/quick-deploy-vps.nft >>"$candidate"
+nft -f "$candidate"
+EOF
+    chmod 700 "$LIB/load-firewall.sh"
+    local before=''
+    if [[ $ROLE == proxy ]]; then before=sing-box.service; fi
+    cat >/etc/systemd/system/quick-deploy-vps-firewall.service <<EOF
+[Unit]
+Description=quick-deploy VPS owned nft table
+Before=$before
+After=network-pre.target
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/lib/quick-deploy-vps/load-firewall.sh
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload
+    systemctl start quick-deploy-vps-firewall.service
 }
 
 case "$ACTION" in
@@ -285,6 +355,8 @@ prepare)
     apt-get -o DPkg::Lock::Timeout=300 install -y --no-upgrade ca-certificates curl gnupg nftables openssl python3 rsync iproute2 procps openssh-server
     # Python-backed pruning/params are first used AFTER bootstrap.
     prune_checkpoints
+    if [[ $(param role) != "$ROLE" ]]; then echo 'Incoming role does not match explicit target role' >&2; exit 1; fi
+    if [[ $ROLE == proxy ]]; then
     install -d -m 755 /etc/apt/keyrings
     curl -fsSL https://sing-box.app/gpg.key -o /etc/apt/keyrings/sagernet.asc
     chmod 644 /etc/apt/keyrings/sagernet.asc
@@ -324,12 +396,16 @@ EOF
     fi
     apt-mark hold sing-box
     rm -f "$ROOT/upgrade-unheld"
+    fi
     without_tailscale=$(param without_tailscale)
     [[ $without_tailscale == True || $without_tailscale == False ]] || { echo 'without_tailscale must be boolean' >&2; exit 1; }
     if [[ $without_tailscale == False ]]; then
         if ! command -v tailscale >/dev/null; then
+            curl -fIsS --connect-timeout 10 --max-time 30 https://pkgs.tailscale.com/stable/ >/dev/null \
+                || { echo 'pkgs.tailscale.com unreachable: official Tailscale installation stopped; no mirror fallback' >&2; exit 1; }
             curl -fsSL https://tailscale.com/install.sh -o "$ROOT/install-tailscale.sh"
-            sh "$ROOT/install-tailscale.sh"
+            sh "$ROOT/install-tailscale.sh" \
+                || { echo 'Official Tailscale install failed (check pkgs.tailscale.com reachability)' >&2; exit 1; }
         fi
         # Live CLI capability gates apply only to the enrollment stage.
         up_help=$(tailscale up --help 2>&1)
@@ -356,15 +432,18 @@ EOF
     done <"$ROOT/incoming/authorized_keys"
     chown "$user" "$user_home/.ssh/authorized_keys"
     chmod 600 "$user_home/.ssh/authorized_keys"
+    checkpoint="$ROOT/checkpoint-$(date +%Y%m%dT%H%M%S)-$$"
+    snapshot "$checkpoint"
     if [[ $without_tailscale == False ]]; then
         systemctl enable --now tailscaled
         auth=()
         if [[ -s $ROOT/incoming/auth-key ]]; then auth=(--auth-key="file:$ROOT/incoming/auth-key"); fi
         # No shell trace or secret-valued arguments. URL goes straight to terminal.
-        tailscale up --advertise-tags=tag:relay --accept-dns=false --accept-routes=false --hostname=qd-vps-relay --timeout=10m "${auth[@]}"
+        if [[ $ROLE == proxy ]]; then tag=tag:egress; else tag=tag:relay; fi
+        tailscale up --advertise-tags="$tag" --accept-dns=false --accept-routes=false --hostname="qd-vps-$ROLE" --timeout=10m "${auth[@]}"
         rm -f "$ROOT/incoming/auth-key"
-        tailscale set --relay-server-port=40000
     fi
+    if [[ $ROLE == proxy ]]; then
     target=$(param target)
     # A real TLS1.3 + h2 handshake FROM the VPS is required at deploy time.
     timeout 20 openssl s_client -connect "$target:443" -servername "$target" -tls1_3 -alpn h2 </dev/null >"$ROOT/target-check.txt" 2>&1
@@ -377,13 +456,14 @@ EOF
     grep -qF "meta skuid $uid jump proxy_output" "$ROOT/candidate.nft" \
         || { echo 'Candidate nft UID substitution failed' >&2; exit 1; }
     sing-box check -c "$ROOT/incoming/config.json"
+    else
+        cp "$ROOT/incoming/firewall.template" "$ROOT/candidate.nft"
+    fi
     # nft check needs an atomic delete/create batch on subsequent deployments.
     : >"$ROOT/candidate-transaction.nft"
     if nft list table inet qd_vps >/dev/null 2>&1; then echo 'delete table inet qd_vps' >>"$ROOT/candidate-transaction.nft"; fi
     cat "$ROOT/candidate.nft" >>"$ROOT/candidate-transaction.nft"
     nft -c -f "$ROOT/candidate-transaction.nft"
-    checkpoint="$ROOT/checkpoint-$(date +%Y%m%dT%H%M%S)-$$"
-    snapshot "$checkpoint"
     printf '%s\n' "$checkpoint" >"$ROOT/prepared"
     echo 'Prepared candidate. No firewall/config swap yet.'
     ;;
@@ -397,6 +477,19 @@ apply)
     [[ -d $checkpoint ]] || exit 1
     # Same independently timed transaction is used for updates and rollback.
     arm_transaction "$checkpoint" apply
+    if [[ $(param without_tailscale) == False ]]; then
+        if [[ $ROLE == relay ]]; then tailscale set --relay-server-port=40000; else tailscale set --relay-server-port=""; fi
+    fi
+    if [[ $ROLE == relay ]]; then
+        nft -f "$ROOT/candidate-transaction.nft"
+        cp "$ROOT/candidate.nft" "$FW"
+        install_firewall
+        activate_params
+        wait_health health
+        trap - EXIT
+        echo 'Relay pending: fresh publickey login and YES required; no proxy installed.'
+        exit 0
+    fi
     if cmp -s "$ROOT/incoming/config.json" "$CONF" && cmp -s "$ROOT/candidate.nft" "$FW" \
             && [[ -f /etc/systemd/system/sing-box.service.d/90-quick-deploy-vps.conf ]] \
             && systemctl is-enabled --quiet sing-box && running_current_binary; then
@@ -430,32 +523,7 @@ EOF
     mv -f "$CONF.candidate" "$CONF"
     nft -f "$ROOT/candidate-transaction.nft"
     cp "$ROOT/candidate.nft" "$FW"
-    # Unit loads ONLY our table, including on reboot; unrelated tables survive.
-    cat >"$LIB/load-firewall.sh" <<'EOF'
-#!/usr/bin/env bash
-set -euo pipefail
-umask 077
-candidate=$(mktemp /run/qd-vps-nft.XXXXXX)
-trap 'rm -f "$candidate"' EXIT
-if nft list table inet qd_vps >/dev/null 2>&1; then echo 'delete table inet qd_vps' >"$candidate"; fi
-cat /etc/quick-deploy-vps.nft >>"$candidate"
-nft -f "$candidate"
-EOF
-    chmod 700 "$LIB/load-firewall.sh"
-    cat >/etc/systemd/system/quick-deploy-vps-firewall.service <<'EOF'
-[Unit]
-Description=quick-deploy VPS owned nft table
-Before=sing-box.service
-After=network-pre.target
-[Service]
-Type=oneshot
-RemainAfterExit=yes
-ExecStart=/usr/local/lib/quick-deploy-vps/load-firewall.sh
-[Install]
-WantedBy=multi-user.target
-EOF
-    systemctl daemon-reload
-    systemctl start quick-deploy-vps-firewall.service
+    install_firewall
     systemctl restart sing-box
     activate_params
     sleep 2
@@ -497,7 +565,7 @@ commit)
     rm -f "$ROOT/pending" "$ROOT/pending-kind" "$ROOT/pending-target" "$ROOT/pending-no-proxy-change" "$ROOT/prepared"
     # Rollback preserves the target's enabled state (including pristine OFF).
     # An apply enables only after its guarded config and firewall are durable.
-    if [[ $kind == apply ]]; then systemctl enable sing-box; fi
+    if [[ $kind == apply && $ROLE == proxy ]]; then systemctl enable sing-box; fi
     echo 'Committed. Packages and Tailscale enrollment are outside config rollback.'
     ;;
 abort)

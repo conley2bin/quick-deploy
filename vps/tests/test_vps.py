@@ -89,7 +89,7 @@ class VPS(unittest.TestCase):
         b = dict(a, host="203.0.113.2")
         first = vps.updated_inventory(self.inv, a)
         second = vps.updated_inventory(first, b)
-        self.assertEqual(second["previous"], [a])
+        self.assertEqual(vps.role_slot(second)['previous'], [dict(a, role='proxy')])
         self.assertEqual(vps.updated_inventory(second, b), second)
         self.assertIsNone(self.inv["current"])
 
@@ -152,7 +152,7 @@ class VPS(unittest.TestCase):
 
     def test_deploy_requires_device_and_init_has_no_machine_name_defaults(self):
         with mock.patch("sys.stderr", new_callable=io.StringIO), self.assertRaises(SystemExit):
-            vps.parser().parse_args(["deploy", "--host", "203.0.113.1", "--dry-run"])
+            vps.main(["deploy", "--host", "203.0.113.1", "--dry-run"])
         args = vps.parser().parse_args(["init"])
         vps.init(self.state, args)
         inv = vps.load(self.state / "inventory.json")
@@ -227,16 +227,17 @@ class VPS(unittest.TestCase):
             first = vps.parser().parse_args(['deploy', '--host', '203.0.113.1', '--device', 'home', '--without-tailscale', '--provider', 'provider-fixture', '--auth-key-file', str(self.state / 'absent-auth')])
             vps.deploy(self.state, first)
             before = (self.state / 'generated/clash-nodes.json').read_bytes()
-            self.assertTrue(vps.load(self.state / 'inventory.json')['without_tailscale'])
+            self.assertTrue(vps.role_slot(vps.load(self.state / 'inventory.json'))['without_tailscale'])
             second = vps.parser().parse_args(['deploy', '--host', '203.0.113.1', '--device', 'home'])
             vps.deploy(self.state, second)
         self.assertEqual(original_identity, (self.state / 'identity.json').read_bytes())
         self.assertEqual(original_inode, (self.state / 'identity.json').stat().st_ino)
         self.assertEqual(before, (self.state / 'generated/clash-nodes.json').read_bytes())
         inv = vps.load(self.state / 'inventory.json')
-        self.assertFalse(inv['without_tailscale'])
-        self.assertEqual(inv['previous'], [])
-        self.assertEqual(inv['current']['provider'], 'provider-fixture')
+        slot = vps.role_slot(inv)
+        self.assertFalse(slot['without_tailscale'])
+        self.assertEqual(slot['previous'], [])
+        self.assertEqual(slot['current']['provider'], 'provider-fixture')
         for without, data in zip((True, False), uploads):
             with tarfile.open(fileobj=io.BytesIO(data)) as archive:
                 self.assertEqual(json.load(archive.extractfile('params.json'))['without_tailscale'], without)
@@ -306,8 +307,7 @@ class VPS(unittest.TestCase):
         self.assertEqual(commands[0][0:2], ["ssh", "other-pc"])
         self.assertIn("--chmod=D700,F600", commands[1])
         self.assertNotIn("--delete", commands[1])
-        self.assertIn("--exclude=.lock", commands[1])
-        self.assertEqual(commands[1][-1], "other-pc:.local/state/quick-deploy-private/vps-backups/source-fixture/")
+        self.assertEqual(commands[1][-1], "other-pc:.local/state/quick-deploy-private/vps-backups/source-fixture/proxy/")
 
     def test_backup_does_not_replace_peer_inventory_or_generated_identity(self):
         peer = self.state.parent / "peer"
@@ -319,12 +319,12 @@ class VPS(unittest.TestCase):
         def execute(argv):
             if argv[0] == "rsync":
                 target = peer / argv[-1].split(":", 1)[1]
-                shutil.copytree(self.state, target, dirs_exist_ok=True)
+                shutil.copytree(Path(argv[-2]), target, dirs_exist_ok=True)
         with mock.patch.object(vps, "run", side_effect=execute), mock.patch.object(vps.socket, "gethostname", return_value="source-fixture"):
             vps.backup(self.state, {"backup_alias": "other-pc"}, None)
         self.assertEqual((live / "inventory.json").read_text(), 'home inventory')
         self.assertEqual((live / "generated/clash-nodes.json").read_text(), 'home nodes')
-        self.assertEqual((peer / ".local/state/quick-deploy-private/vps-backups/source-fixture/inventory.json").read_text(), 'company inventory')
+        self.assertEqual(json.loads((peer / '.local/state/quick-deploy-private/vps-backups/source-fixture/proxy/inventory.json').read_text())['version'], 2)
 
     def test_server_transaction_contract_order_and_no_global_flush(self):
         source = (MODULE / "lib/remote.sh").read_text()
@@ -400,7 +400,7 @@ class VPS(unittest.TestCase):
         actions = [call.args[1] for call in rem.call_args_list]
         self.assertEqual(actions, ["export-backup", "apply", "health", "harden", "health", "commit"])
         self.assertTrue(rem.call_args_list[2].kwargs["fresh"])
-        self.assertEqual(vps.load(self.state / "inventory.json")["device"], "home")
+        self.assertEqual(vps.role_slot(vps.load(self.state / 'inventory.json'))['device'], 'home')
 
     def test_rollback_requires_fresh_login_and_second_confirmation(self):
         vps.write_private(self.state / "identity.json", vps.dumps(self.ident))
