@@ -43,6 +43,7 @@ class RemoteTransaction(unittest.TestCase):
             ' if [[ "$1" == -v && "${2:-}" == tailscale && "${QD_TS_ABSENT:-yes}" == yes && ! -f "' + str(self.state / 'install-tailscale.sh') + '" ]]; then return 1; fi\n'
             ' builtin command "$@"\n}\n')
         self.env['BASH_ENV'] = str(shell_env)
+        self.env['QD_SSH_CONFIG'] = str(self.etc / 'ssh/sshd_config.d/00-quick-deploy-vps.conf')
         (self.state / "incoming/params.json").write_text(json.dumps({"role": "proxy", "ssh_user": "root", "without_tailscale": False}))
         self.stub("systemctl", '''printf 'systemctl %s\\n' "$*" >>"$QD_LOG"
 case "$*" in 'show -p User --value sing-box') echo qd-vps-proxy;; 'show -p MainPID --value sing-box') echo 4242;; esac
@@ -62,7 +63,8 @@ exit 0
         self.stub("tailscale", 'if [[ "${1:-}" == debug ]]; then echo \'{"RelayServerPort":null,"RelayServerStaticEndpoints":[]}\'; else echo \'{"BackendState":"Running","Self":{"Tags":["tag:egress"]}}\'; fi\n')
         self.stub("sshd", '''printf 'sshd %s\\n' "$*" >>"$QD_LOG"
 if [ "${1:-}" = -T ]; then
-printf 'passwordauthentication no\\npermitrootlogin without-password\\n'
+printf 'passwordauthentication no\\n'
+if grep -qx 'PermitRootLogin no' "$QD_SSH_CONFIG"; then echo 'permitrootlogin no'; else echo 'permitrootlogin without-password'; fi
 # Force more than one pipe buffer after the matching lines: old grep -q
 # pipelines cause this producer to SIGPIPE under pipefail.
 python3 -c 'print("padding " + "x" * 32768)'
@@ -222,8 +224,20 @@ exit 0
         self.assertEqual(self.action("apply").returncode, 0)
         result = self.action("harden")
         self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('PermitRootLogin prohibit-password\n', Path(self.env['QD_SSH_CONFIG']).read_text())
         self.assertIn('sshd -T -C user=root,host=x,addr=198.51.100.5', self.log.read_text())
         self.assertIn('systemctl reload ssh', self.log.read_text())
+
+    def test_nonroot_ssh_user_keeps_root_login_disabled(self):
+        path = self.state / 'incoming/params.json'
+        params = json.loads(path.read_text())
+        params['ssh_user'] = 'ubuntu'
+        path.write_text(json.dumps(params))
+        self.assertEqual(self.action('apply').returncode, 0)
+        result = self.action('harden')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('PermitRootLogin no\n', Path(self.env['QD_SSH_CONFIG']).read_text())
+        self.assertIn('user=ubuntu,host=x,addr=', self.log.read_text())
 
     def test_no_early_exit_pipeline_consumers_under_pipefail(self):
         for path in MODULE.rglob("*.sh"):

@@ -157,7 +157,7 @@ bash ~/quick-deploy/vps/setup.sh backup --role relay --alias <对端PC已有SSH�
 
 缺少该role current明确拒绝，不回退到另一台；同IP两角色或服务器role不符也拒绝。relay操作不要求代理identity。
 
-本地render→上传→候选检查→checkpoint（本地/服务器）→独立180秒timer→原子nft/config操作→健康检查→全新非multiplex公钥登录→YES→sshd禁密码/键盘交互、root仅公钥→再新登录→commit。relay同样执行timer/新登录/sshd流程，只没有proxy操作。SSH有效配置捕获`sshd -T -C`完整输出再grep，不用pipefail下早退出管道。rollback也有undo timer和新登录/确认，服务最多轮询20次等就绪。
+本地render→上传→候选检查→checkpoint（本地/服务器）→独立180秒timer→原子nft/config操作→健康检查→全新非multiplex公钥登录→YES→sshd禁密码/键盘交互→再新登录→commit。实际SSH用户是root才保留root仅公钥；使用ubuntu等非root用户时明确`PermitRootLogin no`并检查effective配置，不重新开放root登录。relay同样执行timer/新登录/sshd流程，只没有proxy操作。SSH有效配置捕获`sshd -T -C`完整输出再grep，不用pipefail下早退出管道。rollback也有undo timer和新登录/确认，服务最多轮询20次等就绪。
 
 只有模块表inet qd_vps，绝不flush其他nft/Tailscale表。输入默认drop，保留lo、established、ICMP、link-local DHCPv6回复。relay仅放实际SSH端口和UDP40000/41641。proxy有独立UID guard、443节点及41641；不开放新tailscale0入站服务连接，8743回包按conntrack允许。FW独立unit重启加载。
 

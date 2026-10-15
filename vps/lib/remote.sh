@@ -592,22 +592,25 @@ EOF
     ;;
 harden)
     [[ -f $ROOT/pending ]] || { echo 'No pending transaction' >&2; exit 1; }
-    cat >/etc/ssh/sshd_config.d/00-quick-deploy-vps.conf <<'EOF'
+    user=$(param ssh_user)
+    root_login=prohibit-password
+    expected_root=without-password
+    if [[ $user != root ]]; then root_login=no; expected_root=no; fi
+    cat >/etc/ssh/sshd_config.d/00-quick-deploy-vps.conf <<EOF
 # Written only after a fresh publickey login.
 PasswordAuthentication no
 KbdInteractiveAuthentication no
-PermitRootLogin prohibit-password
+PermitRootLogin $root_login
 EOF
     sshd -t
     # Cloud images can have earlier/Match-scoped overrides. Verify effective
     # settings for this caller, and refuse a misleading hardening claim.
-    user=$(param ssh_user)
     connection=${SSH_CONNECTION:-}
     client_ip=${2:-${connection%% *}}
     [[ $client_ip =~ ^[0-9a-fA-F.:]+$ ]] || { echo 'Missing/invalid SSH client IP for Match evaluation' >&2; exit 1; }
     effective=$(sshd -T -C "user=$user,host=x,addr=$client_ip")
     grep -qx 'passwordauthentication no' <<<"$effective"
-    grep -qx 'permitrootlogin without-password' <<<"$effective"
+    grep -qx "permitrootlogin $expected_root" <<<"$effective"
     systemctl reload ssh
     ;;
 commit)
