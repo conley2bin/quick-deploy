@@ -12,6 +12,10 @@ cleanup_prepare() {
     local status=$?
     trap - EXIT HUP INT TERM PIPE
     rm -f "$ROOT/incoming/auth-key" || status=1
+    if [[ -f $ROOT/upgrade-unheld ]]; then
+        apt-mark hold sing-box || status=1
+        rm -f "$ROOT/upgrade-unheld" || status=1
+    fi
     if [[ -f $ROOT/mask-owned ]]; then
         # Even a failed package installation may have created/enabled the
         # public sample. Remove it BEFORE releasing our runtime mask.
@@ -148,50 +152,70 @@ restore() {
     if [[ -f $source/was-active ]]; then
         sing-box check -c "$CONF"
         systemctl start sing-box
-        systemctl is-active --quiet sing-box
+        wait_health systemctl is-active --quiet sing-box
     fi
     if [[ -f $source/was-enabled ]]; then
         systemctl enable sing-box
     fi
 }
 
+running_current_binary() {
+    local pid executable
+    pid=$(systemctl show -p MainPID --value sing-box) || return 1
+    [[ $pid =~ ^[0-9]+$ && $pid -gt 1 ]] || return 1
+    executable=$(readlink "/proc/$pid/exe") || return 1
+    [[ $executable == /usr/bin/sing-box ]]
+}
+
+wait_health() {
+    local attempt
+    for attempt in {1..20}; do
+        if "$@" >"$ROOT/health-wait.log" 2>&1; then cat "$ROOT/health-wait.log"; return 0; fi
+        sleep 1
+    done
+    cat "$ROOT/health-wait.log" >&2
+    echo 'Health check did not become ready within 20 polls' >&2
+    return 1
+}
+
 proxy_health() {
-    systemctl is-active --quiet sing-box
+    systemctl is-active --quiet sing-box || return 1
+    running_current_binary || { echo 'sing-box MainPID uses a stale/deleted binary' >&2; return 1; }
     local proxy_uid table pid process_uid loaded_user
-    proxy_uid=$(id -u qd-vps-proxy)
-    table=$(nft --numeric list table inet qd_vps)
+    proxy_uid=$(id -u qd-vps-proxy) || return 1
+    table=$(nft --numeric list table inet qd_vps) || return 1
     grep -qF "meta skuid $proxy_uid jump proxy_output" <<<"$table" \
         || { echo 'nft proxy UID guard is missing or substituted incorrectly' >&2; return 1; }
-    grep -qx 'User=qd-vps-proxy' /etc/systemd/system/sing-box.service.d/90-quick-deploy-vps.conf
-    loaded_user=$(systemctl show -p User --value sing-box)
+    grep -qx 'User=qd-vps-proxy' /etc/systemd/system/sing-box.service.d/90-quick-deploy-vps.conf || return 1
+    loaded_user=$(systemctl show -p User --value sing-box) || return 1
     [[ $loaded_user == qd-vps-proxy ]] || { echo 'Loaded sing-box User override is missing' >&2; return 1; }
-    pid=$(systemctl show -p MainPID --value sing-box)
+    pid=$(systemctl show -p MainPID --value sing-box) || return 1
     [[ $pid =~ ^[0-9]+$ && $pid -gt 1 ]] || { echo 'Invalid sing-box MainPID' >&2; return 1; }
-    process_uid=$(ps -o euid= -p "$pid")
+    process_uid=$(ps -o euid= -p "$pid") || return 1
     [[ ${process_uid//[[:space:]]/} == "$proxy_uid" ]] || { echo 'sing-box MainPID does not run as proxy UID' >&2; return 1; }
     local listeners
-    listeners=$(ss -H -ltn 'sport = :443'); grep -q . <<<"$listeners"
-    listeners=$(ss -H -lun 'sport = :443'); grep -q . <<<"$listeners"
+    listeners=$(ss -H -ltn 'sport = :443') || return 1; grep -q . <<<"$listeners" || return 1
+    listeners=$(ss -H -lun 'sport = :443') || return 1; grep -q . <<<"$listeners" || return 1
     echo 'PASS sing-box proxy UID/guard and TCP443 + UDP443 listening'
 }
 
 health() {
-    proxy_health
+    proxy_health || return 1
     local mode
-    mode=$(tailscale_mode)
+    mode=$(tailscale_mode) || return 1
     if [[ $mode == skipped ]]; then
         echo 'SKIP Tailscale install/enrollment/relay health (--without-tailscale)'
         return
     fi
-    systemctl is-active --quiet tailscaled
+    systemctl is-active --quiet tailscaled || return 1
     local listeners
-    listeners=$(ss -H -lun 'sport = :40000'); grep -q . <<<"$listeners"
+    listeners=$(ss -H -lun 'sport = :40000') || return 1; grep -q . <<<"$listeners" || return 1
     timeout 10 tailscale status --json | python3 -c '
 import json,sys
 s=json.load(sys.stdin)
 assert s.get("BackendState") == "Running", "Tailscale is not Running"
 assert "tag:relay" in s.get("Self",{}).get("Tags",[]), "tag:relay not approved"
-'
+' || return 1
     echo 'PASS sing-box active, TCP443 + UDP443/40000 listening, owned firewall, tagged Tailscale running'
 }
 
@@ -239,7 +263,7 @@ transaction_health() {
         if systemctl is-active --quiet sing-box || systemctl is-enabled --quiet sing-box; then
             echo 'Pristine rollback must be stopped and disabled' >&2; return 1
         fi
-        [[ ! -e $CONF ]]
+        [[ ! -e $CONF ]] || return 1
         echo 'PASS pristine rollback: sing-box stopped, disabled, no config'
     else
         health
@@ -252,14 +276,15 @@ prepare)
     # A prepared candidate has never changed the data plane. Replace it under
     # the operation/upload locks instead of permanently blocking redeployment.
     if [[ -f $ROOT/prepared ]]; then echo 'Replacing stale prepared candidate'; rm -f "$ROOT/prepared"; fi
-    prune_checkpoints
     export DEBIAN_FRONTEND=noninteractive
     # Install signed packages via current official routes. No curl | sh on
     # unchecked downloads: download must complete before executing installer.
-    apt-get update
+    apt-get -o DPkg::Lock::Timeout=300 update
     # Stage2 must not upgrade already-present proxy dependencies and trigger
     # unrelated service restarts through package maintenance hooks.
-    apt-get install -y --no-upgrade ca-certificates curl gnupg nftables openssl python3 rsync
+    apt-get -o DPkg::Lock::Timeout=300 install -y --no-upgrade ca-certificates curl gnupg nftables openssl python3 rsync iproute2 procps openssh-server
+    # Python-backed pruning/params are first used AFTER bootstrap.
+    prune_checkpoints
     install -d -m 755 /etc/apt/keyrings
     curl -fsSL https://sing-box.app/gpg.key -o /etc/apt/keyrings/sagernet.asc
     chmod 644 /etc/apt/keyrings/sagernet.asc
@@ -278,8 +303,8 @@ EOF
         # the destination guard exists. Existing installations are not upgraded.
         touch "$ROOT/mask-owned"
         systemctl mask --runtime sing-box.service
-        apt-get update
-        apt-get install -y "sing-box=$version"
+        apt-get -o DPkg::Lock::Timeout=300 update
+        apt-get -o DPkg::Lock::Timeout=300 install -y "sing-box=$version"
         # Upstream ships a public example password. It must NEVER enter the
         # pristine recovery checkpoint or become boot-enabled unguarded.
         rm -f "$CONF"
@@ -288,8 +313,17 @@ EOF
         rm -f "$ROOT/mask-owned"
     fi
     installed_version=$(dpkg-query -W -f='${Version}' sing-box)
-    [[ $installed_version == "$version" ]] || { echo "sing-box version mismatch: expected $version, installed $installed_version; no automatic downgrade/upgrade" >&2; exit 1; }
+    if [[ $installed_version != "$version" ]]; then
+        allow_upgrade=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("allow_upgrade", False))' "$ROOT/incoming/params.json")
+        [[ $allow_upgrade == True ]] || { echo "sing-box version mismatch: expected $version, installed $installed_version; rerun deploy --upgrade and confirm" >&2; exit 1; }
+        touch "$ROOT/upgrade-unheld"
+        apt-mark unhold sing-box
+        apt-get -o DPkg::Lock::Timeout=300 install -y "sing-box=$version"
+        installed_version=$(dpkg-query -W -f='${Version}' sing-box)
+        [[ $installed_version == "$version" ]] || { echo 'Exact sing-box upgrade verification failed' >&2; exit 1; }
+    fi
     apt-mark hold sing-box
+    rm -f "$ROOT/upgrade-unheld"
     without_tailscale=$(param without_tailscale)
     [[ $without_tailscale == True || $without_tailscale == False ]] || { echo 'without_tailscale must be boolean' >&2; exit 1; }
     if [[ $without_tailscale == False ]]; then
@@ -365,7 +399,7 @@ apply)
     arm_transaction "$checkpoint" apply
     if cmp -s "$ROOT/incoming/config.json" "$CONF" && cmp -s "$ROOT/candidate.nft" "$FW" \
             && [[ -f /etc/systemd/system/sing-box.service.d/90-quick-deploy-vps.conf ]] \
-            && systemctl is-enabled --quiet sing-box; then
+            && systemctl is-enabled --quiet sing-box && running_current_binary; then
         # Enrollment in prepare adds the overlay without touching proxy state.
         proxy_health
         touch "$ROOT/pending-no-proxy-change"
@@ -493,7 +527,7 @@ rollback)
     snapshot "$checkpoint"
     arm_transaction "$checkpoint" rollback "$target"
     restore "$target"
-    transaction_health
+    wait_health transaction_health
     trap - EXIT
     echo 'Rollback pending: fresh key SSH and YES required within 180s; otherwise undo rollback.'
     ;;

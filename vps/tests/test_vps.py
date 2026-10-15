@@ -113,7 +113,7 @@ class VPS(unittest.TestCase):
     def test_firewall_limits_local_and_tailnet_access(self):
         fw = vps.firewall("100.70.0.1", 2222, 998)
         self.assertIn('policy drop;', fw)
-        self.assertIn('meta nfproto ipv6 udp sport 547 udp dport 546 accept', fw)
+        self.assertIn('ip6 saddr fe80::/10 udp sport 547 udp dport 546 accept', fw)
         self.assertIn('meta skuid 998 jump proxy_output', fw)
         self.assertIn('fib daddr type local reject', fw)
         self.assertIn('oifname "tailscale0" ip daddr 100.70.0.1 tcp dport 8743 accept', fw)
@@ -249,6 +249,17 @@ class VPS(unittest.TestCase):
         self.assertIn('SKIP Tailscale', output.getvalue())
         self.assertNotIn('tailscale up', output.getvalue())
         self.assertFalse((self.state / 'missing').exists())
+
+    def test_pin_and_upgrade_require_an_additional_explicit_confirmation(self):
+        self.assertEqual(vps.SING_BOX_VERSION, '1.14.3')
+        vps.write_private(self.state / 'identity.json', vps.dumps(self.ident))
+        vps.write_private(self.state / 'inventory.json', vps.dumps(self.inv))
+        args = vps.parser().parse_args(['deploy', '--host', '203.0.113.1', '--device', 'home', '--upgrade'])
+        with mock.patch.object(vps, 'public_keys', return_value=['one', 'two']), mock.patch.object(vps, 'confirm', side_effect=[None, vps.Error('declined')]) as confirm, mock.patch.object(vps, 'run') as run:
+            with self.assertRaisesRegex(vps.Error, 'declined'):
+                vps.deploy(self.state, args)
+        self.assertEqual(confirm.call_count, 2)
+        run.assert_not_called()
 
     def test_fresh_ssh_forces_publickey_and_disables_multiplex_proxy(self):
         argv = vps.ssh_args({"host": "203.0.113.1", "user": "root", "port": 2222}, fresh=True)

@@ -51,6 +51,7 @@ exit 0
         self.stub("sing-box", 'printf "sing-box %s\\n" "$*" >>"$QD_LOG"\nexit 0\n')
         self.stub("id", 'if [ "${1:-}" = -u ] && [ "${2:-}" = qd-vps-proxy ]; then echo 998; else exec /usr/bin/id "$@"; fi\n')
         self.stub("ps", 'echo "${QD_PROCESS_UID:-998}"\n')
+        self.stub("readlink", 'echo /usr/bin/sing-box\n')
         self.stub("ss", 'echo listening\n')
         self.stub("sleep", 'exit 0\n')
         self.stub("tailscale", 'echo \'{"BackendState":"Running","Self":{"Tags":["tag:relay"]}}\'\n')
@@ -180,7 +181,7 @@ exit 0
     def test_enabled_state_and_fresh_package_cleanup_order(self):
         source = self.script.read_text()
         self.assertIn('systemctl is-enabled --quiet sing-box', source)
-        fresh = source.split('apt-get install -y "sing-box=$version"', 1)[1].split('rm -f "$ROOT/mask-owned"', 1)[0]
+        fresh = source.split('apt-get -o DPkg::Lock::Timeout=300 install -y "sing-box=$version"', 1)[1].split('rm -f "$ROOT/mask-owned"', 1)[0]
         self.assertLess(fresh.index('rm -f "$CONF"'), fresh.index('systemctl unmask'))
         restore = source.split('restore() {', 1)[1].split('health() {', 1)[0]
         self.assertLess(restore.index('disable --now sing-box'), restore.index('nft -f'))
@@ -230,7 +231,7 @@ exit 0
         (self.etc / "apt/sources.list.d").mkdir(parents=True)
         self.env["QD_ACCOUNT"] = str(home)
         self.env["QD_CONF"] = str(self.etc / "sing-box/config.json")
-        (self.state / "incoming/params.json").write_text(json.dumps({"ssh_user": "root", "sing_box_version": "1.13.12", "target": "example.net", "without_tailscale": False}))
+        (self.state / "incoming/params.json").write_text(json.dumps({"ssh_user": "root", "sing_box_version": "1.14.3", "target": "example.net", "without_tailscale": False}))
         (self.state / "incoming/authorized_keys").write_text('ssh-ed25519 fixture\n')
         (self.state / "incoming/firewall.template").write_text('table inet qd_vps { meta skuid 999 jump proxy_output; }\n')
         (self.state / "incoming/remote.sh").write_text(self.script.read_text())
@@ -240,7 +241,7 @@ if [[ "$*" == *sing-box=* ]]; then echo public-example >"$QD_CONF"; fi
 if [[ "${QD_APT_FAIL:-}" == yes ]]; then exit 8; fi
 ''')
         self.stub("apt-mark", 'printf "apt-mark %s\\n" "$*" >>"$QD_LOG"\n')
-        self.stub("dpkg-query", 'printf "%s" "${QD_INSTALLED_VERSION:-1.13.12}"\n')
+        self.stub("dpkg-query", 'printf "%s" "${QD_INSTALLED_VERSION:-1.14.3}"\n')
         self.stub("getent", 'if [ "${2:-}" = root ]; then printf "root:x:0:0::%s:/bin/bash\\n" "$QD_ACCOUNT"; else echo qd-vps-proxy:x:998:998::/nonexistent:/usr/sbin/nologin; fi\n')
         self.stub("chown", 'exit 0\n')
         self.stub("tailscale", '''printf 'tailscale %s\\n' "$*" >>"$QD_LOG"
@@ -320,7 +321,7 @@ fi
         self.assertFalse((checkpoint / "was-enabled").exists())
         self.assertFalse((self.state / "mask-owned").exists())
         log = self.log.read_text()
-        self.assertLess(log.index('mask --runtime sing-box.service'), log.index('apt-get install -y sing-box=1.13.12'))
+        self.assertLess(log.index('mask --runtime sing-box.service'), log.index('apt-get -o DPkg::Lock::Timeout=300 install -y sing-box=1.14.3'))
         self.assertLess(log.index('disable --now sing-box'), log.index('unmask --runtime sing-box.service'))
 
     def test_fresh_package_sigpipe_cleans_example_key_and_mask(self):
@@ -380,7 +381,7 @@ fi
             self.assertNotIn('restart sing-box', log)
             self.assertNotIn('disable --now sing-box', log)
             self.assertNotIn('nft -f ', log)
-            self.assertIn('apt-get install -y --no-upgrade ca-certificates', log)
+            self.assertIn('apt-get -o DPkg::Lock::Timeout=300 install -y --no-upgrade ca-certificates', log)
             self.assertEqual('tailscale up ' in log, not without)
             self.assertEqual('tailscale set --relay-server-port=40000' in log, not without)
             self.assertEqual('systemctl enable --now tailscaled' in log, not without)
@@ -448,8 +449,49 @@ fi
 
     def test_pinned_version_is_required_before_hold(self):
         source = self.script.read_text()
-        self.assertIn('apt-get install -y "sing-box=$version"', source)
-        self.assertLess(source.index('installed_version == "$version"'), source.index('apt-mark hold sing-box'))
+        self.assertIn('apt-get -o DPkg::Lock::Timeout=300 install -y "sing-box=$version"', source)
+        self.assertLess(source.index('allow_upgrade == True'), source.index('apt-mark hold sing-box', source.index('prepare)\n')))
+
+    def test_stale_running_binary_forces_restart_even_for_equal_config(self):
+        self.prepare_tools()
+        for action in ('prepare', 'apply', 'commit'):
+            self.assertEqual(self.action(action).returncode, 0)
+        self.assertEqual(self.action('prepare').returncode, 0)
+        marker = self.root / 'readlink-called'
+        self.stub('readlink', f'if [ ! -f "{marker}" ]; then touch "{marker}"; echo "/usr/bin/sing-box (deleted)"; else echo /usr/bin/sing-box; fi\n')
+        self.log.write_text('')
+        result = self.action('apply')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('restart sing-box', self.log.read_text())
+        self.assertNotIn('Proxy unchanged', result.stdout)
+
+    def test_upgrade_requires_authorization_and_reholds_exact_version(self):
+        self.prepare_tools()
+        params_path = self.state / 'incoming/params.json'
+        params = json.loads(params_path.read_text())
+        params['allow_upgrade'] = True
+        params_path.write_text(json.dumps(params))
+        marker = self.root / 'version-read'
+        self.stub('dpkg-query', f'if [ ! -f "{marker}" ]; then touch "{marker}"; echo 1.13.12; else echo 1.14.3; fi\n')
+        result = self.action('prepare')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        log = self.log.read_text()
+        self.assertLess(log.index('apt-mark unhold sing-box'), log.index('install -y sing-box=1.14.3'))
+        self.assertLess(log.index('install -y sing-box=1.14.3'), log.index('apt-mark hold sing-box'))
+
+    def test_dependency_bootstrap_and_lock_timeout_precede_python(self):
+        source = self.script.read_text().split('prepare)\n', 1)[1]
+        self.assertLess(source.index('install -y --no-upgrade'), source.index('prune_checkpoints'))
+        self.assertTrue(all('DPkg::Lock::Timeout=300' in line for line in source.splitlines() if 'apt-get ' in line))
+
+    def test_rollback_waits_for_listeners_to_become_ready(self):
+        self.assertEqual(self.action('apply').returncode, 0)
+        self.assertEqual(self.action('commit').returncode, 0)
+        marker = self.root / 'ss-read'
+        self.stub('ss', f'if [ ! -f "{marker}" ]; then touch "{marker}"; else echo listening; fi\n')
+        result = self.action('rollback')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(marker.exists())
 
     def test_health_tag_failure_is_explicit(self):
         self.stub("tailscale", 'echo \'{"BackendState":"Running","Self":{"Tags":[]}}\'\n')

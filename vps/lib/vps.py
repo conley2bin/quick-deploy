@@ -29,7 +29,7 @@ from urllib.parse import quote, urlencode
 MODULE = Path(__file__).resolve().parents[1]
 DEVICES = ("company", "home", "phone")
 # Audited stable release; replacement hosts must not drift to latest.
-SING_BOX_VERSION = "1.13.12"
+SING_BOX_VERSION = "1.14.3"
 # Explicitly cover shared, benchmark, documentation, multicast and transition
 # ranges as well as RFC1918. Keep this list shared with the kernel output guard.
 BLOCKED4 = ["0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8",
@@ -290,7 +290,7 @@ def firewall(company, ssh_port=22, uid=999):
     ct state established,related accept
     iifname "lo" accept
     meta l4proto {{ icmp, ipv6-icmp }} accept
-    meta nfproto ipv6 udp sport 547 udp dport 546 accept
+    ip6 saddr fe80::/10 udp sport 547 udp dport 546 accept
     # No new tailnet connections to VPS services. Replies use conntrack above.
     iifname "tailscale0" drop
     tcp dport {{ {ports} }} accept
@@ -426,12 +426,12 @@ def remote(record, action, fresh=False, **kwargs):
     return run(ssh_args(record, fresh) + [elevated(record, command)], **kwargs)
 
 
-def bundle(ident, company, record, keys, auth=None, without_tailscale=False):
+def bundle(ident, company, record, keys, auth=None, without_tailscale=False, upgrade=False):
     files = {"remote.sh": (MODULE / "lib/remote.sh").read_bytes(),
              "config.json": dumps(server_config(ident, company, record["host"])).encode(),
              "params.json": dumps({"company": company, "host": record["host"], "ssh_port": record["port"],
                                    "ssh_user": record["user"], "target": ident["reality_target"],
-                                   "sing_box_version": SING_BOX_VERSION, "without_tailscale": without_tailscale}).encode(),
+                                   "sing_box_version": SING_BOX_VERSION, "without_tailscale": without_tailscale, "allow_upgrade": upgrade}).encode(),
              "authorized_keys": ("\n".join(keys) + "\n").encode(),
              "firewall.template": firewall(company, record["port"], 999).encode()}
     if auth and not without_tailscale:
@@ -493,6 +493,8 @@ def deploy(state, args):
         if args.auth_key_file:
             auth = read_private(args.auth_key_file).strip()
     confirm(f"Will install/update ONLY VPS {record['host']}; inspect provider firewall and SSH host fingerprint first.")
+    if args.upgrade:
+        confirm(f"Authorize unhold and exact sing-box={SING_BOX_VERSION} installation if version differs? Package changes are not rolled back.")
     # A fixed trusted extraction path, root-only; upload in a single SSH session.
     # remote lock protects the fixed staging directory across all deployers.
     upload = elevated(record, "bash -c ") + shlex.quote(
@@ -503,7 +505,7 @@ def deploy(state, args):
         "rm -f /var/lib/quick-deploy-vps/incoming/auth-key; "
         "tar -xf - -C /var/lib/quick-deploy-vps/incoming; "
         "bash /var/lib/quick-deploy-vps/incoming/remote.sh prepare")
-    run(ssh_args(record) + [upload], input=bundle(ident, company, record, keys, auth, args.without_tailscale))
+    run(ssh_args(record) + [upload], input=bundle(ident, company, record, keys, auth, args.without_tailscale, args.upgrade))
     # Fetch the exact remote checkpoint (contains private previous config) before
     # applying any data-plane changes; local state inherits restrictive modes.
     try:
@@ -617,6 +619,7 @@ def parser():
     a.add_argument("--port", type=int, default=22)
     a.add_argument("--provider", default="")
     a.add_argument("--dry-run", action="store_true")
+    a.add_argument("--upgrade", action="store_true", help="explicitly confirm upgrading a different installed sing-box version to the pin")
     a.add_argument("--without-tailscale", action="store_true", help="stage1: proxy/firewall/sshd only; skip Tailscale")
     a.add_argument("--auth-key-file", type=Path)
     a.add_argument("--company-ip")

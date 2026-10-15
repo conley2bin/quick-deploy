@@ -70,11 +70,11 @@ bash ~/quick-deploy/vps/setup.sh check --ping
 # --device 必填；在家里PC执行时用 --device home；可加 --user ubuntu --port 2222
 ```
 
-两阶段复用同一identity，第二阶段不会轮换凭据；同host省略provider会保留原标签，不新增虚假换机历史。代理config和防火墙未变且UID/监听健康时，第二阶段及重复deploy不stop/restart sing-box、不交换其配置、不重载nft表。只更新事务化的`active-params.json`阶段状态，仍经新鲜SSH登录和YES确认；未确认/新增relay健康失败会恢复原阶段状态，不打断未改动的代理。
+两阶段复用同一identity，第二阶段不会轮换凭据；同host省略provider会保留原标签，不新增虚假换机历史。代理config和防火墙未变、UID/监听健康且`/proc/MainPID/exe`精确指向当前`/usr/bin/sing-box`时，第二阶段及重复deploy不stop/restart sing-box、不交换其配置、不重载nft表。只更新事务化的`active-params.json`阶段状态，仍经新鲜SSH登录和YES确认；未确认/新增relay健康失败会恢复原阶段状态，不打断未改动的代理。
 
 `--without-tailscale`不读取/上传Tailscale auth key，不执行VPS任何Tailscale命令，也不停止已有Tailscale服务；它表示本次不管理该功能。UDP40000/41641两阶段都可在防火墙放行，第一阶段没有本模块relay监听。health/status/check从VPS已提交的阶段状态判定SKIP；`check --ping`也会显示跳过，不误ping旧节点。第一阶段还不能通过VPS到公司8743，也没有Peer Relay；手机桥和中继只在第二阶段及policy验收后使用。
 
-部署先确认目标，安装 sing-box 官方签名APT包，固定为[稳定版1.13.12](https://github.com/SagerNet/sing-box/releases/tag/v1.13.12)（`vps.py:SING_BOX_VERSION`），并`apt-mark hold`；版本写入上传params。已有版本必须精确匹配，否则明确停止，不自动升/降级。APT仓库若已不保留该版本也失败，不退回latest。版本变更须先修改固定值并重新审查/验收。Tailscale用官方安装器。新包安装期间临时 mask，避免默认配置自动启动。只接受 Ubuntu24.04，Tailscale 现场检查 CLI flags。第二阶段默认 `tailscale up` 打印登录 URL，等待最多10分钟；在浏览器登录并批准标签。然后设置 `--relay-server-port=40000`，不提供 exit node 或子网路由。
+部署先确认目标，安装 sing-box 官方签名APT包，固定为[稳定版1.14.3](https://github.com/SagerNet/sing-box/releases/tag/v1.14.3)（`vps.py:SING_BOX_VERSION`），并`apt-mark hold`；版本写入上传params。已有版本不匹配时默认停止；明确加`deploy --upgrade`并额外输入YES，才执行unhold → 精确安装pin → hold（失败也重新hold），包版本不属于配置回滚。1.13.x的Reality目标TLS记录上限不足以处理Microsoft证书链，不能继续使用。APT仓库若已不保留该版本也失败，不退回latest。版本变更须先修改固定值并重新审查/验收。Tailscale用官方安装器。新包安装期间临时 mask，避免默认配置自动启动。只接受 Ubuntu24.04，Tailscale 现场检查 CLI flags。第二阶段默认 `tailscale up` 打印登录 URL，等待最多10分钟；在浏览器登录并批准标签。然后设置 `--relay-server-port=40000`，不提供 exit node 或子网路由。
 
 可选用 `--auth-key-file /private/auth-key`（当前用户0600）或 `TS_AUTHKEY` 环境变量。密钥通过 SSH stdin 的 root-only 临时文件传输，CLI 只传 `file:` 路径，不打印密钥；用后删除。不保存 auth key 为长期恢复凭据，换机通常新建一次性 tagged key。
 
@@ -84,13 +84,13 @@ bash ~/quick-deploy/vps/setup.sh check --ping
 
 新装包的公开示例配置在unit仍mask时删除，并禁用unit；pristine checkpoint不含代理配置。snapshot记录原有启用状态；恢复首先disable --now sing-box，只有同时具备配置、UID drop-in和持久防火墙的完整checkpoint才允许重新启动/启用。commit最后才enable sing-box，避免回滚后重启跑起无guard代理。
 
-180秒内未确认或检查失败，会恢复之前的配置、nft表、sshd片段与服务 override。失败不会静默降级。包安装、Tailscale 入网、追加公钥不在回滚范围内。遇到断线等待 timer；上传/prepare完成但尚未apply时没有改运行配置，遗留prepared标记会在下一次prepare时替换，也可用`setup.sh abort --host <IP>`清除（未提交inventory也能用）。没有待处理状态时abort明确拒绝，不假装执行了恢复。自动fallback先尝试新登录，再尝试现有ControlMaster连接。prepare对成功、失败及HUP/INT/TERM/PIPE都清理auth-key和本模块拥有的runtime mask；APT显式noninteractive。必要时从服务商控制台执行：
+180秒内未确认或检查失败，会恢复之前的配置、nft表、sshd片段与服务 override。失败不会静默降级。包安装、Tailscale 入网、追加公钥不在回滚范围内。遇到断线等待 timer；上传/prepare完成但尚未apply时没有改运行配置，遗留prepared标记会在下一次prepare时替换，也可用`setup.sh abort --host <IP>`清除（未提交inventory也能用）。没有待处理状态时abort明确拒绝，不假装执行了恢复。自动fallback先尝试新登录，再尝试现有ControlMaster连接。prepare对成功、失败及HUP/INT/TERM/PIPE都清理auth-key和本模块拥有的runtime mask；APT显式noninteractive且等待dpkg锁最长300秒；Python等依赖先安装再运行参数解析/清理。rollback健康检查最多轮询20次，避免服务刚启动尚未监听的竞态。必要时从服务商控制台执行：
 
 ```bash
 sudo /usr/local/lib/quick-deploy-vps/remote.sh abort
 ```
 
-nft只管理 `table inet qd_vps`，不清空其他表或改 `/etc/nftables.conf`；独立 systemd unit 在重启时加载。输入默认drop，仅允许既有连接、lo、ICMP、DHCPv6客户端回复（UDP547→546）、管理端口和代理/relay UDP端口，拒绝新的 tailscale0 入站服务连接；公司8743的回包按 conntrack 放行。sing-box 使用独立 `qd-vps-proxy` UID，OUTPUT 对该 UID 拒绝本机（含自身公网地址）和保留目的地，仅允许 tailscale0 → company:8743；协议层 `auth_user` 再限制为 phone。先 DNS resolve 再按目的 IP 拒绝，避免域名绕过范围规则。DNS使用公共1.1.1.1，VPS 本地解析器不需要私网例外。
+nft只管理 `table inet qd_vps`，不清空其他表或改 `/etc/nftables.conf`；独立 systemd unit 在重启时加载。输入默认drop，仅允许既有连接、lo、ICMP、DHCPv6客户端回复（仅fe80::/10来源的UDP547→546）、管理端口和代理/relay UDP端口，拒绝新的 tailscale0 入站服务连接；公司8743的回包按 conntrack 放行。sing-box 使用独立 `qd-vps-proxy` UID，OUTPUT 对该 UID 拒绝本机（含自身公网地址）和保留目的地，仅允许 tailscale0 → company:8743；协议层 `auth_user` 再限制为 phone。先 DNS resolve 再按目的 IP 拒绝，避免域名绕过范围规则。DNS使用公共1.1.1.1，VPS 本地解析器不需要私网例外。
 
 ## 3. 客户端输出
 
