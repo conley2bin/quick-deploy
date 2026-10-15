@@ -14,6 +14,7 @@ cleanup_prepare() {
     local status=$?
     trap - EXIT HUP INT TERM PIPE
     rm -f "$ROOT/incoming/auth-key" || status=1
+    if [[ -n ${installer_apt_config:-} ]]; then rm -f "$installer_apt_config" || status=1; fi
     if [[ $ROLE == proxy && -f $ROOT/upgrade-unheld ]]; then
         apt-mark hold sing-box || status=1
         rm -f "$ROOT/upgrade-unheld" || status=1
@@ -439,7 +440,7 @@ EOF
         [[ $allow_upgrade == True ]] || { echo "sing-box version mismatch: expected $version, installed $installed_version; rerun deploy --upgrade and confirm" >&2; exit 1; }
         touch "$ROOT/upgrade-unheld"
         apt-mark unhold sing-box
-        apt-get -o DPkg::Lock::Timeout=300 install -y "sing-box=$version"
+        apt-get -o DPkg::Lock::Timeout=300 -o Dpkg::Options::=--force-confold install -y "sing-box=$version"
         installed_version=$(dpkg-query -W -f='${Version}' sing-box)
         [[ $installed_version == "$version" ]] || { echo 'Exact sing-box upgrade verification failed' >&2; exit 1; }
     fi
@@ -453,8 +454,12 @@ EOF
             curl -fIsS --connect-timeout 10 --max-time 30 https://pkgs.tailscale.com/stable/ >/dev/null \
                 || { echo 'pkgs.tailscale.com unreachable: official Tailscale installation stopped; no mirror fallback' >&2; exit 1; }
             curl -fsSL https://tailscale.com/install.sh -o "$ROOT/install-tailscale.sh"
-            sh "$ROOT/install-tailscale.sh" \
+            installer_apt_config=$(mktemp "$ROOT/installer-apt.XXXXXX.conf")
+            printf 'DPkg::Lock::Timeout "300";\n' >"$installer_apt_config"
+            APT_CONFIG="$installer_apt_config" sh "$ROOT/install-tailscale.sh" \
                 || { echo 'Official Tailscale install failed (check pkgs.tailscale.com reachability)' >&2; exit 1; }
+            rm -f "$installer_apt_config"
+            installer_apt_config=''
         fi
         # Live CLI capability gates apply only to the enrollment stage.
         up_help=$(tailscale up --help 2>&1)

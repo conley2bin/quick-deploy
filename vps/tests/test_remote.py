@@ -533,6 +533,40 @@ case "$*" in 'show -p User --value sing-box') echo qd-vps-proxy;; 'show -p MainP
         log = self.log.read_text()
         self.assertLess(log.index('apt-mark unhold sing-box'), log.index('install -y sing-box=1.14.3'))
         self.assertLess(log.index('install -y sing-box=1.14.3'), log.index('apt-mark hold sing-box'))
+        self.assertIn('-o Dpkg::Options::=--force-confold install -y sing-box=1.14.3', log)
+
+    def test_official_installer_apt_config_is_inherited_and_cleaned_on_all_exits(self):
+        self.prepare_tools()
+        source = self.script.read_text().replace('if ! command -v tailscale >/dev/null; then\n            curl -fIsS', 'if true; then\n            curl -fIsS', 1)
+        self.script.write_text(source)
+        (self.state / 'incoming/remote.sh').write_text(source)
+        installer = self.root / 'fake-official-installer.sh'
+        record = self.root / 'installer-apt-path'
+        contents = self.root / 'installer-apt-contents'
+        installer.write_text(f'''#!/bin/sh
+set -eu
+test -f "$APT_CONFIG"
+printf '%s' "$APT_CONFIG" >'{record}'
+cat "$APT_CONFIG" >'{contents}'
+if [ "${{QD_INSTALL_FAIL:-}}" = yes ]; then exit 7; fi
+if [ "${{QD_INSTALL_SIGNAL:-}}" != '' ]; then kill -"$QD_INSTALL_SIGNAL" "$PPID"; exit 1; fi
+''')
+        self.env['QD_INSTALL_TEMPLATE'] = str(installer)
+        self.stub('curl', '''while [ "$#" -gt 0 ]; do
+ if [ "$1" = -o ]; then
+  if [[ "$2" == */install-tailscale.sh ]]; then cp "$QD_INSTALL_TEMPLATE" "$2"; else touch "$2"; fi
+  exit 0
+ fi
+ shift
+done
+''')
+        for environment in ({}, {'QD_INSTALL_FAIL': 'yes'}, {'QD_INSTALL_SIGNAL': 'TERM'}, {'QD_INSTALL_SIGNAL': 'PIPE'}):
+            with self.subTest(environment=environment):
+                result = self.action('prepare', **environment)
+                self.assertEqual(result.returncode == 0, not bool(environment), result.stderr)
+                self.assertEqual(contents.read_text(), 'DPkg::Lock::Timeout "300";\n')
+                self.assertFalse(Path(record.read_text()).exists())
+                self.assertFalse(list(self.state.glob('installer-apt.*.conf')))
 
     def test_dependency_bootstrap_and_lock_timeout_precede_python(self):
         source = self.script.read_text().split('prepare)\n', 1)[1]

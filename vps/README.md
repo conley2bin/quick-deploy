@@ -13,7 +13,7 @@ PC之间仍用原Tailscale IP：能直接连就direct，否则使用获授权的
 
 ## 1. 私有状态和身份
 
-在普通PC用户下运行，不要sudo整个setup。依赖Python3、OpenSSL、OpenSSH；backup需rsync；QR可选qrencode；代理check需mihomo/verge-mihomo及curl。远端先装Python等依赖再解析配置；所有本模块APT命令等待dpkg锁最多300秒，noninteractive且不升级已有依赖包。
+在普通PC用户下运行，不要sudo整个setup。依赖Python3、OpenSSL、OpenSSH；backup需rsync；QR可选qrencode；代理check需mihomo/verge-mihomo及curl。远端先装Python等依赖再解析配置；所有本模块APT命令等待dpkg锁最多300秒，noninteractive且不升级已有依赖包。官方Tailscale安装器通过临时`APT_CONFIG`继承`DPkg::Lock::Timeout "300";`，成功/失败/信号退出均删除临时文件。
 
 ```bash
 # 需要代理时初始化业务身份；重跑绝不轮换已有身份。
@@ -77,7 +77,7 @@ bash ~/quick-deploy/vps/setup.sh check --role proxy --ping
 
 固定[sing-box1.14.3](https://github.com/SagerNet/sing-box/releases/tag/v1.14.3)，官方签名APT安装并hold，版本写入params。1.13.x的utls限制可使Microsoft目标Reality全部失败，不能继续使用。1.14.3的[go.mod](https://github.com/SagerNet/sing-box/blob/v1.14.3/go.mod)使用utls1.8.7。
 
-已有版本不符默认拒绝；只有`deploy --upgrade ...`并额外YES确认才unhold→安装精确`sing-box=1.14.3`→hold，失败也重新hold。不退回latest，包升级不降级回滚。新装包的公开示例配置在unit仍mask时删除，pristine checkpoint无配置，unit禁用，避免回滚后重启暴露示例代理。
+已有版本不符默认拒绝；只有`deploy --upgrade ...`并额外YES确认才unhold→安装精确`sing-box=1.14.3`（`--force-confold`保留已有配置）→hold，失败也重新hold。不退回latest，包升级不降级回滚。新装包的公开示例配置在unit仍mask时删除，pristine checkpoint无配置，unit禁用，避免回滚后重启暴露示例代理。
 
 ## 3. 上海relay：腾讯Lighthouse
 
