@@ -22,7 +22,7 @@ class RelayRemote(unittest.TestCase):
         f = self.f
         f.role = 'relay'
         f.prepare_tools()
-        params = {'role': 'relay', 'ssh_user': 'ubuntu', 'host': '203.0.113.2', 'ssh_port': 22, 'without_tailscale': False}
+        params = {'role': 'relay', 'ssh_user': 'ubuntu', 'host': '93.184.216.34', 'relay_endpoint': '93.184.216.34:40000', 'ssh_port': 22, 'without_tailscale': False}
         (f.state / 'incoming/params.json').write_text(json.dumps(params))
         (f.state / 'incoming/config.json').unlink()
         (f.etc / 'sing-box/config.json').unlink()
@@ -30,12 +30,20 @@ class RelayRemote(unittest.TestCase):
         (f.state / 'incoming/firewall.template').write_text(vps.firewall(role='relay'))
         self.bound = f.root / 'relay-bound'
         self.loaded = f.root / 'nft-loaded'
+        self.endpoint = f.root / 'relay-endpoint'
+        self.argv_log = f.root / 'tailscale-argv.jsonl'
         f.stub('getent', 'printf "%s:x:1000:1000::%s:/bin/bash\\n" "${2:-ubuntu}" "$QD_ACCOUNT"\n')
         f.stub('tailscale', f'''printf 'tailscale %s\\n' "$*" >>"$QD_LOG"
+python3 -c 'import json,sys; print(json.dumps(sys.argv[1:]))' "$@" >>'{self.argv_log}'
 if [[ "${{2:-}}" == --help ]]; then
- echo '--advertise-tags --accept-dns --accept-routes --hostname --timeout --auth-key file: --relay-server-port'
+ echo '--advertise-tags --accept-dns --accept-routes --hostname --timeout --auth-key file: --relay-server-port --relay-server-static-endpoints'
 elif [[ "${{1:-}}" == set ]]; then
- if [[ "$*" == *'=40000'* ]]; then touch '{self.bound}'; else rm -f '{self.bound}'; fi
+ if [[ "$*" == *'--relay-server-port=40000'* ]]; then touch '{self.bound}'; else rm -f '{self.bound}'; fi
+ for arg in "$@"; do
+  if [[ $arg == --relay-server-static-endpoints=* ]]; then printf '%s' "${{arg#*=}}" >'{self.endpoint}'; fi
+ done
+elif [[ "${{1:-}}" == debug ]]; then
+ python3 -c 'import pathlib,json; b=pathlib.Path("{self.bound}"); e=pathlib.Path("{self.endpoint}"); s=e.read_text() if e.exists() else ""; print(json.dumps({{"RelayServerPort":40000 if b.exists() else None,"RelayServerStaticEndpoints":[s] if s else []}}))'
 elif [[ "${{1:-}}" == status ]]; then
  echo '{{"BackendState":"Running","Self":{{"Tags":["tag:relay"]}}}}'
 elif [[ "${{1:-}}" == ip ]]; then echo 100.70.0.90
@@ -66,6 +74,8 @@ fi
         f = self.f
         first = (f.etc / 'quick-deploy-vps.nft').read_bytes()
         self.assertTrue(self.bound.exists())
+        argv = [json.loads(line) for line in self.argv_log.read_text().splitlines()]
+        self.assertIn(['set', '--relay-server-port=40000', '--relay-server-static-endpoints=93.184.216.34:40000'], argv)
         self.assertIn('--advertise-tags=tag:relay', f.log.read_text())
         self.assertNotIn('sing-box', f.log.read_text())
         self.assertFalse((f.etc / 'sing-box/config.json').exists())
@@ -85,8 +95,27 @@ fi
         self.assertIn('pristine relay rollback', result.stdout)
         self.assertFalse(self.bound.exists())
         self.assertFalse(self.loaded.exists())
+        self.assertEqual(self.endpoint.read_text(), '')
+        argv = [json.loads(line) for line in self.argv_log.read_text().splitlines()]
+        self.assertIn(['set', '--relay-server-port=', '--relay-server-static-endpoints='], argv)
         self.assertEqual(self.f.action('commit').returncode, 0)
         self.assertNotIn('sing-box', self.f.log.read_text())
+
+    def test_ipv6_static_endpoint_and_health_reject_missing_pref(self):
+        path = self.f.state / 'incoming/params.json'
+        p = json.loads(path.read_text())
+        p.update(host='2606:4700:4700::1111', relay_endpoint='[2606:4700:4700::1111]:40000')
+        path.write_text(json.dumps(p))
+        self.deploy()
+        expected = '[2606:4700:4700::1111]:40000'
+        argv = [json.loads(line) for line in self.argv_log.read_text().splitlines()]
+        self.assertIn(['set', '--relay-server-port=40000', '--relay-server-static-endpoints=' + expected], argv)
+        self.assertIn(expected, self.f.action('health').stdout)
+        self.assertEqual(self.f.action('relay-endpoint').stdout.strip(), expected)
+        self.endpoint.write_text('')
+        result = self.f.action('health')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('static endpoint missing', result.stderr)
 
     def test_legacy_proxy_host_cannot_be_adopted_as_relay(self):
         (self.f.etc / 'sing-box/config.json').write_text('legacy proxy fixture')
@@ -104,7 +133,7 @@ fi
 
     def test_pkgs_unreachable_has_clear_failure_without_proxy_fallback(self):
         f = self.f
-        source = f.script.read_text().replace('if ! command -v tailscale >/dev/null; then', 'if true; then', 1)
+        source = f.script.read_text().replace('if ! command -v tailscale >/dev/null; then\n            curl -fIsS', 'if true; then\n            curl -fIsS', 1)
         f.script.write_text(source)
         (f.state / 'incoming/remote.sh').write_text(source)
         f.stub('curl', 'echo blocked >&2; exit 7\n')
@@ -131,19 +160,33 @@ class RoleInventory(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory(prefix='qd-vps-roles-')
         self.addCleanup(self.tmp.cleanup)
         self.state = vps.private_dir(Path(self.tmp.name) / 'state')
-        self.proxy = {'host': '203.0.113.1', 'user': 'root', 'port': 22, 'provider': 'proxy', 'role': 'proxy'}
-        self.relay = {'host': '203.0.113.2', 'user': 'ubuntu', 'port': 22, 'provider': 'relay', 'role': 'relay'}
+        self.proxy = {'host': '93.184.216.33', 'user': 'root', 'port': 22, 'provider': 'proxy', 'role': 'proxy'}
+        self.relay = {'host': '93.184.216.34', 'user': 'ubuntu', 'port': 22, 'provider': 'relay', 'role': 'relay'}
         self.inv = vps.updated_inventory({}, self.proxy)
         self.inv = vps.updated_inventory(self.inv, self.relay, 'relay')
         self.inv.update(company_ip='100.70.0.1', home_ip='100.70.0.2')
         vps.write_private(self.state / 'inventory.json', vps.dumps(self.inv))
 
+    def test_global_literal_validation_and_bundle_format_before_contact(self):
+        self.assertEqual(vps.relay_endpoint('93.184.216.34'), '93.184.216.34:40000')
+        self.assertEqual(vps.relay_endpoint('2606:4700:4700::1111'), '[2606:4700:4700::1111]:40000')
+        for host in ('relay.example.net', '10.1.2.3', '192.168.0.2', '100.64.0.2', '127.0.0.1', '203.0.113.2', 'fe80::1', 'fc00::1', '224.0.0.1'):
+            with self.subTest(host=host), mock.patch.object(vps, 'run') as run, mock.patch('sys.stderr', new_callable=io.StringIO):
+                result = vps.main(['--state-dir', str(self.state / 'absent'), 'deploy', '--role', 'relay', '--host', host, '--dry-run'])
+                self.assertEqual(result, 1)
+                run.assert_not_called()
+                self.assertFalse((self.state / 'absent').exists())
+        for host in ('93.184.216.34', '2606:4700:4700::1111'):
+            record = dict(self.relay, host=host)
+            with tarfile.open(fileobj=io.BytesIO(vps.bundle(None, None, record, []))) as archive:
+                self.assertEqual(json.load(archive.extractfile('params.json'))['relay_endpoint'], vps.relay_endpoint(host))
+
     def test_replacing_one_role_preserves_other_current_and_history(self):
         before = vps.dumps(self.inv['roles']['relay'])
-        changed = vps.updated_inventory(self.inv, dict(self.proxy, host='203.0.113.3'))
+        changed = vps.updated_inventory(self.inv, dict(self.proxy, host='93.184.216.35'))
         self.assertEqual(vps.dumps(changed['roles']['relay']), before)
         self.assertEqual(changed['roles']['proxy']['previous'], [self.proxy])
-        self.assertEqual(vps.updated_inventory(changed, dict(self.proxy, host='203.0.113.3')), changed)
+        self.assertEqual(vps.updated_inventory(changed, dict(self.proxy, host='93.184.216.35')), changed)
         with self.assertRaisesRegex(vps.Error, 'same-host'):
             vps.updated_inventory(self.inv, dict(self.relay, host=self.proxy['host']), 'relay')
 
@@ -167,9 +210,9 @@ class RoleInventory(unittest.TestCase):
 
     def test_relay_dryrun_needs_no_device_identity_or_contact(self):
         with mock.patch.object(vps, 'run', side_effect=AssertionError('contact')), mock.patch('sys.stdout', new_callable=io.StringIO) as output:
-            result = vps.main(['--state-dir', str(self.state / 'absent'), 'deploy', '--role', 'relay', '--host', '203.0.113.4', '--dry-run'])
+            result = vps.main(['--state-dir', str(self.state / 'absent'), 'deploy', '--role', 'relay', '--host', '93.184.216.36', '--dry-run'])
         self.assertEqual(result, 0)
-        self.assertIn('ubuntu@203.0.113.4', output.getvalue())
+        self.assertIn('ubuntu@93.184.216.36', output.getvalue())
         self.assertNotIn('sing-box check', output.getvalue())
         self.assertFalse((self.state / 'absent').exists())
 
@@ -185,7 +228,7 @@ class RoleInventory(unittest.TestCase):
                 mock.patch.object(vps, 'render_outputs', side_effect=AssertionError('client output')), \
                 mock.patch.object(vps, 'public_keys', return_value=['one', 'two']), mock.patch.object(vps, 'confirm'), \
                 mock.patch.object(vps, 'remote', return_value=subprocess.CompletedProcess([], 0, b'checkpoint')), mock.patch.object(vps, 'run', side_effect=run):
-            result = vps.main(['--state-dir', str(self.state), 'deploy', '--role', 'relay', '--host', '203.0.113.4'])
+            result = vps.main(['--state-dir', str(self.state), 'deploy', '--role', 'relay', '--host', '93.184.216.36'])
         self.assertEqual(result, 0)
         self.assertFalse((self.state / 'identity.json').exists())
         self.assertFalse((self.state / 'generated').exists())
@@ -204,7 +247,7 @@ class RoleInventory(unittest.TestCase):
         with mock.patch.object(vps, 'public_keys', return_value=['one', 'two']), \
                 mock.patch.object(vps, 'confirm', side_effect=[None, vps.Error('policy not merged')]), \
                 mock.patch.object(vps, 'run') as run:
-            result = vps.main(['--state-dir', str(self.state), 'deploy', '--role', 'relay', '--host', '203.0.113.4'])
+            result = vps.main(['--state-dir', str(self.state), 'deploy', '--role', 'relay', '--host', '93.184.216.36'])
         self.assertEqual(result, 1)
         run.assert_not_called()
 
@@ -251,11 +294,12 @@ class RoleInventory(unittest.TestCase):
         document = {'Self': {'TailscaleIPs': ['100.70.0.1']}, 'Peer': {'p': {'TailscaleIPs': ['100.70.0.2'], 'Active': True, 'PeerRelay': '203.0.113.2:40000:vni:1', 'Relay': 'hkg'}}}
         def run(argv, **kwargs):
             return subprocess.CompletedProcess([], 0, json.dumps(document) if 'status' in argv else '')
-        with mock.patch.object(vps, 'remote', return_value=subprocess.CompletedProcess([], 0, '100.70.0.90\n')), \
+        with mock.patch.object(vps, 'remote', side_effect=lambda record, action, **kwargs: subprocess.CompletedProcess([], 0, '93.184.216.34:40000\n' if action == 'relay-endpoint' else '100.70.0.90\n')), \
                 mock.patch.object(vps, 'run', side_effect=run) as commands, mock.patch('sys.stdout', new_callable=io.StringIO) as output:
             result = vps.main(['--state-dir', str(self.state), 'check', '--role', 'relay'])
         self.assertEqual(result, 0)
         self.assertIn('peer-relay', output.getvalue())
+        self.assertIn('Advertised relay endpoint: 93.184.216.34:40000', output.getvalue())
         self.assertEqual(commands.call_args_list[0].args[0], ['tailscale', 'ping', '100.70.0.90'])
         peer = document['Peer']['p']
         peer['CurAddr'] = '198.51.100.3:41641'

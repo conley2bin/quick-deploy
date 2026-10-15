@@ -38,6 +38,11 @@ class RemoteTransaction(unittest.TestCase):
         self.script.chmod(0o700)
         self.log = self.root / "commands.log"
         self.env = dict(os.environ, PATH=f"{self.bin}:{os.environ['PATH']}", QD_LOG=str(self.log), SSH_CONNECTION="198.51.100.5 12345 203.0.113.1 22")
+        shell_env = self.root / 'bash-env.sh'
+        shell_env.write_text('command() {\n'
+            ' if [[ "$1" == -v && "${2:-}" == tailscale && "${QD_TS_ABSENT:-yes}" == yes && ! -f "' + str(self.state / 'install-tailscale.sh') + '" ]]; then return 1; fi\n'
+            ' builtin command "$@"\n}\n')
+        self.env['BASH_ENV'] = str(shell_env)
         (self.state / "incoming/params.json").write_text(json.dumps({"role": "proxy", "ssh_user": "root", "without_tailscale": False}))
         self.stub("systemctl", '''printf 'systemctl %s\\n' "$*" >>"$QD_LOG"
 case "$*" in 'show -p User --value sing-box') echo qd-vps-proxy;; 'show -p MainPID --value sing-box') echo 4242;; esac
@@ -54,7 +59,7 @@ exit 0
         self.stub("readlink", 'echo /usr/bin/sing-box\n')
         self.stub("ss", 'echo listening\n')
         self.stub("sleep", 'exit 0\n')
-        self.stub("tailscale", 'echo \'{"BackendState":"Running","Self":{"Tags":["tag:egress"]}}\'\n')
+        self.stub("tailscale", 'if [[ "${1:-}" == debug ]]; then echo \'{"RelayServerPort":null,"RelayServerStaticEndpoints":[]}\'; else echo \'{"BackendState":"Running","Self":{"Tags":["tag:egress"]}}\'; fi\n')
         self.stub("sshd", '''printf 'sshd %s\\n' "$*" >>"$QD_LOG"
 if [ "${1:-}" = -T ]; then
 printf 'passwordauthentication no\\npermitrootlogin without-password\\n'
@@ -247,7 +252,9 @@ if [[ "${QD_APT_FAIL:-}" == yes ]]; then exit 8; fi
         self.stub("tailscale", '''printf 'tailscale %s\\n' "$*" >>"$QD_LOG"
 if [[ "${QD_PREPARE_SIGNAL:-}" != "" && "${1:-}" == up ]]; then kill -"$QD_PREPARE_SIGNAL" "$PPID"; exit 1; fi
 if [[ "${2:-}" == --help ]]; then
- echo '--advertise-tags --accept-dns --accept-routes --hostname --timeout --auth-key file: --relay-server-port'
+ echo '--advertise-tags --accept-dns --accept-routes --hostname --timeout --auth-key file: --relay-server-port --relay-server-static-endpoints'
+elif [[ "${1:-}" == debug ]]; then
+ echo '{"RelayServerPort":null,"RelayServerStaticEndpoints":[]}'
 elif [[ "${1:-}" == status ]]; then
  echo '{"BackendState":"Running","Self":{"Tags":["tag:egress"]}}'
 elif [[ "${1:-}" == ip ]]; then echo 100.70.0.99
@@ -339,7 +346,7 @@ fi
         self.prepare_tools()
         # Force the missing-install branch in the safe fixture: stage1 must
         # not even download the installer, while stage2 can install/enroll.
-        source = self.script.read_text().replace('if ! command -v tailscale >/dev/null; then', 'if true; then', 1)
+        source = self.script.read_text().replace('if ! command -v tailscale >/dev/null; then\n            curl -fIsS', 'if true; then\n            curl -fIsS', 1)
         self.script.write_text(source)
         (self.state / 'incoming/remote.sh').write_text(source)
         params_path = self.state / "incoming/params.json"
@@ -388,6 +395,53 @@ fi
             self.assertEqual('systemctl enable --now tailscaled' in log, not without)
             self.assertEqual((self.state / 'install-tailscale.sh').exists(), not without)
 
+    def proxy_existing_tailscale(self):
+        self.prepare_tools()
+        self.env['QD_TS_ABSENT'] = 'no'
+        path = self.state / 'incoming/params.json'
+        params = json.loads(path.read_text())
+        params['without_tailscale'] = True
+        path.write_text(json.dumps(params))
+        prefs = self.root / 'proxy-relay-prefs.json'
+        prefs.write_text(json.dumps({'RelayServerPort': 40000, 'RelayServerStaticEndpoints': ['93.184.216.34:40000']}))
+        argv = self.root / 'proxy-ts-argv.jsonl'
+        self.stub('tailscale', f'''printf 'tailscale %s\\n' "$*" >>"$QD_LOG"
+python3 -c 'import json,sys; print(json.dumps(sys.argv[1:]))' "$@" >>'{argv}'
+if [[ "${{1:-}}" == set ]]; then echo '{{"RelayServerPort":null,"RelayServerStaticEndpoints":[]}}' >'{prefs}';
+elif [[ "${{1:-}}" == debug ]]; then cat '{prefs}'; fi
+''')
+        return prefs, argv
+
+    def test_existing_proxy_only_daemon_clears_relay_and_rollback_never_restores_it(self):
+        prefs, argv_path = self.proxy_existing_tailscale()
+        for action in ('prepare', 'apply', 'commit', 'prepare', 'apply', 'commit'):
+            result = self.action(action)
+            self.assertEqual(result.returncode, 0, action + result.stderr)
+        argv = [json.loads(line) for line in argv_path.read_text().splitlines()]
+        self.assertIn(['set', '--relay-server-port=', '--relay-server-static-endpoints='], argv)
+        self.assertFalse(any(call[0] in ('up', 'down') for call in argv))
+        prefs.write_text('{"RelayServerPort":40000,"RelayServerStaticEndpoints":["93.184.216.34:40000"]}')
+        result = self.action('rollback')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(prefs.read_text())['RelayServerStaticEndpoints'], [])
+        self.assertIsNone(json.loads(prefs.read_text())['RelayServerPort'])
+
+    def test_inactive_existing_proxy_daemon_warns_in_apply_and_health_without_cli_calls(self):
+        _, argv = self.proxy_existing_tailscale()
+        self.stub('systemctl', '''printf 'systemctl %s\\n' "$*" >>"$QD_LOG"
+if [[ "$*" == 'is-active --quiet tailscaled' ]]; then exit 3; fi
+case "$*" in 'show -p User --value sing-box') echo qd-vps-proxy;; 'show -p MainPID --value sing-box') echo 4242;; esac
+''')
+        for action in ('prepare', 'apply', 'commit'):
+            result = self.action(action)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            if action == 'apply': self.assertIn('could not be verified', result.stderr)
+        result = self.action('health')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('could not be verified', result.stderr)
+        self.assertIn('SKIP Tailscale', result.stdout)
+        self.assertFalse(argv.exists())
+
     def test_corrupt_stage_mode_never_silently_skips_or_enables_overlay_checks(self):
         (self.state / 'active-params.json').write_text('{"without_tailscale":"false"}')
         result = self.action('health')
@@ -408,7 +462,7 @@ fi
         params_path.write_text(json.dumps(params))
         self.assertEqual(self.action('prepare').returncode, 0)
         self.log.write_text('')
-        self.stub('tailscale', 'echo \'{"BackendState":"Running","Self":{"Tags":[]}}\'\n')
+        self.stub('tailscale', 'if [[ "${1:-}" == debug ]]; then echo \'{"RelayServerPort":null,"RelayServerStaticEndpoints":[]}\'; else echo \'{"BackendState":"Running","Self":{"Tags":[]}}\'; fi\n')
         result = self.action('apply')
         self.assertNotEqual(result.returncode, 0)
         self.assertTrue(json.loads((self.state / 'active-params.json').read_text())['without_tailscale'])
@@ -495,7 +549,7 @@ fi
         self.assertTrue(marker.exists())
 
     def test_health_tag_failure_is_explicit(self):
-        self.stub("tailscale", 'echo \'{"BackendState":"Running","Self":{"Tags":[]}}\'\n')
+        self.stub("tailscale", 'if [[ "${1:-}" == debug ]]; then echo \'{"RelayServerPort":null,"RelayServerStaticEndpoints":[]}\'; else echo \'{"BackendState":"Running","Self":{"Tags":[]}}\'; fi\n')
         result = self.action("health")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('tag:egress not approved', result.stderr)

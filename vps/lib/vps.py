@@ -203,6 +203,8 @@ def inventory_document(value=None):
             if not isinstance(record, dict) or record.get('role', role) != role:
                 raise Error('Ambiguous host role in inventory')
             record['role'] = role
+            if role == 'relay':
+                relay_endpoint(record['host'])
     a, b = (value['roles'][role]['current'] for role in ('proxy', 'relay'))
     if a and b and ipaddress.ip_address(a['host']) == ipaddress.ip_address(b['host']):
         raise Error('Ambiguous target: proxy and relay cannot share the same host')
@@ -445,9 +447,20 @@ def public_keys(inventory):
     return unique
 
 
+def relay_endpoint(host):
+    if '%' in str(host):
+        raise Error('Relay endpoint cannot contain an interface scope')
+    address = ipaddress.ip_address(host)
+    if not address.is_global or address.is_multicast or address.is_unspecified:
+        raise Error('Relay host must be a global unicast IP literal (not private, CGNAT or reserved)')
+    return f'[{address}]:40000' if address.version == 6 else f'{address}:40000'
+
+
 def host_record(args):
     address = str(ipaddress.ip_address(args.host))
     role = getattr(args, 'role', 'proxy')
+    if role == 'relay':
+        relay_endpoint(address)  # Validate BEFORE identity/inventory/network work.
     user = args.user or ('ubuntu' if role == 'relay' else 'root')
     if not re.fullmatch(r"[a-z_][a-z0-9_-]*", user) or not 1 <= args.port <= 65535:
         raise Error("Invalid SSH user/port")
@@ -458,6 +471,8 @@ def updated_inventory(inventory, record, role='proxy'):
     result = inventory_document(inventory)
     slot = result['roles'][role]
     record = dict(record, role=role)
+    if role == 'relay':
+        relay_endpoint(record['host'])
     other = result['roles']['relay' if role == 'proxy' else 'proxy']['current']
     if other and ipaddress.ip_address(other['host']) == ipaddress.ip_address(record['host']):
         raise Error('Refusing ambiguous same-host proxy/relay ownership')
@@ -506,6 +521,8 @@ def bundle(ident, company, record, keys, auth=None, without_tailscale=False, upg
     if role == 'proxy':
         params.update(company=company, target=ident['reality_target'], sing_box_version=SING_BOX_VERSION)
         files['config.json'] = dumps(server_config(ident, company, record['host'])).encode()
+    else:
+        params['relay_endpoint'] = relay_endpoint(record['host'])
     files['params.json'] = dumps(params).encode()
     if auth and not without_tailscale:
         files["auth-key"] = auth.encode()
@@ -711,6 +728,8 @@ def relay_path(document, company, home):
 
 
 def check_relay(record, inventory, company=None, home=None):
+    advertised = remote(record, 'relay-endpoint', fresh=True, capture_output=True, text=True).stdout.strip()
+    print(f'Advertised relay endpoint: {advertised}')
     address = remote(record, 'tailnet-ip', fresh=True, capture_output=True, text=True).stdout.strip()
     run(['tailscale', 'ping', tail_ip(address)])
     company, home = peers(inventory, company, home)

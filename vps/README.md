@@ -69,7 +69,7 @@ bash ~/quick-deploy/vps/setup.sh deploy --role proxy --host <同一首尔IP> --d
 bash ~/quick-deploy/vps/setup.sh check --role proxy --ping
 ```
 
-此阶段请求`tag:egress`、accept-dns=false、accept-routes=false，且显式将`--relay-server-port`设为空，关闭旧版本可能留下的relay。不提供exit node或子网路由。默认打印登录URL等最多10分钟；可用0600的`--auth-key-file`或`TS_AUTHKEY`，密钥只经SSH stdin到root私有文件、用file:路径传给CLI，用后删除。without阶段不读取/上传auth输入，也不停止现有Tailscale。
+此阶段请求`tag:egress`、accept-dns=false、accept-routes=false，且显式将`--relay-server-port`设为空，关闭旧版本可能留下的relay。不提供exit node或子网路由。默认打印登录URL等最多10分钟；可用0600的`--auth-key-file`或`TS_AUTHKEY`，密钥只经SSH stdin到root私有文件、用file:路径传给CLI，用后删除。without阶段不读取/上传auth输入、不安装/入网或up/down。全新主机没有CLI时不运行Tailscale；若已有active tailscaled，只清空relay端口与static endpoints并验证（不改其他prefs）；若CLI存在但daemon inactive则不失败，apply及health/status明确警告relay prefs无法验证。
 
 两阶段复用身份。配置/防火墙相同、UID/监听健康且`readlink /proc/MainPID/exe`精确为`/usr/bin/sing-box`时，不stop/restart代理、不换配置、不重载nft；只事务化更新阶段状态。已删除/旧二进制不走此捷径，必须正常重启并检查。失败或未确认的纯阶段变化只恢复阶段/sshd，不打断未改动的代理。包安装与Tailscale入网不是配置回滚的一部分。
 
@@ -93,9 +93,9 @@ bash ~/quick-deploy/vps/setup.sh deploy --role relay --host <上海IP> --user ub
 bash ~/quick-deploy/vps/setup.sh check --role relay
 ```
 
-Tailscale请求`tag:relay`，relay UDP40000只在已武装timer的apply阶段开启。官方安装前检查`pkgs.tailscale.com`，不可达则明确停止，不换非官方镜像；安装器后续失败也明确提示。policy/login批准需要Tailscale控制面可达。
+relay的`--host`必须是global unicast数字IP，域名、私网、CGNAT、保留地址在任何contact前拒绝。Tailscale请求`tag:relay`，relay UDP40000只在已武装timer的apply阶段开启，同时固定`--relay-server-static-endpoints=<公网IPv4>:40000`；IPv6为`[公网IPv6]:40000`，不依赖海外DERP/STUN才能发现Lighthouse的公网NAT映射。官方安装前检查`pkgs.tailscale.com`，不可达则明确停止，不换非官方镜像；安装器后续失败也明确提示。policy/login批准需要Tailscale控制面可达。
 
-服务器check验证tailscaled运行、tag:relay、40000UDP监听和模块nft表。PC侧ping该**role当前主机的数字Tailnet IP**，再只读status JSON，报告另一PC当前direct / peer-relay / DERP；若没有活动流量则明确idle/unknown，不编造路径。flags可覆盖PC IP。不会改PC配置、强制断开direct或删DERP；请在两PC实际通信时观察peer-relay是否为上海地址。
+服务器check验证tailscaled运行、tag:relay、40000UDP监听和模块nft表，并从`tailscale debug prefs`确认`RelayServerStaticEndpoints`包含期望endpoint。`check --role relay`打印已验证的advertised endpoint；pristine restore和proxy apply明确清空static endpoints，proxy rollback也绝不恢复relay prefs。PC侧ping该**role当前主机的数字Tailnet IP**，再只读status JSON，报告另一PC当前direct / peer-relay / DERP；若没有活动流量则明确idle/unknown，不编造路径。flags可覆盖PC IP。不会改PC配置、强制断开direct或删DERP；请在两PC实际通信时观察peer-relay是否为上海地址。
 
 ## 4. Tailnet策略：先备份/合并，再enroll
 

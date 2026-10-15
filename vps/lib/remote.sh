@@ -71,6 +71,52 @@ print('skipped' if without else 'enabled')
 PY
 }
 
+relay_endpoint_from() {
+    python3 - "$1" <<'PY'
+import ipaddress, json, sys
+p = json.load(open(sys.argv[1]))
+a = ipaddress.ip_address(p['host'])
+if not a.is_global or a.is_multicast or a.is_unspecified:
+    raise ValueError('relay host must be a global unicast literal')
+expected = f'[{a}]:40000' if a.version == 6 else f'{a}:40000'
+if p.get('relay_endpoint', expected) != expected:
+    raise ValueError('relay endpoint does not match numeric host')
+print(expected)
+PY
+}
+
+verify_relay_prefs() {
+    local expected='' prefs
+    if [[ $ROLE == relay ]]; then expected=$(relay_endpoint_from "$ROOT/active-params.json") || return 1; fi
+    prefs=$(timeout 10 tailscale debug prefs) || return 1
+    python3 -c '
+import json,sys
+p=json.load(sys.stdin)
+endpoints=p.get("RelayServerStaticEndpoints") or []
+if sys.argv[1] == "relay":
+    assert p.get("RelayServerPort") == 40000, "relay port pref is not40000"
+    assert sys.argv[2] in endpoints, "expected relay static endpoint missing from prefs"
+    print("PASS advertised relay endpoint: " + sys.argv[2])
+else:
+    assert p.get("RelayServerPort") is None, "proxy still advertises a relay port"
+    assert not endpoints, "proxy still advertises relay static endpoints"
+    print("PASS proxy relay preferences disabled/empty")
+' "$ROLE" "$expected" <<<"$prefs" || return 1
+}
+
+proxy_relay_guard() {
+    local action=$1
+    if ! command -v tailscale >/dev/null; then return 0; fi
+    if ! systemctl is-active --quiet tailscaled; then
+        echo 'WARNING: tailscaled inactive; proxy relay preferences could not be verified' >&2
+        return 0
+    fi
+    if [[ $action == clear ]]; then
+        tailscale set --relay-server-port="" --relay-server-static-endpoints="" || return 1
+    fi
+    verify_relay_prefs
+}
+
 restore_params() {
     local source=$1
     if [[ -f $source/active-params.json ]]; then
@@ -124,6 +170,7 @@ snapshot() {
 restore() {
     local source=$1
     [[ -d $source ]] || { echo 'No prior checkpoint' >&2; return 1; }
+    if [[ $ROLE == proxy ]]; then proxy_relay_guard clear; fi
     if [[ $ROLE == proxy && ${2:-false} == true ]]; then
         # The proxy/firewall were byte-identical and never changed. Recover
         # stage/SSH metadata without interrupting existing proxy connections.
@@ -164,9 +211,9 @@ restore() {
         # activation are restored to the module checkpoint.
         systemctl start tailscaled
         if [[ -f $source/active-params.json ]]; then
-            tailscale set --relay-server-port=40000
+            tailscale set --relay-server-port=40000 --relay-server-static-endpoints="$(relay_endpoint_from "$source/active-params.json")"
         else
-            tailscale set --relay-server-port=""
+            tailscale set --relay-server-port="" --relay-server-static-endpoints=""
         fi
         if [[ ! -f $source/ts-active ]]; then systemctl stop tailscaled; fi
         if [[ -f $source/ts-enabled ]]; then systemctl enable tailscaled; else systemctl disable tailscaled; fi
@@ -234,10 +281,12 @@ health() {
     local mode
     mode=$(tailscale_mode) || return 1
     if [[ $mode == skipped ]]; then
-        echo 'SKIP Tailscale install/enrollment/relay health (--without-tailscale)'
+        proxy_relay_guard verify || return 1
+        echo 'SKIP Tailscale install/enrollment/bridge health (--without-tailscale)'
         return
     fi
     systemctl is-active --quiet tailscaled || return 1
+    verify_relay_prefs || return 1
     local listeners
     if [[ $ROLE == relay ]]; then
         listeners=$(ss -H -lun 'sport = :40000') || return 1; grep -q . <<<"$listeners" || return 1
@@ -414,6 +463,7 @@ EOF
             grep -q -- "--$flag" <<<"$up_help" || { echo "Unsupported tailscale up --$flag" >&2; exit 1; }
         done
         grep -q -- --relay-server-port <<<"$set_help" || { echo 'Tailscale >=1.86 with relay-server-port required' >&2; exit 1; }
+        grep -q -- --relay-server-static-endpoints <<<"$set_help" || { echo 'Tailscale relay static endpoints support required' >&2; exit 1; }
         grep -q -- 'file:' <<<"$up_help" || { echo 'Tailscale auth-key file support required' >&2; exit 1; }
     else
         echo 'SKIP Tailscale installation and CLI/enrollment (--without-tailscale)'
@@ -477,8 +527,12 @@ apply)
     [[ -d $checkpoint ]] || exit 1
     # Same independently timed transaction is used for updates and rollback.
     arm_transaction "$checkpoint" apply
-    if [[ $(param without_tailscale) == False ]]; then
-        if [[ $ROLE == relay ]]; then tailscale set --relay-server-port=40000; else tailscale set --relay-server-port=""; fi
+    if [[ $ROLE == relay ]]; then
+        tailscale set --relay-server-port=40000 --relay-server-static-endpoints="$(param relay_endpoint)"
+    else
+        # Fresh proxy-only hosts do not install/execute Tailscale. Existing
+        # active daemons must not advertise relay prefs, even in stage1.
+        proxy_relay_guard clear
     fi
     if [[ $ROLE == relay ]]; then
         nft -f "$ROOT/candidate-transaction.nft"
@@ -600,6 +654,7 @@ rollback)
     echo 'Rollback pending: fresh key SSH and YES required within 180s; otherwise undo rollback.'
     ;;
 transaction-health) transaction_health ;;
+relay-endpoint) verify_relay_prefs >/dev/null; relay_endpoint_from "$ROOT/active-params.json" ;;
 tailnet-ip) mode=$(tailscale_mode); if [[ $mode == skipped ]]; then echo skipped; else tailscale ip -4; fi ;;
 health) health ;;
 *) echo "Unknown remote action: $ACTION" >&2; exit 2 ;;
