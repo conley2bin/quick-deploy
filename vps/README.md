@@ -95,7 +95,7 @@ bash ~/quick-deploy/vps/setup.sh check --role relay
 
 relay的`--host`必须是global unicast数字IP，域名、私网、CGNAT、保留地址在任何contact前拒绝。Tailscale请求`tag:relay`，relay UDP40000只在已武装timer的apply阶段开启，同时固定`--relay-server-static-endpoints=<公网IPv4>:40000`；IPv6为`[公网IPv6]:40000`，不依赖海外DERP/STUN才能发现Lighthouse的公网NAT映射。官方安装前检查`pkgs.tailscale.com`，不可达则明确停止，不换非官方镜像；安装器后续失败也明确提示。policy/login批准需要Tailscale控制面可达。
 
-服务器check验证tailscaled运行、tag:relay、40000UDP监听和模块nft表，并从`tailscale debug prefs`确认`RelayServerStaticEndpoints`包含期望endpoint。`check --role relay`打印已验证的advertised endpoint；pristine restore和proxy apply明确清空static endpoints，proxy rollback也绝不恢复relay prefs。PC侧ping该**role当前主机的数字Tailnet IP**，再只读status JSON，报告另一PC当前direct / peer-relay / DERP；若没有活动流量则明确idle/unknown，不编造路径。flags可覆盖PC IP。不会改PC配置、强制断开direct或删DERP；请在两PC实际通信时观察peer-relay是否为上海地址。
+服务器check验证tailscaled运行、tag:relay、40000UDP监听和模块nft表，并从`tailscale debug prefs`确认`RelayServerStaticEndpoints`包含期望endpoint。`check --role relay`打印已验证的advertised endpoint；pristine restore和proxy apply明确清空static endpoints，proxy rollback也绝不恢复relay prefs。PC侧ping该**role当前主机的数字Tailnet IP**，再只读status JSON，报告另一PC当前direct / peer-relay / DERP；若没有活动流量则明确idle/unknown，不编造路径。flags可覆盖PC IP。同一份本地`status --json`会核对private inventory中的company/home策略IP；PC重注册后如IP变更，打印旧/当前地址并警告用当前`--company-ip/--home-ip`重新`render --policy-only`、再合并策略。建议保存唯一company_name/home_name，便于IP变更后定位；没有名称且旧IP消失则明确无法核验，不猜新身份。check不会自动改inventory/策略，也不会改PC配置、强制断开direct或删DERP；请在两PC实际通信时观察peer-relay是否为上海地址。
 
 ## 4. Tailnet策略：先备份/合并，再enroll
 

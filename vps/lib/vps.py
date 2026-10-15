@@ -727,6 +727,35 @@ def relay_path(document, company, home):
     return other, 'unavailable (no current endpoint)'
 
 
+def current_policy_aliases(document, inventory, company, home):
+    """Compare saved policy aliases with one read-only current status snapshot.
+
+    Prefer private hostname anchors after re-registration. Without an anchor,
+    a disappeared IP is unverifiable rather than silently considered current.
+    """
+    nodes = [document.get('Self') or {}] + list((document.get('Peer') or {}).values())
+    current = []
+    for role, fallback in (('company', company), ('home', home)):
+        saved = inventory.get(role + '_ip') or fallback
+        if not inventory.get(role + '_ip'):
+            print(f'WARNING: private {role} policy alias is not recorded; re-render and re-merge the tailnet policy with current PC IPs.', file=sys.stderr)
+        name = (inventory.get(role + '_name') or '').lower().rstrip('.')
+        if name:
+            matches = [n for n in nodes if n.get('HostName', '').lower() == name or n.get('DNSName', '').split('.')[0].lower() == name]
+        else:
+            matches = [n for n in nodes if fallback in (n.get('TailscaleIPs') or [])]
+        addresses = [a for a in (matches[0].get('TailscaleIPs') or []) if ':' not in a] if len(matches) == 1 else []
+        if len(addresses) != 1:
+            print(f'WARNING: cannot verify current {role} policy alias {saved}; re-render with current --company-ip/--home-ip and re-merge the tailnet policy.', file=sys.stderr)
+            current.append(fallback)
+            continue
+        address = tail_ip(addresses[0])
+        current.append(address)
+        if address != saved:
+            print(f'WARNING: stale {role} policy alias: inventory {saved}, current {address}; re-render with current --company-ip/--home-ip and re-merge the tailnet policy BEFORE relying on relay/bridge grants.', file=sys.stderr)
+    return tuple(current)
+
+
 def check_relay(record, inventory, company=None, home=None):
     advertised = remote(record, 'relay-endpoint', fresh=True, capture_output=True, text=True).stdout.strip()
     print(f'Advertised relay endpoint: {advertised}')
@@ -734,6 +763,7 @@ def check_relay(record, inventory, company=None, home=None):
     run(['tailscale', 'ping', tail_ip(address)])
     company, home = peers(inventory, company, home)
     document = json.loads(run(['tailscale', 'status', '--json'], capture_output=True, text=True).stdout)
+    company, home = current_policy_aliases(document, inventory, company, home)
     other, path = relay_path(document, company, home)
     print(f'PC -> {other}: {path} (read-only current status; no routing/settings changed)')
 

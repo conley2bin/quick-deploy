@@ -305,6 +305,36 @@ class RoleInventory(unittest.TestCase):
             vps.backup(self.state, self.inv, 'peer-fixture', 'relay')
         self.assertTrue(seen[0].endswith('/relay/'))
 
+    def test_check_warns_stale_aliases_and_uses_current_named_pc_addresses(self):
+        self.inv.update(company_name='office', home_name='home')
+        vps.write_private(self.state / 'inventory.json', vps.dumps(self.inv))
+        before = (self.state / 'inventory.json').read_bytes()
+        document = {'Self': {'HostName': 'office', 'TailscaleIPs': ['100.70.0.11']}, 'Peer': {'p': {'HostName': 'home', 'TailscaleIPs': ['100.70.0.22'], 'Active': True, 'CurAddr': '198.51.100.3:41641'}}}
+        def remote(record, action, **kwargs):
+            return subprocess.CompletedProcess([], 0, '93.184.216.34:40000\n' if action == 'relay-endpoint' else '100.70.0.90\n')
+        def run(argv, **kwargs):
+            return subprocess.CompletedProcess([], 0, json.dumps(document) if 'status' in argv else '')
+        with mock.patch.object(vps, 'remote', side_effect=remote), mock.patch.object(vps, 'run', side_effect=run), \
+                mock.patch('sys.stderr', new_callable=io.StringIO) as warnings, mock.patch('sys.stdout', new_callable=io.StringIO) as output:
+            result = vps.main(['--state-dir', str(self.state), 'check', '--role', 'relay', '--company-ip', '100.70.0.11', '--home-ip', '100.70.0.22'])
+        self.assertEqual(result, 0)
+        self.assertIn('100.70.0.22: direct', output.getvalue())
+        self.assertIn('inventory 100.70.0.1, current 100.70.0.11', warnings.getvalue())
+        self.assertIn('inventory 100.70.0.2, current 100.70.0.22', warnings.getvalue())
+        self.assertIn('re-render', warnings.getvalue())
+        self.assertIn('re-merge', warnings.getvalue())
+        self.assertEqual((self.state / 'inventory.json').read_bytes(), before)
+
+    def test_alias_check_unchanged_is_quiet_and_missing_unanchored_ip_warns(self):
+        document = {'Self': {'TailscaleIPs': ['100.70.0.1']}, 'Peer': {'p': {'TailscaleIPs': ['100.70.0.2']}}}
+        with mock.patch('sys.stderr', new_callable=io.StringIO) as warnings:
+            self.assertEqual(vps.current_policy_aliases(document, self.inv, '100.70.0.1', '100.70.0.2'), ('100.70.0.1', '100.70.0.2'))
+            self.assertEqual(warnings.getvalue(), '')
+            document['Peer']['p']['TailscaleIPs'] = ['100.70.0.22']
+            vps.current_policy_aliases(document, self.inv, '100.70.0.1', '100.70.0.2')
+        self.assertIn('cannot verify current home policy alias 100.70.0.2', warnings.getvalue())
+        self.assertIn('re-merge', warnings.getvalue())
+
     def test_relay_check_pings_numeric_host_and_reports_other_pc_path(self):
         document = {'Self': {'TailscaleIPs': ['100.70.0.1']}, 'Peer': {'p': {'TailscaleIPs': ['100.70.0.2'], 'Active': True, 'PeerRelay': '203.0.113.2:40000:vni:1', 'Relay': 'hkg'}}}
         def run(argv, **kwargs):
