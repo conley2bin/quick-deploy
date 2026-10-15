@@ -128,6 +128,8 @@ exec /usr/bin/install "${args[@]}"
             result = self.action("rollback")
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual((self.etc / "sing-box/config.json").read_text(), 'old configuration\n')
+            self.assertTrue((self.state / "pending").exists())
+            self.assertEqual(self.action("commit").returncode, 0)
 
     def test_wrong_os_refused_before_commands(self):
         (self.etc / "os-release").write_text('ID=debian\nVERSION_ID=12\n')
@@ -148,6 +150,9 @@ case "$*" in
 'enable sing-box') touch "$root/enabled";;
 'disable --now sing-box') rm -f "$root/enabled" "$root/running";;
 'reboot') if [ -f "$root/enabled" ]; then touch "$root/running"; fi;;
+'restart sing-box'|'start sing-box') touch "$root/running";;
+'is-active --quiet sing-box') test -f "$root/running"; exit $?;;
+'is-enabled --quiet sing-box') test -f "$root/enabled"; exit $?;;
 esac
 exit 0
 ''')
@@ -156,6 +161,8 @@ exit 0
         self.assertTrue((self.root / "enabled").exists())
         result = self.action("rollback")
         self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.action("transaction-health").returncode, 0)
+        self.assertEqual(self.action("commit").returncode, 0)
         subprocess.run([str(self.bin / "systemctl"), "reboot"], env=self.env, check=True)
         self.assertFalse((self.root / "running").exists())
         self.assertFalse((self.root / "enabled").exists())
@@ -171,6 +178,30 @@ exit 0
         self.assertLess(restore.index('disable --now sing-box'), restore.index('nft -f'))
         commit = source.split('commit)\n', 1)[1].split('abort)\n', 1)[0]
         self.assertGreater(commit.index('systemctl enable sing-box'), commit.index('rm -f'))
+
+    def test_timer_absence_is_tolerated_and_elapsed_timer_does_not_linger(self):
+        self.stub("systemctl", '''printf 'systemctl %s\\n' "$*" >>"$QD_LOG"
+if [ "$*" = 'stop quick-deploy-vps-revert.timer' ]; then exit 5; fi
+exit 0
+''')
+        self.assertEqual(self.action("apply").returncode, 0)
+        self.assertIn('--timer-property=RemainAfterElapse=no', self.log.read_text())
+        self.assertLess(self.log.read_text().index('stop quick-deploy-vps-revert.timer'), self.log.read_text().index('systemd-run'))
+        self.assertEqual(self.action("abort").returncode, 0)
+        (self.state / "prepared").write_text(str(self.state / "checkpoint") + "\n")
+        self.assertEqual(self.action("apply").returncode, 0)
+        self.assertEqual(self.action("commit").returncode, 0)
+
+    def test_abort_uses_unbounded_lock_and_rollback_has_undo_timer(self):
+        self.stub("flock", 'printf "flock %s\\n" "$*" >>"$QD_LOG"\nexec /usr/bin/flock "$@"\n')
+        self.assertEqual(self.action("apply").returncode, 0)
+        self.assertEqual(self.action("commit").returncode, 0)
+        self.assertEqual(self.action("rollback").returncode, 0)
+        self.assertEqual((self.state / "pending-kind").read_text().strip(), 'rollback')
+        self.assertEqual((self.etc / "sing-box/config.json").read_text(), 'old configuration\n')
+        self.assertEqual(self.action("abort").returncode, 0)
+        self.assertEqual((self.etc / "sing-box/config.json").read_text(), 'new configuration\n')
+        self.assertIn('flock 8\n', self.log.read_text())
 
     def test_harden_consumes_large_effective_config_with_match_context(self):
         self.assertEqual(self.action("apply").returncode, 0)

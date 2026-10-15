@@ -13,7 +13,13 @@ ACTION=${1:?remote action required}
 [[ $ID == ubuntu && $VERSION_ID == 24.04 ]] || { echo 'Only Ubuntu 24.04 is supported; nothing installed.' >&2; exit 1; }
 install -d -m 700 "$ROOT"
 exec 8>"$ROOT/operation.lock"
-flock -w 30 8 || { echo 'Another VPS operation is running' >&2; exit 1; }
+if [[ $ACTION == abort ]]; then
+    # A timer-triggered recovery must never abandon pending state because a
+    # short operation still owns the lock. It runs as soon as that owner exits.
+    flock 8
+else
+    flock -w 30 8 || { echo 'Another VPS operation is running' >&2; exit 1; }
+fi
 
 param() { python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))[sys.argv[2]])' "$ROOT/incoming/params.json" "$1"; }
 
@@ -102,6 +108,34 @@ assert s.get("BackendState") == "Running", "Tailscale is not Running"
 assert "tag:relay" in s.get("Self",{}).get("Tags",[]), "tag:relay not approved"
 '
     echo 'PASS sing-box active, TCP443 + UDP443/40000 listening, owned firewall, tagged Tailscale running'
+}
+
+stop_timer() {
+    systemctl stop quick-deploy-vps-revert.timer 2>/dev/null || true
+}
+
+arm_transaction() {
+    local checkpoint=$1 kind=$2 target=${3:-}
+    stop_timer
+    printf '%s\n' "$checkpoint" >"$ROOT/pending"
+    printf '%s\n' "$kind" >"$ROOT/pending-kind"
+    printf '%s\n' "$target" >"$ROOT/pending-target"
+    trap 'flock -u 8; "$LIB/remote.sh" abort || true' EXIT
+    systemd-run --collect --unit=quick-deploy-vps-revert --timer-property=RemainAfterElapse=no --on-active=180s "$LIB/remote.sh" abort
+}
+
+transaction_health() {
+    [[ -f $ROOT/pending ]] || { echo 'No pending transaction; it may already have reverted' >&2; return 1; }
+    if [[ $(cat "$ROOT/pending-kind") == rollback && ! -f $(cat "$ROOT/pending-target")/config.json ]]; then
+        # Pristine rollback deliberately has no proxy to probe.
+        if systemctl is-active --quiet sing-box || systemctl is-enabled --quiet sing-box; then
+            echo 'Pristine rollback must be stopped and disabled' >&2; return 1
+        fi
+        [[ ! -e $CONF ]]
+        echo 'PASS pristine rollback: sing-box stopped, disabled, no config'
+    else
+        health
+    fi
 }
 
 case "$ACTION" in
@@ -198,10 +232,8 @@ apply)
     [[ ! -e $ROOT/pending ]] || { echo 'Already pending' >&2; exit 1; }
     checkpoint=$(cat "$ROOT/prepared")
     [[ -d $checkpoint ]] || exit 1
-    # Timer executes separately even if this SSH process dies/disconnects.
-    printf '%s\n' "$checkpoint" >"$ROOT/pending"
-    systemd-run --collect --unit=quick-deploy-vps-revert --on-active=180s "$LIB/remote.sh" abort
-    trap 'flock -u 8; "$LIB/remote.sh" abort || true' EXIT
+    # Same independently timed transaction is used for updates and rollback.
+    arm_transaction "$checkpoint" apply
     systemctl disable --now sing-box
     install -d -m 755 /etc/systemd/system/sing-box.service.d
     cat >/etc/systemd/system/sing-box.service.d/90-quick-deploy-vps.conf <<'EOF'
@@ -277,23 +309,26 @@ EOF
     ;;
 commit)
     [[ -f $ROOT/pending ]] || { echo 'No pending transaction (timer may have rolled back)' >&2; exit 1; }
-    health
-    systemctl enable quick-deploy-vps-firewall.service
-    cp "$ROOT/pending" "$ROOT/previous"
-    systemctl stop quick-deploy-vps-revert.timer
+    transaction_health
+    kind=$(cat "$ROOT/pending-kind")
+    if [[ $kind == apply ]]; then
+        systemctl enable quick-deploy-vps-firewall.service
+        cp "$ROOT/pending" "$ROOT/previous"
+    fi
+    stop_timer
     systemctl reset-failed quick-deploy-vps-revert.service 2>/dev/null || true
-    rm -f "$ROOT/pending" "$ROOT/prepared"
-    # Last commit operation: guards/config are already persistent. If this
-    # enable fails, report failure; the proxy remains guarded and boot-disabled.
-    systemctl enable sing-box
+    rm -f "$ROOT/pending" "$ROOT/pending-kind" "$ROOT/pending-target" "$ROOT/prepared"
+    # Rollback preserves the target's enabled state (including pristine OFF).
+    # An apply enables only after its guarded config and firewall are durable.
+    if [[ $kind == apply ]]; then systemctl enable sing-box; fi
     echo 'Committed. Packages and Tailscale enrollment are outside config rollback.'
     ;;
 abort)
+    stop_timer
     if [[ -f $ROOT/pending ]]; then
         checkpoint=$(cat "$ROOT/pending")
         restore "$checkpoint"
-        rm -f "$ROOT/pending" "$ROOT/prepared"
-        systemctl stop quick-deploy-vps-revert.timer
+        rm -f "$ROOT/pending" "$ROOT/pending-kind" "$ROOT/pending-target" "$ROOT/prepared"
         echo 'Restored pre-deployment config, owned nft table and sshd settings.'
     elif [[ -f $ROOT/prepared ]]; then
         rm -f "$ROOT/prepared"
@@ -303,10 +338,16 @@ abort)
 rollback)
     [[ ! -f $ROOT/pending ]] || { echo 'Pending: use abort instead' >&2; exit 1; }
     [[ -f $ROOT/previous ]] || { echo 'No committed checkpoint' >&2; exit 1; }
-    checkpoint=$(cat "$ROOT/previous")
-    restore "$checkpoint"
-    echo 'Previous configuration restored (repeat rollback is a no-op restore, not a toggle).'
+    target=$(cat "$ROOT/previous")
+    checkpoint="$ROOT/checkpoint-$(date +%Y%m%dT%H%M%S)-rollback-$$"
+    snapshot "$checkpoint"
+    arm_transaction "$checkpoint" rollback "$target"
+    restore "$target"
+    transaction_health
+    trap - EXIT
+    echo 'Rollback pending: fresh key SSH and YES required within 180s; otherwise undo rollback.'
     ;;
+transaction-health) transaction_health ;;
 health) health ;;
 *) echo "Unknown remote action: $ACTION" >&2; exit 2 ;;
 esac

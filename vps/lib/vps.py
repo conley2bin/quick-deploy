@@ -638,8 +638,15 @@ def main(argv=None):
                     print(f"Current host: {record['host']}; prior hosts: {len(inv.get('previous', []))}")
                     remote(record, "health", fresh=True)
                 elif args.command == "rollback":
-                    confirm("Restore previous VPS sing-box config and owned nft table?")
-                    remote(record, "rollback", fresh=True)
+                    confirm("Begin timed rollback of previous VPS config and owned nft table?")
+                    try:
+                        remote(record, "rollback", fresh=True)
+                        remote(record, "transaction-health", fresh=True)
+                        confirm("Fresh key SSH verified rollback. Keep restored configuration?")
+                        remote(record, "commit", fresh=True)
+                    except (Error, EOFError, KeyboardInterrupt):
+                        remote(record, "abort", fresh=True)
+                        raise
                 else:
                     remote(record, "health", fresh=True)
                     check_clients(ident, inv, device or "company", args.mihomo)

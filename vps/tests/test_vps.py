@@ -227,12 +227,12 @@ class VPS(unittest.TestCase):
     def test_server_transaction_contract_order_and_no_global_flush(self):
         source = (MODULE / "lib/remote.sh").read_text()
         apply = source.split('apply)\n', 1)[1].split('harden)\n', 1)[0]
-        self.assertLess(apply.index('systemd-run'), apply.index('mv -f "$CONF.candidate"'))
-        self.assertLess(apply.index('systemd-run'), apply.index('nft -f'))
+        self.assertLess(apply.index('arm_transaction'), apply.index('mv -f "$CONF.candidate"'))
+        self.assertLess(apply.index('arm_transaction'), apply.index('nft -f'))
         self.assertLess(source.index('sing-box check -c "$ROOT/incoming/config.json"'), source.index('apply)\n'))
         self.assertNotIn('flush ruleset', source)
         self.assertNotIn('/etc/nftables.conf', source)
-        self.assertIn('trap', apply)
+        self.assertIn('trap', source.split('arm_transaction() {', 1)[1].split('transaction_health()', 1)[0])
         self.assertIn('User=qd-vps-proxy', apply)
 
     def test_deploy_failure_requests_rollback_without_inventory_update(self):
@@ -299,6 +299,17 @@ class VPS(unittest.TestCase):
         self.assertEqual(actions, ["export-backup", "apply", "health", "harden", "health", "commit"])
         self.assertTrue(rem.call_args_list[2].kwargs["fresh"])
         self.assertEqual(vps.load(self.state / "inventory.json")["device"], "home")
+
+    def test_rollback_requires_fresh_login_and_second_confirmation(self):
+        vps.write_private(self.state / "identity.json", vps.dumps(self.ident))
+        inv = dict(self.inv, current={"host": "203.0.113.1", "user": "root", "port": 22})
+        vps.write_private(self.state / "inventory.json", vps.dumps(inv))
+        with mock.patch.object(vps, "remote") as remote, mock.patch.object(vps, "confirm") as confirm:
+            result = vps.main(["--state-dir", str(self.state), "rollback"])
+        self.assertEqual(result, 0)
+        self.assertEqual([c.args[1] for c in remote.call_args_list], ["rollback", "transaction-health", "commit"])
+        self.assertTrue(all(c.kwargs["fresh"] for c in remote.call_args_list))
+        self.assertEqual(confirm.call_count, 2)
 
     def test_check_report_requires_provider_status_and_never_changes_tun(self):
         config = vps.client_config(vps.nodes(self.ident, "203.0.113.1", "company")[0], 18791)

@@ -130,7 +130,7 @@ bash ~/quick-deploy/vps/setup.sh backup            # 使用 inventory backup_ali
 
 status/check 检查 sing-box、Tailscale运行/标签、443 TCP+UDP及40000UDP监听、本模块nft表。check 再在临时目录启动独立 mihomo（可 `--mihomo /path/to/binary`），绑定临时127.0.0.1 mixed端口，不开TUN、控制器、系统代理或DNS监听，不碰Verge。每节点请求 OpenAI/Anthropic/Gemini models endpoint，TLS验证启用，不发送密钥。收到HTTP状态即可证明该HTTPS端点可达（401/403/400正常）；逐节点、逐服务输出PASS/FAIL。它不能证明账号额度、地域资格或模型权限。端口竞争或启动失败显式失败并清理进程，没有直连fallback。
 
-rollback 恢复最近一次成功deploy之前的配置与本模块nft表，不轮换身份、不删除软件、不退网；重复rollback恢复同一checkpoint，不来回切换。backup用已有SSH别名和rsync保存另一台PC，保留0700/0600，不用`--delete`，不复制活动锁。备份是未加密的本地文件，但通过SSH加密传输；两PC都须妥善保护磁盘与账号。请另存离机加密副本并做恢复演练。
+rollback也使用独立180秒timer：先保存当前状态用于撤销，再恢复最近一次成功deploy之前的配置与本模块nft表，通过新鲜公钥登录并输入YES才保留；否则恢复到rollback前。pristine目标必须保持sing-box停用且无配置。重复确认的rollback恢复同一checkpoint，不来回切换。abort等待操作锁直至取得，timer设置RemainAfterElapse=no；应用前与abort/commit都会清理旧timer，timer缺失不妨碍恢复。不轮换身份、不删除软件、不退网。backup用已有SSH别名和rsync保存另一台PC，保留0700/0600，不用`--delete`，不复制活动锁。备份是未加密的本地文件，但通过SSH加密传输；两PC都须妥善保护磁盘与账号。请另存离机加密副本并做恢复演练。
 
 ## 5. 更换 VPS
 
