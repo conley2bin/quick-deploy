@@ -82,9 +82,10 @@ health() {
     systemctl is-active --quiet sing-box
     systemctl is-active --quiet tailscaled
     nft list table inet qd_vps >/dev/null
-    ss -H -ltn 'sport = :443' | grep -q .
-    ss -H -lun 'sport = :443' | grep -q .
-    ss -H -lun 'sport = :40000' | grep -q .
+    local listeners
+    listeners=$(ss -H -ltn 'sport = :443'); grep -q . <<<"$listeners"
+    listeners=$(ss -H -lun 'sport = :443'); grep -q . <<<"$listeners"
+    listeners=$(ss -H -lun 'sport = :40000'); grep -q . <<<"$listeners"
     timeout 10 tailscale status --json | python3 -c '
 import json,sys
 s=json.load(sys.stdin)
@@ -252,8 +253,13 @@ EOF
     sshd -t
     # Cloud images can have earlier/Match-scoped overrides. Verify effective
     # settings for this caller, and refuse a misleading hardening claim.
-    sshd -T | grep -qx 'passwordauthentication no'
-    sshd -T | grep -qx 'permitrootlogin without-password'
+    user=$(param ssh_user)
+    connection=${SSH_CONNECTION:-}
+    client_ip=${2:-${connection%% *}}
+    [[ $client_ip =~ ^[0-9a-fA-F.:]+$ ]] || { echo 'Missing/invalid SSH client IP for Match evaluation' >&2; exit 1; }
+    effective=$(sshd -T -C "user=$user,host=x,addr=$client_ip")
+    grep -qx 'passwordauthentication no' <<<"$effective"
+    grep -qx 'permitrootlogin without-password' <<<"$effective"
     systemctl reload ssh
     ;;
 commit)

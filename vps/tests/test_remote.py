@@ -3,7 +3,9 @@
 No service, nft, SSH, install or Tailscale commands can reach the real host.
 These tests cover shell control flow and file restoration, not kernel behavior.
 """
+import json
 import os
+import re
 from pathlib import Path
 import subprocess
 import tempfile
@@ -35,7 +37,8 @@ class RemoteTransaction(unittest.TestCase):
         self.script.write_text(source)
         self.script.chmod(0o700)
         self.log = self.root / "commands.log"
-        self.env = dict(os.environ, PATH=f"{self.bin}:{os.environ['PATH']}", QD_LOG=str(self.log))
+        self.env = dict(os.environ, PATH=f"{self.bin}:{os.environ['PATH']}", QD_LOG=str(self.log), SSH_CONNECTION="198.51.100.5 12345 203.0.113.1 22")
+        (self.state / "incoming/params.json").write_text(json.dumps({"ssh_user": "root"}))
         self.stub("systemctl", '''printf 'systemctl %s\\n' "$*" >>"$QD_LOG"
 if [ "${QD_FAIL_RESTART:-}" = yes ] && [ "$*" = 'restart sing-box' ]; then exit 73; fi
 exit 0
@@ -48,8 +51,12 @@ exit 0
         self.stub("ss", 'echo listening\n')
         self.stub("sleep", 'exit 0\n')
         self.stub("tailscale", 'echo \'{"BackendState":"Running","Self":{"Tags":["tag:relay"]}}\'\n')
-        self.stub("sshd", '''if [ "${1:-}" = -T ]; then
+        self.stub("sshd", '''printf 'sshd %s\\n' "$*" >>"$QD_LOG"
+if [ "${1:-}" = -T ]; then
 printf 'passwordauthentication no\\npermitrootlogin without-password\\n'
+# Force more than one pipe buffer after the matching lines: old grep -q
+# pipelines cause this producer to SIGPIPE under pipefail.
+python3 -c 'print("padding " + "x" * 32768)'
 fi
 exit 0
 ''')
@@ -127,6 +134,17 @@ exec /usr/bin/install "${args[@]}"
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('Only Ubuntu 24.04', result.stderr)
         self.assertFalse(self.log.exists())
+
+    def test_harden_consumes_large_effective_config_with_match_context(self):
+        self.assertEqual(self.action("apply").returncode, 0)
+        result = self.action("harden")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('sshd -T -C user=root,host=x,addr=198.51.100.5', self.log.read_text())
+        self.assertIn('systemctl reload ssh', self.log.read_text())
+
+    def test_no_early_exit_pipeline_consumers_under_pipefail(self):
+        for path in MODULE.rglob("*.sh"):
+            self.assertIsNone(re.search(r"\|\s*(?:grep\s+-[^\n]*q|head\b)", path.read_text()), str(path))
 
     def test_health_tag_failure_is_explicit(self):
         self.stub("tailscale", 'echo \'{"BackendState":"Running","Self":{"Tags":[]}}\'\n')

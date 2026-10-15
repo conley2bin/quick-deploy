@@ -402,7 +402,11 @@ def elevated(record, command):
 
 
 def remote(record, action, fresh=False, **kwargs):
-    return run(ssh_args(record, fresh) + [elevated(record, "/usr/local/lib/quick-deploy-vps/remote.sh " + shlex.quote(action))], **kwargs)
+    command = "/usr/local/lib/quick-deploy-vps/remote.sh " + shlex.quote(action)
+    if action == "harden":
+        # Expand in the SSH shell before sudo can filter SSH_CONNECTION.
+        command += ' "${SSH_CONNECTION%% *}"'
+    return run(ssh_args(record, fresh) + [elevated(record, command)], **kwargs)
 
 
 def bundle(ident, company, record, keys, auth=None):
