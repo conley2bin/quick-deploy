@@ -93,7 +93,9 @@ bash ~/quick-deploy/vps/setup.sh render --device home --host <VPS数字IP> \
 
 `generated/clash-nodes.json` 只包含本机选择的 company 或 home 两节点。`clash-company.json`、`clash-home.json` 供人工核对/分发，不能让手机使用PC身份访问8743。恢复同一私有目录到另一台PC后，先 `render --device home`（反之 company），再更新规则。
 
-现有 `clash-verge/tun-fix.sh rules render/apply` 在私有文件存在时把节点与 `🛰️ 自建 VPS` select 组**内联**进生成的 Script，并将组及两节点加入 `🚀 节点选择`。不使用外部 file provider，因此不涉及 SAFE_PATHS 外读。文件不存在时输出与原版逐字节一致；文件损坏、过宽权限或缺少主 select 组会显式失败。订阅节点和其他选择保留。
+现有 `clash-verge/tun-fix.sh rules render/apply` 在私有文件存在时把节点与 `🛰️ 自建 VPS` select 组**内联**进生成的 Script。self组选项为Reality（默认）、Hy2、存在时的`🚀 节点选择`；🚀仅添加两SELF叶节点，不能反向引用self组，否则mihomo检测组循环。缺少🚀时仍保留所有本地规则/TUN exclusions。先注入VPS所有已知数字IP的DIRECT规则，再注入API/认证域名到self组的规则，保证API不随🚀普通选择而变化。清单唯一维护在`clash-verge/lib/rules.py:VPS_MODEL_DOMAINS`，Google不使用宽泛后缀。
+
+`server_ips`随私有输出携带数字IP；稳定hostname从inventory current.host取得主IP，额外已知IPv4/IPv6可填私有`vps_ips`列表。无已知IP就明确失败，不联网猜DNS。不使用外部file provider，不涉及SAFE_PATHS外读。文件不存在时输出与原版逐字节一致；文件损坏或权限过宽显式失败。订阅节点和其他选择保留。
 
 本模块的 render/deploy **不执行** `tun-fix apply` 或重载 Verge。请自行查看候选输出后更新已登记 Script，再在 GUI 重载。生成 Script/备份包含凭据，不能提交到 Git 或分享日志。
 

@@ -51,7 +51,7 @@ class VPSIntegration(unittest.TestCase):
 
     def test_absent_private_file_preserves_historical_bytes(self):
         with mock.patch.object(Path, "home", return_value=self.home):
-            self.assertEqual(rules.load_vps_nodes(), [])
+            self.assertEqual(rules.load_vps_output(), {})
         # Golden hashes measured from the pre-integration generator, not from
         # a second invocation of the new renderer.
         self.assertEqual(hashlib.sha256(self.script([]).encode()).hexdigest(),
@@ -62,31 +62,32 @@ class VPSIntegration(unittest.TestCase):
     def test_private_output_loads_only_expected_pinned_nodes(self):
         self.publish()
         with mock.patch.object(Path, "home", return_value=self.home):
-            self.assertEqual(rules.load_vps_nodes(), self.nodes)
+            self.assertEqual(rules.load_vps_output()["proxies"], self.nodes)
         self.nodes[1]["skip-cert-verify"] = True
         self.publish()
         with mock.patch.object(Path, "home", return_value=self.home), self.assertRaises(rules.SourceError):
-            rules.load_vps_nodes()
+            rules.load_vps_output()
 
     def test_malformed_private_output_and_public_mode_fail_explicitly(self):
         self.publish()
         self.output.chmod(0o644)
         with mock.patch.object(Path, "home", return_value=self.home), self.assertRaisesRegex(rules.SourceError, "0600"):
-            rules.load_vps_nodes()
+            rules.load_vps_output()
         self.output.chmod(0o600)
         self.output.write_text('{invalid')
         with mock.patch.object(Path, "home", return_value=self.home), self.assertRaises(rules.SourceError):
-            rules.load_vps_nodes()
+            rules.load_vps_output()
 
     def test_script_injects_select_choices_without_changing_subscription(self):
         result = self.evaluate(self.script(self.nodes), self.base())
         self.assertEqual(result["proxies"][0]["name"], "airport")
         self.assertEqual([n["name"] for n in result["proxies"][1:]], ["SELF-Reality", "SELF-Hy2"])
         group = next(g for g in result["proxy-groups"] if g["name"] == "🛰️ 自建 VPS")
-        self.assertEqual(group, {"name": "🛰️ 自建 VPS", "type": "select", "proxies": ["SELF-Reality", "SELF-Hy2"]})
-        self.assertEqual(result["proxy-groups"][0]["proxies"], ["airport", "🛰️ 自建 VPS", "SELF-Reality", "SELF-Hy2"])
+        self.assertEqual(group, {"name": "🛰️ 自建 VPS", "type": "select", "proxies": ["SELF-Reality", "SELF-Hy2", "🚀 节点选择"]})
+        self.assertEqual(result["proxy-groups"][0]["proxies"], ["airport", "SELF-Reality", "SELF-Hy2"])
         self.assertEqual(result["proxy-groups"][1]["name"], "unrelated")
-        self.assertEqual(result["rules"], ["MATCH,DIRECT"])
+        self.assertEqual(result["rules"][-1], "MATCH,DIRECT")
+        self.assertEqual(result["rules"][0], "IP-CIDR,203.0.113.1/32,DIRECT,no-resolve")
         self.assertNotIn("proxy-providers", result)
 
     def test_script_is_idempotent_and_replaces_old_credentials(self):
@@ -100,12 +101,42 @@ class VPSIntegration(unittest.TestCase):
         choices = result["proxy-groups"][0]["proxies"]
         self.assertEqual(len(choices), len(set(choices)))
 
-    def test_missing_or_wrong_entry_group_uses_visible_core_guard(self):
-        for groups in ([], [{"name": "🚀 节点选择", "type": "url-test", "proxies": ["DIRECT"]}]):
+    def test_missing_entry_and_null_entries_preserve_rules_and_tun_exclusions(self):
+        self.sources["pre"] = [rules.parse_rule(Path("fixture"), 1, "DST-PORT,22,DIRECT", Path("fixture"), "pre")]
+        for groups in ([], [None, {"name": "unrelated", "type": "select", "proxies": ["DIRECT"]}]):
             base = self.base()
             base["proxy-groups"] = groups
+            base["proxies"].append(None)
             result = self.evaluate(self.script(self.nodes), base)
-            self.assertIn("LOCAL-RULES-ERROR-MISSING-VPS-SELECT", result["rules"][0])
+            self.assertIn("DST-PORT,22,DIRECT", result["rules"])
+            self.assertIn("100.64.0.0/10", result["tun"]["route-exclude-address"])
+            self.assertFalse(any("LOCAL-RULES-ERROR" in rule for rule in result["rules"]))
+            group = next(g for g in result["proxy-groups"] if g["name"] == rules.VPS_GROUP)
+            self.assertEqual(group["proxies"], ["SELF-Reality", "SELF-Hy2"])
+
+    def test_model_domains_precede_subscription_and_endpoint_rules_cover_ipv6(self):
+        base = self.base()
+        base["rules"] = ["DOMAIN-SUFFIX,openai.com,unrelated", "MATCH,DIRECT"]
+        result = self.evaluate(rules.render(self.sources, [], self.nodes, ["2001:db8::9"]), base, twice=True)
+        prefix = result["rules"][:10]
+        self.assertEqual(prefix[:2], ["IP-CIDR6,2001:db8::9/128,DIRECT,no-resolve", "IP-CIDR,203.0.113.1/32,DIRECT,no-resolve"])
+        self.assertEqual(len(prefix), 10)
+        for kind, names in rules.VPS_MODEL_DOMAINS.items():
+            for name in names:
+                self.assertIn(f"{kind},{name},{rules.VPS_GROUP}", prefix)
+        self.assertFalse(any(',google.com,' in rule or ',googleapis.com,' in rule for rule in prefix))
+        self.assertEqual(result["rules"].count("DOMAIN-SUFFIX,openai.com," + rules.VPS_GROUP), 1)
+        self.assertIn("DOMAIN,cloudcode-pa.googleapis.com," + rules.VPS_GROUP, prefix)
+        self.assertIn("DOMAIN,aistudio.google.com," + rules.VPS_GROUP, prefix)
+
+    def test_hostname_output_requires_explicit_known_endpoint_ips(self):
+        self.nodes = vps.nodes(self.ident, "relay.example.net", "company")
+        self.publish()
+        with mock.patch.object(Path, "home", return_value=self.home), self.assertRaises(rules.SourceError):
+            rules.load_vps_output()
+        vps.write_private(self.output, vps.dumps({"version": 1, "proxies": self.nodes, "server_ips": ["203.0.113.1", "2001:db8::9"]}))
+        with mock.patch.object(Path, "home", return_value=self.home):
+            self.assertEqual(len(rules.load_vps_output()["server_ips"]), 2)
 
     def test_cli_reads_optional_file_without_touching_verge_runtime(self):
         self.publish()
@@ -124,21 +155,22 @@ class VPSIntegration(unittest.TestCase):
         self.assertEqual(sentinel.read_text(), "runtime sentinel\n")
         self.assertEqual(list(sentinel.parent.iterdir()), [sentinel])
 
-    def test_native_core_validates_full_generated_config_and_missing_group_guard(self):
+    def test_native_core_validates_full_config_with_and_without_entry_group(self):
         binary = shutil.which("verge-mihomo") or shutil.which("mihomo")
         self.assertIsNotNone(binary)
-        result = self.evaluate(self.script(self.nodes), self.base())
-        # airport 'direct' fixture is a supported mihomo proxy type.
-        config = self.home / "config.json"
-        config.write_text(json.dumps(result, ensure_ascii=False))
-        checked = subprocess.run([binary, "-t", "-d", str(self.home), "-f", str(config)], capture_output=True, text=True)
-        self.assertEqual(checked.returncode, 0, checked.stdout + checked.stderr)
-        base = self.base()
-        base["proxy-groups"] = []
-        config.write_text(json.dumps(self.evaluate(self.script(self.nodes), base), ensure_ascii=False))
-        checked = subprocess.run([binary, "-t", "-d", str(self.home), "-f", str(config)], capture_output=True, text=True)
-        self.assertNotEqual(checked.returncode, 0)
-        self.assertIn("LOCAL-RULES-ERROR", checked.stdout + checked.stderr)
+        for present in (True, False):
+            base = self.base()
+            if not present:
+                base["proxy-groups"] = [None]
+                base["proxies"].append(None)
+            else:
+                # Remove stale reverse edge from an earlier generated profile.
+                base["proxy-groups"][0]["proxies"].append(rules.VPS_GROUP)
+            result = self.evaluate(self.script(self.nodes), base, twice=True)
+            config = self.home / "config.json"
+            config.write_text(json.dumps(result, ensure_ascii=False))
+            checked = subprocess.run([binary, "-t", "-d", str(self.home), "-f", str(config)], capture_output=True, text=True)
+            self.assertEqual(checked.returncode, 0, checked.stdout + checked.stderr)
 
 
 if __name__ == "__main__":

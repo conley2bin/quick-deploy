@@ -209,6 +209,14 @@ class VPS(unittest.TestCase):
         self.assertIn("将pin故意改错，确认连接失败", text)
         self.assertIn("pinSHA256=" + vps.fingerprint(self.ident).lower(), text)
 
+    def test_render_hostname_carries_known_ipv4_ipv6_without_dns(self):
+        inv = dict(self.inv, current={"host": "203.0.113.1"}, vps_ips=["2001:db8::9"])
+        with mock.patch.object(vps.shutil, "which", return_value=None), mock.patch.object(vps.socket, "getaddrinfo", side_effect=AssertionError("DNS")):
+            vps.render_outputs(self.state, self.ident, inv, "home", "relay.example.net", "100.70.0.1", "100.70.0.2")
+        output = vps.load(self.state / "generated/clash-nodes.json")
+        self.assertEqual(output["server_ips"], ["2001:db8::9", "203.0.113.1"])
+        self.assertEqual(output["proxies"][0]["server"], "relay.example.net")
+
     def test_native_mihomo_accepts_both_nodes_offline(self):
         binary = shutil.which("verge-mihomo") or shutil.which("mihomo")
         self.assertIsNotNone(binary, "Repository validation requires installed mihomo")

@@ -516,7 +516,16 @@ def discover_wg_endpoints() -> list[str]:
     return endpoint_cidrs(values)
 
 
-def load_vps_nodes() -> list[dict[str, Any]]:
+# One source of truth for model API + CLI authentication routing. Deliberately
+# exact-match Google service names; never route all google.com/googleapis.com.
+VPS_MODEL_DOMAINS = {
+    "DOMAIN-SUFFIX": ("openai.com", "chatgpt.com", "anthropic.com", "claude.ai", "claude.com"),
+    "DOMAIN": ("generativelanguage.googleapis.com", "cloudcode-pa.googleapis.com", "aistudio.google.com"),
+}
+VPS_GROUP = "🛰️ 自建 VPS"
+
+
+def load_vps_output() -> dict[str, Any]:
     """Optional private artifact; absent means exactly the historical output.
 
     Inline nodes in the generated private Script, rather than using a provider
@@ -524,7 +533,7 @@ def load_vps_nodes() -> list[dict[str, Any]]:
     """
     path = Path.home() / ".local/state/quick-deploy-private/vps/generated/clash-nodes.json"
     if not path.exists() and not path.is_symlink():
-        return []
+        return {}
     try:
         if path.is_symlink() or not path.is_file():
             raise ValueError("require a regular file")
@@ -545,13 +554,25 @@ def load_vps_nodes() -> list[dict[str, Any]]:
             raise ValueError("missing Reality credentials")
         if not nodes[1].get("password") or not nodes[1].get("fingerprint") or nodes[1].get("skip-cert-verify") is not False:
             raise ValueError("Hysteria2 requires pinned certificate and skip-cert-verify=false")
-        return nodes
+        addresses = document.get("server_ips", [])
+        if not isinstance(addresses, list):
+            raise ValueError("server_ips must be numeric IP addresses")
+        # Numeric legacy outputs also have enough information for DIRECT rules.
+        for node in nodes:
+            try:
+                addresses = addresses + [str(ipaddress.ip_address(node["server"]))]
+            except ValueError:
+                pass
+        addresses = sorted({str(ipaddress.ip_address(address)) for address in addresses})
+        if not addresses:
+            raise ValueError("hostname output requires server_ips for DIRECT underlay")
+        return {"proxies": nodes, "server_ips": addresses}
     except (OSError, ValueError, KeyError, TypeError, AttributeError) as error:
         raise SourceError(f"{path}: invalid private VPS output ({error}); run vps/setup.sh render") from error
 
 
 def render(rules: dict[str, list[Rule]], wg_endpoints: list[str] | None = None,
-           vps_nodes: list[dict[str, Any]] | None = None) -> str:
+           vps_nodes: list[dict[str, Any]] | None = None, vps_ips: list[str] | None = None) -> str:
     packed = {phase: [rule.text for rule in rules[phase]] for phase in ("pre", "post")}
     proxy_targets = sorted({rule.target for phase in ("pre", "post") for rule in rules[phase]
                             if rule.target != "DIRECT"})
@@ -563,25 +584,37 @@ def render(rules: dict[str, list[Rule]], wg_endpoints: list[str] | None = None,
 
 
     if vps_nodes:
-        # Idempotently replace our exact two names/group, preserving all other
-        # subscription nodes and group choices. A missing entry group is a
-        # visible core validation failure, matching the existing Script guard.
+        addresses = set(vps_ips or [])
+        for node in vps_nodes:
+            try:
+                addresses.add(str(ipaddress.ip_address(node["server"])))
+            except ValueError:
+                pass
+        self_rules = []
+        for address in sorted(addresses):
+            ip = ipaddress.ip_address(address)
+            self_rules.append(f"{'IP-CIDR' if ip.version == 4 else 'IP-CIDR6'},{ip}/{ip.max_prefixlen},DIRECT,no-resolve")
+        self_rules.extend(f"{kind},{name},{VPS_GROUP}" for kind, names in VPS_MODEL_DOMAINS.items() for name in names)
         injection = """  const selfNodes = %s;
+  const selfRules = %s;
   const selfNames = selfNodes.map(node => node.name);
-  const selfGroup = "🛰️ 自建 VPS";
-  const priorGroups = Array.isArray(config["proxy-groups"]) ? config["proxy-groups"] : [];
+  const selfGroup = %s;
+  const priorGroups = Array.isArray(config["proxy-groups"]) ? config["proxy-groups"].filter(Boolean) : [];
   const entry = priorGroups.find(group => group && group.name === "🚀 节点选择");
-  if (!entry || entry.type !== "select") {
-    return localRulesFailure(config, "MISSING-VPS-SELECT", "entry-group");
-  }
   const priorNodes = Array.isArray(config.proxies) ? config.proxies : [];
-  config.proxies = priorNodes.filter(node => !selfNames.includes(node.name)).concat(selfNodes);
-  config["proxy-groups"] = priorGroups.filter(group => group.name !== selfGroup);
-  config["proxy-groups"].push({name: selfGroup, type: "select", proxies: selfNames});
-  const choices = Array.isArray(entry.proxies) ? entry.proxies : [];
-  entry.proxies = [...new Set(choices.concat([selfGroup], selfNames))];
-""" % json.dumps(vps_nodes, ensure_ascii=False)
+  config.proxies = priorNodes.filter(node => node && !selfNames.includes(node.name)).concat(selfNodes);
+  config["proxy-groups"] = priorGroups.filter(group => group && group.name !== selfGroup);
+  // One-way fallback: self -> entry. entry -> self would be a rejected cycle.
+  const selfChoices = entry ? selfNames.concat([entry.name]) : selfNames;
+  config["proxy-groups"].push({name: selfGroup, type: "select", proxies: selfChoices});
+  if (entry) {
+    const choices = Array.isArray(entry.proxies) ? entry.proxies : [];
+    entry.proxies = [...new Set(choices.filter(name => name && name !== selfGroup).concat(selfNames))];
+  }
+""" % (json.dumps(vps_nodes, ensure_ascii=False), json.dumps(self_rules, ensure_ascii=False), json.dumps(VPS_GROUP, ensure_ascii=False))
         script = script.replace("function main(config) {\n", "function main(config) {\n" + injection, 1)
+        assignment = "  config.rules = [...pre, ...beforeMatch, ...missingPost, ...fromMatch];"
+        script = script.replace(assignment, assignment + "\n  const selfSet = new Set(selfRules.map(norm));\n  config.rules = selfRules.concat(config.rules.filter(rule => !selfSet.has(norm(rule))));", 1)
     return script
 
 
@@ -626,14 +659,16 @@ def main() -> int:
                 parser.error("--prepare requires --prepared-script")
             resolved = resolve_app_rules(rules)
             migration_check(args.registry, resolved)
-            args.prepared_script.write_text(render(resolved, discover_wg_endpoints(), load_vps_nodes()), encoding="utf-8")
+            vps_output = load_vps_output()
+            args.prepared_script.write_text(render(resolved, discover_wg_endpoints(), vps_output.get("proxies"), vps_output.get("server_ips")), encoding="utf-8")
         elif args.migration_check:
             if not args.registry:
                 parser.error("--migration-check requires --registry")
             migration_check(args.registry, rules)
             print("no bound local Rules duplicates")
         elif args.render:
-            print(render(resolve_app_rules(rules), discover_wg_endpoints(), load_vps_nodes()), end="")
+            vps_output = load_vps_output()
+            print(render(resolve_app_rules(rules), discover_wg_endpoints(), vps_output.get("proxies"), vps_output.get("server_ips")), end="")
         else:
             app_count = sum(
                 1 for phase in ("pre", "post") for rule in rules[phase] if rule.selector[0] == "APP"

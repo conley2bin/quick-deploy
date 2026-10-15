@@ -308,9 +308,19 @@ def firewall(company, ssh_port=22, uid=999):
 
 def render_outputs(state, ident, inventory, device, host, company, home):
     output = private_dir(state / "generated")
+    addresses = list(inventory.get("vps_ips", []))
+    try:
+        addresses.append(str(ipaddress.ip_address(host)))
+    except ValueError:
+        current = inventory.get("current") or {}
+        if current.get("host"):
+            addresses.append(current["host"])
+    addresses = sorted({str(ipaddress.ip_address(address)) for address in addresses})
+    if not addresses:
+        raise Error("Stable hostname needs current.host or private inventory vps_ips for DIRECT underlay rules")
     for d in ("company", "home"):
-        write_private(output / f"clash-{d}.json", dumps({"version": 1, "proxies": nodes(ident, host, d)}))
-    write_private(output / "clash-nodes.json", dumps({"version": 1, "proxies": nodes(ident, host, device)}))
+        write_private(output / f"clash-{d}.json", dumps({"version": 1, "proxies": nodes(ident, host, d), "server_ips": addresses}))
+    write_private(output / "clash-nodes.json", dumps({"version": 1, "proxies": nodes(ident, host, device), "server_ips": addresses}))
     links = uris(ident, host)
     write_private(output / "shadowrocket.txt", "\n".join(links) + "\n")
     write_private(output / "shadowrocket-subscription.txt", base64.b64encode(("\n".join(links) + "\n").encode()).decode() + "\n")

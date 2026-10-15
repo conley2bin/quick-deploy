@@ -94,9 +94,13 @@ post: []
 
 若已用 [`../vps/`](../vps/README.md) 生成私有
 `~/.local/state/quick-deploy-private/vps/generated/clash-nodes.json`，规则生成器会把
-`SELF-Reality`、`SELF-Hy2` 和 `🛰️ 自建 VPS` select 组内联进生成的 Script，并把三者加入
-现有 `🚀 节点选择` select 的选项。订阅节点和其它组保持；缺少该 select 组会通过现有
-core 校验 guard 显式报错。不存在私有文件时，生成结果逐字节保持原样；损坏、非0600
+`SELF-Reality`、`SELF-Hy2` 和 `🛰️ 自建 VPS` select 组内联进生成的 Script。self组默认Reality，
+其次Hy2，若有`🚀 节点选择`则可手工回退到它；🚀仅增加两个SELF叶节点，不反向引用self组，
+避免mihomo组循环。🚀缺失仍保留本地规则与TUN exclusions，self组只含两节点；空节点/组不会抛JS异常。
+VPS数字IPv4/IPv6的DIRECT规则最先注入，避免临时check客户端或非22管理连接绕回VPS。
+紧凑API/认证域名规则随后指向self组，不随🚀的普通订阅选择变化；域名清单唯一维护在
+`lib/rules.py:VPS_MODEL_DOMAINS`，Google仅匹配指定服务域名，不匹配整个google.com。
+不存在私有文件时，生成结果逐字节保持原样；损坏、非0600
 或链接文件不会静默忽略。两 PC 各自 `vps/setup.sh render --device company|home`，不要共用
 手机身份。Hy2使用SHA256证书pin，不跳过校验。
 
