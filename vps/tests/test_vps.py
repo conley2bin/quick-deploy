@@ -121,7 +121,7 @@ class VPS(unittest.TestCase):
         self.assertNotIn('flush ruleset', fw)
         self.assertLess(fw.index('fib daddr'), fw.index('tcp dport 8743'))
 
-    def test_uris_encode_phone_identity_and_mark_hy2_insecure(self):
+    def test_uris_encode_phone_identity_and_require_official_hy2_pin(self):
         links = vps.uris(self.ident, "2001:db8::1")
         for link in links:
             parsed = urlsplit(link)
@@ -131,7 +131,8 @@ class VPS(unittest.TestCase):
         self.assertEqual(reality.username, self.ident["users"]["phone"]["uuid"])
         self.assertEqual(parse_qs(reality.query)["flow"], ["xtls-rprx-vision"])
         self.assertEqual(parse_qs(reality.query)["pbk"], [self.ident["reality"]["public_key"]])
-        self.assertEqual(parse_qs(hy2.query)["insecure"], ["1"])
+        self.assertEqual(parse_qs(hy2.query)["pinSHA256"], [vps.fingerprint(self.ident).lower()])
+        self.assertNotIn("insecure", parse_qs(hy2.query))
 
     def test_policy_scopes_relay_and_service(self):
         result = vps.policy("100.70.0.1", "100.70.0.2")
@@ -204,7 +205,9 @@ class VPS(unittest.TestCase):
         self.assertEqual(document["proxies"][1]["fingerprint"], vps.fingerprint(self.ident))
         text = (output / "手机和策略说明.txt").read_text()
         self.assertIn("IP-CIDR,100.70.0.1/32,SELF,no-resolve", text)
-        self.assertIn("insecure=1", text)
+        self.assertIn("insecure=1作为兼容fallback", text)
+        self.assertIn("将pin故意改错，确认连接失败", text)
+        self.assertIn("pinSHA256=" + vps.fingerprint(self.ident).lower(), text)
 
     def test_native_mihomo_accepts_both_nodes_offline(self):
         binary = shutil.which("verge-mihomo") or shutil.which("mihomo")

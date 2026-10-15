@@ -260,9 +260,9 @@ def uris(ident, host):
     u, r = ident["users"]["phone"], ident["reality"]
     reality = urlencode({"encryption": "none", "security": "reality", "type": "tcp", "flow": "xtls-rprx-vision",
                          "sni": ident["reality_target"], "fp": "chrome", "pbk": r["public_key"], "sid": r["short_id"]})
-    # Developer publishes no complete Shadowrocket URI/pinning specification.
-    # Do not invent a pin query parameter; explicitly mark the URI insecure.
-    hy2 = urlencode({"sni": ident["hy2"]["sni"], "insecure": "1"})
+    # Official Hysteria2 URI Scheme defines this exact case-sensitive field.
+    # Third-party import support still needs an on-phone negative-pin test.
+    hy2 = urlencode({"sni": ident["hy2"]["sni"], "pinSHA256": fingerprint(ident).lower()})
     return [f"vless://{u['uuid']}@{address}:443?{reality}#SELF-Reality",
             f"hysteria2://{quote(u['hy2_password'], safe='')}@{address}:443?{hy2}#SELF-Hy2"]
 
@@ -324,9 +324,10 @@ SELF = select,policy-regex-filter=^SELF-
 3. 在 [Rule] 第一行添加：
 IP-CIDR,{company}/32,SELF,no-resolve
 然后浏览器访问 http://{company}:8743，继续使用 Codoxear 密码。
-Hysteria2 URI 显式 insecure=1；当前无法从开发者文档确认 Shadowrocket pin 参数。
-若 App 支持证书 SHA-256 pin，请手工核对并固定：{fingerprint(ident)}
-否则仍是加密但不验证服务器证书身份，可能遭中间人攻击；优先用 Reality。
+Hysteria2 URI 使用官方 pinSHA256={fingerprint(ident).lower()}，默认不跳过TLS验证。
+在手机将pin故意改错，确认连接失败，再恢复正确pin。未做此负向验收前优先用Reality。
+只有App因自签CA拒绝正确pin时，才手动添加insecure=1作为兼容fallback，且仍须保留pin并再次验证错pin失败。
+若App忽略pin或错pin仍能连接，不要使用该Hy2节点；insecure=1且不校验pin会遭中间人冒充。
 以上 Shadowrocket URI 与规则字段须在实际 App 版本核对，尚未实机验收。
 先导出当前 Tailnet policy。合并 tailnet-policy.json；删除原有 allow-all ACL/grant，
 否则新增限制不会抵消旧全放行规则。不要覆盖不相关成员授权。admin console 必须校验通过。

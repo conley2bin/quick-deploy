@@ -109,7 +109,7 @@ Hy2 节点启用 SHA256证书指纹 pin，并保持 `skip-cert-verify: false`；
 
 完整中文指令与指纹在 `generated/手机和策略说明.txt`。只导入节点不会带上规则。随后浏览器访问 `http://<公司TailnetIP>:8743`，继续用现有 Codoxear 密码；不公网开放8743。
 
-**Shadowrocket开发者网站未公布足以核实上述URI/规则/pin字段的规范，以上仍须在实际App确认。** Hy2 URI 显式带 `insecure=1`，因为没有可确认的自动pin导入参数；这会接受任意服务器证书，存在中间人冒充风险。若当前App支持手工固定SHA256，请核对 `hy2-sha256.txt` 后设置；否则优先Reality。mihomo的pin实现不代表Shadowrocket支持相同参数。
+Hy2 URI按[Hysteria2官方URI Scheme](https://v2.hysteria.network/docs/developers/URI-Scheme/)输出大小写敏感的 `pinSHA256=<小写十六进制>`，默认不带 `insecure=1`。**手机必须把pin故意改错并确认无法连接，再恢复正确pin**；这验证当前Shadowrocket真正执行证书绑定。若正确pin仍因自签CA被拒，才手工加 `insecure=1` 兼容，并保留pin、再验错pin失败。错pin仍能连接时不要用Hy2，改用Reality。开发者网站未说明Shadowrocket的具体导入行为，不能把官方协议支持视为App已验收。
 
 ### Tailnet policy
 
@@ -161,4 +161,4 @@ bash -n vps/setup.sh vps/lib/remote.sh
 - sing-box：[官方APT安装](https://sing-box.sagernet.org/installation/package-manager/)、[VLESS inbound](https://sing-box.sagernet.org/configuration/inbound/vless/)、[Hysteria2 inbound](https://sing-box.sagernet.org/configuration/inbound/hysteria2/)、[TLS/Reality](https://sing-box.sagernet.org/configuration/shared/tls/)、[auth_user/ip_cidr/ip_is_private](https://sing-box.sagernet.org/configuration/route/rule/)、[resolve/route/reject动作](https://sing-box.sagernet.org/configuration/route/rule_action/)。Context7 `/sagernet/sing-box` 与官方网站交叉核对；不使用废弃block outbound/geosite/geoip字段。
 - mihomo：[VLESS](https://wiki.metacubex.one/en/config/proxies/vless/)、[Hysteria2](https://wiki.metacubex.one/en/config/proxies/hysteria2/)、[TLS fingerprint/SNI](https://wiki.metacubex.one/en/config/proxies/tls/)。使用`flow: xtls-rprx-vision`、`client-fingerprint: chrome`、`reality-opts.public-key/short-id`、`fingerprint`证书pin。
 - Tailscale：[Linux安装](https://tailscale.com/kb/1031/install-linux)、[Peer Relay](https://tailscale.com/docs/features/peer-relay)、[CLI](https://tailscale.com/kb/1080/cli)。官方要求≥1.86，确认`tailscale.com/cap/relay`及`--relay-server-port`；本机只读`up/set --help`另确认`--auth-key=file:`、`--timeout`等，部署时再核对远端版本。
-- Shadowrocket：[开发者官网](https://shadowlaunch.com/)只有产品入口，没有完整配置规范；**VLESS URI的pbk/sid/fp、Hy2 insecure参数、tun-excluded-routes/skip-proxy、policy-regex-filter和IP-CIDR规则尚无开发者规范可确认，须实机验收**。不会把社区示例冒充官方保证。
+- Hysteria2：[官方URI Scheme](https://v2.hysteria.network/docs/developers/URI-Scheme/)确认 `pinSHA256` 与 `insecure`；本模块默认输出pin，不默认降级。Shadowrocket [开发者官网](https://shadowlaunch.com/)没有完整配置规范；**其对pin的实际执行、VLESS pbk/sid/fp、tun-excluded-routes/skip-proxy、policy-regex-filter和IP-CIDR规则仍须实机验收**。
