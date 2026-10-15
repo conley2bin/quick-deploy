@@ -419,6 +419,7 @@ rollback)
     echo 'Rollback pending: fresh key SSH and YES required within 180s; otherwise undo rollback.'
     ;;
 transaction-health) transaction_health ;;
+tailnet-ip) tailscale ip -4 ;;
 health) health ;;
 *) echo "Unknown remote action: $ACTION" >&2; exit 2 ;;
 esac

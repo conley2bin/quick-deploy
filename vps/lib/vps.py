@@ -290,6 +290,7 @@ def firewall(company, ssh_port=22, uid=999):
     ct state established,related accept
     iifname "lo" accept
     meta l4proto {{ icmp, ipv6-icmp }} accept
+    meta nfproto ipv6 udp sport 547 udp dport 546 accept
     # No new tailnet connections to VPS services. Replies use conntrack above.
     iifname "tailscale0" drop
     tcp dport {{ {ports} }} accept
@@ -695,7 +696,10 @@ def main(argv=None):
                     remote(record, "health", fresh=True)
                     check_clients(ident, inv, device, args.mihomo)
                     if args.ping:
-                        run(["tailscale", "ping", "qd-vps-relay"])
+                        # Read from this exact inventory host, never a colliding
+                        # MagicDNS name still held by the replacement's old node.
+                        address = remote(record, "tailnet-ip", fresh=True, capture_output=True, text=True).stdout.strip()
+                        run(["tailscale", "ping", tail_ip(address)])
         return 0
     except (Error, OSError, ValueError, EOFError) as exc:
         print(f"vps: {exc}", file=sys.stderr)

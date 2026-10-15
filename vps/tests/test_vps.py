@@ -113,6 +113,7 @@ class VPS(unittest.TestCase):
     def test_firewall_limits_local_and_tailnet_access(self):
         fw = vps.firewall("100.70.0.1", 2222, 998)
         self.assertIn('policy drop;', fw)
+        self.assertIn('meta nfproto ipv6 udp sport 547 udp dport 546 accept', fw)
         self.assertIn('meta skuid 998 jump proxy_output', fw)
         self.assertIn('fib daddr type local reject', fw)
         self.assertIn('oifname "tailscale0" ip daddr 100.70.0.1 tcp dport 8743 accept', fw)
@@ -363,6 +364,18 @@ class VPS(unittest.TestCase):
         self.assertEqual(result, 0)
         self.assertEqual(remote.call_args.args[1], 'abort')
         self.assertFalse((self.state / "identity.json").exists())
+
+    def test_ping_targets_numeric_ip_read_from_current_replacement_host(self):
+        vps.write_private(self.state / "identity.json", vps.dumps(self.ident))
+        inv = dict(self.inv, current={"host": "203.0.113.2", "user": "root", "port": 22}, device="home")
+        vps.write_private(self.state / "inventory.json", vps.dumps(inv))
+        with mock.patch.object(vps, "remote", return_value=subprocess.CompletedProcess([], 0, "100.70.0.99\n")) as remote, \
+                mock.patch.object(vps, "check_clients"), mock.patch.object(vps, "run") as run:
+            result = vps.main(["--state-dir", str(self.state), "check", "--ping"])
+        self.assertEqual(result, 0)
+        self.assertEqual(remote.call_args.args[0]["host"], "203.0.113.2")
+        self.assertEqual(remote.call_args.args[1], "tailnet-ip")
+        run.assert_called_once_with(["tailscale", "ping", "100.70.0.99"])
 
     def test_check_report_requires_provider_status_and_never_changes_tun(self):
         config = vps.client_config(vps.nodes(self.ident, "203.0.113.1", "company")[0], 18791)

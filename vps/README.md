@@ -77,7 +77,7 @@ bash ~/quick-deploy/vps/setup.sh deploy --host <VPS数字IP> --device company --
 sudo /usr/local/lib/quick-deploy-vps/remote.sh abort
 ```
 
-nft只管理 `table inet qd_vps`，不清空其他表或改 `/etc/nftables.conf`；独立 systemd unit 在重启时加载。输入默认drop，仅允许既有连接、lo、ICMP、管理端口和代理/relay UDP端口，拒绝新的 tailscale0 入站服务连接；公司8743的回包按 conntrack 放行。sing-box 使用独立 `qd-vps-proxy` UID，OUTPUT 对该 UID 拒绝本机（含自身公网地址）和保留目的地，仅允许 tailscale0 → company:8743；协议层 `auth_user` 再限制为 phone。先 DNS resolve 再按目的 IP 拒绝，避免域名绕过范围规则。DNS使用公共1.1.1.1，VPS 本地解析器不需要私网例外。
+nft只管理 `table inet qd_vps`，不清空其他表或改 `/etc/nftables.conf`；独立 systemd unit 在重启时加载。输入默认drop，仅允许既有连接、lo、ICMP、DHCPv6客户端回复（UDP547→546）、管理端口和代理/relay UDP端口，拒绝新的 tailscale0 入站服务连接；公司8743的回包按 conntrack 放行。sing-box 使用独立 `qd-vps-proxy` UID，OUTPUT 对该 UID 拒绝本机（含自身公网地址）和保留目的地，仅允许 tailscale0 → company:8743；协议层 `auth_user` 再限制为 phone。先 DNS resolve 再按目的 IP 拒绝，避免域名绕过范围规则。DNS使用公共1.1.1.1，VPS 本地解析器不需要私网例外。
 
 ## 3. 客户端输出
 
@@ -125,7 +125,7 @@ Hy2 URI按[Hysteria2官方URI Scheme](https://v2.hysteria.network/docs/developer
 ```bash
 bash ~/quick-deploy/vps/setup.sh status
 bash ~/quick-deploy/vps/setup.sh check             # 此命令会访问VPS和三家API，无API key
-bash ~/quick-deploy/vps/setup.sh check --ping      # 额外可选 tailscale ping qd-vps-relay
+bash ~/quick-deploy/vps/setup.sh check --ping      # 从当前VPS读取数字Tailnet IPv4再ping，不使用可能重名的MagicDNS
 bash ~/quick-deploy/vps/setup.sh rollback
 bash ~/quick-deploy/vps/setup.sh abort             # 当前inventory目标；或 --host <IP> --user root --port 22
 bash ~/quick-deploy/vps/setup.sh backup            # 使用 inventory backup_alias
