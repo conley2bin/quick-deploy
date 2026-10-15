@@ -72,6 +72,7 @@ exec /usr/bin/install "${args[@]}"
         checkpoint = self.state / "checkpoint"
         checkpoint.mkdir()
         (checkpoint / "config.json").write_text('old configuration\n')
+        (checkpoint / "service.conf").write_text('[Service]\nUser=qd-vps-proxy\n')
         (checkpoint / "table.nft").write_text('table inet qd_vps { # old table\n}\n')
         (checkpoint / "persistent.nft").write_text('old persistent table\n')
         for flag in ("had-table", "was-active", "fw-enabled"):
@@ -109,7 +110,7 @@ exec /usr/bin/install "${args[@]}"
         self.assertEqual((self.etc / "quick-deploy-vps.nft").read_text(), 'old persistent table\n')
         self.assertFalse((self.state / "pending").exists())
         self.assertIn('Restored pre-deployment', failed.stdout)
-        self.assertFalse((self.etc / "systemd/system/sing-box.service.d/90-quick-deploy-vps.conf").exists())
+        self.assertEqual((self.etc / "systemd/system/sing-box.service.d/90-quick-deploy-vps.conf").read_text(), '[Service]\nUser=qd-vps-proxy\n')
 
     def test_timer_abort_restores_without_confirmation_and_repeat_is_noop(self):
         self.assertEqual(self.action("apply").returncode, 0)
@@ -134,6 +135,42 @@ exec /usr/bin/install "${args[@]}"
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('Only Ubuntu 24.04', result.stderr)
         self.assertFalse(self.log.exists())
+
+    def test_pristine_rollback_then_reboot_cannot_start_public_example(self):
+        checkpoint = self.state / "checkpoint"
+        for path in checkpoint.iterdir():
+            path.unlink()
+        # Simulate persistent unit state and a reboot independently of process
+        # activity. Old restore left this enabled flag behind after commit.
+        self.stub("systemctl", '''printf 'systemctl %s\\n' "$*" >>"$QD_LOG"
+root=$(dirname "$QD_LOG")
+case "$*" in
+'enable sing-box') touch "$root/enabled";;
+'disable --now sing-box') rm -f "$root/enabled" "$root/running";;
+'reboot') if [ -f "$root/enabled" ]; then touch "$root/running"; fi;;
+esac
+exit 0
+''')
+        self.assertEqual(self.action("apply").returncode, 0)
+        self.assertEqual(self.action("commit").returncode, 0)
+        self.assertTrue((self.root / "enabled").exists())
+        result = self.action("rollback")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        subprocess.run([str(self.bin / "systemctl"), "reboot"], env=self.env, check=True)
+        self.assertFalse((self.root / "running").exists())
+        self.assertFalse((self.root / "enabled").exists())
+        self.assertFalse((self.etc / "sing-box/config.json").exists())
+        self.assertFalse((self.etc / "systemd/system/sing-box.service.d/90-quick-deploy-vps.conf").exists())
+
+    def test_enabled_state_and_fresh_package_cleanup_order(self):
+        source = self.script.read_text()
+        self.assertIn('systemctl is-enabled --quiet sing-box', source)
+        fresh = source.split('apt-get install -y sing-box', 1)[1].split('masked=false', 1)[0]
+        self.assertLess(fresh.index('rm -f "$CONF"'), fresh.index('systemctl unmask'))
+        restore = source.split('restore() {', 1)[1].split('health() {', 1)[0]
+        self.assertLess(restore.index('disable --now sing-box'), restore.index('nft -f'))
+        commit = source.split('commit)\n', 1)[1].split('abort)\n', 1)[0]
+        self.assertGreater(commit.index('systemctl enable sing-box'), commit.index('rm -f'))
 
     def test_harden_consumes_large_effective_config_with_match_context(self):
         self.assertEqual(self.action("apply").returncode, 0)

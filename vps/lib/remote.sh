@@ -34,6 +34,7 @@ snapshot() {
     if [[ -f /etc/systemd/system/sing-box.service.d/90-quick-deploy-vps.conf ]]; then
         cp -p /etc/systemd/system/sing-box.service.d/90-quick-deploy-vps.conf "$destination/service.conf"
     fi
+    systemctl is-enabled --quiet sing-box && touch "$destination/was-enabled" || true
     systemctl is-active --quiet sing-box && touch "$destination/was-active" || true
     systemctl is-enabled --quiet quick-deploy-vps-firewall.service && touch "$destination/fw-enabled" || true
 }
@@ -41,8 +42,9 @@ snapshot() {
 restore() {
     local source=$1
     [[ -d $source ]] || { echo 'No prior checkpoint' >&2; return 1; }
-    # Stop first: never run old/new proxy config without its matching firewall.
-    systemctl stop sing-box
+    # Disable FIRST: a crash/reboot during restore must not start a proxy
+    # after its firewall or isolated-UID override has been removed.
+    systemctl disable --now sing-box
     local transaction="$ROOT/restore.nft"
     : >"$transaction"
     if nft list table inet qd_vps >/dev/null 2>&1; then echo 'delete table inet qd_vps' >>"$transaction"; fi
@@ -71,10 +73,17 @@ restore() {
     local override=/etc/systemd/system/sing-box.service.d/90-quick-deploy-vps.conf
     if [[ -f $source/service.conf ]]; then cp -p "$source/service.conf" "$override"; else rm -f "$override"; fi
     systemctl daemon-reload
+    if [[ -f $source/was-active || -f $source/was-enabled ]]; then
+        [[ -f $source/had-table && -f $source/service.conf && -f $source/persistent.nft && -f $source/config.json ]] \
+            || { echo 'Refusing to start an unguarded sing-box checkpoint' >&2; return 1; }
+    fi
     if [[ -f $source/was-active ]]; then
         sing-box check -c "$CONF"
         systemctl start sing-box
         systemctl is-active --quiet sing-box
+    fi
+    if [[ -f $source/was-enabled ]]; then
+        systemctl enable sing-box
     fi
 }
 
@@ -121,6 +130,10 @@ EOF
         masked=true
         apt-get update
         apt-get install -y sing-box
+        # Upstream ships a public example password. It must NEVER enter the
+        # pristine recovery checkpoint or become boot-enabled unguarded.
+        rm -f "$CONF"
+        systemctl disable --now sing-box
         systemctl unmask --runtime sing-box.service
         masked=false
     fi
@@ -189,7 +202,7 @@ apply)
     printf '%s\n' "$checkpoint" >"$ROOT/pending"
     systemd-run --collect --unit=quick-deploy-vps-revert --on-active=180s "$LIB/remote.sh" abort
     trap 'flock -u 8; "$LIB/remote.sh" abort || true' EXIT
-    systemctl stop sing-box
+    systemctl disable --now sing-box
     install -d -m 755 /etc/systemd/system/sing-box.service.d
     cat >/etc/systemd/system/sing-box.service.d/90-quick-deploy-vps.conf <<'EOF'
 [Unit]
@@ -265,11 +278,14 @@ EOF
 commit)
     [[ -f $ROOT/pending ]] || { echo 'No pending transaction (timer may have rolled back)' >&2; exit 1; }
     health
-    systemctl enable sing-box quick-deploy-vps-firewall.service
+    systemctl enable quick-deploy-vps-firewall.service
     cp "$ROOT/pending" "$ROOT/previous"
-    rm -f "$ROOT/pending" "$ROOT/prepared"
     systemctl stop quick-deploy-vps-revert.timer
     systemctl reset-failed quick-deploy-vps-revert.service 2>/dev/null || true
+    rm -f "$ROOT/pending" "$ROOT/prepared"
+    # Last commit operation: guards/config are already persistent. If this
+    # enable fails, report failure; the proxy remains guarded and boot-disabled.
+    systemctl enable sing-box
     echo 'Committed. Packages and Tailscale enrollment are outside config rollback.'
     ;;
 abort)

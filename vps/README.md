@@ -68,6 +68,8 @@ bash ~/quick-deploy/vps/setup.sh deploy --host <VPS数字IP> --device company --
 
 本地渲染 → SSH 上传 → 远端 `sing-box check` 和 `nft -c` → 私有远端/本地 checkpoint → 启动独立 **180秒自动恢复 timer** → 停 proxy、原子替换配置与本模块表 → 重启/监听/标签检查 → **禁用 SSH multiplex 的全新公钥登录** → 输入 `YES` → sshd 禁密码/键盘交互、root仅公钥 → 再次新登录检查 → 持久化并取消 timer。
 
+新装包的公开示例配置在unit仍mask时删除，并禁用unit；pristine checkpoint不含代理配置。snapshot记录原有启用状态；恢复首先disable --now sing-box，只有同时具备配置、UID drop-in和持久防火墙的完整checkpoint才允许重新启动/启用。commit最后才enable sing-box，避免回滚后重启跑起无guard代理。
+
 180秒内未确认或检查失败，会恢复之前的配置、nft表、sshd片段与服务 override。失败不会静默降级。包安装、Tailscale 入网、追加公钥不在回滚范围内。遇到断线等待 timer；上传/prepare完成但尚未apply时没有改运行配置，遗留prepared标记也可用abort清除。必要时从服务商控制台执行：
 
 ```bash
