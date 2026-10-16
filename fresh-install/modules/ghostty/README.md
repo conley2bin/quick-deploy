@@ -261,13 +261,24 @@ does not create a separate config backup or alter other managed files.
 
 `--pi-launcher-only` checks the existing protected launcher/backpressure library,
 then installs the native entry if absent or upgrades an **exact executable old
-raw launcher**. The upgrade preserves the old file as `ghostty-pi.bak.<timestamp>`
-and rechecks ownership/executability before and after backup, then atomically
-replaces the target. An existing backup is not overwritten. Current executable
+raw launcher**. The upgrade copies it to a private same-directory file, verifies
+that copy, then publishes `ghostty-pi.bak.<timestamp>` using an exclusive hard
+link (`ln -T`, without force). An existing file, symlink or directory at that
+backup path causes explicit failure; it is never overwritten or followed.
+Ownership/executability are rechecked before and after publication, then the
+target is atomically replaced. A published backup is retained if later checks
+fail; only this invocation's private temp names are cleaned. Current executable
 content is a no-op; customized, symlink, directory, or nonexecutable targets are
 refused. Its explicit native override shares `GHOSTTY_PASTE_ACTION` with the
 config renderer, so this mode stays independent of arbitrary global config.
 `--check` reports old managed launchers as upgradeable rather than customized.
+
+Run these migrations as a **single writer**, with no concurrent installer or
+editor changing the managed targets. Their final content checks are snapshots,
+not compare-and-swap with the later rename: an uncooperative write after the
+last comparison is not protected. Exclusive backup publication does protect an
+existing backup even when two installers race; it does not make target replacement
+transactional or add a locking framework.
 
 Neither narrow mode runs apt, rebuilds Wayland backpressure, updates fonts,
 desktop/default-terminal state, starts the GUI, or installs shell hooks. The

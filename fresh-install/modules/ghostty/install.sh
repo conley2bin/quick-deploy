@@ -222,7 +222,7 @@ preflight_commands() {
     # 打包漏掉源码必须在任何写入前拒绝，不能报告一个不完整的成功。
     [ -f "$BACKPRESSURE_SOURCE" ] || die "Ghostty 模块不完整，缺少 Wayland 修复源码: $BACKPRESSURE_SOURCE"
     local command_name
-    for command_name in dpkg apt-cache grep awk sed cmp cp mv mktemp chmod mkdir date fc-list infocmp; do
+    for command_name in dpkg apt-cache grep awk sed cmp cp mv ln mktemp chmod mkdir date fc-list infocmp; do
         require_command "$command_name"
     done
 
@@ -975,7 +975,7 @@ apply_paste_keybind_only() {
         rm -f -- "$tmp"
         die "无法生成新的 Ghostty 配置: $CONFIG_FILE"
     fi
-    # 防止比较和原子替换之间已有别的写入；绝不根据过期的旧内容覆盖它。
+    # 复核生成期间可见的变化。比较与 mv 不是 CAS；部署须单写者、无并发编辑。
     if [ -L "$CONFIG_FILE" ] || ! cmp -s "$CONFIG_FILE" <(render_config 'text:\x16'); then
         rm -f -- "$tmp"
         die "Ghostty 配置在迁移期间变化，拒绝覆盖: $CONFIG_FILE"
@@ -1225,7 +1225,7 @@ pi_launcher_state() {
 }
 
 install_pi_launcher() {
-    local legacy=false tmp backup
+    local legacy=false tmp backup backup_tmp
     [ ! -L "$USER_PI_GHOSTTY_LAUNCHER" ] || die "Pi 专用 Ghostty 启动器是符号链接，拒绝覆盖: $USER_PI_GHOSTTY_LAUNCHER"
     if [ -e "$USER_PI_GHOSTTY_LAUNCHER" ]; then
         [ -f "$USER_PI_GHOSTTY_LAUNCHER" ] || die "Pi 专用 Ghostty 启动器不是普通文件，拒绝覆盖: $USER_PI_GHOSTTY_LAUNCHER"
@@ -1254,11 +1254,24 @@ install_pi_launcher() {
             die "Pi 专用启动器在迁移期间变化，拒绝覆盖"
         fi
         backup="$USER_PI_GHOSTTY_LAUNCHER.bak.$(date +%Y%m%d%H%M%S)"
-        if [ -e "$backup" ] || [ -L "$backup" ] ||
-           ! cp -a -- "$USER_PI_GHOSTTY_LAUNCHER" "$backup"; then
+        if ! backup_tmp="$(mktemp "$USER_PI_GHOSTTY_LAUNCHER.backup.tmp.XXXXXX")"; then
             rm -f -- "$tmp"
-            die "无法备份旧 Pi 专用启动器，拒绝覆盖"
+            die "无法创建旧 Pi 专用启动器的私有备份，拒绝覆盖"
         fi
+        if ! cp -a -- "$USER_PI_GHOSTTY_LAUNCHER" "$backup_tmp" ||
+           [ -L "$backup_tmp" ] || [ ! -f "$backup_tmp" ] || [ ! -x "$backup_tmp" ] ||
+           ! cmp -s "$backup_tmp" <(render_legacy_pi_launcher); then
+            rm -f -- "$tmp" "$backup_tmp"
+            die "无法备份旧 Pi 专用启动器（私有副本校验失败），拒绝覆盖"
+        fi
+        # link 创建是原子 no-clobber；-T 拒绝目录，且不跟随已存在的目标符号链接。
+        # 只向自己的私有文件复制，决不能直接 cp 到可能被另一安装器抢先发布的备份。
+        if ! ln -T -- "$backup_tmp" "$backup"; then
+            rm -f -- "$tmp" "$backup_tmp"
+            die "无法发布旧 Pi 专用启动器备份（目标已存在或链接失败），拒绝覆盖"
+        fi
+        rm -f -- "$backup_tmp"
+        # 下列复核是快照，不是对最终 mv 的 CAS；目标替换仍要求单写者部署。
         if [ -L "$USER_PI_GHOSTTY_LAUNCHER" ] || [ ! -f "$USER_PI_GHOSTTY_LAUNCHER" ] ||
            [ ! -x "$USER_PI_GHOSTTY_LAUNCHER" ] ||
            ! cmp -s "$USER_PI_GHOSTTY_LAUNCHER" <(render_legacy_pi_launcher) ||
@@ -1289,7 +1302,7 @@ verify_pi_launcher() {
 # 受保护启动器内容、可执行性以及库/校验副本均须保持原来的受管基准。
 verify_pi_launcher_prerequisites() {
     local command_name
-    for command_name in cat cmp mktemp chmod mkdir mv rm cp date dirname; do
+    for command_name in cat cmp mktemp chmod mkdir mv rm cp ln date dirname; do
         require_command "$command_name"
     done
     [ -x "$GHOSTTY_BIN" ] || die "Pi 专用启动器依赖已安装的 Ghostty: $GHOSTTY_BIN"

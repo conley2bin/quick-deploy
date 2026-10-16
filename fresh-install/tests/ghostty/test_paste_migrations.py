@@ -114,12 +114,12 @@ install_pi_launcher
         self.assertIn(b'text:\\x16', (self.home / ".local/bin/ghostty-pi").read_bytes())
         self.assertEqual(list(self.home.rglob("ghostty-pi.bak.*")), [])
 
-    def test_launcher_rechecks_after_backup_and_preserves_evidence(self):
+    def test_launcher_rechecks_after_publication_and_preserves_evidence(self):
         result = self.shell(r'''
 mkdir -p "$HOME/.local/bin"
 render_legacy_pi_launcher > "$USER_PI_GHOSTTY_LAUNCHER"
 chmod 755 "$USER_PI_GHOSTTY_LAUNCHER"
-cp() { command cp "$@"; printf '# CONCURRENT-USER\n' >> "$USER_PI_GHOSTTY_LAUNCHER"; }
+ln() { command ln "$@"; printf '# CONCURRENT-USER\n' >> "$USER_PI_GHOSTTY_LAUNCHER"; }
 install_pi_launcher
 ''')
         self.assert_refused(result)
@@ -144,6 +144,83 @@ install_pi_launcher
         target = self.home / ".local/bin/ghostty-pi"
         self.assertIn(b'text:\\x16', target.read_bytes())
         self.assertEqual(Path(str(target) + ".bak.FIXED").read_bytes(), b"PRIOR-BACKUP\n")
+
+    def test_launcher_copy_boundary_collision_preserves_existing_backup(self):
+        result = self.shell(r'''
+mkdir -p "$HOME/.local/bin"
+render_legacy_pi_launcher > "$USER_PI_GHOSTTY_LAUNCHER"
+chmod 755 "$USER_PI_GHOSTTY_LAUNCHER"
+date() { echo FIXED; }
+cp() {
+    printf 'LATE-BACKUP\n' > "$USER_PI_GHOSTTY_LAUNCHER.bak.FIXED"
+    command cp "$@"
+}
+install_pi_launcher
+''')
+        self.assert_refused(result)
+        target = self.home / ".local/bin/ghostty-pi"
+        self.assertIn(b'text:\\x16', target.read_bytes())
+        self.assertEqual(Path(str(target) + ".bak.FIXED").read_bytes(), b"LATE-BACKUP\n")
+
+    def test_launcher_publication_boundary_collisions_never_clobber_or_follow(self):
+        for kind in ("file", "symlink", "directory"):
+            with self.subTest(kind=kind):
+                # Each interleaving has its own private HOME and no prior backup.
+                case_home = self.home / kind
+                case_home.mkdir()
+                result = self.shell(r'''
+HOME="$HOME/$KIND"
+USER_PI_GHOSTTY_LAUNCHER="$HOME/.local/bin/ghostty-pi"
+mkdir -p "$HOME/.local/bin"
+render_legacy_pi_launcher > "$USER_PI_GHOSTTY_LAUNCHER"
+chmod 755 "$USER_PI_GHOSTTY_LAUNCHER"
+printf 'UNRELATED-KEEP\n' > "$HOME/unrelated"
+date() { echo FIXED; }
+ln() {
+    local destination="${@: -1}"
+    case "$KIND" in
+        file) printf 'RACED-BACKUP\n' > "$destination" ;;
+        symlink) command ln -s "$HOME/unrelated" "$destination" ;;
+        directory) mkdir "$destination"; printf 'DIRECTORY-KEEP\n' > "$destination/keep" ;;
+    esac
+    command ln "$@"
+}
+install_pi_launcher
+'''.replace('$KIND', kind))
+                self.assert_refused(result)
+                target = case_home / ".local/bin/ghostty-pi"
+                backup = Path(str(target) + ".bak.FIXED")
+                self.assertIn(b'text:\\x16', target.read_bytes())
+                self.assertEqual((case_home / "unrelated").read_bytes(), b"UNRELATED-KEEP\n")
+                if kind == "file":
+                    self.assertEqual(backup.read_bytes(), b"RACED-BACKUP\n")
+                elif kind == "symlink":
+                    self.assertTrue(backup.is_symlink())
+                    self.assertEqual(backup.readlink(), case_home / "unrelated")
+                else:
+                    self.assertEqual([p.name for p in backup.iterdir()], ["keep"])
+                    self.assertEqual((backup / "keep").read_bytes(), b"DIRECTORY-KEEP\n")
+
+    def test_two_same_date_installers_preserve_the_winner_raw_backup(self):
+        result = self.shell(r'''
+mkdir -p "$HOME/.local/bin"
+render_legacy_pi_launcher > "$USER_PI_GHOSTTY_LAUNCHER"
+chmod 751 "$USER_PI_GHOSTTY_LAUNCHER"
+date() { echo FIXED; }
+cp() {
+    ( unset -f cp; install_pi_launcher )
+    command cp "$@"
+}
+install_pi_launcher
+''')
+        self.assert_refused(result)  # A loses after B has completed its real upgrade.
+        target = self.home / ".local/bin/ghostty-pi"
+        backup = Path(str(target) + ".bak.FIXED")
+        self.assertIn(b'paste_from_clipboard', target.read_bytes())
+        self.assertIn(b'text:\\x16', backup.read_bytes())
+        self.assertNotIn(b'paste_from_clipboard', backup.read_bytes())
+        self.assertEqual(backup.stat().st_mode & 0o777, 0o751)
+        self.assertEqual(list(target.parent.glob("ghostty-pi.bak.*")), [backup])
 
 
 if __name__ == "__main__":
