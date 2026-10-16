@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Explicit Y9000p-only install: no Pi extension, SSH config, service, or host deploy.
+# Explicit per-desktop install: no Pi extension, SSH config, service, or host deploy.
 set -euo pipefail
 exec python3 - "${BASH_SOURCE[0]}" "$@" <<'PY'
 import os

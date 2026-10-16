@@ -5,7 +5,7 @@
 #   pi-agent/install.sh --skills  also run the interactive skills installer
 #
 # Requires Node.js >=22.19, npm and an installed Pi; installs none of them.
-# Only extensions/<name>/install.sh; no VS Code install; leaves settings-free.
+# Only extensions/<name>/install.sh; nested installs stay separate; leaves settings-free.
 # After installation, only global tuiMode is set; existing fullscreen is a no-op.
 # Project/CLI overrides remain separate. No live mode switch/reload/restart.
 set -euo pipefail

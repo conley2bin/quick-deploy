@@ -1,6 +1,6 @@
 # pi-agent
 
-本目录是 quick-deploy 仓库中 Pi 侧资源（extensions / skills）及配套 VS Code 扩展的源码归属地。
+本目录是 quick-deploy 仓库中 Pi 功能及其专属组件、skills 和第三方补丁的源码归属地。
 
 ## 一键安装
 
@@ -16,7 +16,7 @@ pi                                 # 新会话直接使用 fullscreen；无需�
 
 行为：
 
-- 仅浅层发现 `extensions/*/install.sh`，逐个执行；新增带 `install.sh` 的 Pi 扩展即自动纳入，无需改本脚本。`extensions/vscode-video-preview-repair/` 是独立的 VS Code UI 扩展，没有 Pi 安装器，不会被链接到 Pi home；按其 [VSIX 安装说明](extensions/vscode-video-preview-repair/README.md)单独安装到 Code。嵌套的 `extensions/pi-copy-links/client/install.sh` 不会执行，须在每个提供桌面的主机（公司机与 Y9000p）单独运行。Pi home 无需初始化 Git；是 Git worktree 时才做对应安装器的 index/exclude 保护。
+- 仅浅层发现 `extensions/*/install.sh`，逐个执行；新增带 `install.sh` 的 Pi 功能即自动纳入，无需改本脚本。嵌套在功能目录内的组件不会被一键安装器单独执行或链接，按各功能 README 的步骤安装。Pi home 无需初始化 Git；是 Git worktree 时才做对应安装器的 index/exclude 保护。
 - 各扩展安装器都是幂等的：已安装的跳过；旧 checkout 或旧名字的受管链接先备份再迁移；外部文件/目录/链接一律拒绝覆盖。
 - 默认不碰 skills（其安装器是交互式的）；不加 `--skills` 时只打印提示。
 - 所有安装步骤成功后，只将全局 `settings.json` 的 `tuiMode` 保存为 `fullscreen`：位置为 `PI_CODING_AGENT_DIR/settings.json`，未指定时为 `$HOME/.pi/agent/settings.json`。已有全局 `regular` 会有意改为 `fullscreen`；其他字段保留，已是 `fullscreen` 时不重写文件。
@@ -47,13 +47,19 @@ pi                                 # 新会话直接使用 fullscreen；无需�
 
 ## 布局约定
 
+根目录按 Pi 资源种类划分，每类保留自己的安装入口。`extensions/` 的每个子目录是一个 Pi 功能，其顶层 `install.sh` 由一键安装器执行；功能所需的其他组件无论运行在哪台主机或哪个宿主，都放在功能目录内，由功能 README 写明部署步骤。一键安装器只发现 `extensions/*/install.sh`，从不进入更深层；功能安装器仍可部署其自有组件。
+
 | 路径 | 内容 | 部署方式 |
 | --- | --- | --- |
-| `extensions/<Pi 扩展名>/` | Pi 扩展源码（`index.ts` 入口） | 各自的 `install.sh` 创建 `~/.pi/agent/extensions/<name>` 受管符号链接；Pi home 是 git worktree 时同时写入 `info/exclude` |
-| `extensions/vscode-video-preview-repair/` | VS Code UI 扩展（`extension.js` / `engines.vscode`） | 单独打包 VSIX 并安装到 Code；没有 Pi 安装器、`index.ts`/`index.js` 或 `pi.extensions`，不被 Pi 自动发现。移动源码不影响 Code 已安装的独立副本，无需重装或重启 |
-| `extensions/pi-copy-links/client/` | 两机配对桌面的链接接收助手及隔离测试 | 每个提供桌面的主机单独运行 `client/install.sh`，创建 `~/.local/bin/pi-client-link-helper`；不作为 Pi 扩展加载 |
-| `skills/` | 技能源码（`SKILL.md`） | `skills/install-skills.sh` 交互式复制到 `~/.pi/agent/skills/` |
+| `README.md`、`install.sh`、`configure-fullscreen.mjs`、`test/` | 本目录说明、一键安装器、其私有的全局 fullscreen 写入步骤及隔离测试 | `bash pi-agent/install.sh` |
+| `extensions/<功能>/` | 一个 Pi 功能的 Pi 入口及专属组件 | 顶层 `install.sh` 创建 `~/.pi/agent/extensions/<name>` 受管链接；Pi home 是 Git worktree 时做 index/exclude 保护 |
+| `extensions/pi-copy-links/client/` | 配对桌面的链接接收助手 | 每个提供桌面的主机单独运行 `client/install.sh` → `~/.local/bin/pi-client-link-helper` |
+| `extensions/pi-copy-links/vscode-video-preview-repair/` | 公司本机 Code 的可选 MP4 预览修复（VS Code UI 扩展） | 单独[打包 VSIX 安装到 Code](extensions/pi-copy-links/vscode-video-preview-repair/README.md)；只修复无文件夹的本地文件窗口，链接打开不依赖它 |
+| `extensions/pi-remote-clipboard/{src,pi-extension}/` | 本机 provider（systemd user service）与 Pi 入口 | 由该功能顶层 `install.sh` 一并安装 |
+| `extensions/pi-inline-images/{patches,vendor}/` | 与本功能桥接协议共同演进的 pi-tmux-images 补丁与 vendored 代码 | 手动 guarded replay（见功能 README） |
+| `patches/<包>-<版本>/` | 不属于任何自有功能的第三方 Pi 包修复 | 手动 guarded replay，仅适用于指定版本；`apply.sh --check` 先核验版本与哈希 |
+| `skills/` | 自有技能 `skills/<name>/`；vendored `skills/<来源>/<name>/` + `UPSTREAM.txt` | `skills/install-skills.sh` 交互式复制到 `~/.pi/agent/skills/` |
 
 `pi-copy-links` 提供代码块右下角复制按钮和 Ctrl+左键打开网页及 Pi 服务器文件；需使用 Pi 的 `fullscreen` 模式。扩展运行时及其单独的叶安装器不修改全局设置；全局 fullscreen 默认策略由本目录的一键安装器负责。版本号仅作诊断：TUI 启动时在自有隔离对象上检查实际接口与关键行为，契约成立即启用，无需用户逐版验证或编辑版本名单。具体接口/行为不兼容时只停用增强并提示原因，原生 Markdown/Pi 保持可用；`/copy-links` 查看实际状态。更新源码后须在 Pi 空闲时手动 `/reload` 或重启才会生效，详见 [使用说明](extensions/pi-copy-links/README.md)。
 
-一键安装器的隔离测试用 `node --test pi-agent/test/installer.test.mjs`（从仓库根目录，需已安装 Pi 的锁依赖）；测试执行临时源码副本中的主入口，覆盖所有真实叶安装器的普通非 Git home 安装/重跑、VS Code companion 的安装/实际 Pi 自动发现边界，以及受控失败；`npm` 和 `systemctl` 使用只记录调用的替身，不启动 Pi、不下载依赖或操作真实用户服务。扩展测试在各自 `test/` 下，例如 `extensions/pi-suspend-guard/test/run.sh`、`extensions/pi-tmux-window-status/test/installer.sh`；`pi-copy-links` 使用 `npm run check`。其[本地诊断命令](extensions/pi-copy-links/README.md#开发者诊断与本地复现)用于开发/排查，不是用户逐版升级的验证任务。
+一键安装器的隔离测试用 `node --test pi-agent/test/installer.test.mjs`（从仓库根目录，需已安装 Pi 的锁依赖）；测试执行临时源码副本中的主入口，覆盖所有真实叶安装器的普通非 Git home 安装/重跑、顶层功能安装入口约定、含嵌套组件的实际 Pi 入口解析边界，以及受控失败；`npm` 和 `systemctl` 使用只记录调用的替身，不启动 Pi、不下载依赖或操作真实用户服务。扩展测试在各自 `test/` 下，例如 `extensions/pi-suspend-guard/test/run.sh`、`extensions/pi-tmux-window-status/test/installer.sh`；`pi-copy-links` 使用 `npm run check`。其[本地诊断命令](extensions/pi-copy-links/README.md#开发者诊断与本地复现)用于开发/排查，不是用户逐版升级的验证任务。

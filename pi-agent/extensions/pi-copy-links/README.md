@@ -131,7 +131,7 @@ code --new-window --goto -- /absolute/path:12:3
 
 带位置时仅接受普通文件。由于当前 Code CLI 的 `--goto` operand 不能安全表达含字面冒号的 POSIX 路径，这一组合会明确失败；不带位置的冒号路径仍可打开。启动环境复制当前桌面环境，但删除 `VSCODE_IPC_HOOK_CLI`，避免被远端 CLI socket 重定向。不会使用 `--reuse-window`。
 
-**本机 MP4 预览需要单独安装 [VS Code 侧修复扩展](../vscode-video-preview-repair/README.md)。** Code 1.135 的新建独立窗口可能先把 MP4 解析成二进制/文本编辑器；Pi 的通用启动参数不能指定自定义编辑器。修复扩展在目标 Code 窗口启动后仅对首个未修改的本地 MP4 文本标签调用 `vscode.openWith(..., 'vscode.videoPreview')`；它不随 Pi 扩展安装，不修改上述启动参数或 SSH 路由。
+**公司本机可选的 MP4 预览修复：[VS Code 侧扩展](vscode-video-preview-repair/README.md)。** 文件链接打开不依赖它。Code 1.135 的新建独立窗口可能先把 MP4 解析成二进制/文本编辑器；Pi 的通用启动参数不能指定自定义编辑器。修复扩展在目标 Code 窗口启动后，仅对无文件夹/工作区窗口中首个未修改的本地 MP4 文本标签调用 `vscode.openWith(..., 'vscode.videoPreview')`，符合条件的非 Pi 打开也会触发。当前本机文件启动满足这个窗口条件；改动本机 `code` 参数或窗口策略时须复查。它不随 Pi 扩展安装，不修改上述启动参数或 SSH 路由。
 
 配对 SSH 路径使用上表中的**Pi 服务器 authority**和明确的文件/目录 URI：Y9000p 桌面打开公司文件用 `code --remote ssh-remote+conley-company --new-window`；公司桌面打开 Y9000p 文件用 `code --remote ssh-remote+conley-Y9000p --new-window`。点击文件时，**在同一次 Code 请求中把文件的直接所在目录作为工作区，并选中该文件**：例如 `/srv/project/src/file.py` 的工作区是 `/srv/project/src`，不是 `/srv/project` 或搜索到的 Git 根。请求同时携带同一远端 authority 的 `--folder-uri <直接父目录>` 和 `--file-uri <文件>`；行列选择器只跟在文件 URI 后。根目录文件 `/README` 的工作区是 `/`；目录点击仍直接打开该目录本身，不再向上一级。父目录仅按服务器路径的 POSIX 拼写计算，保留 symlink 名称，不做 `realpath`、目录搜索或助手本机 `stat`。
 

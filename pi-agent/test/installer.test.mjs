@@ -9,7 +9,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 
 const source = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const vscodeCompanionName = "vscode-video-preview-repair";
-const vscodeCompanion = join(source, "extensions", vscodeCompanionName);
+const vscodeCompanion = join(source, "extensions", "pi-copy-links", vscodeCompanionName);
 // Read the installed host's library/parser, never execute its CLI or mutate its
 // package/home. Each fixture's executable is a tripwire, not the real Pi.
 const installedCli = realpathSync(execFileSync("bash", ["-c", "type -P pi"], { encoding: "utf8" }).trim());
@@ -101,9 +101,7 @@ function realInstallerFixture(t) {
   const names = readdirSync(join(source, "extensions"))
     .filter(name => existsSync(join(source, "extensions", name, "install.sh"))).sort();
   assert.ok(names.length > 0);
-  // Keep the real VS Code companion beside the Pi leaves during discovery.
-  // Omitting non-installable directories would hide a layout-boundary regression.
-  for (const name of [...names, vscodeCompanionName]) cpSync(join(source, "extensions", name), join(f.checkout, "extensions", name), {
+  for (const name of names) cpSync(join(source, "extensions", name), join(f.checkout, "extensions", name), {
     recursive: true, filter: path => !["node_modules", ".git"].includes(basename(path)),
   });
   // Execute every real leaf's shell flow. npm and systemctl are explicitly
@@ -129,7 +127,9 @@ esac
 }
 
 function assertRealInstallation(f) {
-  assert.equal(f.names.includes(vscodeCompanionName), false, "VS Code companion must not have a Pi installer");
+  const directories = readdirSync(join(source, "extensions"), { withFileTypes: true })
+    .filter(entry => entry.isDirectory()).map(entry => entry.name).sort();
+  assert.deepEqual(f.names, directories, "every top-level feature must have an install.sh");
   assert.deepEqual(readdirSync(join(f.agent, "extensions")).sort(), f.names, "only Pi leaves are linked");
   for (const name of f.names) {
     const target = join(f.agent, "extensions", name);
@@ -198,7 +198,7 @@ for (const location of ["default", "custom", "tilde", "relative"]) test(`fresh a
   clean(f.agent);
 });
 
-test("VS Code companion has no Pi entry and is skipped by actual host automatic discovery", async t => {
+test("actual host resolves only the feature entry with real nested components", async t => {
   const f = fixture(t);
   const manifest = JSON.parse(readFileSync(join(vscodeCompanion, "package.json"), "utf8"));
   assert.deepEqual(manifest.extensionKind, ["ui"]);
@@ -208,22 +208,30 @@ test("VS Code companion has no Pi entry and is skipped by actual host automatic 
   for (const name of ["install.sh", "index.ts", "index.js"]) assert.equal(existsSync(join(vscodeCompanion, name)), false, name);
   assert.equal(existsSync(join(vscodeCompanion, ".vscodeignore")), true, "hidden package exclusions stay with source");
 
-  // Both source colocation (ordinary directory) and an accidental directory
-  // link must leave VS Code's main out of Pi's automatic entry-point selection.
-  for (const [agent, linked] of [[f.checkout, false], [f.agent, true]]) {
-    const extensions = join(agent, "extensions"), companion = join(extensions, vscodeCompanionName);
-    mkdirSync(extensions, { recursive: true });
-    if (linked) symlinkSync(vscodeCompanion, companion);
-    else cpSync(vscodeCompanion, companion, { recursive: true });
-    const control = join(extensions, "positive-control/index.ts");
-    mkdirSync(dirname(control)); writeFileSync(control, "export default function () {}\n");
-    const loaded = await discoverAndLoadExtensions([], f.cwd, agent);
-    assert.deepEqual(loaded.errors, []);
-    assert.deepEqual(loaded.extensions.map(extension => extension.path), [control], "positive control loads, companion does not");
-    // The current resource loader also uses package-manager convention discovery.
+  const feature = join(f.checkout, "extensions/pi-copy-links");
+  cpSync(join(source, "extensions/pi-copy-links"), feature, {
+    recursive: true, filter: path => !["node_modules", ".git"].includes(basename(path)),
+  });
+  assert.ok(existsSync(join(feature, "client/install.sh")), "real nested desktop helper is present");
+  assert.ok(existsSync(join(feature, vscodeCompanionName, "extension.js")), "real nested VS Code entry is present");
+  mkdirSync(join(f.agent, "extensions"), { recursive: true });
+  symlinkSync(feature, join(f.agent, "extensions/pi-copy-links"));
+
+  // Resolve the real manifest/tree first, without importing feature code.
+  for (const agent of [f.checkout, f.agent]) {
+    const entry = join(agent, "extensions/pi-copy-links/index.ts");
     const packages = new DefaultPackageManager({ cwd: f.cwd, agentDir: agent, settingsManager: SettingsManager.inMemory() });
     const resolved = await packages.resolveExtensionSources([agent], { temporary: true });
-    assert.deepEqual(resolved.extensions.map(extension => extension.path), [control], "package discovery also excludes VS Code main");
+    assert.deepEqual(resolved.extensions.map(extension => extension.path), [entry], "package discovery excludes nested components");
+  }
+  // Keep the real manifest and nested components; stub only the Pi factory to
+  // test the host loader without feature dependencies or activation effects.
+  writeFileSync(join(feature, "index.ts"), "export default function () {}\n");
+  for (const agent of [f.checkout, f.agent]) {
+    const loaded = await discoverAndLoadExtensions([], f.cwd, agent);
+    assert.deepEqual(loaded.errors, []);
+    assert.deepEqual(loaded.extensions.map(extension => extension.path), [join(agent, "extensions/pi-copy-links/index.ts")],
+      "only the declared feature entry loads, for both a directory and an installed-style symlink");
   }
 });
 
