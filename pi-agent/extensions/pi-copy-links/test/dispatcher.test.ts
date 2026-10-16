@@ -12,9 +12,12 @@ import {
   dispatchOpenTarget, runClientHelper, type DispatcherDependencies, type HelperRequest, type HelperSpawn,
 } from "../src/dispatcher.ts";
 import type { InputReceiver, InputTopology } from "../src/receiver.ts";
+import { sourceLinkEvidence, sourcePathMatches } from "../src/source.ts";
 
 const client: Extract<InputReceiver, { kind: "remote" }> =
-  { kind: "remote", peer: "192.0.2.64", port: 2222, user: "conley" };
+  Object.freeze({ kind: "remote", alias: "conley-Y9000p", peer: "192.0.2.64", port: 2222, user: "conley" });
+const companyClient: Extract<InputReceiver, { kind: "remote" }> =
+  Object.freeze({ kind: "remote", alias: "conley-company", peer: "192.0.2.103", port: 2203, user: "conley" });
 const tmux = { TMUX: "/fixture/tmux,1,0", TMUX_PANE: "%4" };
 const hop = Object.freeze({
   tty: "/dev/pts/4",
@@ -118,12 +121,12 @@ function decoded(invocations: Invocation[]): HelperRequest[] {
   });
 }
 
-function pinned(invocation: Invocation): void {
+function pinned(invocation: Invocation, receiver = client): void {
   assert.equal(invocation.command, "ssh");
   assert.deepEqual(invocation.options, { stdio: ["pipe", "pipe", "pipe"], shell: false, detached: true });
   assert.deepEqual(invocation.args, ["-T", "-o", "BatchMode=yes", "-o", "ClearAllForwardings=yes",
-    "-o", "StrictHostKeyChecking=yes", "-o", "ConnectTimeout=8", "-o", "HostName=192.0.2.64",
-    "-o", "Port=2222", "-o", "User=conley", "conley-Y9000p", "~/.local/bin/pi-client-link-helper"]);
+    "-o", "StrictHostKeyChecking=yes", "-o", "ConnectTimeout=8", "-o", `HostName=${receiver.peer}`,
+    "-o", `Port=${receiver.port}`, "-o", `User=${receiver.user}`, receiver.alias, "~/.local/bin/pi-client-link-helper"]);
   assert.ok(invocation.input.endsWith("\n"));
   assert.equal(invocation.input.trimEnd().split("\n").length, 2);
   assert.deepEqual(JSON.parse(invocation.input.split("\n")[1]!),
@@ -192,6 +195,84 @@ test("direct paired SSH uses the existing pinned v2 helper without tmux", async 
   });
   assert.deepEqual(decoded(invocations), [{ version: 2, action: "open-web", url: "https://example.org/direct" }]);
   pinned(invocations[0]!);
+});
+
+test("both admitted aliases pin direct and tagged file/folder actions without adding protocol authority", async () => {
+  for (const receiver of [client, companyClient]) {
+    for (const direct of [false, true]) {
+      const invocations: Invocation[] = [];
+      const stats: string[] = [];
+      const serverCwd = receiver === client ? "/company" : "/laptop";
+      const dependencies = setup(invocations, {
+        topology: direct ? Object.freeze({ ...remoteTopology, receiver }) : tmuxTopology,
+        resolve: async () => receiver,
+        stat: async (serverPath) => {
+          stats.push(serverPath);
+          return { isFile: () => !serverPath.endsWith("/folder"), isDirectory: () => serverPath.endsWith("/folder") };
+        },
+        local: async () => assert.fail("remote server resources must never use a local desktop fallback"),
+      });
+      const source = sourceLinkEvidence("Open `reports/中文%#?.png`");
+      const discovered = sourcePathMatches(source, "codespan", "`reports/中文%#?.png`", "reports/中文%#?.png");
+      assert.equal(discovered.length, 1);
+      for (const href of [discovered[0]!.href, "./file.ts#L12C3", "./folder"]) {
+        await dispatchOpenTarget(href, serverCwd, lifetime(), direct ? "unknown" : 802, dependencies);
+      }
+      assert.deepEqual(stats, [`${serverCwd}/reports/中文%#?.png`, `${serverCwd}/file.ts`, `${serverCwd}/folder`]);
+      assert.deepEqual(decoded(invocations), [
+        { version: 2, action: "open-file", kind: "file", path: `${serverCwd}/reports/中文%#?.png` },
+        { version: 2, action: "open-file", kind: "file", path: `${serverCwd}/file.ts`, line: 12, column: 3 },
+        { version: 2, action: "open-file", kind: "directory", path: `${serverCwd}/folder` },
+      ]);
+      invocations.forEach((invocation) => pinned(invocation, receiver));
+      const request = JSON.parse(invocations[0]!.input.split("\n")[0]!);
+      assert.deepEqual(Object.keys(request).sort(), ["action", "kind", "path", "phase", "prepareDeadlineMs", "version"]);
+    }
+  }
+});
+
+test("missing/foreign alias or invalid endpoint refuses before SSH, never selecting a default peer", async () => {
+  const { alias: _alias, ...withoutAlias } = client;
+  const invalid = [withoutAlias, ...["", "other", "conley-Y9000P", "--proxy-command=bad"].map((alias) => ({ ...client, alias })),
+    { ...client, peer: "conley-company" }, { ...client, user: "other" }, { ...client, port: 0 },
+    { ...client, port: 65_536 }];
+  for (const receiver of invalid) {
+    for (const direct of [false, true]) {
+      const invocations: Invocation[] = [];
+      const malformed = receiver as Extract<InputReceiver, { kind: "remote" }>;
+      await assert.rejects(dispatchOpenTarget("https://example.org/?alias=conley-company", "/laptop", lifetime(), direct ? "unknown" : 802,
+        setup(invocations, {
+          topology: direct ? { ...remoteTopology, receiver: malformed } : tmuxTopology,
+          resolve: async () => malformed,
+          local: async () => assert.fail("malformed remote metadata must not launch locally"),
+        })), /已验证的 SSH 客户端地址无效/u);
+      assert.deepEqual(invocations, []);
+    }
+  }
+});
+
+test("reverse localhost keeps server backend, URL origin and PREPARED/COMMIT validation", async () => {
+  const invocations: Invocation[] = [];
+  const url = "https://localhost:8744/p?alias=conley-Y9000p";
+  await dispatchOpenTarget(url, "/laptop", lifetime(), 802, setup(invocations, {
+    resolve: async () => companyClient,
+    probeBackend: async (host) => host === "::1",
+    spawn: fakeSsh(invocations, (request) => {
+      assert.equal(request.action, "open-web");
+      return { status: 0, stdout: JSON.stringify({ ok: true, action: "open-web", openedUrl: request.url,
+        tunnel: { remoteHost: request.backendHost, remotePort: 8744, localPort: 8744, reused: false } }) + "\n" };
+    }),
+    local: async () => assert.fail("reverse loopback must not open on the server desktop"),
+  }));
+  assert.deepEqual(decoded(invocations), [{ version: 2, action: "open-web", url, backendHost: "::1" }]);
+  pinned(invocations[0]!, companyClient);
+  await assert.rejects(dispatchOpenTarget(url, "/laptop", lifetime(), 802, setup(invocations, {
+    resolve: async () => companyClient,
+    probeBackend: async (host) => host === "::1",
+    spawn: fakeSsh(invocations, () => ({ status: 0, stdout: JSON.stringify({ ok: true, action: "open-web", openedUrl: url,
+      tunnel: { remoteHost: "127.0.0.1", remotePort: 8744, localPort: 8744, reused: false } }) + "\n" })),
+  })), /网页\/隧道目标不匹配/u);
+  assert.equal(invocations[1]!.input.trimEnd().split("\n").length, 1, "wrong reverse PREPARED must not COMMIT");
 });
 
 test("unpaired or unknown direct input refuses with its holder diagnostic", async () => {
@@ -267,7 +348,7 @@ test("loopback success replies require the source host and exact original port",
     spawn: fakeSsh(invocations, () => ({ status: 0, stdout: JSON.stringify({
       ok: true, action: "open-web", openedUrl: source, tunnel: null,
     }) + "\n" })),
-  })), /缺少必需的公司回环隧道/u);
+  })), /缺少必需的服务器回环隧道/u);
   const explicitIp = "http://127.0.0.1/path";
   await assert.rejects(dispatchOpenTarget(explicitIp, "/work", lifetime(), 802, setup(invocations, {
     spawn: fakeSsh(invocations, () => ({ status: 0, stdout: JSON.stringify({
@@ -420,7 +501,7 @@ test("localhost PREPARED must attest selected backend, original hostname and exa
     spawn: fakeSsh(invocations, () => ({ status: 0, stdout: JSON.stringify({
       ok: true, action: "open-web", openedUrl: url, tunnel: null,
     }) + "\n" })),
-  })), /缺少必需的公司回环隧道/u);
+  })), /缺少必需的服务器回环隧道/u);
   assert.equal(invocations[0]!.input.trimEnd().split("\n").length, 1);
 });
 
@@ -464,29 +545,31 @@ test("external, explicit IP, file and local routes never consult localhost probe
   assert.deepEqual(calls, ["local"]);
 });
 
-test("verified peer is pinned into command-line SSH options despite post-resolution alias drift", async () => {
-  const invocations: Invocation[] = [];
-  let aliasNow = "192.0.2.64";
-  const dependencies = setup(invocations, { resolve: async () => {
-    aliasNow = "203.0.113.8"; // Equivalent to ssh_config changing after `ssh -G`.
-    return client;
-  } });
-  await dispatchOpenTarget("https://example.org/a", "/work", lifetime(), 802, dependencies);
-  assert.equal(aliasNow, "203.0.113.8");
-  pinned(invocations[0]!);
-  assert.deepEqual(decoded(invocations), [{ version: 2, action: "open-web", url: "https://example.org/a" }]);
-  // OpenSSH's actual config expansion must honor the verified endpoint even
-  // after a fixture alias changes host/user/port. No real host is contacted.
-  const root = mkdtempSync(join(tmpdir(), "pi-dispatcher-config-"));
-  try {
-    const config = join(root, "config");
-    writeFileSync(config, "Host conley-Y9000p\n HostName 203.0.113.8\n User changed\n Port 2200\n");
-    const effective = execFileSync("ssh", ["-G", "-F", config, ...invocations[0]!.args.slice(0, -1)],
-      { encoding: "utf8" });
-    assert.match(effective, /^hostname 192\.0\.2\.64$/mu);
-    assert.match(effective, /^user conley$/mu);
-    assert.match(effective, /^port 2222$/mu);
-  } finally { rmSync(root, { recursive: true, force: true }); }
+test("both aliases retain literal peer/user/port pinning in real OpenSSH after alias drift", async () => {
+  for (const receiver of [client, companyClient]) {
+    const invocations: Invocation[] = [];
+    let aliasNow = receiver.peer;
+    const dependencies = setup(invocations, { resolve: async () => {
+      aliasNow = "203.0.113.8"; // Equivalent to ssh_config changing after `ssh -G`.
+      return receiver;
+    } });
+    await dispatchOpenTarget("https://example.org/a", "/work", lifetime(), 802, dependencies);
+    assert.equal(aliasNow, "203.0.113.8");
+    pinned(invocations[0]!, receiver);
+    assert.deepEqual(decoded(invocations), [{ version: 2, action: "open-web", url: "https://example.org/a" }]);
+    // OpenSSH's actual config expansion must honor the verified endpoint even
+    // after a fixture alias changes host/user/port. No real host is contacted.
+    const root = mkdtempSync(join(tmpdir(), "pi-dispatcher-config-"));
+    try {
+      const config = join(root, "config");
+      writeFileSync(config, `Host ${receiver.alias}\n HostName 203.0.113.8\n User changed\n Port 2200\n`);
+      const effective = execFileSync("ssh", ["-G", "-F", config, ...invocations[0]!.args.slice(0, -1)],
+        { encoding: "utf8" });
+      assert.ok(effective.includes(`hostname ${receiver.peer}\n`));
+      assert.match(effective, /^user conley$/mu);
+      assert.ok(effective.includes(`port ${receiver.port}\n`));
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  }
 });
 
 test("company stat follows symlinks and transmits exact file/directory kind plus locations", async () => {
@@ -505,8 +588,34 @@ test("company stat follows symlinks and transmits exact file/directory kind plus
       { version: 2, action: "open-file", kind: "directory", path: folder },
       { version: 2, action: "open-file", kind: "file", path: link },
     ]);
-    invocations.forEach(pinned);
+    invocations.forEach((invocation) => pinned(invocation));
   } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("auto-discovered paths retain company validation and the pinned paired v2 file route", async () => {
+  for (const direct of [false, true]) {
+    const invocations: Invocation[] = [];
+    const stats: string[] = [];
+    const path = "reports/中文%#?.png";
+    const evidence = sourceLinkEvidence(`Open \`${path}\``);
+    const discovered = sourcePathMatches(evidence, "codespan", `\`${path}\``, path);
+    assert.equal(discovered.length, 1);
+    const dependencies = setup(invocations, {
+      ...(direct ? { topology: remoteTopology } : {}),
+      stat: async (companyPath) => {
+        stats.push(companyPath);
+        return { isFile: () => true, isDirectory: () => false };
+      },
+      local: async () => assert.fail("an automatic company path must never fall back to company GUI"),
+      probeBackend: async () => assert.fail("files do not use browser tunnel preparation"),
+    });
+    assert.deepEqual(stats, [], "source/native path discovery performs no filesystem IO");
+    await dispatchOpenTarget(discovered[0]!.href, "/company/click-cwd", lifetime(), direct ? "unknown" : 802, dependencies);
+    assert.deepEqual(stats, ["/company/click-cwd/reports/中文%#?.png"], "stat runs exactly once on company");
+    assert.deepEqual(decoded(invocations), [{ version: 2, action: "open-file", kind: "file",
+      path: "/company/click-cwd/reports/中文%#?.png" }]);
+    pinned(invocations[0]!);
+  }
 });
 
 test("missing, dangling, special, directory-with-line and colon goto cannot reach SSH", async (t) => {
@@ -539,12 +648,19 @@ test("SSH, helper, invalid reply, mismatched status/target all report errors wit
     ["bad tunnel", 0, '{"ok":true,"action":"open-web","openedUrl":"https://example.org/a","tunnel":{"remoteHost":"127.0.0.1","remotePort":80,"localPort":5,"reused":false}}\n', /隧道目标不匹配/u],
   ];
   let localCalls = 0;
-  for (const [label, status, stdout, pattern] of modes) {
-    const invocations: Invocation[] = [];
-    await assert.rejects(dispatchOpenTarget("https://example.org/a", "/work", lifetime(), 802,
-      setup(invocations, { local: async () => { localCalls++; },
-        spawn: fakeSsh(invocations, () => ({ status, stdout })) })), pattern, label);
-    assert.equal(invocations.length, 1, label);
+  for (const receiver of [client, companyClient]) {
+    for (const [label, status, stdout, pattern] of modes) {
+      const invocations: Invocation[] = [];
+      await assert.rejects(dispatchOpenTarget("https://example.org/a", "/work", lifetime(), 802,
+        setup(invocations, { resolve: async () => receiver, local: async () => { localCalls++; },
+          spawn: fakeSsh(invocations, () => ({ status, stdout })) })), (error: unknown) => {
+        assert.ok(error instanceof Error);
+        assert.match(error.message, pattern, label);
+        assert.doesNotMatch(error.message, /Y9000p|公司/u, "diagnostics must describe client/server roles in either direction");
+        return true;
+      });
+      assert.equal(invocations.length, 1, label);
+    }
   }
   assert.equal(localCalls, 0);
 });

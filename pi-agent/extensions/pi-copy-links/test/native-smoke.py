@@ -31,6 +31,7 @@ import time
 args = argparse.ArgumentParser(description=__doc__)
 args.add_argument('--artifacts', type=Path)
 args.add_argument('--regular-start', action='store_true', help='Enable fullscreen through the real /settings UI')
+args.add_argument('--path-boundaries', action='store_true', help='Add whole-filename/decoy and unprimed full-edge click controls')
 transport = args.add_mutually_exclusive_group()
 transport.add_argument('--osc52', action='store_true')
 transport.add_argument('--tmux', action='store_true')
@@ -98,12 +99,25 @@ url = 'https://example.com/copy-links?a=1&b=two#fragment'
 for name, content in [('model sample.3mf', '3mf'), ('diagram.svg', '<svg/>'), ('data.json', '{\n  "ok": true\n}')]:
     (root / name).write_text(content)
 (root / 'sample-dir').mkdir()
+(root / 'reports').mkdir()
+auto_filename = 'state43_real_grid_1080p.mp4'
+auto_relative = 'reports/中文%#?.png'
+(root / auto_filename).write_bytes(b'fixture mp4 path; no media player is launched')
+(root / auto_relative).write_bytes(b'fixture image path')
 text = ('Native copy test\n\n- ```make\n  ' + code.replace('\n', '\n  ') + '\n  ```\n\n'
         '[WEB_LINK](' + url + ')\n\n'
         '[MODEL_3MF](model%20sample.3mf)\n\n'
         '[DIAGRAM_SVG](diagram.svg)\n\n'
         '[DATA_JSON](data.json#L2)\n\n'
-        '[SAMPLE_DIR](sample-dir)')
+        '[SAMPLE_DIR](sample-dir)\n\n'
+        'AUTO_MP4 `' + auto_filename + '`\n'
+        'AUTO_PNG ' + auto_relative)
+if options.path_boundaries:
+    for name in ('reports/final(1).png', 'reports/final,1.png', 'reports/final', '.png', '1.png',
+                 'reports/final~~1~~.png', 'reports/final1.png', 'a~chart.png'):
+        (root / name).write_text(name)
+    text += ('\nPAREN ./reports/final(1).png PARTIAL ./reports/final~~1~~.png\nCOMMA ./reports/final,1.png'
+             '\n\na~chart.png\n\ncat ~~a~chart.png~~')
 now = '2026-01-01T00:00:00.000Z'
 usage = {k: 0 for k in ['input', 'output', 'cacheRead', 'cacheWrite', 'totalTokens']}
 usage['cost'] = {k: 0 for k in ['input', 'output', 'cacheRead', 'cacheWrite', 'total']}
@@ -194,7 +208,7 @@ pid, fd = pty.fork()
 if pid == 0:
     os.chdir(root)
     os.execvpe(cli[0], cli, env)
-fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack('HHHH', 30, 90, 0, 0))
+fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack('HHHH', 40 if options.path_boundaries else 30, 90, 0, 0))
 wire = bytearray()
 
 def drain(seconds=0.15):
@@ -288,7 +302,7 @@ try:
         refusal_body = '没有受支持的输入来源契'.encode()  # final diagnostic wraps before “约”
         wait_for(lambda: refusal_prefix in wire and refusal_body in wire,
                  'unattributed harness PTY refusal')
-        for label in ('MODEL_3MF', 'DIAGRAM_SVG', 'DATA_JSON', 'SAMPLE_DIR'):
+        for label in ('MODEL_3MF', 'DIAGRAM_SVG', 'DATA_JSON', 'SAMPLE_DIR', 'AUTO_MP4', 'AUTO_PNG'):
             click(target_by_label(after_copy, label), 16)
         drain(0.2)
         assert records('google-chrome-stable') == [] and records('code') == []
@@ -305,13 +319,52 @@ try:
             ('DIAGRAM_SVG', ['--new-window', '--', str(root / 'diagram.svg')]),
             ('DATA_JSON', ['--new-window', '--goto', '--', str(root / 'data.json') + ':2']),
             ('SAMPLE_DIR', ['--new-window', '--', str(root / 'sample-dir')]),
+            ('AUTO_MP4', ['--new-window', '--', str(root / auto_filename)]),
+            ('AUTO_PNG', ['--new-window', '--', str(root / auto_relative)]),
         ]
         for label, expected in local_expectations:
+            before_local_click = records('code')
+            click(target_by_label(after_copy, label))
+            assert records('code') == before_local_click, 'ordinary file click opened Code: ' + label
             click(target_by_label(after_copy, label), 16)
             wait_for(lambda: len(records('code')) >= local_expectations.index((label, expected)) + 1,
                      'Ctrl-click Code handoff ' + label)
             assert records('code')[-1] == {'argv': expected}
+    if options.path_boundaries and not options.osc52:
+        for label, name in [('PAREN', 'reports/final(1).png'), ('COMMA', 'reports/final,1.png')]:
+            current = snapshot('full-edge-' + label.lower())
+            point = target_by_label(current, label)
+            before = records('code')
+            offset = (root / 'input.raw').stat().st_size
+            # No ordinary priming: verify the real delivered Ctrl press and
+            # release as well as the exact existing intended file (decoys exist).
+            click(point, 16)
+            wait_for(lambda: len(records('code')) == len(before) + 1, 'unprimed full-edge ' + label)
+            received = (root / 'input.raw').read_bytes()[offset:]
+            for edge in ('M', 'm'):
+                expected_edge = f'\x1b[<16;{point["x"] + 1};{point["y"] + 1}{edge}'.encode()
+                assert expected_edge in received, (label, edge, received)
+            assert records('code')[-1] == {'argv': ['--new-window', '--', str(root / name)]}
+        for label, needle, operand_offset in [('partial', './reports/final1.png', 0), ('command', 'cat a~chart.png', 4)]:
+            current = snapshot('provenance-' + label)
+            rows = [(y, line.index(needle)) for y, line in enumerate(current['lines']) if needle in line]
+            assert len(rows) == 1, (label, rows)
+            y, x = rows[0]
+            before = records('code')
+            for column in (x + operand_offset, x + len(needle) - 1):
+                point = {'x': column, 'y': y}
+                offset = (root / 'input.raw').stat().st_size
+                click(point, 16)
+                received = (root / 'input.raw').read_bytes()[offset:]
+                for edge in ('M', 'm'):
+                    assert f'\x1b[<16;{column + 1};{y + 1}{edge}'.encode() in received
+            assert records('code') == before, 'unproven split/command opened a file: ' + label
     assert records('xdg-open') == [], 'forbidden xdg-open fallback ran'
+    path_target = target_by_label(after_copy, 'AUTO_MP4')
+    before_path_drag = records('code')
+    send(mouse_sequence(path_target, 16) + mouse_sequence(dict(path_target, x=path_target['x'] + 2), 48) +
+         mouse_sequence(path_target, 16, 'm'))
+    assert records('code') == before_path_drag, 'Ctrl-drag on automatic path opened Code'
     # Exercise tmux's lost-press modifier transition while dragging away and back.
     # Forwarded motion must prevent the release-recovery path from opening a URL.
     click(link)
@@ -346,11 +399,12 @@ try:
     restored = snapshot('reloaded')
     button_after_reload = target_by_label(restored, '[复制]')
     assert button_after_reload['url'] != button['url'], 'reload reused old action registry'
+    assert target_by_label(restored, 'AUTO_MP4')['url'] != path_target['url'], 'reload retained inferred path action'
     click(button_after_reload)
     wait_for(lambda: len(clipboard()) > len(before_reload), 'copy after /reload')
     assert clipboard() == before_reload + [code]
     button_copies.append(clipboard()[-1])
-    fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack('HHHH', 28, 42, 0, 0))
+    fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack('HHHH', 38 if options.path_boundaries else 28, 42, 0, 0))
     drain(0.3)
     narrow = snapshot('narrow')
     before_narrow = clipboard()
@@ -358,6 +412,21 @@ try:
     wait_for(lambda: len(clipboard()) > len(before_narrow), 'copy after narrow resize')
     assert clipboard() == before_narrow + [code]
     button_copies.append(clipboard()[-1])
+    # Copy feedback can recompose the frame. Use current cells, and the same
+    # inert ordinary / Ctrl sequence as above: tmux 3.4 can drop a modifier-
+    # transition press, whose existing recovery requires that exact prior cell.
+    narrow_after_copy = snapshot('narrow-after-copy')
+    for label, expected in [('DIAGRAM_SVG', str(root / 'diagram.svg')), ('AUTO_MP4', str(root / auto_filename))]:
+        point = target_by_label(narrow_after_copy, label)
+        before_narrow_click = records('code')
+        click(point)
+        assert records('code') == before_narrow_click, 'ordinary narrow file click opened Code'
+        click(point, 16)
+        if not options.osc52:
+            wait_for(lambda: len(records('code')) == len(before_narrow_click) + 1, 'narrow file click ' + label)
+            assert records('code')[-1] == {'argv': ['--new-window', '--', expected]}
+        else:
+            assert records('code') == []
     send('/fixture-quit\r')
     def stopped():
         global exited
@@ -375,6 +444,7 @@ try:
     result = {'result': 'passed', 'transport': 'OSC52' if options.osc52 else 'tmux → wl-copy stdin' if options.tmux else 'wl-copy stdin',
               'regularToFullscreen': options.regular_start,
               'buttonCopies': button_copies, 'clipboardWrites': clipboard(), 'nativeSelection': native_selection,
+              'automaticPaths': [auto_filename, auto_relative], 'pathBoundaries': options.path_boundaries,
               'browser': records('google-chrome-stable'), 'code': records('code'),
               'browserDetection': records('xdg-settings'), 'forbiddenXdgOpen': records('xdg-open'),
               'scratch': str(root)}

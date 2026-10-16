@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Y9000p-side, one-request JSON link opener. No Pi/server-side routing here."""
+"""Paired-desktop, one-request JSON link opener. No Pi/server-side routing here."""
 
 import errno
 import fcntl
@@ -21,8 +21,6 @@ import time
 from urllib.parse import quote, urlsplit
 
 
-SSH_ALIAS = "conley-company"
-REMOTE_CODE = "ssh-remote+conley-company"
 MAX_INPUT = 65536
 MAX_PREPARE_MS = 45000
 MAX_INVENTORY_OUTPUT = 1024 * 1024
@@ -58,6 +56,16 @@ class LinkError(Exception):
 
 def fail(code, message):
     raise LinkError(code, message)
+
+
+def paired_server():
+    hostname = socket.gethostname()
+    alias = {"conley-company": "conley-Y9000p",
+             "conley-y9000p": "conley-company"}.get(hostname.lower())
+    if alias is None:
+        fail("unsupported_host", f"no paired server for helper hostname {hostname!r}; "
+                                 "expected conley-company or conley-Y9000P")
+    return alias
 
 
 def live_group_members(group):
@@ -283,7 +291,7 @@ def web_target(raw):
         fail("unsupported_target", "URL port must be a nonempty, nonzero number")
     # Browsers apply IDNA and nonstandard IPv4 number rules before connecting.
     # Only plain ASCII DNS syntax is permitted outside explicit IP/localhost forms;
-    # otherwise a laptop-local listener could be opened as an 'external' URL.
+    # otherwise a desktop-local listener could be opened as an 'external' URL.
     if not host.isascii() or host.endswith(".."):
         fail("unsupported_target", "browser-normalized host spelling is unsupported")
     canonical_host = host.lower().removesuffix(".")
@@ -379,8 +387,8 @@ def private_state(runtime):
         fail("invalid_state", f"cannot create private runtime state: {error}")
 
 
-def ssh_identity():
-    text = checked(["ssh", "-G", SSH_ALIAS], "ssh_config_failed", timeout=8,
+def ssh_identity(server_alias):
+    text = checked(["ssh", "-G", server_alias], "ssh_config_failed", timeout=8,
                    output_limit=MAX_INVENTORY_OUTPUT)
     # A DNS name or repeated field cannot be compared to the exact endpoint of
     # the later master; do not silently resolve or pick an arbitrary ssh-G value.
@@ -553,7 +561,7 @@ def forward_spec(bind_host, local_port, remote_host, remote_port):
 
 def port_conflict(bind_host, port):
     authority = f"[{bind_host}]" if ":" in bind_host else bind_host
-    fail("port_conflict", f"Y9000p loopback port {authority}:{port} cannot be owned on both "
+    fail("port_conflict", f"desktop loopback port {authority}:{port} cannot be owned on both "
                           "127.0.0.1 and [::1]; remove the conflicting listener and retry the original URL")
 
 
@@ -578,7 +586,7 @@ def cannot_bind(bind_host, port):
     return port < 1024 and not all(can_bind_preferred(host, port) for host in bind_hosts(bind_host))
 
 
-def owned_forward(directory, bind_host, remote_port, backend_host, identity):
+def owned_forward(directory, bind_host, remote_port, backend_host, identity, server_alias):
     endpoint = {"host": bind_host, "port": remote_port, "backendHost": backend_host}
     path = record_path(directory, bind_host, remote_port)
     data = load_record(path, directory, endpoint, identity)
@@ -600,7 +608,7 @@ def owned_forward(directory, bind_host, remote_port, backend_host, identity):
              "-o", "BatchMode=yes", "-o", "ExitOnForwardFailure=yes", "-o", "ConnectTimeout=8",
              "-o", "StrictHostKeyChecking=yes", "-o", f"HostName={identity['host']}",
              "-o", f"User={identity['user']}", "-o", f"Port={identity['port']}",
-             SSH_ALIAS], "ssh_master_failed", timeout=12)
+             server_alias], "ssh_master_failed", timeout=12)
     try:
         pid = master_pid(sock, identity)
         if pid is None:
@@ -641,7 +649,7 @@ def owned_forward(directory, bind_host, remote_port, backend_host, identity):
         raise
 
 
-def prepare_web(data, runtime, peer, deadline):
+def prepare_web(data, runtime, peer, deadline, server_alias):
     raw = data["url"]
     _, bind_host, remote_port = web_target(raw)
     ticket = None
@@ -659,8 +667,8 @@ def prepare_web(data, runtime, peer, deadline):
                 except BlockingIOError:
                     time.sleep(min(0.05, max(0, deadline - time.monotonic())))
             peer.alive(deadline)
-            identity = ssh_identity()
-            reused, pid = owned_forward(directory, bind_host, remote_port, backend_host, identity)
+            identity = ssh_identity(server_alias)
+            reused, pid = owned_forward(directory, bind_host, remote_port, backend_host, identity, server_alias)
             ticket = (directory, bind_host, remote_port, backend_host, identity, pid)
         finally:
             os.close(lock_fd)
@@ -672,23 +680,24 @@ def prepare_web(data, runtime, peer, deadline):
 def file_target(data):
     path = data["path"]
     if not 0 < len(path) <= 4096 or "\0" in path or not PurePosixPath(path).is_absolute():
-        fail("unsupported_target", "company path must be a nonempty absolute POSIX path")
+        fail("unsupported_target", "server path must be a nonempty absolute POSIX path")
     if "line" in data and ":" in path:
         fail("unsupported_target", "Code goto cannot preserve a colon-containing filename")
 
 
-def file_command(data):
+def file_command(data, server_alias):
     path = data["path"]
     # VS Code cannot stat a remote positional path and guesses by its basename.
-    # The company-side kind selects its typed resource resolver instead.
+    # The server-side kind selects its typed resource resolver instead.
     target = quote(path, safe="/")
-    args = ["code", "--remote", REMOTE_CODE, "--new-window"]
+    remote_code = "ssh-remote+" + server_alias
+    args = ["code", "--remote", remote_code, "--new-window"]
     if "line" in data:
         args.append("--goto")
         target += f":{data['line']}"
         if "column" in data:
             target += f":{data['column']}"
-    uri = f"vscode-remote://{REMOTE_CODE}{target}"
+    uri = f"vscode-remote://{remote_code}{target}"
     args.extend(["--file-uri" if data["kind"] == "file" else "--folder-uri", uri])
     return args, {"ok": True, "action": "open-file", "path": path, "kind": data["kind"]}
 
@@ -704,13 +713,14 @@ def main():
         # Validate the exact target before touching GUI or transport state.
         if data["action"] == "open-file":
             file_target(data)
+        server_alias = paired_server()
         peer.alive(deadline)
         gui, runtime = gui_environment()
         peer.alive(deadline)
         browser = browser_command(gui) if data["action"] == "open-web" else None
         peer.alive(deadline)
-        response, ticket = (prepare_web(data, runtime, peer, deadline) if data["action"] == "open-web"
-                            else (file_command(data)[1], None))
+        response, ticket = (prepare_web(data, runtime, peer, deadline, server_alias) if data["action"] == "open-web"
+                            else (file_command(data, server_alias)[1], None))
         peer.alive(deadline)
         if ticket is not None:
             verified_record(*ticket)
@@ -722,7 +732,7 @@ def main():
                 type(commit["version"]) is not int or commit["version"] != 2 or
                 commit["phase"] != "commit" or commit["nonce"] != nonce):
             fail("invalid_commit", "expected the matching version 2 COMMIT")
-        # This check is the handoff boundary: once accepted, a later company-side
+        # This check is the handoff boundary: once accepted, a later server-side
         # timeout may not revoke the desktop request. Do not launch on buffered
         # duplicate messages or an already disconnected transport.
         peer.alive(deadline)
@@ -732,7 +742,7 @@ def main():
             peer.alive(deadline)
             launch_browser([*browser, response["openedUrl"]], env=gui)
         else:
-            checked(file_command(data)[0], "code_failed", env=gui, timeout=12)
+            checked(file_command(data, server_alias)[0], "code_failed", env=gui, timeout=12)
         status = 0
     except LinkError as error:
         response, status = {"ok": False, "error": {"code": error.code, "message": str(error)}}, 1

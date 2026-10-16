@@ -2,14 +2,15 @@ import { execFile } from "node:child_process";
 import { readdir, readFile, readlink, stat as fsStat } from "node:fs/promises";
 import { basename } from "node:path";
 import { isIP } from "node:net";
+import { hostname as osHostname } from "node:os";
 import { promisify } from "node:util";
 import type { OpenOrigin } from "./adapter.ts";
+import { pairedSshAlias, type PairedSshAlias } from "./pairing.ts";
 
 const exec = promisify(execFile);
 const CLIENT_FORMAT = "pid=#{client_pid}|tty=#{client_tty}|session=#{session_id}|flags=#{client_flags}";
 const VIEW_FORMAT = "pid=#{client_pid}|tty=#{client_tty}|session=#{session_id}|pane=#{pane_id}";
 const PANE_TTY_FORMAT = "#{pane_tty}";
-const REMOTE_ALIAS = "conley-Y9000p";
 const REMOTE_USER = "conley";
 const MAX_RELAY_DEPTH = 4;
 const DEFAULT_SCAN_TIMEOUT_MS = 750;
@@ -24,6 +25,7 @@ const UNVERIFIED_EMULATORS = new Set([
 
 export type InputReceiver = "local" | Readonly<{
   kind: "remote";
+  alias: PairedSshAlias;
   peer: string;
   port: number;
   user: "conley";
@@ -46,6 +48,8 @@ export class ReceiverResolutionError extends Error {
 export interface ReceiverRunResult { code: number; stdout: string; stderr: string }
 export interface ReceiverDependencies {
   env?: NodeJS.ProcessEnv;
+  /** Actual OS hostname; injectable for tests, never read from inherited env. */
+  hostname?: () => string;
   run?: (program: string, args: readonly string[]) => Promise<ReceiverRunResult>;
   readProc?: (path: string) => Promise<Buffer>;
   readDir?: (path: string) => Promise<readonly string[]>;
@@ -272,7 +276,7 @@ async function sshConnection(pid: number, readProc: NonNullable<ReceiverDependen
   return { peer: literalIp(fields[0]!)!, serverPort: port(fields[3]!)! };
 }
 
-function sshAlias(output: string): { hostname: string; port: number } {
+function sshAlias(output: string, alias: PairedSshAlias): { hostname: string; port: number } {
   const properties = new Map<string, string[]>();
   for (const line of output.split("\n")) {
     const match = /^(hostname|user|port)\s+(\S+)\s*$/iu.exec(line);
@@ -282,7 +286,7 @@ function sshAlias(output: string): { hostname: string; port: number } {
   const hostname = host?.length === 1 && literalIp(host[0]!);
   const remotePort = ports?.length === 1 && port(ports[0]!);
   if (!hostname || !remotePort || user?.length !== 1 || user[0] !== REMOTE_USER) {
-    reject("ssh-alias-invalid", `${REMOTE_ALIAS} must resolve to one literal IP, port and expected user`);
+    reject("ssh-alias-invalid", `${alias} must resolve to one literal IP, port and expected user`);
   }
   return { hostname, port: remotePort };
 }
@@ -290,6 +294,7 @@ function sshAlias(output: string): { hostname: string; port: number } {
 interface UnixSocketEntry { readonly path: string; readonly peerInode: string }
 interface ProcAccess {
   env: NodeJS.ProcessEnv;
+  hostname: () => string;
   run: NonNullable<ReceiverDependencies["run"]>;
   readProc: NonNullable<ReceiverDependencies["readProc"]>;
   readDir: NonNullable<ReceiverDependencies["readDir"]>;
@@ -303,6 +308,7 @@ function access(dependencies: ReceiverDependencies): ProcAccess {
   const configured = dependencies.scanTimeoutMs;
   return {
     env: dependencies.env ?? process.env,
+    hostname: dependencies.hostname ?? osHostname,
     run: dependencies.run ?? runDefault,
     readProc: dependencies.readProc ?? readFile,
     readDir: dependencies.readDir ?? (async (path) => readdir(path)),
@@ -672,8 +678,8 @@ export function sameInputTopology(a: InputTopology, b: InputTopology): boolean {
       !a.hops.every((hop, index) => identitiesEqual(hop, b.hops[index]!))) return false;
   if (a.kind === "local" && b.kind === "local") return a.basis === b.basis;
   if (a.kind === "remote" && b.kind === "remote") {
-    return a.receiver.peer === b.receiver.peer && a.receiver.port === b.receiver.port &&
-      a.receiver.user === b.receiver.user;
+    return a.receiver.alias === b.receiver.alias && a.receiver.peer === b.receiver.peer &&
+      a.receiver.port === b.receiver.port && a.receiver.user === b.receiver.user;
   }
   if (a.kind === "tmux" && b.kind === "tmux") {
     return a.socket === b.socket && a.pane === b.pane && a.inputTty === b.inputTty;
@@ -724,18 +730,24 @@ async function inspectInput(
   if (proof.proof === "sshd") {
     const sshHop = withRole(hop, "sshd");
     try {
+      const actualHostname = accessor.hostname();
+      const selectedAlias = pairedSshAlias(actualHostname);
+      if (!selectedAlias) {
+        return unknown(`本机 ${holderName(actualHostname)} 没有配对 SSH 策略，已拒绝远程客户端`, [sshHop]);
+      }
       const connection = await sshConnection(leader.pid, accessor.readProc);
-      const alias = sshAlias(await command(accessor.run, "ssh", ["-G", REMOTE_ALIAS], "ssh -G"));
+      const alias = sshAlias(await command(accessor.run, "ssh", ["-G", selectedAlias], "ssh -G"), selectedAlias);
       if (connection.peer !== alias.hostname || connection.serverPort !== alias.port) {
-        return unknown(`输入持有者 ${holderName(holder.comm)} 的 SSH 对端不是 ${REMOTE_ALIAS}`, [sshHop]);
+        return unknown(`输入持有者 ${holderName(holder.comm)} 的 SSH 对端不是 ${selectedAlias}`, [sshHop]);
       }
       return Object.freeze({
         kind: "remote",
-        receiver: Object.freeze({ kind: "remote", peer: alias.hostname, port: alias.port, user: REMOTE_USER }),
+        receiver: Object.freeze({ kind: "remote", alias: selectedAlias,
+          peer: alias.hostname, port: alias.port, user: REMOTE_USER }),
         hops: Object.freeze([sshHop]),
       });
     } catch {
-      return unknown(`输入持有者 ${holderName(holder.comm)} 的 SSH 对端无法验证为 ${REMOTE_ALIAS}`, [sshHop]);
+      return unknown(`输入持有者 ${holderName(holder.comm)} 的 SSH 对端无法验证为配对客户端`, [sshHop]);
     }
   }
 

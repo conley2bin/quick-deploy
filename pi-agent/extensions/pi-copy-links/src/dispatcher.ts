@@ -9,8 +9,8 @@ import {
   resolveInputReceiver, resolveInputTopology, revalidateInputTopology,
   type InputReceiver, type InputTopology,
 } from "./receiver.ts";
+import { isPairedSshAlias } from "./pairing.ts";
 
-const REMOTE_ALIAS = "conley-Y9000p";
 const HELPER = "~/.local/bin/pi-client-link-helper";
 const MAX_REQUEST = 65_536;
 const MAX_REPLY = 65_536;
@@ -23,7 +23,7 @@ const BACKEND_DEADLINE_MS = 1_500;
 type BackendHost = "127.0.0.1" | "::1";
 type WebRequest = Readonly<{
   version: 2; action: "open-web"; url: string;
-  // Only localhost URLs carry the separately selected company TCP destination.
+  // Only localhost URLs carry the separately selected server TCP destination.
   backendHost?: BackendHost;
 }>;
 type FileRequest = Readonly<{
@@ -96,13 +96,13 @@ function probeTcpBackend(host: BackendHost, port: number, signal: AbortSignal): 
       if (result instanceof Error) reject(result);
       else resolve(result);
     };
-    const onAbort = () => finish(new Error("公司 localhost TCP 探测已中止"));
+    const onAbort = () => finish(new Error("服务器 localhost TCP 探测已中止"));
     socket.once("connect", () => finish(true));
     // Keep an error listener through destroy: an already queued socket error
     // must not become an unhandled exception after a timeout or abort.
     socket.on("error", (error: NodeJS.ErrnoException) => {
       if (["ECONNREFUSED", "EHOSTUNREACH", "ENETUNREACH", "EADDRNOTAVAIL"].includes(error.code ?? "")) finish(false);
-      else finish(new Error(`公司 localhost ${host}:${port} TCP 探测失败：${error.message}`));
+      else finish(new Error(`服务器 localhost ${host}:${port} TCP 探测失败：${error.message}`));
     });
     signal.addEventListener("abort", onAbort, { once: true });
     if (signal.aborted) { onAbort(); return; }
@@ -116,14 +116,14 @@ async function selectLocalhostBackend(
 ): Promise<BackendHost> {
   ensureCurrent(lifetime);
   const timeoutMs = dependencies.backendTimeoutMs ?? BACKEND_DEADLINE_MS;
-  if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0) throw new Error("公司 localhost 探测超时设置无效");
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0) throw new Error("服务器 localhost 探测超时设置无效");
   const controller = new AbortController();
   let interrupt!: (error: Error) => void;
   const interrupted = new Promise<never>((_resolve, reject) => { interrupt = reject; });
   const onAbort = () => { interrupt(new Error("打开动作已失效")); controller.abort(); };
   lifetime.signal.addEventListener("abort", onAbort, { once: true });
   const timer = setTimeout(() => {
-    interrupt(new Error(`公司 localhost TCP/DNS 探测超时（${timeoutMs} ms）`));
+    interrupt(new Error(`服务器 localhost TCP/DNS 探测超时（${timeoutMs} ms）`));
     controller.abort();
   }, timeoutMs);
   try {
@@ -131,23 +131,23 @@ async function selectLocalhostBackend(
     const choose = async (): Promise<BackendHost> => {
       const probe = dependencies.probeBackend ?? probeTcpBackend;
       // Probe numeric addresses concurrently; localhost resolution must not
-      // prevent detecting an IPv6-only service on this company machine.
+      // prevent detecting an IPv6-only service on this server.
       const [v4, v6] = await Promise.all([
         probe("127.0.0.1", port, controller.signal), probe("::1", port, controller.signal),
       ]);
-      if (typeof v4 !== "boolean" || typeof v6 !== "boolean") throw new Error("公司 localhost TCP 探测返回无效结果");
+      if (typeof v4 !== "boolean" || typeof v6 !== "boolean") throw new Error("服务器 localhost TCP 探测返回无效结果");
       if (v4 && !v6) return "127.0.0.1";
       if (v6 && !v4) return "::1";
-      if (!v4) throw new Error(`公司 localhost:${port} 的 127.0.0.1 和 ::1 均无 TCP 服务`);
+      if (!v4) throw new Error(`服务器 localhost:${port} 的 127.0.0.1 和 ::1 均无 TCP 服务`);
       const addresses = await (dependencies.lookupLocalhost ??
         (() => lookup("localhost", { all: true, order: "verbatim" })))(controller.signal);
-      // Use the company OS resolver's order, never the Y9000p resolver's.
+      // Use this server's OS resolver order, never the desktop client's.
       // Only a literal address we have actually probed is a usable match.
       for (const entry of addresses) {
         if (entry.family === 4 && entry.address === "127.0.0.1") return "127.0.0.1";
         if (entry.family === 6 && entry.address === "::1") return "::1";
       }
-      throw new Error("公司 localhost DNS 未返回已验证的 127.0.0.1 或 ::1 地址");
+      throw new Error("服务器 localhost DNS 未返回已验证的 127.0.0.1 或 ::1 地址");
     };
     const selected = await Promise.race([choose(), interrupted]);
     ensureCurrent(lifetime);
@@ -160,7 +160,7 @@ async function selectLocalhostBackend(
 }
 
 function sshArguments(receiver: RemoteReceiver): string[] {
-  if (typeof receiver.peer !== "string" || !isIP(receiver.peer) ||
+  if (!isPairedSshAlias(receiver.alias) || typeof receiver.peer !== "string" || !isIP(receiver.peer) ||
       !validPort(receiver.port) || receiver.user !== "conley") {
     throw new Error("已验证的 SSH 客户端地址无效");
   }
@@ -170,7 +170,7 @@ function sshArguments(receiver: RemoteReceiver): string[] {
   return ["-T", "-o", "BatchMode=yes", "-o", "ClearAllForwardings=yes",
     "-o", "StrictHostKeyChecking=yes", "-o", "ConnectTimeout=8",
     "-o", `HostName=${receiver.peer}`, "-o", `Port=${receiver.port}`,
-    "-o", `User=${receiver.user}`, REMOTE_ALIAS, HELPER];
+    "-o", `User=${receiver.user}`, receiver.alias, HELPER];
 }
 
 function signalGroup(child: ChildProcess, signal: NodeJS.Signals): void {
@@ -300,7 +300,7 @@ function verifyReply(code: number | null, reply: unknown, request: HelperRequest
                      prepared: Record<string, unknown> | undefined): void {
   if (!record(reply)) {
     if (code === 255) throw new Error("客户端 SSH 连接或认证失败（退出码 255）");
-    if (code === 127) throw new Error("Y9000p 客户端助手未安装或不可执行（退出码 127）");
+    if (code === 127) throw new Error("客户端助手未安装或不可执行（退出码 127）");
     if (code !== 0) throw new Error(`客户端 SSH/助手退出码 ${String(code)}，且没有有效 JSON 回复`);
     throw new Error("客户端助手返回无效 JSON 协议回复");
   }
@@ -311,7 +311,7 @@ function verifyReply(code: number | null, reply: unknown, request: HelperRequest
         typeof reply.error.code === "string" && /^[a-z][a-z0-9_]{0,63}$/u.test(reply.error.code) &&
         typeof reply.error.message === "string" && reply.error.message.length <= 1024 &&
         !/[\x00-\x1f\x7f]/u.test(reply.error.message)) {
-      throw new Error(`Y9000p 助手 ${reply.error.code}：${reply.error.message}`);
+      throw new Error(`客户端助手 ${reply.error.code}：${reply.error.message}`);
     }
     throw new Error("客户端助手返回无效 JSON 协议回复（退出状态与错误结构不匹配）");
   }
@@ -351,7 +351,7 @@ function verifySuccess(reply: Record<string, unknown>, request: HelperRequest,
     throw new Error("客户端助手请求的 localhost 后端与源主机不匹配");
   }
   if (reply.tunnel === null) {
-    if (bindHost) throw new Error("客户端助手返回无效 JSON 协议回复（缺少必需的公司回环隧道）");
+    if (bindHost) throw new Error("客户端助手返回无效 JSON 协议回复（缺少必需的服务器回环隧道）");
     if (reply.openedUrl !== request.url) throw new Error("客户端助手返回无效 JSON 协议回复（网页目标不匹配）");
     return;
   }

@@ -8,11 +8,16 @@ import {
   ReceiverResolutionError, resolveInputReceiver, resolveInputTopology, revalidateInputTopology,
   sameInputTopology, type InputTopology, type ReceiverDependencies, type ReceiverRunResult,
 } from "../src/receiver.ts";
+import type { PairedSshAlias } from "../src/pairing.ts";
 
 const socket = "/fixture/socket,with-comma";
 const tmuxEnv = { TMUX: `${socket},123,0`, TMUX_PANE: "%64" };
 const alias = "hostname 100.123.34.64\nuser conley\nport 22\n";
 const connection = "100.123.34.64 49301 100.125.138.103 22";
+const roles = [
+  { hostname: "conley-company", alias: "conley-Y9000p", peer: "100.123.34.64", server: "100.125.138.103" },
+  { hostname: "conley-Y9000P", alias: "conley-company", peer: "100.125.138.103", server: "100.123.34.64" },
+] as const;
 
 type FakeProcess = {
   pid: number;
@@ -66,6 +71,8 @@ class Fixture {
   readonly dirPaths: string[] = [];
   readonly pathStats = new Map<string, { dev: bigint; ino: bigint }>();
   env: NodeJS.ProcessEnv = {};
+  hostname = "conley-company";
+  expectedAlias: PairedSshAlias = "conley-Y9000p";
   sshConfig = alias;
   paneTty = "/dev/pts/12";
   ssRows: string[] = [];
@@ -120,6 +127,7 @@ class Fixture {
   dependencies(extras: Partial<ReceiverDependencies> = {}): ReceiverDependencies {
     const base: ReceiverDependencies = {
       env: this.env,
+      hostname: () => this.hostname,
       run: async (program, args) => {
         this.calls.push({ program, args });
         const failure = this.fail?.(program, args);
@@ -130,7 +138,7 @@ class Fixture {
           return { code: 0, stdout: this.ssRows.join("\n") + (this.ssRows.length ? "\n" : ""), stderr: "" };
         }
         if (program === "ssh") {
-          assert.deepEqual(args, ["-G", "conley-Y9000p"]);
+          assert.deepEqual(args, ["-G", this.expectedAlias]);
           return { code: 0, stdout: this.sshConfig, stderr: "" };
         }
         assert.equal(program, "tmux");
@@ -318,6 +326,27 @@ function tmuxClient(holder: "ssh" | "display" | "tmux"): Fixture {
   return f;
 }
 
+function useRole(f: Fixture, role: typeof roles[number]): void {
+  f.hostname = role.hostname;
+  f.expectedAlias = role.alias;
+  f.sshConfig = `hostname ${role.peer}\nuser conley\nport 22\n`;
+  for (const process of f.processes.values()) {
+    if (process.env.SSH_CONNECTION) process.env.SSH_CONNECTION = `${role.peer} 49301 ${role.server} 22`;
+  }
+}
+
+function codoxearTmuxClient(): Fixture {
+  const f = tmuxClient("ssh");
+  Object.assign(f.processes.get(6000)!, {
+    ppid: 5100, sid: 6000, pgrp: 6000, tpgid: 6000, fd0: "/dev/pts/21", ttyNr: ptsDevice(21),
+  });
+  f.clients[0]!.tty = "/dev/pts/21";
+  const broker = f.add({ pid: 5100, ppid: 4100, sid: 4100, comm: "codoxear-broker", fd0: "/dev/pts/20",
+    exe: "/usr/bin/python3.12", argv: ["/fixture/venv/bin/python", "/fixture/venv/bin/codoxear-broker", "--"] });
+  f.master(broker, 21);
+  return f;
+}
+
 function assertUnknown(topology: InputTopology, pattern: RegExp): void {
   assert.equal(topology.kind, "unknown");
   if (topology.kind === "unknown") assert.match(topology.diagnostic, pattern);
@@ -393,7 +422,7 @@ test("direct sshd-held PTY resolves the paired receiver and accepts sshd-session
   const f = directSsh();
   const route = await resolveInputTopology(5000, f.dependencies());
   assert.deepEqual(route.kind === "remote" ? route.receiver : route,
-    { kind: "remote", peer: "100.123.34.64", port: 22, user: "conley" });
+    { kind: "remote", alias: "conley-Y9000p", peer: "100.123.34.64", port: 22, user: "conley" });
   assert.equal(route.hops[0]?.proof, "sshd");
   assert.ok(f.procPaths.includes("/proc/4001/environ"));
 
@@ -408,7 +437,106 @@ test("direct sshd-held PTY resolves the paired receiver and accepts sshd-session
   ipv6.processes.get(4001)!.env.SSH_CONNECTION = "2001:db8::64 49301 2001:db8::10 2222";
   const ipv6Route = await resolveInputTopology(5000, ipv6.dependencies());
   assert.deepEqual(ipv6Route.kind === "remote" ? ipv6Route.receiver : ipv6Route,
-    { kind: "remote", peer: "2001:db8::64", port: 2222, user: "conley" });
+    { kind: "remote", alias: "conley-Y9000p", peer: "2001:db8::64", port: 2222, user: "conley" });
+});
+
+for (const role of roles) {
+  test(`${role.hostname}: OS hostname case selects the opposite literal alias and immutable peer`, async () => {
+    for (const actualHostname of [role.hostname, role.hostname.toUpperCase(), role.hostname.toLowerCase()]) {
+      const f = directSsh();
+      useRole(f, role);
+      f.hostname = actualHostname;
+      f.env = { HOSTNAME: "forged-host", SSH_CONNECTION: "stale", DISPLAY: "localhost:10.0" };
+      const route = await resolveInputTopology(5000, f.dependencies());
+      assert.equal(route.kind, "remote");
+      if (route.kind !== "remote") assert.fail("verified paired sshd must resolve");
+      assert.deepEqual(route.receiver, { kind: "remote", alias: role.alias,
+        peer: role.peer, port: 22, user: "conley" });
+      assert.deepEqual(f.calls.filter(({ program }) => program === "ssh"),
+        [{ program: "ssh", args: ["-G", role.alias] }]);
+      assert.ok(Object.isFrozen(route));
+      assert.ok(Object.isFrozen(route.receiver));
+      assert.equal(Reflect.set(route.receiver, "alias", "untrusted-alias"), false);
+      assert.equal(Reflect.set(route.receiver, "peer", "192.0.2.1"), false);
+      assert.equal(sameInputTopology(route, { ...route, receiver: {
+        ...route.receiver, alias: role.alias === "conley-company" ? "conley-Y9000p" : "conley-company",
+      } }), false, "the admitted alias is part of the frozen route identity");
+      const calls = f.calls.length;
+      assert.equal(await revalidateInputTopology(5000, route, f.dependencies()), true);
+      assert.equal(f.calls.length, calls, "cached revalidation must not rerun ssh/ss/tmux");
+      f.processes.get(3001)!.starttime = "999999";
+      assert.equal(await revalidateInputTopology(5000, route, f.dependencies()), false);
+    }
+  });
+
+  test(`${role.hostname}: script/Codoxear and tagged direct/Codoxear clients retain host and origin proof`, async () => {
+    for (const relayName of ["script", "codoxear-broker"]) {
+      const f = relay("ssh", relayName);
+      useRole(f, role);
+      const route = await resolveInputTopology(5000, f.dependencies());
+      assert.equal(route.kind, "remote");
+      assert.deepEqual(route.kind === "remote" ? route.receiver : route,
+        { kind: "remote", alias: role.alias, peer: role.peer, port: 22, user: "conley" });
+      assert.deepEqual(route.hops.map((hop) => hop.role), ["relay", "sshd"]);
+      assert.equal(await revalidateInputTopology(5000, route, f.dependencies()), true);
+      f.processes.get(3001)!.imageIno += 1n;
+      assert.equal(await revalidateInputTopology(5000, route, f.dependencies()), false);
+    }
+    for (const f of [tmuxClient("ssh"), codoxearTmuxClient()]) {
+      useRole(f, role);
+      const receiver = await resolveInputReceiver(6000, f.dependencies());
+      assert.deepEqual(receiver, { kind: "remote", alias: role.alias, peer: role.peer, port: 22, user: "conley" });
+      assert.ok(Object.isFrozen(receiver));
+      f.clients[0]!.pane = "%57";
+      await receiverFails(f, 6000, "pane-mismatch");
+    }
+  });
+
+  test(`${role.hostname}: wrong peer, literal address, user or port refuses direct and tagged SSH`, async () => {
+    const invalid: Array<(f: Fixture, leader: FakeProcess) => void> = [
+      (_f, leader) => { leader.env.SSH_CONNECTION = `192.0.2.99 49301 ${role.server} 22`; },
+      (_f, leader) => { leader.env.SSH_CONNECTION = `${role.peer} 49301 ${role.server} 2222`; },
+      (f) => { f.sshConfig = `hostname ${role.alias}\nuser conley\nport 22\n`; },
+      (f) => { f.sshConfig = `hostname ${role.peer}\nuser other\nport 22\n`; },
+      (f) => { f.sshConfig = `hostname ${role.peer}\nuser conley\nport 2222\n`; },
+      (f) => { f.sshConfig = `hostname 192.0.2.99\nuser conley\nport 22\n`; },
+      (f) => { f.sshConfig = `hostname ${role.peer}\nuser conley\nport 0\n`; },
+    ];
+    for (const invalidate of invalid) {
+      const direct = directSsh();
+      useRole(direct, role);
+      invalidate(direct, direct.processes.get(4001)!);
+      assertUnknown(await resolveInputTopology(5000, direct.dependencies()), /SSH 对端/u);
+      const tagged = codoxearTmuxClient();
+      useRole(tagged, role);
+      invalidate(tagged, tagged.processes.get(4100)!);
+      await receiverFails(tagged, 6000, "input-unattributed");
+    }
+  });
+}
+
+test("unknown OS host visibly refuses direct/relayed/tagged SSH despite inherited paired-host hints", async () => {
+  for (const f of [directSsh(), relay("ssh", "codoxear-broker")]) {
+    f.hostname = "fixture-unpaired";
+    f.env = { HOSTNAME: "conley-company", SSH_CONNECTION: connection, DISPLAY: ":0" };
+    assertUnknown(await resolveInputTopology(5000, f.dependencies()), /fixture-unpaired.*没有配对 SSH 策略/u);
+    assert.ok(f.calls.every(({ program }) => program !== "ssh"), "no guessed peer may be expanded");
+  }
+  const tagged = codoxearTmuxClient();
+  tagged.hostname = "fixture-unpaired";
+  tagged.env = { ...tmuxEnv, HOSTNAME: "conley-Y9000P", SSH_CONNECTION: connection, DISPLAY: ":0" };
+  await receiverFails(tagged, 6000, "input-unattributed");
+  assert.ok(tagged.calls.every(({ program }) => program !== "ssh"));
+});
+
+test("proven Ghostty stays local without a pair profile, including tagged clients", async () => {
+  const direct = localDisplay(true);
+  direct.hostname = "fixture-unpaired";
+  assert.equal((await resolveInputTopology(5000, direct.dependencies())).kind, "local");
+  const tagged = tmuxClient("display");
+  assert.equal(await resolveInputReceiver(6000, tagged.dependencies({
+    hostname: () => { throw new Error("local input must not consult paired SSH policy"); },
+  })), "local");
 });
 
 test("unpaired peer and malformed SSH environment/config stay unknown without leaking values", async () => {
@@ -521,7 +649,7 @@ test("identity-bound script/Codoxear relays unwrap to SSH, display, and tmux", a
   assert.deepEqual(multiplexed.hops.map((hop) => hop.holder.comm), ["script", "tmux: server"]);
   addTmuxClient(shared, "ssh");
   assert.deepEqual(await resolveInputReceiver(6000, shared.dependencies()),
-    { kind: "remote", peer: "100.123.34.64", port: 22, user: "conley" });
+    { kind: "remote", alias: "conley-Y9000p", peer: "100.123.34.64", port: 22, user: "conley" });
 });
 
 test("relay requires matching controlling tty and foreground pgrp", async () => {
@@ -695,7 +823,7 @@ test("tmux marked client resolves display/sshd and refuses a nested tmux client"
   assert.equal(await resolveInputReceiver(6000, local.dependencies()), "local");
   const remote = tmuxClient("ssh");
   assert.deepEqual(await resolveInputReceiver(6000, remote.dependencies()),
-    { kind: "remote", peer: "100.123.34.64", port: 22, user: "conley" });
+    { kind: "remote", alias: "conley-Y9000p", peer: "100.123.34.64", port: 22, user: "conley" });
   const nested = tmuxClient("tmux");
   await receiverFails(nested, 6000, "input-unattributed");
 });

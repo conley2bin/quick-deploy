@@ -2,6 +2,7 @@ import { randomBytes } from "node:crypto";
 import type { Code } from "mdast";
 import remarkParse from "remark-parse";
 import { unified } from "unified";
+import { commandLike, inlineCodePaths, nonPathTextRanges, plainTextPaths, plainTextWordSpans, type PathSpan } from "./paths.ts";
 
 const parser = unified().use(remarkParse);
 const PREFIX_REGISTRY = Symbol.for("pi-copy-links:reserved-prefixes");
@@ -61,6 +62,22 @@ interface TreeNode {
   };
 }
 
+interface SourcePathSpan {
+  readonly kind: "text" | "codespan";
+  readonly raw: string;
+  readonly text: string;
+  readonly paths: readonly PathSpan[];
+  readonly allowed: boolean;
+}
+
+export interface PathMatchWork {
+  commandLines: number;
+  indexedCharacters: number;
+  queries: number;
+  cacheHits: number;
+  lookups: number;
+}
+
 export interface SourceLinkEvidence {
   /** Pi-normalized native raw token spelling -> possible remark semantic hrefs. */
   readonly destinations: ReadonlyMap<string, ReadonlySet<string>>;
@@ -68,10 +85,128 @@ export interface SourceLinkEvidence {
   readonly explicitAutolinks: ReadonlySet<string>;
   /** Plain source text spans that can prove a native bare HTTP(S) autolink. */
   readonly plainTextSpans: readonly string[];
+  readonly pathSpans: readonly SourcePathSpan[];
+  /** Exact feasible leaf keys; null means conflicting/blocked source evidence. */
+  readonly pathIndex: Map<string, SourcePathSpan | null>;
+  readonly pathQueries: Map<string, readonly PathSpan[]>;
+  /** Structural counters for linear-work regressions, not wall-clock admission. */
+  readonly pathWork: PathMatchWork;
 }
+
+export function emptySourceLinkEvidence(): SourceLinkEvidence {
+  return { destinations: new Map(), explicitAutolinks: new Set(), plainTextSpans: [], pathSpans: [],
+    pathIndex: new Map(), pathQueries: new Map(),
+    pathWork: { commandLines: 0, indexedCharacters: 0, queries: 0, cacheHits: 0, lookups: 0 } };
+}
+
+interface TextSlice { start: number; end: number }
+
+// Same strict-del content grammar as Pi, including internal single tildes.
+// Synthetic splits may overapproximate negative evidence; they never mint paths.
+const STRICT_DEL = /(~~)(?=[^\s~])((?:\\.|[^\\])*?(?:\\.|[^\s~\\]))\1(?=[^~]|$)/gu;
+
+function feasibleTextLeaves(raw: string): TextSlice[] {
+  const leaves = new Map<string, TextSlice>();
+  const add = (start: number, end: number) => { if (end > start) leaves.set(`${start}:${end}`, { start, end }); };
+  const visit = (from: number, to: number): void => {
+    add(from, to);
+    const text = raw.slice(from, to);
+    const cells = text.includes("|") ? [...text.matchAll(/[^|\n]+/gu)].map((match) =>
+      ({ start: from + match.index, end: from + match.index + match[0].length })) : [{ start: from, end: to }];
+    for (const cell of cells) {
+      const value = raw.slice(cell.start, cell.end);
+      const left = cell.start + value.length - value.trimStart().length;
+      const right = cell.end - value.length + value.trimEnd().length;
+      const variants = text.includes("|") ? [cell, { start: left, end: cell.end }, { start: cell.start, end: right }, { start: left, end: right }] : [cell];
+      for (const variant of variants) {
+        if (variant.end <= variant.start) continue;
+        add(variant.start, variant.end);
+        const value = raw.slice(variant.start, variant.end);
+        const boundaries: Array<TextSlice & { content?: TextSlice }> = nonPathTextRanges(value).map((range) => {
+          const word = value.slice(range.start, range.end);
+          const url = /^(?:https?:\/\/|ftp:\/\/|www\.)/iu.test(word) ?
+            /^(?:[^?!.,:;*_'"~()&]+|\([^)]*\)|&(?![a-zA-Z0-9]+;$)|[?!.,:;*_'"~)]+(?!$))+/u.exec(word)?.[0] ?? word : word;
+          return { start: range.start, end: range.start + url.length };
+        });
+        for (const match of value.matchAll(STRICT_DEL)) {
+          boundaries.push({ start: match.index, end: match.index + match[0].length,
+            content: { start: match.index + 2, end: match.index + match[0].length - 2 } });
+        }
+        boundaries.sort((a, b) => a.start - b.start);
+        let start = 0;
+        for (const boundary of boundaries) {
+          if (boundary.start < start) continue;
+          add(variant.start + start, variant.start + boundary.start);
+          if (boundary.content) visit(variant.start + boundary.content.start, variant.start + boundary.content.end);
+          start = boundary.end;
+        }
+        add(variant.start + start, variant.end);
+      }
+    }
+  };
+  visit(0, raw.length);
+  return [...leaves.values()];
+}
+
+function pathLeafKey(kind: "text" | "codespan", raw: string): string { return `${kind}\0${raw}`; }
 
 function normalizedMarkdownSpan(value: string): string {
   return value.replace(/\r\n?/gu, "\n").replace(/\t/gu, "   ");
+}
+
+/** Preserve whole source-word authority across AST and synthetic render splits. */
+function sourcePathCandidates(markdown: string, root: TreeNode): { paths: PathSpan[]; offsets: number[] } {
+  const source = normalizedMarkdownSpan(markdown);
+  const offsets: number[] = [];
+  let normalized = 0;
+  for (let at = 0; at < markdown.length; at++) {
+    offsets.push(normalized);
+    normalized += markdown[at] === "\t" ? 3 : markdown[at] === "\n" && markdown[at - 1] === "\r" ? 0 : 1;
+  }
+  offsets.push(normalized);
+  const openings = new Map<number, number>(), closings = new Map<number, number>();
+  const collectStyles = (node: TreeNode): void => {
+    const start = node.position?.start.offset, end = node.position?.end.offset;
+    if ((node.type === "strong" || node.type === "emphasis") && start !== undefined && end !== undefined) {
+      const size = node.type === "strong" ? 2 : 1;
+      openings.set(offsets[start]!, offsets[start + size]!);
+      closings.set(offsets[end]!, offsets[end - size]!);
+    }
+    for (const child of node.children ?? []) collectStyles(child);
+  };
+  collectStyles(root);
+  for (const match of source.matchAll(STRICT_DEL)) {
+    // Do not treat a substring of a longer/escaped marker run as positive syntax.
+    if (source[match.index - 1] === "~" || source[match.index - 1] === "\\") continue;
+    openings.set(match.index, match.index + 2);
+    closings.set(match.index + match[0].length, match.index + match[0].length - 2);
+  }
+  const paths: PathSpan[] = [];
+  for (const word of plainTextWordSpans(source)) {
+    let { start, end } = word;
+    while (openings.has(start) && openings.get(start)! < end) start = openings.get(start)!;
+    while (closings.has(end) && closings.get(end)! > start) end = closings.get(end)!;
+    for (const path of plainTextPaths(source.slice(start, end))) {
+      paths.push({ ...path, start: path.start + start, end: path.end + start });
+    }
+  }
+  return { paths, offsets };
+}
+
+/** Only a complete candidate contained in a slice can carry positive authority. */
+function projectPaths(paths: readonly PathSpan[], start: number, end: number): PathSpan[] {
+  let low = 0, high = paths.length;
+  while (low < high) {
+    const middle = (low + high) >>> 1;
+    if (paths[middle]!.end <= start) low = middle + 1;
+    else high = middle;
+  }
+  const projected: PathSpan[] = [];
+  for (let at = low; at < paths.length && paths[at]!.start < end; at++) {
+    const path = paths[at]!;
+    if (path.start >= start && path.end <= end) projected.push({ ...path, start: path.start - start, end: path.end - start });
+  }
+  return projected;
 }
 
 /** Collect source-exact link semantics before Pi normalizes Markdown for Marked. */
@@ -115,9 +250,95 @@ export function sourceLinkEvidence(markdown: string): SourceLinkEvidence {
     }
     for (const child of node.children ?? []) collectLinks(child, insideLink || link);
   };
+  const pathSpans: SourcePathSpan[] = [];
+  const candidates = sourcePathCandidates(markdown, root);
+  const lineStarts: number[] = [];
+  const blockedLines = [0];
+  let lineOffset = 0;
+  for (const line of markdown.split("\n")) {
+    lineStarts.push(lineOffset);
+    blockedLines.push(blockedLines.at(-1)! + Number(commandLike(line)));
+    lineOffset += line.length + 1;
+  }
+  const lineAt = (offset: number): number => {
+    let low = 0, high = lineStarts.length;
+    while (low + 1 < high) {
+      const middle = (low + high) >>> 1;
+      if (lineStarts[middle]! <= offset) low = middle;
+      else high = middle;
+    }
+    return low;
+  };
+  const containsHtml = (node: TreeNode): boolean => node.type === "html" || (node.children ?? []).some(containsHtml);
+  const collectPaths = (node: TreeNode, excluded = false): void => {
+    // These native tokens never supply independently actionable leaf text.
+    if (["link", "linkReference", "image", "imageReference", "code", "html"].includes(node.type)) return;
+    const blocked = excluded || (["paragraph", "heading"].includes(node.type) && containsHtml(node));
+    if (node.type === "text" || node.type === "inlineCode") {
+      const start = node.position?.start.offset;
+      const end = node.position?.end.offset;
+      if (start === undefined || end === undefined) throw new Error("remark path leaf has no source span");
+      const raw = normalizedMarkdownSpan(markdown.slice(start, end));
+      const kind = node.type === "text" ? "text" : "codespan";
+      const text = kind === "codespan" ? node.value ?? "" : normalizedMarkdownSpan(node.value ?? "");
+      const firstLine = lineAt(start), lastLine = lineAt(Math.max(start, end - 1));
+      const allowed = !blocked && blockedLines[lastLine + 1] === blockedLines[firstLine];
+      // Text entity/escape disagreement is deliberately not guessed. Inline
+      // code uses remark's literal value and additionally requires native equality.
+      const paths = !allowed ? [] : kind === "codespan" ? inlineCodePaths(text) :
+        raw === text ? projectPaths(candidates.paths, candidates.offsets[start]!, candidates.offsets[end]!) : [];
+      pathSpans.push({ kind, raw, text, paths, allowed });
+    }
+    for (const child of node.children ?? []) collectPaths(child, blocked);
+  };
+  const pathIndex = new Map<string, SourcePathSpan | null>();
+  const pathWork: PathMatchWork = { commandLines: lineStarts.length, indexedCharacters: 0, queries: 0, cacheHits: 0, lookups: 0 };
+  const indexLeaf = (kind: "text" | "codespan", raw: string, text: string, paths: readonly PathSpan[]) => {
+    pathWork.indexedCharacters += raw.length;
+    const key = pathLeafKey(kind, raw);
+    const previous = pathIndex.get(key);
+    if (previous === null) return;
+    if (previous && (previous.text !== text || JSON.stringify(previous.paths) !== JSON.stringify(paths))) {
+      pathIndex.set(key, null);
+    } else if (!previous) pathIndex.set(key, { kind, raw, text, paths, allowed: paths.length > 0 });
+  };
   collectDefinitions(root);
   collectLinks(root);
-  return { destinations, explicitAutolinks, plainTextSpans };
+  collectPaths(root);
+  for (const span of pathSpans) {
+    if (span.kind === "codespan") {
+      indexLeaf(span.kind, span.raw, span.text, span.paths);
+      continue;
+    }
+    for (const slice of feasibleTextLeaves(span.raw)) {
+      const raw = span.raw.slice(slice.start, slice.end);
+      const paths = projectPaths(span.paths, slice.start, slice.end);
+      // A fragment can only add negative evidence, never a fresh target. This
+      // also prevents an identical partial/blocked leaf borrowing another word.
+      if (paths.length || plainTextPaths(raw).length) indexLeaf("text", raw, raw, paths);
+    }
+  }
+  return { destinations, explicitAutolinks, plainTextSpans, pathSpans, pathIndex,
+    pathQueries: new Map(), pathWork };
+}
+
+/** One cached exact lookup per native leaf; never rescan the original source. */
+export function sourcePathMatches(
+  evidence: SourceLinkEvidence,
+  kind: "text" | "codespan",
+  raw: string,
+  text: string,
+): readonly PathSpan[] {
+  if (!evidence.pathIndex.size || !raw || !text || (kind === "text" && raw !== text)) return [];
+  evidence.pathWork.queries += 1;
+  const key = `${pathLeafKey(kind, raw)}\0${text}`;
+  const cached = evidence.pathQueries.get(key);
+  if (cached) { evidence.pathWork.cacheHits += 1; return cached; }
+  evidence.pathWork.lookups += 1;
+  const leaf = evidence.pathIndex.get(pathLeafKey(kind, raw));
+  const paths = leaf && leaf.text === text ? leaf.paths : [];
+  evidence.pathQueries.set(key, paths);
+  return paths;
 }
 
 /** Derive remark's semantic spelling only for a native URL proven to occur in plain source text. */
