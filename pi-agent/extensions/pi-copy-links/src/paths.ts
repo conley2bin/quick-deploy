@@ -73,17 +73,35 @@ export function nonPathTextRanges(value: string): Array<{ start: number; end: nu
     .map((match) => ({ start: match.index, end: match.index + match[0].length }));
 }
 
-/** Plain text uses whole, punctuation-delimited words, never URL substrings. */
+const PROSE_END = /[.!:,;，。；：！？、]+$/u;
+const WRAPPERS: Readonly<Record<string, string>> = { "(": ")", "[": "]", "{": "}", "（": "）", "【": "】", "“": "”", "‘": "’", '"': '"', "'": "'" };
+
+function balancedParentheses(value: string): boolean {
+  let depth = 0;
+  for (const char of value) {
+    if (char === "(") depth += 1;
+    if (char === ")" && --depth < 0) return false;
+  }
+  return depth === 0;
+}
+
+/** Whole whitespace words retain filename punctuation; never retry fragments. */
 export function plainTextPaths(value: string): PathSpan[] {
   const paths: PathSpan[] = [];
   const urls = nonPathTextRanges(value);
-  for (const match of value.matchAll(/[^\s<>"'`()\[\]{},;*|]+/gu)) {
-    if (urls.some((url) => match.index >= url.start && match.index < url.end)) continue;
-    const raw = match[0];
-    // Sentence-ending dots/colon are punctuation in prose; code spans are exact.
-    const path = raw.replace(/[.!:]+$/u, "");
-    if (!crediblePath(path, false)) continue;
-    paths.push({ start: match.index, end: match.index + path.length, href: literalHref(path) });
+  let url = 0;
+  for (const match of value.matchAll(/\S+/gu)) {
+    while (urls[url] && urls[url]!.end <= match.index) url += 1;
+    if (urls[url] && urls[url]!.start < match.index + match[0].length) continue;
+    let path = match[0].replace(PROSE_END, "");
+    let start = match.index;
+    // Only enclosing pairs are prose. Internal parentheses/comma stay literal;
+    // unsupported or unbalanced punctuation suppresses the complete word.
+    while (WRAPPERS[path[0]!] === path.at(-1) && path.length > 1) {
+      path = path.slice(1, -1); start += 1;
+    }
+    if (/[“”‘’【】（）]/u.test(path) || !balancedParentheses(path) || !crediblePath(path, false)) continue;
+    paths.push({ start, end: start + path.length, href: literalHref(path) });
   }
   return paths;
 }

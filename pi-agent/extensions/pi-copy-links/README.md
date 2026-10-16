@@ -60,7 +60,7 @@ bash pi-agent/extensions/pi-copy-links/client/install.sh --replace
 | `reports/`、`src/components/`、`./`、`../` | 目录拼写；无根、无扩展名的目录需尾斜杠 |
 | 行内代码中的 `reports/my video.mp4`、`/tmp/中文 文件.pdf` | 完整、带路径前缀的含空格文件名 |
 
-例如正文 `Open reports/result.png`、`输出文件 reports/result.png` 仍可点击其中的路径。普通文字只扫描完整的标点分隔词；句尾 `.`、`!`、`:` 视为标点。行内代码必须整体是一个路径，不会从 `ffmpeg -i in.mp4 out.mp4`、`cat reports/out.png`、`python src/main.py` 中抽取文件名。带 shell prompt、赋值、选项、管道/重定向等命令语法或已知命令起始的正文行也不扫描；这是语法识别，不执行命令、不在渲染时 `stat`。
+例如正文 `Open reports/result.png`、`输出文件 reports/result.png` 仍可点击其中的路径。普通文字按完整空白分隔词保留文件名上下文：`./reports/final(1).png` 和 `./reports/final,1.png` 的内部括号/逗号属于文件名，不会拆成可点击的前缀或后缀。完整外层配对括号/引号及句尾标点视为 prose，例如 `(reports/chart.png),`、`（reports/chart.png），` 和 `reports/chart.png。`；不配对或内部不支持的标点会令整个词保持不可点击，不重试碎片。行内代码必须整体是一个路径，不会从 `ffmpeg -i in.mp4 out.mp4`、`cat reports/out.png`、`python src/main.py` 中抽取文件名。带 shell prompt、赋值、选项、管道/重定向等命令语法或已知命令起始的正文行也不扫描；这是语法识别，不执行命令、不在渲染时 `stat`。
 
 没有足够语法证据时保持文字：`and/or`、`input/output`、`src/components`、`v1.2.3`、`3.14`、`example.com`、未知扩展名和无路径前缀的含空格短语都不猜。常见扩展名/basename 集合见 [`src/paths.ts`](src/paths.ts)；不在集合中的文件可写成 `./name.custom` 或显式 Markdown 链接。`~/`、`~user/` 不自动展开；请写 Pi/公司侧绝对路径。路径、命令与自然语言在个别拼写上不可区分时，使用显式链接表达意图。
 
@@ -132,7 +132,7 @@ code --new-window --goto -- /absolute/path:12:3
 
 Pi 在 lexing 前把 Tab 展开成三个空格，native href 还可能保留 character-reference 拼写。扩展同时用 remark 读取源文 link/linkReference span（引用采用第一条 definition），把 raw span 按 Pi 的 Tab/换行规则归一化后与 native `[raw, href]` 证据核对。
 
-自动路径要求 native text/codespan 的 raw/value 与源文叶片证据一致；完整 code span 才能成为路径，正文子片段需在所有可能的源文出现位置得到相同路径区间。显式链接标签的递归渲染不参与自动发现。装饰只在临时 token payload 插入 OSC8，由 native 继续处理原有颜色、代码样式、换行和宽度，不修改 host token cache。
+自动路径要求 native text/codespan 的 raw/value 与源文叶片证据一致；完整 code span 才能成为路径。正文只匹配完整 remark 叶片，以及 native table cell 裁边、URL 或严格 `~~删除线~~` 产生的可行子叶边界；`chart.png` 不是 `reports/chart.png` 的另一叶片，`README` 也不是 `README.md` 的另一叶片。相同可行 native 叶片若对应命令、HTML 或不同源文语义，仍拒绝借用另一处的目标。源文每次变更都会重建本 frame 的证据索引；收集、table 测量和装饰复用 exact 查询结果，无路径正文直接跳过匹配，不逐 native token 重扫全部源文。这个索引只保存源文证据，动作仍全部属于同一个 ActionStore。显式链接标签的递归渲染不参与自动发现。装饰只在临时 token payload 插入 OSC8，由 native 继续处理原有颜色、代码样式、换行和宽度，不修改 host token cache。
 
 所有显式链接先绑定其唯一的 remark 语义目标，再分类为 web/local/unsupported。因此 `[web](https://example.com/?a=1&amp;b=2)` 打开的是语义 URL `...?a=1&b=2`，不会误开 query key `amp;b`；引用链接遵循同一规则。angle/bare HTTP(S) autolink 只有在原始文本证据存在且 remark/native 的规范化网页语义一致时才可打开，分歧会生成诊断。
 
@@ -182,6 +182,7 @@ python3 test/native-smoke.py
 python3 test/native-smoke.py --osc52
 python3 test/native-smoke.py --tmux
 python3 test/native-smoke.py --tmux --regular-start
+python3 test/native-smoke.py --path-boundaries
 ```
 
 客户端安装器及 fake-endpoint 接收助手回归从仓库根目录运行：
@@ -192,6 +193,6 @@ PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s pi-agent/extensions/pi
 
 `--legacy-peer-deps` 只用于测试依赖安装，避免 npm 自动装入与正在运行的 Pi 不同身份的 peer；`npm run check` 中的 `test/setup-pi.mjs` 核验并链接本机已安装的 Pi/TUI，发现不匹配的第二份运行时会拒绝执行。验收以实际 `pi` 的 bundled CLI 和上面的离线 PTY/recorder 为准，不用未打包入口代替。
 
-单元/集成测试覆盖代码源文、typed action failure atomicity、poisoned-generation clipboard queue、live cwd snapshot、Markdown recursion/table/reference、显式/引用网页及本地链接语义、完整目标语法、browser/Code 启动、PTY holder/identity-bound relay/Ghostty-own-display/SSH 分类、signed `ss` inode、扩展 pts minor、deleted executable image、来源 PID 与客户端地址钉住、fake SSH 协议/失败/abort/no-fallback、async retirement、selection/overlay/tmux recovery/reload/quiescence。Native smoke 使用临时 Pi profile、真实 CLI/PTY 和 recorder executables：`wl-copy`、`xdg-settings`、`google-chrome-stable`、`code`；`xdg-open` 是失败 tripwire。普通和 tmux 模式把 Python 可执行文件复制或 hard-link 为测试私有的 `ghostty` executable 后重新 exec，使 PTY-master 的 `/proc/<pid>/exe` realpath basename 真正满足 emulator 身份；同一进程还持有到私有 `/tmp/.X11-unix/X<n>` fake server 的真实 Unix stream。软链接改名不被接受。`--osc52` 保持 Python 身份且不创建显示连接，链接必须拒绝且无 GUI 端点。四种模式还通过真实 PTY 拖选普通文字，核对原生 selection 写出的 `Native`，并核对普通链接/自动路径点击和 Ctrl-drag 不打开应用、`/reload` 后 action URI 更换、窄屏复制字节不变。截图文件名 `state43_real_grid_1080p.mp4` 和 `reports/中文%#?.png` 分别以行内代码/正文出现：本机模式 Ctrl+左键得到同一 Code new-window argv，窄屏重试 MP4 仍指向同一文件；OSC52 的未知来源保持拒绝，不启动 GUI。自动测试不会启动物理 Chrome/Code，也不会修改物理剪贴板。用 `--artifacts <目录>` 为每次 native 运行指定独立证据目录；默认也保留临时目录。失败时仍保存 `run.json`、PTY/input 原始流、已有 recorder JSONL、snapshot 和人工 fixture 的 session/settings，便于从实际输入/输出定位分歧；这些文件属于隔离测试 profile，不来自用户会话。
+单元/集成测试覆盖代码源文、typed action failure atomicity、poisoned-generation clipboard queue、live cwd snapshot、Markdown recursion/table/reference、显式/引用网页及本地链接语义、完整目标语法、browser/Code 启动、PTY holder/identity-bound relay/Ghostty-own-display/SSH 分类、signed `ss` inode、扩展 pts minor、deleted executable image、来源 PID 与客户端地址钉住、fake SSH 协议/失败/abort/no-fallback、async retirement、selection/overlay/tmux recovery/reload/quiescence。Native smoke 使用临时 Pi profile、真实 CLI/PTY 和 recorder executables：`wl-copy`、`xdg-settings`、`google-chrome-stable`、`code`；`xdg-open` 是失败 tripwire。普通和 tmux 模式把 Python 可执行文件复制或 hard-link 为测试私有的 `ghostty` executable 后重新 exec，使 PTY-master 的 `/proc/<pid>/exe` realpath basename 真正满足 emulator 身份；同一进程还持有到私有 `/tmp/.X11-unix/X<n>` fake server 的真实 Unix stream。软链接改名不被接受。`--osc52` 保持 Python 身份且不创建显示连接，链接必须拒绝且无 GUI 端点。四种模式还通过真实 PTY 拖选普通文字，核对原生 selection 写出的 `Native`，并核对普通链接/自动路径点击和 Ctrl-drag 不打开应用、`/reload` 后 action URI 更换、窄屏复制字节不变。截图文件名 `state43_real_grid_1080p.mp4` 和 `reports/中文%#?.png` 分别以行内代码/正文出现：本机模式 Ctrl+左键得到同一 Code new-window argv，窄屏重试 MP4 仍指向同一文件；OSC52 的未知来源保持拒绝，不启动 GUI。`--path-boundaries` 另建完整括号/逗号文件与同时存在的前缀/后缀 decoy，记录没有普通点击 priming 的真实 Ctrl press/release 和精确 Code argv；单元回归以 100/200/400/800 项的索引工作计数和 query cache 检查增长，不使用易漂移的固定耗时门槛。自动测试不会启动物理 Chrome/Code，也不会修改物理剪贴板。用 `--artifacts <目录>` 为每次 native 运行指定独立证据目录；默认也保留临时目录。失败时仍保存 `run.json`、PTY/input 原始流、已有 recorder JSONL、snapshot 和人工 fixture 的 session/settings，便于从实际输入/输出定位分歧；这些文件属于隔离测试 profile，不来自用户会话。
 
 卸载前确认 `~/.pi/agent/extensions/pi-copy-links` 是本扩展 symlink，删除后 `/reload`。源码和依赖可保留。

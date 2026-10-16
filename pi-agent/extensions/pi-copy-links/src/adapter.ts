@@ -7,7 +7,8 @@ import {
 import { webUrl, type OpenLifetime } from "./browser.ts";
 import { hasUriScheme, isLocalHref } from "./links.ts";
 import {
-  ActionStore, alignCodeBlocks, codeSyntax, sourceAutolinkDestination, sourceCodeBlocks, sourceLinkEvidence, sourcePathMatches,
+  ActionStore, alignCodeBlocks, codeSyntax, emptySourceLinkEvidence, sourceAutolinkDestination,
+  sourceCodeBlocks, sourceLinkEvidence, sourcePathMatches,
   type Action, type ActionEntry, type ActionSlot, type CleanupIssue, type CodeContainer,
   type RenderedCodeBlock, type SourceCodeBlock, type SourceLinkEvidence,
 } from "./source.ts";
@@ -818,7 +819,7 @@ function installOwnedAdapter(options: AdapterOptions, owners: HookOwners, clipbo
       decorationInvalid: false,
       containers: [],
       sources: [],
-      sourceLinks: { destinations: new Map(), explicitAutolinks: new Set(), plainTextSpans: [], pathSpans: [] },
+      sourceLinks: emptySourceLinkEvidence(),
       excludedInline: new WeakSet(),
       inlineExcluded: 0,
       native: [],
@@ -887,7 +888,7 @@ function installOwnedAdapter(options: AdapterOptions, owners: HookOwners, clipbo
         frame.sourceLinks = sourceLinkEvidence(source);
       } catch (error) {
         frame.sources = [];
-        frame.sourceLinks = { destinations: new Map(), explicitAutolinks: new Set(), plainTextSpans: [], pathSpans: [] };
+        frame.sourceLinks = emptySourceLinkEvidence();
         frame.failed = true;
         suspend(error);
       }

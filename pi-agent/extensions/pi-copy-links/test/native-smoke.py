@@ -31,6 +31,7 @@ import time
 args = argparse.ArgumentParser(description=__doc__)
 args.add_argument('--artifacts', type=Path)
 args.add_argument('--regular-start', action='store_true', help='Enable fullscreen through the real /settings UI')
+args.add_argument('--path-boundaries', action='store_true', help='Add whole-filename/decoy and unprimed full-edge click controls')
 transport = args.add_mutually_exclusive_group()
 transport.add_argument('--osc52', action='store_true')
 transport.add_argument('--tmux', action='store_true')
@@ -111,6 +112,10 @@ text = ('Native copy test\n\n- ```make\n  ' + code.replace('\n', '\n  ') + '\n  
         '[SAMPLE_DIR](sample-dir)\n\n'
         'AUTO_MP4 `' + auto_filename + '`\n'
         'AUTO_PNG ' + auto_relative)
+if options.path_boundaries:
+    for name in ('reports/final(1).png', 'reports/final,1.png', 'reports/final', '.png', '1.png'):
+        (root / name).write_text(name)
+    text += '\nPAREN ./reports/final(1).png\nCOMMA ./reports/final,1.png'
 now = '2026-01-01T00:00:00.000Z'
 usage = {k: 0 for k in ['input', 'output', 'cacheRead', 'cacheWrite', 'totalTokens']}
 usage['cost'] = {k: 0 for k in ['input', 'output', 'cacheRead', 'cacheWrite', 'total']}
@@ -323,6 +328,21 @@ try:
             wait_for(lambda: len(records('code')) >= local_expectations.index((label, expected)) + 1,
                      'Ctrl-click Code handoff ' + label)
             assert records('code')[-1] == {'argv': expected}
+    if options.path_boundaries and not options.osc52:
+        for label, name in [('PAREN', 'reports/final(1).png'), ('COMMA', 'reports/final,1.png')]:
+            current = snapshot('full-edge-' + label.lower())
+            point = target_by_label(current, label)
+            before = records('code')
+            offset = (root / 'input.raw').stat().st_size
+            # No ordinary priming: verify the real delivered Ctrl press and
+            # release as well as the exact existing intended file (decoys exist).
+            click(point, 16)
+            wait_for(lambda: len(records('code')) == len(before) + 1, 'unprimed full-edge ' + label)
+            received = (root / 'input.raw').read_bytes()[offset:]
+            for edge in ('M', 'm'):
+                expected_edge = f'\x1b[<16;{point["x"] + 1};{point["y"] + 1}{edge}'.encode()
+                assert expected_edge in received, (label, edge, received)
+            assert records('code')[-1] == {'argv': ['--new-window', '--', str(root / name)]}
     assert records('xdg-open') == [], 'forbidden xdg-open fallback ran'
     path_target = target_by_label(after_copy, 'AUTO_MP4')
     before_path_drag = records('code')
@@ -408,7 +428,7 @@ try:
     result = {'result': 'passed', 'transport': 'OSC52' if options.osc52 else 'tmux → wl-copy stdin' if options.tmux else 'wl-copy stdin',
               'regularToFullscreen': options.regular_start,
               'buttonCopies': button_copies, 'clipboardWrites': clipboard(), 'nativeSelection': native_selection,
-              'automaticPaths': [auto_filename, auto_relative],
+              'automaticPaths': [auto_filename, auto_relative], 'pathBoundaries': options.path_boundaries,
               'browser': records('google-chrome-stable'), 'code': records('code'),
               'browserDetection': records('xdg-settings'), 'forbiddenXdgOpen': records('xdg-open'),
               'scratch': str(root)}

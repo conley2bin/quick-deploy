@@ -53,6 +53,34 @@ test("automatic path syntax accepts screenshot/media/source/artifact and explici
   }
 });
 
+test("plain filename punctuation retains whole resources and only strips prose wrappers", () => {
+  for (const [source, path] of [
+    ["./reports/final(1).png", "./reports/final(1).png"],
+    ["./reports/final,1.png", "./reports/final,1.png"],
+    ["(./reports/final(1).png),", "./reports/final(1).png"],
+    ["（./reports/final，1.png），", "./reports/final，1.png"],
+    ["reports/chart.png。", "reports/chart.png"],
+  ]) {
+    const spans = plainTextPaths(source!);
+    assert.equal(spans.length, 1, source);
+    assert.equal(source!.slice(spans[0]!.start, spans[0]!.end), path);
+    assert.deepEqual(parseOpenTarget(spans[0]!.href, "/click"),
+      { kind: "local", path: `/click/${path!.replace(/^\.\//u, "")}` });
+  }
+  for (const source of ["./reports/final(1.png", "./reports/final)1.png", "./reports/final[1].png",
+    "./reports/final;1.png", "./reports/final|1.png", "./reports/final'1.png"]) {
+    assert.deepEqual(plainTextPaths(source), [], `never authorize punctuation fragments: ${source}`);
+  }
+});
+
+test("native evidence distinguishes complete leaves from filename prefixes and suffixes", () => {
+  for (const [first, second] of [["chart.png", "reports/chart.png"], ["src-a.ts", "src-a.tsx"], ["README", "README.md"]]) {
+    const evidence = sourceLinkEvidence(`${first}\n\n${second}`);
+    assert.equal(sourcePathMatches(evidence, "text", first!, first!).length, 1, first);
+    assert.equal(sourcePathMatches(evidence, "text", second!, second!).length, 1, second);
+  }
+});
+
 test("automatic literal encoding round-trips %, #, ?, Unicode and colon without selectors", () => {
   for (const path of ["100%.png", "literal%20.png", "数据/图#1?.png", "out.png#L12", "out.png?x=1",
     "./file.ts:12:3", "./a:b#L2?.txt", "/tmp/literal%2F.png"]) {
@@ -87,13 +115,53 @@ test("source path proof excludes command lines, code, links, images and HTML wit
     const evidence = sourceLinkEvidence(source);
     assert.deepEqual(sourcePathMatches(evidence, "text", path, path), [], source);
   }
-  for (const source of [`Open ${path}`, `输出文件 ${path}`, `**${path}**`, `> - ${path}`,
-    `| path |\n|---|\n| ${path} |`]) {
-    assert.equal(sourcePathMatches(sourceLinkEvidence(source), "text", path, path).length, 1, source);
+  for (const [source, leaf] of [[`Open ${path}`, `Open ${path}`], [`输出文件 ${path}`, `输出文件 ${path}`],
+    [`**${path}**`, path], [`> - ${path}`, path], [`| path |\n|---|\n| ${path} |`, path]]) {
+    assert.equal(sourcePathMatches(sourceLinkEvidence(source!), "text", leaf!, leaf!).length, 1, source);
   }
   assert.deepEqual(sourcePathMatches(sourceLinkEvidence(`a&amp;b.png`), "text", "a&amp;b.png", "a&amp;b.png"), []);
-  const ambiguous = sourceLinkEvidence(`${path}\n\ncat ${path}`);
-  assert.deepEqual(sourcePathMatches(ambiguous, "text", path, path), [], "never borrow an allowed occurrence for a command leaf");
+  assert.equal(sourcePathMatches(sourceLinkEvidence(`${path}\n\ncat ${path}`), "text", path, path).length, 1,
+    "a command operand substring is not a second native leaf");
+  for (const blocked of [`cat **${path}**`, `<span>${path}</span>`]) {
+    const ambiguous = sourceLinkEvidence(`${path}\n\n${blocked}`);
+    assert.deepEqual(sourcePathMatches(ambiguous, "text", path, path), [], "identical feasible blocked leaf cannot borrow authority");
+  }
+});
+
+test("source path indexing is bounded linear work with cached queries and no-path fast exit", () => {
+  for (const paths of [false, true]) {
+    let previous = 0;
+    for (const count of [100, 200, 400, 800]) {
+      const source = Array.from({ length: count }, (_, i) =>
+        `- **Item ${i}** describes ${paths ? `reports/out_${i}.png` : `the result ${i}`} and explanatory prose.`).join("\n");
+      const evidence = sourceLinkEvidence(source);
+      for (const span of evidence.pathSpans) sourcePathMatches(evidence, span.kind, span.raw, span.text);
+      const first = { ...evidence.pathWork };
+      assert.equal(first.commandLines, count, "classify each original source line once, not for each styled leaf");
+      for (const span of evidence.pathSpans) sourcePathMatches(evidence, span.kind, span.raw, span.text);
+      assert.equal(evidence.pathWork.lookups, first.lookups, "decorate/table repeat must reuse exact query results");
+      assert.ok(first.lookups <= count * 2, "at most one map lookup per native leaf");
+      assert.ok(first.indexedCharacters <= source.length * 4, "bounded indexed text, never all leaf pairs");
+      if (paths) {
+        assert.equal(first.lookups, count * 2);
+        assert.equal(evidence.pathWork.cacheHits, count * 2);
+        if (previous) assert.equal(first.lookups, previous * 2, "doubling the response doubles matching work");
+        previous = first.lookups;
+      } else {
+        assert.equal(evidence.pathIndex.size, 0);
+        assert.equal(first.lookups, 0, "no global source scan for path-free native text");
+        assert.equal(first.queries, 0);
+      }
+    }
+  }
+});
+
+test("many styled leaves on one line share one command-context classification", () => {
+  const source = Array.from({ length: 800 }, (_, i) => `**item${i}** reports/out_${i}.png`).join(" ");
+  const evidence = sourceLinkEvidence(source);
+  assert.equal(evidence.pathWork.commandLines, 1);
+  for (const span of evidence.pathSpans) sourcePathMatches(evidence, span.kind, span.raw, span.text);
+  assert.ok(evidence.pathWork.lookups <= evidence.pathSpans.length);
 });
 
 test("logical code preserves tabs, blank lines, significant spaces and container indentation", () => {

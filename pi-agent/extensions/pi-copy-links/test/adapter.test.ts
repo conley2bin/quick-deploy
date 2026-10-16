@@ -1,5 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { EventEmitter } from "node:events";
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import type { ChildProcess } from "node:child_process";
 import { AssistantMessageComponent, getMarkdownTheme, initTheme, VERSION } from "@earendil-works/pi-coding-agent";
 import {
   getCapabilities, getOsc8LinkAtColumn, hyperlink, Markdown, setCapabilities, stripTerminalSequences,
@@ -7,6 +12,7 @@ import {
 } from "@earendil-works/pi-tui";
 import { installAdapter, type OpenOrigin } from "../src/adapter.ts";
 import type { OpenLifetime } from "../src/browser.ts";
+import { openTarget } from "../src/links.ts";
 
 // Count WeakRef constructions for every adapter installed below. V8 both caps a
 // Set at 2^24 entries and registers each WeakRef's target in a kept-objects list
@@ -665,6 +671,86 @@ function pathAt(tui: TuiAltScreen, label: string, occurrence = 0) {
   assert.ok(url?.startsWith("pi-copy://"), `Missing action on ${label}`);
   return { ...point, url };
 }
+
+test("punctuated plain paths full-edge clicks never open existing prefix or suffix decoys", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-path-decoys-"));
+  mkdirSync(join(cwd, "reports"));
+  for (const name of ["reports/final", ".png", "1.png", "reports/final(1).png", "reports/final,1.png", "reports/final，1.png"]) {
+    writeFileSync(join(cwd, name), name);
+  }
+  try {
+    for (const [source, shown, expected] of [
+      ["./reports/final(1).png", "./reports/final(1).png", "reports/final(1).png"],
+      ["`./reports/final(1).png`", "./reports/final(1).png", "reports/final(1).png"],
+      ["./reports/final,1.png", "./reports/final,1.png", "reports/final,1.png"],
+      ["(./reports/final(1).png),", "./reports/final(1).png", "reports/final(1).png"],
+      ["（./reports/final，1.png），", "./reports/final，1.png", "reports/final，1.png"],
+    ]) {
+      const launches: Array<{ command: string; args: readonly string[] }> = [];
+      const f = fixture(source!, false, undefined, undefined, { cwd, open: async (href, root, lifetime) => {
+        await openTarget(href, root, lifetime, { spawn: (command, args) => {
+          launches.push({ command, args });
+          const child = new EventEmitter() as ChildProcess;
+          child.unref = () => child;
+          queueMicrotask(() => child.emit("exit", 0, null));
+          return child;
+        } });
+      } });
+      try {
+        const start = pathAt(f.tui, shown!);
+        const end = { ...start, x: start.x + visibleWidth(shown!) - 1 };
+        assert.equal(getOsc8LinkAtColumn(screen(f.tui)[end.y]!, end.x), start.url, "whole displayed resource has one action");
+        click(f.terminal, start, 16); await tick(); await tick();
+        click(f.terminal, end, 16); await tick(); await tick();
+        assert.deepEqual(launches, Array.from({ length: 2 }, () => ({ command: "code", args: ["--new-window", "--", join(cwd, expected!)] })), source);
+        assert.deepEqual(f.errorNotices, []);
+      } finally { f.close(); }
+    }
+    for (const source of ["./reports/final(1.png", "./reports/final)1.png", "./reports/final[1].png",
+      "./reports/final;1.png", "./reports/final|1.png", "./reports/final'1.png"]) {
+      const f = fixture(source, false, undefined, undefined, { cwd });
+      try { assert.equal(targets(f.tui, "pi-copy://").length, 0, `no decoy action for ${source}`); }
+      finally { f.close(); }
+    }
+  } finally { rmSync(cwd, { recursive: true, force: true }); }
+});
+
+test("distinct filename leaves survive streaming longer-name addition and removal", async () => {
+  for (const [first, second] of [["chart.png", "reports/chart.png"], ["src-a.ts", "src-a.tsx"], ["README", "README.md"]]) {
+    const f = fixture(first!);
+    try {
+      const owner = markdownOwner(f.component);
+      for (const source of [`${first}\n\n${second}`, first!, `${first}\n\n${second}`]) {
+        owner.setText(source); f.tui.renderNow();
+        click(f.terminal, pathAt(f.tui, first!), 16); await tick();
+        assert.equal(f.openRequests.at(-1)?.href, `./${first}`);
+        if (source.includes("\n")) {
+          const all = targets(f.tui, "pi-copy://");
+          assert.equal(all.length, 2, source);
+          click(f.terminal, all[1]!, 16); await tick();
+          assert.equal(f.openRequests.at(-1)?.href, `./${second}`);
+        }
+      }
+    } finally { f.close(); }
+  }
+});
+
+test("indexed native leaves retain table/autolink splits and genuine blocked collisions", async () => {
+  const source = "Open chart.png before https://example.com/x.png; reports/after.png\n\n" +
+    "| file | other |\n|---|---|\n| reports/cell.png | before https://example.com/t.png after reports/table.png |\n\n" +
+    "~~reports/deleted.png~~\n\n~~before https://example.com/d.png after reports/nested.png~~";
+  const f = fixture(source);
+  try {
+    for (const point of targets(f.tui, "pi-copy://")) { click(f.terminal, point, 16); await tick(); }
+    assert.deepEqual(f.opened, ["./chart.png", "https://example.com/x.png", "./reports/after.png", "./reports/cell.png",
+      "https://example.com/t.png", "./reports/table.png", "./reports/deleted.png", "https://example.com/d.png", "./reports/nested.png"]);
+  } finally { f.close(); }
+  for (const blocked of ["cat **chart.png**", "<span>chart.png</span>"]) {
+    const collision = fixture(`chart.png\n\n${blocked}`);
+    try { assert.equal(targets(collision.tui, "pi-copy://").length, 0, blocked); }
+    finally { collision.close(); }
+  }
+});
 
 test("automatic paths use counted opaque actions in prose, code, nested styles, tables and repeats", async () => {
   const filename = "state43_real_grid_1080p.mp4";

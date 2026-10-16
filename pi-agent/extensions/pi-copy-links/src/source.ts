@@ -67,6 +67,15 @@ interface SourcePathSpan {
   readonly raw: string;
   readonly text: string;
   readonly paths: readonly PathSpan[];
+  readonly allowed: boolean;
+}
+
+export interface PathMatchWork {
+  commandLines: number;
+  indexedCharacters: number;
+  queries: number;
+  cacheHits: number;
+  lookups: number;
 }
 
 export interface SourceLinkEvidence {
@@ -76,9 +85,59 @@ export interface SourceLinkEvidence {
   readonly explicitAutolinks: ReadonlySet<string>;
   /** Plain source text spans that can prove a native bare HTTP(S) autolink. */
   readonly plainTextSpans: readonly string[];
-  /** Native leaves must agree with every matching source occurrence. */
   readonly pathSpans: readonly SourcePathSpan[];
+  /** Exact feasible leaf keys; null means conflicting/blocked source evidence. */
+  readonly pathIndex: Map<string, SourcePathSpan | null>;
+  readonly pathQueries: Map<string, readonly PathSpan[]>;
+  /** Structural counters for linear-work regressions, not wall-clock admission. */
+  readonly pathWork: PathMatchWork;
 }
+
+export function emptySourceLinkEvidence(): SourceLinkEvidence {
+  return { destinations: new Map(), explicitAutolinks: new Set(), plainTextSpans: [], pathSpans: [],
+    pathIndex: new Map(), pathQueries: new Map(),
+    pathWork: { commandLines: 0, indexedCharacters: 0, queries: 0, cacheHits: 0, lookups: 0 } };
+}
+
+// Native Marked trims tables and splits around URL and strict ~~del~~ tokens.
+// Only these source-backed boundaries (and remark's own leaves) can authorize a
+// native text leaf. A filename prefix/suffix is never an alternative leaf.
+function feasibleTextLeaves(raw: string): Set<string> {
+  const leaves = new Set<string>([raw]);
+  const cells = raw.includes("|") ? raw.split(/[|\n]/u) : [raw];
+  for (const cell of cells) {
+    const variants = raw.includes("|") ? [cell, cell.trimStart(), cell.trimEnd(), cell.trim()] : [cell];
+    for (const value of variants) {
+      leaves.add(value);
+      const boundaries: Array<{ start: number; end: number; content?: string }> = nonPathTextRanges(value).map((range) => {
+        const word = value.slice(range.start, range.end);
+        // Source-backed native URL backpedal: balanced (...) stays in URLs,
+        // trailing sentence punctuation does not. Email/other URI words remain opaque.
+        const url = /^(?:https?:\/\/|ftp:\/\/|www\.)/iu.test(word) ?
+          /^(?:[^?!.,:;*_'"~()&]+|\([^)]*\)|&(?![a-zA-Z0-9]+;$)|[?!.,:;*_'"~)]+(?!$))+/u.exec(word)?.[0] ?? word : word;
+        return { start: range.start, end: range.start + url.length };
+      });
+      for (const match of value.matchAll(/~~(?=[^\s~])([^~]*?[^\s~])~~/gu)) {
+        boundaries.push({ start: match.index, end: match.index + match[0].length, content: match[1] });
+      }
+      boundaries.sort((a, b) => a.start - b.start);
+      let start = 0;
+      for (const boundary of boundaries) {
+        if (boundary.start < start) continue;
+        leaves.add(value.slice(start, boundary.start));
+        if (boundary.content !== undefined) {
+          for (const child of feasibleTextLeaves(boundary.content)) leaves.add(child);
+        }
+        start = boundary.end;
+      }
+      leaves.add(value.slice(start));
+    }
+  }
+  return leaves;
+}
+
+function pathLeafKey(kind: "text" | "codespan", raw: string): string { return `${kind}\0${raw}`; }
+
 
 function normalizedMarkdownSpan(value: string): string {
   return value.replace(/\r\n?/gu, "\n").replace(/\t/gu, "   ");
@@ -126,6 +185,23 @@ export function sourceLinkEvidence(markdown: string): SourceLinkEvidence {
     for (const child of node.children ?? []) collectLinks(child, insideLink || link);
   };
   const pathSpans: SourcePathSpan[] = [];
+  const lineStarts: number[] = [];
+  const blockedLines = [0];
+  let lineOffset = 0;
+  for (const line of markdown.split("\n")) {
+    lineStarts.push(lineOffset);
+    blockedLines.push(blockedLines.at(-1)! + Number(commandLike(line)));
+    lineOffset += line.length + 1;
+  }
+  const lineAt = (offset: number): number => {
+    let low = 0, high = lineStarts.length;
+    while (low + 1 < high) {
+      const middle = (low + high) >>> 1;
+      if (lineStarts[middle]! <= offset) low = middle;
+      else high = middle;
+    }
+    return low;
+  };
   const containsHtml = (node: TreeNode): boolean => node.type === "html" || (node.children ?? []).some(containsHtml);
   const collectPaths = (node: TreeNode, excluded = false): void => {
     // These native tokens never supply independently actionable leaf text.
@@ -138,54 +214,64 @@ export function sourceLinkEvidence(markdown: string): SourceLinkEvidence {
       const raw = normalizedMarkdownSpan(markdown.slice(start, end));
       const kind = node.type === "text" ? "text" : "codespan";
       const text = kind === "codespan" ? node.value ?? "" : normalizedMarkdownSpan(node.value ?? "");
-      const lineStart = markdown.lastIndexOf("\n", start - 1) + 1;
-      const nextLine = markdown.indexOf("\n", end);
-      const lines = markdown.slice(lineStart, nextLine < 0 ? markdown.length : nextLine).split(/\r?\n/u);
-      const allowed = !blocked && !lines.some(commandLike);
+      const firstLine = lineAt(start), lastLine = lineAt(Math.max(start, end - 1));
+      const allowed = !blocked && blockedLines[lastLine + 1] === blockedLines[firstLine];
       // Text entity/escape disagreement is deliberately not guessed. Inline
       // code uses remark's literal value and additionally requires native equality.
       const paths = !allowed ? [] : kind === "codespan" ? inlineCodePaths(text) :
         raw === text ? plainTextPaths(text) : [];
-      pathSpans.push({ kind, raw, text, paths });
+      pathSpans.push({ kind, raw, text, paths, allowed });
     }
     for (const child of node.children ?? []) collectPaths(child, blocked);
+  };
+  const pathIndex = new Map<string, SourcePathSpan | null>();
+  const pathWork: PathMatchWork = { commandLines: lineStarts.length, indexedCharacters: 0, queries: 0, cacheHits: 0, lookups: 0 };
+  const indexLeaf = (kind: "text" | "codespan", raw: string, text: string, paths: readonly PathSpan[]) => {
+    pathWork.indexedCharacters += raw.length;
+    const key = pathLeafKey(kind, raw);
+    const previous = pathIndex.get(key);
+    if (previous === null) return;
+    if (previous && (previous.text !== text || JSON.stringify(previous.paths) !== JSON.stringify(paths))) {
+      pathIndex.set(key, null);
+    } else if (!previous) pathIndex.set(key, { kind, raw, text, paths, allowed: true });
   };
   collectDefinitions(root);
   collectLinks(root);
   collectPaths(root);
-  return { destinations, explicitAutolinks, plainTextSpans, pathSpans };
+  for (const span of pathSpans) {
+    if (span.kind === "codespan") {
+      indexLeaf(span.kind, span.raw, span.text, span.paths);
+      continue;
+    }
+    for (const raw of feasibleTextLeaves(span.raw)) {
+      const candidates = plainTextPaths(raw);
+      // Blocked/semantic-disagreement leaves are indexed too: identical native
+      // evidence cannot borrow a valid occurrence elsewhere in the message.
+      const paths = span.allowed && span.raw === span.text ? candidates : [];
+      if (candidates.length) indexLeaf("text", raw, raw, paths);
+    }
+  }
+  return { destinations, explicitAutolinks, plainTextSpans, pathSpans, pathIndex,
+    pathQueries: new Map(), pathWork };
 }
 
-/** Match native leaves/subspans without borrowing authority from another occurrence. */
+/** One cached exact lookup per native leaf; never rescan the original source. */
 export function sourcePathMatches(
   evidence: SourceLinkEvidence,
   kind: "text" | "codespan",
   raw: string,
   text: string,
 ): readonly PathSpan[] {
-  if (!raw || !text || (kind === "text" && raw !== text)) return [];
-  let agreed: readonly PathSpan[] | undefined;
-  for (const span of evidence.pathSpans) {
-    if (span.kind !== kind) continue;
-    if (kind === "codespan") {
-      if (span.raw !== raw) continue;
-      if (span.text !== text) return [];
-      if (agreed && JSON.stringify(agreed) !== JSON.stringify(span.paths)) return [];
-      agreed = span.paths;
-      continue;
-    }
-    const opaque = nonPathTextRanges(span.raw);
-    for (let at = span.raw.indexOf(raw); at >= 0; at = span.raw.indexOf(raw, at + 1)) {
-      // Native autolink labels are excluded by the adapter, just like explicit
-      // labels; they cannot invalidate (or authorize) an independent prose leaf.
-      if (opaque.some((range) => at >= range.start && at + raw.length <= range.end)) continue;
-      const paths = span.paths.filter((path) => path.start >= at && path.end <= at + raw.length)
-        .map((path) => ({ ...path, start: path.start - at, end: path.end - at }));
-      if (agreed && JSON.stringify(agreed) !== JSON.stringify(paths)) return [];
-      agreed = paths;
-    }
-  }
-  return agreed ?? [];
+  if (!evidence.pathIndex.size || !raw || !text || (kind === "text" && raw !== text)) return [];
+  evidence.pathWork.queries += 1;
+  const key = `${pathLeafKey(kind, raw)}\0${text}`;
+  const cached = evidence.pathQueries.get(key);
+  if (cached) { evidence.pathWork.cacheHits += 1; return cached; }
+  evidence.pathWork.lookups += 1;
+  const leaf = evidence.pathIndex.get(pathLeafKey(kind, raw));
+  const paths = leaf && leaf.text === text ? leaf.paths : [];
+  evidence.pathQueries.set(key, paths);
+  return paths;
 }
 
 /** Derive remark's semantic spelling only for a native URL proven to occur in plain source text. */
