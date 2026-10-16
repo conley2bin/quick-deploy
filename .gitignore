@@ -3,7 +3,13 @@
 .vscode/
 LOG.md
 PROMPT.md
+# Regenerable Python bytecode and test/tool caches across modules
 __pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
 .pi-subagents/*
 .pi/
 .memory/
