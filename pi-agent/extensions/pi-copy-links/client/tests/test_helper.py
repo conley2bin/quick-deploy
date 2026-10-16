@@ -18,8 +18,9 @@ import tempfile
 import time
 import unittest
 from urllib.parse import quote, urlsplit
+from unittest.mock import patch
 
-from hostname_fixture import HELPER, LAPTOP_HOST, helper_command
+from hostname_fixture import COMPANY_HOST, HELPER, HOST_ROLES, LAPTOP_HOST, helper_command
 
 
 class IPv6HTTPServer(HTTPServer):
@@ -41,6 +42,7 @@ args = sys.argv[1:]
 state_path = Path(os.environ["FAKE_STATE"])
 log_path = Path(os.environ["FAKE_LOG"])
 state = json.loads(state_path.read_text())
+peer = json.loads(os.environ["FAKE_PEER"])
 with log_path.open("a") as log:
     log.write(json.dumps({"name": name, "args": args, "display": os.environ.get("DISPLAY"),
                           "authority": os.environ.get("XAUTHORITY")}) + "\n")
@@ -78,24 +80,25 @@ elif name == "xdg-settings":
     print(state.get("default_browser", "google-chrome.desktop"))
 elif name == "ssh":
     if "-G" in args:
+        assert args == ["-G", peer["alias"]], args
         if state.get("ssh_config_lines"):
             print(state["ssh_config_lines"])
         elif os.environ.get("FAKE_SSH_CONFIG"):
             import subprocess
             config = Path(os.environ["FAKE_SSH_CONFIG"])
-            query = subprocess.run([os.environ["REAL_SSH"], "-G", "-F", str(config), "conley-company"],
+            query = subprocess.run([os.environ["REAL_SSH"], "-G", "-F", str(config), peer["alias"]],
                                    text=True, capture_output=True, check=True)
             print(query.stdout, end="")
             if state.get("mutate_alias_after_snapshot"):
                 config.write_text(state["mutate_alias_after_snapshot"])
         else:
-            print("hostname 198.51.100.23\nuser conley\nport 22")
+            print("hostname {host}\nuser {user}\nport {port}".format(**peer))
     elif "-M" in args:
         assert "ClearAllForwardings=yes" in args and "BatchMode=yes" in args
         assert "ExitOnForwardFailure=yes" in args and "-fN" in args
         assert "StrictHostKeyChecking=yes" in args
-        assert "-R" not in args and args[-1] == "conley-company"
-        assert "HostName=198.51.100.23" in args and "User=conley" in args and "Port=22" in args
+        assert "-R" not in args and args[-1] == peer["alias"]
+        assert f"HostName={peer['host']}" in args and f"User={peer['user']}" in args and f"Port={peer['port']}" in args
         if os.environ.get("FAKE_SSH_CONFIG"):
             import subprocess
             expanded = [os.environ["REAL_SSH"], "-G", "-F", os.environ["FAKE_SSH_CONFIG"]]
@@ -119,7 +122,7 @@ elif name == "ssh":
         assert args[args.index("-F") + 1] == "/dev/null"
         assert "BatchMode=yes" in args
         assert "-R" not in args
-        assert args[-5:] == ["-p", "22", "-l", "conley", "198.51.100.23"]
+        assert args[-5:] == ["-p", str(peer["port"]), "-l", peer["user"], peer["host"]]
         op = args[args.index("-O") + 1]
         sock = args[args.index("-S") + 1]
         master = state["masters"].get(sock)
@@ -208,11 +211,15 @@ else:
 
 
 class HelperCase(unittest.TestCase):
+    HOSTNAME = LAPTOP_HOST
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
-        self.hostname = LAPTOP_HOST
+        self.hostname = self.HOSTNAME
+        self.peer = HOST_ROLES[self.HOSTNAME]
+        self.remote_code = "ssh-remote+" + self.peer["alias"]
         self.runtime = self.root / "runtime"
         self.runtime.mkdir(mode=0o700)
         self.bin = self.root / "bin"
@@ -231,6 +238,7 @@ class HelperCase(unittest.TestCase):
         self.env = os.environ.copy()
         self.env.update({"PATH": str(self.bin) + ":" + self.env["PATH"],
                          "FAKE_STATE": str(self.state_path), "FAKE_LOG": str(self.log_path),
+                         "FAKE_PEER": json.dumps(self.peer),
                          "TEST_RUNTIME": str(self.runtime), "DISPLAY": ":99",
                          "XAUTHORITY": "/wrong/ssh/authority", "HOME": str(self.root)})
 
@@ -292,6 +300,142 @@ class HelperCase(unittest.TestCase):
     def web(self, url, *, backend_host=None):
         return self.invoke({"action": "open-web", "url": url,
                             **({"backendHost": backend_host} if backend_host is not None else {})})
+
+    def test_os_hostname_selects_case_insensitive_peer_despite_inherited_environment(self):
+        self.hostname = self.HOSTNAME.swapcase()
+        other = COMPANY_HOST if self.HOSTNAME == LAPTOP_HOST else LAPTOP_HOST
+        self.env.update({"HOSTNAME": other, "SSH_CONNECTION": "203.0.113.9 1 203.0.113.8 22",
+                         "SSH_CLIENT": "203.0.113.9 1 22", "SSH_TTY": "/dev/pts/99"})
+        path = "/opposite-server/主机 空格%#?.py"
+        status, result = self.invoke({"action": "open-file", "kind": "file", "path": path, "line": 9})
+        self.assertEqual(status, 0, result)
+        self.assertEqual(self.calls("code")[-1]["args"],
+                         ["--remote", self.remote_code, "--new-window", "--goto", "--file-uri",
+                          "vscode-remote://" + self.remote_code + quote(path, safe="/") + ":9"])
+        self.assertEqual(self.web("https://localhost:8745/os-host?x=1#f", backend_host="::1")[0], 0)
+        self.assertEqual(self.calls("ssh", "-G")[-1]["args"], ["-G", self.peer["alias"]])
+        self.assertEqual(self.calls("ssh", "-M")[-1]["args"][-1], self.peer["alias"])
+        self.assertEqual(self.calls("xset")[-1]["display"], ":1")
+        self.assertEqual(self.calls("code")[-1]["display"], ":1")
+
+    def test_unknown_os_hostname_refuses_all_paired_work_before_gui_or_transport(self):
+        self.env["HOSTNAME"] = self.HOSTNAME
+        self.env["SSH_CONNECTION"] = "198.51.100.23 1234 203.0.113.64 22"
+        for hostname in ("unpaired-desktop", self.HOSTNAME + ".example", ""):
+            self.hostname = hostname
+            for request in ({"action": "open-file", "kind": "file", "path": "/server/file.py"},
+                            {"action": "open-file", "kind": "directory", "path": "/server/project.v2"},
+                            {"action": "open-web", "url": "http://127.0.0.1:8743/path"},
+                            {"action": "open-web", "url": "https://example.org/path"}):
+                with self.subTest(hostname=hostname, request=request):
+                    status, result = self.invoke(request)
+                    self.assertEqual((status, result["phase"], result["error"]["code"]),
+                                     (1, "result", "unsupported_host"), result)
+                    self.assertIn(repr(hostname), result["error"]["message"])
+                    self.assertNotIn("nonce", result)
+        self.assertEqual(self.logs(), [])
+        self.assertFalse((self.runtime / "pi-client-link-helper").exists())
+
+    def test_request_cannot_select_server_alias_or_remote_authority(self):
+        for key in ("serverAlias", "sshAlias", "hostname", "remoteAuthority"):
+            for request in ({"action": "open-file", "kind": "file", "path": "/server/file.py"},
+                            {"action": "open-web", "url": "http://127.0.0.1:8743/path"}):
+                with self.subTest(key=key, request=request):
+                    status, result = self.invoke({**request, key: "arbitrary-host"})
+                    self.assertEqual((status, result["error"]["code"]), (1, "invalid_request"))
+        self.assertEqual(self.logs(), [])
+
+    def test_remote_resources_ignore_same_spelling_local_decoys_and_preserve_literal_unicode(self):
+        local_folder = self.root / "Makefile"
+        local_folder.mkdir()
+        local_file = self.root / "project.v2"
+        local_file.write_text("desktop decoy, not the server resource")
+        local_link = self.root / "linked-resource"
+        local_link.symlink_to(local_folder, target_is_directory=True)
+        missing = self.root / "not-on-this-desktop" / "主机 空格 'quotes'%#?.py"
+        requests = [{"kind": "file", "path": str(local_folder)},
+                    {"kind": "directory", "path": str(local_file)},
+                    {"kind": "file", "path": str(local_link)},
+                    {"kind": "file", "path": str(missing), "line": 31, "column": 7}]
+        for target in requests:
+            with self.subTest(target=target):
+                before = len(self.calls("code"))
+                process = self.start({"action": "open-file", **target})
+                prepared = json.loads(process.stdout.readline())
+                self.assertEqual(set(prepared), {"version", "phase", "nonce", "ok", "action", "path", "kind"})
+                self.assertEqual((prepared["path"], prepared["kind"]), (target["path"], target["kind"]))
+                self.assertEqual(len(self.calls("code")), before)
+                status, result = self.finish(process, prepared)
+                self.assertEqual(status, 0, result)
+                self.assertEqual(set(result), {"version", "phase", "ok", "action", "path", "kind"})
+                expected = ["--remote", self.remote_code, "--new-window"]
+                uri = "vscode-remote://" + self.remote_code + quote(target["path"], safe="/")
+                if "line" in target:
+                    expected.append("--goto")
+                    uri += f":{target['line']}:{target['column']}"
+                expected.extend(["--file-uri" if target["kind"] == "file" else "--folder-uri", uri])
+                self.assertEqual(self.calls("code")[-1]["args"], expected)
+        self.assertFalse(self.calls("ssh"))
+        self.assertFalse(self.calls("google-chrome-stable"))
+        self.assertTrue(local_folder.is_dir())
+        self.assertEqual(local_file.read_text(), "desktop decoy, not the server resource")
+        self.assertFalse(missing.exists())
+
+    def test_file_target_and_command_never_stat_the_remote_path(self):
+        helper = runpy.run_path(str(HELPER))
+        with patch("socket.gethostname", return_value=self.hostname):
+            alias = helper["paired_server"]()
+        for kind in ("file", "directory"):
+            target = {"kind": kind, "path": "/server-only/不可读取%#?.data"}
+            with patch("os.stat", side_effect=AssertionError("remote path stat on desktop")), \
+                    patch("os.lstat", side_effect=AssertionError("remote path lstat on desktop")), \
+                    patch("os.access", side_effect=AssertionError("remote path access on desktop")):
+                helper["file_target"](target)
+                argv, result = helper["file_command"](target, alias)
+            self.assertEqual(argv[2], self.remote_code)
+            self.assertEqual(result["kind"], kind)
+
+    def test_tunnel_reuse_requires_selected_opposite_literal_identity(self):
+        url = "http://127.0.0.1:8743/paired?x=1#literal"
+        status, result = self.web(url)
+        self.assertEqual(status, 0, result)
+        record = next((self.runtime / "pi-client-link-helper").glob("e-*.json"))
+        original = json.loads(record.read_text())
+        identity = {key: self.peer[key] for key in ("host", "user", "port")}
+        self.assertEqual(original["identity"], identity)
+        self.assertEqual(self.web(url)[1]["tunnel"]["reused"], True)
+        for key, value in (("host", "192.0.2.99"), ("user", "other-user"), ("port", 2223)):
+            with self.subTest(field=key):
+                changed = {**original, "identity": {**identity, key: value}}
+                record.write_text(json.dumps(changed))
+                status, result = self.web(url)
+                self.assertEqual((status, result["error"]["code"]), (1, "tunnel_unverified"))
+                self.assertEqual(json.loads(record.read_text()), changed)
+        record.write_text(json.dumps(original))
+        # A role change in the same fixture runtime must not adopt the prior
+        # opposite server's live master or close its listeners.
+        other = COMPANY_HOST if self.HOSTNAME == LAPTOP_HOST else LAPTOP_HOST
+        self.hostname = other
+        self.env["FAKE_PEER"] = json.dumps(HOST_ROLES[other])
+        status, result = self.web(url)
+        self.assertEqual((status, result["error"]["code"]), (1, "tunnel_unverified"))
+        self.assertEqual(self.calls("ssh", "-G")[-1]["args"], ["-G", HOST_ROLES[other]["alias"]])
+        self.assertEqual(json.loads(record.read_text()), original)
+        self.assertEqual(len(self.calls("ssh", "-M")), 1)
+        self.assertEqual(len(self.calls("ssh", "forward")), 1)
+        self.assertEqual(len(self.calls("google-chrome-stable")), 2)
+        self.assertFalse(self.calls("ssh", "exit"))
+        self.assertEqual(json.loads(self.state_path.read_text())["masters"][original["socket"]]["alive"], True)
+
+    def test_port_conflict_diagnostic_names_desktop_without_assuming_laptop(self):
+        self.state["listeners"] = [{"host": "::1", "port": 8743, "pid": 999}]
+        self.save()
+        status, result = self.web("http://127.0.0.1:8743/conflict")
+        self.assertEqual((status, result["error"]["code"]), (1, "port_conflict"))
+        self.assertIn("desktop loopback port 127.0.0.1:8743", result["error"]["message"])
+        self.assertEqual(json.loads(self.state_path.read_text())["listeners"], self.state["listeners"])
+        self.assertFalse(self.calls("ssh", "-M"))
+        self.assertFalse(self.calls("google-chrome-stable"))
 
     def test_exact_origin_is_opened_and_reused_only_with_verified_record(self):
         original = "http://127.0.0.1:8743/a%2Fb?q=a%2Bb&x=1#frag%20raw"
@@ -432,20 +576,19 @@ class HelperCase(unittest.TestCase):
         self.assertIsNotNone(real_ssh)
         config = self.root / "ssh-config"
         identity_file = self.root / "configured-id"
-        config.write_text("Host conley-company\n"
-                          " HostName 198.51.100.23\n User conley\n Port 22\n"
+        config.write_text("Host {alias}\n HostName {host}\n User {user}\n Port {port}\n".format(**self.peer) +
                           f" IdentityFile {identity_file}\n")
         self.env.update({"FAKE_SSH_CONFIG": str(config), "REAL_SSH": real_ssh})
         self.state["mutate_alias_after_snapshot"] = (
-            "Host conley-company\n HostName 203.0.113.88\n User wrong\n Port 2200\n"
+            f"Host {self.peer['alias']}\n HostName 203.0.113.88\n User wrong\n Port 2200\n"
             f" IdentityFile {identity_file}\n")
         self.save()
         status, result = self.web("http://127.0.0.1:8743/pin")
         self.assertEqual(status, 0, result)
         effective = json.loads(self.state_path.read_text())["master_effective_config"]
-        self.assertIn("\nhostname 198.51.100.23\n", "\n" + effective)
-        self.assertIn("\nuser conley\n", "\n" + effective)
-        self.assertIn("\nport 22\n", "\n" + effective)
+        self.assertIn(f"\nhostname {self.peer['host']}\n", "\n" + effective)
+        self.assertIn(f"\nuser {self.peer['user']}\n", "\n" + effective)
+        self.assertIn(f"\nport {self.peer['port']}\n", "\n" + effective)
         self.assertIn("\nstricthostkeychecking true\n", "\n" + effective)
         self.assertIn(f"\nidentityfile {identity_file}\n", "\n" + effective)
         self.assertIn("HostName 203.0.113.88", config.read_text())
@@ -592,7 +735,7 @@ class HelperCase(unittest.TestCase):
         self.assertFalse(self.calls("google-chrome-stable"))
 
     def test_file_kind_uri_argv_preserves_remote_paths_and_location(self):
-        prefix = "vscode-remote://ssh-remote+conley-company"
+        prefix = "vscode-remote://" + self.remote_code
         path = "/company/not-on-laptop/-name with spaces 'quotes'.py"
         status, result = self.invoke({"version": 1, "action": "open-file", "kind": "file",
                                       "path": path, "line": 31, "column": 7})
@@ -600,7 +743,7 @@ class HelperCase(unittest.TestCase):
         self.assertEqual(result["path"], path)
         self.assertEqual(result["kind"], "file")
         self.assertEqual(self.calls("code")[-1]["args"],
-                         ["--remote", "ssh-remote+conley-company", "--new-window", "--goto",
+                         ["--remote", self.remote_code, "--new-window", "--goto",
                           "--file-uri", prefix + quote(path, safe="/") + ":31:7"])
         self.assertFalse(self.calls("ssh"))
         self.assertFalse(self.calls("google-chrome-stable"))
@@ -609,12 +752,12 @@ class HelperCase(unittest.TestCase):
             status, _ = self.invoke({"version": 1, "action": "open-file", "kind": "file", "path": path})
             self.assertEqual(status, 0)
             self.assertEqual(self.calls("code")[-1]["args"],
-                             ["--remote", "ssh-remote+conley-company", "--new-window", "--file-uri", prefix + path])
+                             ["--remote", self.remote_code, "--new-window", "--file-uri", prefix + path])
         status, _ = self.invoke({"version": 1, "action": "open-file", "kind": "directory",
                                   "path": "/company/project.v2"})
         self.assertEqual(status, 0)
         self.assertEqual(self.calls("code")[-1]["args"],
-                         ["--remote", "ssh-remote+conley-company", "--new-window", "--folder-uri",
+                         ["--remote", self.remote_code, "--new-window", "--folder-uri",
                           prefix + "/company/project.v2"])
         colon_path = "/company/report:2026#raw?.txt"
         status, _ = self.invoke({"version": 1, "action": "open-file", "kind": "file", "path": colon_path})
@@ -631,6 +774,8 @@ class HelperCase(unittest.TestCase):
             {"path": "/company/project.v2", "kind": "directory"},
             {"path": "/company/a b#c?.py", "kind": "file", "line": 31, "column": 7},
             {"path": "/company/report:2026#raw?.txt", "kind": "file"},
+            {"path": "/server-only/主机 空格 'quotes'%#?.py", "kind": "file", "line": 9},
+            {"path": "/server-only/项目 空格%#?.v2", "kind": "directory"},
         ]
         for target in requests:
             status, result = self.invoke({"version": 1, "action": "open-file", **target})
@@ -644,8 +789,10 @@ class HelperCase(unittest.TestCase):
                          [(target["kind"], target["path"]) for target in requests])
         self.assertEqual(resolved[4]["line"], 31)
         self.assertEqual(resolved[4]["column"], 7)
+        self.assertEqual(resolved[6]["line"], 9)
+        self.assertEqual(resolved[6]["column"], 1)  # Code defaults a line-only goto to column 1.
         self.assertEqual({resource["remoteAuthority"] for resource in resolved},
-                         {"ssh-remote+conley-company"})
+                         {self.remote_code})
 
     def test_colon_path_with_goto_and_directory_location_fail_before_code(self):
         for path in ("/company/report:2026", "/company/report:suffix.py"):
@@ -1241,6 +1388,11 @@ class HelperCase(unittest.TestCase):
         failed = subprocess.run([str(installer)], env=self.env, capture_output=True)
         self.assertNotEqual(failed.returncode, 0)
         self.assertEqual(target.read_text(), "foreign")
+
+
+class CompanyDesktopCase(HelperCase):
+    """Replay every helper contract on the company desktop targeting Y9000p."""
+    HOSTNAME = COMPANY_HOST
 
 
 if __name__ == "__main__":
