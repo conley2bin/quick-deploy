@@ -425,7 +425,8 @@ async function sshdHolder(candidate: ProcStat, leader: ProcStat, leaderUid: read
       await link(accessor, `/proc/${leader.pid}/fd/0`) !== tty ||
       !sameUid(await uid(candidate.pid, accessor), leaderUid)) return false;
   const args = await argv(candidate.pid, accessor);
-  if (!args || args.length !== 1) return false;
+  // sshd retitles argv and may leave trailing NUL padding, never extra arguments.
+  if (!args || args.slice(1).some((arg) => arg !== "")) return false;
   const number = ttyIndex(tty);
   return number !== undefined && new RegExp(`^(?:sshd|sshd-session): [^\\s/@]+@pts/${number}\\s*$`, "u").test(args[0]!);
 }
