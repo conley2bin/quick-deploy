@@ -7,7 +7,7 @@ import {
 import { webUrl, type OpenLifetime } from "./browser.ts";
 import { hasUriScheme, isLocalHref } from "./links.ts";
 import {
-  ActionStore, alignCodeBlocks, codeSyntax, sourceAutolinkDestination, sourceCodeBlocks, sourceLinkEvidence,
+  ActionStore, alignCodeBlocks, codeSyntax, sourceAutolinkDestination, sourceCodeBlocks, sourceLinkEvidence, sourcePathMatches,
   type Action, type ActionEntry, type ActionSlot, type CleanupIssue, type CodeContainer,
   type RenderedCodeBlock, type SourceCodeBlock, type SourceLinkEvidence,
 } from "./source.ts";
@@ -66,6 +66,8 @@ interface Frame {
   containers: CodeContainer[];
   sources: SourceCodeBlock[];
   sourceLinks: SourceLinkEvidence;
+  excludedInline: WeakSet<Token[]>;
+  inlineExcluded: number;
   native: RenderedCodeBlock[];
   codeEntries: ActionSlot[];
   links: Map<string, LinkCollection>;
@@ -816,7 +818,9 @@ function installOwnedAdapter(options: AdapterOptions, owners: HookOwners, clipbo
       decorationInvalid: false,
       containers: [],
       sources: [],
-      sourceLinks: { destinations: new Map(), explicitAutolinks: new Set(), plainTextSpans: [] },
+      sourceLinks: { destinations: new Map(), explicitAutolinks: new Set(), plainTextSpans: [], pathSpans: [] },
+      excludedInline: new WeakSet(),
+      inlineExcluded: 0,
       native: [],
       codeEntries: [],
       links: new Map(),
@@ -883,7 +887,7 @@ function installOwnedAdapter(options: AdapterOptions, owners: HookOwners, clipbo
         frame.sourceLinks = sourceLinkEvidence(source);
       } catch (error) {
         frame.sources = [];
-        frame.sourceLinks = { destinations: new Map(), explicitAutolinks: new Set(), plainTextSpans: [] };
+        frame.sourceLinks = { destinations: new Map(), explicitAutolinks: new Set(), plainTextSpans: [], pathSpans: [] };
         frame.failed = true;
         suspend(error);
       }
@@ -1000,7 +1004,49 @@ function installOwnedAdapter(options: AdapterOptions, owners: HookOwners, clipbo
     if (!enabled || !frame || frame.phase === "native" || !frame.assistant || frame.failed) {
       return original.inline.call(this, tokens, style);
     }
+    // Native recursively renders explicit-link labels. Their text must never
+    // gain an independent inferred path, even when identical prose is eligible.
+    if (frame.inlineExcluded || frame.excludedInline.has(tokens)) {
+      frame.inlineExcluded += 1;
+      try { return original.inline.call(this, tokens, style); }
+      finally { frame.inlineExcluded -= 1; }
+    }
     try {
+      for (const value of tokens) {
+        if ((value.type === "link" || value.type === "image") && value.tokens) frame.excludedInline.add(value.tokens);
+      }
+      const pathTokens = tokens.map((value) => {
+        if ((value.type !== "text" && value.type !== "codespan") || value.tokens?.length) return value;
+        const paths = sourcePathMatches(frame.sourceLinks, value.type, value.raw ?? "", value.text ?? "");
+        let text = "";
+        let offset = 0;
+        for (const path of paths) {
+          const key = JSON.stringify(["path", value.type, value.raw, value.text, path.start, path.end, path.href]);
+          let collected = frame.links.get(key);
+          if (frame.phase === "collect") {
+            if (collected) collected.count += 1;
+            else {
+              collected = { raw: value.raw ?? "", href: path.href, count: 1, decorated: 0,
+                action: { kind: "open", href: path.href } };
+              frame.links.set(key, collected);
+              frame.linkKeys.push(key);
+            }
+            continue;
+          }
+          if (!collected?.entry || collected.decorated >= collected.count) {
+            frame.decorationInvalid = true;
+            return value;
+          }
+          collected.decorated += 1;
+          const shown = value.text!.slice(path.start, path.end);
+          text += value.text!.slice(offset, path.start) + hyperlink(
+            pressedUrl === collected.entry.url ? emphasize(shown) : shown, collected.entry.url);
+          offset = path.end;
+        }
+        // Only a temporary payload changes: native owns styling, width and
+        // surrounding style restoration. Never mutate host-cached tokens/source.
+        return offset ? { ...value, text: text + value.text!.slice(offset) } : value;
+      });
       if (frame.phase === "collect") {
         for (const value of tokens) {
           if (value.type !== "link") continue;
@@ -1020,7 +1066,7 @@ function installOwnedAdapter(options: AdapterOptions, owners: HookOwners, clipbo
         return original.inline.call(this, tokens, style);
       }
 
-      const linked = tokens.map((value) => {
+      const linked = pathTokens.map((value) => {
         if (value.type !== "link") return value;
         const key = linkKey(value.raw ?? "", value.href ?? "");
         const collected = frame.links.get(key);

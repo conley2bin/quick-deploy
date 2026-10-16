@@ -640,6 +640,193 @@ test("recovery succeeds after failed later-turn probes and disposal cancels a pe
   weakRefAlwaysFails = false;
 });
 
+const withoutOsc8 = (text: string) => text.replace(/\x1b\]8;;[^\x1b\x07]*(?:\x1b\\|\x07)/gu, "");
+function markdownOwner(node: object): Markdown {
+  const visit = (component: object): Markdown | undefined => {
+    if (component instanceof Markdown) return component;
+    for (const child of (component as { children?: object[] }).children ?? []) {
+      const found = visit(child);
+      if (found) return found;
+    }
+    return undefined;
+  };
+  const found = visit(node);
+  assert.ok(found, "assistant Markdown owner");
+  return found;
+}
+
+function pathAt(tui: TuiAltScreen, label: string, occurrence = 0) {
+  const rows = screen(tui).map(stripTerminalSequences);
+  const hits = rows.flatMap((line, y) => [...line.matchAll(new RegExp(label.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&"), "gu"))]
+    .map((match) => ({ x: visibleWidth(line.slice(0, match.index)), y })));
+  const point = hits[occurrence];
+  assert.ok(point, `Missing display ${label}: ${rows.join("\n")}`);
+  const url = getOsc8LinkAtColumn(screen(tui)[point.y]!, point.x);
+  assert.ok(url?.startsWith("pi-copy://"), `Missing action on ${label}`);
+  return { ...point, url };
+}
+
+test("automatic paths use counted opaque actions in prose, code, nested styles, tables and repeats", async () => {
+  const filename = "state43_real_grid_1080p.mp4";
+  const source = `Open ${filename} and reports/\n\n**src/main.ts**\n\n> - \`notes.pdf\`\n\n` +
+    `| output |\n|---|\n| \`${filename}\` |\n| \`${filename}\` |`;
+  const before = weakRefCount;
+  const f = fixture(source);
+  try {
+    for (const name of [filename, "reports/", "src/main.ts", "notes.pdf", filename]) {
+      click(f.terminal, pathAt(f.tui, name, name === filename && f.opened.length ? 1 : 0), 16);
+      await tick();
+    }
+    assert.deepEqual(f.opened, [`./${filename}`, "./reports/", "./src/main.ts", "./notes.pdf", `./${filename}`]);
+    assert.equal(pathAt(f.tui, filename, 1).url, pathAt(f.tui, filename, 2).url,
+      "repeated identical table cells share their existing counted evidence entry");
+    const urls = targets(f.tui, "pi-copy://").map((point) => point.url);
+    for (let pass = 0; pass < 12; pass++) f.tui.renderNow();
+    assert.deepEqual(targets(f.tui, "pi-copy://").map((point) => point.url), urls);
+    assert.ok(weakRefCount - before <= urls.length + 1, "no table measurement/action churn");
+    assert.deepEqual(f.errorNotices, []);
+    assert.deepEqual(f.nativeOpened, []);
+  } finally { f.close(); }
+});
+
+test("automatic paths preserve exact native ANSI styles, wrapping, source and cached token bytes", () => {
+  for (const source of [
+    "Open reports/result.png and `state43_real_grid_1080p.mp4`.",
+    "# reports/header.png\n\n**reports/bold.png** *reports/italic.png* ~~reports/deleted.png~~",
+    "> **reports/quote.png** and `reports/my video.mp4`\n\n- reports/list.png",
+    "| file |\n|---|\n| `reports/中文#1?.png` |\n| reports/wrapped_long_filename.mp4 |",
+  ]) {
+    const original = message(source);
+    const originalBytes = JSON.stringify(original);
+    const native = new AssistantMessageComponent(original, false, undefined, "Thinking", 1);
+    const f = fixture(source);
+    try {
+      for (const width of [64, 32, 12, 7]) {
+        const enhanced = f.component.render(width);
+        assert.deepEqual(enhanced.map(withoutOsc8), native.render(width), `${width}: ${source}`);
+        assert.ok(enhanced.every((line) => visibleWidth(line) <= width));
+      }
+      assert.equal(JSON.stringify(original), originalBytes, "message/model content is untouched");
+      const owner = markdownOwner(f.component);
+      const cache = owner as unknown as { text: string; cachedTokens?: WeakRef<{ source: string; tokens: unknown[] }> };
+      assert.equal(cache.text, source);
+      const record = cache.cachedTokens?.deref();
+      if (record) {
+        assert.equal(record.source, source.replace(/\t/gu, "   "));
+        assert.doesNotMatch(JSON.stringify(record.tokens), /pi-copy:\/\/|\\u001b/iu, "no OSC8 injection in host token cache");
+      }
+    } finally { f.close(); }
+  }
+});
+
+test("automatic source semantics revalidate even when Tab-normalized native tokens are reused", () => {
+  const source = "`reports/a\tb.png`";
+  const f = fixture(source);
+  try {
+    const owner = markdownOwner(f.component);
+    const cache = owner as unknown as { cachedTokens?: WeakRef<{ source: string; tokens: unknown[] }> };
+    const before = cache.cachedTokens?.deref?.();
+    assert.equal(targets(f.tui, "pi-copy://").length, 0, "literal Tab is not silently changed to a filename space");
+    owner.setText(source.replace("\t", "   "));
+    f.tui.renderNow();
+    assert.equal(targets(f.tui, "pi-copy://").length, 1, "source now genuinely contains three filename spaces");
+    const after = cache.cachedTokens?.deref?.();
+    if (before && after) assert.equal(after.tokens, before.tokens, "host reused normalized tokens");
+    owner.setText(source);
+    f.tui.renderNow();
+    assert.equal(targets(f.tui, "pi-copy://").length, 0, "same display/token spelling cannot authorize changed source");
+  } finally { f.close(); }
+});
+
+test("automatic path gesture preserves ordinary selection and uses one live click-time cwd", async () => {
+  const selected: string[] = [];
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  const f = fixture("`state43_real_grid_1080p.mp4`", false, undefined, undefined, {
+    cwd: "/render-cwd", copySelection: async (text) => { selected.push(text); return true; },
+    open: async () => { await gate; },
+  });
+  try {
+    const point = pathAt(f.tui, "state43_real_grid_1080p.mp4");
+    f.terminal.input(sgr(point.x, point.y));
+    f.terminal.input(sgr(point.x + 6, point.y, 32));
+    f.terminal.input(sgr(point.x + 6, point.y, 0, "m"));
+    await tick();
+    assert.equal(selected.at(-1), "state43");
+    click(f.terminal, point); await tick();
+    assert.equal(f.openRequests.length, 0);
+    f.terminal.input(sgr(point.x, point.y, 16));
+    f.terminal.input(sgr(point.x + 2, point.y, 48));
+    f.terminal.input(sgr(point.x, point.y, 16, "m"));
+    await tick();
+    assert.equal(f.openRequests.length, 0, "Ctrl-drag is not activation");
+    f.setCwd("/click-cwd");
+    click(f.terminal, point, 16); await tick();
+    assert.equal(f.openRequests.length, 1);
+    assert.equal(f.openRequests[0]!.cwd, "/click-cwd");
+    assert.equal(f.openRequests[0]!.href, "./state43_real_grid_1080p.mp4");
+    f.setCwd("/later-cwd");
+    assert.equal(f.openRequests[0]!.cwd, "/click-cwd");
+    release(); await tick();
+    assert.deepEqual(f.nativeOpened, []);
+  } finally { release?.(); f.close(); }
+});
+
+test("automatic literal paths open exact filename data, while explicit selectors retain their grammar", async () => {
+  const source = "`数据/图%20#L12?.png`\n\n`./file.ts:12:3`\n\n[SELECTOR](./file.ts:12:3)";
+  const f = fixture(source);
+  try {
+    for (const point of targets(f.tui, "pi-copy://")) { click(f.terminal, point, 16); await tick(); }
+    assert.deepEqual(f.opened, ["./%E6%95%B0%E6%8D%AE/%E5%9B%BE%2520%23L12%3F.png", "./file.ts%3A12%3A3", "./file.ts:12:3"]);
+  } finally { f.close(); }
+});
+
+test("automatic recognition never descends into commands, URLs, explicit labels, HTML, images or code", async () => {
+  for (const source of ["`cat reports/out.png`", "cat reports/out.png", "custom --out reports/out.png",
+    "`ffmpeg -i in.mp4 out.mp4`", "`python src/main.py`", "<span>reports/out.png</span>",
+    "![reports/out.png](image.png)", "```sh\nreports/out.png\n```", "    reports/out.png",
+    "and/or input/output v1.2.3 3.14 example.com", "`~/out.png`", "`javascript:out.png`", "`a.png + b.png`"]) {
+    const f = fixture(source);
+    try {
+      const points = targets(f.tui, "pi-copy://");
+      assert.equal(points.length, source.startsWith("```") || source.startsWith("    ") ? 1 : 0, source);
+      assert.deepEqual(f.openRequests, []);
+    } finally { f.close(); }
+  }
+  const f = fixture("reports/out.png\n\n[**reports/out.png** `reports/out.png`](https://example.com/out.png)\n\nhttps://example.com/reports/out.png");
+  try {
+    const points = targets(f.tui, "pi-copy://");
+    assert.equal(points.length, 3, "one inferred path plus two unchanged explicit/native web links");
+    for (const point of points) { click(f.terminal, point, 16); await tick(); }
+    assert.deepEqual(f.opened, ["./reports/out.png", "https://example.com/out.png", "https://example.com/reports/out.png"]);
+  } finally { f.close(); }
+});
+
+test("automatic owner mutation synchronously retires superseded actions and disposal aborts opens", async () => {
+  let lifetime: OpenLifetime | undefined;
+  const f = fixture("first.png", false, undefined, undefined, { open: async (_href, _cwd, alive) => { lifetime = alive; } });
+  try {
+    const stale = pathAt(f.tui, "first.png");
+    const oldScreen = [...screen(f.tui)];
+    const owner = markdownOwner(f.component);
+    owner.setText("second.png");
+    f.tui.renderNow();
+    const fresh = pathAt(f.tui, "second.png");
+    assert.notEqual(stale.url, fresh.url);
+    const state = f.tui as unknown as { previousScreen: string[] };
+    state.previousScreen = oldScreen;
+    click(f.terminal, stale, 16); await tick();
+    assert.equal(f.openRequests.length, 0, "old owner href cannot be activated from stale frame");
+    f.tui.renderNow(true);
+    click(f.terminal, pathAt(f.tui, "second.png"), 16); await tick();
+    assert.equal(f.openRequests[0]!.href, "./second.png");
+    assert.ok(lifetime?.isCurrent());
+    f.adapter.dispose();
+    assert.equal(lifetime?.signal.aborted, true);
+    assert.equal(screen(f.tui).some((line) => line.includes("pi-copy://")), false);
+  } finally { f.close(); }
+});
+
 test("local links use live activation cwd once and bind the accepted request across awaits", async () => {
   let release!: () => void;
   const gate = new Promise<void>((resolve) => { release = resolve; });

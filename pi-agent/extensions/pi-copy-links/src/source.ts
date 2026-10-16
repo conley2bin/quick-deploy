@@ -2,6 +2,7 @@ import { randomBytes } from "node:crypto";
 import type { Code } from "mdast";
 import remarkParse from "remark-parse";
 import { unified } from "unified";
+import { commandLike, inlineCodePaths, nonPathTextRanges, plainTextPaths, type PathSpan } from "./paths.ts";
 
 const parser = unified().use(remarkParse);
 const PREFIX_REGISTRY = Symbol.for("pi-copy-links:reserved-prefixes");
@@ -61,6 +62,13 @@ interface TreeNode {
   };
 }
 
+interface SourcePathSpan {
+  readonly kind: "text" | "codespan";
+  readonly raw: string;
+  readonly text: string;
+  readonly paths: readonly PathSpan[];
+}
+
 export interface SourceLinkEvidence {
   /** Pi-normalized native raw token spelling -> possible remark semantic hrefs. */
   readonly destinations: ReadonlyMap<string, ReadonlySet<string>>;
@@ -68,6 +76,8 @@ export interface SourceLinkEvidence {
   readonly explicitAutolinks: ReadonlySet<string>;
   /** Plain source text spans that can prove a native bare HTTP(S) autolink. */
   readonly plainTextSpans: readonly string[];
+  /** Native leaves must agree with every matching source occurrence. */
+  readonly pathSpans: readonly SourcePathSpan[];
 }
 
 function normalizedMarkdownSpan(value: string): string {
@@ -115,9 +125,67 @@ export function sourceLinkEvidence(markdown: string): SourceLinkEvidence {
     }
     for (const child of node.children ?? []) collectLinks(child, insideLink || link);
   };
+  const pathSpans: SourcePathSpan[] = [];
+  const containsHtml = (node: TreeNode): boolean => node.type === "html" || (node.children ?? []).some(containsHtml);
+  const collectPaths = (node: TreeNode, excluded = false): void => {
+    // These native tokens never supply independently actionable leaf text.
+    if (["link", "linkReference", "image", "imageReference", "code", "html"].includes(node.type)) return;
+    const blocked = excluded || (["paragraph", "heading"].includes(node.type) && containsHtml(node));
+    if (node.type === "text" || node.type === "inlineCode") {
+      const start = node.position?.start.offset;
+      const end = node.position?.end.offset;
+      if (start === undefined || end === undefined) throw new Error("remark path leaf has no source span");
+      const raw = normalizedMarkdownSpan(markdown.slice(start, end));
+      const kind = node.type === "text" ? "text" : "codespan";
+      const text = kind === "codespan" ? node.value ?? "" : normalizedMarkdownSpan(node.value ?? "");
+      const lineStart = markdown.lastIndexOf("\n", start - 1) + 1;
+      const nextLine = markdown.indexOf("\n", end);
+      const lines = markdown.slice(lineStart, nextLine < 0 ? markdown.length : nextLine).split(/\r?\n/u);
+      const allowed = !blocked && !lines.some(commandLike);
+      // Text entity/escape disagreement is deliberately not guessed. Inline
+      // code uses remark's literal value and additionally requires native equality.
+      const paths = !allowed ? [] : kind === "codespan" ? inlineCodePaths(text) :
+        raw === text ? plainTextPaths(text) : [];
+      pathSpans.push({ kind, raw, text, paths });
+    }
+    for (const child of node.children ?? []) collectPaths(child, blocked);
+  };
   collectDefinitions(root);
   collectLinks(root);
-  return { destinations, explicitAutolinks, plainTextSpans };
+  collectPaths(root);
+  return { destinations, explicitAutolinks, plainTextSpans, pathSpans };
+}
+
+/** Match native leaves/subspans without borrowing authority from another occurrence. */
+export function sourcePathMatches(
+  evidence: SourceLinkEvidence,
+  kind: "text" | "codespan",
+  raw: string,
+  text: string,
+): readonly PathSpan[] {
+  if (!raw || !text || (kind === "text" && raw !== text)) return [];
+  let agreed: readonly PathSpan[] | undefined;
+  for (const span of evidence.pathSpans) {
+    if (span.kind !== kind) continue;
+    if (kind === "codespan") {
+      if (span.raw !== raw) continue;
+      if (span.text !== text) return [];
+      if (agreed && JSON.stringify(agreed) !== JSON.stringify(span.paths)) return [];
+      agreed = span.paths;
+      continue;
+    }
+    const opaque = nonPathTextRanges(span.raw);
+    for (let at = span.raw.indexOf(raw); at >= 0; at = span.raw.indexOf(raw, at + 1)) {
+      // Native autolink labels are excluded by the adapter, just like explicit
+      // labels; they cannot invalidate (or authorize) an independent prose leaf.
+      if (opaque.some((range) => at >= range.start && at + raw.length <= range.end)) continue;
+      const paths = span.paths.filter((path) => path.start >= at && path.end <= at + raw.length)
+        .map((path) => ({ ...path, start: path.start - at, end: path.end - at }));
+      if (agreed && JSON.stringify(agreed) !== JSON.stringify(paths)) return [];
+      agreed = paths;
+    }
+  }
+  return agreed ?? [];
 }
 
 /** Derive remark's semantic spelling only for a native URL proven to occur in plain source text. */

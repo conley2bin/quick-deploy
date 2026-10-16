@@ -98,12 +98,19 @@ url = 'https://example.com/copy-links?a=1&b=two#fragment'
 for name, content in [('model sample.3mf', '3mf'), ('diagram.svg', '<svg/>'), ('data.json', '{\n  "ok": true\n}')]:
     (root / name).write_text(content)
 (root / 'sample-dir').mkdir()
+(root / 'reports').mkdir()
+auto_filename = 'state43_real_grid_1080p.mp4'
+auto_relative = 'reports/中文%#?.png'
+(root / auto_filename).write_bytes(b'fixture mp4 path; no media player is launched')
+(root / auto_relative).write_bytes(b'fixture image path')
 text = ('Native copy test\n\n- ```make\n  ' + code.replace('\n', '\n  ') + '\n  ```\n\n'
         '[WEB_LINK](' + url + ')\n\n'
         '[MODEL_3MF](model%20sample.3mf)\n\n'
         '[DIAGRAM_SVG](diagram.svg)\n\n'
         '[DATA_JSON](data.json#L2)\n\n'
-        '[SAMPLE_DIR](sample-dir)')
+        '[SAMPLE_DIR](sample-dir)\n\n'
+        'AUTO_MP4 `' + auto_filename + '`\n'
+        'AUTO_PNG ' + auto_relative)
 now = '2026-01-01T00:00:00.000Z'
 usage = {k: 0 for k in ['input', 'output', 'cacheRead', 'cacheWrite', 'totalTokens']}
 usage['cost'] = {k: 0 for k in ['input', 'output', 'cacheRead', 'cacheWrite', 'total']}
@@ -288,7 +295,7 @@ try:
         refusal_body = '没有受支持的输入来源契'.encode()  # final diagnostic wraps before “约”
         wait_for(lambda: refusal_prefix in wire and refusal_body in wire,
                  'unattributed harness PTY refusal')
-        for label in ('MODEL_3MF', 'DIAGRAM_SVG', 'DATA_JSON', 'SAMPLE_DIR'):
+        for label in ('MODEL_3MF', 'DIAGRAM_SVG', 'DATA_JSON', 'SAMPLE_DIR', 'AUTO_MP4', 'AUTO_PNG'):
             click(target_by_label(after_copy, label), 16)
         drain(0.2)
         assert records('google-chrome-stable') == [] and records('code') == []
@@ -305,13 +312,23 @@ try:
             ('DIAGRAM_SVG', ['--new-window', '--', str(root / 'diagram.svg')]),
             ('DATA_JSON', ['--new-window', '--goto', '--', str(root / 'data.json') + ':2']),
             ('SAMPLE_DIR', ['--new-window', '--', str(root / 'sample-dir')]),
+            ('AUTO_MP4', ['--new-window', '--', str(root / auto_filename)]),
+            ('AUTO_PNG', ['--new-window', '--', str(root / auto_relative)]),
         ]
         for label, expected in local_expectations:
+            before_local_click = records('code')
+            click(target_by_label(after_copy, label))
+            assert records('code') == before_local_click, 'ordinary file click opened Code: ' + label
             click(target_by_label(after_copy, label), 16)
             wait_for(lambda: len(records('code')) >= local_expectations.index((label, expected)) + 1,
                      'Ctrl-click Code handoff ' + label)
             assert records('code')[-1] == {'argv': expected}
     assert records('xdg-open') == [], 'forbidden xdg-open fallback ran'
+    path_target = target_by_label(after_copy, 'AUTO_MP4')
+    before_path_drag = records('code')
+    send(mouse_sequence(path_target, 16) + mouse_sequence(dict(path_target, x=path_target['x'] + 2), 48) +
+         mouse_sequence(path_target, 16, 'm'))
+    assert records('code') == before_path_drag, 'Ctrl-drag on automatic path opened Code'
     # Exercise tmux's lost-press modifier transition while dragging away and back.
     # Forwarded motion must prevent the release-recovery path from opening a URL.
     click(link)
@@ -346,6 +363,7 @@ try:
     restored = snapshot('reloaded')
     button_after_reload = target_by_label(restored, '[复制]')
     assert button_after_reload['url'] != button['url'], 'reload reused old action registry'
+    assert target_by_label(restored, 'AUTO_MP4')['url'] != path_target['url'], 'reload retained inferred path action'
     click(button_after_reload)
     wait_for(lambda: len(clipboard()) > len(before_reload), 'copy after /reload')
     assert clipboard() == before_reload + [code]
@@ -358,6 +376,21 @@ try:
     wait_for(lambda: len(clipboard()) > len(before_narrow), 'copy after narrow resize')
     assert clipboard() == before_narrow + [code]
     button_copies.append(clipboard()[-1])
+    # Copy feedback can recompose the frame. Use current cells, and the same
+    # inert ordinary / Ctrl sequence as above: tmux 3.4 can drop a modifier-
+    # transition press, whose existing recovery requires that exact prior cell.
+    narrow_after_copy = snapshot('narrow-after-copy')
+    for label, expected in [('DIAGRAM_SVG', str(root / 'diagram.svg')), ('AUTO_MP4', str(root / auto_filename))]:
+        point = target_by_label(narrow_after_copy, label)
+        before_narrow_click = records('code')
+        click(point)
+        assert records('code') == before_narrow_click, 'ordinary narrow file click opened Code'
+        click(point, 16)
+        if not options.osc52:
+            wait_for(lambda: len(records('code')) == len(before_narrow_click) + 1, 'narrow file click ' + label)
+            assert records('code')[-1] == {'argv': ['--new-window', '--', expected]}
+        else:
+            assert records('code') == []
     send('/fixture-quit\r')
     def stopped():
         global exited
@@ -375,6 +408,7 @@ try:
     result = {'result': 'passed', 'transport': 'OSC52' if options.osc52 else 'tmux → wl-copy stdin' if options.tmux else 'wl-copy stdin',
               'regularToFullscreen': options.regular_start,
               'buttonCopies': button_copies, 'clipboardWrites': clipboard(), 'nativeSelection': native_selection,
+              'automaticPaths': [auto_filename, auto_relative],
               'browser': records('google-chrome-stable'), 'code': records('code'),
               'browserDetection': records('xdg-settings'), 'forbiddenXdgOpen': records('xdg-open'),
               'scratch': str(root)}

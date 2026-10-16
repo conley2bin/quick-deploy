@@ -3,7 +3,7 @@
 给 Pi **fullscreen 模式**的助手 Markdown 增加两类受控操作：
 
 - 代码块右下角 **[复制]**：左键复制逻辑源文，保留代码自身的缩进、Tab、空行和行尾空格；不复制围栏、Pi 显示缩进、右侧补空格或屏幕折行。
-- Markdown 链接：仅 **Ctrl + 鼠标左键**激活；普通点击不打开链接，拖选继续交给 Pi。公司本机点击让 Chrome/VS Code 显式请求新窗口；来自已验证 conley-Y9000p SSH 输入（直接 PTY 或 tmux 客户端）的网页点击解析 Y9000p 默认浏览器并显式请求新窗口，使 GNOME 把新 toplevel 放在用户当前 workspace；公司文件则在 Y9000p 的 VS Code Remote-SSH 新窗口打开。
+- Markdown 链接及可明确识别的文件路径（正文或行内代码）：仅 **Ctrl + 鼠标左键**激活；普通点击不打开链接，拖选继续交给 Pi。公司本机点击让 Chrome/VS Code 显式请求新窗口；来自已验证 conley-Y9000p SSH 输入（直接 PTY 或 tmux 客户端）的网页点击解析 Y9000p 默认浏览器并显式请求新窗口，使 GNOME 把新 toplevel 放在用户当前 workspace；公司文件则在 Y9000p 的 VS Code Remote-SSH 新窗口打开。
 
 按下可执行目标时会反色，拖走、失焦、弹窗、滚动、尺寸变化或修饰键不匹配都会取消。只有上述 Y9000p 网页路径通过创建新 toplevel 来获得当前 workspace 放置；其他远端 X11/桌面路径不作 workspace 承诺。
 
@@ -14,7 +14,7 @@
 1. 在 Pi **空闲时**执行 `/reload`，确认 `/settings` 中 **TUI mode = fullscreen**；`/copy-links` 查看扩展状态。也可用 `pi --tui-mode fullscreen` 启动。
 2. 直接在 Y9000p 的 SSH shell 中启动公司 Pi 即可，无需 tmux。扩展从 Pi 的 fd0 PTY 找到实际主端持有者；只有该 PTY 由匹配 `conley-Y9000p` 字面地址/端口的 sshd 会话持有时才走笔记本助手。只有输入契约已核实的 Codoxear broker 和 util-linux `/usr/bin/script` 可作为 relay：还必须确认其 fd0 是不同 PTY、该 PTY 同时是进程的控制终端，且进程组是前台组，才沿 fd0 继续解析。因此直接 SSH→Codoxear→Pi 和 tmux→`script`→Pi 保留外层来源；其他“看起来像 relay”的程序一律不推断。生产 Codoxear `keys` 路径只发送 `Esc` 中断，Web 消息走 bracketed paste 且不生成终端鼠标事件，因此不需要修改 Codoxear。
 3. tmux 只用于一个 pane 可由多个客户端输入的场景。此时保留逐次鼠标事件的 client-PID 标记，并要求按下/松开来自同一已验证客户端。公司本机目前只支持 **Ghostty 自身**持有 Unix socket、且 peer 是本地 Wayland/X server socket 的情形；不从父/祖先继承显示权限。本机实际安装/工作流只使用 Ghostty，审阅接受其 GTK4 单一 default display 契约。gnome-terminal-server、kitty、alacritty、konsole、xterm、foot、tilix、xfce4-terminal 和 wezterm-gui 的逐窗口/复用输入契约未验证，都会带诊断拒绝；特别是 xfce4-terminal 可在同一进程保留本地 X 连接而把目标窗口放到转发 X，WezTerm 可接收远端 mux 鼠标事件。VS Code integrated terminal/ptyHost、ttyd/网络 PTY server、未知 GUI、sudo/su、非 tmux multiplexer 和嵌套 tmux 也明确拒绝，不会退回公司 GUI。
-4. 对仍有效的助手 Markdown 链接按 **Ctrl + 鼠标左键**；打开动作跟随发出点击的桌面。公司回环网址在 Y9000p 需要助手自有的 SSH 本地转发，浏览器仍收到原网址。
+4. 对仍有效的助手 Markdown 链接或下述文件路径按 **Ctrl + 鼠标左键**；打开动作跟随发出点击的桌面。公司回环网址在 Y9000p 需要助手自有的 SSH 本地转发，浏览器仍收到原网址。
 5. 若报告 `port_conflict`，先在 Y9000p 查明占用原端口的监听器及其所有者。例如 `ss -H -ltnp '( sport = :8795 )'`，再将输出中的 PID 交给 `ps -fp` 辨认旧转发；确认有无依赖它的标签页，**取得所有者同意后**才显式关闭旧转发并重试原链接。已有手动 `ssh -N -L 8795:127.0.0.1:8795 ...` 会占用 Y9000p 的 8795；助手不会接管或自动终止它，也不会改端口打开替代网址。
 
 ## 安装和启用
@@ -47,7 +47,26 @@ bash pi-agent/extensions/pi-copy-links/client/install.sh --replace
 
 ## 链接目标
 
-扩展只处理助手消息中真实的 Markdown `link` token，包括显式链接、引用链接和 Pi 原生 HTTP(S) autolink。它不从裸文件路径文字、代码 span、代码块、图片或任意 OSC 8 文件 URL 推断目标。
+扩展处理助手消息中的显式/引用 Markdown 链接、Pi 原生 HTTP(S) autolink，以及正文和行内代码中有明确文件证据的 POSIX 路径。它只给当前渲染增加不含目标内容的私有动作；消息、模型上下文、显示文字和原生样式不变，不增加下划线或打印 URI。普通点击/拖选仍归 Pi，只有 Ctrl+左键打开。
+
+### 不写 Markdown 链接也可点击的路径
+
+| 助手输出示例（正文或行内代码） | 自动目标 |
+|---|---|
+| `state43_real_grid_1080p.mp4`、`chart.png`、`notes.pdf`、`src/main.ts` | 普通文件名、带目录的文件名 |
+| `data.jsonl`、`dataset.parquet`、`weights.pt`、`model.3mf` | 常见数据、模型和媒体产物 |
+| `README`、`LICENSE`、`Dockerfile`、`Makefile`、`.gitignore` | 明确的常见文件 basename |
+| `/tmp/output`、`./output`、`../output` | 绝对或显式相对路径，不要求扩展名 |
+| `reports/`、`src/components/`、`./`、`../` | 目录拼写；无根、无扩展名的目录需尾斜杠 |
+| 行内代码中的 `reports/my video.mp4`、`/tmp/中文 文件.pdf` | 完整、带路径前缀的含空格文件名 |
+
+例如正文 `Open reports/result.png`、`输出文件 reports/result.png` 仍可点击其中的路径。普通文字只扫描完整的标点分隔词；句尾 `.`、`!`、`:` 视为标点。行内代码必须整体是一个路径，不会从 `ffmpeg -i in.mp4 out.mp4`、`cat reports/out.png`、`python src/main.py` 中抽取文件名。带 shell prompt、赋值、选项、管道/重定向等命令语法或已知命令起始的正文行也不扫描；这是语法识别，不执行命令、不在渲染时 `stat`。
+
+没有足够语法证据时保持文字：`and/or`、`input/output`、`src/components`、`v1.2.3`、`3.14`、`example.com`、未知扩展名和无路径前缀的含空格短语都不猜。常见扩展名/basename 集合见 [`src/paths.ts`](src/paths.ts)；不在集合中的文件可写成 `./name.custom` 或显式 Markdown 链接。`~/`、`~user/` 不自动展开；请写 Pi/公司侧绝对路径。路径、命令与自然语言在个别拼写上不可区分时，使用显式链接表达意图。
+
+URL/email 的子串、显式链接标签、图片 alt、raw HTML 所在段落、围栏和缩进代码块都不自动推断文件。Markdown 转义/实体导致源文与 native 文字不一致，或重复 native 片段可能对应不可点击的命令/HTML 源文时，不借其他位置的文件名猜目标。宽度极窄以致 native table 回退原始表格文字时，也不会凭空增加命中点。
+
+**自动路径的 `%`、`#`、`?`、`:` 是文件名字面数据。** 例如行内代码 `图%20#L12?.png` 指向名称确实包含 `%20#L12?` 的 PNG；`./file.ts:12` 指向文件名 `file.ts:12`，不会跳到第 12 行。需要行列导航时使用显式链接 `[定位](./file.ts:12:3)` 或 `[定位](file.ts#L12)`，沿用下面的 href 规则。scheme-shaped 的裸 `file.ts:12` 不自动识别，含冒号文件可加 `./`。自动目标先按字面数据编码一次，再交给现有点击时解析器；不会生成 terminal-native `file:` / `vscode:` URI。
 
 ### 网页
 
@@ -69,6 +88,8 @@ bash pi-agent/extensions/pi-copy-links/client/install.sh --replace
 ### 公司文件和目录
 
 相对路径在**经过验证的 Ctrl+左键松开时**读取一次当前 Pi `ctx.cwd`，随后整次异步打开都使用这个快照。渲染时目录、扩展源码目录和 `process.cwd()` 都不参与解析。
+
+下面的表格和 percent/selector 规则针对**显式 Markdown href**；自动路径的字面数据规则见上节，二者不混用。
 
 | Markdown href | 含义 |
 |---|---|
@@ -111,6 +132,8 @@ code --new-window --goto -- /absolute/path:12:3
 
 Pi 在 lexing 前把 Tab 展开成三个空格，native href 还可能保留 character-reference 拼写。扩展同时用 remark 读取源文 link/linkReference span（引用采用第一条 definition），把 raw span 按 Pi 的 Tab/换行规则归一化后与 native `[raw, href]` 证据核对。
 
+自动路径要求 native text/codespan 的 raw/value 与源文叶片证据一致；完整 code span 才能成为路径，正文子片段需在所有可能的源文出现位置得到相同路径区间。显式链接标签的递归渲染不参与自动发现。装饰只在临时 token payload 插入 OSC8，由 native 继续处理原有颜色、代码样式、换行和宽度，不修改 host token cache。
+
 所有显式链接先绑定其唯一的 remark 语义目标，再分类为 web/local/unsupported。因此 `[web](https://example.com/?a=1&amp;b=2)` 打开的是语义 URL `...?a=1&b=2`，不会误开 query key `amp;b`；引用链接遵循同一规则。angle/bare HTTP(S) autolink 只有在原始文本证据存在且 remark/native 的规范化网页语义一致时才可打开，分歧会生成诊断。
 
 本地链接仍额外要求唯一源文语义与 native href 一致。Tab/三个空格碰撞或 `a&amp;b.svg` 一类本地分歧会生成私有诊断动作；Ctrl+点击只解释拒绝原因，不猜文件名。Percent-encoded 等价写法是可靠表示。
@@ -124,7 +147,7 @@ Pi 在 lexing 前把 Tab 展开成三个空格，native href 还可能保留 cha
 - 公司本机网页启动先以自有 `spawn`（`shell: false`、有界输出、2.5 秒硬 deadline）执行 `xdg-settings get default-web-browser`，要求单个合法 desktop ID，再以 `xdg-settings check default-web-browser <id>` 确认 `yes`；只接受 `google-chrome.desktop` 并执行 `google-chrome-stable --new-window URL`。不读取 `BROWSER`、desktop entry `Exec`，不调用 `xdg-open`/`gio open` 或备用启动器。deadline/abort/输出溢出独立结算，detached 进程组先 TERM、200 ms 内 KILL；leader `exit` 不代表继承管道的 descendants 已完成，正常结算等待 child `close` 或两个输出流关闭。
 - 公司本机 Chrome/Code 使用参数数组、`shell: false`、`stdio: "ignore"`、detached 子进程。监听器安装、abort 脱钩与 `unref()` 成功才交接；spawn 后同步 handoff 失败先移除 observer，再 TERM+KILL 尚属扩展的组。已接受应用独立于后来代际 abort；可观测 lookup/权限/非零退出在动作仍有效时报告。
 - 一个 mounted Markdown 拥有其全部 copy/open/diagnostic action。所有动作都使用同一随机 `pi-copy://<nonce>/<sequence>` 内存命名空间；URI 不包含路径、命令或代码内容。
-- 缓存 miss 采用原生收集 pass、一次联合 action commit、装饰 pass；链接以 exact `[raw, href]` key 和计数绑定，不用递归 cursor，因此 table 的测量/输出双渲染不会错位或多分配。代码块仍用源位置、容器路径、围栏结构、语言/meta 和逻辑文本做线性最早/最晚唯一对齐。若私有 action 登记不可用，transcript 中看似仍有的 native HTTP 链接也保持不可执行；不会退回 Marked href 绕过源文语义核对。
+- 缓存 miss 采用原生收集 pass、一次联合 action commit、装饰 pass；显式链接以 exact `[raw, href]`、自动路径以 native 类型/raw/text/区间/编码目标 key 和计数绑定，不用递归 cursor，因此 table 的测量/输出双渲染不会错位或多分配。代码块仍用源位置、容器路径、围栏结构、语言/meta 和逻辑文本做线性最早/最晚唯一对齐。若私有 action 登记不可用，transcript 中看似仍有的 native HTTP 链接也保持不可执行；不会退回 Marked href 绕过源文语义核对。
 - 动作按字段比较，未变 rerender 复用 URI。owner batch 变化时同步删除并 unregister 被替代条目；任何 allocation、Map/WeakMap/WeakRef/finalizer、commit 或 cleanup 异常都会先摘除整个代际，再尽力清理并用全新 prefix 恢复。
 - 每代有一个 `AbortController`，且异步工作的唯一 liveness 判据同时要求 adapter enabled、仍是 current generation、无 poison、signal 未 abort、store trusted。队列中的 clipboard 写入在真正开始前及所有成功/失败反馈前都重查；当前代际一旦 poisoned 会先 suspend/retire，不能继续执行已排队副作用。退役先从 current generation 摘除，再 abort 浏览器探测/文件检查并静默迟到反馈。已经完成 handoff 的 Chrome/Code 只移除 observer，不会被 kill，窗口可以独立于 Pi 存活。
 - Clipboard 仍使用进程级 `Symbol.for` 串行队列，跨代际、adapter 和 `/reload` 保证最后点击的写入顺序；打开动作不进入该队列。
@@ -169,6 +192,6 @@ PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s pi-agent/extensions/pi
 
 `--legacy-peer-deps` 只用于测试依赖安装，避免 npm 自动装入与正在运行的 Pi 不同身份的 peer；`npm run check` 中的 `test/setup-pi.mjs` 核验并链接本机已安装的 Pi/TUI，发现不匹配的第二份运行时会拒绝执行。验收以实际 `pi` 的 bundled CLI 和上面的离线 PTY/recorder 为准，不用未打包入口代替。
 
-单元/集成测试覆盖代码源文、typed action failure atomicity、poisoned-generation clipboard queue、live cwd snapshot、Markdown recursion/table/reference、显式/引用网页及本地链接语义、完整目标语法、browser/Code 启动、PTY holder/identity-bound relay/Ghostty-own-display/SSH 分类、signed `ss` inode、扩展 pts minor、deleted executable image、来源 PID 与客户端地址钉住、fake SSH 协议/失败/abort/no-fallback、async retirement、selection/overlay/tmux recovery/reload/quiescence。Native smoke 使用临时 Pi profile、真实 CLI/PTY 和 recorder executables：`wl-copy`、`xdg-settings`、`google-chrome-stable`、`code`；`xdg-open` 是失败 tripwire。普通和 tmux 模式把 Python 可执行文件复制或 hard-link 为测试私有的 `ghostty` executable 后重新 exec，使 PTY-master 的 `/proc/<pid>/exe` realpath basename 真正满足 emulator 身份；同一进程还持有到私有 `/tmp/.X11-unix/X<n>` fake server 的真实 Unix stream。软链接改名不被接受。`--osc52` 保持 Python 身份且不创建显示连接，链接必须拒绝且无 GUI 端点。四种模式还通过真实 PTY 拖选普通文字，核对原生 selection 写出的 `Native`，并核对普通链接点击和 Ctrl-drag 不打开浏览器、`/reload` 后 action URI 更换、窄屏复制字节不变。自动测试不会启动物理 Chrome/Code，也不会修改物理剪贴板。用 `--artifacts <目录>` 为每次 native 运行指定独立证据目录；默认也保留临时目录。失败时仍保存 `run.json`、PTY/input 原始流、已有 recorder JSONL、snapshot 和人工 fixture 的 session/settings，便于从实际输入/输出定位分歧；这些文件属于隔离测试 profile，不来自用户会话。
+单元/集成测试覆盖代码源文、typed action failure atomicity、poisoned-generation clipboard queue、live cwd snapshot、Markdown recursion/table/reference、显式/引用网页及本地链接语义、完整目标语法、browser/Code 启动、PTY holder/identity-bound relay/Ghostty-own-display/SSH 分类、signed `ss` inode、扩展 pts minor、deleted executable image、来源 PID 与客户端地址钉住、fake SSH 协议/失败/abort/no-fallback、async retirement、selection/overlay/tmux recovery/reload/quiescence。Native smoke 使用临时 Pi profile、真实 CLI/PTY 和 recorder executables：`wl-copy`、`xdg-settings`、`google-chrome-stable`、`code`；`xdg-open` 是失败 tripwire。普通和 tmux 模式把 Python 可执行文件复制或 hard-link 为测试私有的 `ghostty` executable 后重新 exec，使 PTY-master 的 `/proc/<pid>/exe` realpath basename 真正满足 emulator 身份；同一进程还持有到私有 `/tmp/.X11-unix/X<n>` fake server 的真实 Unix stream。软链接改名不被接受。`--osc52` 保持 Python 身份且不创建显示连接，链接必须拒绝且无 GUI 端点。四种模式还通过真实 PTY 拖选普通文字，核对原生 selection 写出的 `Native`，并核对普通链接/自动路径点击和 Ctrl-drag 不打开应用、`/reload` 后 action URI 更换、窄屏复制字节不变。截图文件名 `state43_real_grid_1080p.mp4` 和 `reports/中文%#?.png` 分别以行内代码/正文出现：本机模式 Ctrl+左键得到同一 Code new-window argv，窄屏重试 MP4 仍指向同一文件；OSC52 的未知来源保持拒绝，不启动 GUI。自动测试不会启动物理 Chrome/Code，也不会修改物理剪贴板。用 `--artifacts <目录>` 为每次 native 运行指定独立证据目录；默认也保留临时目录。失败时仍保存 `run.json`、PTY/input 原始流、已有 recorder JSONL、snapshot 和人工 fixture 的 session/settings，便于从实际输入/输出定位分歧；这些文件属于隔离测试 profile，不来自用户会话。
 
 卸载前确认 `~/.pi/agent/extensions/pi-copy-links` 是本扩展 symlink，删除后 `/reload`。源码和依赖可保留。

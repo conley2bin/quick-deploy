@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { inlineCodePaths, plainTextPaths } from "../src/paths.ts";
+import { parseOpenTarget } from "../src/links.ts";
 import {
   ActionStore, alignCodeBlocks, codeBlocks, codeSyntax, sourceAutolinkDestination,
-  sourceCodeBlocks, sourceLinkEvidence,
+  sourceCodeBlocks, sourceLinkEvidence, sourcePathMatches,
   type RenderedCodeBlock, type SourceCodeBlock,
 } from "../src/source.ts";
 
@@ -25,6 +27,73 @@ test("source link evidence normalizes Pi spans and resolves the first definition
   assert.equal(sourceAutolinkDestination(autolink, "https://example.com/?a=1&amp;b=2"),
     "https://example.com/?a=1&b=2");
   assert.equal(sourceAutolinkDestination(autolink, "https://missing.example/"), undefined);
+});
+
+test("automatic path syntax accepts screenshot/media/source/artifact and explicit directory evidence", () => {
+  for (const path of [
+    "state43_real_grid_1080p.mp4", "reports/state43_real_grid_1080p.mp4", "/tmp/output", "./output", "../output",
+    "reports/", "src/components/", "./", "../", "README", "Dockerfile", "Makefile", "LICENSE", ".gitignore",
+    "src/main.ts", "chart.png", "notes.pdf", "data.jsonl", "dataset.parquet", "weights.pt", "model.3mf",
+  ]) {
+    const plain = plainTextPaths(path);
+    const code = inlineCodePaths(path);
+    assert.equal(plain.length, 1, path);
+    assert.deepEqual(code, plain, path);
+    const expected = path.startsWith("/") ? path : `/click/${path.replace(/^\.\//u, "")}`;
+    assert.equal(parseOpenTarget(code[0]!.href, "/click").kind, "local");
+    if (!path.includes("..") && !path.endsWith("/")) {
+      assert.equal((parseOpenTarget(code[0]!.href, "/click") as { path: string }).path, expected);
+    }
+  }
+  for (const text of ["1.2", "v1.2.3", "example.com", "example.org", "example.dev", "a.b", "and/or", "input/output",
+    "src/components", "~/report.png", "~other/report.png", "mailto:x.png", "javascript:report.png", "file:///tmp/x.png",
+    "vscode://file/tmp/x.png", "https://example.com/(x.png)", "www.example.com/x.png", "x@y.png", "--out.png"]) {
+    assert.deepEqual(plainTextPaths(text), [], text);
+    assert.deepEqual(inlineCodePaths(text), [], text);
+  }
+});
+
+test("automatic literal encoding round-trips %, #, ?, Unicode and colon without selectors", () => {
+  for (const path of ["100%.png", "literal%20.png", "数据/图#1?.png", "out.png#L12", "out.png?x=1",
+    "./file.ts:12:3", "./a:b#L2?.txt", "/tmp/literal%2F.png"]) {
+    const paths = inlineCodePaths(path);
+    assert.equal(paths.length, 1, path);
+    const target = parseOpenTarget(paths[0]!.href, "/click");
+    assert.deepEqual(target, { kind: "local", path: path.startsWith("/") ? path : `/click/${path.replace(/^\.\//u, "")}` });
+  }
+  assert.deepEqual(inlineCodePaths("file.ts:12"), [], "bare scheme-shaped spelling remains ambiguous");
+  assert.deepEqual(parseOpenTarget("./file.ts:12:3", "/click"),
+    { kind: "local", path: "/click/file.ts", line: 12, column: 3 }, "explicit href grammar is unchanged");
+});
+
+test("single code paths may have spaces but commands and expressions are never partially scanned", () => {
+  for (const path of ["reports/my video.mp4", "./a b.png", "/tmp/中文 文件.pdf"]) {
+    assert.equal(inlineCodePaths(path).length, 1, path);
+  }
+  for (const command of ["cat report.png", "echo report.png", "printf report.png", "ffmpeg -i in.mp4 out.mp4", "python src/main.py", "npm run build",
+    "./script.sh reports/out.png", "/usr/bin/tool output.png", "FOO=x python a.py", "cat x.png | head",
+    "custom reports/out.png", "./tool reports/out.png", "x = output.png", "a.png + b.png"]) {
+    assert.deepEqual(inlineCodePaths(command), [], command);
+    const evidence = sourceLinkEvidence(`\`${command}\``);
+    assert.deepEqual(sourcePathMatches(evidence, "codespan", `\`${command}\``, command), [], command);
+  }
+});
+
+test("source path proof excludes command lines, code, links, images and HTML without changing source", () => {
+  const path = "reports/result.png";
+  for (const source of [`cat ${path}`, `echo ${path}`, `printf ${path}`, `python ${path}`, `$ custom ${path}`, `custom --out ${path}`,
+    `run ffmpeg -i ${path} output.mp4`, `<span>${path}</span>`, `![${path}](image.png)`, `[${path}](other.png)`,
+    `\`cat ${path}\``, `\`\`\`\n${path}\n\`\`\``, `    ${path}`]) {
+    const evidence = sourceLinkEvidence(source);
+    assert.deepEqual(sourcePathMatches(evidence, "text", path, path), [], source);
+  }
+  for (const source of [`Open ${path}`, `输出文件 ${path}`, `**${path}**`, `> - ${path}`,
+    `| path |\n|---|\n| ${path} |`]) {
+    assert.equal(sourcePathMatches(sourceLinkEvidence(source), "text", path, path).length, 1, source);
+  }
+  assert.deepEqual(sourcePathMatches(sourceLinkEvidence(`a&amp;b.png`), "text", "a&amp;b.png", "a&amp;b.png"), []);
+  const ambiguous = sourceLinkEvidence(`${path}\n\ncat ${path}`);
+  assert.deepEqual(sourcePathMatches(ambiguous, "text", path, path), [], "never borrow an allowed occurrence for a command leaf");
 });
 
 test("logical code preserves tabs, blank lines, significant spaces and container indentation", () => {

@@ -12,6 +12,7 @@ import {
   dispatchOpenTarget, runClientHelper, type DispatcherDependencies, type HelperRequest, type HelperSpawn,
 } from "../src/dispatcher.ts";
 import type { InputReceiver, InputTopology } from "../src/receiver.ts";
+import { sourceLinkEvidence, sourcePathMatches } from "../src/source.ts";
 
 const client: Extract<InputReceiver, { kind: "remote" }> =
   { kind: "remote", peer: "192.0.2.64", port: 2222, user: "conley" };
@@ -507,6 +508,32 @@ test("company stat follows symlinks and transmits exact file/directory kind plus
     ]);
     invocations.forEach(pinned);
   } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("auto-discovered paths retain company validation and the pinned paired v2 file route", async () => {
+  for (const direct of [false, true]) {
+    const invocations: Invocation[] = [];
+    const stats: string[] = [];
+    const path = "reports/中文%#?.png";
+    const evidence = sourceLinkEvidence(`Open \`${path}\``);
+    const discovered = sourcePathMatches(evidence, "codespan", `\`${path}\``, path);
+    assert.equal(discovered.length, 1);
+    const dependencies = setup(invocations, {
+      ...(direct ? { topology: remoteTopology } : {}),
+      stat: async (companyPath) => {
+        stats.push(companyPath);
+        return { isFile: () => true, isDirectory: () => false };
+      },
+      local: async () => assert.fail("an automatic company path must never fall back to company GUI"),
+      probeBackend: async () => assert.fail("files do not use browser tunnel preparation"),
+    });
+    assert.deepEqual(stats, [], "source/native path discovery performs no filesystem IO");
+    await dispatchOpenTarget(discovered[0]!.href, "/company/click-cwd", lifetime(), direct ? "unknown" : 802, dependencies);
+    assert.deepEqual(stats, ["/company/click-cwd/reports/中文%#?.png"], "stat runs exactly once on company");
+    assert.deepEqual(decoded(invocations), [{ version: 2, action: "open-file", kind: "file",
+      path: "/company/click-cwd/reports/中文%#?.png" }]);
+    pinned(invocations[0]!);
+  }
 });
 
 test("missing, dangling, special, directory-with-line and colon goto cannot reach SSH", async (t) => {
