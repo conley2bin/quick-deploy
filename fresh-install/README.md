@@ -44,11 +44,13 @@ bash fresh-install/setup.sh
 | --- | --- |
 | 1. 公司机与 Y9000p（适用 Ubuntu 24.04+/amd64 时） | 分别运行 `bash fresh-install/setup.sh`；检查提示后继续的步骤是否实际成功。 |
 | 2. 两机互联 | 如走 Tailnet，分别运行 `bash tailscale/install.sh` 并完成入网；依照 [Tailscale 说明](../tailscale/README.md)验证双向连通。确保两端 SSH 服务可用，配置双向授权密钥和已核验指纹的 `known_hosts`：公司机上的 `conley-Y9000p`、Y9000p 上的 `conley-company` 均须非交互可用。 |
-| 3. 公司机（Pi 所在端） | 单独安装 Node.js ≥22.19 和兼容版本 Pi（推荐 `npm install -g --ignore-scripts @earendil-works/pi-coding-agent@0.87.1`），再运行 `bash pi-agent/install.sh` 安装扩展；见 [Pi 安装说明](../pi-agent/README.md)。 |
-| 4. Y9000p（点击来源桌面） | 使用匹配且已审阅的仓库 checkout 运行 `bash pi-agent/extensions/pi-copy-links/client/install.sh`；同一 checkout 的旧路径链接自动迁移，独立版本/外来软链接须显式加 `--replace`。准备默认浏览器、VS Code Remote-SSH 和可用的桌面会话环境，见 [助手安装、checksum 与隔离测试](../pi-agent/extensions/pi-copy-links/client/README.md#install-and-version-check)。 |
-| 5. 启用 | 对比公司机助手源码与 Y9000p 已安装助手的 SHA-256 及软链接目标；匹配后在公司机 Pi **空闲时**执行 `/reload`，设 `/settings` → `fullscreen`，从 Y9000p 以 Ctrl+鼠标左键点击助手 Markdown 链接；见 [链接操作说明](../pi-agent/extensions/pi-copy-links/README.md)。 |
+| 3. 每个运行 Pi 的主机（双向使用时两机都做） | 单独安装 Node.js ≥22.19、npm 和 Pi（例如 `npm install -g --ignore-scripts @earendil-works/pi-coding-agent@latest`），用 `pi --version` 核验。先更新已审阅的服务器扩展源码，再运行 `bash pi-agent/install.sh` 安装扩展并保存全局 fullscreen 默认值；见 [Pi 安装说明](../pi-agent/README.md)。 |
+| 4. 每个点击来源桌面（公司机与 Y9000p） | 使用匹配且已审阅的仓库 checkout，分别运行 `bash pi-agent/extensions/pi-copy-links/client/install.sh`；同一 checkout 的旧路径链接自动迁移，独立版本/外来软链接须显式加 `--replace`。各桌面准备受支持的默认浏览器、VS Code Remote-SSH 对另一服务器的连接和可用的桌面会话环境，见 [助手安装、checksum 与隔离测试](../pi-agent/extensions/pi-copy-links/client/README.md#install-on-each-desktop-and-check-versions)。 |
+| 5. 启用与验收 | 核对各 Pi 的已安装扩展源码/软链接，以及两台桌面已安装助手与已审阅源码的 SHA-256/软链接目标。匹配后由用户在对应 Pi **空闲时**执行 `/reload` 或重启；新会话默认 fullscreen，已有会话确认 `/settings` → `fullscreen`。两个方向都以 Ctrl+鼠标左键点击另一服务器的路径，并确认 Code 的 SSH 主机和文件内容；见 [链接操作说明](../pi-agent/extensions/pi-copy-links/README.md)。 |
 
-两端还应分别用 `ssh -T -o BatchMode=yes -o StrictHostKeyChecking=yes -o ClearAllForwardings=yes <对端别名> true` 验证免交互认证；别名须解析为正确的字面 IP、用户名和端口。助手安装器只链接**当前 Y9000p checkout**，不会取代码、远程安装或运行助手，也不会升级旧 checkout；外来软链接默认拒绝，只有有意指定 `--replace` 才重指向，普通文件/目录即使带此参数也拒绝。公司主入口的浅层扩展扫描不执行嵌套的 `client/install.sh`。其他机器、用户或 SSH 别名需要有意适配两端配对，不会靠单次基础安装自动生效。链接功能无需可选的[远端剪贴板桥](../pi-agent/extensions/pi-remote-clipboard/README.md)；它有自己的 provider 和 SSH 转发。
+角色由实际 OS hostname（大小写归一）固定选择：Y9000p 桌面→公司 Pi 的文件使用 `ssh-remote+conley-company`；公司桌面→Y9000p Pi 的文件使用 `ssh-remote+conley-Y9000p`。服务器侧 `stat` 决定文件/目录，桌面同名路径不能改变目标。未知机器明确拒绝配对 SSH，继承环境和请求不能指定主机。
+
+两端还应分别用 `ssh -T -o BatchMode=yes -o StrictHostKeyChecking=yes -o ClearAllForwardings=yes <对端别名> true` 验证免交互认证；别名须解析为正确的字面 IP、`conley` 用户和端口。助手安装器只链接**执行它的当前 checkout**，不会取代码、远程安装或运行助手，也不会升级旧 checkout；只装助手不会更新 Pi 服务器的旧 renderer/自动路径识别。外来软链接默认拒绝，只有有意指定 `--replace` 才重指向，普通文件/目录即使带此参数也拒绝。主入口在两机上的浅层扩展扫描均不执行嵌套的 `client/install.sh`，它必须在每个桌面单独运行。其他机器、用户或 SSH 别名需要有意适配两端配对，不会靠单次基础安装自动生效。安装器不重载或注入运行中的用户会话。链接功能无需可选的[远端剪贴板桥](../pi-agent/extensions/pi-remote-clipboard/README.md)；它有自己的 provider 和 SSH 转发。
 
 ## 单独运行模块
 

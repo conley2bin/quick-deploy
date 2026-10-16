@@ -2,9 +2,6 @@
 # current subscription; node definitions never belong here.
 version: 1
 pre: []
-# 已验证的失败实验（2026-10-13 晚高峰）：把公司 VPN 端点 183.195.186.154 的
-# 底层 UDP 走代理后，机场节点的 UDP 回程绕路，RTT 从 ~13ms 涨到 340-460ms，
-# 虽 0% 丢包但不可用。直连晚高峰丢包 26-94% 是跨网 UDP QoS，只能错峰或换中枢。
 post: []
 # Examples (keep disabled until the corresponding group exists in every profile):
 # pre:

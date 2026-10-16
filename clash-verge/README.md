@@ -90,6 +90,23 @@ post: []
 改完执行菜单回车（或 `./clash-verge/tun-fix.sh rules apply`），然后在 Verge 中重载/重新
 生成配置。**重载前运行中的核心仍是旧规则**；工具只报告写入成功，不会声称已经生效。
 
+### 可选自建 VPS 节点
+
+若已用 [`../vps/`](../vps/README.md) 生成私有
+`~/.local/state/quick-deploy-private/vps/generated/clash-nodes.json`，规则生成器会把
+`SELF-Reality`、`SELF-Hy2`内联为普通可选节点：仅追加到本来包含至少一个订阅单节点的
+`select`组。url-test/fallback/load-balance和只有DIRECT/REJECT/其他组的策略组保持不变。
+不创建专用自建组、不注入模型/API域名规则，不改任何组原有顺序、默认项或selection字段。
+海外流量由用户自己选择节点；空节点/组不会抛JS异常。
+VPS数字IPv4/IPv6的DIRECT规则仍最先注入，避免临时check客户端或非22管理连接绕回VPS。
+不存在私有文件时，生成结果逐字节保持原样；损坏、非0600
+或链接文件不会静默忽略。两 PC 各自 `vps/setup.sh render --device company|home`，不要共用
+手机身份。Hy2使用SHA256证书pin，不跳过校验。
+
+只在显式规则 render/apply 时读取私有输出；`vps/setup.sh render/deploy` 不自动写 Script
+或重载 Verge。无外部 file provider，不需要放宽 mihomo SAFE_PATHS。生成的Script和备份
+含凭据，不能提交Git或分享。新增离线回归：`RM_GUARD_CONFIRM=1 python3 clash-verge/tests/vps-integration.py`。
+
 ### 应用声明
 
 受支持的 ID 只有 `baidunetdisk`（百度网盘）、`wemeet`（腾讯会议）、`feishu`（飞书）、
@@ -157,14 +174,11 @@ tun:
 Verge 应用设置接管的字段（接管的只有 TUN 堆栈选择）。注入采用并集合并：Merge 或
 订阅里已有的排除条目会被保留。
 
-公司 VPN 端点必须走**路由层排除**，规则层 `DIRECT` 不够：底层 UDP 一旦进入 TUN
-（Meta mtu 9000），wg-quick 会按 9000−80 把 wg0 的 MTU 算成 8920，隧道内 TCP 的
-大包在物理链路上分片全丢，ssh 一有大输出就冻死（2026-10-13 实测：1400 字节丢
-80%，4000 字节以上 100%）。路由排除后 wg-quick 从物理网卡（1500）推出 1420，
-且底层不再经过 mihomo 的 UDP 栈。走代理的替代方案也测过：0% 丢包但 RTT 340−460ms
-（机场 UDP 回程绕路，见 rules/proxy.yaml 注记），不可用。跨网直连晚高峰丢包
-26−94% 是运营商 UDP QoS，只能错峰；隧道内 ping 丢包率另有一个假象来源——公司
-网关会代理应答/过滤 ICMP，ping 不通不代表隧道数据面断了，要用 ssh 实测。
+WireGuard 端点使用**路由层排除**，避免底层 UDP 进入 TUN；规则层 `DIRECT`
+只决定 mihomo 接收流量后的出口，不能保证底层路由或 MTU 选择正确。wg-quick 自动
+推导 MTU 时若选中大 MTU 的 TUN，隧道 MTU 可能超过实际物理路径承载能力。排除端点
+使其按物理路由发送；它不能保证公网 UDP 的延迟、丢包或可达性，仍须验证真实 SSH
+与大块数据传输。
 
 端点地址不硬编码：`rules render/apply` 在生成时用 sudo 自动发现——运行中的隧道
 读 `wg show all endpoints`（已解析为 IP），未启动的隧道读 `/etc/wireguard/*.conf`
@@ -172,14 +186,13 @@ Verge 应用设置接管的字段（接管的只有 TUN 堆栈选择）。注入
 `discoveredWgEndpoints`。所以 VPN 没开也能排除；换端点只需重跑一次 apply。
 `/etc/wireguard` 仅 root 可读：交互运行时按提示输密码，非交互运行前先 `sudo -v`，
 或用 `TUN_FIX_WG_ENDPOINTS=<host:port,...>` 显式指定（`off` 关闭发现，测试用）。
-没有 `/etc/wireguard` 的机器（非 wg 客户端，如公司那台）自动跳过、不需要 sudo。
+没有 `/etc/wireguard` 的机器自动跳过、不需要 sudo。
 排除的语义只是「不进 TUN、按物理路由表直连」，即使端点 IP 与局域网某台机器重合
 也无害——与不加这条规则时的物理网络行为完全一致。
 
-注意两个已验证的边界：tailscaled 的底层流量自带 fwmark 规则，优先级高于 mihomo
-的策略路由，从来不进 TUN，所以**不需要** `exclude-uid`；而且 `exclude-uid: [0]`
-有过实际危害——它曾把公司 VPN 的内核 WireGuard 底层流量从代理路径挤到跨网直连
-UDP，晚高峰丢包 26%，隧道内的 TCP 会话随之间歇性卡死。
+当前安装中，tailscaled 的底层流量自带 fwmark 规则，优先级高于 mihomo 的策略路由，
+因此这里不注入 `exclude-uid`。按 UID 排除所有 root 流量会同时改变其他服务的出口，
+不能代替按 WireGuard 端点排除。
 
 改动在 Verge 重载/重新生成配置后才生效；生效后 `tailscale ping <对端>` 应在数包内
 从 `via DERP(...)` 升级为 `via <对端公网地址>` 直连。两台机器需要各自应用一次。
