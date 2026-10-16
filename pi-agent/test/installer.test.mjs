@@ -8,6 +8,8 @@ import test from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 const source = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+const vscodeCompanionName = "vscode-video-preview-repair";
+const vscodeCompanion = join(source, "extensions", vscodeCompanionName);
 // Read the installed host's library/parser, never execute its CLI or mutate its
 // package/home. Each fixture's executable is a tripwire, not the real Pi.
 const installedCli = realpathSync(execFileSync("bash", ["-c", "type -P pi"], { encoding: "utf8" }).trim());
@@ -20,6 +22,8 @@ while (!existsSync(join(packageDir, "package.json"))) {
 }
 const settingsModule = pathToFileURL(join(packageDir, "dist/core/settings-manager.js")).href;
 const { SettingsManager } = await import(settingsModule);
+const { discoverAndLoadExtensions } = await import(pathToFileURL(join(packageDir, "dist/core/extensions/loader.js")).href);
+const { DefaultPackageManager } = await import(pathToFileURL(join(packageDir, "dist/core/package-manager.js")).href);
 const lockfile = createRequire(installedCli)("proper-lockfile");
 
 function fixture(t, location = "default") {
@@ -97,7 +101,9 @@ function realInstallerFixture(t) {
   const names = readdirSync(join(source, "extensions"))
     .filter(name => existsSync(join(source, "extensions", name, "install.sh"))).sort();
   assert.ok(names.length > 0);
-  for (const name of names) cpSync(join(source, "extensions", name), join(f.checkout, "extensions", name), {
+  // Keep the real VS Code companion beside the Pi leaves during discovery.
+  // Omitting non-installable directories would hide a layout-boundary regression.
+  for (const name of [...names, vscodeCompanionName]) cpSync(join(source, "extensions", name), join(f.checkout, "extensions", name), {
     recursive: true, filter: path => !["node_modules", ".git"].includes(basename(path)),
   });
   // Execute every real leaf's shell flow. npm and systemctl are explicitly
@@ -123,6 +129,8 @@ esac
 }
 
 function assertRealInstallation(f) {
+  assert.equal(f.names.includes(vscodeCompanionName), false, "VS Code companion must not have a Pi installer");
+  assert.deepEqual(readdirSync(join(f.agent, "extensions")).sort(), f.names, "only Pi leaves are linked");
   for (const name of f.names) {
     const target = join(f.agent, "extensions", name);
     const expected = join(f.checkout, "extensions", name, ...(name === "pi-remote-clipboard" ? ["pi-extension"] : []));
@@ -188,6 +196,35 @@ for (const location of ["default", "custom", "tilde", "relative"]) test(`fresh a
   const manager = SettingsManager.create(f.cwd, f.agent, { projectTrusted: false });
   assert.equal(manager.getTuiMode(), "fullscreen"); assert.deepEqual(manager.drainErrors(), []);
   clean(f.agent);
+});
+
+test("VS Code companion has no Pi entry and is skipped by actual host automatic discovery", async t => {
+  const f = fixture(t);
+  const manifest = JSON.parse(readFileSync(join(vscodeCompanion, "package.json"), "utf8"));
+  assert.deepEqual(manifest.extensionKind, ["ui"]);
+  assert.ok(manifest.engines.vscode);
+  assert.equal(manifest.main, "./extension.js");
+  assert.equal(manifest.pi, undefined);
+  for (const name of ["install.sh", "index.ts", "index.js"]) assert.equal(existsSync(join(vscodeCompanion, name)), false, name);
+  assert.equal(existsSync(join(vscodeCompanion, ".vscodeignore")), true, "hidden package exclusions stay with source");
+
+  // Both source colocation (ordinary directory) and an accidental directory
+  // link must leave VS Code's main out of Pi's automatic entry-point selection.
+  for (const [agent, linked] of [[f.checkout, false], [f.agent, true]]) {
+    const extensions = join(agent, "extensions"), companion = join(extensions, vscodeCompanionName);
+    mkdirSync(extensions, { recursive: true });
+    if (linked) symlinkSync(vscodeCompanion, companion);
+    else cpSync(vscodeCompanion, companion, { recursive: true });
+    const control = join(extensions, "positive-control/index.ts");
+    mkdirSync(dirname(control)); writeFileSync(control, "export default function () {}\n");
+    const loaded = await discoverAndLoadExtensions([], f.cwd, agent);
+    assert.deepEqual(loaded.errors, []);
+    assert.deepEqual(loaded.extensions.map(extension => extension.path), [control], "positive control loads, companion does not");
+    // The current resource loader also uses package-manager convention discovery.
+    const packages = new DefaultPackageManager({ cwd: f.cwd, agentDir: agent, settingsManager: SettingsManager.inMemory() });
+    const resolved = await packages.resolveExtensionSources([agent], { temporary: true });
+    assert.deepEqual(resolved.extensions.map(extension => extension.path), [control], "package discovery also excludes VS Code main");
+  }
 });
 
 test("all real discovered installers succeed in a fresh non-Git home and rerun", t => {

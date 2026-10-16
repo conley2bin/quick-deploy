@@ -5,7 +5,7 @@ A small **VS Code** extension for the company-local Pi link workflow. Pi still o
 ## Test and install
 
 ```bash
-cd pi-agent/vscode-video-preview-repair
+cd pi-agent/extensions/vscode-video-preview-repair
 npm test
 # Install @vscode/vsce if needed; package outside the repository.
 vsce package --no-dependencies -o /tmp/pi-video-preview-repair-0.1.0.vsix
@@ -13,6 +13,8 @@ code --install-extension /tmp/pi-video-preview-repair-0.1.0.vsix --force
 code --list-extensions --show-versions | grep '^pi-local.pi-video-preview-repair@0.1.0$'
 ```
 
-Restart **only after saving work in affected Code windows**, then Ctrl+click a Pi MP4 link **from the company desktop**. The separate Pi `pi-copy-links` extension and its local-vs-SSH launcher stay unchanged. This companion repairs only local `file:` MP4 tabs in company Code. An SSH-origin click opens a company file in **Y9000p Code Remote-SSH** as a `vscode-remote:` resource; the company installation and this extension's current URI guard do not repair that separate UI. Installing it into Pi's extension directory does nothing. To uninstall: `code --uninstall-extension pi-local.pi-video-preview-repair` and restart Code.
+Restart **only after saving work in affected Code windows**, then Ctrl+click a Pi MP4 link **from the company desktop**. The separate Pi `pi-copy-links` extension and its local-vs-SSH launcher stay unchanged. This companion repairs only local `file:` MP4 tabs in company Code. An SSH-origin click opens a company file in **Y9000p Code Remote-SSH** as a `vscode-remote:` resource; the company installation and this extension's current URI guard do not repair that separate UI. This source directory is colocated with Pi extensions, but is **not a Pi extension**: it has no `install.sh`, `index.ts`/`index.js`, or `pi.extensions` manifest. `pi-agent/install.sh` skips it; Pi's automatic directory discovery does not load its VS Code `main` entry. Install the VSIX into Code only; do not link this directory into Pi or configure `extension.js` as a Pi extension. To uninstall: `code --uninstall-extension pi-local.pi-video-preview-repair` and restart Code.
+
+Moving this source directory does not affect an existing VSIX installation: Code runs its installed copy. No reinstall or restart is needed for a source-only relocation.
 
 `vsce` is the official VS Code packaging tool (`npm install -g @vscode/vsce` if absent); the command above is an **operator step**, not part of Pi's installer. Isolated validation can use a private `--user-data-dir`/`--extensions-dir` profile and `Xephyr` without altering the real Code profile. `npm test` mocks VS Code APIs; a real video frame in the destination window is the visual acceptance criterion.

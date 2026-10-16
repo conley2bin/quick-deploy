@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# One-click installer for everything pi-agent owns.
+# One-click installer for Pi extensions and optional skills.
 #
 #   pi-agent/install.sh           install extensions, persist global fullscreen
 #   pi-agent/install.sh --skills  also run the interactive skills installer
 #
 # Requires Node.js >=22.19, npm and an installed Pi; installs none of them.
-# Discovers extensions/<name>/install.sh; leaf installers remain settings-free.
+# Only extensions/<name>/install.sh; no VS Code install; leaves settings-free.
 # After installation, only global tuiMode is set; existing fullscreen is a no-op.
 # Project/CLI overrides remain separate. No live mode switch/reload/restart.
 set -euo pipefail
