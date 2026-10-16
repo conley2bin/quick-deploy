@@ -8,6 +8,7 @@ import ipaddress
 import json
 import os
 from pathlib import Path, PurePosixPath
+import posixpath
 import re
 import select
 import shutil
@@ -698,7 +699,12 @@ def file_command(data, server_alias):
         if "column" in data:
             target += f":{data['column']}"
     uri = f"vscode-remote://{remote_code}{target}"
-    args.extend(["--file-uri" if data["kind"] == "file" else "--folder-uri", uri])
+    if data["kind"] == "file":
+        # Textual POSIX dirname keeps server-side symlink spelling; no local stat.
+        parent_uri = f"vscode-remote://{remote_code}{quote(posixpath.dirname(path), safe='/')}"
+        args.extend(["--folder-uri", parent_uri, "--file-uri", uri])
+    else:
+        args.extend(["--folder-uri", uri])
     return args, {"ok": True, "action": "open-file", "path": path, "kind": data["kind"]}
 
 
