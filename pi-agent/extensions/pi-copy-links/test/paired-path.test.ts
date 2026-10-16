@@ -3,7 +3,7 @@ import { spawn } from "node:child_process";
 import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, posix } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 import { dispatchOpenTarget, type DispatcherDependencies, type HelperSpawn } from "../src/dispatcher.ts";
@@ -62,7 +62,7 @@ function endpoint(role: typeof roles[number], root: string, paths: string[], hel
     input: input.trim().split("\n").map((line) => JSON.parse(line)), calls }) };
 }
 
-test("both rows: automatic path -> server stat -> pinned v2 helper -> opposite Code URI", async () => {
+test("both rows: automatic path -> server stat -> v2 helper -> one remote parent/file request", async () => {
   const root = mkdtempSync(join(tmpdir(), "pi-paired-path-"));
   try {
     const server = join(root, "same-server-path");
@@ -78,10 +78,14 @@ test("both rows: automatic path -> server stat -> pinned v2 helper -> opposite C
     ];
     // Both roles use these exact same filesystem spellings. Only the paired
     // machine identity changes the authority, never path existence or basename.
+    // Neither remote resources nor the new parent workspace may be statted on
+    // the helper desktop; only the real server-side stat below is authoritative.
+    const protectedPaths = [...new Set(targets.flatMap(({ path, kind }) =>
+      kind === "file" ? [path, posix.dirname(path)] : [path]))];
     for (const role of roles) for (const [index, target] of targets.entries()) {
       const desktop = join(root, role.server + "-" + index);
       mkdirSync(desktop);
-      const bridge = endpoint(role, desktop, targets.map(({ path }) => path));
+      const bridge = endpoint(role, desktop, protectedPaths);
       const stats: string[] = [];
       await dispatchOpenTarget(target.href, server, lifetime(), "unknown", { ...bridge.dependencies,
         stat: async (path) => { stats.push(path); return stat(path); } });
@@ -97,10 +101,13 @@ test("both rows: automatic path -> server stat -> pinned v2 helper -> opposite C
         ...(target.suffix ? { line: 9, column: 3 } : {}) });
       for (const reply of replies) assert.equal(reply.path, target.path);
       const remote = "ssh-remote+" + role.authority;
-      const uri = "vscode-remote://" + remote + target.path.split("/").map(encodeURIComponent).join("/") + target.suffix;
+      const resourceUri = (path: string) => "vscode-remote://" + remote + path.split("/").map(encodeURIComponent).join("/");
+      const uri = resourceUri(target.path) + target.suffix;
       const opened = commands(desktop).filter(({ name }) => name === "code");
       assert.deepEqual(opened.map(({ args }) => args), [["--remote", remote, "--new-window",
-        ...(target.suffix ? ["--goto"] : []), target.kind === "file" ? "--file-uri" : "--folder-uri", uri]]);
+        ...(target.suffix ? ["--goto"] : []),
+        ...(target.kind === "file" ? ["--folder-uri", resourceUri(posix.dirname(target.path)), "--file-uri", uri] :
+          ["--folder-uri", uri])]], "one invocation pairs the immediate remote parent with its file; directories stay their own workspace");
       assert.ok(commands(desktop).every(({ name }) => !["ssh", "ss", "xdg-open", "google-chrome-stable"].includes(name)));
     }
   } finally { rmSync(root, { recursive: true, force: true }); }

@@ -7,6 +7,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 import json
 import os
 from pathlib import Path
+import posixpath
 import runpy
 import shutil
 import signal
@@ -310,8 +311,9 @@ class HelperCase(unittest.TestCase):
         status, result = self.invoke({"action": "open-file", "kind": "file", "path": path, "line": 9})
         self.assertEqual(status, 0, result)
         self.assertEqual(self.calls("code")[-1]["args"],
-                         ["--remote", self.remote_code, "--new-window", "--goto", "--file-uri",
-                          "vscode-remote://" + self.remote_code + quote(path, safe="/") + ":9"])
+                         ["--remote", self.remote_code, "--new-window", "--goto",
+                          "--folder-uri", "vscode-remote://" + self.remote_code + "/opposite-server",
+                          "--file-uri", "vscode-remote://" + self.remote_code + quote(path, safe="/") + ":9"])
         self.assertEqual(self.web("https://localhost:8745/os-host?x=1#f", backend_host="::1")[0], 0)
         self.assertEqual(self.calls("ssh", "-G")[-1]["args"], ["-G", self.peer["alias"]])
         self.assertEqual(self.calls("ssh", "-M")[-1]["args"][-1], self.peer["alias"])
@@ -373,13 +375,69 @@ class HelperCase(unittest.TestCase):
                 if "line" in target:
                     expected.append("--goto")
                     uri += f":{target['line']}:{target['column']}"
-                expected.extend(["--file-uri" if target["kind"] == "file" else "--folder-uri", uri])
+                if target["kind"] == "file":
+                    expected.extend(["--folder-uri", "vscode-remote://" + self.remote_code +
+                                     quote(posixpath.dirname(target["path"]), safe="/"), "--file-uri", uri])
+                else:
+                    expected.extend(["--folder-uri", uri])
                 self.assertEqual(self.calls("code")[-1]["args"], expected)
         self.assertFalse(self.calls("ssh"))
         self.assertFalse(self.calls("google-chrome-stable"))
         self.assertTrue(local_folder.is_dir())
         self.assertEqual(local_file.read_text(), "desktop decoy, not the server resource")
         self.assertFalse(missing.exists())
+
+    def test_file_and_immediate_parent_share_one_typed_remote_request(self):
+        prefix = "vscode-remote://" + self.remote_code
+        cases = [
+            ("/srv/project/src/file.py", "/srv/project/src", {}),
+            ("/README", "/", {"line": 9}),
+            ("/srv/project.v2/space 子目录%#?/Makefile", "/srv/project.v2/space 子目录%#?",
+             {"line": 31, "column": 7}),
+            ("/srv/link/../selected/./src/README", "/srv/link/../selected/./src", {}),
+            ("/srv/release:2026/report:raw.txt", "/srv/release:2026", {}),
+        ]
+        for path, parent, selectors in cases:
+            with self.subTest(path=path, selectors=selectors):
+                before = len(self.calls("code"))
+                process = self.start({"action": "open-file", "kind": "file", "path": path, **selectors})
+                prepared = json.loads(process.stdout.readline())
+                self.assertEqual(prepared["phase"], "prepared", prepared)
+                self.assertEqual(len(self.calls("code")), before)
+                status, result = self.finish(process, prepared)
+                self.assertEqual(status, 0, result)
+                self.assertEqual(len(self.calls("code")), before + 1)
+                suffix = f":{selectors['line']}" if "line" in selectors else ""
+                if "column" in selectors:
+                    suffix += f":{selectors['column']}"
+                self.assertEqual(self.calls("code")[-1]["args"],
+                                 ["--remote", self.remote_code, "--new-window",
+                                  *(["--goto"] if selectors else []),
+                                  "--folder-uri", prefix + quote(parent, safe="/"),
+                                  "--file-uri", prefix + quote(path, safe="/") + suffix])
+                self.assertEqual(result["path"], path)
+                self.assertEqual(set(result), {"version", "phase", "ok", "action", "path", "kind"})
+        self.assertFalse(self.calls("ssh"))
+        self.assertFalse(self.calls("google-chrome-stable"))
+
+    def test_parent_workspace_keeps_symlink_spelling_despite_local_parent_decoy(self):
+        actual = self.root / "actual"
+        actual.mkdir()
+        (actual / "src.v2").write_text("desktop parent is a file, not a remote directory")
+        link = self.root / "link 空格%#?"
+        link.symlink_to(actual, target_is_directory=True)
+        parent = str(link / "src.v2")
+        path = parent + "/Makefile"
+        status, result = self.invoke({"action": "open-file", "kind": "file", "path": path})
+        self.assertEqual(status, 0, result)
+        self.assertEqual(len(self.calls("code")), 1)
+        prefix = "vscode-remote://" + self.remote_code
+        self.assertEqual(self.calls("code")[0]["args"],
+                         ["--remote", self.remote_code, "--new-window",
+                          "--folder-uri", prefix + quote(parent, safe="/"),
+                          "--file-uri", prefix + quote(path, safe="/")])
+        self.assertEqual((actual / "src.v2").read_text(), "desktop parent is a file, not a remote directory")
+        self.assertFalse(self.calls("ssh"))
 
     def test_file_target_and_command_never_stat_the_remote_path(self):
         helper = runpy.run_path(str(HELPER))
@@ -389,7 +447,9 @@ class HelperCase(unittest.TestCase):
             target = {"kind": kind, "path": "/server-only/不可读取%#?.data"}
             with patch("os.stat", side_effect=AssertionError("remote path stat on desktop")), \
                     patch("os.lstat", side_effect=AssertionError("remote path lstat on desktop")), \
-                    patch("os.access", side_effect=AssertionError("remote path access on desktop")):
+                    patch("os.access", side_effect=AssertionError("remote path access on desktop")), \
+                    patch("os.path.realpath", side_effect=AssertionError("remote path realpath on desktop")), \
+                    patch.object(Path, "resolve", side_effect=AssertionError("remote path resolve on desktop")):
                 helper["file_target"](target)
                 argv, result = helper["file_command"](target, alias)
             self.assertEqual(argv[2], self.remote_code)
@@ -744,6 +804,7 @@ class HelperCase(unittest.TestCase):
         self.assertEqual(result["kind"], "file")
         self.assertEqual(self.calls("code")[-1]["args"],
                          ["--remote", self.remote_code, "--new-window", "--goto",
+                          "--folder-uri", prefix + "/company/not-on-laptop",
                           "--file-uri", prefix + quote(path, safe="/") + ":31:7"])
         self.assertFalse(self.calls("ssh"))
         self.assertFalse(self.calls("google-chrome-stable"))
@@ -752,7 +813,8 @@ class HelperCase(unittest.TestCase):
             status, _ = self.invoke({"version": 1, "action": "open-file", "kind": "file", "path": path})
             self.assertEqual(status, 0)
             self.assertEqual(self.calls("code")[-1]["args"],
-                             ["--remote", self.remote_code, "--new-window", "--file-uri", prefix + path])
+                             ["--remote", self.remote_code, "--new-window", "--folder-uri", prefix + "/company",
+                              "--file-uri", prefix + path])
         status, _ = self.invoke({"version": 1, "action": "open-file", "kind": "directory",
                                   "path": "/company/project.v2"})
         self.assertEqual(status, 0)
@@ -776,6 +838,10 @@ class HelperCase(unittest.TestCase):
             {"path": "/company/report:2026#raw?.txt", "kind": "file"},
             {"path": "/server-only/主机 空格 'quotes'%#?.py", "kind": "file", "line": 9},
             {"path": "/server-only/项目 空格%#?.v2", "kind": "directory"},
+            {"path": "/README", "kind": "file", "line": 2},
+            {"path": "/project.v2/space 子目录%#?/Makefile", "kind": "file", "line": 31, "column": 7},
+            {"path": "/srv/link-name/src/file.py", "kind": "file"},
+            {"path": "/", "kind": "directory"},
         ]
         for target in requests:
             status, result = self.invoke({"version": 1, "action": "open-file", **target})
@@ -785,14 +851,23 @@ class HelperCase(unittest.TestCase):
                                input=json.dumps(argvs), text=True, capture_output=True, timeout=10)
         self.assertEqual(probe.returncode, 0, probe.stderr)
         resolved = json.loads(probe.stdout)
-        self.assertEqual([(resource["kind"], resource["path"]) for resource in resolved],
-                         [(target["kind"], target["path"]) for target in requests])
-        self.assertEqual(resolved[4]["line"], 31)
-        self.assertEqual(resolved[4]["column"], 7)
-        self.assertEqual(resolved[6]["line"], 9)
-        self.assertEqual(resolved[6]["column"], 1)  # Code defaults a line-only goto to column 1.
-        self.assertEqual({resource["remoteAuthority"] for resource in resolved},
-                         {self.remote_code})
+        self.assertEqual(len(resolved), len(requests))
+        for target, outcome in zip(requests, resolved):
+            with self.subTest(target=target):
+                parent = posixpath.dirname(target["path"]) if target["kind"] == "file" else target["path"]
+                files = ([{"kind": "file", "path": target["path"], "line": target.get("line"),
+                           "column": target.get("column", 1) if "line" in target else None,
+                           "remoteAuthority": self.remote_code}] if target["kind"] == "file" else [])
+                self.assertEqual(outcome["resources"],
+                                 [{"kind": "directory", "path": parent, "remoteAuthority": self.remote_code}, *files])
+                self.assertEqual(outcome["fresh"],
+                                 {"windowIds": [42], "created": [{"folder": parent, "remoteAuthority": self.remote_code,
+                                                                  "forceNewWindow": True, "files": files}], "messages": []})
+                # Code's native existing-folder branch reuses that window even
+                # with --new-window, forwarding the selected file to it once.
+                self.assertEqual(outcome["existingParent"],
+                                 {"windowIds": [41], "created": [],
+                                  "messages": [{"channel": "vscode:openFiles", "files": files}]})
 
     def test_colon_path_with_goto_and_directory_location_fail_before_code(self):
         for path in ("/company/report:2026", "/company/report:suffix.py"):
