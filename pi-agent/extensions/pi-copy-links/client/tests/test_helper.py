@@ -19,13 +19,14 @@ import time
 import unittest
 from urllib.parse import quote, urlsplit
 
+from hostname_fixture import HELPER, LAPTOP_HOST, helper_command
+
 
 class IPv6HTTPServer(HTTPServer):
     address_family = socket.AF_INET6
 
 
 MODULE = Path(__file__).resolve().parents[1]
-HELPER = MODULE / "pi-client-link-helper"
 FAKE = r'''#!PYTHON
 import json
 import os
@@ -211,6 +212,7 @@ class HelperCase(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
+        self.hostname = LAPTOP_HOST
         self.runtime = self.root / "runtime"
         self.runtime.mkdir(mode=0o700)
         self.bin = self.root / "bin"
@@ -248,14 +250,8 @@ class HelperCase(unittest.TestCase):
         return found
 
     def start(self, request, *, browser_grace=None):
-        command = [str(HELPER)]
-        if browser_grace is not None:
-            wrapper = ("import runpy,sys; "
-                       f"module=runpy.run_path({str(HELPER)!r}); "
-                       f"module['launch_browser'].__globals__['BROWSER_LAUNCH_GRACE_SECONDS']={browser_grace!r}; "
-                       "sys.exit(module['main']())")
-            command = [sys.executable, "-c", wrapper]
-        process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        process = subprocess.Popen(helper_command(self.hostname, browser_grace=browser_grace),
+                                   stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                    stderr=subprocess.PIPE, env=self.env)
         data = {"phase": "request", "prepareDeadlineMs": 15000, **request, "version": 2}
         process.stdin.write(json.dumps(data).encode() + b"\n")
@@ -278,7 +274,7 @@ class HelperCase(unittest.TestCase):
 
     def invoke(self, request):
         if isinstance(request, bytes):
-            process = subprocess.run([str(HELPER)], input=request, env=self.env,
+            process = subprocess.run(helper_command(self.hostname), input=request, env=self.env,
                                      capture_output=True, timeout=20)
             self.assertEqual(process.stderr, b"")
             return process.returncode, json.loads(process.stdout)
