@@ -113,9 +113,11 @@ text = ('Native copy test\n\n- ```make\n  ' + code.replace('\n', '\n  ') + '\n  
         'AUTO_MP4 `' + auto_filename + '`\n'
         'AUTO_PNG ' + auto_relative)
 if options.path_boundaries:
-    for name in ('reports/final(1).png', 'reports/final,1.png', 'reports/final', '.png', '1.png'):
+    for name in ('reports/final(1).png', 'reports/final,1.png', 'reports/final', '.png', '1.png',
+                 'reports/final~~1~~.png', 'reports/final1.png', 'a~chart.png'):
         (root / name).write_text(name)
-    text += '\nPAREN ./reports/final(1).png\nCOMMA ./reports/final,1.png'
+    text += ('\nPAREN ./reports/final(1).png PARTIAL ./reports/final~~1~~.png\nCOMMA ./reports/final,1.png'
+             '\n\na~chart.png\n\ncat ~~a~chart.png~~')
 now = '2026-01-01T00:00:00.000Z'
 usage = {k: 0 for k in ['input', 'output', 'cacheRead', 'cacheWrite', 'totalTokens']}
 usage['cost'] = {k: 0 for k in ['input', 'output', 'cacheRead', 'cacheWrite', 'total']}
@@ -206,7 +208,7 @@ pid, fd = pty.fork()
 if pid == 0:
     os.chdir(root)
     os.execvpe(cli[0], cli, env)
-fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack('HHHH', 30, 90, 0, 0))
+fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack('HHHH', 40 if options.path_boundaries else 30, 90, 0, 0))
 wire = bytearray()
 
 def drain(seconds=0.15):
@@ -343,6 +345,20 @@ try:
                 expected_edge = f'\x1b[<16;{point["x"] + 1};{point["y"] + 1}{edge}'.encode()
                 assert expected_edge in received, (label, edge, received)
             assert records('code')[-1] == {'argv': ['--new-window', '--', str(root / name)]}
+        for label, needle, operand_offset in [('partial', './reports/final1.png', 0), ('command', 'cat a~chart.png', 4)]:
+            current = snapshot('provenance-' + label)
+            rows = [(y, line.index(needle)) for y, line in enumerate(current['lines']) if needle in line]
+            assert len(rows) == 1, (label, rows)
+            y, x = rows[0]
+            before = records('code')
+            for column in (x + operand_offset, x + len(needle) - 1):
+                point = {'x': column, 'y': y}
+                offset = (root / 'input.raw').stat().st_size
+                click(point, 16)
+                received = (root / 'input.raw').read_bytes()[offset:]
+                for edge in ('M', 'm'):
+                    assert f'\x1b[<16;{column + 1};{y + 1}{edge}'.encode() in received
+            assert records('code') == before, 'unproven split/command opened a file: ' + label
     assert records('xdg-open') == [], 'forbidden xdg-open fallback ran'
     path_target = target_by_label(after_copy, 'AUTO_MP4')
     before_path_drag = records('code')
@@ -388,7 +404,7 @@ try:
     wait_for(lambda: len(clipboard()) > len(before_reload), 'copy after /reload')
     assert clipboard() == before_reload + [code]
     button_copies.append(clipboard()[-1])
-    fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack('HHHH', 28, 42, 0, 0))
+    fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack('HHHH', 38 if options.path_boundaries else 28, 42, 0, 0))
     drain(0.3)
     narrow = snapshot('narrow')
     before_narrow = clipboard()

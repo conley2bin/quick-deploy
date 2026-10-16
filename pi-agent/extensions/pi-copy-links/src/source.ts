@@ -2,7 +2,7 @@ import { randomBytes } from "node:crypto";
 import type { Code } from "mdast";
 import remarkParse from "remark-parse";
 import { unified } from "unified";
-import { commandLike, inlineCodePaths, nonPathTextRanges, plainTextPaths, type PathSpan } from "./paths.ts";
+import { commandLike, inlineCodePaths, nonPathTextRanges, plainTextPaths, plainTextWordSpans, type PathSpan } from "./paths.ts";
 
 const parser = unified().use(remarkParse);
 const PREFIX_REGISTRY = Symbol.for("pi-copy-links:reserved-prefixes");
@@ -99,48 +99,114 @@ export function emptySourceLinkEvidence(): SourceLinkEvidence {
     pathWork: { commandLines: 0, indexedCharacters: 0, queries: 0, cacheHits: 0, lookups: 0 } };
 }
 
-// Native Marked trims tables and splits around URL and strict ~~del~~ tokens.
-// Only these source-backed boundaries (and remark's own leaves) can authorize a
-// native text leaf. A filename prefix/suffix is never an alternative leaf.
-function feasibleTextLeaves(raw: string): Set<string> {
-  const leaves = new Set<string>([raw]);
-  const cells = raw.includes("|") ? raw.split(/[|\n]/u) : [raw];
-  for (const cell of cells) {
-    const variants = raw.includes("|") ? [cell, cell.trimStart(), cell.trimEnd(), cell.trim()] : [cell];
-    for (const value of variants) {
-      leaves.add(value);
-      const boundaries: Array<{ start: number; end: number; content?: string }> = nonPathTextRanges(value).map((range) => {
-        const word = value.slice(range.start, range.end);
-        // Source-backed native URL backpedal: balanced (...) stays in URLs,
-        // trailing sentence punctuation does not. Email/other URI words remain opaque.
-        const url = /^(?:https?:\/\/|ftp:\/\/|www\.)/iu.test(word) ?
-          /^(?:[^?!.,:;*_'"~()&]+|\([^)]*\)|&(?![a-zA-Z0-9]+;$)|[?!.,:;*_'"~)]+(?!$))+/u.exec(word)?.[0] ?? word : word;
-        return { start: range.start, end: range.start + url.length };
-      });
-      for (const match of value.matchAll(/~~(?=[^\s~])([^~]*?[^\s~])~~/gu)) {
-        boundaries.push({ start: match.index, end: match.index + match[0].length, content: match[1] });
-      }
-      boundaries.sort((a, b) => a.start - b.start);
-      let start = 0;
-      for (const boundary of boundaries) {
-        if (boundary.start < start) continue;
-        leaves.add(value.slice(start, boundary.start));
-        if (boundary.content !== undefined) {
-          for (const child of feasibleTextLeaves(boundary.content)) leaves.add(child);
+interface TextSlice { start: number; end: number }
+
+// Same strict-del content grammar as Pi, including internal single tildes.
+// Synthetic splits may overapproximate negative evidence; they never mint paths.
+const STRICT_DEL = /(~~)(?=[^\s~])((?:\\.|[^\\])*?(?:\\.|[^\s~\\]))\1(?=[^~]|$)/gu;
+
+function feasibleTextLeaves(raw: string): TextSlice[] {
+  const leaves = new Map<string, TextSlice>();
+  const add = (start: number, end: number) => { if (end > start) leaves.set(`${start}:${end}`, { start, end }); };
+  const visit = (from: number, to: number): void => {
+    add(from, to);
+    const text = raw.slice(from, to);
+    const cells = text.includes("|") ? [...text.matchAll(/[^|\n]+/gu)].map((match) =>
+      ({ start: from + match.index, end: from + match.index + match[0].length })) : [{ start: from, end: to }];
+    for (const cell of cells) {
+      const value = raw.slice(cell.start, cell.end);
+      const left = cell.start + value.length - value.trimStart().length;
+      const right = cell.end - value.length + value.trimEnd().length;
+      const variants = text.includes("|") ? [cell, { start: left, end: cell.end }, { start: cell.start, end: right }, { start: left, end: right }] : [cell];
+      for (const variant of variants) {
+        if (variant.end <= variant.start) continue;
+        add(variant.start, variant.end);
+        const value = raw.slice(variant.start, variant.end);
+        const boundaries: Array<TextSlice & { content?: TextSlice }> = nonPathTextRanges(value).map((range) => {
+          const word = value.slice(range.start, range.end);
+          const url = /^(?:https?:\/\/|ftp:\/\/|www\.)/iu.test(word) ?
+            /^(?:[^?!.,:;*_'"~()&]+|\([^)]*\)|&(?![a-zA-Z0-9]+;$)|[?!.,:;*_'"~)]+(?!$))+/u.exec(word)?.[0] ?? word : word;
+          return { start: range.start, end: range.start + url.length };
+        });
+        for (const match of value.matchAll(STRICT_DEL)) {
+          boundaries.push({ start: match.index, end: match.index + match[0].length,
+            content: { start: match.index + 2, end: match.index + match[0].length - 2 } });
         }
-        start = boundary.end;
+        boundaries.sort((a, b) => a.start - b.start);
+        let start = 0;
+        for (const boundary of boundaries) {
+          if (boundary.start < start) continue;
+          add(variant.start + start, variant.start + boundary.start);
+          if (boundary.content) visit(variant.start + boundary.content.start, variant.start + boundary.content.end);
+          start = boundary.end;
+        }
+        add(variant.start + start, variant.end);
       }
-      leaves.add(value.slice(start));
     }
-  }
-  return leaves;
+  };
+  visit(0, raw.length);
+  return [...leaves.values()];
 }
 
 function pathLeafKey(kind: "text" | "codespan", raw: string): string { return `${kind}\0${raw}`; }
 
-
 function normalizedMarkdownSpan(value: string): string {
   return value.replace(/\r\n?/gu, "\n").replace(/\t/gu, "   ");
+}
+
+/** Preserve whole source-word authority across AST and synthetic render splits. */
+function sourcePathCandidates(markdown: string, root: TreeNode): { paths: PathSpan[]; offsets: number[] } {
+  const source = normalizedMarkdownSpan(markdown);
+  const offsets: number[] = [];
+  let normalized = 0;
+  for (let at = 0; at < markdown.length; at++) {
+    offsets.push(normalized);
+    normalized += markdown[at] === "\t" ? 3 : markdown[at] === "\n" && markdown[at - 1] === "\r" ? 0 : 1;
+  }
+  offsets.push(normalized);
+  const openings = new Map<number, number>(), closings = new Map<number, number>();
+  const collectStyles = (node: TreeNode): void => {
+    const start = node.position?.start.offset, end = node.position?.end.offset;
+    if ((node.type === "strong" || node.type === "emphasis") && start !== undefined && end !== undefined) {
+      const size = node.type === "strong" ? 2 : 1;
+      openings.set(offsets[start]!, offsets[start + size]!);
+      closings.set(offsets[end]!, offsets[end - size]!);
+    }
+    for (const child of node.children ?? []) collectStyles(child);
+  };
+  collectStyles(root);
+  for (const match of source.matchAll(STRICT_DEL)) {
+    // Do not treat a substring of a longer/escaped marker run as positive syntax.
+    if (source[match.index - 1] === "~" || source[match.index - 1] === "\\") continue;
+    openings.set(match.index, match.index + 2);
+    closings.set(match.index + match[0].length, match.index + match[0].length - 2);
+  }
+  const paths: PathSpan[] = [];
+  for (const word of plainTextWordSpans(source)) {
+    let { start, end } = word;
+    while (openings.has(start) && openings.get(start)! < end) start = openings.get(start)!;
+    while (closings.has(end) && closings.get(end)! > start) end = closings.get(end)!;
+    for (const path of plainTextPaths(source.slice(start, end))) {
+      paths.push({ ...path, start: path.start + start, end: path.end + start });
+    }
+  }
+  return { paths, offsets };
+}
+
+/** Only a complete candidate contained in a slice can carry positive authority. */
+function projectPaths(paths: readonly PathSpan[], start: number, end: number): PathSpan[] {
+  let low = 0, high = paths.length;
+  while (low < high) {
+    const middle = (low + high) >>> 1;
+    if (paths[middle]!.end <= start) low = middle + 1;
+    else high = middle;
+  }
+  const projected: PathSpan[] = [];
+  for (let at = low; at < paths.length && paths[at]!.start < end; at++) {
+    const path = paths[at]!;
+    if (path.start >= start && path.end <= end) projected.push({ ...path, start: path.start - start, end: path.end - start });
+  }
+  return projected;
 }
 
 /** Collect source-exact link semantics before Pi normalizes Markdown for Marked. */
@@ -185,6 +251,7 @@ export function sourceLinkEvidence(markdown: string): SourceLinkEvidence {
     for (const child of node.children ?? []) collectLinks(child, insideLink || link);
   };
   const pathSpans: SourcePathSpan[] = [];
+  const candidates = sourcePathCandidates(markdown, root);
   const lineStarts: number[] = [];
   const blockedLines = [0];
   let lineOffset = 0;
@@ -219,7 +286,7 @@ export function sourceLinkEvidence(markdown: string): SourceLinkEvidence {
       // Text entity/escape disagreement is deliberately not guessed. Inline
       // code uses remark's literal value and additionally requires native equality.
       const paths = !allowed ? [] : kind === "codespan" ? inlineCodePaths(text) :
-        raw === text ? plainTextPaths(text) : [];
+        raw === text ? projectPaths(candidates.paths, candidates.offsets[start]!, candidates.offsets[end]!) : [];
       pathSpans.push({ kind, raw, text, paths, allowed });
     }
     for (const child of node.children ?? []) collectPaths(child, blocked);
@@ -233,7 +300,7 @@ export function sourceLinkEvidence(markdown: string): SourceLinkEvidence {
     if (previous === null) return;
     if (previous && (previous.text !== text || JSON.stringify(previous.paths) !== JSON.stringify(paths))) {
       pathIndex.set(key, null);
-    } else if (!previous) pathIndex.set(key, { kind, raw, text, paths, allowed: true });
+    } else if (!previous) pathIndex.set(key, { kind, raw, text, paths, allowed: paths.length > 0 });
   };
   collectDefinitions(root);
   collectLinks(root);
@@ -243,12 +310,12 @@ export function sourceLinkEvidence(markdown: string): SourceLinkEvidence {
       indexLeaf(span.kind, span.raw, span.text, span.paths);
       continue;
     }
-    for (const raw of feasibleTextLeaves(span.raw)) {
-      const candidates = plainTextPaths(raw);
-      // Blocked/semantic-disagreement leaves are indexed too: identical native
-      // evidence cannot borrow a valid occurrence elsewhere in the message.
-      const paths = span.allowed && span.raw === span.text ? candidates : [];
-      if (candidates.length) indexLeaf("text", raw, raw, paths);
+    for (const slice of feasibleTextLeaves(span.raw)) {
+      const raw = span.raw.slice(slice.start, slice.end);
+      const paths = projectPaths(span.paths, slice.start, slice.end);
+      // A fragment can only add negative evidence, never a fresh target. This
+      // also prevents an identical partial/blocked leaf borrowing another word.
+      if (paths.length || plainTextPaths(raw).length) indexLeaf("text", raw, raw, paths);
     }
   }
   return { destinations, explicitAutolinks, plainTextSpans, pathSpans, pathIndex,

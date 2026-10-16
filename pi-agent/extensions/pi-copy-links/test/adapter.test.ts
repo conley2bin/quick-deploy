@@ -675,33 +675,36 @@ function pathAt(tui: TuiAltScreen, label: string, occurrence = 0) {
 test("punctuated plain paths full-edge clicks never open existing prefix or suffix decoys", async () => {
   const cwd = mkdtempSync(join(tmpdir(), "pi-path-decoys-"));
   mkdirSync(join(cwd, "reports"));
-  for (const name of ["reports/final", ".png", "1.png", "reports/final(1).png", "reports/final,1.png", "reports/final，1.png"]) {
+  for (const name of ["reports/final", ".png", "1.png", "reports/final(1).png", "reports/final,1.png", "reports/final，1.png", "reports/final~~1~~.png"]) {
     writeFileSync(join(cwd, name), name);
   }
   try {
     for (const [source, shown, expected] of [
       ["./reports/final(1).png", "./reports/final(1).png", "reports/final(1).png"],
       ["`./reports/final(1).png`", "./reports/final(1).png", "reports/final(1).png"],
+      ["`./reports/final~~1~~.png`", "./reports/final~~1~~.png", "reports/final~~1~~.png"],
       ["./reports/final,1.png", "./reports/final,1.png", "reports/final,1.png"],
       ["(./reports/final(1).png),", "./reports/final(1).png", "reports/final(1).png"],
       ["（./reports/final，1.png），", "./reports/final，1.png", "reports/final，1.png"],
     ]) {
       const launches: Array<{ command: string; args: readonly string[] }> = [];
-      const f = fixture(source!, false, undefined, undefined, { cwd, open: async (href, root, lifetime) => {
-        await openTarget(href, root, lifetime, { spawn: (command, args) => {
+      const pending: Promise<void>[] = [];
+      const f = fixture(source!, false, undefined, undefined, { cwd, open: (href, root, lifetime) => {
+        const operation = openTarget(href, root, lifetime, { spawn: (command, args) => {
           launches.push({ command, args });
           const child = new EventEmitter() as ChildProcess;
           child.unref = () => child;
           queueMicrotask(() => child.emit("exit", 0, null));
           return child;
         } });
+        pending.push(operation); return operation;
       } });
       try {
         const start = pathAt(f.tui, shown!);
         const end = { ...start, x: start.x + visibleWidth(shown!) - 1 };
         assert.equal(getOsc8LinkAtColumn(screen(f.tui)[end.y]!, end.x), start.url, "whole displayed resource has one action");
-        click(f.terminal, start, 16); await tick(); await tick();
-        click(f.terminal, end, 16); await tick(); await tick();
+        click(f.terminal, start, 16); await Promise.all(pending);
+        click(f.terminal, end, 16); await Promise.all(pending);
         assert.deepEqual(launches, Array.from({ length: 2 }, () => ({ command: "code", args: ["--new-window", "--", join(cwd, expected!)] })), source);
         assert.deepEqual(f.errorNotices, []);
       } finally { f.close(); }
@@ -713,6 +716,70 @@ test("punctuated plain paths full-edge clicks never open existing prefix or suff
       finally { f.close(); }
     }
   } finally { rmSync(cwd, { recursive: true, force: true }); }
+});
+
+test("complete source provenance keeps partial styled filenames and blocked tilde commands inert", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-path-provenance-"));
+  mkdirSync(join(cwd, "reports"));
+  for (const name of ["reports/final", ".png", "reports/final~~1~~.png", "reports/final1.png", "reports/final.png", "a~chart.png", "reports/okay.png"]) {
+    writeFileSync(join(cwd, name), name);
+  }
+  try {
+    for (const [source, shown] of [
+      ["./reports/final~~1~~.png", "./reports/final1.png"],
+      ["./reports/**final**.png", "./reports/final.png"],
+      ["./reports/*final*.png", "./reports/final.png"],
+      ["a~chart.png\n\ncat ~~a~chart.png~~", "cat a~chart.png"],
+    ]) {
+      const launches: string[] = [];
+      const pending: Promise<void>[] = [];
+      const f = fixture(source!, false, undefined, undefined, { cwd, open: (href, root, lifetime) => {
+        const operation = openTarget(href, root, lifetime, { spawn: (_command, args) => {
+          launches.push(args.at(-1)!);
+          const child = new EventEmitter() as ChildProcess; child.unref = () => child;
+          queueMicrotask(() => child.emit("exit", 0, null)); return child;
+        } });
+        pending.push(operation); return operation;
+      } });
+      try {
+        const rows = screen(f.tui).map(stripTerminalSequences);
+        const y = rows.findIndex((row) => row.includes(shown!));
+        assert.ok(y >= 0, shown);
+        const x = visibleWidth(rows[y]!.slice(0, rows[y]!.indexOf(shown!)));
+        // Deliver complete Ctrl edges at beginning and suffix/command operand;
+        // all intended files and dangerous decoys actually exist.
+        for (const column of [x + (shown!.startsWith("cat ") ? 4 : 0), x + visibleWidth(shown!) - 1]) {
+          click(f.terminal, { x: column, y }, 16); await Promise.all(pending);
+        }
+        assert.deepEqual(launches, [], source);
+        assert.equal(targets(f.tui, "pi-copy://").length, 0, source);
+      } finally { f.close(); }
+    }
+    for (const source of ["~~a~chart.png~~", "**reports/okay.png**", "*reports/okay.png*", "~~**reports/okay.png**~~",
+      "Saved **reports/okay.png**, next", "~~before https://example.com/ after reports/okay.png~~"]) {
+      const f = fixture(source, false, undefined, undefined, { cwd });
+      try {
+        const name = source.includes("a~chart") ? "a~chart.png" : "reports/okay.png";
+        click(f.terminal, pathAt(f.tui, name), 16); await tick();
+        assert.equal(f.openRequests.at(-1)?.href, `./${name}`, source);
+      } finally { f.close(); }
+    }
+  } finally { rmSync(cwd, { recursive: true, force: true }); }
+});
+
+test("blocked provenance additions and removals rebuild native source authority", async () => {
+  const f = fixture("a~chart.png");
+  try {
+    const owner = markdownOwner(f.component);
+    for (const [source, count] of [["a~chart.png", 1], ["a~chart.png\n\ncat ~~a~chart.png~~", 0], ["a~chart.png", 1]] as const) {
+      owner.setText(source); f.tui.renderNow();
+      assert.equal(targets(f.tui, "pi-copy://").length, count, source);
+      if (count) {
+        click(f.terminal, pathAt(f.tui, "a~chart.png"), 16); await tick();
+        assert.equal(f.openRequests.at(-1)?.href, "./a~chart.png");
+      }
+    }
+  } finally { f.close(); }
 });
 
 test("distinct filename leaves survive streaming longer-name addition and removal", async () => {
@@ -778,6 +845,7 @@ test("automatic paths use counted opaque actions in prose, code, nested styles, 
 test("automatic paths preserve exact native ANSI styles, wrapping, source and cached token bytes", () => {
   for (const source of [
     "Open reports/result.png and `state43_real_grid_1080p.mp4`.",
+    "./reports/final~~1~~.png", "./reports/**final**.png", "./reports/*final*.png",
     "# reports/header.png\n\n**reports/bold.png** *reports/italic.png* ~~reports/deleted.png~~",
     "> **reports/quote.png** and `reports/my video.mp4`\n\n- reports/list.png",
     "| file |\n|---|\n| `reports/中文#1?.png` |\n| reports/wrapped_long_filename.mp4 |",

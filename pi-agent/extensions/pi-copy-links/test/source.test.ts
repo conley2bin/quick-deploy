@@ -128,6 +128,21 @@ test("source path proof excludes command lines, code, links, images and HTML wit
   }
 });
 
+test("rendering splits only project complete source candidates and propagate blocked tilde leaves", () => {
+  for (const source of ["./reports/final~~1~~.png", "./reports/**final**.png", "./reports/*final*.png"]) {
+    const evidence = sourceLinkEvidence(source);
+    for (const fragment of ["./reports/final", "./reports/", "final", ".png"]) {
+      assert.deepEqual(sourcePathMatches(evidence, "text", fragment, fragment), [], `${source}: ${fragment}`);
+    }
+  }
+  const command = sourceLinkEvidence("a~chart.png\n\ncat ~~a~chart.png~~");
+  assert.deepEqual(sourcePathMatches(command, "text", "a~chart.png", "a~chart.png"), [], "real blocked native leaf cannot borrow standalone authority");
+  for (const source of ["~~a~chart.png~~", "**reports/okay.png**", "*reports/okay.png*", "~~**reports/okay.png**~~"]) {
+    const path = source.includes("a~chart") ? "a~chart.png" : "reports/okay.png";
+    assert.equal(sourcePathMatches(sourceLinkEvidence(source), "text", path, path).length, 1, source);
+  }
+});
+
 test("source path indexing is bounded linear work with cached queries and no-path fast exit", () => {
   for (const paths of [false, true]) {
     let previous = 0;

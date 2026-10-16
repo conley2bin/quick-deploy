@@ -85,14 +85,10 @@ function balancedParentheses(value: string): boolean {
   return depth === 0;
 }
 
-/** Whole whitespace words retain filename punctuation; never retry fragments. */
-export function plainTextPaths(value: string): PathSpan[] {
-  const paths: PathSpan[] = [];
-  const urls = nonPathTextRanges(value);
-  let url = 0;
+/** Complete source/display word bounds, before deciding whether a word is a path. */
+export function plainTextWordSpans(value: string): Array<{ start: number; end: number }> {
+  const words: Array<{ start: number; end: number }> = [];
   for (const match of value.matchAll(/\S+/gu)) {
-    while (urls[url] && urls[url]!.end <= match.index) url += 1;
-    if (urls[url] && urls[url]!.start < match.index + match[0].length) continue;
     let path = match[0].replace(PROSE_END, "");
     let start = match.index;
     // Only enclosing pairs are prose. Internal parentheses/comma stay literal;
@@ -100,8 +96,22 @@ export function plainTextPaths(value: string): PathSpan[] {
     while (WRAPPERS[path[0]!] === path.at(-1) && path.length > 1) {
       path = path.slice(1, -1); start += 1;
     }
-    if (/[“”‘’【】（）]/u.test(path) || !balancedParentheses(path) || !crediblePath(path, false)) continue;
-    paths.push({ start, end: start + path.length, href: literalHref(path) });
+    if (/[“”‘’【】（）]/u.test(path) || !balancedParentheses(path) || !path) continue;
+    words.push({ start, end: start + path.length });
+  }
+  return words;
+}
+
+/** Whole whitespace words retain filename punctuation; never retry fragments. */
+export function plainTextPaths(value: string): PathSpan[] {
+  const paths: PathSpan[] = [];
+  const urls = nonPathTextRanges(value);
+  let url = 0;
+  for (const word of plainTextWordSpans(value)) {
+    while (urls[url] && urls[url]!.end <= word.start) url += 1;
+    if (urls[url] && urls[url]!.start < word.end) continue;
+    const path = value.slice(word.start, word.end);
+    if (crediblePath(path, false)) paths.push({ ...word, href: literalHref(path) });
   }
   return paths;
 }
