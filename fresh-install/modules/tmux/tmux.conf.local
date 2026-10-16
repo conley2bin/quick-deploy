@@ -132,8 +132,8 @@ bind -T copy-mode-vi WheelDownPane send-keys -X -N 1 scroll-down
 bind -T copy-mode    MouseDragEnd1Pane send-keys -X copy-selection-no-clear \; send-keys -X clear-selection
 bind -T copy-mode-vi MouseDragEnd1Pane send-keys -X copy-selection-no-clear \; send-keys -X clear-selection
 
-# Ghostty 的两种粘贴键均发送原始 0x16。只在请求粘贴时退出历史模式，
-# 再把该字节交给 Pi 或 ZLE；不粘贴 tmux buffer，不发送 Esc 或回车。
+# 物理 Ctrl+V 请求退出历史模式，再把原始 0x16 交给 Pi 或 ZLE；
+# 不粘贴 tmux buffer，不发送 Esc 或回车。Ghostty 原生 Ctrl+Shift+V 粘贴文字前先退出模式。
 # root 表保持正常转发。vi 的矩形选择移到 Alt+V，emacs 翻页仍有 PageDown。
 bind -T copy-mode    C-v send-keys -X cancel \; send-keys -H 16 #!important
 bind -T copy-mode-vi C-v send-keys -X cancel \; send-keys -H 16 #!important

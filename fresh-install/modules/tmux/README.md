@@ -110,8 +110,8 @@ copy-mode 表里的绑定只有在可选项 `tmux_conf_copy_to_os_clipboard` 显
 
 滚轮和普通拖选都会进入 copy-mode。拖选释放已经复制，但仍保留历史位置；
 清除选区不等于退出模式。默认 emacs 表把 `Ctrl+V` 用作翻页，vi 表用作矩形
-选择，会吞掉 Ghostty 为 `Ctrl+Shift+V` 发送的原始 `0x16`，Pi/ZLE 收不到。
-本基线仅在两张 mode table 中让粘贴请求**先退出，再转交原始 Ctrl+V**：
+选择，会吞掉物理 `Ctrl+V` 的原始 `0x16`，Pi/ZLE 收不到。本基线仅在
+两张 mode table 中让物理 Ctrl+V **先退出，再转交原始字节**：
 
 ```tmux
 bind -T copy-mode    C-v send-keys -X cancel \; send-keys -H 16 #!important
@@ -120,8 +120,11 @@ bind -T copy-mode-vi M-v send-keys -X rectangle-toggle #!important
 ```
 
 只转交一个字节，不发送 Esc/回车，不读取系统剪贴板或粘贴 tmux buffer；
-root 表保持正常转发。滚动与拖选释放仍停留在原位置，直到用户按粘贴键。
-vi 的矩形选择改用 **Alt+V**，emacs 原来的翻页仍可用 PageDown。行尾
+root 表保持正常转发。滚动与拖选释放仍停留在原位置，直到用户按 Ctrl+V。
+Ghostty 的 `Ctrl+Shift+V` 现在固定为原生**文字**粘贴，不再产生 `C-v`。
+文字可能被 copy-mode 的键表或快速/括号粘贴路径消费，不能依靠上述绑定
+自动转交；原生粘贴前先按 Esc 退出历史模式。不为此改回 raw shifted-V，
+也不增加 Pi 进入/退出时的动态切换。vi 的矩形选择改用 **Alt+V**，emacs 原来的翻页仍可用 PageDown。行尾
 `#!important` 保证 Oh My Tmux 重建键位后重放这三条绑定。
 
 复制的所有者各不相同：
@@ -129,14 +132,16 @@ vi 的矩形选择改用 **Alt+V**，emacs 原来的翻页仍可用 PageDown。�
 - **Ghostty**：Shift+拖选产生终端选区，再用 Ctrl+Shift+C；普通拖选被应用
   接管时，Ctrl+Shift+C 不会自动获取应用选区。
 - **tmux**：应用未请求鼠标上报时，普通拖选释放通过 OSC 52 自动复制，无需
-  再按 Ctrl+Shift+C；复制后仍在历史模式，但现在按粘贴键就能退出并转交。
+  再按 Ctrl+Shift+C；复制后仍在历史模式，物理 Ctrl+V 才走上述退出转交。
 - **Pi**：Pi 请求鼠标上报时普通拖选交给 Pi，由 Pi 的剪贴板适配器复制。
   转交的 Ctrl+V 继续使用 Pi 原有图片/文本粘贴或 SSH 桥。
 
-本地 Wayland zsh 需要 Ghostty 模块的受管 ZLE hook；它读取 **shell/server
-主机** 的 Wayland 剪贴板，不按共享 pane 的输入客户端路由。其他程序自行
-解释 Ctrl+V。打开的 tmux 命令/搜索 prompt 先于 mode table 消费按键，这三条
-绑定不处理 prompt 编辑。真实 Ghostty/系统剪贴板结果仍须人工验收。
+本地 Wayland zsh 的物理 Ctrl+V 需要 Ghostty 模块的受管 ZLE hook；本地
+输入读 shell/server 的 Wayland 剪贴板，共享 pane 最近活动客户端来自 SSH
+时读已有客户端桥（是活动时间推断，不是逐键来源证明）。原生 Ctrl+Shift+V
+直接由输入端 Ghostty 读文字，不依赖该 hook。其他程序自行解释 Ctrl+V。
+打开的 tmux 命令/搜索 prompt 先于 mode table 消费按键，这三条绑定不处理
+prompt 编辑。真实 Ghostty/系统剪贴板新鲜度仍须人工验收。
 
 ### 现有机器的窄部署
 
@@ -159,8 +164,9 @@ tmux -S "$socket" bind-key -T copy-mode-vi M-v send-keys -X rectangle-toggle
 
 CLI 中须像上例把两步命令列表整体引用；单独传未转义的分号会在安装绑定时
 执行第二条命令，不能保存完整路由。配置文件中则保留上文的 `\;`。部署后
-分别在 emacs/vi 模式滚历史、拖选，按两种粘贴键确认当前内容到达 Pi/新 zsh；
-多行文本不应自动提交，vi Alt+V 应仍切换矩形选择。此过程不改变全局 Ghostty
+分别在 emacs/vi 模式滚历史、拖选，按物理 Ctrl+V 确认单字节转交 Pi/新 zsh；
+原生 Ctrl+Shift+V 先退出历史模式再测文字，多行不自动提交，vi Alt+V 仍切换
+矩形选择。此过程不改变全局 Ghostty
 快捷键、OSC 52 策略或 Pi 剪贴板实现。
 
 ## 幂等语义

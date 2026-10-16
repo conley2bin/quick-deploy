@@ -25,6 +25,19 @@ sed '/^main "\$@"$/,$d' "$INSTALLER" > "$WORK/functions.sh"
 HOME="$WORK/render-hook-home" bash -c 'source "$1"; render_ssh_mouse_hook' _ "$WORK/functions.sh" > "$HOOK_SOURCE"
 HOME="$WORK/render-hook-home" bash -c 'source "$1"; render_local_paste_hook' _ "$WORK/functions.sh" > "$PASTE_HOOK_SOURCE"
 python3 "$(dirname "${BASH_SOURCE[0]}")/test_shell_paste.py" || fail "shell clipboard reader regressions failed"
+python3 "$(dirname "${BASH_SOURCE[0]}")/test_paste_dispatch.py" || fail "text/control PTY regressions failed"
+python3 "$(dirname "${BASH_SOURCE[0]}")/test_paste_migrations.py" || fail "paste migration guard regressions failed"
+# Independent historical fixture: changing the current renderer must not redefine
+# which deployed raw launchers the installer is allowed to replace.
+cat > "$WORK/legacy-pi-launcher" <<'EOF'
+#!/bin/sh
+# 由 fresh-install/modules/ghostty/install.sh 生成与维护。
+exec "$HOME/.local/bin/ghostty" --gtk-single-instance=false '--keybind=ctrl+shift+v=text:\x16' "$@"
+EOF
+printf '9db1c2a1562c6b8eacd55c1d9f4fd2b5da4624b1dd31b8eff863d947d21b246f  %s\n' \
+    "$WORK/legacy-pi-launcher" | sha256sum --check --status || fail "旧 raw launcher fixture 字节改变"
+bash -c 'source "$1"; render_legacy_pi_launcher' _ "$WORK/functions.sh" \
+    | cmp -s - "$WORK/legacy-pi-launcher" || fail "旧 raw launcher renderer 字节改变"
 for version in v1 v2 v3; do
     HOME="$WORK/render-hook-home" bash -c 'source "$1"; render_local_paste_hook "$2"' \
         _ "$WORK/functions.sh" "$version" > "$WORK/ghostty-local-paste-$version.zsh"
@@ -105,13 +118,13 @@ render_variant() {
 render_variant "$WORK/config.ghostty"
 grep -Fqx 'keybind = ctrl+shift+r=reset' "$WORK/config.ghostty" || fail "缺少 reset keybind"
 # 鼠标上报下普通拖选属于 Pi/tmux，Shift+拖选产生 Ghostty 本地选区，
-# Ctrl+Shift+C 复制；Ctrl+Shift+V 向 Pi 发送原始 Ctrl+V。三行显式写入，
+# Ctrl+Shift+C 复制；Ctrl+Shift+V 原生粘贴文字，Ctrl+V 留给程序。三行显式写入，
 # never 还禁止程序用 XTSHIFTESCAPE 抢走 Shift，行为不随上游默认漂移。
 grep -Fqx 'mouse-shift-capture = never' "$WORK/config.ghostty" || fail "缺少 mouse-shift-capture = never"
 grep -Fqx 'keybind = ctrl+shift+c=copy_to_clipboard:mixed' "$WORK/config.ghostty" \
     || fail "缺少 ctrl+shift+c 复制绑定"
-grep -Fqx 'keybind = ctrl+shift+v=text:\x16' "$WORK/config.ghostty" \
-    || fail "缺少 ctrl+shift+v 原始 Ctrl+V 绑定"
+grep -Fqx 'keybind = ctrl+shift+v=paste_from_clipboard' "$WORK/config.ghostty" \
+    || fail "缺少 ctrl+shift+v 原生文字粘贴绑定"
 ! grep -Eq '^keybind = ctrl\+(c|v)=' "$WORK/config.ghostty" \
     || fail "Ctrl+C/V 不应被全局改绑"
 # 只有 never 能保证程序不能通过 XTSHIFTESCAPE 改写这条本地选择路径。
@@ -149,7 +162,7 @@ HOME="$WORK/config-home" bash -c '
     grep -Fqx "clipboard-read = deny" "$CONFIG_FILE"
     grep -Fqx "mouse-shift-capture = never" "$CONFIG_FILE"
     grep -Fqx "keybind = ctrl+shift+c=copy_to_clipboard:mixed" "$CONFIG_FILE"
-    grep -Fqx '\''keybind = ctrl+shift+v=text:\x16'\'' "$CONFIG_FILE"
+    grep -Fqx "keybind = ctrl+shift+v=paste_from_clipboard" "$CONFIG_FILE"
     digest=$(sha256sum "$CONFIG_FILE" | cut -d" " -f1)
     write_config > "$HOME/second.out"
     grep -Fq "配置文件无变化" "$HOME/second.out"
@@ -172,6 +185,12 @@ if [ -x /usr/bin/ghostty ]; then
     XDG_CONFIG_HOME="$WORK/xdg" HOME="$WORK/render-home" \
         /usr/bin/ghostty +validate-config >"$WORK/ghostty-validate.log" 2>&1 \
         || { cat "$WORK/ghostty-validate.log" >&2; fail "Ghostty 配置校验失败"; }
+    XDG_CONFIG_HOME="$WORK/xdg" HOME="$WORK/render-home" \
+        /usr/bin/ghostty +list-keybinds --plain > "$WORK/ghostty-keybinds"
+    grep -Fqx 'keybind = ctrl+shift+v=paste_from_clipboard' "$WORK/ghostty-keybinds" \
+        || fail "Ghostty parser 没有选择原生文字粘贴"
+    ! grep -Eq '^keybind = ctrl\+v=' "$WORK/ghostty-keybinds" \
+        || fail "Ghostty parser 接管了 Ctrl+V"
 fi
 
 # ============================================================
@@ -217,37 +236,50 @@ def argv(name):
     assert raw.endswith(b"\0"), (name, raw)
     return [value.decode() for value in raw[:-1].split(b"\0")]
 
-special = ["--gtk-single-instance=false", r"--keybind=ctrl+shift+v=text:\x16"]
+special = ["--gtk-single-instance=false", "--keybind=ctrl+shift+v=paste_from_clipboard"]
 assert argv("attach-argv") == special + ["-e", "tmux", "attach-session", "-t", "quick-deploy_pi-agent"]
 assert argv("generic-argv") == special + ["--working-directory=inherit"]
 assert (home / "normal-argv").read_bytes() == b"", "ordinary Ghostty entry gained flags"
 PY
 
-for kind in custom symlink directory nonexec; do
+# Both current outputs must follow the same policy variable, not two literals.
+HOME="$WORK/policy-home" bash -c '
+    source "$1"
+    GHOSTTY_PASTE_ACTION=ignore
+    render_config | grep -Fx "keybind = ctrl+shift+v=ignore" >/dev/null
+    render_pi_launcher | grep -F -- "--keybind=ctrl+shift+v=ignore" >/dev/null
+' _ "$WORK/functions.sh" || fail "配置和 Pi launcher 未共享同一当前策略"
+
+for kind in custom custom-legacy symlink directory nonexec legacy-nonexec; do
     HOME="$WORK/pi-refuse-$kind" bash -c '
         set -euo pipefail
         source "$1"
         mkdir -p "$(dirname "$USER_PI_GHOSTTY_LAUNCHER")"
         case "$2" in
-            custom) printf "KEEP\n" > "$USER_PI_GHOSTTY_LAUNCHER" ;;
+            custom) printf "KEEP\n" > "$USER_PI_GHOSTTY_LAUNCHER"; chmod 755 "$USER_PI_GHOSTTY_LAUNCHER" ;;
+            custom-legacy) render_legacy_pi_launcher > "$USER_PI_GHOSTTY_LAUNCHER"; printf "# USER\n" >> "$USER_PI_GHOSTTY_LAUNCHER"; chmod 755 "$USER_PI_GHOSTTY_LAUNCHER" ;;
             symlink) printf "KEEP\n" > "$HOME/target"; ln -s "$HOME/target" "$USER_PI_GHOSTTY_LAUNCHER" ;;
             directory) mkdir "$USER_PI_GHOSTTY_LAUNCHER"; printf "KEEP\n" > "$USER_PI_GHOSTTY_LAUNCHER/content" ;;
             nonexec) render_pi_launcher > "$USER_PI_GHOSTTY_LAUNCHER"; chmod 644 "$USER_PI_GHOSTTY_LAUNCHER" ;;
+            legacy-nonexec) render_legacy_pi_launcher > "$USER_PI_GHOSTTY_LAUNCHER"; chmod 644 "$USER_PI_GHOSTTY_LAUNCHER" ;;
         esac
         case "$2" in
-            custom) test "$(pi_launcher_state)" = "含非基准内容（正式安装将拒绝覆盖）" ;;
+            custom|custom-legacy) test "$(pi_launcher_state)" = "含非基准内容（正式安装将拒绝覆盖）" ;;
             symlink) test "$(pi_launcher_state)" = "符号链接（正式安装将拒绝覆盖）" ;;
             directory) test "$(pi_launcher_state)" = "不是普通文件（正式安装将拒绝覆盖）" ;;
             nonexec) test "$(pi_launcher_state)" = "内容相同但不可执行（正式安装将拒绝覆盖）" ;;
+            legacy-nonexec) test "$(pi_launcher_state)" = "旧 raw 基准但不可执行（正式安装将拒绝覆盖）" ;;
         esac
         ( install_pi_launcher ) > "$HOME/refuse.log" 2>&1 && exit 1
         grep -Fq "拒绝覆盖" "$HOME/refuse.log"
         ! compgen -G "$USER_PI_GHOSTTY_LAUNCHER.bak.*" >/dev/null
         case "$2" in
             custom) test "$(cat "$USER_PI_GHOSTTY_LAUNCHER")" = KEEP ;;
+            custom-legacy) grep -Fqx "# USER" "$USER_PI_GHOSTTY_LAUNCHER" ;;
             symlink) test -L "$USER_PI_GHOSTTY_LAUNCHER" && test "$(cat "$HOME/target")" = KEEP ;;
             directory) test -d "$USER_PI_GHOSTTY_LAUNCHER" && test "$(cat "$USER_PI_GHOSTTY_LAUNCHER/content")" = KEEP ;;
             nonexec) test -f "$USER_PI_GHOSTTY_LAUNCHER" && test ! -x "$USER_PI_GHOSTTY_LAUNCHER" && cmp -s "$USER_PI_GHOSTTY_LAUNCHER" <(render_pi_launcher) ;;
+            legacy-nonexec) test -f "$USER_PI_GHOSTTY_LAUNCHER" && test ! -x "$USER_PI_GHOSTTY_LAUNCHER" && cmp -s "$USER_PI_GHOSTTY_LAUNCHER" <(render_legacy_pi_launcher) ;;
         esac
     ' _ "$WORK/functions.sh" "$kind" || fail "Pi 专用启动器未拒绝 $kind 用户目标"
 done
@@ -337,6 +369,42 @@ if [ -x /usr/bin/ghostty ]; then
     ! compgen -G "$PI_ONLY_HOME/.local/bin/ghostty-pi.bak.*" >/dev/null \
         || fail "Pi 窄安装意外生成启动器备份"
 
+    # Upgrade an independently pinned deployed launcher without requiring or
+    # rewriting the arbitrary shared config from prepare_pi_only_home.
+    LEGACY_HOME="$WORK/pi-only-legacy"
+    prepare_pi_only_home "$LEGACY_HOME"
+    cp "$WORK/legacy-pi-launcher" "$LEGACY_HOME/.local/bin/ghostty-pi"
+    chmod 751 "$LEGACY_HOME/.local/bin/ghostty-pi"
+    HOME="$LEGACY_HOME" bash -c '
+        source "$1"
+        test "$(pi_launcher_state)" = "旧 raw 受管基准（正式安装将备份并迁移为原生文字粘贴）"
+    ' _ "$WORK/functions.sh" || fail "未识别精确旧 raw launcher"
+    snapshot_pi_only_home "$LEGACY_HOME" > "$WORK/pi-legacy-before"
+    run_pi_only "$LEGACY_HOME" --pi-launcher-only > "$WORK/pi-legacy-migrate.log" \
+        || fail "旧 raw launcher 窄升级失败"
+    snapshot_pi_only_home "$LEGACY_HOME" > "$WORK/pi-legacy-after"
+    python3 - "$LEGACY_HOME" "$WORK/legacy-pi-launcher" "$WORK/pi-legacy-before" "$WORK/pi-legacy-after" <<'PY'
+from pathlib import Path
+import ast
+import sys
+home, fixture, before_file, after_file = map(Path, sys.argv[1:])
+backups = list((home / '.local/bin').glob('ghostty-pi.bak.*'))
+assert len(backups) == 1 and backups[0].read_bytes() == fixture.read_bytes()
+assert backups[0].stat().st_mode & 0o777 == 0o751
+current = home / '.local/bin/ghostty-pi'
+assert current.stat().st_mode & 0o777 == 0o755
+assert current.read_bytes() == fixture.read_bytes().replace(b'text:\\x16', b'paste_from_clipboard')
+before = {row[0]: row for row in map(ast.literal_eval, before_file.read_text().splitlines())}
+after = {row[0]: row for row in map(ast.literal_eval, after_file.read_text().splitlines())}
+assert {key for key in before.keys() | after.keys() if before.get(key) != after.get(key)} == {backups[0].relative_to(home).as_posix()}
+PY
+    pi_inode=$(stat -c %i "$LEGACY_HOME/.local/bin/ghostty-pi")
+    run_pi_only "$LEGACY_HOME" --pi-launcher-only > "$WORK/pi-legacy-rerun.log" \
+        || fail "旧 raw launcher 升级后重跑失败"
+    test "$pi_inode" = "$(stat -c %i "$LEGACY_HOME/.local/bin/ghostty-pi")" || fail "升级后重跑改写 inode"
+    snapshot_pi_only_home "$LEGACY_HOME" > "$WORK/pi-legacy-rerun"
+    cmp -s "$WORK/pi-legacy-after" "$WORK/pi-legacy-rerun" || fail "升级后重跑增加备份或修改非目标"
+
     for other in --check --ppa-only --deb-only --default-terminal --no-default-terminal --paste-keybind-only --shell-paste-only; do
         if run_pi_only "$PI_ONLY_HOME" --pi-launcher-only "$other" > "$WORK/pi-only-args.log" 2>&1; then
             fail "Pi 窄安装接受了冲突选项 $other"
@@ -396,7 +464,7 @@ prepare_pi_only_home "$PASTE_ONLY_HOME"
 HOME="$PASTE_ONLY_HOME" bash -c '
     set -euo pipefail
     source "$1"
-    render_config paste_from_clipboard > "$CONFIG_FILE"
+    render_config '\''text:\x16'\'' > "$CONFIG_FILE"
     chmod 600 "$CONFIG_FILE"
 ' _ "$WORK/functions.sh" || fail "无法生成旧版受管配置"
 cp "$PASTE_ONLY_HOME/.config/ghostty/config.ghostty" "$WORK/paste-old-baseline"
@@ -409,8 +477,8 @@ import sys
 
 before = Path(sys.argv[1]).read_bytes()
 after = Path(sys.argv[2]).read_bytes()
-old = b"keybind = ctrl+shift+v=paste_from_clipboard\n"
-new = b"keybind = ctrl+shift+v=text:\\x16\n"
+old = b"keybind = ctrl+shift+v=text:\\x16\n"
+new = b"keybind = ctrl+shift+v=paste_from_clipboard\n"
 assert before.count(old) == 1, "old baseline lacks unique keybind"
 assert after == before.replace(old, new), "migration changed more than one binding"
 PY
@@ -440,18 +508,22 @@ for other in --check --ppa-only --deb-only --default-terminal --no-default-termi
         || fail "全局单键窄迁移未明确拒绝冲突选项 $other"
 done
 
-for scenario in custom-old custom-new symlink directory missing symlink-config-dir; do
+for scenario in custom-old custom-new duplicate conflicting font-drift directory-drift symlink directory missing symlink-config-dir; do
     private_home="$WORK/paste-refuse-$scenario"
     prepare_pi_only_home "$private_home"
     HOME="$private_home" bash -c '
         set -euo pipefail
         source "$1"
         render_config "$2" > "$CONFIG_FILE"
-    ' _ "$WORK/functions.sh" paste_from_clipboard \
+    ' _ "$WORK/functions.sh" 'text:\x16' \
         || fail "无法生成拒绝场景的受管配置 $scenario"
     config="$private_home/.config/ghostty/config.ghostty"
     case "$scenario" in
         custom-old) printf "# USER CUSTOM\n" >> "$config" ;;
+        duplicate) printf '%s\n' 'keybind = ctrl+shift+v=text:\x16' >> "$config" ;;
+        conflicting) printf '%s\n' 'keybind = ctrl+shift+v=paste_from_clipboard' >> "$config" ;;
+        font-drift) sed -i 's/^font-size = .*/font-size = 99/' "$config" ;;
+        directory-drift) sed -i 's|^working-directory = .*|working-directory = /custom|' "$config" ;;
         custom-new)
             HOME="$private_home" bash -c 'source "$1"; render_config > "$CONFIG_FILE"' _ "$WORK/functions.sh"
             printf "# USER CUSTOM\n" >> "$config" ;;
@@ -638,7 +710,7 @@ for scenario in old-global custom-global custom-zshrc symlink-zshrc malformed-zs
     zshrc="$private_home/.zshrc"
     paste_hook="$private_home/.config/ghostty/ghostty-local-paste.zsh"
     case "$scenario" in
-        old-global) sed -i 's|^keybind = ctrl+shift+v=text:\\x16$|keybind = ctrl+shift+v=paste_from_clipboard|' "$config" ;;
+        old-global) sed -i 's|^keybind = ctrl+shift+v=paste_from_clipboard$|keybind = ctrl+shift+v=text:\\x16|' "$config" ;;
         custom-global) printf '# user config\n' >> "$config" ;;
         custom-zshrc) sed -i 's|# 由 fresh-install/modules/ghostty/install.sh 管理|# user edit inside managed block|' "$zshrc" ;;
         symlink-zshrc) mv "$zshrc" "$private_home/real-zshrc"; ln -s "$private_home/real-zshrc" "$zshrc" ;;
@@ -1311,8 +1383,8 @@ try:
     assert capture() == first, bytes(output[-500:])
     clear()
 
-    # Same PTY byte represents either physical key under the unchanged global
-    # Ghostty binding; changing fake clipboard must be observed on next ^V.
+    # Physical Ctrl+V still invokes the widget and re-reads its own clipboard.
+    # Terminal-owned text paste is tested separately below, without this byte.
     clip.write_bytes(b"SECOND-now")
     os.write(master, b"\x16")
     assert capture() == b"SECOND-now"
@@ -1334,6 +1406,18 @@ try:
     os.write(master, b"\x16")
     assert capture() == payload, repr((home / "zle-buffer").read_bytes())
     assert not executed.exists(), "pasted newline executed a command"
+    clear()
+
+    # Terminal text arrives as bracketed payload, not as a rich-paste trigger.
+    # A distinct fixture and reader counters detect accidental ^V dispatch.
+    local_reads = log.read_bytes()
+    remote_reads = len(bridge_requests) if remote else 0
+    native_payload = f"终端文字\n$(touch {executed})\n\n".encode()
+    os.write(master, b"\x1b[200~" + native_payload + b"\x1b[201~")
+    assert capture() == native_payload, "native text payload did not reach ZLE intact"
+    assert log.read_bytes() == local_reads, "native text called local Ctrl+V reader"
+    assert (len(bridge_requests) if remote else 0) == remote_reads, "native text called SSH reader"
+    assert not executed.exists(), "native bracketed text executed a command"
     clear()
 
     # Preserve the separate literal insertion action on a sequence verified

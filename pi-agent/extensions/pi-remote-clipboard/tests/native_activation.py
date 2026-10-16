@@ -34,7 +34,8 @@ def installed_cli() -> tuple[Path, Path]:
 
 
 class NativeActivationTests(unittest.TestCase):
-    def run_cli(self, *, target: bool, missing_paste: bool = False) -> list[dict]:
+    def run_cli(self, *, target: bool, missing_paste: bool = False,
+                terminal_text: bool = False, remote: bool = True) -> list[dict]:
         entry, node = installed_cli()
         with tempfile.TemporaryDirectory(prefix="pi-remote-clipboard-native-") as directory:
             root = Path(directory)
@@ -64,7 +65,7 @@ export default function(pi) {
     log("started", {mode: ctx.mode});
     const interval = setInterval(() => {
       const text = ctx.ui.getEditorText?.();
-      if (text?.includes("BRIDGE_FIXTURE")) {
+      if (text?.includes("BRIDGE_FIXTURE") || text?.includes("TERMINAL_TEXT_FIXTURE")) {
         log("editor", {text});
         clearInterval(interval);
       }
@@ -96,6 +97,8 @@ printf 'BRIDGE_FIXTURE\\n'
                 "PI_OFFLINE": "1", "PI_SKIP_VERSION_CHECK": "1", "PATH": f"{bin_dir}:/usr/bin:/bin",
                 "TERM": "xterm-256color", "NO_COLOR": "1", "CI": "1", "LANG": "C.UTF-8",
             }
+            if not remote:
+                env.pop("SSH_CONNECTION")
             args = [
                 str(node), str(entry), "--no-extensions", "--extension", str(fixture),
                 *(["--extension", str(EXTENSION)] if target else []),
@@ -140,7 +143,16 @@ printf 'BRIDGE_FIXTURE\\n'
                 wait_for(lambda: any(item["kind"] == "started" for item in events()), "Pi startup")
                 self.assertEqual(events()[0], {"kind": "loaded", "method": "function"})
                 drain(.5)
-                if missing_paste:
+                if terminal_text:
+                    # Model text already read by the terminal. This is not a GUI
+                    # key event and must not invoke Pi's clipboard key handler.
+                    os.write(master, b"\x1b[200~TERMINAL_TEXT_FIXTURE\x1b[201~")
+                    wait_for(lambda: any(item["kind"] == "editor" for item in events()), "terminal text insertion")
+                    self.assertEqual(helpers(), 0, "terminal text invoked the SSH clipboard bridge")
+                    self.assertFalse(any(item["kind"] == "native-paste" for item in events()))
+                    self.assertEqual(next(item for item in events() if item["kind"] == "editor")["text"],
+                                     "TERMINAL_TEXT_FIXTURE")
+                elif missing_paste:
                     self.assertTrue(target, "only the explicit shortcut uses a missing private paste seam")
                     os.write(master, b"\x1b\x16")  # Alt+Ctrl+V via classic terminal encoding
                     wait_for(lambda: helpers() == 1, "explicit Ctrl+Alt+V shortcut")
@@ -148,7 +160,7 @@ printf 'BRIDGE_FIXTURE\\n'
                     self.assertFalse(any(item["kind"] == "native-paste" for item in events()))
                 else:
                     os.write(master, b"\x16")  # Pi's native Ctrl+V key
-                    if target:
+                    if target and remote:
                         wait_for(lambda: helpers() == 1, "Ctrl+V bridge wrapper")
                         wait_for(lambda: any(item["kind"] == "editor" for item in events()), "Ctrl+V insertion")
                         self.assertFalse(any(item["kind"] == "native-paste" for item in events()))
@@ -175,6 +187,13 @@ printf 'BRIDGE_FIXTURE\\n'
         self.run_cli(target=False)  # control proves the key reaches our bundled-class stub
         events = self.run_cli(target=True)
         self.assertEqual([event["kind"] for event in events if event["kind"] == "editor"], ["editor"])
+
+    def test_local_ctrl_v_with_extension_keeps_native_handler(self) -> None:
+        self.run_cli(target=True, remote=False)
+
+    def test_terminal_text_bypasses_native_and_bridge_clipboard_handlers(self) -> None:
+        self.run_cli(target=False, terminal_text=True)
+        self.run_cli(target=True, terminal_text=True)
 
     def test_explicit_shortcut_survives_missing_private_paste_method(self) -> None:
         events = self.run_cli(target=True, missing_paste=True)

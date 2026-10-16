@@ -673,6 +673,15 @@ try:
         assert state()[0:2] == before[0:2], "idle/drag lost history position"
         assert received.read_bytes() == b"", "mouse/copy injected application input"
 
+        # Model text already read by Ghostty, not a Ctrl+V key event. Tmux3.4
+        # bypasses mode key tables for bracketed paste, but its copy-mode has
+        # no key callback to forward that payload to the underlying program.
+        native_text = "终端-042".encode()
+        os.write(actor_fd, b"\x1b[200~" + native_text + b"\x1b[201~")
+        drain(actor_fd, 0.3)
+        assert state()[0:2] == before[0:2], "native paste unexpectedly exited copy-mode"
+        assert received.read_bytes() == b"", "native paste bypassed the documented copy-mode boundary"
+
         if tx("show-options", "-wv", "-t", session, "mode-keys").stdout.strip() == "vi":
             rectangle = state()[3]
             os.write(actor_fd, b"\x1bv")  # Alt+V remains a mode command.
@@ -686,6 +695,11 @@ try:
         assert_input(b"\x16")
         assert state()[0] == "0", state()
         print(f"PASTE_HANDOFF={entry}:root=16,mode=0,input=16,held-scroll={before[1]}")
+        # The same native text now reaches the raw fixture outside copy-mode;
+        # tmux strips brackets because that fixture did not request them.
+        os.write(actor_fd, b"\x1b[200~" + native_text + b"\x1b[201~")
+        assert_input(b"\x16" + native_text)
+        print(f"NATIVE_TEXT_BOUNDARY={entry}:copy-input=empty,live-input={native_text.hex()}")
         raise SystemExit(0)
 
     os.write(actor_fd, f"\x1b[<0;{start_col};{row}M".encode())

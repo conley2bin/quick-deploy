@@ -92,9 +92,9 @@ WORKING_DIRECTORY="~/Documents"
 # xterm-256color，不会把用户卡在花屏状态。前提是远端有 infocmp 与 tic
 # （ncurses 自带，绝大多数 Linux 都有）；极简容器镜像可能没有，那种情况下回退。
 SHELL_INTEGRATION_FEATURES="ssh-env,ssh-terminfo"
-# 所有普通 Ghostty 窗口将 Ctrl+Shift+V 交给终端内的 Ctrl+V 处理器。
-# 历史基准 paste_from_clipboard 只用于窄迁移的逐字节核对。
-GHOSTTY_PASTE_ACTION='text:\x16'
+# 普通配置和 ghostty-pi 的 Ctrl+Shift+V 都由 Ghostty 原生粘贴文字。
+# 不绑定 Ctrl+V：Pi 保留图片/文本及 SSH 剪贴板桥，zsh 保留自己的 ^V widget。
+GHOSTTY_PASTE_ACTION='paste_from_clipboard'
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -128,8 +128,8 @@ usage() {
 
 选项:
   --check                 只读预检：报告当前状态与计划，不安装、不修改
-  --pi-launcher-only      只验证受保护启动器/背压库，再安装 Pi 专用启动器
-  --paste-keybind-only    只迁移现有受管全局配置的一条粘贴按键绑定
+  --pi-launcher-only      只验证受保护启动器/背压库，安装或迁移 Pi 专用启动器
+  --paste-keybind-only    只将受管全局 Ctrl+Shift+V 从原始 Ctrl+V 迁移到原生文字粘贴
   --shell-paste-only      只为现有受管 Ghostty/zsh 安装本地 Wayland 提示符粘贴 hook
   --no-default-terminal   不接管 Ctrl+Alt+T（默认会接管）
   --default-terminal      兼容旧命令行，默认已是开启状态
@@ -143,8 +143,9 @@ usage() {
   Ghostty 配置重置为本模块的基准内容；内容变化时会先保存 .bak.<时间戳> 备份。
   用户级 desktop 覆盖（每个外部启动用独立进程）含本模块之外的改动时，
   脚本会明确失败而不是覆盖，处理方式见 README 的对应章节。
-  --pi-launcher-only 不执行软件包/编译器、配置、字体、桌面入口、默认终端
-  或 GUI 步骤。--paste-keybind-only 只接受旧/新精确受管配置，拒绝自定义
+  --pi-launcher-only 只接受精确的当前/旧 raw 可执行启动器（或缺失目标），
+  不执行软件包/编译器、配置、字体、桌面入口、默认终端或 GUI 步骤。
+  --paste-keybind-only 只接受旧 raw/当前 native 精确受管配置，拒绝自定义
   内容和符号链接；不执行软件包、启动器、字体、桌面入口、默认终端或 GUI
   步骤。--shell-paste-only 核对现有全局按键及 zsh 托管块，只写入粘贴 hook
   和必要时迁移 .zshrc 托管块；不执行其它安装步骤。窄模式不能组合。
@@ -479,6 +480,7 @@ show_check() {
         echo "第三方 PPA: 未出现在 apt 源中"
     fi
     echo "配置: $CONFIG_FILE —— $(config_state)"
+    echo "粘贴策略: Ctrl+Shift+V -> $GHOSTTY_PASTE_ACTION（原生文字）；Ctrl+V 留给程序"
     echo "Wayland 背压修复: $(backpressure_state)"
     echo "Pi 专用启动器: $USER_PI_GHOSTTY_LAUNCHER —— $(pi_launcher_state)"
     echo "用户级 desktop 覆盖: $USER_DESKTOP_FILE —— $(desktop_override_state)"
@@ -913,10 +915,9 @@ render_config() {
     echo "mouse-shift-capture = never"
 
     # Ctrl+Shift+C 把 Ghostty 本地选区写进本机系统剪贴板。mixed 同时提供
-    # 纯文本与带样式两种格式。Ctrl+Shift+V 发送原始 Ctrl+V (0x16)，绕过
-    # Ghostty 可能陈旧的 GTK 粘贴视图；在 Pi 内由现有图片/文本粘贴动作处理。
-    # 在本地 Wayland zsh 提示符由本模块 ZLE widget 读取当前剪贴板；
-    # Pi/TUI 的原始按键输入不经过 zsh 的行编辑器。
+    # 纯文本与带样式两种格式。Ctrl+Shift+V 由 Ghostty 读取文字并送入 PTY，
+    # 不要求前台程序实现剪贴板动作（例如 SSH 密码读取器）。Ctrl+V 不改绑，
+    # Pi 继续图片/文本及 SSH 桥，本地 zsh 继续使用已有 ZLE widget。
     echo "keybind = ctrl+shift+c=copy_to_clipboard:mixed"
     echo "keybind = ctrl+shift+v=$paste_action"
 
@@ -925,9 +926,8 @@ render_config() {
     # SSH 到达本机 Ghostty，由它落到本机系统剪贴板。写入端是终端本身，
     # 不需要远端有 Wayland / X11 会话或任何剪贴板工具，也与本机跑在
     # Wayland 还是 X11 无关。
-    # 拒绝读取：读取会让终端里的程序把本机剪贴板内容取走。右键或
-    # Shift+Insert 仍可走 Ghostty 本地粘贴；Ctrl+Shift+V 是上面的原始
-    # Ctrl+V 输入，Pi 再按自己已有的粘贴路径读取，不经过 OSC 52 查询。
+    # 拒绝读取只限制程序发出的 OSC 52 查询，不禁止用户主动的原生粘贴。
+    # Ctrl+Shift+V 读取默认剪贴板文字；Ctrl+V 仍由 Pi/ZLE 自己处理。
     echo "clipboard-write = allow"
     echo "clipboard-read = deny"
 
@@ -965,18 +965,18 @@ apply_paste_keybind_only() {
         echo "配置按键已是当前基准，跳过写入: $CONFIG_FILE"
         return 0
     fi
-    cmp -s "$CONFIG_FILE" <(render_config paste_from_clipboard) \
-        || die "Ghostty 配置不等于旧版受管基准，拒绝覆盖用户内容: $CONFIG_FILE"
+    cmp -s "$CONFIG_FILE" <(render_config 'text:\x16') \
+        || die "Ghostty 配置不等于旧版 raw 受管基准，拒绝覆盖用户内容: $CONFIG_FILE"
 
     tmp="$(mktemp "$CONFIG_FILE.tmp.XXXXXX")"
     # 从已核对的旧文件替换单行，避免生成期间字体/目录环境变化改动其它行。
-    if ! sed 's|^keybind = ctrl+shift+v=paste_from_clipboard$|keybind = ctrl+shift+v=text:\\x16|' \
+    if ! sed 's|^keybind = ctrl+shift+v=text:\\x16$|keybind = ctrl+shift+v='"$GHOSTTY_PASTE_ACTION"'|' \
         "$CONFIG_FILE" > "$tmp" || ! chmod --reference="$CONFIG_FILE" "$tmp"; then
         rm -f -- "$tmp"
         die "无法生成新的 Ghostty 配置: $CONFIG_FILE"
     fi
     # 防止比较和原子替换之间已有别的写入；绝不根据过期的旧内容覆盖它。
-    if [ -L "$CONFIG_FILE" ] || ! cmp -s "$CONFIG_FILE" <(render_config paste_from_clipboard); then
+    if [ -L "$CONFIG_FILE" ] || ! cmp -s "$CONFIG_FILE" <(render_config 'text:\x16'); then
         rm -f -- "$tmp"
         die "Ghostty 配置在迁移期间变化，拒绝覆盖: $CONFIG_FILE"
     fi
@@ -984,7 +984,7 @@ apply_paste_keybind_only() {
         rm -f -- "$tmp"
         die "无法替换 Ghostty 配置: $CONFIG_FILE"
     fi
-    echo "已将全局 Ctrl+Shift+V 改为原始 Ctrl+V: $CONFIG_FILE"
+    echo "已将全局 Ctrl+Shift+V 恢复为 Ghostty 原生文字粘贴: $CONFIG_FILE"
 }
 
 write_config() {
@@ -1184,15 +1184,20 @@ verify_backpressure() {
     echo "OK: 原生 Wayland 背压修复库与启动器已托管（新启动的窗口生效）"
 }
 
-# 专用入口保留兼容：全局基准现已发送同样的 Ctrl+V 原始字节；CLI 选项
-# 对旧配置启动的窗口也生效。仍须经过用户级启动器保留 Wayland 背压保护，
-# -e 及后续参数原样传给 Ghostty；普通启动器/desktop 不被专用入口改写。
+# 显式原生粘贴覆盖让 --pi-launcher-only 独立于全局配置，旧 raw 配置也可用。
+# 当前动作与全局配置共用一个策略；保护入口、独立进程和参数透传不变。
 render_pi_launcher() {
-    cat <<'EOF'
+    local paste_action="${1-$GHOSTTY_PASTE_ACTION}"
+    cat <<EOF
 #!/bin/sh
 # 由 fresh-install/modules/ghostty/install.sh 生成与维护。
-exec "$HOME/.local/bin/ghostty" --gtk-single-instance=false '--keybind=ctrl+shift+v=text:\x16' "$@"
+exec "\$HOME/.local/bin/ghostty" --gtk-single-instance=false '--keybind=ctrl+shift+v=$paste_action' "\$@"
 EOF
+}
+
+# 精确历史三行（含末尾换行），只用于受管旧文件识别，不能随当前策略改变。
+render_legacy_pi_launcher() {
+    render_pi_launcher 'text:\x16'
 }
 
 pi_launcher_state() {
@@ -1208,21 +1213,69 @@ pi_launcher_state() {
         else
             echo "内容相同但不可执行（正式安装将拒绝覆盖）"
         fi
+    elif cmp -s "$USER_PI_GHOSTTY_LAUNCHER" <(render_legacy_pi_launcher); then
+        if [ -x "$USER_PI_GHOSTTY_LAUNCHER" ]; then
+            echo "旧 raw 受管基准（正式安装将备份并迁移为原生文字粘贴）"
+        else
+            echo "旧 raw 基准但不可执行（正式安装将拒绝覆盖）"
+        fi
     else
         echo "含非基准内容（正式安装将拒绝覆盖）"
     fi
 }
 
 install_pi_launcher() {
+    local legacy=false tmp backup
     [ ! -L "$USER_PI_GHOSTTY_LAUNCHER" ] || die "Pi 专用 Ghostty 启动器是符号链接，拒绝覆盖: $USER_PI_GHOSTTY_LAUNCHER"
     if [ -e "$USER_PI_GHOSTTY_LAUNCHER" ]; then
         [ -f "$USER_PI_GHOSTTY_LAUNCHER" ] || die "Pi 专用 Ghostty 启动器不是普通文件，拒绝覆盖: $USER_PI_GHOSTTY_LAUNCHER"
-        cmp -s "$USER_PI_GHOSTTY_LAUNCHER" <(render_pi_launcher) \
-            || die "用户已有自定义 Pi 专用 Ghostty 启动器，拒绝覆盖: $USER_PI_GHOSTTY_LAUNCHER"
         [ -x "$USER_PI_GHOSTTY_LAUNCHER" ] \
-            || die "Pi 专用 Ghostty 启动器内容相同但不可执行，拒绝覆盖: $USER_PI_GHOSTTY_LAUNCHER"
+            || die "Pi 专用 Ghostty 启动器不可执行，拒绝覆盖: $USER_PI_GHOSTTY_LAUNCHER"
+        if cmp -s "$USER_PI_GHOSTTY_LAUNCHER" <(render_pi_launcher); then
+            echo "文件无变化，跳过: $USER_PI_GHOSTTY_LAUNCHER"
+            return 0
+        fi
+        cmp -s "$USER_PI_GHOSTTY_LAUNCHER" <(render_legacy_pi_launcher) \
+            || die "用户已有自定义 Pi 专用 Ghostty 启动器，拒绝覆盖: $USER_PI_GHOSTTY_LAUNCHER"
+        legacy=true
     fi
-    write_atomic_text "$USER_PI_GHOSTTY_LAUNCHER" "$(render_pi_launcher)"$'\n' 755
+    mkdir -p "$(dirname "$USER_PI_GHOSTTY_LAUNCHER")"
+    tmp="$(mktemp "$USER_PI_GHOSTTY_LAUNCHER.tmp.XXXXXX")"
+    if ! render_pi_launcher > "$tmp" || ! chmod 755 "$tmp"; then
+        rm -f -- "$tmp"
+        die "无法生成 Pi 专用 Ghostty 启动器"
+    fi
+    if [ "$legacy" = true ]; then
+        # 生成期间若目标改为自有内容、链接或不可执行文件，不得覆盖。
+        if [ -L "$USER_PI_GHOSTTY_LAUNCHER" ] || [ ! -f "$USER_PI_GHOSTTY_LAUNCHER" ] ||
+           [ ! -x "$USER_PI_GHOSTTY_LAUNCHER" ] ||
+           ! cmp -s "$USER_PI_GHOSTTY_LAUNCHER" <(render_legacy_pi_launcher); then
+            rm -f -- "$tmp"
+            die "Pi 专用启动器在迁移期间变化，拒绝覆盖"
+        fi
+        backup="$USER_PI_GHOSTTY_LAUNCHER.bak.$(date +%Y%m%d%H%M%S)"
+        if [ -e "$backup" ] || [ -L "$backup" ] ||
+           ! cp -a -- "$USER_PI_GHOSTTY_LAUNCHER" "$backup"; then
+            rm -f -- "$tmp"
+            die "无法备份旧 Pi 专用启动器，拒绝覆盖"
+        fi
+        if [ -L "$USER_PI_GHOSTTY_LAUNCHER" ] || [ ! -f "$USER_PI_GHOSTTY_LAUNCHER" ] ||
+           [ ! -x "$USER_PI_GHOSTTY_LAUNCHER" ] ||
+           ! cmp -s "$USER_PI_GHOSTTY_LAUNCHER" <(render_legacy_pi_launcher) ||
+           ! cmp -s "$backup" <(render_legacy_pi_launcher); then
+            rm -f -- "$tmp"
+            die "Pi 专用启动器在备份期间变化，拒绝覆盖（备份保留: $backup）"
+        fi
+        echo "已备份: $backup"
+    elif [ -e "$USER_PI_GHOSTTY_LAUNCHER" ] || [ -L "$USER_PI_GHOSTTY_LAUNCHER" ]; then
+        rm -f -- "$tmp"
+        die "Pi 专用启动器在安装期间出现，拒绝覆盖"
+    fi
+    if ! mv -f -- "$tmp" "$USER_PI_GHOSTTY_LAUNCHER"; then
+        rm -f -- "$tmp"
+        die "无法替换 Pi 专用 Ghostty 启动器"
+    fi
+    echo "已写入: $USER_PI_GHOSTTY_LAUNCHER"
 }
 
 verify_pi_launcher() {
@@ -1545,7 +1598,7 @@ add-zsh-hook precmd _quick_deploy_ghostty_ssh_precmd
 ZSH_MOUSE_HOOK
 }
 
-# Ctrl+Shift+V 和 Ctrl+V 都到达原始 ^V；ZLE 只插入文本，不提交命令。
+# 物理 Ctrl+V 仍由 ZLE 读取文字；Ctrl+Shift+V 走 Ghostty 原生粘贴，不经过此 widget。
 # 共享 tmux 的 SSH 客户端读已有剪贴板桥，本地读 wl-paste；Pi 不经过 ZLE。
 render_local_paste_hook() {
     cat <<'ZSH_LOCAL_PASTE_HEADER'
@@ -2287,8 +2340,8 @@ main() {
     echo "     infocmp -x xterm-ghostty | ssh HOST -- tic -x -"
     echo "  5. SSH 异常断开后点击若出现 0;xx;xxM 乱码，按 Ctrl+Shift+R；"
     echo "     zsh hook 会在 ssh 返回到本地提示符时自动清理常见鼠标模式。"
-    echo "  6. 本地 Wayland zsh 提示符中 Ctrl+Shift+V/Ctrl+V 粘贴当前文本；"
-    echo "     Esc 后按 Ctrl+V 仍可 quoted-insert，Pi 的原始 Ctrl+V 不变。"
+    echo "  6. Ctrl+Shift+V 由 Ghostty 原生粘贴文字；Pi 中 Ctrl+V 继续图片/文本及 SSH 桥。"
+    echo "     本地 zsh 的 Ctrl+V widget 和 Esc Ctrl+V quoted-insert 保留；tmux 历史模式先退出。"
 }
 
 main "$@"

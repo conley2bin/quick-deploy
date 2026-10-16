@@ -73,7 +73,7 @@ sudo apt install --allow-downgrades ghostty=1.3.1~ppa2-noble1
   - 为 `Ctrl+Alt+=/+` 显式发送 CSI-u 序列，交给 tmux 新建 window
   - `Ctrl+Shift+R` 绑定 Ghostty 原生 `reset`，用于清理异常 SSH 后残留的终端状态
   - `mouse-shift-capture = never`：鼠标上报的程序（Pi 全屏、tmux `mouse on`）里用 **Shift+拖选** 产生 Ghostty 本地选区，并禁止程序用 `XTSHIFTESCAPE` 抢走 Shift（见“鼠标上报下的复制”一节）
-  - `Ctrl+Shift+C` 保留 `copy_to_clipboard:mixed`；全局 `Ctrl+Shift+V` 改为 `text:\x16`，向终端内发送原始 Ctrl+V，普通 Pi 会使用自身图片/文本粘贴动作（见下节）。`Ctrl+C/V` 不变
+  - `Ctrl+Shift+C` 保留 `copy_to_clipboard:mixed`；`Ctrl+Shift+V` 固定为 `paste_from_clipboard`，由 Ghostty 原生粘贴文字。Ghostty 不绑定 `Ctrl+V`，Pi 继续使用自身图片/文本粘贴和已有 SSH 桥（见下节）
   - `clipboard-write = allow` / `clipboard-read = deny`：允许 OSC 52 写入（远端 tmux 复制回本机剪贴板的入口），拒绝 OSC 52 读取（见下节）
   - 新终端起始目录 `~/Documents`（不存在时回退到 XDG 文档目录，再不行就 `home`）
   - 关闭新窗口工作目录继承；新标签页和分屏仍保留继承
@@ -83,7 +83,7 @@ sudo apt install --allow-downgrades ghostty=1.3.1~ppa2-noble1
 - `~/.local/bin/ghostty`
   - 唯一受保护的用户级启动器；图形菜单、Ctrl+Alt+T 和交互式 PATH 都指向它
 - `~/.local/bin/ghostty-pi`
-  - 只供主动打开 Pi 专用窗口的入口；转交给上述受保护启动器，并仅在新进程内把 `Ctrl+Shift+V` 转为原始 `Ctrl+V` 输入（见下节）
+  - 保留的 Pi 窗口兼容入口；转交给上述受保护启动器，在新进程显式覆盖 `Ctrl+Shift+V` 为原生文字粘贴。与全局配置共用同一策略，即使只升级此入口、全局仍是旧配置也生效（见下节）
 - `~/.local/share/applications/com.mitchellh.ghostty.desktop`
   - 由系统模板 `/usr/share/applications/com.mitchellh.ghostty.desktop` 逐行生成，把两个 `Exec=` 改为
     用户级启动器与 `--gtk-single-instance=false`，并写 `DBusActivatable=false`；系统文件本身不改
@@ -143,7 +143,7 @@ clipboard-read = deny
 
 - **写允许**：终端里的程序（包括 SSH 远端 tmux 发来的、由本地 tmux 重发的序列）可以发 OSC 52 把内容写进本机系统剪贴板。这是 `fresh-install/modules/tmux` 那条“远端 tmux 复制 → 本机剪贴板”路径的终点：序列经 SSH 与本地 tmux 到达 Ghostty，再由 Ghostty 用**它当前平台的剪贴板后端**（Wayland/X11/macOS 等由 Ghostty 自己选择）落下。因此远端与路径中间的机器都不需要 Wayland/X11 会话或剪贴板工具。
 - **读拒绝**：OSC 52 读取会让终端里的程序向 Ghostty 查询本机剪贴板。Ghostty 默认值是 `ask`（弹窗询问），本模块改为无条件拒绝这种终端协议查询；本机程序自己调用 `wl-paste` 等系统接口不受该设置约束，Pi 的 Ctrl+V 正走自己的读取路径。
-- **本地粘贴与 Pi 粘贴**：鼠标右键、`Shift+Insert` 仍可触发 Ghostty 的本地粘贴；`Ctrl+Shift+V` 发送原始 Ctrl+V，由 Pi 自己读取图片或文本，不经过 OSC 52 查询。`Ctrl+Shift+C` 复制仍走 Ghostty 本地选区。本地 Wayland 交互式 zsh 提示符通过下述 ZLE widget 消费原始 Ctrl+V 并读取当前剪贴板。
+- **文字粘贴与 Pi 富粘贴**：`Ctrl+Shift+V` 由 Ghostty 读取输入端桌面的文字并发送到 PTY，不经过 OSC 52 查询；`clipboard-read = deny` 不限制用户主动粘贴。`Ctrl+V` 继续由 Pi 读取图片/文本，SSH Pi 使用既有剪贴板桥。本地 Wayland zsh 的物理 `Ctrl+V` 则由下述 ZLE widget 处理。`Ctrl+Shift+C` 复制仍走 Ghostty 本地选区。
 - **Ghostty 配置渲染**与显示服务器无关：回归测试在 Wayland、X11、无会话变量下断言这两条 OSC 52 策略及全局按键渲染逐字节相同。本地 zsh 粘贴 hook 则只在 Wayland 会话启用；配置渲染测试不能替代真实图形会话验收。
 - 本模块不写 `terminal-features` 之类的终端能力声明，也不强制声明 `Ms`；远端 tmux 能不能发 OSC 52 取决于它客户端侧的有效 `Ms`（可能来自 terminfo、配置的特性或 tmux 的运行时识别，见 `fresh-install/modules/tmux/README.md` 剪贴板一节）。本模块能做的是保证本机 `xterm-ghostty` 记录确实带 `Ms`：`--check` 会报告它，正式安装的验证阶段缺 `Ms` 会明确失败。
 
@@ -157,22 +157,33 @@ clipboard-read = deny
 ```ini
 mouse-shift-capture = never
 keybind = ctrl+shift+c=copy_to_clipboard:mixed
-keybind = ctrl+shift+v=text:\x16
+keybind = ctrl+shift+v=paste_from_clipboard
 ```
 
 `never` 阻止程序通过 `XTSHIFTESCAPE` 抢走 Shift+鼠标；普通拖选仍属于申请
 鼠标上报的程序。`Ctrl+Shift+C` 的 `mixed` 同时提供纯文本和带样式格式。
 `Ctrl+C` 和 `Ctrl+V` 原有行为保持不变。
 
-**所有普通 Ghostty 窗口**的 `Ctrl+Shift+V` 现在向 pty 发送原始 0x16，
-等同按下 `Ctrl+V`。本地 Pi 的现有 `app.clipboard.pasteImage` 动作先尝试
-图片再回退文本，读取当前剪贴板，避开 Ghostty/GTK 可能陈旧的文本粘贴
-视图；已有 `ghostty-pi` 以同一覆盖参数启动，保持兼容但不再是必需入口。
-SSH 中的 Pi 若启用了已安装的剪贴板桥，则继续由该桥处理 Ctrl+V；这项
-Ghostty 配置不改变远端 Pi 本身的剪贴板能力。
+两个键固定分工，不随进入/退出 Pi 动态切换：
+
+| 按键 | 所有者与内容 |
+|---|---|
+| `Ctrl+Shift+V` | 普通 Ghostty 与 `ghostty-pi` 都执行 `paste_from_clipboard`，读取**输入端桌面文字**并送入 PTY；不要求前台 shell、SSH 密码读取器或 TUI 自己实现剪贴板读取 |
+| `Ctrl+V` | Ghostty 不绑定；Pi 的 `app.clipboard.pasteImage` 继续本地富粘贴，SSH Pi 使用现有 `pi-remote-clipboard` 桥；本地 Wayland zsh 保留原 ZLE 文字 widget |
+
+Pi 的 `Ctrl+V` 可插入图片临时路径；`Ctrl+Shift+V` 不提供图片传输，也不会
+调用 Pi 的图片动作或桥。桥诊断仍可用 `Ctrl+Alt+V`。仅修改 Ghostty 按键
+不增加远端 Pi 的能力，也不要求重装桥或修改 Pi keybindings/bundle。
+
+原生文字粘贴恢复了普通程序和密码提示的路径，但仍读取 Ghostty/GTK 的
+剪贴板视图。此前在 GNOME Wayland + tmux/OSC52 下发生过该视图陈旧、Pi
+`Ctrl+V` 能读到新文字的情况；本改动不修 GTK/Mutter，也不保证两条路径
+永远读取相同文字。应人工验证跨窗口重新复制以及 Pi/tmux 复制后的新鲜度。
+不要为绕过它重新把全局 shifted-V 改成 raw，或增加 Pi 进入/退出切换。
 
 The managed zsh widget on local Wayland **interactive prompts (including local
-tmux panes)** receives raw `^V` from both `Ctrl+V` and `Ctrl+Shift+V`. Local
+tmux panes)** receives raw `^V` only from physical `Ctrl+V`. Native terminal
+text paste is separate and does not invoke this widget. Local
 input reads the current system CLIPBOARD through
 `wl-paste --no-newline --type text` within two seconds; input from an SSH
 client viewing a shared tmux pane reads the client's clipboard bridge instead.
@@ -197,7 +208,7 @@ inherit stale `SSH_CONNECTION`/`SSH_CLIENT`; those variables are not remote
 proof, otherwise real local prompts would be skipped. A remote zsh allocated
 an SSH PTY is excluded by `SSH_TTY`.
 
-**A shared tmux paste chooses its clipboard when the key is pressed**: it lists
+**A shared tmux Ctrl+V chooses its clipboard when the key is pressed**: it lists
 only clients currently displaying this pane, takes the newest `client_activity`,
 then inspects that client's `/proc` ancestry. When the newest client came over
 SSH, it reads text through the existing [pi-remote-clipboard
@@ -224,35 +235,53 @@ Raw-mode programs such as Pi do not use ZLE and keep their own Ctrl+V handlers
 for image/text reads; the SSH clipboard bridge and OSC 52 write path are
 unchanged. Other TUIs interpret raw `^V` themselves. Non-Wayland sessions,
 remote SSH-PTY zsh, other shells, and terminals without the Ghostty child-shell
-conditions do not receive this ZLE key; right-click or Ghostty's native
-`Shift+Insert` paste remains available.
+conditions do not receive this ZLE key; Ghostty's native `Ctrl+Shift+V` text
+paste does not depend on those hook conditions. Exit tmux copy-mode before
+native text paste: its payload is not the `C-v` trigger that cancels the mode,
+and mode key handling can consume or drop text. Existing physical `Ctrl+V`
+handoff, mouse selection, and OSC 52 behavior remain unchanged.
 
-### Migrate only this key in an existing installation
+### Migrate the two existing managed entries
 
-From the repository root, run:
+From the repository root, run the updated installer in two separate modes:
 
 ```bash
 bash fresh-install/modules/ghostty/install.sh --paste-keybind-only
+bash fresh-install/modules/ghostty/install.sh --pi-launcher-only
 ```
 
-The narrow mode accepts an existing non-symlink
-`~/.config/ghostty/config.ghostty` only when it **byte-exactly equals the old
-managed baseline**, then atomically replaces it with the new baseline that
-differs only in this key; a current file is not rewritten. Custom content, or
-changed fonts/start-directory settings since the old install, fails explicitly
-and preserves the file for manual handling. It does not call apt, rebuild the
-Wayland backpressure library, update fonts/desktop/default-terminal state,
-start the GUI, or modify `ghostty-pi` or the ordinary launcher. Do not run the
-full argument-free `install.sh` for this migration: it resets the whole
-configuration and performs the other steps above.
+`--paste-keybind-only` accepts an existing non-symlink config only when it
+**byte-exactly equals the old raw managed baseline** (`text:\x16`) or the
+current native baseline (`paste_from_clipboard`). It replaces only that one
+binding, preserving all other bytes and file permissions; a current native
+file is not rewritten and keeps its inode. Custom content, duplicate/conflicting
+bindings, or changed fonts/start-directory settings since the old install
+fail explicitly. It rechecks the old baseline before atomic replacement and
+does not create a separate config backup or alter other managed files.
 
-**A currently running Ghostty process** must reload its configuration normally
-(Ghostty 1.3.1 defaults to `Ctrl+Shift+,`, action `reload_config`) or start a
-new process from a managed entry before it receives the new binding; creating a
-new Pi pane in an old window is not a process-level reload. After returning to
-Pi, verify that `Ctrl+V` and `Ctrl+Shift+V` paste the same current text, then
-try an image. The dedicated `ghostty-pi` still runs and applies the same
-`--keybind=ctrl+shift+v=text:\x16` override in its new process.
+`--pi-launcher-only` checks the existing protected launcher/backpressure library,
+then installs the native entry if absent or upgrades an **exact executable old
+raw launcher**. The upgrade preserves the old file as `ghostty-pi.bak.<timestamp>`
+and rechecks ownership/executability before and after backup, then atomically
+replaces the target. An existing backup is not overwritten. Current executable
+content is a no-op; customized, symlink, directory, or nonexecutable targets are
+refused. Its explicit native override shares `GHOSTTY_PASTE_ACTION` with the
+config renderer, so this mode stays independent of arbitrary global config.
+`--check` reports old managed launchers as upgradeable rather than customized.
+
+Neither narrow mode runs apt, rebuilds Wayland backpressure, updates fonts,
+desktop/default-terminal state, starts the GUI, or installs shell hooks. The
+modes cannot be combined. Do not use the full argument-free installer for this
+repair: it resets the whole configuration and performs the other steps above.
+No Pi/bridge/tmux reinstall or reload is needed for this terminal-key change.
+
+**Ordinary running Ghostty processes** need user configuration reload
+(1.3.1 default `Ctrl+Shift+,`, action `reload_config`) or a new managed process.
+A new Pi pane or shell does not reload Ghostty. **Processes originally started
+with the old `--keybind=ctrl+shift+v=text:\x16` argv keep that override even on
+configuration reload**: Ghostty loads CLI arguments after the default file.
+Open a new process through the updated launcher; a new tab/window inside the
+old process does not remove its argv. Do not stop existing tmux/Pi sessions.
 
 ### Add only the zsh prompt paste on an existing machine
 
@@ -262,8 +291,9 @@ After the global key migration, run from the repository root:
 bash fresh-install/modules/ghostty/install.sh --shell-paste-only
 ```
 
-This narrow mode first byte-checks the current managed Ghostty configuration
-(which must remain `ctrl+shift+v=text:\x16`), the SSH mouse hook, and the
+This optional mode installs only the physical Ctrl+V widget; it is not needed
+when merely migrating the two terminal entries above. It first byte-checks the
+current native managed Ghostty configuration, the SSH mouse hook, and the
 existing `.zshrc` marker block. The paste hook must be absent, a
 **byte-exact deployed v1/v2/v3**, or the current baseline; historical content
 is pinned by independent SHA-256 values in the installer and tests, so renderer
@@ -294,10 +324,9 @@ The argument-free full `install.sh` also renders this hook and writes the same
 managed block while installing Ghostty; the module still has `install.sh` as
 its only shell source file.
 
-To add only the dedicated `ghostty-pi` entry on a machine lacking it, run
-`install.sh --pi-launcher-only`; it verifies the protected launcher and
-backpressure library and installs that entry, but **does not** migrate global
-configuration. The three narrow modes cannot be combined. The retained
+`install.sh --pi-launcher-only` can install or upgrade just `ghostty-pi`, but
+**does not** migrate global configuration. The three narrow modes cannot be
+combined. The retained
 dedicated entry can start directly or attach an existing Pi session:
 
 ```bash
@@ -541,7 +570,12 @@ env -u LD_PRELOAD bash ../../tests/ghostty/run.sh
 插入、多行/多个结尾换行、不自动执行、quoted-insert、冲突与读取失败；
 已部署 v2、`SSH_TTY` 和未知终端的 PTY 对照保持 quoted-insert 且零剪贴板
 读取。测试还验证 v1/v2 窄迁移与已有新 `.zshrc` 块的字节/inode 保留。
-这些隔离测试不证明真实 Ghostty 图形按键、物理剪贴板或复制流程已验收。
+新测试还以固定旧 launcher/hash 验证 raw→native 备份迁移和写前冲突拒绝，
+用禁回显的私有 PTY 区分文字输入与 raw Ctrl+V；ZLE 的 bracketed text 输入
+必须不调用 Ctrl+V 读端。合成 loopback provider 验证文字/PNG 和 0600 临时
+图片，另有 `pi-remote-clipboard/tests/native_activation.py` 在私有 Pi home
+验证实际 CLI 的 Ctrl+V/桥及 terminal text 分路。它们不连接真实 SSH，
+不读真实 clipboard，也不证明 Ghostty 图形按键、物理剪贴板新鲜度已验收。
 
 预检报告：系统与架构、Ghostty 版本、apt 候选版本、PPA 是否已在源中、配置状态、C 编译器与 Wayland 背压库/启动器状态、Pi 专用启动器状态（缺失 / 基准 / 将拒绝覆盖）、用户级 desktop 覆盖状态（已是基准内容 / 将被替换 / 将被拒绝）、两种字体、`xterm-ghostty` terminfo（含 OSC 52 所需的 `Ms` 能力是否在场）、SSH 鼠标自愈 hook、当前默认终端所有者以及计划动作。它不会添加软件源、调用修改状态的 apt 命令、访问 GitHub、下载文件或写入用户目录。
 
@@ -561,9 +595,9 @@ env -u LD_PRELOAD bash ../../tests/ghostty/run.sh
    infocmp -x xterm-ghostty | ssh HOST -- tic -x -
    ```
 
-10. 在普通 Ghostty/Pi 窗口验证：按住 **Shift** 拖选产生 Ghostty 本地选区，`Ctrl+Shift+C` 复制；先后按 `Ctrl+V` 与 `Ctrl+Shift+V`，确认两者读取相同的当前文本，再试图片。现有窗口须先正常重载配置，或打开新进程。
-11. 在新开的本地 Wayland zsh 提示符和本机 tmux 普通 pane（已退出 copy-mode）的新 zsh 中，两键均应粘贴当前文本且不提交命令；多行与结尾换行应保持在编辑缓冲区。`Esc Ctrl+V` 应提供 quoted-insert。若提示符显示 `wl-paste` 错误或绑定冲突，检查本地 Wayland/SSH 环境与自有 zsh 键映射。共享 tmux 的远端客户端仍读取 shell 主机剪贴板。
-12. 可选：从 `ghostty-pi` 新窗口进入同一 Pi 输入，确认其同样工作。SSH Pi 的粘贴依赖该 Pi 的 Ctrl+V/剪贴板桥行为，不把全局按键改动误当作远端桥的验证。
+10. 普通 Ghostty 与新版 `ghostty-pi` 都应在 Ctrl+Shift+V 原生粘贴当前文字；在禁回显的本地 dummy 输入提示中验证完整已知 token，不用真实密码测试。普通旧窗口先重载；旧 raw CLI override 窗口须新进程。Shift+拖选/Ctrl+Shift+C 仍为 Ghostty 本地复制。
+11. 本地 Wayland zsh 及本机 tmux 普通 pane（先退出 copy-mode）分别验证原生文字粘贴和物理 Ctrl+V widget；多行不自动提交，Esc Ctrl+V 保留 quoted-insert。共享 tmux 中物理 Ctrl+V 按已有规则选择本地/SSH 客户端桥；native shifted-V 直接读取输入端桌面。跨窗口重新复制以及 Pi/tmux 复制后都检查当前文字，留意历史 GTK 陈旧视图问题。
+12. 本地和 SSH Pi 中，Ctrl+V 分别测试文字与图片；SSH 失败时用 Ctrl+Alt+V 看诊断。Ctrl+Shift+V 只验证文字，不期待图片桥。确认桥的 Pi 版本/加载与客户端 forward，不把终端配置解析当作远端图片验收。
 
 GUI 冒烟测试只在 `DISPLAY` 或 `WAYLAND_DISPLAY` 存在时运行。它不使用 xdotool、XTEST、libXtst 或任何合成键鼠事件；测试依据是从受保护启动器启动的进程持续存活、stderr 未出现错误，以及 `/proc/<pid>/maps` 中出现 fcitx5 GTK4 immodule（在 Wayland 下还要出现背压库）。
 
