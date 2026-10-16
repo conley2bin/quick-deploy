@@ -36,6 +36,7 @@ type FakeProcess = {
   imageIno: bigint;
   env: Record<string, string>;
   rawEnvironment?: Buffer;
+  rawCmdline?: Buffer;
   argv: string[];
   masters: Map<string, number>;
   sockets: Map<string, string>;
@@ -173,7 +174,7 @@ class Fixture {
           if (!process) throw new Error("ENOENT");
           if (match[2] === "stat") return statBytes(process);
           if (match[2] === "status") return Buffer.from(`Name:\t${process.comm}\nUid:\t${process.uid}\t${process.uid}\t${process.uid}\t${process.uid}\n`);
-          if (match[2] === "cmdline") return Buffer.from(process.argv.join("\0") + "\0");
+          if (match[2] === "cmdline") return process.rawCmdline ?? Buffer.from(process.argv.join("\0") + "\0");
           return process.rawEnvironment ?? environment(process.env);
         }
         match = /^\/proc\/(\d+)\/fdinfo\/(\d+)$/u.exec(path);
@@ -438,6 +439,148 @@ test("direct sshd-held PTY resolves the paired receiver and accepts sshd-session
   const ipv6Route = await resolveInputTopology(5000, ipv6.dependencies());
   assert.deepEqual(ipv6Route.kind === "remote" ? ipv6Route.receiver : ipv6Route,
     { kind: "remote", alias: "conley-Y9000p", peer: "2001:db8::64", port: 2222, user: "conley" });
+});
+
+test("raw deployed sshd title padding admits the exact 21-byte reverse SSH cmdline", async () => {
+  const f = new Fixture();
+  const rawCmdline = Buffer.from("sshd: conley@pts/4\0\0\0");
+  assert.equal(rawCmdline.length, 21);
+  assert.equal(rawCmdline.toString().slice(0, -1).split("\0").length, 3);
+  f.add({ pid: 188093, ppid: 188092, sid: 188093, comm: "MainThread", fd0: "/dev/pts/4",
+    env: { SSH_CONNECTION: connection } });
+  const holder = f.add({ pid: 188092, ppid: 1, sid: 188049, comm: "sshd", rawCmdline,
+    fdReadable: false, tpgid: -1 });
+  useRole(f, roles[1]);
+  const base = f.dependencies();
+  const dependencies = f.dependencies({ readLink: async (path) => {
+    if (path === "/proc/188092/exe" || path.startsWith("/proc/188092/fd/")) {
+      throw Object.assign(new Error("non-dumpable sshd"), { code: "EACCES" });
+    }
+    return base.readLink!(path);
+  } });
+  const route = await resolveInputTopology(188093, dependencies);
+  assert.equal(route.kind, "remote");
+  if (route.kind !== "remote") assert.fail("padded non-dumpable sshd title must retain its proof");
+  assert.deepEqual(route.receiver, { kind: "remote", alias: "conley-company",
+    peer: "100.125.138.103", port: 22, user: "conley" });
+  assert.equal(route.hops[0]?.proof, "sshd");
+  assert.ok(Object.isFrozen(route.receiver));
+  assert.equal(await revalidateInputTopology(188093, route, dependencies), true);
+  holder.rawCmdline = Buffer.from("sshd: conley@pts/4\0\0extra\0");
+  assert.equal(await revalidateInputTopology(188093, route, dependencies), false);
+});
+
+test("sshd title padding accepts only trailing empty slots for sshd and sshd-session in both roles", async () => {
+  for (const role of roles) {
+    for (const comm of ["sshd", "sshd-session"]) {
+      for (const zeroCount of [1, 2, 3, 8, 64]) {
+        const f = directSsh();
+        useRole(f, role);
+        Object.assign(f.processes.get(3001)!, {
+          comm, rawCmdline: Buffer.from(`${comm}: conley@pts/12  ${"\0".repeat(zeroCount)}`),
+        });
+        const route = await resolveInputTopology(5000, f.dependencies());
+        assert.equal(route.kind, "remote", `${role.hostname}/${comm}/${zeroCount} NULs`);
+        assert.equal(route.hops[0]?.proof, "sshd");
+        assert.equal(await revalidateInputTopology(5000, route, f.dependencies()), true);
+      }
+    }
+  }
+});
+
+test("sshd title padding rejects extra/leading/embedded args, malformed titles, termination and UTF-8", async () => {
+  const title = "sshd: conley@pts/12";
+  const invalid: Array<[string, Buffer]> = [
+    ["empty buffer", Buffer.alloc(0)], ["empty title", Buffer.from("\0\0\0")],
+    ["missing final NUL", Buffer.from(title)], ["unterminated extra argument", Buffer.from(`${title}\0\0extra`)],
+    ["extra argument", Buffer.from(`${title}\0extra\0`)],
+    ["extra after padding", Buffer.from(`${title}\0\0extra\0\0`)],
+    ["leading empty", Buffer.from(`\0${title}\0`)],
+    ["embedded split title", Buffer.from("sshd: conley\0@pts/12\0")],
+    ["embedded argument", Buffer.from(`sshd:\0ignored\0conley@pts/12\0`)],
+    ["wrong tty", Buffer.from("sshd: conley@pts/4\0\0")],
+    ["empty username", Buffer.from("sshd: @pts/12\0\0")],
+    ["malformed username", Buffer.from("sshd: conley/other@pts/12\0\0")],
+    ["prefixed title", Buffer.from(` ${title}\0\0`)],
+    ["suffixed title", Buffer.from(`${title} extra\0\0`)],
+    ["malformed UTF-8 title", Buffer.from([0xc3, 0x28, 0])],
+    ["malformed UTF-8 after title", Buffer.concat([Buffer.from(`${title}\0`), Buffer.from([0xff, 0])])],
+  ];
+  for (const [label, rawCmdline] of invalid) {
+    const f = directSsh();
+    const route = await resolveInputTopology(5000, f.dependencies());
+    assert.equal(route.kind, "remote");
+    f.processes.get(3001)!.rawCmdline = rawCmdline;
+    assert.equal(await revalidateInputTopology(5000, route, f.dependencies()), false, label);
+    assert.equal((await resolveInputTopology(5000, f.dependencies())).kind, "unknown", label);
+  }
+});
+
+test("sshd title padding preserves UID, parent, leader fd0, comm and process incarnation checks", async () => {
+  const invalid: Array<[string, (f: Fixture) => void]> = [
+    ["UID", (f) => { f.processes.get(3001)!.uid = 1001; }],
+    ["parent", (f) => { f.processes.get(4001)!.ppid = 2001; }],
+    ["leader fd0", (f) => { f.processes.get(4001)!.fd0 = "/dev/pts/99"; }],
+    ["comm", (f) => { f.processes.get(3001)!.comm = "unrelated"; }],
+    ["holder incarnation", (f) => { f.processes.get(3001)!.starttime = "999999"; }],
+    ["leader incarnation", (f) => { f.processes.get(4001)!.starttime = "999999"; }],
+  ];
+  for (const [label, invalidate] of invalid) {
+    const f = directSsh();
+    f.processes.get(3001)!.rawCmdline = Buffer.from("sshd: conley@pts/12\0\0\0");
+    const route = await resolveInputTopology(5000, f.dependencies());
+    assert.equal(route.kind, "remote");
+    invalidate(f);
+    assert.equal(await revalidateInputTopology(5000, route, f.dependencies()), false, label);
+    if (!label.endsWith("incarnation")) {
+      assert.equal((await resolveInputTopology(5000, f.dependencies())).kind, "unknown", label);
+    }
+  }
+});
+
+test("sshd title padding retains script/Codoxear relay and tagged tmux origin proof", async () => {
+  for (const role of roles) {
+    for (const f of [relay("ssh"), relay("ssh", "codoxear-broker"), tmuxClient("ssh"), codoxearTmuxClient()]) {
+      useRole(f, role);
+      const tagged = f.clients.length > 0;
+      const holder = f.processes.get(tagged ? 3100 : 2001)!;
+      const title = `sshd: conley@pts/${tagged ? 20 : 12}`;
+      holder.rawCmdline = Buffer.from(`${title}\0\0\0`);
+      const subject = tagged ? 6000 : 5000;
+      const route = await resolveInputTopology(subject, f.dependencies());
+      assert.equal(route.kind, "remote");
+      assert.equal(await revalidateInputTopology(subject, route, f.dependencies()), true);
+      if (tagged) {
+        assert.deepEqual(await resolveInputReceiver(subject, f.dependencies()), {
+          kind: "remote", alias: role.alias, peer: role.peer, port: 22, user: "conley",
+        });
+        f.clients[0]!.pane = "%57";
+        await receiverFails(f, subject, "pane-mismatch");
+        f.clients[0]!.pane = "%64";
+      }
+      holder.rawCmdline = Buffer.from(`${title}\0\0extra\0`);
+      assert.equal(await revalidateInputTopology(subject, route, f.dependencies()), false);
+      if (tagged) {
+        // Direct holder failure leaves no hop to match the client tty; a relay retains its hop.
+        await receiverFails(f, subject, route.hops[0]?.role === "relay" ? "input-unattributed" : "client-mismatch");
+      }
+    }
+  }
+});
+
+test("sshd title padding does not erase empty argv slots from Codoxear identity", async () => {
+  for (const args of [
+    ["python3", "", "/fixture/venv/bin/codoxear-broker", "--"],
+    ["", "python3", "-m", "codoxear.broker"],
+    ["python3", "-m", "", "codoxear.broker"],
+  ]) {
+    const f = relay("ssh", "codoxear-broker");
+    const route = await resolveInputTopology(5000, f.dependencies());
+    assert.equal(route.kind, "remote");
+    f.processes.get(3001)!.rawCmdline = Buffer.from(args.join("\0") + "\0");
+    assert.equal(await revalidateInputTopology(5000, route, f.dependencies()), false);
+    assertUnknown(await resolveInputTopology(5000, f.dependencies()), /没有受支持的输入来源契约/u);
+  }
 });
 
 for (const role of roles) {
