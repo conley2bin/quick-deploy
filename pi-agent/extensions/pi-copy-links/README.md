@@ -133,7 +133,9 @@ code --new-window --goto -- /absolute/path:12:3
 
 **本机 MP4 预览需要单独安装 [VS Code 侧修复扩展](../../vscode-video-preview-repair/README.md)。** Code 1.135 的新建独立窗口可能先把 MP4 解析成二进制/文本编辑器；Pi 的通用启动参数不能指定自定义编辑器。修复扩展在目标 Code 窗口启动后仅对首个未修改的本地 MP4 文本标签调用 `vscode.openWith(..., 'vscode.videoPreview')`；它不随 Pi 扩展安装，不修改上述启动参数或 SSH 路由。
 
-配对 SSH 路径使用上表中的**Pi 服务器 authority**和明确的文件/目录 URI：Y9000p 桌面打开公司文件用 `code --remote ssh-remote+conley-company --new-window`；公司桌面打开 Y9000p 文件用 `code --remote ssh-remote+conley-Y9000p --new-window`。`--file-uri`/`--folder-uri` 保留服务器 `stat` 得到的 kind，助手不在桌面查找同名路径。若同一文件夹已经在某个 VS Code 窗口中打开，VS Code 即使收到 `--new-window` 也可能聚焦那个已有窗口，因此它仍可能跳到该窗口所在的 workspace。启动成功只表示桌面接受请求，不保证窗口已绘制或 Remote-SSH 已连接；实际反向连接和可见窗口属于部署后的验收。
+配对 SSH 路径使用上表中的**Pi 服务器 authority**和明确的文件/目录 URI：Y9000p 桌面打开公司文件用 `code --remote ssh-remote+conley-company --new-window`；公司桌面打开 Y9000p 文件用 `code --remote ssh-remote+conley-Y9000p --new-window`。点击文件时，**在同一次 Code 请求中把文件的直接所在目录作为工作区，并选中该文件**：例如 `/srv/project/src/file.py` 的工作区是 `/srv/project/src`，不是 `/srv/project` 或搜索到的 Git 根。请求同时携带同一远端 authority 的 `--folder-uri <直接父目录>` 和 `--file-uri <文件>`；行列选择器只跟在文件 URI 后。根目录文件 `/README` 的工作区是 `/`；目录点击仍直接打开该目录本身，不再向上一级。父目录仅按服务器路径的 POSIX 拼写计算，保留 symlink 名称，不做 `realpath`、目录搜索或助手本机 `stat`。
+
+`--file-uri`/`--folder-uri` 保留服务器 `stat` 得到的 kind，桌面同名文件不会改变目标。请求仍携带 `--new-window`；Code 1.135 在同一远端父目录工作区已经打开时，会把文件交给那个已有窗口，即使收到 `--new-window`，因此它仍可能切到该窗口所在的桌面 workspace。助手不使用第二次启动、`--add`、`--reuse-window` 或延时规避这个 Code 策略。公司本机非 SSH 文件打开和上面的本机媒体预览策略保持不变。启动成功只表示桌面接受请求，不保证窗口已绘制或 Remote-SSH 已连接；实际窗口/资源状态和可见内容应分别核验。
 
 ### 源文分歧
 
@@ -198,7 +200,7 @@ python3 test/native-smoke.py --path-boundaries
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s pi-agent/extensions/pi-copy-links/client/tests -v
 ```
 
-`test/paired-path.test.ts` 还把两个生产组件直接接起来：同一源路径在两行角色中经自动路径识别、真实服务器 `stat`、钉住的 SSH argv、真实管道上的 v2 PREPARED/COMMIT，最后到 Python 助手的精确 Code remote URI；桌面端同名路径 `stat` 是失败 tripwire。它只替换 SSH/桌面命令端点和测试进程的 OS hostname，unknown 服务器/助手均须拒绝。接收器 PTY/sshd 权限由 receiver 回归单独覆盖；此组合 fixture 不代替真实反向 SSH/GUI 证明。
+`test/paired-path.test.ts` 还把两个生产组件直接接起来：同一源路径在两行角色中经自动路径识别、真实服务器 `stat`、钉住的 SSH argv、真实管道上的 v2 PREPARED/COMMIT，最后到 Python 助手的一次精确 Code 请求；文件必须同时携带同一远端的直接父目录工作区 URI 和文件 URI，目录只携带自身工作区 URI。桌面端对同名资源和父目录的 `stat` 都是失败 tripwire。它只替换 SSH/桌面命令端点和测试进程的 OS hostname，unknown 服务器/助手均须拒绝。接收器 PTY/sshd 权限由 receiver 回归单独覆盖；此组合 fixture 不代替真实反向 SSH/GUI 证明。
 
 `--legacy-peer-deps` 只用于测试依赖安装，避免 npm 自动装入与正在运行的 Pi 不同身份的 peer；`npm run check` 中的 `test/setup-pi.mjs` 核验并链接本机已安装的 Pi/TUI，发现不匹配的第二份运行时会拒绝执行。验收以实际 `pi` 的 bundled CLI 和上面的离线 PTY/recorder 为准，不用未打包入口代替。
 
