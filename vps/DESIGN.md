@@ -74,8 +74,10 @@ an arbitrary allow-list.
    revocation even if it interleaves with export. Export rejects source links
    before dereference and preserves links during staging to reject raced-in ones.
 6. Only existing owned resources may change. Inspect all effective systemd load
-   paths, exact/prefix/type drop-ins, loaded fragments and runtime configuration
-   before service execution; refuse foreign definitions instead of overriding.
+   paths, exact/prefix/type drop-ins, outgoing `.wants`/`.requires` edges, loaded
+   fragments and runtime configuration before service execution; refuse foreign
+   definitions instead of overriding. Declared fragment dependencies and reverse
+   target links from our enable operation remain allowed.
    Repeating the same desired state is health/backup work, not an unnecessary
    service restart or new identity. URI identity checks are explicit errors,
    independent of Python optimization.

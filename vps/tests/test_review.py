@@ -119,6 +119,75 @@ class ReviewGates(unittest.TestCase):
                 finally:
                     f.doCleanups()
 
+    def test_foreign_dependency_edges_refuse_through_actual_ctl_guard(self):
+        cases = [(unit, suffix, origin) for unit in host.UNIT_NAMES for suffix in ('wants', 'requires')
+                 for origin in ('persistent', 'runtime', 'vendor')]
+        cases += [(host.PANEL, 'wants', kind) for kind in ('dangling-edge', 'directory-link', 'dangling-directory', 'directory-file')]
+        for unit, suffix, origin in cases:
+            with self.subTest(unit=unit, suffix=suffix, origin=origin):
+                f = fixtures.FakeHost()
+                f.setUp()
+                try:
+                    f.upload()
+                    directory = {'runtime': f.root / 'run/systemd/system',
+                                 'vendor': f.root / 'usr/lib/systemd/system'}.get(origin, f.h.UNITS)
+                    dependency = directory / (unit + '.' + suffix)
+                    dependency.parent.mkdir(parents=True, exist_ok=True)
+                    foreign = f.root / 'outside-dependency-fixture/unrelated.service'
+                    foreign.parent.mkdir()
+                    foreign.write_text('[Service]\nExecStart=/synthetic/foreign-hook\n')
+                    if origin in ('directory-link', 'dangling-directory'):
+                        dependency.symlink_to(foreign.parent if origin == 'directory-link' else f.root / 'missing-directory', target_is_directory=True)
+                    elif origin == 'directory-file':
+                        dependency.write_text('unexpected dependency configuration')
+                    else:
+                        dependency.mkdir()
+                        (dependency / foreign.name).symlink_to(f.root / 'missing-unit' if origin == 'dangling-edge' else foreign)
+                    executed = []
+                    original_run = f.run_command
+                    def checked_run(argv, **kwargs):
+                        if argv[:2] in (['systemctl', 'start'], ['systemctl', 'restart']):
+                            executed.append(argv)
+                            return subprocess.CompletedProcess(argv, 0, b'', b'')
+                        return original_run(argv, **kwargs)
+                    with mock.patch.object(f.h, 'run', side_effect=checked_run):
+                        for action in ('start', 'restart'):
+                            with self.assertRaisesRegex(f.h.Error, '[Dd]ependency'):
+                                f.control_service(action, unit)
+                        with self.assertRaisesRegex(f.h.Error, '[Dd]ependency'):
+                            f.h.preflight(f.request)
+                    self.assertEqual(executed, [])
+                    self.assertTrue(dependency.exists() or dependency.is_symlink())
+                    self.assertIn('foreign-hook', foreign.read_text())
+                finally:
+                    f.doCleanups()
+
+    def test_declared_and_reverse_enable_dependencies_remain_allowed(self):
+        f = self.fixture()
+        f.upload()
+        f.h.atomic(f.h.ROOT / 'export-sha256', 'receipt')
+        f.h.commit(dict(f.request, machine_id='a' * 32, offnode_sha256='receipt'))
+        self.assertIn('Wants=network-online.target', f.h.unit_texts()[f.h.PANEL])
+        for unit in f.h.UNIT_NAMES:
+            target = 'timers.target' if unit == f.h.TIMER else 'multi-user.target'
+            edge = f.h.UNITS / (target + '.wants') / unit
+            edge.parent.mkdir(exist_ok=True)
+            edge.symlink_to(f.h.UNITS / unit)
+        # Empty real directories introduce no edge. Our enable links point FROM
+        # targets to owned units, not FROM an owned unit to a foreign service.
+        (f.h.UNITS / (f.h.PANEL + '.requires')).mkdir()
+        f.h.preflight(f.request)
+        original_run = f.run_command
+        executed = []
+        def checked_run(argv, **kwargs):
+            if argv == ['systemctl', 'start', f.h.PANEL]:
+                executed.append(argv)
+                return subprocess.CompletedProcess(argv, 0, b'', b'')
+            return original_run(argv, **kwargs)
+        with mock.patch.object(f.h, 'run', side_effect=checked_run):
+            f.control_service('start', f.h.PANEL)
+        self.assertEqual(len(executed), 1)
+
     def test_commit_rejects_expired_changed_boot_and_midcheck_expiry(self):
         for kind in ('expired', 'reboot', 'during-health'):
             with self.subTest(kind=kind):

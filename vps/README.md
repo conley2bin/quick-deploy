@@ -30,8 +30,10 @@ OpenSSL、systemd/`systemd-analyze`、`ss`、`nft`、可信 CA 包及至少2GiB�
 HTTP01需要公网80可达，Caddy禁用 TLS-ALPN 挑战和自动重定向，明确不占用443。
 已有防火墙规则、占用端口、外来同名 unit 或旧代理目录会拒绝，**不清空/开放规则、
 不停止外来服务、不接管旧机器**。四个unit在实际systemd加载路径中的同名定义、
-精确/前缀/类型drop-in以及有效FragmentPath/DropInPaths/SourcePath/运行时配置均检查；
-执行服务操作前再次核验，发现外来或未重载配置就拒绝，不删除override来绕过。
+精确/前缀/类型drop-in、四个名称的`.wants/`/`.requires/`外加依赖边，以及有效
+FragmentPath/DropInPaths/SourcePath/运行时配置均检查；悬空/链接依赖目录也拒绝。
+自己的正常依赖写在完整unit里，enable生成的反向target.wants链接不受此限制。
+执行服务操作前再次核验，发现外来或未重载配置就拒绝，不删除override或依赖边来绕过。
 云防火墙由操作者审阅并开放所选入口。
 
 ## 实际命令

@@ -596,6 +596,15 @@ def check_units(require_all=True):
                 raise Error('Foreign unit in systemd load path')
             if any((directory / dropin).exists() or (directory / dropin).is_symlink() for dropin in dropins):
                 raise Error('Foreign systemd drop-in configuration; no takeover')
+            # Our outgoing dependencies are declared in the exact owned
+            # fragments. enable creates reverse target.wants links, not edges
+            # FROM these four names. Any injected outgoing directory edge is
+            # foreign; never follow even a dangling directory/entry symlink.
+            for relation in ('wants', 'requires'):
+                dependencies = directory / (name + '.' + relation)
+                if dependencies.is_symlink() or (dependencies.exists() and
+                        (not dependencies.is_dir() or any(dependencies.iterdir()))):
+                    raise Error('Foreign systemd dependency edge configuration; no takeover')
         output = run(['systemctl', 'show', name,
             '--property=LoadState,FragmentPath,DropInPaths,SourcePath,NeedDaemonReload,Transient', '--no-pager'], timeout=15).stdout.decode()
         props = dict(line.split('=', 1) for line in output.splitlines() if '=' in line)
