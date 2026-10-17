@@ -1,5 +1,9 @@
 # 两个 VPS 角色：首尔代理、上海 Tailscale Peer Relay
 
+> **新方案请先读 [长期个人代理设计](DESIGN.md)：仅提案，未实现、未部署。**
+> 当前代码仍是旧的混合角色/Tailscale/公司8743实现；下文仅保留历史说明，**不得当作新设计的可用部署流程执行**。
+> `--without-tailscale` 尚不构成纯代理边界；本文新设计不授权上海中继、私网桥接或任何实际部署。
+
 本模块只改变**明确指定的 Ubuntu24.04 VPS**，不改两PC的Clash运行配置、Tailscale设置、SSH别名、tmux、Codoxear、Sunshine或WireGuard。海外节点由用户自己选择；不按模型/API域名强制分流。
 
 | 角色 | 主机职责 | Tailscale身份 | 默认SSH用户 |
