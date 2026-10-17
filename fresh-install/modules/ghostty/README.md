@@ -72,6 +72,7 @@ sudo apt install --allow-downgrades ghostty=1.3.1~ppa2-noble1
   - 显式解除 `Ctrl+Alt+←/→` 的 Ghostty split 绑定，把按键交给 tmux 切 window
   - 为 `Ctrl+Alt+=/+` 显式发送 CSI-u 序列，交给 tmux 新建 window
   - `Ctrl+Shift+R` 绑定 Ghostty 原生 `reset`，用于清理异常 SSH 后残留的终端状态
+  - `Ctrl+Z` 发送原生编辑器的撤销字节 `^_`（`0x1f`）；`Ctrl+Shift+Z` 发送原来的挂起字节 `^Z`（`0x1a`），具体范围见下节
   - `mouse-shift-capture = never`：鼠标上报的程序（Pi 全屏、tmux `mouse on`）里用 **Shift+拖选** 产生 Ghostty 本地选区，并禁止程序用 `XTSHIFTESCAPE` 抢走 Shift（见“鼠标上报下的复制”一节）
   - `Ctrl+Shift+C` 保留 `copy_to_clipboard:mixed`；`Ctrl+Shift+V` 固定为 `paste_from_clipboard`，由 Ghostty 原生粘贴文字。Ghostty 不绑定 `Ctrl+V`，Pi 继续使用自身图片/文本粘贴和已有 SSH 桥（见下节）
   - `clipboard-write = allow` / `clipboard-read = deny`：允许 OSC 52 写入（远端 tmux 复制回本机剪贴板的入口），拒绝 OSC 52 读取（见下节）
@@ -131,6 +132,77 @@ keybind = ctrl+alt+arrow_right=unbind
 
 这不是改绑 Ghostty 标签页；Ghostty 标签页继续使用上游默认的 `Ctrl+Tab` /
 `Ctrl+Shift+Tab`。代价是 Ghostty 自己的 split 不再能用这两个键切换。
+
+### Ctrl+Z：撤销当前未提交输入
+
+共享配置固定发送两个控制字节：
+
+```ini
+keybind = ctrl+z=text:\x1f
+keybind = ctrl+shift+z=text:\x1a
+```
+
+`Ctrl+Z` 到达前台程序时变成 `^_`。emacs 模式的 zsh/ZLE 与 bash/readline
+把它解释为原生 undo；Linux Pi 的默认 `ctrl+-` 也接受这个字节，包括启用
+Kitty keyboard protocol 时。无需改 shell hook、Pi keybindings 或 tmux，也不
+改变 `ghostty-pi` 启动参数。这里使用 Ghostty `text` 动作；Ghostty 自带的
+`undo` 动作管理 macOS 窗口/tab，不管理应用的输入框。
+
+撤销单位由编辑器决定（Pi 会按词/编辑组撤销），只涉及**当前尚未提交的
+输入**。Enter 后的 shell 命令、Pi 消息、工具调用或文件改动不在该撤销栈。
+重复按键会继续撤销，空栈由编辑器处理。此功能没有新增 redo。
+
+终端无法为所有前台程序创建 undo 栈。此绑定适用于保留默认撤销键的 emacs
+模式 zsh/bash 和 Pi；vi 模式、自定义 keymap、其他 TUI 或密码/普通 canonical
+读取器可能有不同含义，不能据此声称支持。SSH 远端也必须有对应编辑器绑定。
+在 tmux 的正常输入模式下字节透传；copy-mode、待输入的 prefix 和自定义 root
+键可能先消费它。先退出 copy-mode，再进行编辑。
+
+`Ctrl+Z` 不再发送通常用于 Unix job-control 的 `^Z`。需要挂起普通前台任务
+时改按 **Ctrl+Shift+Z**，返回提示符后用 `fg` 恢复。这个替代键只恢复原来的
+字节：raw-mode 应用仍由自身处理，Pi 若在个人配置中禁用了 `app.suspend`，
+替代键不会重新启用它。tmux prefix 表仍保留自己的 `C-z`，但终端重映射也
+作用于 prefix 后的物理 Ctrl+Z；需要原来的 `suspend-client` 时改用 prefix
+后 Ctrl+Shift+Z，或在 tmux 命令提示符运行 `suspend-client`。
+
+#### 已安装机器：只增加撤销键
+
+从仓库根目录运行：
+
+```bash
+bash fresh-install/modules/ghostty/install.sh --undo-keybind-only
+/usr/bin/ghostty +validate-config
+/usr/bin/ghostty +list-keybinds --plain | grep -E 'ctrl\+(shift\+)?z='
+```
+
+窄模式只接受**逐字节匹配**的当前受管配置或添加这两个键之前的受管配置，
+包括 native/raw 两种历史粘贴策略；它不改变原有粘贴策略，只在 reset 绑定后
+插入这两行并保留文件权限。已是当前基准时不改 inode、mtime，也不创建备份。
+缺失目标、链接目录/文件、重复/部分撤销键或任何用户定制均明确拒绝，不能
+通过这个模式重置字体、工作目录或覆盖自定义按键。原来的粘贴窄迁移仍只改
+粘贴行，且兼容有/无撤销键的精确历史基准。
+
+生成临时文件后再次比较原文件和预期输出，原子替换后回读。和其他窄模式
+一样，比较与 rename 不是 CAS；部署要求单写者、无并发编辑。此模式不执行
+apt、编译、字体、启动器、desktop、shell/Pi 配置或 GUI 步骤，也不能与其他
+安装选项组合。无需重装 Pi/tmux。
+
+现有 Ghostty 进程需要由用户正常重载配置（1.3.1 默认 `Ctrl+Shift+,`）或新开
+受管进程；新开 shell/Pi pane 不会重载终端。任何显式同键 CLI 覆盖仍优先于
+文件。不得为应用此改动关闭现有 tmux/Pi 会话。
+
+验证应分层记录：`+validate-config` / `+list-keybinds` 证明解析与有效动作；
+私有 PTY 下实际 ZLE/readline/Pi 编辑器的 buffer 变化证明接收端；只有在隔离、
+任务自有的 GUI 窗口注入按键或人工物理按键才证明 Ghostty 分发。不能把 PTY
+结果称为 GUI 验证，更不能把合成 GUI 按键称为物理键验收。可运行：
+
+```bash
+python3 fresh-install/tests/ghostty/test_undo.py
+# 可选：用当前安装的 Pi 类和个人 keybindings 验证，无 API 调用或包修改。
+PI_ENTRY="$(readlink -f "$(command -v pi)")"
+PI_PACKAGE_DIR="$(dirname "$(dirname "$(dirname "$PI_ENTRY")")")"
+node fresh-install/tests/ghostty/verify_pi_undo.mjs "$PI_PACKAGE_DIR" "$HOME/.pi/agent/keybindings.json"
+```
 
 ### OSC 52 剪贴板：只写不读
 
@@ -252,7 +324,8 @@ bash fresh-install/modules/ghostty/install.sh --pi-launcher-only
 
 `--paste-keybind-only` accepts an existing non-symlink config only when it
 **byte-exactly equals the old raw managed baseline** (`text:\x16`) or the
-current native baseline (`paste_from_clipboard`). It replaces only that one
+current native baseline (`paste_from_clipboard`), with or without the two managed
+undo-key lines. It replaces only that one
 binding, preserving all other bytes and file permissions; a current native
 file is not rewritten and keeps its inode. Custom content, duplicate/conflicting
 bindings, or changed fonts/start-directory settings since the old install

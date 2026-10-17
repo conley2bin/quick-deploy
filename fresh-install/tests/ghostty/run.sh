@@ -27,6 +27,7 @@ HOME="$WORK/render-hook-home" bash -c 'source "$1"; render_local_paste_hook' _ "
 python3 "$(dirname "${BASH_SOURCE[0]}")/test_shell_paste.py" || fail "shell clipboard reader regressions failed"
 python3 "$(dirname "${BASH_SOURCE[0]}")/test_paste_dispatch.py" || fail "text/control PTY regressions failed"
 python3 "$(dirname "${BASH_SOURCE[0]}")/test_paste_migrations.py" || fail "paste migration guard regressions failed"
+python3 "$(dirname "${BASH_SOURCE[0]}")/test_undo.py" || fail "undo key migration/PTY regressions failed"
 # Independent historical fixture: changing the current renderer must not redefine
 # which deployed raw launchers the installer is allowed to replace.
 cat > "$WORK/legacy-pi-launcher" <<'EOF'
@@ -117,6 +118,8 @@ render_variant() {
 }
 render_variant "$WORK/config.ghostty"
 grep -Fqx 'keybind = ctrl+shift+r=reset' "$WORK/config.ghostty" || fail "缺少 reset keybind"
+grep -Fqx 'keybind = ctrl+z=text:\x1f' "$WORK/config.ghostty" || fail "缺少 Ctrl+Z 原生 undo 字节"
+grep -Fqx 'keybind = ctrl+shift+z=text:\x1a' "$WORK/config.ghostty" || fail "缺少 Ctrl+Shift+Z 挂起字节"
 # 鼠标上报下普通拖选属于 Pi/tmux，Shift+拖选产生 Ghostty 本地选区，
 # Ctrl+Shift+C 复制；Ctrl+Shift+V 原生粘贴文字，Ctrl+V 留给程序。三行显式写入，
 # never 还禁止程序用 XTSHIFTESCAPE 抢走 Shift，行为不随上游默认漂移。
@@ -189,6 +192,11 @@ if [ -x /usr/bin/ghostty ]; then
         /usr/bin/ghostty +list-keybinds --plain > "$WORK/ghostty-keybinds"
     grep -Fqx 'keybind = ctrl+shift+v=paste_from_clipboard' "$WORK/ghostty-keybinds" \
         || fail "Ghostty parser 没有选择原生文字粘贴"
+    # 1.3.1 的列表输出把 text 动作内的反斜杠再转义；磁盘配置只有一层。
+    grep -Fqx 'keybind = ctrl+z=text:\\x1f' "$WORK/ghostty-keybinds" \
+        || fail "Ghostty parser 没有选择 Ctrl+Z undo 字节"
+    grep -Fqx 'keybind = ctrl+shift+z=text:\\x1a' "$WORK/ghostty-keybinds" \
+        || fail "Ghostty parser 没有选择 Ctrl+Shift+Z 挂起字节"
     ! grep -Eq '^keybind = ctrl\+v=' "$WORK/ghostty-keybinds" \
         || fail "Ghostty parser 接管了 Ctrl+V"
 fi
@@ -405,7 +413,7 @@ PY
     snapshot_pi_only_home "$LEGACY_HOME" > "$WORK/pi-legacy-rerun"
     cmp -s "$WORK/pi-legacy-after" "$WORK/pi-legacy-rerun" || fail "升级后重跑增加备份或修改非目标"
 
-    for other in --check --ppa-only --deb-only --default-terminal --no-default-terminal --paste-keybind-only --shell-paste-only; do
+    for other in --check --ppa-only --deb-only --default-terminal --no-default-terminal --paste-keybind-only --undo-keybind-only --shell-paste-only; do
         if run_pi_only "$PI_ONLY_HOME" --pi-launcher-only "$other" > "$WORK/pi-only-args.log" 2>&1; then
             fail "Pi 窄安装接受了冲突选项 $other"
         fi
@@ -500,7 +508,7 @@ cmp -s "$WORK/paste-only-before" "$WORK/paste-only-rerun" \
 ! compgen -G "$PASTE_ONLY_HOME/.config/ghostty/config.ghostty.bak.*" >/dev/null \
     || fail "全局单键窄迁移写了非目标备份"
 
-for other in --check --ppa-only --deb-only --default-terminal --no-default-terminal --pi-launcher-only --shell-paste-only; do
+for other in --check --ppa-only --deb-only --default-terminal --no-default-terminal --pi-launcher-only --undo-keybind-only --shell-paste-only; do
     if run_pi_only "$PASTE_ONLY_HOME" --paste-keybind-only "$other" > "$WORK/paste-only-args.log" 2>&1; then
         fail "全局单键窄迁移接受了冲突选项 $other"
     fi
@@ -695,7 +703,7 @@ PY
 done
 echo 'PASS: exact v1/v2/v3/current hook migrations, .zshrc bytes/inode preservation, narrow-mode idempotence'
 
-for other in --check --ppa-only --deb-only --default-terminal --no-default-terminal --paste-keybind-only --pi-launcher-only; do
+for other in --check --ppa-only --deb-only --default-terminal --no-default-terminal --paste-keybind-only --undo-keybind-only --pi-launcher-only; do
     if run_shell_only "$SHELL_ONLY_HOME" --shell-paste-only "$other" > "$WORK/shell-args.log" 2>&1; then
         fail "zsh 粘贴窄模式接受了冲突选项 $other"
     fi

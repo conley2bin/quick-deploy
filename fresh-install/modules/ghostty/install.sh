@@ -18,6 +18,7 @@ set -euo pipefail
 CHECK_ONLY=false
 PI_LAUNCHER_ONLY=false
 PASTE_KEYBIND_ONLY=false
+UNDO_KEYBIND_ONLY=false
 SHELL_PASTE_ONLY=false
 # 默认接管 Ctrl+Alt+T。本模块刚引入时默认为否，是为了不和当时还在的
 # kitty 模块争抢同一个包装脚本（两个模块都写就是后跑者赢，无告警）。
@@ -124,12 +125,14 @@ usage() {
   ./install.sh [--check] [--no-default-terminal] [--ppa-only | --deb-only] [--help]
   ./install.sh --pi-launcher-only
   ./install.sh --paste-keybind-only
+  ./install.sh --undo-keybind-only
   ./install.sh --shell-paste-only
 
 选项:
   --check                 只读预检：报告当前状态与计划，不安装、不修改
   --pi-launcher-only      只验证受保护启动器/背压库，安装或迁移 Pi 专用启动器
   --paste-keybind-only    只将受管全局 Ctrl+Shift+V 从原始 Ctrl+V 迁移到原生文字粘贴
+  --undo-keybind-only     只为精确受管配置添加 Ctrl+Z 撤销与 Ctrl+Shift+Z 挂起字节
   --shell-paste-only      只为现有受管 Ghostty/zsh 安装本地 Wayland 提示符粘贴 hook
   --no-default-terminal   不接管 Ctrl+Alt+T（默认会接管）
   --default-terminal      兼容旧命令行，默认已是开启状态
@@ -147,7 +150,10 @@ usage() {
   不执行软件包/编译器、配置、字体、桌面入口、默认终端或 GUI 步骤。
   --paste-keybind-only 只接受旧 raw/当前 native 精确受管配置，拒绝自定义
   内容和符号链接；不执行软件包、启动器、字体、桌面入口、默认终端或 GUI
-  步骤。--shell-paste-only 核对现有全局按键及 zsh 托管块，只写入粘贴 hook
+  步骤。--undo-keybind-only 只为精确的新旧受管配置添加两个按键，不改粘贴、
+  启动器或 shell/Pi 配置。Ctrl+Z 发送 ^_ 给原生编辑器撤销；Ctrl+Shift+Z
+  发送旧 ^Z 字节（Pi 若禁用了挂起则仍不挂起）。--shell-paste-only 核对
+  现有全局按键及 zsh 托管块，只写入粘贴 hook
   和必要时迁移 .zshrc 托管块；不执行其它安装步骤。窄模式不能组合。
 EOF
 }
@@ -159,6 +165,7 @@ parse_args() {
             --check) CHECK_ONLY=true; other_mode=true ;;
             --pi-launcher-only) PI_LAUNCHER_ONLY=true ;;
             --paste-keybind-only) PASTE_KEYBIND_ONLY=true ;;
+            --undo-keybind-only) UNDO_KEYBIND_ONLY=true ;;
             --shell-paste-only) SHELL_PASTE_ONLY=true ;;
             --default-terminal) DEFAULT_TERMINAL=true; other_mode=true ;;
             --no-default-terminal) DEFAULT_TERMINAL=false; other_mode=true ;;
@@ -177,11 +184,14 @@ parse_args() {
         esac
         shift
     done
-    if [ "$PI_LAUNCHER_ONLY" = true ] && { [ "$PASTE_KEYBIND_ONLY" = true ] || [ "$SHELL_PASTE_ONLY" = true ] || [ "$other_mode" = true ]; }; then
+    if [ "$PI_LAUNCHER_ONLY" = true ] && { [ "$PASTE_KEYBIND_ONLY" = true ] || [ "$UNDO_KEYBIND_ONLY" = true ] || [ "$SHELL_PASTE_ONLY" = true ] || [ "$other_mode" = true ]; }; then
         die "--pi-launcher-only 不能与其他安装或预检选项组合"
     fi
-    if [ "$PASTE_KEYBIND_ONLY" = true ] && { [ "$SHELL_PASTE_ONLY" = true ] || [ "$other_mode" = true ]; }; then
+    if [ "$PASTE_KEYBIND_ONLY" = true ] && { [ "$UNDO_KEYBIND_ONLY" = true ] || [ "$SHELL_PASTE_ONLY" = true ] || [ "$other_mode" = true ]; }; then
         die "--paste-keybind-only 不能与其他安装或预检选项组合"
+    fi
+    if [ "$UNDO_KEYBIND_ONLY" = true ] && { [ "$SHELL_PASTE_ONLY" = true ] || [ "$other_mode" = true ]; }; then
+        die "--undo-keybind-only 不能与其他安装或预检选项组合"
     fi
     if [ "$SHELL_PASTE_ONLY" = true ] && [ "$other_mode" = true ]; then
         die "--shell-paste-only 不能与其他安装或预检选项组合"
@@ -481,6 +491,7 @@ show_check() {
     fi
     echo "配置: $CONFIG_FILE —— $(config_state)"
     echo "粘贴策略: Ctrl+Shift+V -> $GHOSTTY_PASTE_ACTION（原生文字）；Ctrl+V 留给程序"
+    echo '撤销策略: Ctrl+Z -> ^_（编辑器 undo）；Ctrl+Shift+Z -> ^Z（旧挂起字节）'
     echo "Wayland 背压修复: $(backpressure_state)"
     echo "Pi 专用启动器: $USER_PI_GHOSTTY_LAUNCHER —— $(pi_launcher_state)"
     echo "用户级 desktop 覆盖: $USER_DESKTOP_FILE —— $(desktop_override_state)"
@@ -873,8 +884,15 @@ resolved_working_directory() {
     printf 'home\n'
 }
 
+# ^_ 是 ZLE/readline 的 undo，也是 Pi Linux 默认 ctrl+- 的旧式编码。
+# 不使用 Ghostty 的 undo 动作：它撤销的是 macOS 窗口/tab，而非应用输入。
+render_undo_keybinds() {
+    printf '%s\n' 'keybind = ctrl+z=text:\x1f' 'keybind = ctrl+shift+z=text:\x1a'
+}
+
 render_config() {
-    local paste_action="${1-$GHOSTTY_PASTE_ACTION}"
+    # 第二参数只用于识别精确历史基准；正常渲染始终包含撤销键。
+    local paste_action="${1-$GHOSTTY_PASTE_ACTION}" undo_keys="${2-true}"
     echo "# 由 fresh-install/modules/ghostty/install.sh 生成与维护。"
     echo "# 重跑脚本会把本文件重置为基准内容；手工修改请在脚本里改。"
     font_exists "$FONT_FAMILY" && echo "font-family = $FONT_FAMILY"
@@ -904,6 +922,7 @@ render_config() {
     # prompt 发出针对常见鼠标协议的 DECRST；Ctrl+Shift+R 是所有 shell
     # 和非交互式 SSH 启动方式都能使用的 Ghostty 原生 reset 兜底。
     echo "keybind = ctrl+shift+r=reset"
+    if [ "$undo_keys" = true ]; then render_undo_keybinds; fi
 
     # 鼠标拖选的所有权：Pi 全屏、tmux `mouse on` 都会申请鼠标上报，此时
     # 普通拖选被程序接管（Pi 自己画选区并在释放时复制），Ghostty 没有本地
@@ -955,17 +974,21 @@ render_config() {
 # 因此这里独立核对旧渲染的逐字节基准，仅替换这一行；已是新基准不动 inode。
 # 字体/起始目录若自安装以来变化，基准不再匹配，明确拒绝而非重置其它行。
 apply_paste_keybind_only() {
-    local command_name tmp
+    local command_name tmp undo_keys
     for command_name in cmp mktemp chmod mv rm sed; do require_command "$command_name"; done
     [ -d "$CONFIG_DIR" ] && [ ! -L "$CONFIG_DIR" ] \
         || die "Ghostty 配置目录缺失或是符号链接，拒绝窄迁移: $CONFIG_DIR"
     [ ! -L "$CONFIG_FILE" ] && [ -f "$CONFIG_FILE" ] \
         || die "Ghostty 配置缺失、是符号链接或不是普通文件，拒绝窄迁移: $CONFIG_FILE"
-    if cmp -s "$CONFIG_FILE" <(render_config); then
-        echo "配置按键已是当前基准，跳过写入: $CONFIG_FILE"
-        return 0
-    fi
-    cmp -s "$CONFIG_FILE" <(render_config 'text:\x16') \
+    # 保持原粘贴窄模式：历史配置尚无 undo 两行也可迁移，但不顺带添加它们。
+    for undo_keys in true false; do
+        if cmp -s "$CONFIG_FILE" <(render_config "$GHOSTTY_PASTE_ACTION" "$undo_keys"); then
+            echo "配置按键已是当前基准，跳过写入: $CONFIG_FILE"
+            return 0
+        fi
+        if cmp -s "$CONFIG_FILE" <(render_config 'text:\x16' "$undo_keys"); then break; fi
+    done
+    cmp -s "$CONFIG_FILE" <(render_config 'text:\x16' "$undo_keys") \
         || die "Ghostty 配置不等于旧版 raw 受管基准，拒绝覆盖用户内容: $CONFIG_FILE"
 
     tmp="$(mktemp "$CONFIG_FILE.tmp.XXXXXX")"
@@ -976,7 +999,7 @@ apply_paste_keybind_only() {
         die "无法生成新的 Ghostty 配置: $CONFIG_FILE"
     fi
     # 复核生成期间可见的变化。比较与 mv 不是 CAS；部署须单写者、无并发编辑。
-    if [ -L "$CONFIG_FILE" ] || ! cmp -s "$CONFIG_FILE" <(render_config 'text:\x16'); then
+    if [ -L "$CONFIG_FILE" ] || ! cmp -s "$CONFIG_FILE" <(render_config 'text:\x16' "$undo_keys"); then
         rm -f -- "$tmp"
         die "Ghostty 配置在迁移期间变化，拒绝覆盖: $CONFIG_FILE"
     fi
@@ -985,6 +1008,51 @@ apply_paste_keybind_only() {
         die "无法替换 Ghostty 配置: $CONFIG_FILE"
     fi
     echo "已将全局 Ctrl+Shift+V 恢复为 Ghostty 原生文字粘贴: $CONFIG_FILE"
+}
+
+# 仅添加 undo 两行，接受 native/raw 粘贴的精确旧基准，保留其粘贴策略。
+# 已迁移配置不重写；未知内容/链接拒绝。比较和 rename 不是 CAS，须单写者。
+apply_undo_keybind_only() {
+    local command_name tmp paste_action line
+    for command_name in cmp mktemp chmod mv rm; do require_command "$command_name"; done
+    [ -d "$CONFIG_DIR" ] && [ ! -L "$CONFIG_DIR" ] \
+        || die "Ghostty 配置目录缺失或是符号链接，拒绝窄迁移: $CONFIG_DIR"
+    [ ! -L "$CONFIG_FILE" ] && [ -f "$CONFIG_FILE" ] \
+        || die "Ghostty 配置缺失、是符号链接或不是普通文件，拒绝窄迁移: $CONFIG_FILE"
+    for paste_action in "$GHOSTTY_PASTE_ACTION" 'text:\x16'; do
+        if cmp -s "$CONFIG_FILE" <(render_config "$paste_action"); then
+            echo "撤销按键已是当前基准，跳过写入: $CONFIG_FILE"
+            return 0
+        fi
+        if cmp -s "$CONFIG_FILE" <(render_config "$paste_action" false); then break; fi
+    done
+    cmp -s "$CONFIG_FILE" <(render_config "$paste_action" false) \
+        || die "Ghostty 配置不等于撤销键迁移前的受管基准，拒绝覆盖用户内容: $CONFIG_FILE"
+
+    tmp="$(mktemp "$CONFIG_FILE.tmp.XXXXXX")"
+    # 从已核对文件插入，避免重渲染更改其它字节（包括粘贴策略）。
+    if ! {
+        while IFS= read -r line; do
+            printf '%s\n' "$line"
+            if [ "$line" = 'keybind = ctrl+shift+r=reset' ]; then render_undo_keybinds; fi
+        done < "$CONFIG_FILE" > "$tmp"
+    } || ! chmod --reference="$CONFIG_FILE" "$tmp"; then
+        rm -f -- "$tmp"
+        die "无法生成撤销按键配置，拒绝替换: $CONFIG_FILE"
+    fi
+    if [ -L "$CONFIG_DIR" ] || [ -L "$CONFIG_FILE" ] ||
+       ! cmp -s "$CONFIG_FILE" <(render_config "$paste_action" false) ||
+       ! cmp -s "$tmp" <(render_config "$paste_action"); then
+        rm -f -- "$tmp"
+        die "Ghostty 配置在撤销键迁移期间变化，拒绝覆盖: $CONFIG_FILE"
+    fi
+    if ! mv -f -- "$tmp" "$CONFIG_FILE"; then
+        rm -f -- "$tmp"
+        die "无法替换撤销按键配置: $CONFIG_FILE"
+    fi
+    cmp -s "$CONFIG_FILE" <(render_config "$paste_action") \
+        || die "撤销按键配置回读失败: $CONFIG_FILE"
+    echo "已添加 Ctrl+Z 撤销（^_）与 Ctrl+Shift+Z 挂起字节（^Z）: $CONFIG_FILE"
 }
 
 write_config() {
@@ -1994,7 +2062,8 @@ verify_local_paste_prerequisites() {
     done
     [ -d "$CONFIG_DIR" ] && [ ! -L "$CONFIG_DIR" ] \
         || die "Ghostty 配置目录缺失或是符号链接，拒绝安装 shell 粘贴: $CONFIG_DIR"
-    [ -f "$CONFIG_FILE" ] && [ ! -L "$CONFIG_FILE" ] && cmp -s "$CONFIG_FILE" <(render_config) \
+    [ -f "$CONFIG_FILE" ] && [ ! -L "$CONFIG_FILE" ] &&
+        { cmp -s "$CONFIG_FILE" <(render_config) || cmp -s "$CONFIG_FILE" <(render_config "$GHOSTTY_PASTE_ACTION" false); } \
         || die "全局按键不是当前逐字节受管基准，拒绝安装 shell 粘贴: $CONFIG_FILE"
     [ -f "$SSH_MOUSE_HOOK_CONFIG" ] && [ ! -L "$SSH_MOUSE_HOOK_CONFIG" ] &&
         cmp -s "$SSH_MOUSE_HOOK_CONFIG" <(render_ssh_mouse_hook) \
@@ -2258,6 +2327,11 @@ main() {
         echo "已完成全局按键迁移；现有 Ghostty 需正常重载配置或开启新进程"
         return 0
     fi
+    if [ "$UNDO_KEYBIND_ONLY" = true ]; then
+        apply_undo_keybind_only
+        echo "撤销按键迁移完成；现有 Ghostty 需正常重载配置或开启新进程"
+        return 0
+    fi
     if [ "$SHELL_PASTE_ONLY" = true ]; then
         install_local_paste_hook
         echo '已安装 zsh 提示符粘贴；已有 shell 执行 source "$HOME/.config/ghostty/ghostty-local-paste.zsh"，或开启新 shell'
@@ -2355,6 +2429,8 @@ main() {
     echo "     zsh hook 会在 ssh 返回到本地提示符时自动清理常见鼠标模式。"
     echo "  6. Ctrl+Shift+V 由 Ghostty 原生粘贴文字；Pi 中 Ctrl+V 继续图片/文本及 SSH 桥。"
     echo "     本地 zsh 的 Ctrl+V widget 和 Esc Ctrl+V quoted-insert 保留；tmux 历史模式先退出。"
+    echo "  7. Ctrl+Z 撤销未提交输入（emacs 模式 zsh/bash、Pi 默认 undo）；"
+    echo "     Ctrl+Shift+Z 发送旧挂起字节。其他应用/自定义按键由应用决定。"
 }
 
 main "$@"
