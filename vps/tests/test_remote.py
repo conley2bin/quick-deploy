@@ -116,6 +116,11 @@ class FakeHost(unittest.TestCase):
         with sqlite3.connect(folder / 'db/x-ui.db') as db:
             db.execute('create table settings(id integer primary key, key text, value text)')
             db.execute('create table users(id integer primary key, username text, password text)')
+            db.execute('insert into users values(1,?,?)', (manifest['admin_user'], 'fixture-only'))
+            db.execute('create table inbounds(id integer primary key,user_id integer,remark text,protocol text,port integer)')
+            db.execute('insert into inbounds values(1,1,?,?,?)', ('SELF-main', 'vless', manifest['config']['proxy_port']))
+            db.execute('create table hosts(group_id text,inbound_id integer,address text,port integer,is_disabled integer,is_hidden integer)')
+            db.execute('insert into hosts values(?,1,?,?,0,0)', ('owned-fixture-host', manifest['endpoint'], manifest['config']['proxy_port']))
             db.execute('create table clients(email text, uuid text, sub_id text, enable integer, flow text)')
             db.executemany('insert into clients values(?,?,?,?,?)',
                 [(d, c['id'], c['subId'], c['enable'], c['flow']) for d, c in manifest['accounts'].items()])
@@ -124,11 +129,13 @@ class FakeHost(unittest.TestCase):
     def configure(self, folder, manifest, fresh, rotate=False):
         import sqlite3
         import uuid
-        if rotate:
-            with sqlite3.connect(folder / 'db/x-ui.db') as db:
+        with sqlite3.connect(folder / 'db/x-ui.db') as db:
+            db.execute('update hosts set address=?', (manifest['endpoint'],))
+            if rotate:
                 for device in self.h.DEVICES:
                     db.execute('update clients set uuid=? where email=?', (str(uuid.uuid4()), device))
         manifest['accounts'] = self.h.snapshot_accounts(folder / 'db/x-ui.db')
+        manifest['host_group_id'] = self.h.snapshot_host_group(folder / 'db/x-ui.db', manifest)
 
     def upload(self):
         with tempfile.TemporaryDirectory(dir=self.root) as tmp:

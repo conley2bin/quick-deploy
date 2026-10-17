@@ -188,6 +188,50 @@ class ReviewGates(unittest.TestCase):
             f.control_service('start', f.h.PANEL)
         self.assertEqual(len(executed), 1)
 
+    def test_snapshot_host_identity_rejects_ambiguous_or_foreign_membership(self):
+        import copy
+        import shutil
+        import sqlite3
+        f = self.fixture()
+        f.upload()
+        manifest = f.h.read_json(f.h.ROOT / 'active/manifest.json')
+        reference = f.root / 'closed-source.db'
+        f.h.db_snapshot(f.h.ROOT / 'active/db/x-ui.db', reference)
+        legacy = copy.deepcopy(manifest)
+        legacy.pop('host_group_id')
+        self.assertEqual(f.h.snapshot_host_group(reference, legacy), manifest['host_group_id'])
+        self.assertNotIn('host_group_id', legacy)
+        cases = ('duplicate', 'extra-hidden-group', 'dangling-inbound', 'wrong-old-address',
+                 'new-address-in-manifest', 'wrong-port', 'extra-inbound', 'wrong-owner', 'wrong-remark', 'changed-saved-id')
+        for case in cases:
+            with self.subTest(case=case):
+                database = f.root / (case + '.db')
+                shutil.copy2(reference, database)
+                metadata = copy.deepcopy(manifest)
+                with sqlite3.connect(database) as db:
+                    if case == 'duplicate':
+                        db.execute('insert into hosts select * from hosts')
+                    elif case == 'extra-hidden-group':
+                        db.execute("insert into hosts select 'foreign-group',inbound_id,address,port,1,1 from hosts")
+                    elif case == 'dangling-inbound':
+                        db.execute('update hosts set inbound_id=999')
+                    elif case == 'wrong-old-address':
+                        db.execute("update hosts set address='93.184.216.99'")
+                    elif case == 'new-address-in-manifest':
+                        metadata['endpoint'] = '93.184.216.35'
+                    elif case == 'wrong-port':
+                        db.execute('update hosts set port=4443')
+                    elif case == 'extra-inbound':
+                        db.execute('insert into inbounds select 2,user_id,remark,protocol,port from inbounds')
+                    elif case == 'wrong-owner':
+                        db.execute('update inbounds set user_id=999')
+                    elif case == 'wrong-remark':
+                        db.execute("update inbounds set remark='foreign'")
+                    elif case == 'changed-saved-id':
+                        metadata['host_group_id'] = 'foreign-saved-id'
+                with self.assertRaisesRegex(f.h.Error, '[Hh]ost'):
+                    f.h.snapshot_host_group(database, metadata)
+
     def test_commit_rejects_expired_changed_boot_and_midcheck_expiry(self):
         for kind in ('expired', 'reboot', 'during-health'):
             with self.subTest(kind=kind):

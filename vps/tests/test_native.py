@@ -217,6 +217,135 @@ class Native(unittest.TestCase):
         with self.assertRaisesRegex(host.Error, 'binary/geodata drift'):
             self.export_without_systemctl()
 
+    def test_review_closed_archive_new_ip_restore_and_replace(self):
+        import re
+        import sqlite3
+        self.prepare_export_fixture()
+        api = host.wait_api(self.manifest)
+        for device, client in self.native_accounts().items():
+            client.update(trafficReset='monthly', trafficResetDay=11, reset=4, resetMax=8, limitHwid=0,
+                          totalGB=987654321, expiryTime=int(time.time() * 1000) + 20 * 86400000,
+                          limitIp=2, comment='new-IP-preserved-policy')
+            if device == 'company':
+                client['enable'] = False
+            api.call('/panel/api/clients/update/' + device, client)
+        group = api.call('/panel/api/hosts/get/' + api.call('/panel/api/hosts/list')[0]['groupId'])
+        group.update(remark='owned-host-fixture', serverDescription='preserve native Host policy',
+                     tags=['fixture-owned'], sortOrder=9)
+        api.call('/panel/api/hosts/update/' + group['groupId'], group)
+        original_group = api.call('/panel/api/hosts/get/' + group['groupId'])
+        original_records = {d: api.call('/panel/api/clients/get/' + d)['client'] for d in host.DEVICES}
+        original_keys = copy.deepcopy(self.manifest['reality'])
+        archive = self.export_without_systemctl()
+        self.stop()  # the old process is gone before either new-target restoration
+        old_stage = self.root / 'old-source-archive'
+        old_stage.mkdir()
+        with archive.open('rb') as stream:
+            host.safe_unpack(stream, old_stage)
+        # Exercise a source-era archive without the new Host ownership metadata.
+        archived_manifest = old_stage / 'deployment/manifest.json'
+        legacy = host.read_json(archived_manifest)
+        legacy.pop('host_group_id', None)
+        host.atomic(archived_manifest, host.dumps(legacy))
+        old_archive = self.root / 'old-source-native.tar'
+        host.archive_tree(old_stage, old_archive)
+        original_archive_hash = host.digest(old_archive)
+        for mode, endpoint in (('restore', '93.184.216.35'), ('replace', '93.184.216.36')):
+            with self.subTest(mode=mode):
+                stage = self.root / ('different-IP-' + mode)
+                stage.mkdir()
+                with old_archive.open('rb') as stream:
+                    host.safe_unpack(stream, stage)
+                untouched = (stage / 'deployment/manifest.json').read_bytes()
+                recovered = host.verify_backup(stage, self.lock)
+                self.assertEqual((stage / 'deployment/manifest.json').read_bytes(), untouched)
+                self.work = stage / 'deployment'
+                self.manifest = recovered
+                self.manifest['endpoint'] = endpoint
+                host.install_runtime(self.work, self.lock)
+                if mode == 'replace':
+                    self.manifest['reality'] = host.native_keys(self.work)
+                self.start()
+                try:
+                    calls = []
+                    native_call = host.API.call
+                    def watched(session, path, data=None):
+                        if '/hosts/update/' in path or '/clients/update/' in path:
+                            calls.append(path)
+                        return native_call(session, path, data)
+                    with mock.patch.object(host.API, 'call', new=watched):
+                        host.configure_native(self.work, self.manifest, False, rotate=(mode == 'replace'))
+                    with sqlite3.connect(self.work / 'db/x-ui.db') as db:
+                        rows = db.execute('select group_id,inbound_id,address,port from hosts').fetchall()
+                    self.assertEqual(len(rows), 1)
+                    self.assertEqual(rows[0][2], endpoint, 'authoritative native Host must move, not just externalProxy')
+                    self.assertEqual(rows[0][0], original_group['groupId'])
+                    self.assertEqual(rows[0][3], self.manifest['config']['proxy_port'])
+                    self.assertEqual(self.manifest['host_group_id'], original_group['groupId'])
+                    outputs = host.backend_health(self.work, self.manifest)  # strict scope rejection stays active
+                    self.assertNotIn('company.txt', outputs)
+                    for device in ('home', 'phone'):
+                        host.validate_feed_scope(self.manifest, device, outputs[device + '.txt'], 'sub')
+                        servers = re.findall(r'(?m)^\s*server:\s*([^\n]+)$', outputs[device + '.yaml'].decode())
+                        self.assertEqual([s.strip().strip('\"\'') for s in servers], [endpoint])
+                    current_api = host.API(self.manifest)
+                    migrated = current_api.call('/panel/api/hosts/get/' + original_group['groupId'])
+                    self.assertEqual(migrated['hosts'], [endpoint + ':' + str(self.manifest['config']['proxy_port'])])
+                    self.assertEqual({k: v for k, v in migrated.items() if k != 'hosts'},
+                                     {k: v for k, v in original_group.items() if k != 'hosts'})
+                    for device in host.DEVICES:
+                        current = current_api.call('/panel/api/clients/get/' + device)['client']
+                        before = original_records[device]
+                        self.assertEqual(current['uuid'] == before['uuid'], mode == 'restore')
+                        self.assertEqual({k: v for k, v in current.items() if k not in ('uuid', 'updatedAt')},
+                                         {k: v for k, v in before.items() if k not in ('uuid', 'updatedAt')})
+                    self.assertFalse(self.native_accounts()['company']['enable'])
+                    config = json.loads((self.work / 'bin/config.json').read_text())
+                    core_ids = {c['id'] for i in config['inbounds'] if i['protocol'] == 'vless' for c in i['settings']['clients']}
+                    self.assertNotIn(self.native_accounts()['company']['id'], core_ids)
+                    self.assertEqual(self.manifest['reality'] == original_keys, mode == 'restore')
+                    self.assertEqual(sum('/hosts/update/' in c for c in calls), 1)
+                    self.assertEqual(sum('/clients/update/' in c for c in calls), 0 if mode == 'restore' else 3)
+                    host.atomic(self.work / 'manifest.json', host.dumps(self.manifest))
+                    self.assertEqual(host.read_json(self.work / 'manifest.json')['host_group_id'], original_group['groupId'])
+                    self.assertEqual(host.digest(old_archive), original_archive_hash)
+                finally:
+                    self.stop()
+
+    def test_review_foreign_native_hosts_refuse_before_mutation(self):
+        api = host.API(self.manifest)
+        original = api.call('/panel/api/hosts/get/' + api.call('/panel/api/hosts/list')[0]['groupId'])
+        for kind in ('extra-address', 'extra-disabled-hidden-group'):
+            with self.subTest(kind=kind):
+                extra = copy.deepcopy(original)
+                if kind == 'extra-address':
+                    extra['hosts'].append('93.184.216.99:' + str(self.manifest['config']['proxy_port']))
+                    api.call('/panel/api/hosts/update/' + original['groupId'], extra)
+                else:
+                    extra.update(groupId='foreign-hidden-fixture', hosts=['93.184.216.99:' + str(self.manifest['config']['proxy_port'])],
+                                 isDisabled=True, isHidden=True)
+                    api.call('/panel/api/hosts/add', extra)
+                try:
+                    before = api.call('/panel/api/hosts/list')
+                    pid = self.proc.pid
+                    mutations = []
+                    native_call = host.API.call
+                    def watched(session, path, data=None):
+                        if any(part in path for part in ('/hosts/update/', '/clients/update/', '/inbounds/update/')):
+                            mutations.append(path)
+                        return native_call(session, path, data)
+                    with mock.patch.object(host.API, 'call', new=watched):
+                        with self.assertRaisesRegex(host.Error, '[Hh]ost'):
+                            host.configure_native(self.work, self.manifest, False, rotate=True)
+                    self.assertEqual(mutations, [])
+                    self.assertEqual(self.proc.pid, pid)
+                    self.assertEqual(api.call('/panel/api/hosts/list'), before)
+                finally:
+                    if kind == 'extra-address':
+                        api.call('/panel/api/hosts/update/' + original['groupId'], original)
+                    else:
+                        api.call('/panel/api/hosts/del/foreign-hidden-fixture', {})
+
     def test_native_api_scope_core_mihomo_and_no_rotation(self):
         before = copy.deepcopy(self.manifest)
         outputs = host.backend_health(self.work, self.manifest)

@@ -69,6 +69,12 @@ an arbitrary allow-list.
    Dedicated native client endpoints perform rotation from complete fresh Client
    objects plus the native account's HWID limit; no reduced projection is written
    back. Inbound forms cannot overwrite authoritative global clients in v3.10.2.
+   The native Hosts table/API owns exported addresses: validate the single owned
+   group/inbound/old-endpoint membership and update its complete group address
+   only. Preserve other Host fields, then verify DB/API and true native feeds.
+   Fresh creation records group identity; a missing source-era archive identity
+   is derived only from its verified closed OLD-endpoint snapshot. Extra/hidden/
+   disabled duplicates, dangling membership and saved-ID conflicts refuse.
    Controlled restore performs no client updates. Publication metadata is derived
    from and verified against the exact closed SQLite snapshot, preserving a
    revocation even if it interleaves with export. Export rejects source links

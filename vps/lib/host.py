@@ -307,6 +307,36 @@ def initialize_db(folder, manifest):
     settings_write(folder / 'db/x-ui.db', backend_settings(manifest))
 
 
+def owned_host_group(folder, api, manifest):
+    """Attest the single owned native Host group before any endpoint write."""
+    inbounds = api.call('/panel/api/inbounds/list') or []
+    if len(inbounds) != 1 or inbounds[0].get('remark') != 'SELF-main':
+        raise Error('Unexpected native Host inbound membership')
+    inbound = inbounds[0]
+    stream = inbound['streamSettings']
+    stream = json.loads(stream) if isinstance(stream, str) else stream
+    external = stream.get('externalProxy', [])
+    if (len(external) != 1 or inbound['port'] != manifest['config']['proxy_port'] or
+            external[0].get('port') != manifest['config']['proxy_port']):
+        raise Error('Unexpected native Host endpoint membership')
+    old_endpoint = public_ip(external[0]['dest'])
+    group_id = manifest.get('host_group_id')
+    if not group_id:
+        raise Error('Missing native Host ownership identity; verify the closed backup first')
+    # Count all DB rows, including hidden/disabled duplicates that the grouped
+    # API can deduplicate. A changed saved ID is never silently adopted.
+    snapshot_host_group(folder / 'db/x-ui.db', dict(manifest, endpoint=old_endpoint))
+    groups = api.call('/panel/api/hosts/list') or []
+    if len(groups) != 1 or groups[0].get('groupId') != group_id:
+        raise Error('Unexpected native Host group membership')
+    group = api.call('/panel/api/hosts/get/' + group_id)
+    expected = [old_endpoint + ':' + str(manifest['config']['proxy_port'])]
+    if (group.get('groupId') != group_id or group.get('inboundIds') != [inbound['id']] or
+            group.get('hosts') != expected or group.get('port') != manifest['config']['proxy_port']):
+        raise Error('Unexpected native Host group endpoint/inbound membership')
+    return inbound, group
+
+
 def configure_native(folder, manifest, fresh, rotate=False):
     if fresh:
         # admin/admin exists only in the loopback candidate; change via native API,
@@ -316,6 +346,8 @@ def configure_native(folder, manifest, fresh, rotate=False):
         api.call('/panel/api/setting/updateUser', {'oldUsername': 'admin', 'oldPassword': 'admin',
                  'newUsername': manifest['admin_user'], 'newPassword': manifest['admin_password']})
     api = wait_api(manifest)
+    if not fresh:
+        owned_host_group(folder, api, manifest)  # before settings, inbound or client writes
     if fresh:
         template = api.call('/panel/api/setting/getDefaultJsonConfig')
         template = json.loads(template) if isinstance(template, str) else template
@@ -337,17 +369,20 @@ def configure_native(folder, manifest, fresh, rotate=False):
     settings_write(folder / 'db/x-ui.db', dict(backend_settings(manifest), xrayTemplateConfig=json.dumps(template)))
     ctl('start', PANEL)
     api = wait_api(manifest)
-    inbounds = api.call('/panel/api/inbounds/list') or []
     if fresh:
-        if inbounds:
-            raise Error('Fresh database unexpectedly contains inbounds')
+        if api.call('/panel/api/inbounds/list') or api.call('/panel/api/hosts/list'):
+            raise Error('Fresh database unexpectedly contains inbound/Host state')
         api.call('/panel/api/inbounds/add', inbound_for(manifest))
+        groups = api.call('/panel/api/hosts/list') or []
+        if len(groups) != 1:
+            raise Error('Fresh native Host creation has unexpected membership')
+        manifest['host_group_id'] = groups[0]['groupId']
+        owned_host_group(folder, api, manifest)
     else:
-        if len(inbounds) != 1 or inbounds[0].get('remark') != 'SELF-main':
-            raise Error('Refusing unrecognized native inbound state')
+        original, group = owned_host_group(folder, api, manifest)
         # Preserve the full restored inbound and all its policies. The DB is
         # authoritative; wrapper account metadata is never a write-back input.
-        inbound = copy.deepcopy(inbounds[0])
+        inbound = copy.deepcopy(original)
         stream = inbound['streamSettings']
         stream = json.loads(stream) if isinstance(stream, str) else stream
         external = stream.get('externalProxy', [])
@@ -359,7 +394,15 @@ def configure_native(folder, manifest, fresh, rotate=False):
             reality.update(manifest['reality'])
             reality.setdefault('settings', {})['publicKey'] = manifest['reality']['publicKey']
         inbound['streamSettings'] = json.dumps(stream)
+        desired_group = copy.deepcopy(group)
+        desired_group['hosts'] = [manifest['endpoint'] + ':' + str(manifest['config']['proxy_port'])]
+        if desired_group['hosts'] != group['hosts']:
+            # Hosts, not externalProxy, is authoritative for native feeds. Send
+            # the complete object and change the address only, never its policy.
+            api.call('/panel/api/hosts/update/' + group['groupId'], desired_group)
         api.call('/panel/api/inbounds/update/' + str(inbound['id']), inbound)
+        if owned_host_group(folder, api, manifest)[1] != desired_group:
+            raise Error('Native Host update changed unexpected fields')
         if rotate:
             # Each complete fresh native object carries quota/expiry/reset and
             # disabled state. Change only UUID, never reconstruct a Client DTO.
@@ -512,10 +555,8 @@ def backend_health(folder, manifest):
         time.sleep(0.5)
     else:
         raise Error('Native core is not running the pinned version')
-    inbounds = api.call('/panel/api/inbounds/list') or []
-    if len(inbounds) != 1 or inbounds[0].get('remark') != 'SELF-main':
-        raise Error('Unexpected native inbound ownership')
-    settings = inbounds[0]['settings']
+    inbound, _ = owned_host_group(folder, api, manifest)
+    settings = inbound['settings']
     clients = (json.loads(settings) if isinstance(settings, str) else settings)['clients']
     if len(clients) != len(DEVICES) or {c['email'] for c in clients} != set(DEVICES):
         raise Error('Unexpected native account membership; manual ownership review required')
@@ -814,6 +855,27 @@ def snapshot_accounts(database):
             for email, identity, sub_id, enabled, flow in rows}
 
 
+def snapshot_host_group(database, manifest):
+    """Verify Host identity from an owned DB; old metadata upgrades are read-only."""
+    with contextlib.closing(sqlite3.connect('file:' + str(database) + '?mode=ro', uri=True)) as db:
+        inbounds = db.execute('select id,user_id,remark,protocol,port from inbounds').fetchall()
+        admins = db.execute('select id from users where username=?', (manifest['admin_user'],)).fetchall()
+        # No enabled/hidden filter: foreign inactive rows and duplicates count.
+        hosts = db.execute('select group_id,inbound_id,address,port from hosts').fetchall()
+    if (len(inbounds) != 1 or len(admins) != 1 or
+            inbounds[0][1:] != (admins[0][0], 'SELF-main', 'vless', manifest['config']['proxy_port'])):
+        raise Error('Unexpected native Host owned-inbound identity')
+    if len(hosts) != 1:
+        raise Error('Unexpected native Host snapshot membership')
+    group_id, inbound_id, address, port = hosts[0]
+    if (not isinstance(group_id, str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,128}', group_id) or
+            inbound_id != inbounds[0][0] or address != manifest['endpoint'] or port != manifest['config']['proxy_port']):
+        raise Error('Unexpected native Host snapshot endpoint/membership')
+    if 'host_group_id' in manifest and manifest['host_group_id'] != group_id:
+        raise Error('Changed persisted native Host group identity')
+    return group_id
+
+
 def reject_symlinks(root):
     if root.is_symlink():
         raise Error('Symlink in owned export source')
@@ -847,6 +909,7 @@ def export_backup():
             reject_symlinks(stage / 'deployment')
             metadata = db_snapshot(active / 'db/x-ui.db', stage / 'deployment/db/x-ui.db')
             manifest['accounts'] = snapshot_accounts(stage / 'deployment/db/x-ui.db')
+            manifest['host_group_id'] = snapshot_host_group(stage / 'deployment/db/x-ui.db', manifest)
             atomic(stage / 'deployment/manifest.json', dumps(manifest))
             metadata.update(format=FORMAT, encryption='none', panel_version=read_json(active / 'release-lock.json')['panel']['version'])
             atomic(stage / 'database-schema.sql', metadata.pop('schema'))
@@ -887,6 +950,9 @@ def verify_backup(folder, lock):
             raise Error('Corrupt backup database')
     if manifest['accounts'] != snapshot_accounts(active / 'db/x-ui.db'):
         raise Error('Backup metadata disagrees with native snapshot accounts')
+    # This is the only source-era metadata migration: derive from the verified
+    # closed OLD-endpoint snapshot; never alter the archive or adopt a conflict.
+    manifest['host_group_id'] = snapshot_host_group(active / 'db/x-ui.db', manifest)
     return manifest
 
 
