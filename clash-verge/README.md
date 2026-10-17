@@ -1,8 +1,11 @@
 # Clash Verge 本地路由工具
 
 把「哪些流量直连、哪些走代理」放进两个可编辑的 YAML，生成已登记的全局 Script，
-再在 Verge 里重载。更新规则不改订阅、Merge、DNS、TUN、运行 YAML 或 SSH；
-只有单独选择“配置 GitHub SSH”才会修改 SSH 配置。
+再在 Verge 里重载。规则更新只写这个 Script 及其备份，不改订阅、Merge、DNS/TUN
+设置文件、运行 YAML 或 SSH；只有“配置 GitHub SSH”动作会修改 SSH 配置。
+
+Script 重载后会应用规则、并集写入 `tun.route-exclude-address`，还可加入本机私有
+VPS 节点及符合条件的组条目；它不写 `tun.stack`。以下命令均从仓库根目录运行。
 
 ```bash
 ./clash-verge/tun-fix.sh          # 打开菜单；回车 = 更新规则
@@ -22,40 +25,31 @@
 已登记的全局 Script，以及只读的 `profiles.yaml`/订阅文件。输入空行等于选项 1；
 EOF 直接退出且不写任何文件；某个动作失败会打印原因并回到菜单，不会假装成功。
 
-## `tun.stack` 被应用设置接管
+[安装](#安装-clash-verge-rev) · [日常规则](#日常修改路由) · [恢复](#写入范围与恢复) ·
+[`tun.stack` 提示](#tunstack-被应用设置接管) · [自动化与测试](#代码结构与自动化入口)
 
-如果 Verge 提示：
+## 安装 Clash Verge Rev
 
-> 扩展配置或脚本写入了由应用设置接管的字段 tun.stack，这些值已被丢弃
+```bash
+./clash-verge/install.sh
+```
 
-说明扩展执行后得到的栈值与应用设置不同。带此提示的版本在生成末尾恢复应用拥有的值，
-但**不会删除扩展文件中的赋值**。当前 `tun-fix.sh` 生成的 Script 只赋值 `config.rules`，
-不写 `tun.stack`；更新规则不会清理其它 Merge/Script。旧优化器被移除时也没有清空
-已安装的扩展，因此需要定位实际输入，不能凭这条提示认定是本工具或某个旧 Merge。
+安装器在自身目录查找匹配当前 `dpkg` 架构的 `Clash.Verge_*_<架构>.deb`，
+核对包元数据并选择 Debian 版本最高的一份，再用 apt 安装、回查 dpkg。
+更新离线包只需替换同目录的 deb，不必修改脚本；没有匹配架构的包时使用官方安装包。
+随仓包、dpkg 中已安装的包、正在运行的 GUI 版本需分别核实。
 
-在**实际报错的机器**上处理：
+配置文件常见位置：
 
-1. 先核对实际运行的 Verge 版本与它使用的配置目录。打开 **设置 → 系统设置 →
-   虚拟网卡模式旁的齿轮 → TUN 模式堆栈**；保留当前选择，无需为消除提示而保存。
-   如果确实需要更换栈，在这里设置目标值并保存，不把扩展中被丢弃的值自动搬过来。
-   保存的栈属于应用 `config.yaml` 的 `tun.stack`，TUN 开关另由应用设置管理。
-2. 定位并备份确定写入该字段的全局或订阅级扩展。若是 Merge，**只删除 `tun` 下的
-   `stack` 叶**，保留其它 TUN、DNS、规则和注释；不要删除整个 `tun` 块或清空 Merge。
-   若是自定义 Script，只手动修改确认写栈的赋值，不执行或批量重写未知 JS。
-   找不到来源时先核对输入，缺失的 Merge 文件不需要为了消除提示而创建。
-3. 在 Verge 中**重新生成/重载配置**，核对应用栈选择、TUN 开关和运行配置。
-   不改订阅、注册表或运行 YAML；重生成前不能声称核心已加载新配置。
-   后续自定义 Script 若读取被删除的值，需要同时检查其逻辑。重复相同字段的提示可能被
-   抑制，所以第二次没有提示不能单独证明扩展已清理。
+```text
+~/.local/share/io.github.clash-verge-rev.clash-verge-rev/profiles.yaml     # 注册表
+~/.local/share/io.github.clash-verge-rev.clash-verge-rev/profiles/Script.js # 生成的路由
+~/.local/share/io.github.clash-verge-rev.clash-verge-rev/clash-verge.yaml   # Verge 生成，不要手改
+~/.ssh/config
+```
 
-版本边界：官方 v2.5.5–v2.5.7 有这条提示与生成末尾的 TUN 字段接管；仓库内置的
-官方 **2.5.2 没有这条提示，也没有新版的 TUN 接管**。在 2.5.2 删除扩展栈值可能改变
-有效栈，不能照搬上述操作。包版本、运行产物与截图来源需分别核实。
-
-上游依据（固定 v2.5.7 源码）：[提示原文](https://github.com/clash-verge-rev/clash-verge-rev/blob/ea509b82363a40c3c32e951d7ce9d66d66da411f/src/locales/zh/profiles.json#L54)、
-[生成末尾提示与接管](https://github.com/clash-verge-rev/clash-verge-rev/blob/ea509b82363a40c3c32e951d7ce9d66d66da411f/src-tauri/src/enhance/mod.rs#L938-L963)、
-[GUI 保存栈设置](https://github.com/clash-verge-rev/clash-verge-rev/blob/ea509b82363a40c3c32e951d7ce9d66d66da411f/src/components/setting/mods/tun-viewer.tsx#L102-L134)。
-2.5.2 的扩展顺序见[旧版本实现](https://github.com/clash-verge-rev/clash-verge-rev/blob/28f2efc504059b1dc75c793618b775c8e1b2a5f1/src-tauri/src/enhance/mod.rs#L685-L773)。
+Script 的实际目标以注册表为准。订阅、运行 YAML 和含 VPS 节点的 Script/备份可能有
+凭据；排查时只提供必要字段，不提交或分享整份文件。
 
 ## 日常修改路由
 
@@ -105,7 +99,7 @@ VPS数字IPv4/IPv6的DIRECT规则仍最先注入，避免临时check客户端或
 
 只在显式规则 render/apply 时读取私有输出；`vps/setup.sh render/deploy` 不自动写 Script
 或重载 Verge。无外部 file provider，不需要放宽 mihomo SAFE_PATHS。生成的Script和备份
-含凭据，不能提交Git或分享。新增离线回归：`RM_GUARD_CONFIRM=1 python3 clash-verge/tests/vps-integration.py`。
+含凭据，不能提交Git或分享。回归入口统一列在[离线回归检查](#离线回归检查)。
 
 ### 应用声明
 
@@ -209,27 +203,6 @@ profile 绑定了已不存在或不可读的扩展文件时，更新同样会被
 绑定需要在 Verge 里修好或删除后再重试：工具不会跳过、也不会自动改动你的 registry；
 缺失文件本身也可能意味着该订阅的本地覆盖来源不明，所以这里选择停下来而不是猜。
 
-## 写入范围与恢复
-
-一次更新只做这些事：按 `profiles.yaml` 中 `Script` 条目定位目标 → 渲染候选 → 已有目标
-先建立同目录唯一备份 → 原子替换。
-
-- `rules/direct.yaml`、`rules/proxy.yaml` 永不被改写。
-- 生成结果与现有目标逐字节相同时是空操作：不改写、不新建备份、mtime 与权限不变。
-- 目标不存在时直接创建；目标存在但不是本工具生成的文件（首行缺少生成标记）会要求
-  确认，EOF 视为取消。
-- `profiles.yaml` 未登记 Script、登记类型或文件名不安全、目标目录不存在时，报错并且
-  不创建任何孤儿文件。**不需要 Merge 登记**，路由只依赖 Script。
-- 还原：菜单选项 4 只认「已登记 Script 文件名 + `.backup.YYYYMMDD_HHMMSS[.后缀]`」的
-  同目录普通文件，选最新一个，显示备份与目标并确认；先把当前内容另存为新的唯一备份，
-  再原子替换。没有可用备份时不删除当前 Script，只报告没有可恢复版本。
-  恢复不回改两个 YAML 来源——之后再更新会按当前来源重新生成。
-- 不自动重载核心，也不声称已经生效，请在 Verge 中手动重载/重新生成配置。
-
-新备份名形如 `Script.js.backup.20260917_191624.aB3xY9`，时间戳后追加随机后缀并独占创建，
-避免同一秒内的备份互相覆盖。恢复也兼容旧的无后缀、数字后缀备份；这些只是本工具的
-同目录回滚点，不涉及订阅或云端。
-
 ## GitHub SSH（可选的独立动作）
 
 只有菜单选项 2 会碰 `~/.ssh/config`；更新、恢复、应用识别都不会。脚本备份原文件后，
@@ -262,34 +235,85 @@ GitHub SSH 走 `ssh.github.com:443`，`DST-PORT,22` 不会匹配它，所以
 `ssh.github.com` 的域名上下文：不要在 `fake-ip-filter` 里用 `*.github.com` 把它排除，
 原始 SSH 没有 TLS SNI，嗅探无法补回丢失的域名。
 
-## 安装 Clash Verge Rev
+## 写入范围与恢复
 
-仓库内置 Clash Verge Rev 离线安装包，`./install.sh` 会查找匹配当前 `dpkg`
-架构的 `Clash.Verge_*_<架构>.deb`，按包元数据中的 Debian 版本选择最高版本，
-校验后用 apt 安装并回查 dpkg。更新安装包时只替换仓库里的 deb 文件，不需要改脚本；
-没有匹配架构的包时请用官方安装包。
+一次更新只做这些事：按 `profiles.yaml` 中 `Script` 条目定位目标 → 渲染候选 → 已有目标
+先建立同目录唯一备份 → 原子替换。
 
-配置文件常见位置：
+- `rules/direct.yaml`、`rules/proxy.yaml` 永不被改写。
+- 生成结果与现有目标逐字节相同时是空操作：不改写、不新建备份、mtime 与权限不变。
+- 目标不存在时直接创建；目标存在但不是本工具生成的文件（首行缺少生成标记）会要求
+  确认，EOF 视为取消。
+- `profiles.yaml` 未登记 Script、登记类型或文件名不安全、目标目录不存在时，报错并且
+  不创建任何孤儿文件。**不需要 Merge 登记**，路由只依赖 Script。
+- 还原：菜单选项 4 只认「已登记 Script 文件名 + `.backup.YYYYMMDD_HHMMSS[.后缀]`」的
+  同目录普通文件，选最新一个，显示备份与目标并确认；先把当前内容另存为新的唯一备份，
+  再原子替换。没有可用备份时不删除当前 Script，只报告没有可恢复版本。
+  恢复不回改两个 YAML 来源——之后再更新会按当前来源重新生成。
+- 不自动重载核心，也不声称已经生效，请在 Verge 中手动重载/重新生成配置。
 
-```text
-~/.local/share/io.github.clash-verge-rev.clash-verge-rev/profiles.yaml     # 注册表
-~/.local/share/io.github.clash-verge-rev.clash-verge-rev/profiles/Script.js # 生成的路由
-~/.local/share/io.github.clash-verge-rev.clash-verge-rev/clash-verge.yaml   # Verge 生成，不要手改
-~/.ssh/config
-```
+新备份名形如 `Script.js.backup.20260917_191624.aB3xY9`，时间戳后追加随机后缀并独占创建，
+避免同一秒内的备份互相覆盖。恢复也兼容旧的无后缀、数字后缀备份；这些只是本工具的
+同目录回滚点，不涉及订阅或云端。
 
-订阅和运行 YAML 可能包含凭据或节点信息；排查时只给出必要字段。
+## `tun.stack` 被应用设置接管
+
+如果 Verge 提示：
+
+> 扩展配置或脚本写入了由应用设置接管的字段 tun.stack，这些值已被丢弃
+
+说明扩展执行后得到的栈值与应用设置不同。带此提示的版本在生成末尾恢复应用拥有的值，
+但**不会删除扩展文件中的赋值**。当前生成器不写 `tun.stack`，更新规则也不清理其它
+Merge/Script。旧优化器移除时没有清空已安装扩展，不能凭提示认定来源。
+
+在**实际报错的机器**上处理：
+
+1. 先核对实际运行的 Verge 版本与它使用的配置目录。打开 **设置 → 系统设置 →
+   虚拟网卡模式旁的齿轮 → TUN 模式堆栈**；保留当前选择，无需为消除提示而保存。
+   如果确实需要更换栈，在这里设置目标值并保存，不把扩展中被丢弃的值自动搬过来。
+   保存的栈属于应用 `config.yaml` 的 `tun.stack`，TUN 开关另由应用设置管理。
+2. 定位并备份确定写入该字段的全局或订阅级扩展。若是 Merge，**只删除 `tun` 下的
+   `stack` 叶**，保留其它 TUN、DNS、规则和注释；不要删除整个 `tun` 块或清空 Merge。
+   若是自定义 Script，只手动修改确认写栈的赋值，不执行或批量重写未知 JS。
+   找不到来源时先核对输入，缺失的 Merge 文件不需要为了消除提示而创建。
+3. 在 Verge 中**重新生成/重载配置**，核对应用栈选择、TUN 开关和运行配置。
+   不改订阅、注册表或运行 YAML；重生成前不能声称核心已加载新配置。
+   后续自定义 Script 若读取被删除的值，需要同时检查其逻辑。重复相同字段的提示可能被
+   抑制，所以第二次没有提示不能单独证明扩展已清理。
+
+版本边界：已核查的官方 v2.5.5–v2.5.7 有这条提示与生成末尾的 TUN 字段接管；
+历史官方 **2.5.2 两者都没有**。在 2.5.2 删除扩展栈值可能改变有效栈，不能照搬上述操作。
+这段历史边界不代表当前随仓包或实际运行版本。
+
+上游依据（固定 v2.5.7 源码）：[提示原文](https://github.com/clash-verge-rev/clash-verge-rev/blob/ea509b82363a40c3c32e951d7ce9d66d66da411f/src/locales/zh/profiles.json#L54)、
+[生成末尾提示与接管](https://github.com/clash-verge-rev/clash-verge-rev/blob/ea509b82363a40c3c32e951d7ce9d66d66da411f/src-tauri/src/enhance/mod.rs#L938-L963)、
+[GUI 保存栈设置](https://github.com/clash-verge-rev/clash-verge-rev/blob/ea509b82363a40c3c32e951d7ce9d66d66da411f/src/components/setting/mods/tun-viewer.tsx#L102-L134)。
+2.5.2 的扩展顺序见[旧版本实现](https://github.com/clash-verge-rev/clash-verge-rev/blob/28f2efc504059b1dc75c793618b775c8e1b2a5f1/src-tauri/src/enhance/mod.rs#L685-L773)。
 
 ## 代码结构与自动化入口
 
 ```text
-tun-fix.sh          # 菜单与 CLI 分派
-lib/config.sh       # registry 定位、候选渲染、原子写入、备份与恢复
-lib/ssh.sh          # GitHub SSH 配置
-lib/rules.py        # 唯一的 YAML/registry/规则读取器与 Script 渲染器
-lib/discover_apps.py# 只读原生应用发现
-lib/report_apps.py  # 菜单选项 3 的人类可读渲染
-rules/*.yaml        # 日常编辑的路由来源
+clash-verge/
+├── README.md
+├── install.sh                     # 同目录离线包选择与安装
+├── tun-fix.sh                     # 菜单与 CLI 分派
+├── Clash.Verge_*_<架构>.deb        # 随仓离线包，版本随文件更新
+├── lib/
+│   ├── config.sh                  # registry、候选写入、备份与恢复
+│   ├── ssh.sh                     # GitHub SSH 配置
+│   ├── rules.py                   # YAML/registry 读取与 Script 渲染
+│   ├── discover_apps.py           # 只读原生应用发现
+│   ├── report_apps.py             # 应用盘点的人类可读输出
+│   └── requirements.txt           # PyYAML 依赖
+├── rules/
+│   ├── direct.yaml                # 日常编辑的直连来源
+│   └── proxy.yaml                 # 日常编辑的代理来源
+└── tests/
+    ├── install-package-selection.py
+    ├── route-menu.py
+    ├── app-integration.py
+    ├── discover-apps.py
+    └── vps-integration.py
 ```
 
 ```bash
@@ -299,17 +323,25 @@ rules/*.yaml        # 日常编辑的路由来源
 ./clash-verge/tun-fix.sh apps discover   # JSON 形式的只读应用盘点
 ```
 
-`rules check/render` 不读注册表；`rules apply` 在取消时以退出码 2 结束。
+`rules check/render` 不读注册表，但 `render` 会发现 WireGuard 端点、读取可选的本机
+VPS 输出，stdout 可能含凭据，不要提交或分享。`rules apply` 在取消时以退出码 2 结束。
 
 ## 离线回归检查
 
+从仓库根目录执行，需要 Python 3、PyYAML、Bash、Node.js 和 `verge-mihomo`。
+显式设置 `TUN_FIX_WG_ENDPOINTS=off`，防止 render/apply 测试读取主机的 WireGuard
+配置或调用 sudo；其中 `app-integration.py` 并未在每个子进程内自行关闭发现。
+
 ```bash
-python3 clash-verge/tests/install-package-selection.py # 离线安装包架构/版本选择
-python3 clash-verge/tests/route-menu.py       # 菜单、更新、恢复、SSH 隔离与写入边界
-python3 clash-verge/tests/app-integration.py  # 规则语法、registry、应用展开、Script 守卫
-python3 clash-verge/tests/discover-apps.py    # 原生应用发现
+TUN_FIX_WG_ENDPOINTS=off python3 clash-verge/tests/install-package-selection.py # 离线包选择
+TUN_FIX_WG_ENDPOINTS=off python3 clash-verge/tests/route-menu.py       # 菜单、写入/恢复、SSH 边界
+TUN_FIX_WG_ENDPOINTS=off python3 clash-verge/tests/app-integration.py  # 规则、registry、应用展开
+TUN_FIX_WG_ENDPOINTS=off python3 clash-verge/tests/discover-apps.py    # 原生应用发现
+TUN_FIX_WG_ENDPOINTS=off python3 clash-verge/tests/vps-integration.py  # 合成 VPS 节点/组与 Script
 ```
 
-从仓库根目录执行。需要 Python 3、PyYAML、Bash、Node.js 和 `verge-mihomo`。全部用例
-只使用专用临时 HOME 与合成配置：不读真实 HOME、不启动应用、不访问控制器、不建立网络
-连接，`dpkg-query`/`ssh` 被替身取代，`curl`/`openssl`/`ip` 等被守卫。
+本地 rm-guard 若要求确认，再为相应命令加 `RM_GUARD_CONFIRM=1` 前缀，允许清理测试
+临时目录；其他环境无需此变量，它也不是隔离开关。
+
+用例通过临时目录、合成配置和命令替身验证各自边界；部分调用已安装的 Mihomo 做
+`-t` 配置检查。它们不能代替真实 Verge 重载、应用连接或网络路由验收。

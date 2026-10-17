@@ -74,20 +74,20 @@ usage() {
   ./tun-fix.sh --help          显示本帮助
 
 菜单是日常入口：回车等价于选项 1。更新只写已登记的全局 Script 及其同目录备份；
-订阅、Merge、DNS、TUN、运行 YAML 和 ~/.ssh 都不会被这条路径改动。
-生成的 Script 除路由规则外还会并集注入 TUN 排除字段（exclude-uid/route-exclude-address，
-用于 Tailscale 与 TUN 共存，详见 README「TUN 与 Tailscale 共存」）；字段注入在
-Verge 重载后才进入运行配置。
-生成成功后需在 Verge 中手动重载/重新生成配置。
+不改规则来源、订阅、Merge、DNS/TUN 设置文件、运行 YAML 或 ~/.ssh。
+Verge 手动重载/重新生成配置后，Script 应用路由规则，并集写入 tun.route-exclude-address
+（Tailscale/LAN 网段和生成时发现的 WireGuard 端点）；若存在本机私有 VPS 输出，
+还会加入可选 VPS 节点及符合条件的 select 组条目。不写 tun.stack。
+生成 Script、备份和 render 的 stdout 可能含 VPS 凭据，不要提交或分享。
 
 遇到“由应用设置接管的字段 tun.stack，这些值已被丢弃”：
-本工具只写路由规则，不写 tun.stack；更新规则不会清理其它扩展中的 stack。
-在实际报错机器上，打开 设置 → 系统设置 → 虚拟网卡模式旁的齿轮 → TUN 模式堆栈，
-保留当前选择；需要更改时在此设置并保存，不把扩展里被丢弃的值直接搬入设置。
+更新规则不会清理其它扩展中的 stack。在实际报错机器上，打开
+设置 → 系统设置 → 虚拟网卡模式旁的齿轮 → TUN 模式堆栈，保留当前选择；
+需要更改时在此设置并保存，不把扩展里被丢弃的值直接搬入设置。
 确认来源并备份后，只删除该 Merge 的 tun.stack 叶或自定义 Script 的栈赋值，
 保留其它 TUN/DNS/路由内容；不要清空 Merge、改订阅或运行 YAML。之后在 Verge 重新生成配置。
-未定位来源时先核对实际运行版本与扩展，不猜测删除；仓库内置的官方 2.5.2 没有此提示，
-也没有新版的 TUN 字段接管，不能照搬上述删除操作。详见 clash-verge/README.md。
+已核查的官方 v2.5.5–v2.5.7 有此提示与接管；历史官方 2.5.2 两者都没有，不能照搬删除操作。
+随仓包、已安装包与正在运行的版本须分别核实；未定位来源时不要猜测删除。详见 clash-verge/README.md。
 EOF
 }
 
