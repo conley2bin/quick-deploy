@@ -161,8 +161,10 @@ Kitty keyboard protocol 时。无需改 shell hook、Pi keybindings 或 tmux，�
 `Ctrl+Z` 不再发送通常用于 Unix job-control 的 `^Z`。需要挂起普通前台任务
 时改按 **Ctrl+Shift+Z**，返回提示符后用 `fg` 恢复。这个替代键只恢复原来的
 字节：raw-mode 应用仍由自身处理，Pi 若在个人配置中禁用了 `app.suspend`，
-替代键不会重新启用它。tmux prefix 表仍保留自己的 `C-z`，但终端重映射也
-作用于 prefix 后的物理 Ctrl+Z；需要原来的 `suspend-client` 时改用 prefix
+替代键不会重新启用它。如果 Pi 还把 `ctrl+z` 绑定为 undo，Ctrl+Shift+Z
+发送的旧字节也会触发 undo，而不是挂起或 redo。tmux prefix 表仍保留自己的
+`C-z`，但终端重映射也作用于 prefix 后的物理 Ctrl+Z；需要原来的
+`suspend-client` 时改用 prefix
 后 Ctrl+Shift+Z，或在 tmux 命令提示符运行 `suspend-client`。
 
 #### 已安装机器：只增加撤销键
@@ -198,11 +200,23 @@ apt、编译、字体、启动器、desktop、shell/Pi 配置或 GUI 步骤，�
 
 ```bash
 python3 fresh-install/tests/ghostty/test_undo.py
-# 可选：用当前安装的 Pi 类和个人 keybindings 验证，无 API 调用或包修改。
+# 可选：用当前安装的 Pi 类和生产 profile loader 验证，无 API 调用或包修改。
 PI_ENTRY="$(readlink -f "$(command -v pi)")"
 PI_PACKAGE_DIR="$(dirname "$(dirname "$(dirname "$PI_ENTRY")")")"
 node fresh-install/tests/ghostty/verify_pi_undo.mjs "$PI_PACKAGE_DIR" "$HOME/.pi/agent/keybindings.json"
+node fresh-install/tests/ghostty/test_pi_undo_verifier.mjs "$PI_PACKAGE_DIR"
 ```
+
+Pi 验证器通过安装包的 `KeybindingsManager.loadFromFile` 加载个人配置，保留
+旧 action 名迁移及新旧字段优先级；显式传入的文件必须可读。`^_` 必须仍匹配
+undo，并且不匹配任何 `app.*` 动作：这些动作可能在原生 undo 前消费输入。
+这里保守拒绝全部 app 冲突（包括仅在其他对话框使用的动作），不维护可能
+过期的应用 handler 清单。回归包括旧字段禁用/改绑 undo、app.clear 等抢占。
+
+该辅助器只验证安装包的原生 `CustomEditor`；扩展快捷键、fullscreen 外层
+分发、替换 editor 和完整 Pi 会话仍需独立检查。shell PTY 回归也显式选择
+emacs 模式，不能替代目标机器安装的 rc/keymap 验证。没有个人 keybindings
+文件时省略辅助器的最后一个参数，只测试实际默认配置。
 
 ### OSC 52 剪贴板：只写不读
 

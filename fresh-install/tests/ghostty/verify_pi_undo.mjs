@@ -1,6 +1,7 @@
 // Optional installed-Pi contract test, no provider calls or package edits.
 // Usage: node verify_pi_undo.mjs /absolute/path/to/pi-coding-agent [keybindings.json]
 // The ordinary regression suite does not require Pi to be installed.
+// This covers native CustomEditor only, not extensions, fullscreen dispatch or replacement editors.
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import { pathToFileURL } from 'node:url';
@@ -12,7 +13,12 @@ const { CustomEditor } = await import(pathToFileURL(`${root}/dist/modes/interact
 const { setKeybindings, setKittyProtocolActive, matchesKey } = await import(
     pathToFileURL(`${root}/node_modules/@earendil-works/pi-tui/dist/index.js`));
 const profiles = [['defaults', {}]];
-if (process.argv[3]) profiles.push(['profile', JSON.parse(fs.readFileSync(process.argv[3], 'utf8'))]);
+if (process.argv[3]) {
+    // Fail a missing/unreadable supplied path instead of silently checking defaults.
+    fs.accessSync(process.argv[3], fs.constants.R_OK);
+    // Match production profile loading, including legacy action-name migration.
+    profiles.push(['profile', KeybindingsManager.loadFromFile(process.argv[3])]);
+}
 const results = [];
 for (const [profile, config] of profiles) {
     for (const kitty of [false, true]) {
@@ -32,6 +38,12 @@ for (const [profile, config] of profiles) {
         assert.equal(matchesKey('\x1f', 'ctrl+-'), true);
         assert.equal(kb.matches('\x1f', 'tui.editor.undo'), true,
             'This profile no longer retains the common undo key; do not deploy the alias blindly');
+        // App handlers can win before Editor.undo. Reject all matching app actions
+        // conservatively (including dialog-only ones), rather than freezing a copy
+        // of InteractiveMode.setupKeyHandlers that can drift between Pi releases.
+        const appConflicts = Object.keys(kb.getEffectiveConfig()).filter(
+            action => action.startsWith('app.') && kb.matches('\x1f', action));
+        assert.deepEqual(appConflicts, [], `App actions can precede undo: ${appConflicts.join(', ')}`);
         editor.handleInput('\x1f');
         assert.equal(editor.getText(), '');
         for (const ch of 'one two') editor.handleInput(ch);
@@ -48,7 +60,7 @@ for (const [profile, config] of profiles) {
         assert.equal(editor.getText(), 'agai');
         editor.handleInput('\x1f');
         assert.equal(editor.getText(), 'again');
-        results.push({ profile, kitty, undoKeys: kb.getKeys('tui.editor.undo'), states, suspend });
+        results.push({ profile, kitty, undoKeys: kb.getKeys('tui.editor.undo'), appConflicts, states, suspend });
     }
 }
 console.log(JSON.stringify(results, null, 2));
