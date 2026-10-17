@@ -1,0 +1,332 @@
+"""Native release/API evidence in temporary directories, loopback listeners only.
+
+Set QD_VPS_ARTIFACTS to a directory containing the three pinned official assets.
+No SSH, installer, systemctl, DNS/ACME request or live client settings are used.
+"""
+import base64
+import copy
+import json
+import os
+from pathlib import Path
+import shutil
+import signal
+import socket
+import ssl
+import subprocess
+import sys
+import tempfile
+import time
+import unittest
+from unittest import mock
+from urllib.error import HTTPError
+from urllib.request import Request, build_opener, ProxyHandler
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'lib'))
+import host
+import vps
+
+
+def free_port():
+    with socket.socket() as sock:
+        sock.bind(('127.0.0.1', 0))
+        return sock.getsockname()[1]
+
+
+@unittest.skipUnless(os.environ.get('QD_VPS_ARTIFACTS'), 'Native release test requires explicit QD_VPS_ARTIFACTS; unit fixtures are not native evidence')
+class Native(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.temp = tempfile.TemporaryDirectory(prefix='qd-native-')
+        cls.addClassCleanup(cls.temp.cleanup)
+        cls.root = Path(cls.temp.name)
+        cls.base = cls.root / 'base'
+        cls.base.mkdir(mode=0o700)
+        cls.lock = vps.release_lock()
+        artifacts = Path(os.environ['QD_VPS_ARTIFACTS'])
+        (cls.base / 'artifacts').mkdir(mode=0o700)
+        for key in ('panel', 'core', 'front'):
+            shutil.copy2(artifacts / cls.lock[key]['file'], cls.base / 'artifacts' / cls.lock[key]['file'])
+        host.install_runtime(cls.base, cls.lock)
+
+    def setUp(self):
+        self.work = self.root / ('candidate-' + str(time.monotonic_ns()))
+        shutil.copytree(self.base, self.work)
+        self.proc = None
+        self.addCleanup(self.stop)
+        self.addCleanup(mock.patch.stopall)
+        mock.patch.object(host, 'ADMIN_PORT', free_port()).start()
+        mock.patch.object(host, 'SUB_PORT', free_port()).start()
+        self.manifest = host.new_manifest('owner-fixture', {'domain': 'sub.example.org', 'reality_target': 'target.example.org', 'acme_email': 'operator@example.org', 'proxy_port': 443}, '93.184.216.34')
+        self.manifest['config']['proxy_port'] = free_port()
+        self.manifest['reality'] = host.native_keys(self.work)
+        host.initialize_db(self.work, self.manifest)
+        self.log = (self.work / 'native.log').open('wb')
+        self.addCleanup(self.log.close)
+        self.real_inbound = host.inbound_for
+        def loopback_inbound(manifest):
+            inbound = self.real_inbound(manifest)
+            inbound['listen'] = '127.0.0.1'
+            return inbound
+        mock.patch.object(host, 'inbound_for', side_effect=loopback_inbound).start()
+        def ctl(action, unit):
+            self.assertEqual(unit, host.PANEL)
+            if action == 'stop':
+                self.stop()
+            elif action == 'start':
+                self.start()
+            else:
+                raise AssertionError('Unexpected systemctl operation')
+        mock.patch.object(host, 'ctl', side_effect=ctl).start()
+        self.start()
+        host.configure_native(self.work, self.manifest, True)
+
+    def start(self):
+        if self.proc is not None:
+            raise AssertionError('Fixture panel already running')
+        self.proc = subprocess.Popen([str(self.work / 'bin/x-ui'), 'run'], env=host.panel_env(self.work),
+            cwd=self.work, stdout=self.log, stderr=self.log, start_new_session=True)
+
+    def stop(self):
+        if self.proc is not None:
+            os.killpg(self.proc.pid, signal.SIGTERM)
+            try:
+                self.proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                os.killpg(self.proc.pid, signal.SIGKILL)
+                self.proc.wait()
+            self.proc = None
+
+    def test_native_api_scope_core_mihomo_and_no_rotation(self):
+        before = copy.deepcopy(self.manifest)
+        outputs = host.backend_health(self.work, self.manifest)
+        host.backend_health(self.work, self.manifest)
+        self.assertEqual(self.manifest, before)
+        self.assertEqual(len(outputs), 6)
+        for device in host.DEVICES:
+            for ext, fmt in (('.txt', 'sub'), ('.yaml', 'mihomo')):
+                host.validate_feed_scope(self.manifest, device, outputs[device + ext], fmt)
+            for name in ('geoip.dat', 'geosite.dat'):
+                shutil.copy2(self.work / 'bin' / name, self.work / name)
+            path = self.work / (device + '.yaml')
+            path.write_bytes(outputs[device + '.yaml'])
+            binary = shutil.which('verge-mihomo') or shutil.which('mihomo')
+            self.assertIsNotNone(binary)
+            result = subprocess.run([binary, '-t', '-d', str(self.work), '-f', str(path)], capture_output=True, timeout=45)
+            self.assertEqual(result.returncode, 0, result.stdout.decode() + result.stderr.decode())
+        # Wrong administrative credentials must fail, not return an empty list.
+        with self.assertRaises(host.Error):
+            host.API(dict(self.manifest, admin_password='incorrect-fixture'))
+        opener = build_opener(ProxyHandler({}))
+        for suffix in ('/sub/unknown-sub-id', '/mihomo/unknown-sub-id'):
+            try:
+                with opener.open(f'http://127.0.0.1:{host.SUB_PORT}' + suffix) as response:
+                    self.assertEqual(response.read(), b'')
+            except HTTPError as exc:
+                self.assertIn(exc.code, (400, 404))
+        # Native device disable must remove its usable feed without changing
+        # another device's credentials or claiming a revoked path stayed live.
+        api = host.API(self.manifest)
+        inbound = api.call('/panel/api/inbounds/list')[0]
+        native = inbound['settings']
+        native = json.loads(native) if isinstance(native, str) else native
+        account = next(c for c in native['clients'] if c['email'] == 'company')
+        account['enable'] = False
+        api.call('/panel/api/clients/update/company', account)
+        updated = api.call('/panel/api/inbounds/list')[0]['settings']
+        updated = json.loads(updated) if isinstance(updated, str) else updated
+        self.assertFalse(next(c for c in updated['clients'] if c['email'] == 'company')['enable'])
+        api.call('/panel/api/server/restartXrayService', {})
+        for _ in range(60):
+            config = json.loads((self.work / 'bin/config.json').read_text())
+            native_users = [c['id'] for inbound in config['inbounds'] if inbound['protocol'] == 'vless' for c in inbound['settings']['clients']]
+            if self.manifest['accounts']['company']['id'] not in native_users:
+                break
+            time.sleep(0.1)
+        else:
+            self.fail('Disabled native device remained in the core authorization config')
+        # Upstream intentionally can retain the disabled URI. Our public front
+        # removes that path when explicitly re-deployed; no silent reactivation.
+        outputs = host.backend_health(self.work, self.manifest)
+        self.assertFalse(self.manifest['accounts']['company']['enable'])
+        self.assertNotIn('company.txt', outputs)
+        self.assertEqual(len(host.feed_paths(self.manifest)), 4)
+        host.validate_feed_scope(self.manifest, 'home', host.get_feed(self.manifest, 'home', 'sub'), 'sub')
+
+    def test_complete_native_backup_archive_and_schema_restore(self):
+        # Re-home this disposable fixture under the adapter's exact active layout.
+        self.stop()
+        destination = self.root / 'active'
+        self.work.rename(destination)
+        self.work = destination
+        self.start()
+        mock.patch.object(host, 'ROOT', self.root).start()
+        units = self.root / 'fixture-units'
+        units.mkdir()
+        mock.patch.object(host, 'UNITS', units).start()
+        for name, text in host.unit_texts().items():
+            host.atomic(units / name, text)
+        host.atomic(self.root / 'host.py', (vps.MODULE / 'lib/host.py').read_bytes())
+        host.atomic(self.work / 'manifest.json', host.dumps(self.manifest))
+        host.atomic(self.work / 'Caddyfile', host.caddyfile(self.manifest, False))
+        # Certificate content belongs to the separate actual TLS-front test;
+        # here assert that both external files and renewal state survive export.
+        certs = self.work / 'caddy/data/caddy/certificates/fixture'
+        host.atomic(certs / 'sub.example.org.crt', 'fixture external certificate')
+        host.atomic(certs / 'sub.example.org.key', 'fixture external private key')
+        host.atomic(self.work / 'caddy/data/caddy/acme/fixture/account.json', '{"account":"fixture"}')
+        original_run = subprocess.run
+        def no_real_systemctl(argv, **kwargs):
+            if argv[0] == 'systemctl':
+                self.assertEqual(argv, ['systemctl', 'is-active', '--quiet', host.FRONT])
+                return subprocess.CompletedProcess(argv, 3, b'', b'')
+            return original_run(argv, **kwargs)
+        with mock.patch.object(subprocess, 'run', side_effect=no_real_systemctl), mock.patch.object(host, 'ctl') as ctl:
+            archive = host.export_backup()
+        ctl.assert_called_once_with('stop', host.FRONT)
+        offnode = self.root / 'offnode.tar'
+        shutil.copy2(archive, offnode)
+        self.assertEqual(offnode.stat().st_mode & 0o777, 0o600)
+        stage = self.root / 'restore-proof'
+        stage.mkdir()
+        with offnode.open('rb') as stream:
+            names = host.safe_unpack(stream, stage)
+        recovered = host.verify_backup(stage, self.lock)
+        self.assertEqual(recovered['accounts'], self.manifest['accounts'])
+        self.assertEqual(json.loads((stage / 'backup.json').read_text())['encryption'], 'none')
+        for name in host.UNIT_NAMES:
+            self.assertIn('units/' + name, names)
+        for component in ('panel', 'core', 'front'):
+            self.assertIn('deployment/artifacts/' + self.lock[component]['file'], names)
+        self.assertIn('deployment/caddy/data/caddy/acme/fixture/account.json', names)
+        self.assertIn('deployment/db/x-ui.db', names)
+        self.assertFalse(any(name.endswith(('.db-wal', '.db-shm')) for name in names))
+        # Restore from the archive's closed database alone. The live source
+        # process is stopped and no source WAL/SHM is copied into the new tree.
+        self.stop()
+        self.work = stage / 'deployment'
+        host.install_runtime(self.work, self.lock)
+        self.assertEqual(set(host.read_json(self.work / 'binary-hashes.json')),
+                         {'x-ui', 'xray-linux-amd64', 'caddy', 'geoip.dat', 'geosite.dat'})
+        self.manifest = recovered
+        expected_accounts = copy.deepcopy(recovered['accounts'])
+        self.start()
+        restored_outputs = host.backend_health(self.work, self.manifest)
+        self.assertEqual(len(restored_outputs), 6)
+        self.assertEqual(self.manifest['accounts'], expected_accounts)
+        self.stop()
+        (stage / 'deployment/caddy/data/caddy/certificates/fixture/sub.example.org.key').unlink()
+        with self.assertRaisesRegex(host.Error, 'missing external TLS'):
+            host.verify_backup(stage, self.lock)
+
+    def test_native_restore_rotates_proxy_identity_preserves_subids(self):
+        import uuid
+        before = copy.deepcopy(self.manifest)
+        self.stop()
+        schema = host.db_snapshot(self.work / 'db/x-ui.db', self.work / 'snapshot.db')
+        self.assertIn('CREATE TABLE `clients`', schema['schema'])
+        # Controlled restore preserves the exact native database and identities.
+        self.start()
+        host.configure_native(self.work, self.manifest, False)
+        host.backend_health(self.work, self.manifest)
+        self.assertEqual(self.manifest['accounts'], before['accounts'])
+        # Cold replacement rotates using the native CLIENT endpoint, not a stale
+        # inbound form. The old process need not exist for these writes.
+        self.stop()
+        for account in self.manifest['accounts'].values():
+            account['id'] = str(uuid.uuid4())
+        self.manifest['reality'] = host.native_keys(self.work)
+        self.start()
+        host.configure_native(self.work, self.manifest, False)
+        host.backend_health(self.work, self.manifest)
+        for device in host.DEVICES:
+            self.assertNotEqual(self.manifest['accounts'][device]['id'], before['accounts'][device]['id'])
+            self.assertEqual(self.manifest['accounts'][device]['subId'], before['accounts'][device]['subId'])
+        self.assertNotEqual(self.manifest['reality']['publicKey'], before['reality']['publicKey'])
+
+    def test_real_tls_front_scopes_http_and_admin_paths(self):
+        cert, key = self.work / 'fixture.crt', self.work / 'fixture.key'
+        host.run(['openssl', 'req', '-x509', '-newkey', 'ec', '-pkeyopt', 'ec_paramgen_curve:P-256', '-nodes',
+                  '-days', '1', '-subj', '/CN=sub.example.org', '-addext', 'subjectAltName=DNS:sub.example.org',
+                  '-keyout', key, '-out', cert], timeout=15)
+        http, https = free_port(), free_port()
+        text = host.caddyfile(self.manifest, True).replace('http_port 80', f'http_port {http}').replace('https_port 8443', f'https_port {https}')
+        text = text.replace(':8443 {', f':{https} {{\n    bind 127.0.0.1').replace(':80 {', f':{http} {{\n    bind 127.0.0.1')
+        start = text.index('    tls {')
+        end = text.index('    @feed', start)
+        text = text[:start] + f'    tls {cert} {key}\n' + text[end:]
+        config = self.work / 'front.Caddyfile'
+        host.atomic(config, text)
+        front = subprocess.Popen([str(self.work / 'bin/caddy'), 'run', '--config', str(config), '--adapter', 'caddyfile'],
+                                 env=host.front_env(self.work), stdout=self.log, stderr=self.log, start_new_session=True)
+        def stop_front():
+            if front.poll() is None:
+                os.killpg(front.pid, signal.SIGTERM)
+                front.wait(timeout=10)
+        self.addCleanup(stop_front)
+        for _ in range(60):
+            try:
+                with socket.create_connection(('127.0.0.1', https), timeout=0.1):
+                    break
+            except OSError:
+                time.sleep(0.1)
+        else:
+            self.fail('Native TLS front did not start')
+        context = ssl.create_default_context(cafile=str(cert))
+        def get(path, secure=True):
+            with socket.create_connection(('127.0.0.1', https if secure else http), timeout=5) as raw:
+                stream = context.wrap_socket(raw, server_hostname='sub.example.org') if secure else raw
+                stream.sendall(('GET ' + path + ' HTTP/1.1\r\nHost: sub.example.org\r\nConnection: close\r\n\r\n').encode())
+                result = b''
+                while chunk := stream.recv(65536):
+                    result += chunk
+                if secure:
+                    stream.close()
+                return result
+        token_path = '/sub/' + self.manifest['accounts']['phone']['subId']
+        payload = get(token_path)
+        self.assertTrue(payload.startswith(b'HTTP/1.1 200'))
+        self.assertIn(b'Cache-Control: no-store', payload)
+        for path in ('/', '/sub/', '/sub/unknown', self.manifest['admin_path'] + 'panel/api/inbounds/list'):
+            self.assertTrue(get(path).startswith(b'HTTP/1.1 404'), path)
+        plain = get(token_path, secure=False)
+        self.assertTrue(plain.startswith(b'HTTP/1.1 404'))
+        self.assertNotIn(self.manifest['accounts']['phone']['id'].encode(), plain)
+        with self.assertRaises(ssl.SSLCertVerificationError):
+            with socket.create_connection(('127.0.0.1', https), timeout=5) as raw:
+                ssl.create_default_context().wrap_socket(raw, server_hostname='sub.example.org')
+
+    def test_native_caddy_adaptation_and_bad_certificate_fail_closed(self):
+        config = self.work / 'Caddyfile'
+        host.atomic(config, host.caddyfile(self.manifest, True))
+        command = [self.work / 'bin/caddy', 'adapt', '--config', config, '--adapter', 'caddyfile']
+        adapted = json.loads(host.run(command).stdout)
+        servers = adapted['apps']['http']['servers']
+        listen = {addr for server in servers.values() for addr in server['listen']}
+        self.assertEqual(listen, {':80', ':8443'})
+        self.assertNotIn(':443', listen)
+        policy = adapted['apps']['tls']['automation']['policies'][0]
+        self.assertTrue(policy['issuers'][0]['challenges']['tls-alpn']['disabled'])
+        for server in servers.values():
+            if ':80' in server['listen']:
+                self.assertNotIn('reverse_proxy', json.dumps(server))
+        # Exercise real Caddy with explicit invalid cert paths, only high
+        # loopback ports. Startup must fail; never open a plaintext feed.
+        http, https = free_port(), free_port()
+        bad = host.caddyfile(self.manifest, True).replace('http_port 80', f'http_port {http}').replace('https_port 8443', f'https_port {https}')
+        bad = bad.replace(':8443 {', f':{https} {{').replace(':80 {', f':{http} {{')
+        bad = bad.replace('    tls {', '    bind 127.0.0.1\n    tls /missing-cert-fixture /missing-key-fixture\n    # tls {', 1)
+        # Replace the whole automation block rather than generate malformed syntax.
+        start = bad.index('    # tls {')
+        end = bad.index('    @feed', start)
+        bad = bad[:start] + bad[end:]
+        host.atomic(config, bad)
+        result = subprocess.run([str(self.work / 'bin/caddy'), 'run', '--config', str(config), '--adapter', 'caddyfile'],
+                                env=host.front_env(self.work), capture_output=True, timeout=15)
+        self.assertNotEqual(result.returncode, 0)
+        for port in (http, https):
+            with self.assertRaises(OSError):
+                socket.create_connection(('127.0.0.1', port), timeout=0.2)
+
+
+if __name__ == '__main__':
+    unittest.main()

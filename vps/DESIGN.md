@@ -9,9 +9,11 @@ operator gate; a source implementation is not deployed-client acceptance.
 - **3x-ui** owns SQLite schema, admin authentication, device accounts, Xray
   generation, full Mihomo profiles and base64 URI subscriptions. No public
   converter and no local node-format engine.
-- **Xray** serves VLESS/TCP/REALITY/Vision on TCP443. Each of company/home/phone
-  has its own UUID and SubID. A native account operation can revoke one device.
-- **Caddy** serves trusted HTTPS on TCP8443, proxying only six exact feed paths.
+- **Xray** serves VLESS/TCP/REALITY/Vision on TCP443 by default. One validated
+  `config.proxy_port` setting owns inbound, native export, health and backup;
+  optional `--port` still means SSH only. Each of company/home/phone has its own
+  UUID and SubID. A native Clients operation can revoke one device.
+- **Caddy** serves trusted HTTPS on TCP8443, proxying only up to six exact feed paths.
   Panel2053 and subscription2096 bind127.0.0.1. Management is through SSH forwarding.
 - **TCP80** belongs exclusively to HTTP01 validation. All normal HTTP requests
   return404. Automatic redirects and TLS-ALPN challenges are disabled; Caddy
@@ -60,6 +62,8 @@ an arbitrary allow-list.
 5. Replacement needs no old-node contact: restore the off-node native DB,
    account/SubID mapping, certificates and exact releases on a fresh host.
    Default replacement rotates node keys and proxy UUIDs, preserving SubIDs.
+   Dedicated native client endpoints perform rotation; inbound forms cannot
+   overwrite authoritative global client rows in v3.10.2.
    Controlled restore is the explicit exception preserving proxy credentials.
 6. Only existing owned resources may change. Repeating the same desired state
    is health/backup work, not an unnecessary service restart or new identity.

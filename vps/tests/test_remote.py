@@ -1,647 +1,330 @@
-"""Execute remote transaction shell in a rewritten, unprivileged fake VPS root.
+"""Owned fake-host lifecycle: actual file transitions, fake system interfaces.
 
-No service, nft, SSH, install or Tailscale commands can reach the real host.
-These tests cover shell control flow and file restoration, not kernel behavior.
+Only an isolated copy of host.py sees rewritten /etc,/proc,/var paths. Every
+service/kernel/network operation is a hard mock; unknown operations fail.
 """
+import copy
+import hashlib
+import importlib.util
+import io
 import json
 import os
-import re
 from pathlib import Path
+import shutil
 import subprocess
+import sys
+import tarfile
 import tempfile
 import unittest
+from unittest import mock
 
-MODULE = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'lib'))
+import host
+import vps
 
 
-class RemoteTransaction(unittest.TestCase):
+class FakeHost(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory(prefix="qd-vps-remote-test-")
+        self.tmp = tempfile.TemporaryDirectory(prefix='qd-host-')
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
-        self.bin = self.root / "bin"
-        self.bin.mkdir()
-        self.state = self.root / "var/lib/quick-deploy-vps"
-        self.lib = self.root / "usr/local/lib/quick-deploy-vps"
-        self.etc = self.root / "etc"
-        for directory in (self.state / "incoming", self.lib, self.etc / "sing-box", self.etc / "ssh/sshd_config.d",
-                          self.etc / "systemd/system/sing-box.service.d", self.root / "run"):
-            directory.mkdir(parents=True, exist_ok=True)
-        (self.etc / "os-release").write_text('ID=ubuntu\nVERSION_ID=24.04\n')
-        source = (MODULE / "lib/remote.sh").read_text()
-        source = source.replace('[[ $EUID == 0 ]]', '[[ 1 == 1 ]]')
-        # Longest roots first; only this fixture copy is rewritten.
-        for absolute in ("/usr/local/lib/quick-deploy-vps", "/var/lib/quick-deploy-vps", "/etc", "/run/qd-vps-nft"):
-            source = source.replace(absolute, str(self.root) + absolute)
-        self.script = self.lib / "remote.sh"
-        self.script.write_text(source)
-        self.script.chmod(0o700)
-        self.log = self.root / "commands.log"
-        self.env = dict(os.environ, PATH=f"{self.bin}:{os.environ['PATH']}", QD_LOG=str(self.log), SSH_CONNECTION="198.51.100.5 12345 203.0.113.1 22")
-        shell_env = self.root / 'bash-env.sh'
-        shell_env.write_text('command() {\n'
-            ' if [[ "$1" == -v && "${2:-}" == tailscale && "${QD_TS_ABSENT:-yes}" == yes && ! -f "' + str(self.state / 'install-tailscale.sh') + '" ]]; then return 1; fi\n'
-            ' builtin command "$@"\n}\n')
-        self.env['BASH_ENV'] = str(shell_env)
-        self.env['QD_SSH_CONFIG'] = str(self.etc / 'ssh/sshd_config.d/00-quick-deploy-vps.conf')
-        (self.state / "incoming/params.json").write_text(json.dumps({"role": "proxy", "ssh_user": "root", "without_tailscale": False}))
-        self.stub("systemctl", '''printf 'systemctl %s\\n' "$*" >>"$QD_LOG"
-case "$*" in 'show -p User --value sing-box') echo qd-vps-proxy;; 'show -p MainPID --value sing-box') echo 4242;; esac
-if [ "${QD_FAIL_RESTART:-}" = yes ] && [ "$*" = 'restart sing-box' ]; then exit 73; fi
-exit 0
-''')
-        self.stub("nft", '''printf 'nft %s\\n' "$*" >>"$QD_LOG"
-if [[ " $* " == *' list '* ]]; then printf 'table inet qd_vps { meta skuid 998 jump proxy_output; }\\n'; fi
-exit 0
-''')
-        self.stub("sing-box", 'printf "sing-box %s\\n" "$*" >>"$QD_LOG"\nexit 0\n')
-        self.stub("id", 'if [ "${1:-}" = -u ] && [ "${2:-}" = qd-vps-proxy ]; then echo 998; else exec /usr/bin/id "$@"; fi\n')
-        self.stub("ps", 'echo "${QD_PROCESS_UID:-998}"\n')
-        self.stub("readlink", 'echo /usr/bin/sing-box\n')
-        self.stub("ss", 'echo listening\n')
-        self.stub("sleep", 'exit 0\n')
-        self.stub("tailscale", 'if [[ "${1:-}" == debug ]]; then echo \'{"RelayServerPort":null,"RelayServerStaticEndpoints":[]}\'; else echo \'{"BackendState":"Running","Self":{"Tags":["tag:egress"]}}\'; fi\n')
-        self.stub("sshd", '''printf 'sshd %s\\n' "$*" >>"$QD_LOG"
-if [ "${1:-}" = -T ]; then
-printf 'passwordauthentication no\\n'
-if grep -qx 'PermitRootLogin no' "$QD_SSH_CONFIG"; then echo 'permitrootlogin no'; else echo 'permitrootlogin without-password'; fi
-# Force more than one pipe buffer after the matching lines: old grep -q
-# pipelines cause this producer to SIGPIPE under pipefail.
-python3 -c 'print("padding " + "x" * 32768)'
-fi
-exit 0
-''')
-        self.stub("systemd-run", 'printf "systemd-run %s\\n" "$*" >>"$QD_LOG"\nexit 0\n')
-        self.stub("install", '''args=()
-while [ "$#" -gt 0 ]; do
-case "$1" in -o|-g) shift 2;; *) args+=("$1"); shift;; esac
-done
-exec /usr/bin/install "${args[@]}"
-''')
-        for command in ("curl", "apt-get", "useradd", "ssh", "rsync"):
-            self.stub(command, f'echo "UNEXPECTED {command}" >&2\nexit 90\n')
-        checkpoint = self.state / "checkpoint"
-        checkpoint.mkdir()
-        (checkpoint / "config.json").write_text('old configuration\n')
-        (checkpoint / "service.conf").write_text('[Service]\nUser=qd-vps-proxy\n')
-        (checkpoint / "table.nft").write_text('table inet qd_vps { # old table\n}\n')
-        (checkpoint / "persistent.nft").write_text('old persistent table\n')
-        for flag in ("had-table", "was-active", "fw-enabled"):
-            (checkpoint / flag).touch()
-        (self.state / "prepared").write_text(str(checkpoint) + "\n")
-        (self.state / "candidate.nft").write_text('table inet qd_vps { # new\n}\n')
-        (self.state / "candidate-transaction.nft").write_text('delete table inet qd_vps\ntable inet qd_vps {}\n')
-        (self.state / "incoming/config.json").write_text('new configuration\n')
-        (self.etc / "sing-box/config.json").write_text('old configuration\n')
-        (self.etc / "systemd/system/sing-box.service.d/90-quick-deploy-vps.conf").write_text('[Service]\nUser=qd-vps-proxy\n')
+        source = (vps.MODULE / 'lib/host.py').read_text()
+        for prefix in ('/var/lib', '/etc', '/proc', '/run'):
+            source = source.replace(prefix, str(self.root) + prefix)
+        source = source.replace('ROOT.stat().st_uid != 0', 'ROOT.stat().st_uid != os.getuid()')
+        script = self.root / 'host_fixture.py'
+        script.write_text(source)
+        spec = importlib.util.spec_from_file_location('host_fixture', script)
+        self.h = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.h)
+        self.h.UNITS.mkdir(parents=True)
+        (self.root / 'var/lib').mkdir(parents=True)
+        (self.root / 'proc/sys/kernel/random').mkdir(parents=True)
+        (self.root / 'etc/os-release').write_text('ID=ubuntu\nVERSION_ID="24.04"\n')
+        (self.root / 'etc/machine-id').write_text('a' * 32)
+        (self.root / 'proc/sys/kernel/random/boot_id').write_text('fixture-boot-1')
+        self.config = {'domain': 'sub.example.org', 'reality_target': 'target.example.org', 'acme_email': 'operator@example.org', 'proxy_port': 443}
+        self.request = {'owner': 'owner-fixture', 'endpoint': '93.184.216.34', 'config': self.config, 'mode': 'deploy',
+                        'lock': vps.release_lock(), 'adapter_sha256': host.digest(vps.MODULE / 'lib/host.py')}
+        self.events, self.services = [], set()
+        self.listeners = b''
+        self.ruleset = b'{"nftables":[{"metainfo":{}}]}'
+        self.patch(self.h.os, 'geteuid', return_value=0)
+        self.patch(self.h.platform, 'machine', return_value='x86_64')
+        self.patch(self.h.shutil, 'which', side_effect=lambda name: '/fake/' + name)
+        self.patch(self.h.shutil, 'disk_usage', return_value=shutil._ntuple_diskusage(10 * 1024**3, 1, 9 * 1024**3))
+        self.patch(self.h, 'run', side_effect=self.run_command)
+        self.patch(self.h, 'ctl', side_effect=self.ctl)
+        self.patch(self.h, 'check_target')
+        self.patch(self.h, 'verify_artifacts')
+        self.patch(self.h, 'install_runtime', side_effect=self.install)
+        self.patch(self.h, 'initialize_db', side_effect=self.initialize)
+        self.patch(self.h, 'native_keys', return_value={'privateKey': 'x' * 43, 'publicKey': 'y' * 43, 'shortIds': ['0123456789abcdef']})
+        self.patch(self.h, 'front_config', side_effect=lambda folder, manifest, published: self.h.atomic(folder / 'Caddyfile', self.h.caddyfile(manifest, published)))
+        self.patch(self.h, 'configure_native')
+        self.patch(self.h, 'backend_health', return_value={})
+        self.patch(self.h, 'wait_tls')
+        self.patch(self.h, 'tls_probe')
+        self.process_health = self.h.process_health
+        self.patch(self.h, 'process_health')
+        self.env = mock.patch.dict(os.environ, QD_SSH_CONNECTION='198.51.100.1 12345 93.184.216.34 22')
+        self.env.start()
+        self.addCleanup(self.env.stop)
 
-    def stub(self, name, body):
-        path = self.bin / name
-        path.write_text('#!/usr/bin/env bash\nset -euo pipefail\n' + body)
-        path.chmod(0o700)
+    def patch(self, obj, key, **kwargs):
+        p = mock.patch.object(obj, key, **kwargs)
+        result = p.start()
+        self.addCleanup(p.stop)
+        return result
 
-    def action(self, action, **env):
-        return subprocess.run(["bash", str(self.script), action, '', getattr(self, 'role', 'proxy')], env=dict(self.env, **env), capture_output=True, text=True)
+    def run_command(self, argv, **kwargs):
+        if argv == ['nft', '-j', 'list', 'ruleset']:
+            return subprocess.CompletedProcess(argv, 0, self.ruleset)
+        if argv == ['ss', '-H', '-ltnp']:
+            return subprocess.CompletedProcess(argv, 0, self.listeners)
+        raise AssertionError('Unmocked host command: ' + str(argv))
 
-    def test_apply_requires_confirmation_then_commit_persists(self):
-        apply = self.action("apply")
-        self.assertEqual(apply.returncode, 0, apply.stdout + apply.stderr)
-        self.assertTrue((self.state / "pending").exists())
-        self.assertEqual((self.etc / "sing-box/config.json").read_text(), 'new configuration\n')
-        self.assertLess(self.log.read_text().index('systemd-run'), self.log.read_text().index('restart sing-box'))
-        self.assertEqual(self.action("harden").returncode, 0)
-        self.assertEqual(self.action("commit").returncode, 0)
-        self.assertFalse((self.state / "pending").exists())
-        self.assertTrue((self.state / "previous").exists())
-        self.assertIn('stop quick-deploy-vps-revert.timer', self.log.read_text())
+    def ctl(self, *args):
+        self.events.append(args)
+        if args[0] in ('start', 'restart'):
+            self.services.update(args[1:])
+        if args[0] in ('stop', 'disable'):
+            self.services.difference_update(arg for arg in args[1:] if not arg.startswith('-'))
 
-    def test_restart_failure_trap_restores_exact_files_and_clears_pending(self):
-        failed = self.action("apply", QD_FAIL_RESTART="yes")
-        self.assertNotEqual(failed.returncode, 0)
-        self.assertEqual((self.etc / "sing-box/config.json").read_text(), 'old configuration\n')
-        self.assertEqual((self.etc / "quick-deploy-vps.nft").read_text(), 'old persistent table\n')
-        self.assertFalse((self.state / "pending").exists())
-        self.assertIn('Restored pre-deployment', failed.stdout)
-        self.assertEqual((self.etc / "systemd/system/sing-box.service.d/90-quick-deploy-vps.conf").read_text(), '[Service]\nUser=qd-vps-proxy\n')
+    def install(self, folder, lock):
+        (folder / 'bin').mkdir(exist_ok=True)
+        self.h.atomic(folder / 'release-lock.json', host.dumps(lock))
+        self.h.atomic(folder / 'binary-hashes.json', '{}')
 
-    def test_timer_abort_restores_without_confirmation_and_repeat_is_noop(self):
-        self.assertEqual(self.action("apply").returncode, 0)
-        self.assertEqual(self.action("harden").returncode, 0)
-        self.assertEqual(self.action("abort").returncode, 0)
-        self.assertFalse((self.etc / "ssh/sshd_config.d/00-quick-deploy-vps.conf").exists())
-        self.assertEqual((self.etc / "sing-box/config.json").read_text(), 'old configuration\n')
-        repeated = self.action("abort")
-        self.assertNotEqual(repeated.returncode, 0)
-        self.assertIn('Refusing abort: no pending', repeated.stderr)
-        self.assertNotEqual(self.action("commit").returncode, 0)
+    def initialize(self, folder, manifest):
+        import sqlite3
+        (folder / 'db').mkdir()
+        with sqlite3.connect(folder / 'db/x-ui.db') as db:
+            db.execute('create table settings(id integer primary key, key text, value text)')
+            db.execute('create table users(id integer primary key, username text, password text)')
+        self.h.settings_write(folder / 'db/x-ui.db', self.h.backend_settings(manifest))
 
-    def test_rollback_is_repeatable_and_does_not_toggle(self):
-        self.assertEqual(self.action("apply").returncode, 0)
-        self.assertEqual(self.action("commit").returncode, 0)
-        for _ in range(2):
-            result = self.action("rollback")
-            self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual((self.etc / "sing-box/config.json").read_text(), 'old configuration\n')
-            self.assertTrue((self.state / "pending").exists())
-            self.assertEqual(self.action("commit").returncode, 0)
+    def upload(self):
+        with tempfile.TemporaryDirectory(dir=self.root) as tmp:
+            folder = Path(tmp)
+            for component in ('panel', 'core', 'front'):
+                (folder / self.request['lock'][component]['file']).write_bytes(b'artifact fixture')
+            with vps.upload_bundle(self.request, folder=folder) as stream:
+                return self.h.prepare(stream)
 
-    def test_wrong_os_refused_before_commands(self):
-        (self.etc / "os-release").write_text('ID=debian\nVERSION_ID=12\n')
-        result = self.action("prepare")
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn('Only Ubuntu 24.04', result.stderr)
-        self.assertFalse(self.log.exists())
+    def test_process_health_attests_executables_and_loopback_not_just_syntax(self):
+        self.config['proxy_port'] = 4443
+        for name, text in self.h.unit_texts().items():
+            self.h.atomic(self.h.UNITS / name, text)
+        self.h.atomic(self.h.ROOT / 'active/manifest.json', host.dumps({'config': self.config}))
+        lines = []
+        for index, port in enumerate(self.h.required_ports(self.config), 1):
+            unit = self.h.FRONT if port in (80, 8443) else self.h.PANEL
+            binary = 'caddy' if unit == self.h.FRONT else ('xray-linux-amd64' if port in (self.config['proxy_port'], self.h.API_PORT) else 'x-ui')
+            proc = self.root / 'proc' / str(index)
+            proc.mkdir()
+            (proc / 'cgroup').write_text('0::/system.slice/' + unit)
+            (proc / 'exe').symlink_to(self.h.ROOT / 'active/bin' / binary)
+            address = '127.0.0.1' if port in (self.h.ADMIN_PORT, self.h.SUB_PORT, self.h.API_PORT) else '0.0.0.0'
+            lines.append(f'LISTEN 0 100 {address}:{port} 0.0.0.0:* users:(("native",pid={index},fd=1))')
+        self.listeners = ('\n'.join(lines) + '\n').encode()
+        self.process_health()
+        self.listeners = self.listeners.replace(b'127.0.0.1:2053', b'0.0.0.0:2053')
+        with self.assertRaisesRegex(self.h.Error, 'escaped loopback'):
+            self.process_health()
+        self.listeners = ('\n'.join(lines[:-1]) + '\n').encode()
+        with self.assertRaisesRegex(self.h.Error, 'missing'):
+            self.process_health()
 
-    def test_pristine_rollback_then_reboot_cannot_start_public_example(self):
-        checkpoint = self.state / "checkpoint"
-        for path in checkpoint.iterdir():
-            path.unlink()
-        # Simulate persistent unit state and a reboot independently of process
-        # activity. Old restore left this enabled flag behind after commit.
-        self.stub("systemctl", '''printf 'systemctl %s\\n' "$*" >>"$QD_LOG"
-root=$(dirname "$QD_LOG")
-case "$*" in
-'show -p User --value sing-box') echo qd-vps-proxy;;
-'show -p MainPID --value sing-box') echo 4242;;
-'enable sing-box') touch "$root/enabled";;
-'disable --now sing-box') rm -f "$root/enabled" "$root/running";;
-'reboot') if [ -f "$root/enabled" ]; then touch "$root/running"; fi;;
-'restart sing-box'|'start sing-box') touch "$root/running";;
-'is-active --quiet sing-box') test -f "$root/running"; exit $?;;
-'is-enabled --quiet sing-box') test -f "$root/enabled"; exit $?;;
-esac
-exit 0
-''')
-        self.assertEqual(self.action("apply").returncode, 0)
-        self.assertEqual(self.action("commit").returncode, 0)
-        self.assertTrue((self.root / "enabled").exists())
-        result = self.action("rollback")
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.action("transaction-health").returncode, 0)
-        self.assertEqual(self.action("commit").returncode, 0)
-        subprocess.run([str(self.bin / "systemctl"), "reboot"], env=self.env, check=True)
-        self.assertFalse((self.root / "running").exists())
-        self.assertFalse((self.root / "enabled").exists())
-        self.assertFalse((self.etc / "sing-box/config.json").exists())
-        self.assertFalse((self.etc / "systemd/system/sing-box.service.d/90-quick-deploy-vps.conf").exists())
+    def test_preflight_os_wrong_address_machine_and_conflicts_before_ownership(self):
+        self.assertFalse(self.h.preflight(self.request)['owned'])
+        self.assertFalse(self.h.ROOT.exists())
+        for change, match in [({'endpoint': '93.184.216.35'}, 'address'), ({'machine_id': 'b' * 32}, 'identity')]:
+            with self.assertRaisesRegex(self.h.Error, match):
+                self.h.preflight(dict(self.request, **change))
+        (self.root / 'etc/os-release').write_text('ID=debian\nVERSION_ID=12\n')
+        with self.assertRaisesRegex(self.h.Error, 'Ubuntu24.04'):
+            self.h.preflight(self.request)
+        self.assertEqual(self.events, [])
+        self.assertFalse(self.h.ROOT.exists())
 
-    def test_enabled_state_and_fresh_package_cleanup_order(self):
-        source = self.script.read_text()
-        self.assertIn('systemctl is-enabled --quiet sing-box', source)
-        fresh = source.split('apt-get -o DPkg::Lock::Timeout=300 install -y "sing-box=$version"', 1)[1].split('rm -f "$ROOT/mask-owned"', 1)[0]
-        self.assertLess(fresh.index('rm -f "$CONF"'), fresh.index('systemctl unmask'))
-        restore = source.split('restore() {', 1)[1].split('health() {', 1)[0]
-        self.assertLess(restore.index('disable --now sing-box'), restore.index('nft -f'))
-        commit = source.split('commit)\n', 1)[1].split('abort)\n', 1)[0]
-        self.assertGreater(commit.index('systemctl enable sing-box'), commit.index('rm -f'))
+    def test_abort_before_bootstrap_and_partial_unit_recovery(self):
+        request = dict(self.request, machine_id='a' * 32)
+        self.assertTrue(self.h.abort(request)['pristine'])
+        self.assertFalse(self.h.ROOT.exists())
+        with self.assertRaisesRegex(self.h.Error, 'Wrong machine'):
+            self.h.abort(dict(request, machine_id='b' * 32))
+        self.h.ROOT.mkdir(mode=0o700)
+        self.h.atomic(self.h.ROOT / 'owner.json', host.dumps({'format': self.h.FORMAT, 'owner': request['owner'], 'machine_id': request['machine_id']}))
+        self.h.atomic(self.h.ROOT / 'pending.json', host.dumps({'boot_id': 'fixture-boot-1', 'deadline': 0, 'had_active': False}))
+        self.assertFalse(self.h.abort(request)['pending'])
+        self.assertFalse(self.h.preflight(request)['ports'] == [])
+        with self.assertRaisesRegex(self.h.Error, 'actual SSH port'):
+            self.h.preflight(dict(request, config=dict(self.config, proxy_port=22)))
 
-    def test_timer_absence_is_tolerated_and_elapsed_timer_does_not_linger(self):
-        self.stub("systemctl", '''printf 'systemctl %s\\n' "$*" >>"$QD_LOG"
-if [ "$*" = 'stop quick-deploy-vps-revert.timer' ]; then exit 5; fi
-case "$*" in 'show -p User --value sing-box') echo qd-vps-proxy;; 'show -p MainPID --value sing-box') echo 4242;; esac
-exit 0
-''')
-        self.assertEqual(self.action("apply").returncode, 0)
-        self.assertIn('--timer-property=RemainAfterElapse=no', self.log.read_text())
-        self.assertLess(self.log.read_text().index('stop quick-deploy-vps-revert.timer'), self.log.read_text().index('systemd-run'))
-        self.assertEqual(self.action("abort").returncode, 0)
-        (self.state / "prepared").write_text(str(self.state / "checkpoint") + "\n")
-        self.assertEqual(self.action("apply").returncode, 0)
-        self.assertEqual(self.action("commit").returncode, 0)
+    def test_foreign_resources_firewall_and_port_are_never_changed(self):
+        legacy = self.root / 'var/lib/quick-deploy-vps'
+        legacy.mkdir()
+        sentinel = legacy / 'identity'
+        sentinel.write_text('foreign secret')
+        with self.assertRaisesRegex(self.h.Error, 'Legacy/foreign'):
+            self.h.preflight(self.request)
+        self.assertEqual(sentinel.read_text(), 'foreign secret')
+        sentinel.unlink()
+        legacy.rmdir()
+        self.ruleset = b'{"nftables":[{"table":{"name":"foreign"}}]}'
+        with self.assertRaisesRegex(self.h.Error, 'firewall'):
+            self.h.preflight(self.request)
+        self.ruleset = b'{"nftables":[]}'
+        self.listeners = b'LISTEN 0 100 0.0.0.0:443 0.0.0.0:* users:(("foreign",pid=999,fd=1))\n'
+        with self.assertRaisesRegex(self.h.Error, 'already in use'):
+            self.h.preflight(self.request)
+        self.assertFalse(self.h.ROOT.exists())
+        self.assertEqual(self.events, [])
 
-    def test_abort_uses_unbounded_lock_and_rollback_has_undo_timer(self):
-        self.stub("flock", 'printf "flock %s\\n" "$*" >>"$QD_LOG"\nexec /usr/bin/flock "$@"\n')
-        self.assertEqual(self.action("apply").returncode, 0)
-        self.assertEqual(self.action("commit").returncode, 0)
-        self.assertEqual(self.action("rollback").returncode, 0)
-        self.assertEqual((self.state / "pending-kind").read_text().strip(), 'rollback')
-        self.assertEqual((self.etc / "sing-box/config.json").read_text(), 'old configuration\n')
-        self.assertEqual(self.action("abort").returncode, 0)
-        self.assertEqual((self.etc / "sing-box/config.json").read_text(), 'new configuration\n')
-        self.assertIn('flock 8\n', self.log.read_text())
+    def test_fresh_prepare_publish_and_repeat_no_rotate_no_restart(self):
+        self.assertFalse(self.upload()['unchanged'])
+        active = self.h.ROOT / 'active'
+        first = (active / 'manifest.json').read_bytes()
+        before = self.h.read_json(active / 'manifest.json')
+        self.assertNotIn('@feed', (active / 'Caddyfile').read_text())
+        self.assertTrue((self.h.ROOT / 'pending.json').exists())
+        with self.assertRaisesRegex(self.h.Error, 'off-node backup'):
+            self.h.commit(dict(self.request, machine_id='a' * 32, offnode_sha256='bad'))
+        self.h.atomic(self.h.ROOT / 'export-sha256', 'verified-offnode')
+        result = self.h.commit(dict(self.request, machine_id='a' * 32, offnode_sha256='verified-offnode'))
+        self.assertTrue(result['published'])
+        published = (active / 'Caddyfile').read_text()
+        self.assertIn('@feed', published)
+        self.assertNotIn('file_server', published)
+        self.assertNotIn('http://0.0.0.0', published)
+        self.events.clear()
+        current = (active / 'manifest.json').read_bytes()
+        inode = (active / 'manifest.json').stat().st_ino
+        self.assertTrue(self.upload()['unchanged'])
+        self.assertEqual((active / 'manifest.json').read_bytes(), current)
+        self.assertEqual((active / 'manifest.json').stat().st_ino, inode)
+        self.assertEqual(self.h.read_json(active / 'manifest.json')['accounts'], before['accounts'])
+        self.assertEqual(self.events, [])
 
-    def test_harden_consumes_large_effective_config_with_match_context(self):
-        self.assertEqual(self.action("apply").returncode, 0)
-        result = self.action("harden")
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn('PermitRootLogin prohibit-password\n', Path(self.env['QD_SSH_CONFIG']).read_text())
-        self.assertIn('sshd -T -C user=root,host=x,addr=198.51.100.5', self.log.read_text())
-        self.assertIn('systemctl reload ssh', self.log.read_text())
+    def test_bad_cert_cannot_publish_http_and_failure_keeps_ssh_sentinel(self):
+        ssh = self.root / 'etc/ssh/sshd_config'
+        ssh.parent.mkdir()
+        ssh.write_text('foreign SSH unchanged')
+        self.h.wait_tls.side_effect = self.h.Error('no trusted certificate')
+        with self.assertRaisesRegex(self.h.Error, 'no trusted certificate'):
+            self.upload()
+        self.assertNotIn(self.h.PANEL, self.services)
+        self.assertNotIn(self.h.FRONT, self.services)
+        self.assertFalse((self.h.ROOT / 'pending.json').exists())
+        failed = list(self.h.ROOT.glob('failed-*'))
+        self.assertEqual(len(failed), 1)
+        self.assertNotIn('@feed', (failed[0] / 'Caddyfile').read_text())
+        self.assertEqual(ssh.read_text(), 'foreign SSH unchanged')
+        self.assertTrue(all('ssh' not in str(event) and 'nft' not in str(event) for event in self.events))
 
-    def test_nonroot_ssh_user_keeps_root_login_disabled(self):
-        path = self.state / 'incoming/params.json'
-        params = json.loads(path.read_text())
-        params['ssh_user'] = 'ubuntu'
-        path.write_text(json.dumps(params))
-        self.assertEqual(self.action('apply').returncode, 0)
-        result = self.action('harden')
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn('PermitRootLogin no\n', Path(self.env['QD_SSH_CONFIG']).read_text())
-        self.assertIn('user=ubuntu,host=x,addr=', self.log.read_text())
+    def test_persistent_pending_survives_ssh_loss_reboot_and_expiry(self):
+        self.upload()
+        result = self.h.recover()
+        self.assertTrue(result['waiting'])
+        self.h.guard()
+        (self.root / 'proc/sys/kernel/random/boot_id').write_text('fixture-boot-2')
+        with self.assertRaisesRegex(self.h.Error, 'across reboot'):
+            self.h.guard()
+        self.assertFalse(self.h.recover()['pending'])
+        self.assertFalse((self.h.ROOT / 'active').exists())
+        self.assertFalse(self.h.recover()['committed'])
+        self.assertFalse(self.services.intersection({self.h.PANEL, self.h.FRONT}))
+        self.upload()
+        pending = self.h.read_json(self.h.ROOT / 'pending.json')
+        pending['deadline'] = 0
+        self.h.atomic(self.h.ROOT / 'pending.json', host.dumps(pending))
+        self.assertFalse(self.h.recover()['pending'])
 
-    def wrong_relay_prepare_payload(self):
-        self.prepare_tools()
-        self.role = 'relay'
-        (self.etc / 'sing-box/config.json').unlink()
-        (self.etc / 'systemd/system/sing-box.service.d/90-quick-deploy-vps.conf').unlink()
-        (self.state / 'incoming/config.json').unlink()
-        (self.state / 'incoming/params.json').write_text(json.dumps({'role': 'relay', 'host': '93.184.216.34', 'relay_endpoint': '93.184.216.34:40000', 'ssh_user': 'ubuntu', 'without_tailscale': False}))
-        self.stub('getent', 'printf "%s:x:1000:1000::%s:/bin/bash\\n" "${2:-ubuntu}" "$QD_ACCOUNT"\n')
+    def test_owned_marker_and_modified_unit_refuse_takeover(self):
+        self.upload()
+        self.h.recover(force=True)
+        with self.assertRaisesRegex(self.h.Error, 'Foreign owned'):
+            self.h.preflight(dict(self.request, owner='different-owner'))
+        unit = self.h.UNITS / self.h.PANEL
+        unit.write_text('foreign replacement unit')
+        with self.assertRaisesRegex(self.h.Error, 'modified owned unit'):
+            self.h.preflight(self.request)
+        self.assertEqual(unit.read_text(), 'foreign replacement unit')
 
-    def correct_proxy_prepare_payload(self):
-        self.role = 'proxy'
-        (self.state / 'incoming/config.json').write_text('proxy config fixture\n')
-        (self.state / 'incoming/params.json').write_text(json.dumps({'role': 'proxy', 'ssh_user': 'root', 'sing_box_version': '1.14.3', 'target': 'example.net', 'without_tailscale': True}))
+    def test_offnode_backup_replace_and_controlled_restore_preserve_owned_state(self):
+        self.upload()
+        old_root, old_units = self.h.ROOT, self.h.UNITS
+        old_active = old_root / 'active'
+        old = self.h.read_json(old_active / 'manifest.json')
+        old['accounts']['company']['enable'] = False
+        self.h.atomic(old_active / 'manifest.json', host.dumps(old))
+        original = (old_active / 'manifest.json').read_bytes()
+        stage = self.root / 'offnode-export'
+        stage.mkdir()
+        shutil.copytree(old_active, stage / 'deployment')
+        schema = self.h.db_snapshot(old_active / 'db/x-ui.db', stage / 'snapshot.db')
+        (stage / 'snapshot.db').unlink()
+        self.h.atomic(stage / 'database-schema.sql', schema.pop('schema'))
+        schema.update(format=self.h.FORMAT, encryption='none')
+        self.h.atomic(stage / 'backup.json', host.dumps(schema))
+        self.h.atomic(stage / 'host.py', (old_root / 'host.py').read_bytes())
+        cert = stage / 'deployment/caddy/data/caddy/certificates/fixture'
+        self.h.atomic(cert / 'sub.example.org.crt', 'certificate fixture')
+        self.h.atomic(cert / 'sub.example.org.key', 'private key fixture')
+        for name in self.h.UNIT_NAMES:
+            self.h.atomic(stage / 'units' / name, (old_units / name).read_bytes())
+        archive = self.root / 'offnode.tar'
+        self.h.archive_tree(stage, archive)
+        for mode in ('replace', 'restore'):
+            with self.subTest(mode=mode):
+                newroot = self.root / 'var/lib' / ('new-' + mode)
+                newunits = self.root / ('units-' + mode)
+                newunits.mkdir()
+                with mock.patch.object(self.h, 'ROOT', newroot), mock.patch.object(self.h, 'UNITS', newunits), \
+                     mock.patch.dict(os.environ, QD_SSH_CONNECTION='198.51.100.1 12345 93.184.216.35 22'):
+                    request = dict(self.request, endpoint='93.184.216.35', mode=mode)
+                    self.h.native_keys.return_value = {'privateKey': 'z' * 43, 'publicKey': 'w' * 43, 'shortIds': ['fedcba9876543210']}
+                    with vps.upload_bundle(request, backup=archive) as stream:
+                        self.assertFalse(self.h.prepare(stream)['unchanged'])
+                    current = self.h.read_json(newroot / 'active/manifest.json')
+                    self.assertFalse(current['accounts']['company']['enable'])
+                    for device in self.h.DEVICES:
+                        self.assertEqual(current['accounts'][device]['subId'], old['accounts'][device]['subId'])
+                        self.assertEqual(current['accounts'][device]['id'] == old['accounts'][device]['id'], mode == 'restore')
+                    self.assertEqual(current['reality'] == old['reality'], mode == 'restore')
+                    self.assertEqual(current['endpoint'], '93.184.216.35')
+                    self.assertEqual((old_active / 'manifest.json').read_bytes(), original)
 
-    def test_failed_wrong_role_prepare_does_not_claim_fresh_host(self):
-        self.wrong_relay_prepare_payload()
-        result = self.action('prepare', QD_APT_FAIL='yes')
-        self.assertNotEqual(result.returncode, 0)
-        self.assertFalse((self.state / 'role').exists())
-        self.correct_proxy_prepare_payload()
-        result = self.action('prepare')
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertFalse((self.state / 'role').exists())
+    def test_safe_archive_rejects_traversal_symlink_and_duplicates(self):
+        for name, kind in [('../escape', tarfile.REGTYPE), ('/absolute', tarfile.REGTYPE), ('link', tarfile.SYMTYPE)]:
+            stream = io.BytesIO()
+            with tarfile.open(fileobj=stream, mode='w') as archive:
+                item = tarfile.TarInfo(name)
+                item.type, item.size, item.linkname = kind, 0, '/etc/ssh'
+                archive.addfile(item, io.BytesIO())
+            stream.seek(0)
+            with self.assertRaisesRegex(self.h.Error, 'Unsafe'):
+                self.h.safe_unpack(stream, self.root / 'extract')
+        self.assertFalse((self.root / 'escape').exists())
 
-    def test_aborted_wrong_role_prepare_and_legacy_stale_marker_can_be_reused(self):
-        self.wrong_relay_prepare_payload()
-        self.assertEqual(self.action('prepare').returncode, 0)
-        self.assertFalse((self.state / 'role').exists())
-        self.assertEqual(self.action('abort').returncode, 0)
-        # Old54d20f7 could leave this marker after an interrupted prepare.
-        (self.state / 'role').write_text('relay\n')
-        self.correct_proxy_prepare_payload()
-        result = self.action('prepare')
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertFalse((self.state / 'role').exists())
-        self.assertEqual(self.action('apply').returncode, 0)
-        self.assertFalse((self.state / 'role').exists())
-        self.assertEqual(self.action('commit').returncode, 0)
-        self.assertEqual((self.state / 'role').read_text().strip(), 'proxy')
-
-    def test_no_early_exit_pipeline_consumers_under_pipefail(self):
-        for path in MODULE.rglob("*.sh"):
-            self.assertIsNone(re.search(r"\|\s*(?:grep\s+-[^\n]*q|head\b)", path.read_text()), str(path))
-
-    def prepare_tools(self):
-        # Exercise full prepare without apt/network/root account mutations.
-        home = self.root / "account"
-        home.mkdir()
-        (self.etc / "apt/sources.list.d").mkdir(parents=True)
-        self.env["QD_ACCOUNT"] = str(home)
-        self.env["QD_CONF"] = str(self.etc / "sing-box/config.json")
-        (self.state / "incoming/params.json").write_text(json.dumps({"role": "proxy", "ssh_user": "root", "sing_box_version": "1.14.3", "target": "example.net", "without_tailscale": False}))
-        (self.state / "incoming/authorized_keys").write_text('ssh-ed25519 fixture\n')
-        (self.state / "incoming/firewall.template").write_text('table inet qd_vps { meta skuid 999 jump proxy_output; }\n')
-        (self.state / "incoming/remote.sh").write_text(self.script.read_text())
-        self.stub("curl", 'while [ "$#" -gt 0 ]; do if [ "$1" = -o ]; then touch "$2"; exit 0; fi; shift; done\n')
-        self.stub("apt-get", '''printf 'apt-get %s frontend=%s\\n' "$*" "${DEBIAN_FRONTEND:-}" >>"$QD_LOG"
-if [[ "$*" == *sing-box=* ]]; then echo public-example >"$QD_CONF"; fi
-if [[ "${QD_APT_FAIL:-}" == yes ]]; then exit 8; fi
-''')
-        self.stub("apt-mark", 'printf "apt-mark %s\\n" "$*" >>"$QD_LOG"\n')
-        self.stub("dpkg-query", 'printf "%s" "${QD_INSTALLED_VERSION:-1.14.3}"\n')
-        self.stub("getent", 'if [ "${2:-}" = root ]; then printf "root:x:0:0::%s:/bin/bash\\n" "$QD_ACCOUNT"; else echo qd-vps-proxy:x:998:998::/nonexistent:/usr/sbin/nologin; fi\n')
-        self.stub("chown", 'exit 0\n')
-        self.stub("tailscale", '''printf 'tailscale %s\\n' "$*" >>"$QD_LOG"
-if [[ "${QD_PREPARE_SIGNAL:-}" != "" && "${1:-}" == up ]]; then kill -"$QD_PREPARE_SIGNAL" "$PPID"; exit 1; fi
-if [[ "${2:-}" == --help ]]; then
- echo '--advertise-tags --accept-dns --accept-routes --hostname --timeout --auth-key file: --relay-server-port --relay-server-static-endpoints'
-elif [[ "${1:-}" == debug ]]; then
- echo '{"RelayServerPort":null,"RelayServerStaticEndpoints":[]}'
-elif [[ "${1:-}" == status ]]; then
- echo '{"BackendState":"Running","Self":{"Tags":["tag:egress"]}}'
-elif [[ "${1:-}" == ip ]]; then echo 100.70.0.99
-fi
-''')
-        self.stub("openssl", 'printf "TLSv1.3\\nALPN protocol: h2\\n"\n')
-
-    def test_prepare_replaces_stale_marker_and_cleans_auth_on_success_and_signal(self):
-        self.prepare_tools()
-        key = self.state / "incoming/auth-key"
-        key.write_text('secret fixture')
-        result = self.action("prepare")
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn('Replacing stale prepared candidate', result.stdout)
-        self.assertFalse(key.exists())
-        self.assertIn('apt-mark hold sing-box', self.log.read_text())
-        self.assertIn('frontend=noninteractive', self.log.read_text())
-        key.write_text('secret fixture')
-        result = self.action("prepare", QD_PREPARE_SIGNAL="PIPE")
-        self.assertNotEqual(result.returncode, 0)
-        self.assertFalse(key.exists())
-
-    def test_prepare_failure_cleans_owned_mask_and_package_example(self):
-        self.prepare_tools()
-        key = self.state / "incoming/auth-key"
-        key.write_text('secret fixture')
-        (self.state / "mask-owned").touch()
-        result = self.action("prepare", QD_APT_FAIL="yes")
-        self.assertNotEqual(result.returncode, 0)
-        self.assertFalse(key.exists())
-        self.assertFalse((self.state / "mask-owned").exists())
-        self.assertFalse((self.etc / "sing-box/config.json").exists())
-        self.assertIn('unmask --runtime sing-box.service', self.log.read_text())
-
-    def test_prepare_version_mismatch_fails_before_hold_and_removes_auth(self):
-        self.prepare_tools()
-        key = self.state / "incoming/auth-key"
-        key.write_text('secret fixture')
-        result = self.action("prepare", QD_INSTALLED_VERSION="1.99.0")
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn('version mismatch', result.stderr)
-        self.assertNotIn('apt-mark hold', self.log.read_text())
-        self.assertFalse(key.exists())
-
-    def fresh_prepare_tools(self):
-        self.prepare_tools()
-        # Choose the fresh-install branch in this fixture copy even on hosts
-        # that already have sing-box; the package/service tools remain stubs.
-        source = self.script.read_text().replace('if ! command -v sing-box >/dev/null; then', 'if true; then', 1)
-        self.script.write_text(source)
-        (self.state / "incoming/remote.sh").write_text(source)
-        self.stub("systemctl", '''printf 'systemctl %s\\n' "$*" >>"$QD_LOG"
-case "$*" in
-'is-enabled --quiet sing-box'|'is-active --quiet sing-box') exit 1;;
-'unmask --runtime sing-box.service') test ! -e "$QD_CONF";;
-esac
-''')
-        self.stub("apt-get", '''printf 'apt-get %s\\n' "$*" >>"$QD_LOG"
-if [[ "$*" == *sing-box=* ]]; then
- echo public-example >"$QD_CONF"
- if [[ "${QD_APT_PIPE:-}" == yes ]]; then kill -PIPE "$PPID"; exit 1; fi
-fi
-''')
-
-    def test_fresh_package_example_is_removed_while_masked_and_not_snapshotted(self):
-        self.fresh_prepare_tools()
-        result = self.action("prepare")
-        self.assertEqual(result.returncode, 0, result.stderr)
-        checkpoint = Path((self.state / "prepared").read_text().strip())
-        self.assertFalse((checkpoint / "config.json").exists())
-        self.assertFalse((checkpoint / "was-enabled").exists())
-        self.assertFalse((self.state / "mask-owned").exists())
-        log = self.log.read_text()
-        self.assertLess(log.index('mask --runtime sing-box.service'), log.index('apt-get -o DPkg::Lock::Timeout=300 install -y sing-box=1.14.3'))
-        self.assertLess(log.index('disable --now sing-box'), log.index('unmask --runtime sing-box.service'))
-
-    def test_fresh_package_sigpipe_cleans_example_key_and_mask(self):
-        self.fresh_prepare_tools()
-        key = self.state / "incoming/auth-key"
-        key.write_text('secret fixture')
-        result = self.action("prepare", QD_APT_PIPE="yes")
-        self.assertNotEqual(result.returncode, 0)
-        self.assertFalse(key.exists())
-        self.assertFalse((self.etc / "sing-box/config.json").exists())
-        self.assertFalse((self.state / "mask-owned").exists())
-        self.assertIn('unmask --runtime sing-box.service', self.log.read_text())
-
-    def test_without_then_with_tailscale_preserves_running_proxy_idempotently(self):
-        self.prepare_tools()
-        # Force the missing-install branch in the safe fixture: stage1 must
-        # not even download the installer, while stage2 can install/enroll.
-        source = self.script.read_text().replace('if ! command -v tailscale >/dev/null; then\n            curl -fIsS', 'if true; then\n            curl -fIsS', 1)
-        self.script.write_text(source)
-        (self.state / 'incoming/remote.sh').write_text(source)
-        params_path = self.state / "incoming/params.json"
-        params = json.loads(params_path.read_text())
-        params['without_tailscale'] = True
-        params_path.write_text(json.dumps(params))
-        first = self.action("prepare")
-        self.assertEqual(first.returncode, 0, first.stderr)
-        self.assertNotIn('tailscale ', self.log.read_text())
-        self.assertNotIn('tailscaled', self.log.read_text())
-        self.assertFalse((self.state / 'install-tailscale.sh').exists())
-        self.assertEqual(self.action("apply").returncode, 0)
-        health = self.action("health")
-        self.assertEqual(health.returncode, 0, health.stderr)
-        self.assertIn('SKIP Tailscale', health.stdout)
-        self.assertEqual(self.action("tailnet-ip").stdout.strip(), 'skipped')
-        self.assertEqual(self.action("commit").returncode, 0)
-        config = self.etc / "sing-box/config.json"
-        before = config.read_bytes(), config.stat().st_ino, config.stat().st_mtime_ns
-        firewall = (self.etc / "quick-deploy-vps.nft").read_bytes()
-        # Repeat proxy-only, enable overlay, repeat full stage: none may restart
-        # or rewrite the already-correct proxy, or reapply its nft table.
-        for without in (True, False, False):
-            params['without_tailscale'] = without
-            params_path.write_text(json.dumps(params))
-            self.log.write_text('')
-            result = self.action("prepare")
-            self.assertEqual(result.returncode, 0, result.stderr)
-            applied = self.action("apply")
-            self.assertEqual(applied.returncode, 0, applied.stderr)
-            self.assertIn('Proxy unchanged', applied.stdout)
-            checked = self.action("health")
-            self.assertEqual(checked.returncode, 0, checked.stderr)
-            self.assertEqual('SKIP Tailscale' in checked.stdout, without)
-            self.assertEqual(self.action("commit").returncode, 0)
-            self.assertEqual((config.read_bytes(), config.stat().st_ino, config.stat().st_mtime_ns), before)
-            self.assertEqual((self.etc / "quick-deploy-vps.nft").read_bytes(), firewall)
-            log = self.log.read_text()
-            self.assertNotIn('restart sing-box', log)
-            self.assertNotIn('disable --now sing-box', log)
-            self.assertNotIn('nft -f ', log)
-            self.assertIn('apt-get -o DPkg::Lock::Timeout=300 install -y --no-upgrade ca-certificates', log)
-            self.assertEqual('tailscale up ' in log, not without)
-            self.assertEqual('tailscale set --relay-server-port=' in log, not without)
-            self.assertNotIn('tailscale set --relay-server-port=40000', log)
-            self.assertEqual('systemctl enable --now tailscaled' in log, not without)
-            self.assertEqual((self.state / 'install-tailscale.sh').exists(), not without)
-
-    def proxy_existing_tailscale(self):
-        self.prepare_tools()
-        self.env['QD_TS_ABSENT'] = 'no'
-        path = self.state / 'incoming/params.json'
-        params = json.loads(path.read_text())
-        params['without_tailscale'] = True
-        path.write_text(json.dumps(params))
-        prefs = self.root / 'proxy-relay-prefs.json'
-        prefs.write_text(json.dumps({'RelayServerPort': 40000, 'RelayServerStaticEndpoints': ['93.184.216.34:40000']}))
-        argv = self.root / 'proxy-ts-argv.jsonl'
-        self.stub('tailscale', f'''printf 'tailscale %s\\n' "$*" >>"$QD_LOG"
-python3 -c 'import json,sys; print(json.dumps(sys.argv[1:]))' "$@" >>'{argv}'
-if [[ "${{1:-}}" == set ]]; then echo '{{"RelayServerPort":null,"RelayServerStaticEndpoints":[]}}' >'{prefs}';
-elif [[ "${{1:-}}" == debug ]]; then cat '{prefs}'; fi
-''')
-        return prefs, argv
-
-    def test_existing_proxy_only_daemon_clears_relay_and_rollback_never_restores_it(self):
-        prefs, argv_path = self.proxy_existing_tailscale()
-        for action in ('prepare', 'apply', 'commit', 'prepare', 'apply', 'commit'):
-            result = self.action(action)
-            self.assertEqual(result.returncode, 0, action + result.stderr)
-        argv = [json.loads(line) for line in argv_path.read_text().splitlines()]
-        self.assertIn(['set', '--relay-server-port=', '--relay-server-static-endpoints='], argv)
-        self.assertFalse(any(call[0] in ('up', 'down') for call in argv))
-        prefs.write_text('{"RelayServerPort":40000,"RelayServerStaticEndpoints":["93.184.216.34:40000"]}')
-        result = self.action('rollback')
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(json.loads(prefs.read_text())['RelayServerStaticEndpoints'], [])
-        self.assertIsNone(json.loads(prefs.read_text())['RelayServerPort'])
-
-    def test_inactive_existing_proxy_daemon_warns_in_apply_and_health_without_cli_calls(self):
-        _, argv = self.proxy_existing_tailscale()
-        self.stub('systemctl', '''printf 'systemctl %s\\n' "$*" >>"$QD_LOG"
-if [[ "$*" == 'is-active --quiet tailscaled' ]]; then exit 3; fi
-case "$*" in 'show -p User --value sing-box') echo qd-vps-proxy;; 'show -p MainPID --value sing-box') echo 4242;; esac
-''')
-        for action in ('prepare', 'apply', 'commit'):
-            result = self.action(action)
-            self.assertEqual(result.returncode, 0, result.stderr)
-            if action == 'apply': self.assertIn('could not be verified', result.stderr)
-        result = self.action('health')
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn('could not be verified', result.stderr)
-        self.assertIn('SKIP Tailscale', result.stdout)
-        self.assertFalse(argv.exists())
-
-    def test_corrupt_stage_mode_never_silently_skips_or_enables_overlay_checks(self):
-        (self.state / 'active-params.json').write_text('{"without_tailscale":"false"}')
-        result = self.action('health')
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn('must be boolean', result.stderr)
-        self.assertNotIn('SKIP Tailscale', result.stdout)
-        self.assertNotEqual(self.action('tailnet-ip').returncode, 0)
-
-    def test_failed_overlay_health_restores_stage_without_stopping_proxy(self):
-        self.prepare_tools()
-        params_path = self.state / "incoming/params.json"
-        params = json.loads(params_path.read_text())
-        params['without_tailscale'] = True
-        params_path.write_text(json.dumps(params))
-        for action in ('prepare', 'apply', 'commit'):
-            self.assertEqual(self.action(action).returncode, 0)
-        params['without_tailscale'] = False
-        params_path.write_text(json.dumps(params))
-        self.assertEqual(self.action('prepare').returncode, 0)
-        self.log.write_text('')
-        self.stub('tailscale', 'if [[ "${1:-}" == debug ]]; then echo \'{"RelayServerPort":null,"RelayServerStaticEndpoints":[]}\'; else echo \'{"BackendState":"Running","Self":{"Tags":[]}}\'; fi\n')
-        result = self.action('apply')
-        self.assertNotEqual(result.returncode, 0)
-        self.assertTrue(json.loads((self.state / 'active-params.json').read_text())['without_tailscale'])
-        self.assertNotIn('disable --now sing-box', self.log.read_text())
-        self.assertNotIn('restart sing-box', self.log.read_text())
-        self.assertFalse((self.state / 'pending').exists())
-        self.assertIn('SKIP Tailscale', self.action('health').stdout)
-
-    def test_pruning_keeps_last_good_and_recent_checkpoints_only(self):
-        checkpoints = []
-        for number in range(7):
-            path = self.state / f"checkpoint-{number}"
-            path.mkdir()
-            (path / "secret").write_text('fixture secret')
-            os.utime(path, (number, number))
-            checkpoints.append(path)
-        (self.state / "previous").write_text(str(checkpoints[0]) + "\n")
-        foreign = self.state / "unrelated"
-        foreign.mkdir()
-        link = self.state / "checkpoint-link"
-        link.symlink_to(foreign, target_is_directory=True)
-        result = self.action("abort")
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertTrue(checkpoints[0].exists())
-        self.assertTrue(all(path.exists() for path in checkpoints[-3:]))
-        self.assertTrue(all(not path.exists() for path in checkpoints[1:4]))
-        self.assertTrue(foreign.exists())
-        self.assertTrue(link.is_symlink())
-
-    def test_health_rejects_unsubstituted_uid_or_root_proxy_process(self):
-        self.assertEqual(self.action("health").returncode, 0)
-        result = self.action("health", QD_PROCESS_UID="0")
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn('MainPID does not run as proxy UID', result.stderr)
-        self.stub("nft", 'echo "table inet qd_vps { meta skuid 999 jump proxy_output; }"\n')
-        result = self.action("health")
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn('nft proxy UID guard', result.stderr)
-
-    def test_pinned_version_is_required_before_hold(self):
-        source = self.script.read_text()
-        self.assertIn('apt-get -o DPkg::Lock::Timeout=300 install -y "sing-box=$version"', source)
-        self.assertLess(source.index('allow_upgrade == True'), source.index('apt-mark hold sing-box', source.index('prepare)\n')))
-
-    def test_stale_running_binary_forces_restart_even_for_equal_config(self):
-        self.prepare_tools()
-        for action in ('prepare', 'apply', 'commit'):
-            self.assertEqual(self.action(action).returncode, 0)
-        self.assertEqual(self.action('prepare').returncode, 0)
-        marker = self.root / 'readlink-called'
-        self.stub('readlink', f'if [ ! -f "{marker}" ]; then touch "{marker}"; echo "/usr/bin/sing-box (deleted)"; else echo /usr/bin/sing-box; fi\n')
-        self.log.write_text('')
-        result = self.action('apply')
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn('restart sing-box', self.log.read_text())
-        self.assertNotIn('Proxy unchanged', result.stdout)
-
-    def test_upgrade_requires_authorization_and_reholds_exact_version(self):
-        self.prepare_tools()
-        params_path = self.state / 'incoming/params.json'
-        params = json.loads(params_path.read_text())
-        params['allow_upgrade'] = True
-        params_path.write_text(json.dumps(params))
-        marker = self.root / 'version-read'
-        self.stub('dpkg-query', f'if [ ! -f "{marker}" ]; then touch "{marker}"; echo 1.13.12; else echo 1.14.3; fi\n')
-        result = self.action('prepare')
-        self.assertEqual(result.returncode, 0, result.stderr)
-        log = self.log.read_text()
-        self.assertLess(log.index('apt-mark unhold sing-box'), log.index('install -y sing-box=1.14.3'))
-        self.assertLess(log.index('install -y sing-box=1.14.3'), log.index('apt-mark hold sing-box'))
-        self.assertIn('-o Dpkg::Options::=--force-confold install -y sing-box=1.14.3', log)
-
-    def test_official_installer_apt_config_is_inherited_and_cleaned_on_all_exits(self):
-        self.prepare_tools()
-        source = self.script.read_text().replace('if ! command -v tailscale >/dev/null; then\n            curl -fIsS', 'if true; then\n            curl -fIsS', 1)
-        self.script.write_text(source)
-        (self.state / 'incoming/remote.sh').write_text(source)
-        installer = self.root / 'fake-official-installer.sh'
-        record = self.root / 'installer-apt-path'
-        contents = self.root / 'installer-apt-contents'
-        installer.write_text(f'''#!/bin/sh
-set -eu
-test -f "$APT_CONFIG"
-printf '%s' "$APT_CONFIG" >'{record}'
-cat "$APT_CONFIG" >'{contents}'
-if [ "${{QD_INSTALL_FAIL:-}}" = yes ]; then exit 7; fi
-if [ "${{QD_INSTALL_SIGNAL:-}}" != '' ]; then kill -"$QD_INSTALL_SIGNAL" "$PPID"; exit 1; fi
-''')
-        self.env['QD_INSTALL_TEMPLATE'] = str(installer)
-        self.stub('curl', '''while [ "$#" -gt 0 ]; do
- if [ "$1" = -o ]; then
-  if [[ "$2" == */install-tailscale.sh ]]; then cp "$QD_INSTALL_TEMPLATE" "$2"; else touch "$2"; fi
-  exit 0
- fi
- shift
-done
-''')
-        for environment in ({}, {'QD_INSTALL_FAIL': 'yes'}, {'QD_INSTALL_SIGNAL': 'TERM'}, {'QD_INSTALL_SIGNAL': 'PIPE'}):
-            with self.subTest(environment=environment):
-                result = self.action('prepare', **environment)
-                self.assertEqual(result.returncode == 0, not bool(environment), result.stderr)
-                self.assertEqual(contents.read_text(), 'DPkg::Lock::Timeout "300";\n')
-                self.assertFalse(Path(record.read_text()).exists())
-                self.assertFalse(list(self.state.glob('installer-apt.*.conf')))
-
-    def test_dependency_bootstrap_and_lock_timeout_precede_python(self):
-        source = self.script.read_text().split('prepare)\n', 1)[1]
-        self.assertLess(source.index('install -y --no-upgrade'), source.index('prune_checkpoints'))
-        self.assertTrue(all('DPkg::Lock::Timeout=300' in line for line in source.splitlines() if 'apt-get ' in line))
-
-    def test_rollback_waits_for_listeners_to_become_ready(self):
-        self.assertEqual(self.action('apply').returncode, 0)
-        self.assertEqual(self.action('commit').returncode, 0)
-        marker = self.root / 'ss-read'
-        self.stub('ss', f'if [ ! -f "{marker}" ]; then touch "{marker}"; else echo listening; fi\n')
-        result = self.action('rollback')
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertTrue(marker.exists())
-
-    def test_health_tag_failure_is_explicit(self):
-        self.stub("tailscale", 'if [[ "${1:-}" == debug ]]; then echo \'{"RelayServerPort":null,"RelayServerStaticEndpoints":[]}\'; else echo \'{"BackendState":"Running","Self":{"Tags":[]}}\'; fi\n')
-        result = self.action("health")
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn('tag:egress not approved', result.stderr)
+    def test_native_sqlite_snapshot_integrity_schema_and_plaintext_truth(self):
+        self.upload()
+        active = self.h.ROOT / 'active'
+        schema = self.h.db_snapshot(active / 'db/x-ui.db', self.root / 'snapshot.db')
+        self.assertIn('CREATE TABLE settings', schema['schema'])
+        self.assertEqual(schema['schema_sha256'], hashlib.sha256(schema['schema'].encode()).hexdigest())
+        with tempfile.TemporaryDirectory(dir=self.root) as temp:
+            stage = Path(temp)
+            (stage / 'backup.json').write_text('{"encryption":"none"}')
+            (stage / 'secret').write_text('unencrypted fixture')
+            path = self.root / 'backup.tar'
+            self.h.archive_tree(stage, path)
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+            with tarfile.open(path) as archive:
+                self.assertEqual(archive.extractfile('secret').read(), b'unencrypted fixture')
+                self.assertEqual(json.load(archive.extractfile('backup.json'))['encryption'], 'none')
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     unittest.main()
