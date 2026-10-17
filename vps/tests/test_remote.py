@@ -240,6 +240,49 @@ class FakeHost(unittest.TestCase):
         self.assertEqual(self.h.read_json(active / 'manifest.json')['accounts'], before['accounts'])
         self.assertEqual(self.events, [])
 
+    def test_commit_waits_for_restarted_listener_and_rechecks_lease(self):
+        import types
+        for outcome in ('ready', 'expired', 'foreign', 'certificate'):
+            with self.subTest(outcome=outcome):
+                f = FakeHost()
+                f.setUp()
+                try:
+                    f.upload()
+                    pending = f.h.ROOT / 'pending.json'
+                    f.h.atomic(f.h.ROOT / 'export-sha256', 'receipt')
+                    # Run the real helper with this isolated host's globals.
+                    wait = types.FunctionType(host.wait_tls.__code__, f.h.__dict__)
+                    wait.__defaults__ = host.wait_tls.__defaults__
+                    f.h.wait_tls.side_effect = wait
+                    calls = []
+                    def probe(manifest):
+                        calls.append('probe')
+                        if len(calls) == 2:
+                            if outcome == 'certificate':
+                                raise f.h.ssl.SSLCertVerificationError('invalid certificate')
+                            raise ConnectionRefusedError('listener starting')
+                    f.h.tls_probe.side_effect = probe
+                    def sleep(seconds):
+                        if outcome == 'expired':
+                            journal = f.h.read_json(pending)
+                            journal['deadline'] = 0
+                            f.h.atomic(pending, f.h.dumps(journal))
+                    with mock.patch.object(f.h.time, 'sleep', side_effect=sleep):
+                        if outcome == 'foreign':
+                            f.h.process_health.side_effect = [None, f.h.Error('Foreign listener')]
+                        request = dict(f.request, machine_id='a' * 32, offnode_sha256='receipt')
+                        if outcome == 'ready':
+                            self.assertTrue(f.h.commit(request)['published'])
+                            self.assertEqual(len(calls), 3)
+                            self.assertFalse(pending.exists())
+                        else:
+                            with self.assertRaises((f.h.Error, f.h.ssl.SSLCertVerificationError)):
+                                f.h.commit(request)
+                            self.assertTrue(pending.exists())
+                            self.assertFalse(f.h.read_json(f.h.ROOT / 'active/manifest.json')['published'])
+                finally:
+                    f.doCleanups()
+
     def test_bad_cert_cannot_publish_http_and_failure_keeps_ssh_sentinel(self):
         ssh = self.root / 'etc/ssh/sshd_config'
         ssh.parent.mkdir()

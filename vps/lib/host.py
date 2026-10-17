@@ -594,12 +594,16 @@ def tls_probe(manifest):
                 raise Error('Unexpected TLS front root response')
 
 
-def wait_tls(manifest):
+def wait_tls(manifest, pending=False):
     for _ in range(120):
+        if pending:
+            check_lease()
         try:
             tls_probe(manifest)
             return
-        except (OSError, ssl.SSLError, Error):
+        except ssl.SSLCertVerificationError:
+            raise  # An invalid certificate is not a listener-readiness race.
+        except (OSError, ssl.SSLError):
             time.sleep(2)
     raise Error('No publicly trusted HTTPS certificate; feeds remain unpublished; check grey DNS/HTTP01:80')
 
@@ -1106,7 +1110,9 @@ def commit(request):
     front_config(active, manifest, True)
     check_lease()  # validation may have taken time; do not start an expired front
     ctl('restart', FRONT)
-    tls_probe(manifest)
+    wait_tls(manifest, pending=True)
+    process_health()
+    check_lease()  # readiness/ownership checks must not outlive the lease
     manifest['published'] = True
     atomic(active / 'manifest.json', dumps(manifest))
     ctl('enable', PANEL, FRONT)
