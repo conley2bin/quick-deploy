@@ -1,9 +1,10 @@
 # Ubuntu 新机初始化
 
-`fresh-install/` 是 Ubuntu 24.04+、amd64（x86）主机的一键初始化套件。根目录只保留编排入口、共享实现和导航文档；可独立运行的安装单元集中在 `modules/`。个别模块支持更多架构，例如 Ghostty 模块同时支持 amd64 与 arm64；支持范围以模块自身文档为准。
+`fresh-install/` 是 Ubuntu 24.04+、amd64（x86）主机的一键初始化套件。`setup.sh` 编排安装，`modules/` 中的模块也可独立运行；`lib/` 放共享实现，`docs/` 放未接入安装的语音方案。个别模块支持更多架构，例如 Ghostty 同时支持 amd64 与 arm64；以模块自身文档为准。
 
 ```text
 fresh-install/
+├── README.md
 ├── setup.sh                 # 一键入口：按固定顺序执行模块
 ├── lib/                     # 仅供脚本 source 的共享实现，不单独执行
 │   └── apt-lock-wait.sh
@@ -14,6 +15,10 @@ fresh-install/
 │   ├── chinese-input-method/
 │   ├── ghostty/
 │   └── tmux/
+├── docs/                    # 语音软件说明与待实施方案
+│   ├── voice-input-software.md
+│   └── voice-input-plan.md
+└── tests/ghostty/            # Ghostty 的外置回归测试
 ```
 
 ## 一键安装
@@ -43,14 +48,12 @@ bash fresh-install/setup.sh
 | 顺序 / 主机 | 另需完成 |
 | --- | --- |
 | 1. 公司机与 Y9000p（适用 Ubuntu 24.04+/amd64 时） | 分别运行 `bash fresh-install/setup.sh`；检查提示后继续的步骤是否实际成功。 |
-| 2. 两机互联 | 如走 Tailnet，分别运行 `bash tailscale/install.sh` 并完成入网；依照 [Tailscale 说明](../tailscale/README.md)验证双向连通。确保两端 SSH 服务可用，配置双向授权密钥和已核验指纹的 `known_hosts`：公司机上的 `conley-Y9000p`、Y9000p 上的 `conley-company` 均须非交互可用。 |
-| 3. 每个运行 Pi 的主机（双向使用时两机都做） | 单独安装 Node.js ≥22.19、npm 和 Pi（例如 `npm install -g --ignore-scripts @earendil-works/pi-coding-agent@latest`），用 `pi --version` 核验。先更新已审阅的服务器扩展源码，再运行 `bash pi-agent/install.sh` 安装扩展并保存全局 fullscreen 默认值；见 [Pi 安装说明](../pi-agent/README.md)。 |
-| 4. 每个点击来源桌面（公司机与 Y9000p） | 使用匹配且已审阅的仓库 checkout，分别运行 `bash pi-agent/extensions/pi-copy-links/client/install.sh`；同一 checkout 的旧路径链接自动迁移，独立版本/外来软链接须显式加 `--replace`。各桌面准备受支持的默认浏览器、VS Code Remote-SSH 对另一服务器的连接和可用的桌面会话环境，见 [助手安装、checksum 与隔离测试](../pi-agent/extensions/pi-copy-links/client/README.md#install-on-each-desktop-and-check-versions)。 |
-| 5. 启用与验收 | 核对各 Pi 的已安装扩展源码/软链接，以及两台桌面已安装助手与已审阅源码的 SHA-256/软链接目标。匹配后由用户在对应 Pi **空闲时**执行 `/reload` 或重启；新会话默认 fullscreen，已有会话确认 `/settings` → `fullscreen`。两个方向都以 Ctrl+鼠标左键点击另一服务器的路径，并确认 Code 的 SSH 主机和文件内容；见 [链接操作说明](../pi-agent/extensions/pi-copy-links/README.md)。 |
+| 2. 两机互联 | 如走 Tailnet，分别运行 `bash tailscale/install.sh` 并按 [Tailscale 说明](../tailscale/README.md)完成入网；准备双向非交互 SSH，连接要求见[两机说明](../pi-agent/README.md#客户端链接公司机--y9000p)。 |
+| 3. 每个运行 Pi 的主机（双向使用时两机都做） | 按 [Pi 安装说明](../pi-agent/README.md#一键安装)准备 Node.js、npm 和 Pi，用 `pi --version` 核验；在已更新、已审阅的 checkout 执行 `bash pi-agent/install.sh`，安装扩展并保存全局 fullscreen 默认值。 |
+| 4. 每个点击来源桌面（公司机与 Y9000p） | 在匹配且已审阅的 checkout 单独运行 `bash pi-agent/extensions/pi-copy-links/client/install.sh`；Pi 主入口不会执行这个嵌套安装器。桌面环境、替换条件与逐台校验见[助手安装说明](../pi-agent/extensions/pi-copy-links/client/README.md#install-on-each-desktop-and-check-versions)。 |
+| 5. 启用与验收 | 核对各 Pi 扩展和两台桌面助手的源码、软链接与 SHA-256；匹配后由用户在对应 Pi **空闲时** `/reload` 或重启。新会话默认 fullscreen，已有会话确认 `/settings` → `fullscreen`。两个方向都用 Ctrl+鼠标左键点击另一服务器的路径，核对 Code 的 SSH 主机与内容；见[操作说明](../pi-agent/extensions/pi-copy-links/README.md#使用在点击来源的桌面打开)。 |
 
-角色由实际 OS hostname（大小写归一）固定选择：Y9000p 桌面→公司 Pi 的文件使用 `ssh-remote+conley-company`；公司桌面→Y9000p Pi 的文件使用 `ssh-remote+conley-Y9000p`。服务器侧 `stat` 决定文件/目录，桌面同名路径不能改变目标。未知机器明确拒绝配对 SSH，继承环境和请求不能指定主机。
-
-两端还应分别用 `ssh -T -o BatchMode=yes -o StrictHostKeyChecking=yes -o ClearAllForwardings=yes <对端别名> true` 验证免交互认证；别名须解析为正确的字面 IP、`conley` 用户和端口。助手安装器只链接**执行它的当前 checkout**，不会取代码、远程安装或运行助手，也不会升级旧 checkout；只装助手不会更新 Pi 服务器的旧 renderer/自动路径识别。外来软链接默认拒绝，只有有意指定 `--replace` 才重指向，普通文件/目录即使带此参数也拒绝。主入口在两机上的浅层扩展扫描均不执行嵌套的 `client/install.sh`，它必须在每个桌面单独运行。其他机器、用户或 SSH 别名需要有意适配两端配对，不会靠单次基础安装自动生效。安装器不重载或注入运行中的用户会话。链接功能无需可选的[远端剪贴板桥](../pi-agent/extensions/pi-remote-clipboard/README.md)；它有自己的 provider 和 SSH 转发。
+主机角色、SSH 别名、Code Remote-SSH 和连接验证以 [Pi 两机说明](../pi-agent/README.md#客户端链接公司机--y9000p)为准。链接功能不依赖可选的[远端剪贴板桥](../pi-agent/extensions/pi-remote-clipboard/README.md)。
 
 ## 单独运行模块
 
@@ -64,7 +67,7 @@ bash fresh-install/modules/ghostty/install.sh
 bash fresh-install/modules/tmux/install.sh
 ```
 
-各模块自行定位仓库共享库，不依赖从哪个工作目录启动。Ghostty 模块只保留 `modules/ghostty/install.sh` 一个 shell 源文件；zsh 运行时 hook 从它生成，Wayland C 源码与它一起打包，测试放在 `fresh-install/tests/ghostty/`。Ghostty 的库编译、启动器和桌面集成都由该安装入口一次完成。Ghostty 和 tmux 的参数、持久配置及恢复语义见各自目录中的 `README.md`。
+各模块自行定位仓库共享库，不依赖启动目录。Ghostty 模块按约定只保留 `install.sh` 一个 shell 源文件：它生成 zsh hook，并与相邻 Wayland C 源码一起交付；测试因此放在模块外的 `tests/ghostty/`。其他模块的测试仍随模块放置。参数、持久配置与恢复说明见 [Ghostty](modules/ghostty/README.md) 和 [tmux](modules/tmux/README.md)。
 
 ## 语音输入（现成软件与备选集成）
 
@@ -77,3 +80,13 @@ bash fresh-install/modules/tmux/install.sh
 ## 共享实现
 
 `lib/apt-lock-wait.sh` 被一键入口和所有执行 APT 操作的模块共同加载。它只等待真实持锁进程结束，不删除锁文件、不终止系统更新。保留模块自己的加载逻辑，是为了让模块脱离 `setup.sh` 单独运行时仍具备相同的首开机可靠性。
+
+## 回归测试入口
+
+从仓库根目录执行；Ghostty 和 tmux 的测试条件见各自模块说明。
+
+```bash
+bash fresh-install/modules/chinese-input-method/tests/run.sh
+bash fresh-install/modules/tmux/tests/run.sh
+env -u LD_PRELOAD bash fresh-install/tests/ghostty/run.sh
+```
