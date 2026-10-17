@@ -1,0 +1,23 @@
+{
+  "platform": "ubuntu-24.04-amd64",
+  "verified": "2026-10-18",
+  "trust": "Official GitHub HTTPS release API asset SHA256 digests, cross-checked against release checksums and downloaded bytes. Not a claim of reproducible builds or independent signing for 3x-ui/Xray.",
+  "panel": {
+    "version": "3.10.2",
+    "file": "x-ui-linux-amd64.tar.gz",
+    "url": "https://github.com/MHSanaei/3x-ui/releases/download/v3.10.2/x-ui-linux-amd64.tar.gz",
+    "sha256": "bfda7921984e7a72555c38d4e861c7a8b67b3686b658608937de99682f1452d0"
+  },
+  "core": {
+    "version": "26.10.10",
+    "file": "Xray-linux-64.zip",
+    "url": "https://github.com/XTLS/Xray-core/releases/download/v26.10.10/Xray-linux-64.zip",
+    "sha256": "72a5fde819713a103c6fc26a87aa025c1518c918a34eba4bc38d64dc0728e5d9"
+  },
+  "front": {
+    "version": "2.11.7",
+    "file": "caddy_2.11.7_linux_amd64.tar.gz",
+    "url": "https://github.com/caddyserver/caddy/releases/download/v2.11.7/caddy_2.11.7_linux_amd64.tar.gz",
+    "sha256": "727b91701a392de6ebc5027509f548bf39979e5216340d0faed8fa5e69c84f8b"
+  }
+}
