@@ -477,13 +477,15 @@ def validate_feed_scope(manifest, device, data, fmt):
                 raise ValueError()
             parsed = urlsplit(links[0])
             query = parse_qs(parsed.query)
-            assert parsed.scheme == 'vless' and parsed.username == current['id']
-            assert parsed.hostname == manifest['endpoint'] and parsed.port == manifest['config']['proxy_port']
-            assert query['security'] == ['reality'] and query['flow'] == ['xtls-rprx-vision']
-            assert query['pbk'] == [manifest['reality']['publicKey']]
-            assert query['sid'] == [manifest['reality']['shortIds'][0]]
-            assert query['sni'] == [manifest['config']['reality_target']]
-        except (ValueError, KeyError, AssertionError, UnicodeError) as exc:
+            valid = (parsed.scheme == 'vless' and parsed.username == current['id'] and
+                     parsed.hostname == manifest['endpoint'] and parsed.port == manifest['config']['proxy_port'] and
+                     query.get('security') == ['reality'] and query.get('flow') == ['xtls-rprx-vision'] and
+                     query.get('pbk') == [manifest['reality']['publicKey']] and
+                     query.get('sid') == [manifest['reality']['shortIds'][0]] and
+                     query.get('sni') == [manifest['config']['reality_target']])
+            if not valid:
+                raise ValueError('URI identity mismatch')
+        except (ValueError, KeyError, UnicodeError) as exc:
             raise Error('Native URI subscription does not match device/node identity') from exc
     else:
         text = data.decode()
@@ -554,6 +556,8 @@ def wait_tls(manifest):
 
 
 def ctl(*args):
+    if args[0] in ('start', 'restart', 'stop', 'enable', 'disable'):
+        check_units(require_all=False)
     return run(['systemctl', *args], timeout=60)
 
 
@@ -570,12 +574,34 @@ def unit_texts():
 
 
 def check_units(require_all=True):
+    paths = run(['systemd-analyze', 'unit-paths'], timeout=15).stdout.decode().splitlines()
+    if not paths or any(not Path(path).is_absolute() for path in paths):
+        raise Error('Cannot attest systemd unit load paths')
     for name, contents in unit_texts().items():
         path = UNITS / name
         if path.is_symlink() or (path.exists() and (not path.is_file() or path.read_text() != contents)):
             raise Error('Foreign or modified owned unit; manual review required')
         if require_all and not path.is_file():
             raise Error('Missing owned service unit')
+        stem, kind = name.rsplit('.', 1)
+        dropins = [name + '.d', kind + '.d']
+        dropins += [stem[:index + 1] + '.' + kind + '.d' for index, char in enumerate(stem) if char == '-']
+        for directory in map(Path, paths):
+            candidate = directory / name
+            if directory.resolve() != UNITS.resolve() and (candidate.exists() or candidate.is_symlink()):
+                raise Error('Foreign unit in systemd load path')
+            if any((directory / dropin).exists() or (directory / dropin).is_symlink() for dropin in dropins):
+                raise Error('Foreign systemd drop-in configuration; no takeover')
+        output = run(['systemctl', 'show', name,
+            '--property=LoadState,FragmentPath,DropInPaths,SourcePath,NeedDaemonReload,Transient', '--no-pager'], timeout=15).stdout.decode()
+        props = dict(line.split('=', 1) for line in output.splitlines() if '=' in line)
+        if props.get('DropInPaths') or props.get('SourcePath') or props.get('Transient') == 'yes':
+            raise Error('Foreign effective/runtime systemd configuration')
+        if props.get('LoadState') == 'not-found' and not path.exists() and not require_all:
+            continue
+        if (props.get('LoadState') != 'loaded' or props.get('FragmentPath') != str(path) or
+                props.get('NeedDaemonReload') != 'no'):
+            raise Error('Foreign or stale effective systemd fragment')
 
 
 def process_health():
@@ -614,9 +640,17 @@ def boot_id():
     return Path('/proc/sys/kernel/random/boot_id').read_text().strip()
 
 
+def check_lease():
+    journal = read_json(ROOT / 'pending.json')
+    if journal['boot_id'] != boot_id():
+        raise Error('Pending lease changed across reboot; recovery required')
+    if time.time() >= journal['deadline']:
+        raise Error('Pending lease expired; recovery required')
+
+
 def guard():
-    if (ROOT / 'pending.json').exists() and read_json(ROOT / 'pending.json')['boot_id'] != boot_id():
-        raise Error('Interrupted transaction across reboot: recovery must run before services')
+    if (ROOT / 'pending.json').exists():
+        check_lease()
 
 
 def machine_id():
@@ -633,7 +667,7 @@ def preflight(request):
         raise Error('Only dedicated Ubuntu24.04 amd64 is supported')
     if os.geteuid() != 0:
         raise Error('Root or passwordless sudo is required')
-    for name in ('python3', 'openssl', 'systemctl', 'ss', 'nft'):
+    for name in ('python3', 'openssl', 'systemctl', 'systemd-analyze', 'ss', 'nft'):
         if not shutil.which(name):
             raise Error(f'Missing prerequisite {name}; install explicitly before deployment')
     connection = os.environ.get('QD_SSH_CONNECTION', os.environ.get('SSH_CONNECTION', '')).split()
@@ -653,7 +687,6 @@ def preflight(request):
             raise Error('Foreign owned state; no takeover')
         if ROOT.stat().st_uid != 0 or ROOT.stat().st_mode & 0o077:
             raise Error('Owned root must be root:0700')
-        check_units(require_all=(ROOT / 'active/manifest.json').exists())
     elif ROOT.exists():
         raise Error('Unmarked state tree; preserve and inspect, never adopt implicitly')
     for path in ('/var/lib/quick-deploy-vps', '/etc/x-ui', '/usr/local/x-ui', '/opt/3x-ui', '/etc/sing-box/config.json'):
@@ -661,6 +694,7 @@ def preflight(request):
             raise Error('Legacy/foreign proxy state detected; explicit migration required, nothing deleted')
     if not owned and any((UNITS / name).exists() or (UNITS / name).is_symlink() for name in UNIT_NAMES):
         raise Error('Foreign unit name conflict')
+    check_units(require_all=(ROOT / 'active/manifest.json').exists())
     # We never change the firewall. Unknown rules might drop HTTP01/feed/Reality
     # or protect services the operator forgot about. Refuse rather than flush.
     ruleset = json.loads(run(['nft', '-j', 'list', 'ruleset'], timeout=15).stdout)
@@ -773,7 +807,6 @@ def reject_symlinks(root):
     for directory, names, files in os.walk(root, followlinks=False):
         if any((Path(directory) / name).is_symlink() for name in names + files):
             raise Error('Symlink in owned export source')
-
 
 
 def export_backup():
@@ -971,6 +1004,7 @@ def status(request):
 def commit(request):
     if not (ROOT / 'pending.json').exists():
         return status(request)  # Lost SSH reply after commit is not an abort.
+    check_lease()
     marker = read_json(ROOT / 'owner.json')
     if marker['owner'] != request['owner'] or marker['machine_id'] != request['machine_id'] or marker['machine_id'] != machine_id():
         raise Error('Wrong owner/machine at publication')
@@ -981,7 +1015,9 @@ def commit(request):
     backend_health(active, manifest)
     tls_probe(manifest)
     process_health()
+    check_lease()  # caller holds the operation lock; timer timing is irrelevant
     front_config(active, manifest, True)
+    check_lease()  # validation may have taken time; do not start an expired front
     ctl('restart', FRONT)
     tls_probe(manifest)
     manifest['published'] = True
@@ -1023,7 +1059,14 @@ def main():
         # create/claim it. flock is released by kernel even on interrupted SSH.
         fd = os.open('/run/lock/qd-3x-ui.lock', os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
         with os.fdopen(fd, 'w') as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX)
+            try:
+                flags = fcntl.LOCK_EX | (fcntl.LOCK_NB if action == 'recover' else 0)
+                fcntl.flock(lock, flags)
+            except BlockingIOError:
+                # Periodic recovery must finish, not wait behind a caller whose
+                # service start is itself ordered after this recovery oneshot.
+                print(dumps({'pending': True, 'busy': True}), end='')
+                return
             if action == 'prepare':
                 result = prepare(sys.stdin.buffer)
             elif action == 'recover':

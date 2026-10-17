@@ -49,7 +49,9 @@ an arbitrary allow-list.
 
 1. Resolve explicit SSH target/alias with normal verified host trust, no
    multiplexing, forwarding or proxy jump. Pin the public endpoint and remote
-   machine-id before uploading credentials. Initial support is a dedicated
+   machine-id before uploading credentials; bind resolved endpoint/user/port in
+   the transport itself, retaining strict host-key checks and saved selections.
+   Initial support is a dedicated
    Ubuntu24.04 amd64 machine; other platforms stop before installation.
 2. Create/reuse native accounts without rotating them on repeated deploy.
    Missing/corrupt or legacy private state must not be regenerated silently.
@@ -57,16 +59,26 @@ an arbitrary allow-list.
    native Mihomo profiles, URI scope and public-CA TLS are validated. An
    off-node complete backup receipt and a fresh SSH call precede publication.
 4. Persistent pending state records boot identity/deadline. Recovery must work
-   after lost SSH and reboot; a transient timer alone is insufficient. Failed
+   after lost SSH and reboot; a transient timer alone is insufficient. Periodic
+   recovery never waits on a busy operation flock; the next tick retries. Commit
+   checks the lease under that lock immediately before publication. Failed
    private candidates are retained for inspection, not erased.
 5. Replacement needs no old-node contact: restore the off-node native DB,
    account/SubID mapping, certificates and exact releases on a fresh host.
    Default replacement rotates node keys and proxy UUIDs, preserving SubIDs.
-   Dedicated native client endpoints perform rotation; inbound forms cannot
-   overwrite authoritative global client rows in v3.10.2.
-   Controlled restore is the explicit exception preserving proxy credentials.
-6. Only existing owned resources may change. Repeating the same desired state
-   is health/backup work, not an unnecessary service restart or new identity.
+   Dedicated native client endpoints perform rotation from complete fresh Client
+   objects plus the native account's HWID limit; no reduced projection is written
+   back. Inbound forms cannot overwrite authoritative global clients in v3.10.2.
+   Controlled restore performs no client updates. Publication metadata is derived
+   from and verified against the exact closed SQLite snapshot, preserving a
+   revocation even if it interleaves with export. Export rejects source links
+   before dereference and preserves links during staging to reject raced-in ones.
+6. Only existing owned resources may change. Inspect all effective systemd load
+   paths, exact/prefix/type drop-ins, loaded fragments and runtime configuration
+   before service execution; refuse foreign definitions instead of overriding.
+   Repeating the same desired state is health/backup work, not an unnecessary
+   service restart or new identity. URI identity checks are explicit errors,
+   independent of Python optimization.
 
 Mihomo domestic/Bili and node/subscription-underlay DIRECT rules belong in the
 upstream supported inline routing setting. The phone URI feed updates nodes,

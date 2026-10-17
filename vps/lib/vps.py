@@ -127,12 +127,21 @@ def target_record(args, current=None):
         raise host.Error('--ssh is user@host or a verified alias, never a shell command')
     options = ['-o', 'StrictHostKeyChecking=yes', '-o', 'BatchMode=yes', '-o', 'ControlMaster=no', '-o', 'ControlPath=none',
                '-o', 'ClearAllForwardings=yes', '-o', 'ProxyCommand=none', '-o', 'ProxyJump=none', '-o', 'ConnectTimeout=15']
-    if getattr(args, 'port', None):
-        if not 1 <= args.port <= 65535:
+    same_target = current is not None and target == current['target']
+    port_override = getattr(args, 'port', None)
+    identity = getattr(args, 'identity', None)
+    if same_target:
+        if port_override is None:
+            port_override = current['port']
+        saved = current['options']
+        if identity is None and '-i' in saved:
+            identity = Path(saved[saved.index('-i') + 1])
+    if port_override is not None:
+        if not 1 <= port_override <= 65535:
             raise host.Error('Invalid SSH port')
-        options += ['-p', str(args.port)]
-    if getattr(args, 'identity', None):
-        options += ['-i', str(args.identity.expanduser().absolute()), '-o', 'IdentitiesOnly=yes']
+        options += ['-p', str(port_override)]
+    if identity is not None:
+        options += ['-i', str(identity.expanduser().absolute()), '-o', 'IdentitiesOnly=yes']
     # Resolve aliases through OpenSSH, never parse/read private SSH config here.
     result = host.run(['ssh', '-G', *options, target], timeout=15)
     effective = {}
@@ -156,7 +165,13 @@ def remote(record, action, request=None, stdin=None, stdout=None):
     source = (MODULE / 'lib/host.py').read_text()
     prefix = '' if record['user'] == 'root' else 'sudo -n '
     command = prefix + 'env QD_SSH_CONNECTION="$SSH_CONNECTION" python3 -c ' + shlex.quote(source) + ' ' + shlex.quote(action)
-    argv = ['ssh', '-T', *record['options'], record['target'], command]
+    endpoint = host.public_ip(record['endpoint'])
+    if not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_-]*', record['user']) or not 1 <= int(record['port']) <= 65535:
+        raise host.Error('Invalid saved SSH transport identity')
+    # Resolve once, then bind the transport itself BEFORE any private stdin is
+    # released. Alias matching/normal host-key checking remain in OpenSSH.
+    pinned = ['-o', 'HostName=' + endpoint, '-o', 'User=' + record['user'], '-o', 'Port=' + str(record['port'])]
+    argv = ['ssh', '-T', *pinned, *record['options'], record['target'], command]
     kwargs = {'check': False, 'stderr': subprocess.PIPE}
     if stdin is not None:
         kwargs['stdin'] = stdin

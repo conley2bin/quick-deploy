@@ -8,7 +8,7 @@ Caddy 只公开指定订阅路径。没有 Tailscale、DERP、公司8743、sshd 
 ## 前提与端口
 
 管理 PC：Python3、OpenSSH、原生 `mihomo` 或 `verge-mihomo`。远端需已有 Python3、
-OpenSSL、systemd、`ss`、`nft`、可信 CA 包及至少2GiB可用空间；工具缺失会明确停止，
+OpenSSL、systemd/`systemd-analyze`、`ss`、`nft`、可信 CA 包及至少2GiB可用空间；工具缺失会明确停止，
 脚本不自动安装系统依赖。仅支持 SSH 最终 HostName 为公网 IPv4 的已核验别名或
 `user@IPv4`，以及 root / 免密 sudo；不绕过 known_hosts，不支持 NAT 地址映射。
 首次先从服务商控制台核验 SSH host key，再按正常 OpenSSH 流程登记。
@@ -29,7 +29,10 @@ OpenSSL、systemd、`ss`、`nft`、可信 CA 包及至少2GiB可用空间；工�
 域名由用户控制并设置 **DNS-only/灰云** A 记录；不需要 Cloudflare API key。
 HTTP01需要公网80可达，Caddy禁用 TLS-ALPN 挑战和自动重定向，明确不占用443。
 已有防火墙规则、占用端口、外来同名 unit 或旧代理目录会拒绝，**不清空/开放规则、
-不停止外来服务、不接管旧机器**。云防火墙由操作者审阅并开放所选入口。
+不停止外来服务、不接管旧机器**。四个unit在实际systemd加载路径中的同名定义、
+精确/前缀/类型drop-in以及有效FragmentPath/DropInPaths/SourcePath/运行时配置均检查；
+执行服务操作前再次核验，发现外来或未重载配置就拒绝，不删除override来绕过。
+云防火墙由操作者审阅并开放所选入口。
 
 ## 实际命令
 
@@ -62,7 +65,9 @@ bash vps/setup.sh restore --ssh root@<新公网IPv4> \
 
 `preflight` 不保存部署配置或创建远端目录。所有远端命令都使用正常 host-key
 验证和新 SSH 进程，禁用复用、跳板和转发；显式传递的身份路径只保存引用，不复制私钥。
-缺少可恢复状态、损坏文件或错误机器身份会停止，不自动猜测当前节点。
+同一已保存SSH目标的短重跑保留原身份/端口，除非明确覆盖。解析得到的IP、用户和端口
+直接绑定每次OpenSSH传输，仍保留严格host-key验证；别名在预检后改变也不能把私有归档
+发送到另一台已信任主机。缺少可恢复状态、损坏文件或错误机器身份会停止，不自动猜测当前节点。
 
 默认私有目录为 `~/.local/state/quick-deploy-private/vps`，目录0700、文件0600。
 需独立目录时在子命令**前**传 `--state-dir /private/directory`。
@@ -97,7 +102,12 @@ Xray26.10.10、Caddy2.11.7二进制和 geodata，**不运行上游安装器**。
 
 每次部署公开前及 `backup` 都把恢复集取回管理PC：一致、关闭且独立于 WAL/SHM 的
 SQLite数据库，SQLite/schema/version信息，原生账户映射，外部证书与Caddy续期存储，
-完整release包、校验信息、环境/unit配置、适配器。损坏DB、缺证书/私钥或版本不匹配会拒绝。
+完整release包、校验信息、环境/unit配置、适配器。账户元数据从**同一关闭的数据库快照**
+读取，恢复前核对一致性；不把较早的API投影当作账户写回来源。受控restore不更新client，
+replace从完整、新读取的原生Client/账户对象仅更换UUID，并保留禁用、配额、到期、IP/HWID
+限制和reset策略。备份不要求受限/过期账户能成功下载feed；但部署发布的feed门槛仍独立检查。
+导出前拒绝来源树中的文件/目录symlink，复制时也保留链接再拒绝，不跟随到树外秘密。
+损坏DB、账户元数据不一致、缺证书/私钥或版本不匹配会拒绝。
 
 **备份是未加密 TAR。** SSH传输加密、0700/0600权限不是静态加密；请另用既有的
 加密存储/导出流程保存到第二个离机位置。工具没有内置加密导出。定期演练新管理PC恢复，
@@ -110,7 +120,10 @@ SQLite数据库，SQLite/schema/version信息，原生账户映射，外部证�
 泄露的SubID若保留URL也保留泄露能力；失控旧机/订阅泄露需轮换SubID并重新导入客户端。
 
 失败候选的持久pending记录包含启动标识及15分钟期限，配合systemd恢复服务、周期检查
-和启动前guard，在SSH丢失、超时或重启后停止/禁用候选。失败私有目录保留供检查，不删除。
+和启动前guard，在SSH丢失、超时或重启后停止/禁用候选。周期恢复遇到事务锁会立即退出，
+等待下一轮，不与有服务顺序依赖的start/restart互相等待。guard检查启动标识和期限；
+commit在锁内、发布前再次检查lease，不依赖timer恰好先触发。URI身份门槛使用显式错误，
+Python优化模式不会删除它。失败私有目录保留供检查，不删除。
 同状态重跑不替换已有工作包；新机失败不会修改旧节点。没有假称“配置回滚也降级了包”。
 **原机版本升级尚未实现**：不同release lock拒绝，不能点面板一键升级或改成latest绕过。
 磁盘上的历史备份/失败目录不会自动清理，需操作者审阅容量。

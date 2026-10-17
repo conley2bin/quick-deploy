@@ -47,6 +47,7 @@ class FakeHost(unittest.TestCase):
         self.request = {'owner': 'owner-fixture', 'endpoint': '93.184.216.34', 'config': self.config, 'mode': 'deploy',
                         'lock': vps.release_lock(), 'adapter_sha256': host.digest(vps.MODULE / 'lib/host.py')}
         self.events, self.services = [], set()
+        self.unit_overrides = {}
         self.listeners = b''
         self.ruleset = b'{"nftables":[{"metainfo":{}}]}'
         self.patch(self.h.os, 'geteuid', return_value=0)
@@ -54,6 +55,7 @@ class FakeHost(unittest.TestCase):
         self.patch(self.h.shutil, 'which', side_effect=lambda name: '/fake/' + name)
         self.patch(self.h.shutil, 'disk_usage', return_value=shutil._ntuple_diskusage(10 * 1024**3, 1, 9 * 1024**3))
         self.patch(self.h, 'run', side_effect=self.run_command)
+        self.control_service = self.h.ctl
         self.patch(self.h, 'ctl', side_effect=self.ctl)
         self.patch(self.h, 'check_target')
         self.patch(self.h, 'verify_artifacts')
@@ -78,6 +80,18 @@ class FakeHost(unittest.TestCase):
         return result
 
     def run_command(self, argv, **kwargs):
+        load_paths = [self.h.UNITS, self.root / 'run/systemd/system', self.root / 'usr/lib/systemd/system']
+        if argv == ['systemd-analyze', 'unit-paths']:
+            return subprocess.CompletedProcess(argv, 0, ('\n'.join(map(str, load_paths)) + '\n').encode())
+        if argv[:2] == ['systemctl', 'show']:
+            name = argv[2]
+            if name not in self.h.UNIT_NAMES:
+                raise AssertionError('Unknown unit query')
+            fragment = next((str(path / name) for path in load_paths if (path / name).is_file()), '')
+            props = {'LoadState': 'loaded' if fragment else 'not-found', 'FragmentPath': fragment,
+                     'DropInPaths': '', 'SourcePath': '', 'NeedDaemonReload': 'no'}
+            props.update(self.unit_overrides.get(name, {}))
+            return subprocess.CompletedProcess(argv, 0, ('\n'.join(k + '=' + v for k, v in props.items()) + '\n').encode())
         if argv == ['nft', '-j', 'list', 'ruleset']:
             return subprocess.CompletedProcess(argv, 0, self.ruleset)
         if argv == ['ss', '-H', '-ltnp']:
@@ -115,7 +129,6 @@ class FakeHost(unittest.TestCase):
                 for device in self.h.DEVICES:
                     db.execute('update clients set uuid=? where email=?', (str(uuid.uuid4()), device))
         manifest['accounts'] = self.h.snapshot_accounts(folder / 'db/x-ui.db')
-
 
     def upload(self):
         with tempfile.TemporaryDirectory(dir=self.root) as tmp:
