@@ -559,7 +559,7 @@ def load_vps_output() -> dict[str, Any]:
             raise ValueError("hostname output requires server_ips for DIRECT underlay")
         return {"proxies": nodes, "server_ips": addresses}
     except (OSError, ValueError, KeyError, TypeError, AttributeError) as error:
-        raise SourceError(f"{path}: invalid private VPS output ({error}); run vps/setup.sh render") from error
+        raise SourceError(f"{path}: invalid legacy private VPS output ({error}); manually review or restore a valid authoritative legacy backup; file preserved") from error
 
 
 def render(rules: dict[str, list[Rule]], wg_endpoints: list[str] | None = None,

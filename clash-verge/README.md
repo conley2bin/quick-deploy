@@ -84,20 +84,23 @@ post: []
 改完执行菜单回车（或 `./clash-verge/tun-fix.sh rules apply`），然后在 Verge 中重载/重新
 生成配置。**重载前运行中的核心仍是旧规则**；工具只报告写入成功，不会声称已经生效。
 
-### 可选自建 VPS 节点
+### 可选旧版 VPS 节点文件
 
-若已用 [`../vps/`](../vps/README.md) 生成私有
-`~/.local/state/quick-deploy-private/vps/generated/clash-nodes.json`，规则生成器会把
+此入口仅兼容**已有的旧版私有 JSON**，不是新3x-ui的订阅合并接口。
+[`../vps/`](../vps/README.md) 现在输出原生完整Mihomo/URI订阅，作为独立订阅导入，
+不生成本节旧文件，也不自动改动已有机场或Script。
+若已有私有 `~/.local/state/quick-deploy-private/vps/generated/clash-nodes.json`，规则生成器会把
 `SELF-Reality`、`SELF-Hy2`内联为普通可选节点：仅追加到本来包含至少一个订阅单节点的
 `select`组。url-test/fallback/load-balance和只有DIRECT/REJECT/其他组的策略组保持不变。
 不创建专用自建组、不注入模型/API域名规则，不改任何组原有顺序、默认项或selection字段。
 海外流量由用户自己选择节点；空节点/组不会抛JS异常。
 VPS数字IPv4/IPv6的DIRECT规则仍最先注入，避免临时check客户端或非22管理连接绕回VPS。
 不存在私有文件时，生成结果逐字节保持原样；损坏、非0600
-或链接文件不会静默忽略。两 PC 各自 `vps/setup.sh render --device company|home`，不要共用
-手机身份。Hy2使用SHA256证书pin，不跳过校验。
+或链接文件不会静默忽略。旧文件须来自自己的合法旧备份/权威来源，并保持各设备身份独立；
+损坏时手动审阅或恢复，不删除用户文件，也不调用已移除的 `vps/setup.sh render`。
+Hy2使用SHA256证书pin，不跳过校验。
 
-只在显式规则 render/apply 时读取私有输出；`vps/setup.sh render/deploy` 不自动写 Script
+只在显式规则 render/apply 时读取旧私有输出；新 `vps/setup.sh deploy` 不自动写 Script
 或重载 Verge。无外部 file provider，不需要放宽 mihomo SAFE_PATHS。生成的Script和备份
 含凭据，不能提交Git或分享。回归入口统一列在[离线回归检查](#离线回归检查)。
 

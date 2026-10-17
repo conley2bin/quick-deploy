@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Offline private nodes: manual select choices, no forced routing or live writes."""
+import copy
 import hashlib
 import json
 import os
@@ -13,26 +14,40 @@ from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / 'clash-verge/lib'))
-sys.path.insert(0, str(ROOT / 'vps/lib'))
 import rules
-import vps
+
+# Deterministic legacy-schema fixture, independent of the new 3x-ui lifecycle.
+# The RFC7748 public key and SHA256-shaped pin are parser inputs, not live keys.
+REALITY_UUID = '11111111-1111-4111-8111-111111111111'
+LEGACY_NODES = [
+    {'name': 'SELF-Reality', 'type': 'vless', 'server': '203.0.113.1', 'port': 443,
+     'uuid': REALITY_UUID, 'flow': 'xtls-rprx-vision', 'tls': True, 'udp': True,
+     'servername': 'target.example.org', 'client-fingerprint': 'chrome',
+     'reality-opts': {'public-key': 'hSDwCYkwp1R0i33ctD73Wg2_Og0mOBr066SpjqqbTmo',
+                      'short-id': '0123456789abcdef'}},
+    {'name': 'SELF-Hy2', 'type': 'hysteria2', 'server': '203.0.113.1', 'port': 443,
+     'password': 'legacy-fixture-password', 'sni': 'qd-vps.invalid',
+     'fingerprint': 'AB' * 32, 'skip-cert-verify': False},
+]
 
 
 class VPSIntegration(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.ident = vps.new_identity()
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(prefix='clash-vps-test-')
         self.addCleanup(self.tmp.cleanup)
         self.home = Path(self.tmp.name)
         self.output = self.home / '.local/state/quick-deploy-private/vps/generated/clash-nodes.json'
-        self.nodes = vps.nodes(self.ident, '203.0.113.1', 'company')
+        self.nodes = copy.deepcopy(LEGACY_NODES)
         self.sources = {'pre': [], 'post': []}
 
+    def write_output(self, document):
+        self.output.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        self.output.write_text(json.dumps(document, ensure_ascii=False) + '\n')
+        self.output.chmod(0o600)
+
     def publish(self):
-        vps.write_private(self.output, vps.dumps({'version': 1, 'proxies': self.nodes}))
+        self.write_output({'version': 1, 'proxies': self.nodes})
 
     def script(self, nodes):
         return rules.render(self.sources, [], nodes)
@@ -107,7 +122,7 @@ class VPSIntegration(unittest.TestCase):
         base['proxy-groups'][0]['selected'] = 'SELF-Reality'
         result = self.evaluate(self.script(self.nodes), base, twice=True)
         self.assertEqual(len(result['proxies']), 4)
-        self.assertEqual(result['proxies'][2]['uuid'], self.ident['users']['company']['uuid'])
+        self.assertEqual(result['proxies'][2]['uuid'], REALITY_UUID)
         self.assertEqual(result['proxy-groups'][0]['proxies'][0], 'SELF-Reality')
         self.assertEqual(result['proxy-groups'][0]['selected'], 'SELF-Reality')
         self.assertEqual(result['proxy-groups'][0]['proxies'].count('SELF-Reality'), 1)
@@ -127,11 +142,12 @@ class VPSIntegration(unittest.TestCase):
         self.assertEqual(result['rules'][2:], base['rules'])
 
     def test_hostname_requires_known_endpoint_ips(self):
-        self.nodes = vps.nodes(self.ident, 'relay.example.net', 'company')
+        for node in self.nodes:
+            node['server'] = 'relay.example.net'
         self.publish()
         with mock.patch.object(Path, 'home', return_value=self.home), self.assertRaises(rules.SourceError):
             rules.load_vps_output()
-        vps.write_private(self.output, vps.dumps({'version': 1, 'proxies': self.nodes, 'server_ips': ['203.0.113.1', '2001:db8::9']}))
+        self.write_output({'version': 1, 'proxies': self.nodes, 'server_ips': ['203.0.113.1', '2001:db8::9']})
         with mock.patch.object(Path, 'home', return_value=self.home):
             self.assertEqual(len(rules.load_vps_output()['server_ips']), 2)
 
