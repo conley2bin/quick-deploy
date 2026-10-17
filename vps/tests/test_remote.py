@@ -61,7 +61,7 @@ class FakeHost(unittest.TestCase):
         self.patch(self.h, 'initialize_db', side_effect=self.initialize)
         self.patch(self.h, 'native_keys', return_value={'privateKey': 'x' * 43, 'publicKey': 'y' * 43, 'shortIds': ['0123456789abcdef']})
         self.patch(self.h, 'front_config', side_effect=lambda folder, manifest, published: self.h.atomic(folder / 'Caddyfile', self.h.caddyfile(manifest, published)))
-        self.patch(self.h, 'configure_native')
+        self.patch(self.h, 'configure_native', side_effect=self.configure)
         self.patch(self.h, 'backend_health', return_value={})
         self.patch(self.h, 'wait_tls')
         self.patch(self.h, 'tls_probe')
@@ -102,7 +102,20 @@ class FakeHost(unittest.TestCase):
         with sqlite3.connect(folder / 'db/x-ui.db') as db:
             db.execute('create table settings(id integer primary key, key text, value text)')
             db.execute('create table users(id integer primary key, username text, password text)')
+            db.execute('create table clients(email text, uuid text, sub_id text, enable integer, flow text)')
+            db.executemany('insert into clients values(?,?,?,?,?)',
+                [(d, c['id'], c['subId'], c['enable'], c['flow']) for d, c in manifest['accounts'].items()])
         self.h.settings_write(folder / 'db/x-ui.db', self.h.backend_settings(manifest))
+
+    def configure(self, folder, manifest, fresh, rotate=False):
+        import sqlite3
+        import uuid
+        if rotate:
+            with sqlite3.connect(folder / 'db/x-ui.db') as db:
+                for device in self.h.DEVICES:
+                    db.execute('update clients set uuid=? where email=?', (str(uuid.uuid4()), device))
+        manifest['accounts'] = self.h.snapshot_accounts(folder / 'db/x-ui.db')
+
 
     def upload(self):
         with tempfile.TemporaryDirectory(dir=self.root) as tmp:
@@ -258,6 +271,9 @@ class FakeHost(unittest.TestCase):
         old_active = old_root / 'active'
         old = self.h.read_json(old_active / 'manifest.json')
         old['accounts']['company']['enable'] = False
+        import sqlite3
+        with sqlite3.connect(old_active / 'db/x-ui.db') as db:
+            db.execute("update clients set enable=0 where email='company'")
         self.h.atomic(old_active / 'manifest.json', host.dumps(old))
         original = (old_active / 'manifest.json').read_bytes()
         stage = self.root / 'offnode-export'

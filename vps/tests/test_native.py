@@ -96,6 +96,117 @@ class Native(unittest.TestCase):
                 self.proc.wait()
             self.proc = None
 
+    def native_accounts(self):
+        settings = host.wait_api(self.manifest).call('/panel/api/inbounds/list')[0]['settings']
+        settings = json.loads(settings) if isinstance(settings, str) else settings
+        return {client['email']: client for client in settings['clients']}
+
+    def prepare_export_fixture(self):
+        self.stop()
+        owned = self.root / ('export-' + str(time.monotonic_ns()))
+        owned.mkdir()
+        self.work.rename(owned / 'active')
+        self.work = owned / 'active'
+        self.start()
+        mock.patch.object(host, 'ROOT', owned).start()
+        units = owned / 'units'
+        units.mkdir()
+        mock.patch.object(host, 'UNITS', units).start()
+        for name, text in host.unit_texts().items():
+            host.atomic(units / name, text)
+        host.atomic(owned / 'host.py', (vps.MODULE / 'lib/host.py').read_bytes())
+        host.atomic(self.work / 'manifest.json', host.dumps(self.manifest))
+        host.atomic(self.work / 'Caddyfile', host.caddyfile(self.manifest, False))
+        certs = self.work / 'caddy/data/caddy/certificates/fixture'
+        host.atomic(certs / 'sub.example.org.crt', 'fixture cert')
+        host.atomic(certs / 'sub.example.org.key', 'fixture key')
+        host.atomic(self.work / 'caddy/data/caddy/acme/fixture/account.json', '{}')
+
+    def export_without_systemctl(self):
+        original_run = subprocess.run
+        def no_systemctl(argv, **kwargs):
+            if argv[0] == 'systemctl':
+                self.assertEqual(argv, ['systemctl', 'is-active', '--quiet', host.FRONT])
+                return subprocess.CompletedProcess(argv, 3, b'', b'')
+            return original_run(argv, **kwargs)
+        with mock.patch.object(subprocess, 'run', side_effect=no_systemctl), mock.patch.object(host, 'ctl'), mock.patch.object(host, 'check_units'):
+            return host.export_backup()
+
+    def test_review_snapshot_revocation_and_full_policy_restore(self):
+        self.prepare_export_fixture()
+        for device, client in self.native_accounts().items():
+            client.update(trafficReset='monthly', trafficResetDay=6, limitHwid=3)
+            if device == 'company':
+                client.update(totalGB=1234567890, expiryTime=int(time.time() * 1000) + 30 * 86400000,
+                              limitIp=2, reset=7, resetMax=9, comment='retained-policy-fixture')
+            host.API(self.manifest).call('/panel/api/clients/update/' + device, client)
+        real_snapshot = host.db_snapshot
+        def revoke_before_snapshot(source, target):
+            current = self.native_accounts()['company']
+            current['limitHwid'] = host.API(self.manifest).call('/panel/api/clients/get/company')['client']['limitHwid']
+            current['enable'] = False
+            host.API(self.manifest).call('/panel/api/clients/update/company', current)
+            return real_snapshot(source, target)
+        with mock.patch.object(host, 'db_snapshot', side_effect=revoke_before_snapshot):
+            archive = self.export_without_systemctl()
+        expected = self.native_accounts()
+        expected_records = {d: host.API(self.manifest).call('/panel/api/clients/get/' + d)['client'] for d in host.DEVICES}
+        self.assertFalse(expected['company']['enable'])
+        self.stop()
+        stage = self.root / 'interleaved-restore'
+        stage.mkdir()
+        with archive.open('rb') as stream:
+            host.safe_unpack(stream, stage)
+        recovered = host.verify_backup(stage, self.lock)
+        self.assertFalse(recovered['accounts']['company']['enable'], 'metadata must describe the same revoked snapshot')
+        stored_manifest = stage / 'deployment/manifest.json'
+        wrong = copy.deepcopy(recovered)
+        wrong['accounts']['company']['enable'] = True
+        host.atomic(stored_manifest, host.dumps(wrong))
+        with self.assertRaisesRegex(host.Error, 'snapshot account'):
+            host.verify_backup(stage, self.lock)
+        host.atomic(stored_manifest, host.dumps(recovered))
+        self.work = stage / 'deployment'
+        self.manifest = recovered
+        host.install_runtime(self.work, self.lock)
+        self.start()
+        host.configure_native(self.work, self.manifest, False)
+        controlled = self.native_accounts()
+        for device in host.DEVICES:
+            self.assertEqual({k: v for k, v in controlled[device].items() if k != 'updated_at'},
+                             {k: v for k, v in expected[device].items() if k != 'updated_at'})
+        self.manifest['reality'] = host.native_keys(self.work)
+        host.configure_native(self.work, self.manifest, False, rotate=True)
+        replaced = self.native_accounts()
+        for device in host.DEVICES:
+            self.assertNotEqual(replaced[device]['id'], controlled[device]['id'])
+            self.assertEqual({k: v for k, v in replaced[device].items() if k not in ('id', 'updated_at')},
+                             {k: v for k, v in controlled[device].items() if k not in ('id', 'updated_at')})
+        self.assertFalse(replaced['company']['enable'])
+        self.assertEqual(replaced['company']['totalGB'], 1234567890)
+        for device in host.DEVICES:
+            record = host.API(self.manifest).call('/panel/api/clients/get/' + device)['client']
+            self.assertNotEqual(record['uuid'], expected_records[device]['uuid'])
+            self.assertEqual({k: v for k, v in record.items() if k not in ('uuid', 'updatedAt')},
+                             {k: v for k, v in expected_records[device].items() if k not in ('uuid', 'updatedAt')})
+            self.assertEqual(record['limitHwid'], 3)
+
+    def test_review_export_rejects_outside_file_and_directory_links(self):
+        self.prepare_export_fixture()
+        outside = self.root / 'outside-private-fixture'
+        host.atomic(outside / 'sentinel', 'outside-owned-secret-fixture')
+        for target in (outside / 'sentinel', outside):
+            with self.subTest(target=target.name):
+                link = self.work / 'unexpected-link'
+                link.symlink_to(target, target_is_directory=target.is_dir())
+                try:
+                    with self.assertRaisesRegex(host.Error, '[Ss]ymlink'):
+                        self.export_without_systemctl()
+                    self.assertFalse((host.ROOT / 'export.tar').exists())
+                    self.assertEqual((outside / 'sentinel').read_text(), 'outside-owned-secret-fixture')
+                finally:
+                    link.unlink()
+
     def test_native_api_scope_core_mihomo_and_no_rotation(self):
         before = copy.deepcopy(self.manifest)
         outputs = host.backend_health(self.work, self.manifest)
@@ -180,7 +291,7 @@ class Native(unittest.TestCase):
                 self.assertEqual(argv, ['systemctl', 'is-active', '--quiet', host.FRONT])
                 return subprocess.CompletedProcess(argv, 3, b'', b'')
             return original_run(argv, **kwargs)
-        with mock.patch.object(subprocess, 'run', side_effect=no_real_systemctl), mock.patch.object(host, 'ctl') as ctl:
+        with mock.patch.object(subprocess, 'run', side_effect=no_real_systemctl), mock.patch.object(host, 'ctl') as ctl, mock.patch.object(host, 'check_units'):
             archive = host.export_backup()
         ctl.assert_called_once_with('stop', host.FRONT)
         offnode = self.root / 'offnode.tar'
@@ -232,11 +343,9 @@ class Native(unittest.TestCase):
         # Cold replacement rotates using the native CLIENT endpoint, not a stale
         # inbound form. The old process need not exist for these writes.
         self.stop()
-        for account in self.manifest['accounts'].values():
-            account['id'] = str(uuid.uuid4())
         self.manifest['reality'] = host.native_keys(self.work)
         self.start()
-        host.configure_native(self.work, self.manifest, False)
+        host.configure_native(self.work, self.manifest, False, rotate=True)
         host.backend_health(self.work, self.manifest)
         for device in host.DEVICES:
             self.assertNotEqual(self.manifest['accounts'][device]['id'], before['accounts'][device]['id'])

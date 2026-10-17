@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import base64
 import contextlib
+import copy
 import fcntl
 import hashlib
 import http.cookiejar
@@ -306,7 +307,7 @@ def initialize_db(folder, manifest):
     settings_write(folder / 'db/x-ui.db', backend_settings(manifest))
 
 
-def configure_native(folder, manifest, fresh):
+def configure_native(folder, manifest, fresh, rotate=False):
     if fresh:
         # admin/admin exists only in the loopback candidate; change via native API,
         # never place a password in process argv or systemd Environment.
@@ -344,11 +345,34 @@ def configure_native(folder, manifest, fresh):
     else:
         if len(inbounds) != 1 or inbounds[0].get('remark') != 'SELF-main':
             raise Error('Refusing unrecognized native inbound state')
-        api.call('/panel/api/inbounds/update/' + str(inbounds[0]['id']), inbound_for(manifest))
-        # v3.10.2 deliberately protects global client rows from stale inbound
-        # forms. Credential rotation must use the native client endpoint.
-        for device, account in manifest['accounts'].items():
-            api.call('/panel/api/clients/update/' + device, account)
+        # Preserve the full restored inbound and all its policies. The DB is
+        # authoritative; wrapper account metadata is never a write-back input.
+        inbound = copy.deepcopy(inbounds[0])
+        stream = inbound['streamSettings']
+        stream = json.loads(stream) if isinstance(stream, str) else stream
+        external = stream.get('externalProxy', [])
+        if len(external) != 1 or inbound['port'] != manifest['config']['proxy_port']:
+            raise Error('Unexpected restored native endpoint configuration')
+        external[0]['dest'] = manifest['endpoint']
+        if rotate:
+            reality = stream['realitySettings']
+            reality.update(manifest['reality'])
+            reality.setdefault('settings', {})['publicKey'] = manifest['reality']['publicKey']
+        inbound['streamSettings'] = json.dumps(stream)
+        api.call('/panel/api/inbounds/update/' + str(inbound['id']), inbound)
+        if rotate:
+            # Each complete fresh native object carries quota/expiry/reset and
+            # disabled state. Change only UUID, never reconstruct a Client DTO.
+            for device in DEVICES:
+                current = api.call('/panel/api/inbounds/list')[0]['settings']
+                current = json.loads(current) if isinstance(current, str) else current
+                account = next(c for c in current['clients'] if c['email'] == device)
+                # The native update endpoint has one policy outside Client DTO:
+                # LimitHwid. Preserve it from its own complete native record.
+                detail = api.call('/panel/api/clients/get/' + device)['client']
+                account['limitHwid'] = detail['limitHwid']
+                account['id'] = str(uuid.uuid4())
+                api.call('/panel/api/clients/update/' + device, account)
     api.call('/panel/api/server/restartXrayService', {})
     for _ in range(60):
         config = folder / 'bin/config.json'
@@ -733,11 +757,33 @@ def db_snapshot(source, target):
                 'schema_sha256': hashlib.sha256(schema.encode()).hexdigest(), 'schema': schema}
 
 
+def snapshot_accounts(database):
+    """Read only publication metadata from the same authoritative closed DB."""
+    with contextlib.closing(sqlite3.connect('file:' + str(database) + '?mode=ro', uri=True)) as db:
+        rows = db.execute('select email,uuid,sub_id,enable,flow from clients order by email').fetchall()
+    if len(rows) != len(DEVICES) or {row[0] for row in rows} != set(DEVICES):
+        raise Error('Unexpected snapshot account membership')
+    return {email: {'email': email, 'id': identity, 'subId': sub_id, 'enable': bool(enabled), 'flow': flow}
+            for email, identity, sub_id, enabled, flow in rows}
+
+
+def reject_symlinks(root):
+    if root.is_symlink():
+        raise Error('Symlink in owned export source')
+    for directory, names, files in os.walk(root, followlinks=False):
+        if any((Path(directory) / name).is_symlink() for name in names + files):
+            raise Error('Symlink in owned export source')
+
+
+
 def export_backup():
     active = ROOT / 'active'
+    reject_symlinks(active)
+    if (ROOT / 'host.py').is_symlink():
+        raise Error('Symlink recovery adapter cannot be exported')
     manifest = read_json(active / 'manifest.json')
-    backend_health(active, manifest)
-    atomic(active / 'manifest.json', dumps(manifest))
+    # Backups must also work for expired/quota/HWID-restricted accounts. Their
+    # authoritative snapshot, not successful feed access, defines this export.
     # Caddy storage uses atomic file writes, but its cert/key pair must be taken
     # together. Briefly stop ONLY our subscription front, not Xray or SSH.
     check_units()
@@ -746,8 +792,12 @@ def export_backup():
     try:
         with tempfile.TemporaryDirectory(prefix='export-', dir=ROOT) as tmp:
             stage = Path(tmp)
-            shutil.copytree(active, stage / 'deployment', ignore=shutil.ignore_patterns('logs', '*.db-wal', '*.db-shm', 'x-ui.db'))
+            shutil.copytree(active, stage / 'deployment', symlinks=True,
+                            ignore=shutil.ignore_patterns('logs', '*.db-wal', '*.db-shm', 'x-ui.db'))
+            reject_symlinks(stage / 'deployment')
             metadata = db_snapshot(active / 'db/x-ui.db', stage / 'deployment/db/x-ui.db')
+            manifest['accounts'] = snapshot_accounts(stage / 'deployment/db/x-ui.db')
+            atomic(stage / 'deployment/manifest.json', dumps(manifest))
             metadata.update(format=FORMAT, encryption='none', panel_version=read_json(active / 'release-lock.json')['panel']['version'])
             atomic(stage / 'database-schema.sql', metadata.pop('schema'))
             atomic(stage / 'backup.json', dumps(metadata))
@@ -785,6 +835,8 @@ def verify_backup(folder, lock):
     with contextlib.closing(sqlite3.connect('file:' + str(active / 'db/x-ui.db') + '?mode=ro', uri=True)) as db:
         if db.execute('pragma integrity_check').fetchone()[0] != 'ok':
             raise Error('Corrupt backup database')
+    if manifest['accounts'] != snapshot_accounts(active / 'db/x-ui.db'):
+        raise Error('Backup metadata disagrees with native snapshot accounts')
     return manifest
 
 
@@ -853,8 +905,6 @@ def prepare(upload):
                 # keys and proxy UUIDs. SubIDs/admin credentials stay stable.
                 manifest.update(endpoint=request['endpoint'], node_id=str(uuid.uuid4()), published=False)
                 if request['mode'] == 'replace':
-                    for account in manifest['accounts'].values():
-                        account['id'] = str(uuid.uuid4())
                     manifest['reality'] = native_keys(active)
                 settings_write(active / 'db/x-ui.db', backend_settings(manifest))
                 fresh = False
@@ -869,8 +919,9 @@ def prepare(upload):
             atomic(active / 'manifest.json', dumps(manifest))
             front_config(active, manifest, False)
             ctl('start', PANEL)
-            configure_native(active, manifest, fresh)
+            configure_native(active, manifest, fresh, rotate=(request['mode'] == 'replace'))
             backend_health(active, manifest)
+            atomic(active / 'manifest.json', dumps(manifest))
             ctl('start', FRONT)
             wait_tls(manifest)
             process_health()
