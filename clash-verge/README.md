@@ -146,12 +146,12 @@ socket/路由才能确认；自建 DERP 域名不在覆盖范围内。
 
 ### TUN 与 Tailscale 共存
 
-规则层的 `DIRECT` 救不了 Tailscale 打洞：tailscaled 的底层 UDP（STUN 探测、DERP、
-对端 WireGuard 流量）走的是对端公网 IP，这些包一旦进入 mihomo 的 TUN 就会被代理
-出口转发，对端看到的来源不再是本机真实地址，NAT 打洞必然失败，tailnet 流量只能
-绕远端 DERP 中继（实测国内互访被绕到洛杉矶，340ms+ 且大抖动）。
+TUN 是流量进入 Mihomo 的入口，不等于使用代理：进入后仍按规则选择 `DIRECT`
+或代理出口。规则层的 `DIRECT` 不决定流量是否进入 TUN，也不决定底层隧道的路由。
 
-因此生成的全局 Script 在规则之外还会向运行配置的 `tun` 段并集注入路由排除字段：
+生成的 Script 向 `tun.route-exclude-address` 并集加入下面五个 tailnet/LAN 目的网段，
+让这些目的地址绕过 TUN、沿系统原有路由发送（例如 `tailscale0` 或 LAN 接口）；
+另加入生成时发现的显式 WireGuard 端点：
 
 ```yaml
 tun:
@@ -168,11 +168,10 @@ tun:
 Verge 应用设置接管的字段（接管的只有 TUN 堆栈选择）。注入采用并集合并：Merge 或
 订阅里已有的排除条目会被保留。
 
-WireGuard 端点使用**路由层排除**，避免底层 UDP 进入 TUN；规则层 `DIRECT`
-只决定 mihomo 接收流量后的出口，不能保证底层路由或 MTU 选择正确。wg-quick 自动
-推导 MTU 时若选中大 MTU 的 TUN，隧道 MTU 可能超过实际物理路径承载能力。排除端点
-使其按物理路由发送；它不能保证公网 UDP 的延迟、丢包或可达性，仍须验证真实 SSH
-与大块数据传输。
+显式 WireGuard 端点的排除用于让底层 UDP 沿原有 underlay 路由发送，避免 TUN
+影响路径选择。wg-quick 自动推导 MTU 时若选中大 MTU 的 TUN，隧道 MTU 可能超过
+实际路径承载能力。本工具不设置接口 MTU，排除端点也不保证 UDP 的可达性、延迟或
+丢包表现；实际出接口仍由系统路由决定，需另行验证连接和大块数据传输。
 
 端点地址不硬编码：`rules render/apply` 在生成时用 sudo 自动发现——运行中的隧道
 读 `wg show all endpoints`（已解析为 IP），未启动的隧道读 `/etc/wireguard/*.conf`
@@ -180,16 +179,16 @@ WireGuard 端点使用**路由层排除**，避免底层 UDP 进入 TUN；规则
 `discoveredWgEndpoints`。所以 VPN 没开也能排除；换端点只需重跑一次 apply。
 `/etc/wireguard` 仅 root 可读：交互运行时按提示输密码，非交互运行前先 `sudo -v`，
 或用 `TUN_FIX_WG_ENDPOINTS=<host:port,...>` 显式指定（`off` 关闭发现，测试用）。
-没有 `/etc/wireguard` 的机器自动跳过、不需要 sudo。
-排除的语义只是「不进 TUN、按物理路由表直连」，即使端点 IP 与局域网某台机器重合
-也无害——与不加这条规则时的物理网络行为完全一致。
+没有 `/etc/wireguard` 的机器自动跳过、不需要 sudo。这里发现的是上述 WireGuard
+端点，不包括 tailscaled 的动态公网对端。
 
-当前安装中，tailscaled 的底层流量自带 fwmark 规则，优先级高于 mihomo 的策略路由，
-因此这里不注入 `exclude-uid`。按 UID 排除所有 root 流量会同时改变其他服务的出口，
-不能代替按 WireGuard 端点排除。
+此前在本机观测到 tailscaled 底层包通过 fwmark 和更高优先级规则绕过 Mihomo 策略
+路由；这是该环境的行为，不是本生成器配置的结果，也不代表所有主机。生成器不注入
+`exclude-uid`：排除所有 root 流量会改变其他服务的出口，不能代替按端点排除。
 
-改动在 Verge 重载/重新生成配置后才生效；生效后 `tailscale ping <对端>` 应在数包内
-从 `via DERP(...)` 升级为 `via <对端公网地址>` 直连。两台机器需要各自应用一次。
+修改 Script 后需在对应机器的 Verge 重载/重新生成配置。随后可用
+`tailscale ping <对端>` 诊断当前是直连还是 DERP；能否打洞仍取决于 NAT、防火墙和
+公网 UDP 可达性等条件。上述排除不保证从 DERP 转为直连。
 
 ### 迁移：清掉旧的订阅级重复规则
 
@@ -328,20 +327,38 @@ VPS 输出，stdout 可能含凭据，不要提交或分享。`rules apply` 在�
 
 ## 离线回归检查
 
-从仓库根目录执行，需要 Python 3、PyYAML、Bash、Node.js 和 `verge-mihomo`。
-显式设置 `TUN_FIX_WG_ENDPOINTS=off`，防止 render/apply 测试读取主机的 WireGuard
-配置或调用 sudo；其中 `app-integration.py` 并未在每个子进程内自行关闭发现。
+在 Bash 中从仓库根目录执行，需要 Python 3、PyYAML、Node.js 和 `verge-mihomo`。
+下例运行完整 `route-menu.py`；修改 `suite` 可选择表中的其他入口。
 
 ```bash
-TUN_FIX_WG_ENDPOINTS=off python3 clash-verge/tests/install-package-selection.py # 离线包选择
-TUN_FIX_WG_ENDPOINTS=off python3 clash-verge/tests/route-menu.py       # 菜单、写入/恢复、SSH 边界
-TUN_FIX_WG_ENDPOINTS=off python3 clash-verge/tests/app-integration.py  # 规则、registry、应用展开
-TUN_FIX_WG_ENDPOINTS=off python3 clash-verge/tests/discover-apps.py    # 原生应用发现
-TUN_FIX_WG_ENDPOINTS=off python3 clash-verge/tests/vps-integration.py  # 合成 VPS 节点/组与 Script
+(
+  set -eu
+  suite=route-menu.py
+  work=$(mktemp -d /tmp/clash-tests.XXXXXX)
+  trap 'RM_GUARD_CONFIRM=1 rm -r -- "$work"' EXIT
+  mkdir -p "$work"/{home,config,data,state,cache,runtime,tmp}
+  chmod 700 "$work/runtime"
+  env -i PATH="$PATH" LANG="${LANG:-C.UTF-8}" \
+    HOME="$work/home" XDG_CONFIG_HOME="$work/config" XDG_DATA_HOME="$work/data" \
+    XDG_STATE_HOME="$work/state" XDG_CACHE_HOME="$work/cache" \
+    XDG_RUNTIME_DIR="$work/runtime" TMPDIR="$work/tmp" \
+    TUN_FIX_WG_ENDPOINTS=off PYTHONDONTWRITEBYTECODE=1 RM_GUARD_CONFIRM=1 \
+    python3 "clash-verge/tests/$suite"
+)
 ```
 
-本地 rm-guard 若要求确认，再为相应命令加 `RM_GUARD_CONFIRM=1` 前缀，允许清理测试
-临时目录；其他环境无需此变量，它也不是隔离开关。
+| `suite` 文件名 | 检查内容 |
+| --- | --- |
+| [install-package-selection.py](tests/install-package-selection.py) | 离线包选择 |
+| [route-menu.py](tests/route-menu.py) | 菜单、写入/恢复、SSH 边界 |
+| [app-integration.py](tests/app-integration.py) | 规则、registry、应用展开 |
+| [discover-apps.py](tests/discover-apps.py) | 原生应用发现 |
+| [vps-integration.py](tests/vps-integration.py) | 合成 VPS 节点/组与 Script |
 
-用例通过临时目录、合成配置和命令替身验证各自边界；部分调用已安装的 Mihomo 做
-`-t` 配置检查。它们不能代替真实 Verge 重载、应用连接或网络路由验收。
+`env -i` 清除继承的 `CLASH_DIR` 等配置目标及私有状态变量，只保留所列环境；HOME、
+XDG 目录和临时目录均为本次专用。`TUN_FIX_WG_ENDPOINTS=off` 另行关闭真实 WireGuard
+发现；只设置它不能隔离配置目标。`RM_GUARD_CONFIRM=1` 仅传给测试及该临时目录的
+清理，以满足本地 rm-guard；未启用该守卫的环境不需要它，它本身不提供隔离。
+
+用例通过合成配置和命令替身验证各自边界；部分调用已安装的 Mihomo 做 `-t` 配置
+检查。它们不能代替真实 Verge 重载、应用连接或网络路由验收。
