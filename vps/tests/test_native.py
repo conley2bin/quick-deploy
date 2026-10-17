@@ -211,6 +211,11 @@ class Native(unittest.TestCase):
         with mock.patch.object(host, 'ROOT', root_alias):
             with self.assertRaisesRegex(host.Error, '[Ss]ymlink'):
                 self.export_without_systemctl()
+        # Decoupling backup from restricted feed access must retain artifact
+        # integrity checks; a drifted native binary cannot define a valid set.
+        host.atomic(self.work / 'bin/caddy', b'drifted-fixture-binary', 0o700)
+        with self.assertRaisesRegex(host.Error, 'binary/geodata drift'):
+            self.export_without_systemctl()
 
     def test_native_api_scope_core_mihomo_and_no_rotation(self):
         before = copy.deepcopy(self.manifest)

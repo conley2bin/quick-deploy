@@ -495,10 +495,14 @@ def validate_feed_scope(manifest, device, data, fmt):
         raise Error('Cross-device credentials present in native subscription')
 
 
-def backend_health(folder, manifest):
+def binary_health(folder):
     stored = read_json(folder / 'binary-hashes.json')
     if any(digest(folder / 'bin' / name) != sha for name, sha in stored.items()):
         raise Error('Installed binary/geodata drift; no automatic upgrade or repair')
+
+
+def backend_health(folder, manifest):
+    binary_health(folder)
     api = API(manifest)
     expected_core = read_json(folder / 'release-lock.json')['core']['version']
     for attempt in range(20):
@@ -817,6 +821,8 @@ def export_backup():
     if (ROOT / 'host.py').is_symlink():
         raise Error('Symlink recovery adapter cannot be exported')
     manifest = read_json(active / 'manifest.json')
+    binary_health(active)
+    verify_artifacts(active / 'artifacts', read_json(active / 'release-lock.json'))
     # Backups must also work for expired/quota/HWID-restricted accounts. Their
     # authoritative snapshot, not successful feed access, defines this export.
     # Caddy storage uses atomic file writes, but its cert/key pair must be taken
