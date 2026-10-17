@@ -82,8 +82,7 @@ def confirm(message):
 
 def configuration(args, saved=None):
     values = dict(saved or {})
-    for key, prompt in [('domain', 'Grey DNS subscription hostname'), ('reality_target', 'Verified REALITY TLS1.3+h2 target hostname'),
-                        ('acme_email', 'ACME contact email')]:
+    for key, prompt in [('domain', 'Grey DNS subscription hostname'), ('reality_target', 'Verified REALITY TLS1.3+h2 target hostname')]:
         provided = getattr(args, key, None)
         if saved and provided and provided != saved[key]:
             raise host.Error('Configuration differs from stored deployment; no silent domain/target change')
@@ -91,8 +90,14 @@ def configuration(args, saved=None):
             values[key] = provided
         if not values.get(key):
             if not sys.stdin.isatty():
-                raise host.Error('First setup requires --domain, --reality-target and --acme-email (or interactive input)')
+                raise host.Error('First setup requires --domain and --reality-target (or interactive input)')
             values[key] = input(prompt + ': ').strip()
+    contact = getattr(args, 'acme_email', None)
+    if saved:
+        if contact is not None and contact != saved['acme_email']:
+            raise host.Error('ACME contact differs from stored deployment; no implicit contact change')
+    else:
+        values['acme_email'] = '' if contact is None else contact
     port = getattr(args, 'proxy_port', None)
     if saved:
         if port is not None and port != saved['proxy_port']:
@@ -402,8 +407,9 @@ def parser():
             a.add_argument('--port', type=int, help='SSH port ONLY; otherwise use verified SSH config')
             a.add_argument('--proxy-port', type=int, help='first setup REALITY listener; default443, saved once')
             a.add_argument('--identity', type=Path)
-            for flag in ('domain', 'reality-target', 'acme-email'):
+            for flag in ('domain', 'reality-target'):
                 a.add_argument('--' + flag)
+            a.add_argument('--acme-email', help='optional explicit CA contact; default none, saved contact retained')
         if name in ('deploy', 'replace', 'restore'):
             a.add_argument('--backup', type=Path, help='existing private unencrypted recovery archive')
             a.add_argument('--mihomo', help='native core executable for profile validation')

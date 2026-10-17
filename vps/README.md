@@ -28,6 +28,13 @@ OpenSSL、systemd/`systemd-analyze`、`ss`、`nft`、可信 CA 包及至少2GiB�
 
 域名由用户控制并设置 **DNS-only/灰云** A 记录；不需要 Cloudflare API key。
 HTTP01需要公网80可达，Caddy禁用 TLS-ALPN 挑战和自动重定向，明确不占用443。
+ACME邮箱**默认不提供、不提示填写**；配置保留`acme_email: ""`。只有用户首次明确传
+`--acme-email`才使用经验证的联系人，不从截图或账户自动取值；旧配置已保存的联系人
+在省略参数时原样保留，不自动清除。签发机构固定为Let's Encrypt，不自动换其他CA。
+Caddy自动续期依靠其任务和HTTP01/DNS可达，不依赖邮箱提醒。
+[Let's Encrypt公告](https://letsencrypt.org/2025/06/26/expiration-notification-service-has-ended/)
+说明到期通知已于2025-06-04结束、新提交联系人转交ISRG独立系统；此工具默认不传联系人，
+不承诺CA邮件提醒，也不额外接入通知服务。
 已有防火墙规则、占用端口、外来同名 unit 或旧代理目录会拒绝，**不清空/开放规则、
 不停止外来服务、不接管旧机器**。四个unit在实际systemd加载路径中的同名定义、
 精确/前缀/类型drop-in、四个名称的`.wants/`/`.requires/`外加依赖边，以及有效
@@ -41,13 +48,12 @@ FragmentPath/DropInPaths/SourcePath/运行时配置均检查；悬空/链接依�
 在完整仓库的管理 PC 运行，不要 sudo 整个入口，不要在未批准时联系 VPS：
 
 ```bash
-# 首次也可省略三项配置，终端会逐项询问；保存一次，重跑不重生身份。
+# 首次只需域名与目标；省略时终端询问这两项。默认不填写邮箱。
 bash vps/setup.sh preflight --ssh root@<公网IPv4> \
-  --domain sub.example.org --reality-target <经验证的目标域名> \
-  --acme-email operator@example.org
+  --domain sub.example.org --reality-target <经验证的目标域名>
 bash vps/setup.sh deploy --ssh root@<公网IPv4> \
-  --domain sub.example.org --reality-target <同一目标域名> \
-  --acme-email operator@example.org
+  --domain sub.example.org --reality-target <同一目标域名>
+# 可选：仅在明确愿意提供CA联系地址时，首次加 --acme-email <自选联系邮箱>。
 # 非默认 SSH 端口/身份：追加 --port 2222 --identity "$HOME/.ssh/<实际密钥>"
 # 非默认代理监听：仅首次追加 --proxy-port <已审阅端口>；默认443。
 

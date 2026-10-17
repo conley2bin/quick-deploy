@@ -135,8 +135,11 @@ def validate_config(config):
         raise Error('Invalid proxy_port or conflict with certificate/subscription/management listener')
     hostname(config['domain'])
     hostname(config['reality_target'])
-    if not re.fullmatch(r'[^\s@{}]+@[^\s@{}]+\.[^\s@{}]+', config['acme_email']):
-        raise Error('Require an ACME contact email')
+    email = config['acme_email']
+    if not isinstance(email, str) or (email and not re.fullmatch(r'[^\s@{}]+@[^\s@{}]+\.[^\s@{}]+', email)):
+        raise Error('ACME contact must be empty or a valid email')
+    if email:
+        hostname(email.rsplit('@', 1)[1])
     if config['domain'] == config['reality_target']:
         raise Error('The subscription hostname cannot be its own REALITY target')
 
@@ -455,13 +458,14 @@ def caddyfile(manifest, published):
         }}
     }}
 ''' if published and paths else ''
+    contact = manifest['config']['acme_email']
+    email_option = '    email ' + json.dumps(contact) + '\n' if contact else ''
     return f'''{{
     admin off
     auto_https disable_redirects
     http_port 80
     https_port 8443
-    email {manifest['config']['acme_email']}
-    log default {{
+{email_option}    log default {{
         output discard
     }}
     servers {{
