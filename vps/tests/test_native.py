@@ -206,6 +206,11 @@ class Native(unittest.TestCase):
                     self.assertEqual((outside / 'sentinel').read_text(), 'outside-owned-secret-fixture')
                 finally:
                     link.unlink()
+        root_alias = self.root / 'owned-root-link'
+        root_alias.symlink_to(host.ROOT, target_is_directory=True)
+        with mock.patch.object(host, 'ROOT', root_alias):
+            with self.assertRaisesRegex(host.Error, '[Ss]ymlink'):
+                self.export_without_systemctl()
 
     def test_native_api_scope_core_mihomo_and_no_rotation(self):
         before = copy.deepcopy(self.manifest)

@@ -810,6 +810,8 @@ def reject_symlinks(root):
 
 
 def export_backup():
+    if ROOT.is_symlink():
+        raise Error('Symlink owned root cannot be exported')
     active = ROOT / 'active'
     reject_symlinks(active)
     if (ROOT / 'host.py').is_symlink():
