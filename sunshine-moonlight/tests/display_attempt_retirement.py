@@ -65,6 +65,23 @@ class Kernel:
         self.t.put(Path("/proc")/self.t.props["MainPID"]/"cgroup", ("0::"+self.cg+"\n").encode())
         self.base_run = self.t.run
         self.t.run = self.run
+        self.t.require_scope_removed = self.require_scope_removed
+        self.targeted_lookups = []
+
+    def require_scope_removed(self, path, expected_parent):
+        # Kernel-like counterpart of the native dirfd primitive. Never enumerate.
+        self.targeted_lookups.append(path)
+        def parent():
+            value = self.t.identity(path.parent)
+            observed = (value.device,value.inode,value.mode,value.uid,value.gid)
+            if observed != expected_parent or self.t.realpath(path.parent) != path.parent:
+                rt.retirement_refused("fixture old parent changed")
+        parent()
+        for _ in range(2):
+            try: self.t.identity(path)
+            except FileNotFoundError: parent()
+            else: rt.retirement_refused("fixture old child reappeared")
+        return True
 
     def run(self, argv, *, timeout, max_output):
         if argv == SHOW:
@@ -131,6 +148,116 @@ class Kernel:
             assert witness["witness"]["terminal"]["MainPID"] == "0"
             assert witness["witness"]["cgroup_retirement"] in ("removed", "hierarchical_empty")
             self.events.append("witness-before-start")
+
+
+class ScopeLookupTransportTests(unittest.TestCase):
+    """Actual openat/fstatat on private directories; no native cgroup or bus."""
+    def setUp(self):
+        import tempfile
+        self.temp = tempfile.TemporaryDirectory(prefix="qd-scope-lookup-")
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        # Exercise only the new primitive, not the native user-bus constructor.
+        self.transport = object.__new__(rt.RetirementTransport)
+
+    def target(self, name):
+        parent = self.root/name; parent.mkdir(mode=0o700)
+        info = parent.lstat()
+        return parent/rt.UNIT,(info.st_dev,info.st_ino,info.st_mode,info.st_uid,info.st_gid)
+
+    def test_cardinality_independent_two_target_lookups_and_presence(self):
+        for count in (128,129,558,8192):
+            with self.subTest(siblings=count):
+                path,expected = self.target(str(count))
+                for n in range(count): (path.parent/("sibling-"+str(n))).touch()
+                real_stat = rt.os.stat; lookups = []
+                def observe(name,**kw):
+                    if kw.get("dir_fd") is not None:
+                        self.assertEqual(name,rt.UNIT); self.assertIs(kw.get("follow_symlinks"),False)
+                        lookups.append(kw["dir_fd"])
+                    return real_stat(name,**kw)
+                with mock.patch.object(rt.os,"scandir",side_effect=AssertionError("no enumeration")), \
+                     mock.patch.object(self.transport,"listdir",side_effect=AssertionError("no generic listing")), \
+                     mock.patch.object(rt.os,"stat",side_effect=observe):
+                    self.assertTrue(self.transport.require_scope_removed(path,expected))
+                    self.assertEqual(len(lookups),2)
+                    path.mkdir()
+                    with self.assertRaises(Refusal): self.transport.require_scope_removed(path,expected)
+                for fd in lookups:
+                    with self.assertRaises(OSError): rt.os.fstat(fd)  # Every descriptor was closed.
+
+    def test_present_directory_file_and_dangling_symlink_are_not_absent(self):
+        for kind in ("directory","file","dangling-link","directory-link"):
+            with self.subTest(kind=kind):
+                path,expected = self.target(kind)
+                if kind == "directory": path.mkdir()
+                elif kind == "file": path.touch()
+                else: path.symlink_to(path.parent/("missing" if kind == "dangling-link" else "."))
+                with self.assertRaises(Refusal): self.transport.require_scope_removed(path,expected)
+
+    def test_parent_identity_disappearance_symlink_and_wrong_type_refuse(self):
+        path,expected = self.target("mismatch")
+        for column in range(5):
+            bad = list(expected);bad[column] += 1
+            with self.assertRaises(Refusal): self.transport.require_scope_removed(path,tuple(bad))
+        for kind in ("missing","symlink","file"):
+            with self.subTest(kind=kind):
+                path,expected = self.target(kind)
+                path.parent.rename(self.root/(kind+"-original"))
+                if kind == "symlink": path.parent.symlink_to(self.root/(kind+"-original"),target_is_directory=True)
+                elif kind == "file": path.parent.touch()
+                with self.assertRaises(Refusal): self.transport.require_scope_removed(path,expected)
+
+    def test_permission_and_io_errors_never_mean_absence(self):
+        import errno
+        path,expected = self.target("errors")
+        for error in (PermissionError(errno.EACCES,"fixture permission"),OSError(errno.EIO,"fixture I/O"),
+                      OSError(errno.ENOTDIR,"fixture not-directory")):
+            real_stat = rt.os.stat
+            def fail_target(name,**kw):
+                if kw.get("dir_fd") is not None: raise error
+                return real_stat(name,**kw)
+            with mock.patch.object(rt.os,"stat",side_effect=fail_target),self.assertRaises(Refusal):
+                self.transport.require_scope_removed(path,expected)
+            with mock.patch.object(rt.os,"open",side_effect=error),self.assertRaises(Refusal):
+                self.transport.require_scope_removed(path,expected)
+            with mock.patch.object(self.transport,"identity",side_effect=error),self.assertRaises(Refusal):
+                self.transport.require_scope_removed(path,expected)
+
+    def test_parent_replacement_and_anchored_rename_restore_refuse(self):
+        for variant in ("replace","restore","disappear"):
+            restore = variant == "restore"
+            with self.subTest(variant=variant):
+                path,expected = self.target("parent-"+variant)
+                if restore: path.mkdir()  # Must be seen through old FD even while name points elsewhere.
+                real_stat = rt.os.stat; changed = []
+                def replace_parent(name,**kw):
+                    if kw.get("dir_fd") is not None and not changed:
+                        changed.append(True); saved=path.parent.with_name(path.parent.name+"-saved")
+                        path.parent.rename(saved)
+                        if variant != "disappear": path.parent.mkdir()
+                        if restore:
+                            try: return real_stat(name,**kw)
+                            finally: path.parent.rmdir();saved.rename(path.parent)
+                    return real_stat(name,**kw)
+                with mock.patch.object(rt.os,"stat",side_effect=replace_parent),self.assertRaises(Refusal):
+                    self.transport.require_scope_removed(path,expected)
+                self.assertTrue(changed)
+
+    def test_child_recreation_between_target_lookups_refuses(self):
+        path,expected = self.target("recreation")
+        real_stat = rt.os.stat; calls = []
+        def recreate(name,**kw):
+            if kw.get("dir_fd") is not None:
+                calls.append(kw["dir_fd"])
+                if len(calls)==1:
+                    try: return real_stat(name,**kw)
+                    except FileNotFoundError:
+                        path.mkdir(); raise
+            return real_stat(name,**kw)
+        with mock.patch.object(rt.os,"stat",side_effect=recreate),self.assertRaises(Refusal):
+            self.transport.require_scope_removed(path,expected)
+        self.assertEqual(len(calls),2)
 
 
 class RecoveryTests(unittest.TestCase):
@@ -455,6 +582,46 @@ class RecoveryTests(unittest.TestCase):
         record = json.loads(next((f.controller/"state").glob("attempt-stopped-*.bak")).read_bytes())
         self.assertEqual(record["witness"]["cgroup_retirement"],"removed")
         self.assertEqual(k.controls,["stop","start"])
+
+    def test_removed_scope_with_many_siblings_never_calls_generic_listdir(self):
+        for count in (128,129,558,8192):
+            with self.subTest(siblings=count):
+                f = self.retained(di.Fixture(Path(self.temp.name)/str(count)))
+                k = f.kernel
+                def remove(action):
+                    if action != "stop": return
+                    for path in list(f.t.files):
+                        if k.path in path.parents: f.t.files.pop(path); f.t.ids.pop(path,None)
+                    f.t.dirs.remove(k.path); f.t.ids.pop(k.path); k.removed = True
+                    for n in range(count): f.t.mkdir(k.path.parent/("fixture-sibling-"+str(n)))
+                k.after_control = remove
+                listing = f.t.listdir
+                def no_scope_listing(path):
+                    if path == k.path.parent: raise AssertionError("single-child removal must not enumerate siblings")
+                    return listing(path)
+                f.t.listdir = no_scope_listing
+                self.assertTrue(self.recover(f)["ok"])
+                self.assertEqual(k.controls,["stop","start"])
+                self.assertTrue(k.targeted_lookups)
+
+    def test_removed_scope_requires_positive_targeted_transport_not_listing(self):
+        for value in (None,False,1,"missing"):
+            with self.subTest(value=value):
+                f = self.retained(di.Fixture(Path(self.temp.name)/str(value)))
+                k = f.kernel
+                original = (f.controller/"state/reservation.json").read_bytes()
+                def remove(action):
+                    if action != "stop": return
+                    for path in list(f.t.files):
+                        if k.path in path.parents: f.t.files.pop(path);f.t.ids.pop(path,None)
+                    f.t.dirs.remove(k.path);f.t.ids.pop(k.path);k.removed=True
+                    if value == "missing": del f.t.require_scope_removed
+                    else: f.t.require_scope_removed = lambda *args:value
+                k.after_control = remove
+                with self.assertRaises(Refusal): self.recover(f)
+                self.assertEqual(k.controls,["stop"])
+                self.assertEqual((f.controller/"state/reservation.json").read_bytes(),original)
+                self.assertFalse(list((f.controller/"state").glob("attempt-start-issued-*.bak")))
 
     def test_uncertain_control_never_repeated_even_if_terminal_or_successor(self):
         for fault in ("stop-before","stop-after","start-before","start-after"):

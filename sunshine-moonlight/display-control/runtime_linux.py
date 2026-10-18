@@ -954,6 +954,43 @@ class RetirementTransport(LocalTransport):
                 "DBUS_SESSION_BUS_ADDRESS": f"unix:path=/run/user/{self.uid}/bus",
                 "LC_ALL": "C", "PATH": "/usr/bin:/bin", "SYSTEMD_PAGER": "", "SYSTEMD_COLORS": "0"}
 
+    def require_scope_removed(self, path, expected_parent):
+        """Two no-follow lookups of ONE known child in the pinned parent FD.
+
+        No sibling enumeration or cardinality limit. The open descriptor binds
+        ENOENT to the original parent, not to a transient replacement pathname.
+        Named/canonical parent checks surround both lookups; any presence,
+        including a dangling symlink, is a contradiction rather than absence.
+        """
+        if (not isinstance(path, Path) or not path.is_absolute() or ".." in path.parts or path.name != UNIT
+                or type(expected_parent) is not tuple or len(expected_parent) != 5
+                or any(type(v) is not int or v < 0 for v in expected_parent)
+                or not stat.S_ISDIR(expected_parent[2])):
+            retirement_refused("invalid exact old scope/parent removal target")
+        parent, fd = path.parent, None
+        def stamp(value):
+            return (value.device, value.inode, value.mode, value.uid, value.gid)
+        try:
+            fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+            def check_parent():
+                if (stamp(FileIdentity.from_stat(os.fstat(fd))) != expected_parent
+                        or stamp(self.identity(parent)) != expected_parent or self.realpath(parent) != parent):
+                    retirement_refused("old scope parent descriptor/path changed")
+            check_parent()
+            for _ in range(2):
+                try:
+                    os.stat(path.name, dir_fd=fd, follow_symlinks=False)
+                except FileNotFoundError:
+                    check_parent()
+                else:
+                    retirement_refused("old scope child exists/reappeared; removal is contradictory")
+            return True
+        except (OSError, ValueError) as exc:
+            raise Refusal("attempt_retirement_unproven", "targeted old-scope removal proof unavailable") from exc
+        finally:
+            if fd is not None:
+                os.close(fd)
+
 
 @dataclass(frozen=True)
 class RetirementBoundary:
@@ -1168,8 +1205,9 @@ class AttemptRetirement:
         try:
             identity = self.directory(path)
         except FileNotFoundError:
-            if path.name in self.transport.listdir(path.parent):
-                retirement_refused("old stopped scope removal is contradictory")
+            targeted = getattr(self.transport, "require_scope_removed", None)
+            if not callable(targeted) or targeted(path, boundary.parent_identity) is not True:
+                retirement_refused("positive targeted old-scope removal proof is unavailable")
             scope = "removed"
         else:
             if identity != boundary.cgroup_identity or self.populated(path):
