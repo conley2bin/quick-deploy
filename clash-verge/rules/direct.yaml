@@ -3,6 +3,8 @@
 # to an earlier subscription exception. See ../README.md.
 version: 1
 pre:
+  - "DOMAIN,pan.quark.cn,DIRECT"
+  - "DOMAIN,drive.quark.cn,DIRECT"
   - "DOMAIN,ssh.github.com,DIRECT"
   - "DST-PORT,22,DIRECT"
   # Tailscale control/log/DERP domains plus the tailnet CGNAT and ULA peer ranges.
