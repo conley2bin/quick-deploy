@@ -88,6 +88,98 @@ post:
             self.assertNotEqual(rules.render(first), rules.render(second))
             self.assertEqual(original, hashlib.sha256(direct_path.read_bytes() + proxy_path.read_bytes()).hexdigest())
 
+    def test_manifest_backed_baidu_layouts_render_stably_without_policy_writeback(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            direct_path, proxy_path = write_sources(
+                directory / "rules", "version: 1\npre:\n  - app: baidunetdisk\npost: []\n",
+                "version: 1\npre: []\npost: []\n",
+            )
+            original = (direct_path.read_bytes(), proxy_path.read_bytes())
+            source = rules.parsed_sources(direct_path, proxy_path)
+            for layout, roles in (("4.17.8", ("main",)), ("8.6.0", ("main", "helper"))):
+                root = directory / f"relocated {layout}"
+                root.mkdir()
+                manifest = []
+                for role, relative, _required in discover_apps.SPECS["baidunetdisk"].programs:
+                    if role in roles:
+                        path = root / relative
+                        path.write_bytes(b"\x7fELFfixture")
+                        path.chmod(0o755)
+                        manifest.append(str(path))
+                evidence = discover_apps.Evidence("linux", {"baidunetdisk": manifest})
+                result = discover_apps.resolve_app("baidunetdisk", evidence)
+                self.assertEqual(result.status, "resolved", result)
+                resolver = fake_discover({"baidunetdisk": result})
+                expanded = rules.resolve_app_rules(source, resolver)
+                self.assertEqual([item.text for item in expanded["pre"]],
+                                 [f"PROCESS-PATH,{path},DIRECT" for path in manifest])
+                self.assertEqual(rules.render(expanded), rules.render(rules.resolve_app_rules(source, resolver)))
+                if "helper" in roles:
+                    (root / "netdisk_service").unlink()
+                    broken = discover_apps.resolve_app("baidunetdisk", evidence)
+                    self.assertEqual(broken.status, "missing", broken)
+                    with self.assertRaisesRegex(rules.SourceError, "cannot resolve PROCESS-PATH"):
+                        rules.resolve_app_rules(source, fake_discover({"baidunetdisk": broken}))
+            self.assertEqual(original, (direct_path.read_bytes(), proxy_path.read_bytes()))
+
+    def test_misplaced_baidu_helper_blocks_render_apply_before_writes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            root = directory / "opt/baidunetdisk"
+            root.mkdir(parents=True)
+            main = root / "baidunetdisk"
+            main.write_bytes(b"\x7fELFfixture")
+            main.chmod(0o755)
+            rules_dir = directory / "rules"
+            direct, proxy = write_sources(
+                rules_dir, "version: 1\npre:\n  - app: baidunetdisk\npost: []\n",
+                "version: 1\npre: []\npost: []\n",
+            )
+            original = (direct.read_bytes(), proxy.read_bytes())
+            home = directory / "home"
+            state = home / ".local/share/io.github.clash-verge-rev.clash-verge-rev"
+            profiles = state / "profiles"
+            profiles.mkdir(parents=True)
+            registry = state / "profiles.yaml"
+            registry.write_text("items:\n- uid: Script\n  type: script\n  file: Script.js\n", encoding="utf-8")
+            script = profiles / "Script.js"
+            script.write_text("// sentinel\n", encoding="utf-8")
+            baseline = (script.read_bytes(), registry.read_bytes(), script.stat().st_mtime_ns)
+            fake_bin = directory / "bin"
+            fake_bin.mkdir()
+            dpkg = fake_bin / "dpkg-query"
+            dpkg.write_text(
+                '#!/bin/sh\ncase "$*" in\n  *baidunetdisk*)\n'
+                '    if [ "$1" = "-L" ]; then printf "%s\\n" "$BAIDU_ROOT" "$BAIDU_MAIN" "$BAIDU_HELPER"; '
+                'else printf installed; fi;;\nesac\n', encoding="utf-8",
+            )
+            dpkg.chmod(0o755)
+            for helper in (root / "bin/netdisk_service", directory / "usr/lib/baidunetdisk/netdisk_service"):
+                helper.parent.mkdir(parents=True, exist_ok=True)
+                for present in (False, True):
+                    with self.subTest(helper=helper, present=present):
+                        if present:
+                            helper.write_bytes(b"\x7fELFfixture")
+                            helper.chmod(0o755)
+                        environment = dict(
+                            os.environ, HOME=str(home), RULES_DIR=str(rules_dir),
+                            PATH=f"{fake_bin}:{os.environ['PATH']}", BAIDU_ROOT=str(root),
+                            BAIDU_MAIN=str(main), BAIDU_HELPER=str(helper),
+                        )
+                        for action in ("render", "apply"):
+                            result = subprocess.run(
+                                ["bash", str(CLASH / "tun-fix.sh"), "rules", action],
+                                cwd=ROOT, env=environment, text=True, capture_output=True, check=False,
+                            )
+                            self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                            self.assertIn("unsupported Baidu helper layout", result.stderr)
+                        self.assertEqual(baseline, (script.read_bytes(), registry.read_bytes(), script.stat().st_mtime_ns))
+                        self.assertEqual(sorted(path.name for path in profiles.iterdir()), ["Script.js"])
+                        self.assertEqual(original, (direct.read_bytes(), proxy.read_bytes()))
+                        if present:
+                            helper.unlink()
+
     def test_schema_process_validation_and_expanded_collision_fail_explicitly(self) -> None:
         valid_direct = """version: 1
 pre:

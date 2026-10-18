@@ -33,7 +33,7 @@ class AppSpec:
     packages: tuple[str, ...]
     desktop_files: tuple[str, ...]
     process_names: tuple[str, ...]
-    # role, path relative to the dynamically discovered install root, required
+    # role, relative path, required in manifest; declared roles always validate
     programs: tuple[tuple[str, str, bool], ...]
     # number of parent directories from the main executable to its install root
     main_root_parents: int
@@ -43,7 +43,7 @@ SPECS: dict[str, AppSpec] = {
     "baidunetdisk": AppSpec(
         "baidunetdisk", "Baidu Netdisk", ("baidunetdisk",),
         ("baidunetdisk.desktop",), ("baidunetdisk", "netdisk_service"),
-        (("main", "baidunetdisk", True), ("helper", "netdisk_service", True)), 1,
+        (("main", "baidunetdisk", True), ("helper", "netdisk_service", False)), 1,
     ),
     "wemeet": AppSpec(
         "wemeet", "Tencent Meeting", ("wemeet",), ("wemeetapp.desktop",),
@@ -237,8 +237,9 @@ def resolve_app(
 ) -> DiscoveryResult:
     """Resolve one canonical app ID from package metadata, safely and deterministically.
 
-    A package must identify every required app-owned executable in one root.  Two
-    valid roots are an ambiguity, even if the package happens to own both.  A
+    A package must identify every required app-owned executable in one root.
+    Optional roles may be absent from the manifest, never broken when declared.
+    Two valid roots are an ambiguity, even if the package happens to own both. A
     shell wrapper, shared interpreter, broken symlink, non-executable, or unsafe
     delimiter path never becomes a candidate process rule.
     """
@@ -303,7 +304,7 @@ def resolve_app(
             )
         if failure:
             invalid_reasons.append(failure)
-        elif len(discovered) == len(spec.programs):
+        else:  # Every required role and every manifest-declared role validated.
             valid_roots.append((root, tuple(discovered)))
 
     all_manifest_paths = {path for roles in roots.values() for candidates in roles.values() for path in candidates}
@@ -332,6 +333,19 @@ def resolve_app(
         )
 
     _root, executables = valid_roots[0]
+    if app_id == "baidunetdisk":
+        # Directory-derived candidate roots are not supported installations.
+        # Every known helper declaration must belong to the validated layout.
+        unassigned_helpers = sorted({
+            path for path in evidence.package_files.get("baidunetdisk", ())
+            if Path(path).name == "netdisk_service"
+            and path not in roots[_root].get("helper", ())
+        })
+        if unassigned_helpers:
+            return DiscoveryResult(
+                spec.app_id, spec.name, "unsupported", (), tuple(desktop_evidence),
+                "unsupported Baidu helper layout: " + ", ".join(unassigned_helpers),
+            )
     observed_processes = _process_evidence(evidence.processes, {item.path for item in executables})
     enriched = tuple(
         DiscoveredExecutable(
@@ -340,7 +354,13 @@ def resolve_app(
         )
         for item in executables
     )
-    return DiscoveryResult(spec.app_id, spec.name, "resolved", enriched, tuple(desktop_evidence))
+    coverage_evidence = tuple(
+        f"package-manifest:{spec.packages[0]}: {role} not declared ({relative}); not included in coverage"
+        for role, relative, required in spec.programs
+        if not required and role not in roots[_root]
+    )
+    return DiscoveryResult(spec.app_id, spec.name, "resolved", enriched,
+                           tuple(desktop_evidence) + coverage_evidence)
 
 
 def _run(*command: str) -> str | None:
