@@ -19,6 +19,7 @@ import pwd
 import re
 import stat
 import sys
+import uuid
 
 # -I excludes the caller's cwd/PYTHONPATH, including the script directory.
 # Only the explicit local/validated installed source directory is importable.
@@ -1129,6 +1130,694 @@ def repair_owned_release(root, version, serial, installed, desktop, files, ref, 
     return True
 
 
+# This separate ENROLL transition retires only positively unlaunched, failed
+# preparations. It grants idle authority, never capture/launch authority. Keep
+# lifecycle's RPC enrollment guard unchanged and do not nest its operation lock.
+UNLAUNCHED_RECORDS = ("reservation.json", "operation.json", "start-receipt.json", "prepare-backup.conf")
+
+
+def unlaunched_refused(reason):
+    fail("unlaunched_retirement_refused", "Unlaunched preparation retirement refused: " + reason)
+
+
+def retirement_generation(value, uid):
+    try:
+        if type(value) is not dict or set(value) != set(rt.Generation.__dataclass_fields__):
+            raise ValueError("fields")
+        generation = rt.Generation(**value)
+        boot = generation.boot_id.replace("-", "")
+        if (not re.fullmatch("[0-9a-f]{32}", boot)
+                or generation.boot_id not in (boot, str(uuid.UUID(boot)))
+                or type(generation.invocation_id) is not str
+                or not re.fullmatch("[0-9a-f]{32}", generation.invocation_id)
+                or generation.unit not in (rt.UNIT, rt.ALIAS) or type(generation.uid) is not int
+                or generation.uid != uid or any(type(v) is not int or not 0 < v < (1 << 63)
+                    for v in (generation.pid, generation.start_ticks, generation.start_monotonic_usec))):
+            raise ValueError("birth")
+        return replace(generation, boot_id=boot)
+    except (ValueError, TypeError, AttributeError):
+        unlaunched_refused("invalid exact process birth")
+
+
+def retired_generation(generation, current, transport):
+    """Positive boot retirement OR exact dead/absent/reused birth + newer unit."""
+    if generation.unit != current.unit or generation.uid != current.uid:
+        unlaunched_refused("retired generation belongs to another unit/user")
+    if generation.boot_id != current.boot_id:
+        return {"kind": "previous_boot"}
+    if (generation.invocation_id == current.invocation_id
+            or current.start_monotonic_usec <= generation.start_monotonic_usec):
+        unlaunched_refused("no qualified newer invocation retires the old birth")
+    try:
+        data = transport.read(Path("/proc") / str(generation.pid) / "stat", limit=4096)
+    except FileNotFoundError:
+        return {"kind": "absent_old_process", "new_invocation": current.invocation_id}
+    except OSError:
+        unlaunched_refused("old process retirement is inaccessible")
+    try:
+        if type(data) is not bytes or len(data) > 4096:
+            raise ValueError("bound")
+        text = data.decode("ascii")
+        end = text.rfind(")")
+        fields = text[end + 2:].split() if end > 0 else []
+        if (not text.startswith(str(generation.pid) + " (") or len(fields) < 20
+                or not re.fullmatch("[1-9][0-9]*", fields[19]) or len(fields[0]) != 1
+                or fields[0] not in "RSDZTtWXxKPI"):
+            raise ValueError("stat")
+        ticks = int(fields[19])
+        if ticks == generation.start_ticks and fields[0] not in ("Z", "X", "x"):
+            unlaunched_refused("the exact old process birth remains alive")
+        return {"kind": "pid_reused" if ticks != generation.start_ticks else "dead_process",
+                "start_ticks": ticks, "state": fields[0]}
+    except (ValueError, UnicodeError):
+        unlaunched_refused("invalid old process birth evidence")
+
+
+def retirement_receipt(controller, desktop, current, lease, enrollment, before, after, transport, *, committed=False):
+    """Pending startup authority and committed read-only preservation are distinct."""
+    if controller.files.read("start-receipt.json") is None:
+        return {"kind": "absent"}, None
+    receipt = controller.receipt(desktop)  # Schema only; explicit qualification follows.
+    envelope = controller.files.document("start-receipt.json")
+    if receipt is None:
+        unlaunched_refused("receipt Desktop context differs")
+    try:
+        issuance = envelope["issuance"]
+        issued = retirement_generation(asdict(receipt.generation), current.generation.uid)
+        previous = retirement_generation(issuance["previous_generation"], current.generation.uid)
+        def fingerprint(value, uid, executable=False):
+            ident = value.identity
+            if (type(value.sha256) is not str or not re.fullmatch("[0-9a-f]{64}", value.sha256)
+                    or any(type(v) is not int or v < 0 for v in asdict(ident).values())
+                    or not stat.S_ISREG(ident.mode) or ident.uid != uid or ident.mode & 0o022
+                    or (executable and not ident.mode & 0o111)):
+                raise ValueError("fingerprint")
+        fingerprint(receipt.config, current.generation.uid)
+        fingerprint(receipt.executable, 0, True)
+        if (receipt.host_uniqueid != controller.host.uuid
+                or receipt.qualified_build != controller.settings.runtime.build
+                or receipt.executable.sha256 != current.binary.file.sha256
+                or receipt.executable.identity.size != current.binary.file.identity.size
+                or receipt.unit_digest != current.unit.ownership_digest
+                or receipt.config_path != current.config.path or receipt.config_root != current.config.root
+                or receipt.manager_environment_digest != current.config.manager_environment_digest
+                or type(issuance["enrollment_revision"]) is not int
+                or not 1 <= issuance["enrollment_revision"] <= enrollment["revision"]
+                or previous.unit != issued.unit or previous.boot_id != issued.boot_id
+                or previous.invocation_id == issued.invocation_id
+                or previous.start_monotonic_usec >= issued.start_monotonic_usec):
+            raise ValueError("context")
+        intent = lease is not None and issuance["operation"] == lease["restart_id"]
+        if intent:
+            if (previous != retirement_generation(lease["previous_generation"], issued.uid)
+                    or issuance["enrollment_revision"] != enrollment["revision"]
+                    or receipt.config.sha256 != cfg.digest(after)
+                    or receipt.config.identity.size != len(after)):
+                raise ValueError("intent")
+            kind = "this_restart"
+        else:
+            # Full known bytes and stable context explain preservation, never
+            # current authority. Boot inequality cannot establish chronology.
+            if (receipt.config.sha256 not in (cfg.digest(before), cfg.digest(after))
+                    or receipt.config.identity.size != (len(before) if receipt.config.sha256 == cfg.digest(before) else len(after))):
+                raise ValueError("historical config")
+            kind = "independent_history" if committed else "retired_history"
+            if not committed:
+                reserved = retirement_generation(lease["previous_generation"], issued.uid)
+                if issued == current.generation or previous == reserved:
+                    raise ValueError("unrelated current issuer contradicts pending intent")
+                if issued.boot_id == reserved.boot_id:
+                    if issued != reserved and (issued.invocation_id == reserved.invocation_id
+                            or issued.start_monotonic_usec >= reserved.start_monotonic_usec):
+                        raise ValueError("receipt is not prior to the reserved birth")
+                    kind = "prior_history"  # An actual same-boot ordering proof.
+                elif issued.boot_id == current.generation.boot_id:
+                    raise ValueError("unrelated post-reboot issuer contradicts pending intent")
+                # A third boot proves only retired/noncurrent preservation.
+                # Do not invent its order relative to the reserved boot.
+    except (ValueError, KeyError, TypeError, AttributeError):
+        unlaunched_refused("receipt lacks qualified host/build/unit/root/config/Desktop/issuance context")
+    matching = False
+    try:
+        controller.runtime._match_receipt(receipt, current)
+        matching = True
+    except Refusal as exc:
+        if exc.code != "receipt_mismatch":
+            raise
+    if matching and not intent:
+        if not committed:
+            unlaunched_refused("an unrelated current receipt cannot authorize a pending preparation")
+        kind = "independent_current"  # Read-only replay; no new authority.
+    retirement = None
+    if not matching:
+        # A same-generation after receipt can remain after positive disk CAS
+        # rollback; it is historical for disk ownership, not a loaded-B claim.
+        rollback_split = (intent and issued == current.generation
+                          and lease["stage"] == "rolled_back_requires_reconciliation")
+        if not rollback_split:
+            retirement = retired_generation(issued, current.generation, transport)
+    authority_receipt = receipt if matching and intent and not committed else None
+    return {"kind": kind, "current_match": matching, "retirement": retirement}, authority_receipt
+
+
+def unlaunched_evidence(installed, records, transport, info):
+    controller = lc.HostController(installed, rt.LinuxRuntime(installed.runtime, transport), None, info, None)
+    controller.files = IdentityRecords(records)
+    meta = controller.meta()
+    state = rs._decode(records["reservation.json"], controller.host)
+    status, lease = state.status, meta["lease"]
+    fields = {"owner_digest", "stage", "selection_desktop", "display_id", "selector", "topology",
+              "desktop_digest", "before_digest", "after_digest", "restart_id", "previous_generation"}
+    if (status.phase is not rs.Phase.RECONCILIATION_REQUIRED
+            or status.uncertainty is not rs.Uncertainty.RUNTIME_CHANGED
+            or status.launch_attempted or status.active_observed or status.desktop is not None
+            or status.binding is None or state.owner_digest is None or meta["enrollment"] is None
+            or meta["enrollment"]["revision"] >= status.revision or status.revision >= rs.MAX_REVISION
+            or lease is None or set(lease) != fields or lease["owner_digest"] != state.owner_digest
+            or lease["stage"] not in ("restart_intent", "rolled_back_requires_reconciliation")):
+        unlaunched_refused("exact enrolled, owned, unlaunched runtime_changed preparation required")
+    try:
+        previous = retirement_generation(lease["previous_generation"], installed.runtime.uid)
+        bound = status.binding.generation
+        if (lc.service_generation(previous) != replace(bound, boot_id=bound.boot_id.replace("-", ""))
+                or lc.canonical_uuid(lease["restart_id"]) != lease["restart_id"]
+                or any(type(lease[k]) is not str or not re.fullmatch("[0-9a-f]{64}", lease[k])
+                       for k in ("before_digest", "after_digest", "topology", "desktop_digest"))
+                or lease["before_digest"] != status.binding.config_digest
+                or lease["topology"] != status.binding.topology_digest
+                or type(lease["selector"]) is not str or not 1 <= len(lease["selector"]) <= 80
+                or any(ord(c) < 32 or ord(c) == 127 for c in lease["selector"])
+                or type(lease["display_id"]) is not str or not re.fullmatch(
+                    r"kms:card[0-9]+:" + re.escape(lease["selector"]), lease["display_id"])):
+            raise ValueError("intent")
+    except (ValueError, TypeError, AttributeError):
+        unlaunched_refused("restart intent does not match reserved generation/config/topology")
+    before = records["prepare-backup.conf"]
+    after = cfg.select_output(before, lease["selector"])
+    if (cfg.digest(before) != lease["before_digest"] or cfg.digest(after) != lease["after_digest"]
+            or cfg.get_settings(before)["capture"] != "kms"):
+        unlaunched_refused("backup/selection reconstruction does not match KMS before/after context")
+    disk, _ = cfg.load(installed.runtime.config_file)
+    if ((lease["stage"] == "restart_intent" and disk != after)
+            or (lease["stage"] == "rolled_back_requires_reconciliation" and (before == after or disk != before))):
+        unlaunched_refused("disk is neither the exact planned after-config nor positive CAS rollback")
+    facts = cfg.get_settings(disk)
+    owned = controller.sample_ownership({"address": facts["bind_address"], "port": installed.base_port}, use_receipt=False)
+    current, desktop = owned.current, owned.desktop
+    if (owned.content != disk or owned.endpoint.state != "FREE" or owned.endpoint.currentgame != 0
+            or not current.binary.supported_build or current.host_uniqueid != installed.host_uniqueid
+            or current.binary.file.sha256 != installed.runtime.build.executable_sha256
+            or current.generation.unit != previous.unit or current.generation.uid != previous.uid
+            or desktop != controller.selection_desktop(lease) or desktop.definition_digest != lease["desktop_digest"]
+            or any(lc.inspected_desktop(installed, content, current.config.root) != desktop for content in (before, after))):
+        unlaunched_refused("fresh qualified runtime/endpoint/Desktop/context differs")
+    retirement = retired_generation(previous, current.generation, transport)
+    receipt_context, receipt = retirement_receipt(controller, desktop, current, lease, meta["enrollment"], before, after, transport)
+    if receipt is not None:
+        checked = controller.runtime.observe(receipt=receipt)
+        if lc.authority(checked) != lc.authority(current):
+            unlaunched_refused("receipt-bound current runtime changed")
+    elif (current.binary.process_exe_status != "verified"
+            or current.config.process_environment_status != "verified"):
+        unlaunched_refused("current executable/config-root require verified proc access without a matching receipt")
+    again = controller.sample_ownership({"address": facts["bind_address"], "port": installed.base_port}, use_receipt=False)
+    if (lc.authority(again.current) != lc.authority(current) or again.desktop != desktop
+            or again.content != disk or again.endpoint != owned.endpoint
+            or again.current.binary != current.binary
+            or again.current.config.process_environment_status != current.config.process_environment_status):
+        unlaunched_refused("runtime/config/Desktop/endpoint changed during observation")
+    # No reconstructed A fingerprint is substituted for actual disk B, and no
+    # historical receipt is consumed as current loaded/capture authority.
+    return {"reservation_revision": status.revision, "stage": lease["stage"], "owner_digest": state.owner_digest,
+            "restart_id": lease["restart_id"], "previous_generation": asdict(previous), "retirement": retirement,
+            "generation": asdict(current.generation), "unit": asdict(current.unit), "config": asdict(current.config),
+            "binary": asdict(current.binary), "desktop": asdict(desktop), "receipt_context": receipt_context,
+            "endpoint": {"uuid": installed.host_uniqueid, "state": "FREE", "currentgame": 0}}
+
+
+def unlaunched_records(files, journal=None):
+    records, identities = {}, {}
+    expected = journal["records"] if journal else None
+    for name in UNLAUNCHED_RECORDS:
+        archive = name + "." + journal["id"] + ".bak" if journal else None
+        archived = files.read(archive, 1024 * 1024) if archive else None
+        live = files.read(name, 1024 * 1024)
+        if expected is not None and name not in expected:
+            if archived is not None or live is not None:
+                unlaunched_refused("originally absent receipt appeared")
+            continue
+        if archived is not None:
+            allowed = {bytes.fromhex(journal["replacement"][name])}
+            if name == "reservation.json":
+                allowed |= {RELEASE_BLOCKED, bytes.fromhex(journal["blocked"])}
+            if live is not None and live not in allowed:
+                unlaunched_refused("unexpected live replacement record")
+            path, data = files.path / archive, archived
+        else:
+            path, data = files.path / name, live
+        if data is None:
+            if name != "start-receipt.json" or expected is not None:
+                unlaunched_refused("original preparation record missing")
+            continue
+        records[name], identities[name] = data, record_identity(path)
+    if journal and identities != expected:
+        unlaunched_refused("original preparation records differ from journal")
+    return records, identities
+
+
+def unlaunched_journal(path):
+    try:
+        value = unique_json(private_read(path, lc.MAX_PRIVATE))
+        required = {"schema", "id", "version", "serial", "manifest", "evidence", "records", "replacement",
+                    "blocked", "permanent", "history", "active_prefix", "confirmation"}
+        if (type(value) is not dict or set(value) != required or type(value["schema"]) is not int or value["schema"] != 1
+                or type(value["id"]) is not str or not re.fullmatch("[0-9a-f]{32}", value["id"])
+                or path.name != "unlaunched-transition-" + value["id"] + ".bak"
+                or type(value["serial"]) is not int or not 1 <= value["serial"] <= 512
+                or value["confirmation"] != "ENROLL:exclusive:no_unmanaged_stream:no_admin_edits"
+                or type(value["evidence"]) is not dict
+                or type(value["evidence"]["reservation_revision"]) is not int
+                or not 1 <= value["evidence"]["reservation_revision"] < rs.MAX_REVISION
+                or type(value["records"]) is not dict
+                or not {"reservation.json", "operation.json", "prepare-backup.conf"} <= set(value["records"])
+                or set(value["records"]) - set(UNLAUNCHED_RECORDS)
+                or type(value["replacement"]) is not dict or set(value["replacement"]) != set(value["records"])
+                or any(type(v) is not str or not re.fullmatch("(?:[0-9a-f]{2})+", v) for v in value["replacement"].values())
+                or type(value["blocked"]) is not str or not re.fullmatch("(?:[0-9a-f]{2})+", value["blocked"])
+                or type(value["manifest"]) is not dict
+                or set(value["manifest"]) != {"schema", "release", "version", "files"}
+                or type(value["manifest"]["schema"]) is not int or value["manifest"]["schema"] != 1
+                or type(value["manifest"]["release"]) is not int or value["manifest"]["release"] != RELEASE
+                or value["manifest"]["version"] != value["version"]
+                or type(value["manifest"]["files"]) is not dict
+                or set(value["manifest"]["files"]) != set(SOURCES) | {"host-settings.json"}
+                or any(type(v) is not str or not re.fullmatch("[0-9a-f]{64}", v) for v in value["manifest"]["files"].values())
+                or value["version"] != f"v{RELEASE}-" + cfg.digest(document(value["manifest"]["files"]))
+                or type(value["permanent"]) is not dict
+                or set(value["permanent"]) != {".install.lock", "state/operation.lock", "state/reservation.lock"}
+                or type(value["history"]) is not dict
+                or any(type(k) is not str or "/" in k or not k.endswith(".bak") for k in value["history"])
+                or type(value["active_prefix"]) is not dict
+                or set(value["active_prefix"]) != {f"{n:08d}.json" for n in range(1, value["serial"] + 1)}):
+            raise ValueError("journal")
+        for identities in (value["records"], value["permanent"], value["history"], value["active_prefix"]):
+            for record in identities.values():
+                if (type(record) is not dict or set(record) != {"sha256", "device", "inode", "mode", "uid", "size", "mtime_ns"}
+                        or type(record["sha256"]) is not str or not re.fullmatch("[0-9a-f]{64}", record["sha256"])
+                        or any(type(v) is not int or v < 0 for k, v in record.items() if k != "sha256")):
+                    raise ValueError("identity")
+        return value
+    except (ValueError, KeyError, TypeError, UnicodeError, RecursionError, Refusal):
+        unlaunched_refused("invalid durable preparation-retirement journal")
+
+
+def unlaunched_identity(path, data, expected=None):
+    """Pin intended bytes and a stable private-file identity, never a fresh hash alone."""
+    if private_read(path) != data:
+        unlaunched_refused("intended publication bytes differ")
+    identity = record_identity(path)
+    if (identity["sha256"] != cfg.digest(data) or identity["size"] != len(data)
+            or (expected is not None and identity != expected)
+            or private_read(path) != data or record_identity(path) != identity):
+        unlaunched_refused("intended publication identity differs")
+    return identity
+
+
+def unlaunched_commitment(journal, records, installed):
+    """Derive the promise from the actual immutable original reservation, not the journal's floor."""
+    controller = lc.HostController(installed, None, None, None, None)
+    controller.files = IdentityRecords(records)
+    meta = controller.meta()
+    original = rs._decode(records["reservation.json"], controller.host)
+    status, lease = original.status, meta["lease"]
+    if (status.phase is not rs.Phase.RECONCILIATION_REQUIRED
+            or status.uncertainty is not rs.Uncertainty.RUNTIME_CHANGED
+            or status.desktop is not None or status.launch_attempted or status.active_observed
+            or original.owner_digest is None or status.binding is None
+            or meta["enrollment"] is None or lease is None or lease["owner_digest"] != original.owner_digest
+            or lease["stage"] not in ("restart_intent", "rolled_back_requires_reconciliation")
+            or not meta["enrollment"]["revision"] < status.revision < rs.MAX_REVISION
+            or journal["evidence"]["reservation_revision"] != status.revision):
+        unlaunched_refused("journal contradicts the original reservation revision/lifecycle")
+    try:
+        generation = retirement_generation(journal["evidence"]["generation"], installed.runtime.uid)
+        disk_digest = journal["evidence"]["config"]["file"]["sha256"]
+        before = records["prepare-backup.conf"]
+        after = cfg.select_output(before, lease["selector"])
+        if (cfg.digest(before) != lease["before_digest"] or cfg.digest(after) != lease["after_digest"]
+                or status.binding.config_digest != lease["before_digest"]
+                or disk_digest != (lease["after_digest"] if lease["stage"] == "restart_intent" else lease["before_digest"])
+                or (lease["stage"] == "rolled_back_requires_reconciliation" and before == after)):
+            raise ValueError("config promise")
+        binding = rs.RuntimeBinding(status.host, lc.service_generation(generation), status.binding.topology_digest, disk_digest)
+        available = rs._encode(rs._State(rs.Status(status.host, status.revision + 1, rs.Phase.AVAILABLE, binding)))
+        blocked = rs._encode(rs._State(rs.Status(status.host, status.revision, rs.Phase.SELECTING, status.binding),
+                                      original.owner_digest))
+        replacement = {name: data.hex() for name, data in records.items()}
+        replacement["operation.json"] = document({"schema": 1, "enrollment": meta["enrollment"], "lease": None}).hex()
+        replacement["reservation.json"] = available.hex()
+        if journal["replacement"] != replacement or journal["blocked"] != blocked.hex():
+            raise ValueError("compound promise")
+    except (ValueError, KeyError, TypeError, AttributeError):
+        unlaunched_refused("journal promise differs from original enrollment/config and exact R+1")
+    return status.revision + 1, available, blocked
+
+
+def unlaunched_live(files, replacement, blocked, expected=None):
+    """Intermediate absence is not readiness: require the complete actual blocked baseline."""
+    identities, records = {}, {}
+    for name in UNLAUNCHED_RECORDS:
+        intended = blocked if name == "reservation.json" else (
+            bytes.fromhex(replacement[name]) if name in replacement else None)
+        live = files.read(name, 1024 * 1024)
+        if live != intended:
+            unlaunched_refused("complete live replacement baseline is missing or changed")
+        if intended is not None:
+            records[name] = live
+            identities[name] = unlaunched_identity(files.path / name, intended,
+                                                   expected.get(name) if expected is not None else None)
+    if expected is not None and identities != expected:
+        unlaunched_refused("live replacement identity set differs")
+    return records, identities
+
+
+def unlaunched_descriptor(files, journal, journal_data, journal_identity):
+    """A derived promise binds intended journal and blocked-live identities.
+
+    Descriptor identity is pinned within an invocation; cross-invocation replay
+    requires exact typed content/semantics, not an invented self-inode witness.
+    """
+    name = "unlaunched-committed-" + journal["id"] + ".bak"
+    data = files.read(name)
+    if data is None:
+        return None, None, None
+    try:
+        value = unique_json(data)
+        if (type(value) is not dict or set(value) != {"schema", "journal_sha256", "journal_identity", "live_records"}
+                or type(value["schema"]) is not int or value["schema"] != 1
+                or value["journal_sha256"] != cfg.digest(journal_data)
+                or type(value["journal_identity"]) is not dict
+                or value["journal_identity"] != journal_identity
+                or any(type(v) is not int or v < 0 for k, v in value["journal_identity"].items() if k != "sha256")
+                or type(value["live_records"]) is not dict or set(value["live_records"]) != set(journal["replacement"])):
+            raise ValueError("descriptor")
+        for record_name, identity in value["live_records"].items():
+            intended = bytes.fromhex(journal["blocked"] if record_name == "reservation.json" else journal["replacement"][record_name])
+            if (type(identity) is not dict
+                    or set(identity) != {"sha256", "device", "inode", "mode", "uid", "size", "mtime_ns"}
+                    or identity["sha256"] != cfg.digest(intended) or identity["size"] != len(intended)
+                    or any(type(v) is not int or v < 0 for k, v in identity.items() if k != "sha256")
+                    or not stat.S_ISREG(identity["mode"]) or stat.S_IMODE(identity["mode"]) != 0o600
+                    or identity["uid"] != os.geteuid()):
+                raise ValueError("live identity")
+        if data != document(value):
+            raise ValueError("descriptor bytes")
+    except (ValueError, KeyError, TypeError, UnicodeError, RecursionError):
+        unlaunched_refused("descriptor differs from intended journal and live baseline")
+    identity = unlaunched_identity(files.path / name, data)
+    return data, identity, value["live_records"]
+
+
+def retire_unlaunched(root, version, serial, installed, files, transport, info, marker, authorize):
+    """Owned-release ordering; independent ENROLL proof and actual compound readiness."""
+    anchors = {p: private_directory(p) for p in (root, root / "versions", root / "active", files.path,
+                                                root / "versions" / version)}
+    permanent_paths = (root / ".install.lock", files.path / "operation.lock", files.path / "reservation.lock")
+    if (private_read(permanent_paths[0], 1) != b"\0" or private_read(permanent_paths[1], 1) != b""
+            or private_read(permanent_paths[2], 1) != b"\0"):
+        unlaunched_refused("permanent lock bytes differ")
+    permanent = {str(p.relative_to(root)): record_identity(p) for p in permanent_paths}
+    journals = [unlaunched_journal(p) for p in files.path.glob("unlaunched-transition-*.bak")]
+    journals.sort(key=lambda item: item["evidence"]["reservation_revision"])
+    revisions = [item["evidence"]["reservation_revision"] for item in journals]
+    if len(set(revisions)) != len(revisions):
+        unlaunched_refused("duplicate retirement revision")
+    journal_pins, descriptor_pins, commitments = {}, {}, {}
+    for index, item in enumerate(journals):
+        path = files.path / ("unlaunched-transition-" + item["id"] + ".bak")
+        intended = document(item)
+        journal_identity = unlaunched_identity(path, intended)
+        journal_pins[item["id"]] = intended, journal_identity
+        if (item["serial"] > serial or active_prefix(root, item["serial"]) != item["active_prefix"]
+                or any(record_identity(files.path / name) != identity for name, identity in item["history"].items())
+                or permanent != item["permanent"]):
+            unlaunched_refused("original history/active prefix/permanent locks differ")
+        seal = files.read("unlaunched-committed-" + item["id"] + ".bak")
+        originals = {}
+        for name, identity in item["records"].items():
+            archive = name + "." + item["id"] + ".bak"
+            data = files.read(archive, 1024 * 1024)
+            if data is not None:
+                if record_identity(files.path / archive) != identity:
+                    unlaunched_refused("original archive differs")
+            elif (index != len(journals) - 1 or seal is not None or files.read(name, 1024 * 1024) is None
+                  or record_identity(files.path / name) != identity):
+                unlaunched_refused("original preparation record differs")
+            else:
+                data = files.read(name, 1024 * 1024)
+            originals[name] = data
+        if any(name not in item["records"] and files.read(name + "." + item["id"] + ".bak", 1024 * 1024) is not None
+               for name in UNLAUNCHED_RECORDS):
+            unlaunched_refused("journal omitted an existing original archive")
+        # Even a self-consistently altered journal/descriptor cannot redefine
+        # the floor: R and preserved enrollment/bytes come from the originals.
+        commitments[item["id"]] = unlaunched_commitment(item, originals, installed)
+        descriptor_pins[item["id"]] = unlaunched_descriptor(files, item, intended, journal_identity)
+        if descriptor_pins[item["id"]][0] != seal:
+            unlaunched_refused("descriptor changed during replay classification")
+        if index < len(journals) - 1 and (seal is None or revisions[index + 1] < commitments[item["id"]][0]):
+            unlaunched_refused("prior retirement is unsealed")
+    if any(p.name not in {"unlaunched-committed-" + item["id"] + ".bak" for item in journals}
+           for p in files.path.glob("unlaunched-committed-*.bak")):
+        unlaunched_refused("descriptor has no matching intended journal")
+
+    def check_promises():
+        for key, (data, identity) in journal_pins.items():
+            unlaunched_identity(files.path / ("unlaunched-transition-" + key + ".bak"), data, identity)
+        for key, (data, identity, _) in descriptor_pins.items():
+            path = files.path / ("unlaunched-committed-" + key + ".bak")
+            if data is None:
+                if files.read(path.name) is not None:
+                    unlaunched_refused("unintended descriptor appeared")
+            else:
+                unlaunched_identity(path, data, identity)
+
+    def check_installation():
+        if (permanent != {str(p.relative_to(root)): record_identity(p) for p in permanent_paths}
+                or any(private_directory(p) != identity for p, identity in anchors.items())
+                or active(root) != (version, serial) or validate_version(root / "versions" / version) != marker):
+            unlaunched_refused("installation/active source or permanent locks changed")
+
+    journal = journals[-1] if journals else None
+    if journal:
+        floor, promised_raw, blocked = commitments[journal["id"]]
+        seal_data, _, sealed_live = descriptor_pins[journal["id"]]
+        live = files.read("reservation.json", rs.MAX_STATE)
+        pending = live is None or live in (RELEASE_BLOCKED, blocked)
+        if not pending:
+            current = rs._decode(live, rs.HostIdentity(installed.host_uniqueid, installed.base_port))
+            if current.status.revision < floor:
+                if (files.read("reservation.json." + journal["id"] + ".bak") is not None
+                        or record_identity(files.path / "reservation.json") != journal["records"]["reservation.json"]):
+                    unlaunched_refused("reservation rollback below original R+1 floor")
+                pending = True
+            elif seal_data is None or (current.status.revision == floor and live != promised_raw):
+                unlaunched_refused("reservation contradicts sealed commit")
+        # Classify actual commit BEFORE original precommit live bytes/source.
+        # A committed descriptor does NOT freeze later legitimate live records.
+        if not pending:
+            disk = cfg.load(installed.runtime.config_file)[0]
+            desktop = lc.inspected_desktop(installed, disk, installed.runtime.config_file.parent)
+            validate_state(installed, desktop, files)
+            if current.status.phase is rs.Phase.RECONCILIATION_REQUIRED and unique_json(files.read("operation.json"))["lease"] is None:
+                check_promises()
+                check_installation()
+                return None  # Keep ordinary explicit lease-free onboarding.
+            if current.status.phase is not rs.Phase.RECONCILIATION_REQUIRED:
+                controller = lc.HostController(installed, rt.LinuxRuntime(installed.runtime, transport), None, info, None)
+                controller.files = files
+                context_lease, context_enrollment, before, after = None, controller.meta()["enrollment"], disk, disk
+                live_receipt = files.read("start-receipt.json")
+                for item in journals:
+                    if (live_receipt is not None and "start-receipt.json" in item["records"]
+                            and live_receipt == files.read("start-receipt.json." + item["id"] + ".bak")):
+                        archived_meta = unique_json(files.read("operation.json." + item["id"] + ".bak"))
+                        context_lease, context_enrollment = archived_meta["lease"], archived_meta["enrollment"]
+                        before = files.read("prepare-backup.conf." + item["id"] + ".bak", 1024 * 1024)
+                        after = cfg.select_output(before, context_lease["selector"])
+                        break
+                retirement_receipt(controller, desktop, controller.runtime.observe(), context_lease,
+                                   context_enrollment, before, after, transport, committed=True)
+                check_promises()
+                check_installation()
+                return response(True, action="enroll", **lc.HostController.status_fields(current.status))
+            journal = None
+        elif (journal["version"], journal["serial"], journal["manifest"]) != (version, serial, marker):
+            unlaunched_refused("pending retirement source/settings changed")
+        elif seal_data is not None:
+            # Once readiness was sealed there is no legitimate missing-copy
+            # cut. Do not heal a deleted/changed live record behind the seal.
+            unlaunched_live(files, journal["replacement"], blocked, sealed_live)
+    records, identities = unlaunched_records(files, journal)
+    prefix = active_prefix(root, serial)
+    excluded = set(UNLAUNCHED_RECORDS) | {"operation.lock", "reservation.lock"}
+    if journal:
+        excluded |= {"unlaunched-transition-" + journal["id"] + ".bak", "unlaunched-committed-" + journal["id"] + ".bak"}
+        excluded |= {name + "." + journal["id"] + ".bak" for name in journal["records"]}
+    def history():
+        result = {}
+        for path in files.path.iterdir():
+            if path.name not in excluded:
+                if not path.name.endswith(".bak"):
+                    unlaunched_refused("unknown/incomplete private publication")
+                result[path.name] = record_identity(path)
+        return result
+    original_history = history()
+    evidence = unlaunched_evidence(installed, records, transport, info)
+    state = rs._decode(records["reservation.json"], rs.HostIdentity(installed.host_uniqueid, installed.base_port))
+    meta = unique_json(records["operation.json"])
+    # Historical topology grants no screen authorization. Ordinary list/acquire
+    # refresh native metadata; generation and ACTUAL disk digest are fresh.
+    binding = rs.RuntimeBinding(state.status.host, lc.service_generation(rt.Generation(**evidence["generation"])),
+                                state.status.binding.topology_digest, evidence["config"]["file"]["sha256"])
+    new_status = rs.Status(state.status.host, state.status.revision + 1, rs.Phase.AVAILABLE, binding)
+    new_state = rs._encode(rs._State(new_status))
+    replacement = {name: data.hex() for name, data in records.items()}
+    replacement["operation.json"] = document({"schema": 1, "enrollment": meta["enrollment"], "lease": None}).hex()
+    replacement["reservation.json"] = new_state.hex()
+    blocked = rs._encode(rs._State(rs.Status(state.status.host, state.status.revision, rs.Phase.SELECTING,
+                                           state.status.binding), state.owner_digest))
+    if journal:
+        if (journal["evidence"] != evidence or journal["records"] != identities or journal["replacement"] != replacement
+                or journal["blocked"] != blocked.hex() or journal["permanent"] != permanent
+                or journal["history"] != original_history or journal["active_prefix"] != prefix):
+            unlaunched_refused("pending retirement facts differ")
+    elif authorize() is not True:
+        unlaunched_refused("local exclusive ENROLL confirmation required")
+    ready_ids = descriptor_pins[journal["id"]][2] if journal else None
+    def repeat():
+        check_promises()
+        again, again_ids = unlaunched_records(files, journal)
+        if (again != records or again_ids != identities or unlaunched_evidence(installed, again, transport, info) != evidence
+                or history() != original_history or active_prefix(root, serial) != prefix):
+            unlaunched_refused("facts changed after ENROLL or before availability commit")
+        check_installation()
+        if ready_ids is not None:
+            # Runtime/endpoint sampling above may have invalidated the actual
+            # originals. Final readiness never substitutes restored live copies
+            # or intermediate missing-record tolerance for physical archives.
+            for name in UNLAUNCHED_RECORDS:
+                archive = name + "." + journal["id"] + ".bak"
+                original = records.get(name)
+                if (files.read(archive, 1024 * 1024) != original
+                        or (original is not None and record_identity(files.path / archive) != identities[name])):
+                    unlaunched_refused("original archives changed after final external observation")
+            unlaunched_live(files, replacement, blocked, ready_ids)
+        check_promises()  # Filesystem checks only; no further external observations.
+    repeat()
+    if journal is None:
+        journal = {"schema": 1, "id": os.urandom(16).hex(), "version": version, "serial": serial, "manifest": marker,
+                   "evidence": evidence, "records": identities, "replacement": replacement, "blocked": blocked.hex(),
+                   "permanent": permanent, "history": original_history, "active_prefix": prefix,
+                   "confirmation": "ENROLL:exclusive:no_unmanaged_stream:no_admin_edits"}
+        journal_data = document(journal)
+        if len(journal_data) > lc.MAX_PRIVATE:
+            unlaunched_refused("retirement journal exceeds private bound")
+        path = files.path / ("unlaunched-transition-" + journal["id"] + ".bak")
+        create(path, journal_data)
+        journal_pins[journal["id"]] = journal_data, unlaunched_identity(path, journal_data)
+        descriptor_pins[journal["id"]] = None, None, None
+        unlaunched_commitment(journal, records, installed)
+        excluded |= {path.name, "unlaunched-committed-" + journal["id"] + ".bak"}
+        excluded |= {name + "." + journal["id"] + ".bak" for name in records}
+    for name in UNLAUNCHED_RECORDS:  # reservation FIRST, lease remains until sentinel
+        if name not in records:
+            continue
+        archive = name + "." + journal["id"] + ".bak"
+        if files.read(archive, 1024 * 1024) is None:
+            if record_identity(files.path / name) != identities[name]:
+                unlaunched_refused("record changed before archival")
+            files.anchor()
+            os.rename(name, archive, src_dir_fd=files.fd, dst_dir_fd=files.fd)
+            os.fsync(files.fd)
+        if record_identity(files.path / archive) != identities[name]:
+            unlaunched_refused("archive lost original bytes/inode/mode/mtime")
+        if name == "reservation.json" and files.read(name) is None:
+            if (files.read("operation.json") != records["operation.json"]
+                    or record_identity(files.path / "operation.json") != identities["operation.json"]):
+                unlaunched_refused("old lease disappeared before sentinel")
+            create(files.path / name, RELEASE_BLOCKED)
+    for name in ("operation.json", "start-receipt.json", "prepare-backup.conf"):
+        if name not in replacement:
+            continue
+        data = bytes.fromhex(replacement[name])
+        if files.read(name, 1024 * 1024) is None:
+            create(files.path / name, data)
+        elif files.read(name, 1024 * 1024) != data:
+            unlaunched_refused("replacement differs from journal")
+        if name == "operation.json":
+            if files.read("reservation.json") == RELEASE_BLOCKED:
+                files.write("reservation.json", blocked, limit=rs.MAX_STATE)
+            elif files.read("reservation.json") != blocked:
+                unlaunched_refused("blocked precommit state differs")
+    actual, actual_ids = unlaunched_live(files, replacement, blocked, ready_ids)
+    candidate = lc.HostController(installed, None, None, None, None)
+    candidate.files = IdentityRecords(actual)
+    if (candidate.meta() != {"schema": 1, "enrollment": meta["enrollment"], "lease": None}
+            or rs._decode(actual["reservation.json"], candidate.host) != rs._decode(blocked, candidate.host)):
+        unlaunched_refused("actual live compound blocked baseline differs")
+    ready_ids = actual_ids
+    repeat()
+    journal_data, journal_identity = journal_pins[journal["id"]]
+    seal = files.path / ("unlaunched-committed-" + journal["id"] + ".bak")
+    seal_data = document({"schema": 1, "journal_sha256": cfg.digest(journal_data),
+                          "journal_identity": journal_identity, "live_records": ready_ids})
+    if descriptor_pins[journal["id"]][0] is None:
+        create(seal, seal_data)
+        descriptor_pins[journal["id"]] = seal_data, unlaunched_identity(seal, seal_data), ready_ids
+    elif descriptor_pins[journal["id"]][0] != seal_data:
+        unlaunched_refused("commitment descriptor differs from exact readiness")
+    repeat()  # Positively require descriptor + complete actual live state now.
+    files.write("reservation.json", new_state, limit=rs.MAX_STATE)  # Sole availability commit.
+    return response(True, action="enroll", **lc.HostController.status_fields(new_status))
+
+
+def local_enroll_retirement(manifest, authorize, *, transport=None, info=None):
+    """Return None for ordinary onboarding; exceptional authority is fixed-NSS local."""
+    installed = host.settings(manifest, "linux")
+    probe = lc.HostController(installed, None, None, None, None)
+    probe.files = IdentityRecords({"operation.json": private_read(installed.state_directory / "operation.json")}
+                                 if (installed.state_directory / "operation.json").exists() else {})
+    if probe.meta()["lease"] is None and not list(installed.state_directory.glob("unlaunched-transition-*.bak")):
+        return None
+    uid = os.geteuid()
+    home = Path(pwd.getpwuid(uid).pw_dir).resolve(strict=True)
+    root = home / RELATIVE_ROOT
+    if (home.stat().st_uid != uid or installed.runtime.home != home
+            or installed.state_directory != root / "state" or root.parent.resolve(strict=True) != root.parent):
+        unlaunched_refused("settings/installation parents do not belong to fixed canonical NSS home/state")
+    private_read(root / ".install.lock", 1)  # never recreate missing permanent locks
+    with installation_lock(root):
+        anchors = {p: private_directory(p) for p in (root, root / "versions", root / "active", root / "state")}
+        if {p.name for p in root.iterdir()} != {".install.lock", "versions", "active", "state"}:
+            unlaunched_refused("foreign/incomplete installation")
+        version, serial = active(root)
+        expected = root / "versions" / str(version) / "host-settings.json"
+        if Path(manifest) != expected or host.settings(expected, "linux") != installed:
+            unlaunched_refused("caller is not the current immutable installed version")
+        for path in (root / "versions").iterdir():
+            validate_version(path)
+        marker = validate_version(expected.parent)
+        private_read(root / "state/operation.lock", 1)
+        private_read(root / "state/reservation.lock", 1)
+        with lc.PrivateFiles(root / "state").locked() as files:
+            result = retire_unlaunched(root, version, serial, installed, files,
+                                      transport or rt.LocalTransport(), info or host.serverinfo, marker, authorize)
+            if any(private_directory(p) != identity for p, identity in anchors.items()):
+                unlaunched_refused("installation directory identity changed")
+            return result
+
+
 def validate_transition_version(path, marker):
     """Only a journal-bound, exact subset may resume an interrupted version."""
     private_directory(path)
@@ -1353,6 +2042,10 @@ def rpc_main(*, enroll=False, manifest=host.MANIFEST, handle=host.handle, intera
         if enroll:
             if not stdin.isatty() or not stderr.isatty():
                 fail("operator_authorization_required", "run quick-deploy-display-control --enroll in the host user's interactive terminal")
+            retired = local_enroll_retirement(manifest, interactive)
+            if retired is not None:
+                stdout.buffer.write(retired)
+                return 0
             installed = host.settings(manifest, "linux")
             content, _ = cfg.load(installed.runtime.config_file)
             facts = cfg.get_settings(content)
