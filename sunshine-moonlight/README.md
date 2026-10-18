@@ -82,6 +82,20 @@ quick-deploy-display-control --enroll
 
 首次发布是 **UNENROLLED**：没有收养已有串流，也没有签发受控启动 receipt。`--enroll` 必须从主机用户的交互终端调用，使用 `/dev/tty` 的 `ENROLL` 独占确认与新鲜 idle 事实；busy/非受管串流阻止 enrollment。普通 stdin RPC 即使提交 `action=enroll` 也拒绝，FREE 不会自动 enrollment。重新安装不重演仪式。后续必要的 idle restart/receipt 属于已预约的准备操作，不属于安装阶段；不要在受管预约中并行运行下文的手动改输出/重启步骤。
 
+**确定未启动串流的失败准备：本地 ENROLL 对账**：同一 UUID 下，若预约为 `reconciliation_required/runtime_changed`，没有 attempt/active/Desktop，且 owner、原 enrollment、旧进程出生与完整准备 lease 一致，现有本地入口可处理两种明确结果：
+
+```bash
+quick-deploy-display-control --enroll
+```
+
+仍由 Sunshine 用户在主机交互终端输入原有 `ENROLL`，确认独占、没有非受管/在途串流及并发管理员修改。这不是通用清锁命令。`restart_intent` 要求 disk 等于按 backup B 和 selector 在内存重建的 A，两个摘要分别匹配 before/after（包括 Y 的 before=after）。`rolled_back_requires_reconciliation` 要求记录的是成功的精确 CAS 回滚、B≠A 且 disk 等于 B；company 的新进程仍可能加载 A，不能把重建 A 冒充实际 disk 或已验证 loaded config。两者都须正面证明旧 boot 已退休，或在合格的新 invocation 下证明精确旧进程出生已不存在、死亡或被重用；PID 不同、退出、等待或 FREE 都不够。
+
+控制器重新验证 NSS 固定安装的 immutable manifest/settings、原独立 build 资格及精确 executable SHA、完整 unit/proc/config-root/environment/endpoint/Desktop 事实。待退休的 preparation 中，只有**该精确 restart intent** 的 issuer/previous generation/原 enrollment 均相符且完整匹配当前 runtime 的 receipt，才能弥补当前 `/proc/exe` 或进程配置来源的访问限制；其它情况必须直接验证当前两项访问。receipt 可缺失；现存 receipt 必须在自身发行和已知完整 A/B 配置上下文中解释。同 boot 的先后须有出生顺序证据；不同 boot 只能证明已退休/非当前，不能凭 UUID 不同编造先后或把历史 receipt 当当前权威。与待处理 intent 无关的当前/重启后 issuer 必须拒绝；提交后的只读重放仍保留独立合法的后来 receipt。只通过 JSON 结构校验或部分诊断比较不能批准实际主机。任何不符均保留阻断记录，等待有边界的本地资格核对。
+
+成功只退休该未启动的准备：原 reservation/operation/receipt/backup 的字节、inode、权限和 mtime 在绑定 `.bak` 档案保留，永久锁与 enrollment 不变。reservation 先归档，旧 lease 随后被无效 sentinel 阻断，再替换 operation；旧、新 dispatcher 在提交前都不能 acquire/enroll。journal 的预期精确字节与身份在本次操作中固定；描述符绑定该 journal 身份及**实际完整 live** operation/enrollment、receipt（或正确缺失）、backup 和 owned SELECTING reservation 的字节/身份。中间归档切点可暂缺副本，但不能据此认定最终就绪；已封存后副本缺失、改变或换 inode 会拒绝，不静默补齐。最终检查正面要求描述符仍存在、内容正确且本次 invocation 中身份不变；跨 invocation 对描述符自身保证精确内容/typed 语义，不声称能识别字节完全相同的换 inode。原档案、历史及永久锁的持久身份保证不变。最后一次 runtime/endpoint 外部观察结束后，逐个从**实际原始归档路径**重新核对完整原字节、记录身份或原本缺失，并完成其余文件系统就绪检查；新 live 副本不能替代原档案，其后不再插入外部观察。最终文件检查之后的既有操作者独占/race 边界不变。**最后一次原子 reservation 替换**才以从原始归档 reservation 推导的 R+1 发布无 owner/lease/attempt/Desktop/active/uncertainty 的 available，不能信任 journal 自称或重新自封的较低 floor；后续 BUSY 或漂移仍拒绝，描述符本身不是提交。中断可凭精确 journal 续接；提交后的重放先分类原始记录确定的 revision 下限，保留合法后续预约、源码追加及新 receipt，不用重新 enrollment 破坏历史。
+
+这里的 idle authority 不要求当前 DRM/capture 可用，也不下载参考包或执行 vendor 操作。新 binding 的 generation 和**实际 disk 摘要**来自新鲜观察；topology digest 仅保留原有**历史**快照，普通 list/acquire 会重新采集刷新。后续必须走连接器、明确选屏和正常 prepare/launch 取得新的选定输出证明。此命令不重启、不 quit、不改配置、不采纳/重发 capability，不保证原 prepare 问题已解决。驱动一致化、获准的 reboot 或另行核对的 root/proc 访问修正，与恢复 idle authority 是独立事项；证据不足时不要删除状态或使用通用 reset。
+
 **实例 UUID 变化的本地对账**：Sunshine 在官方配对时保存实例 UUID；未保存时重启会生成另一个 UUID。控制器报告 `host_identity_changed` 会立即停止，保留原预约与准备证据，不自动接受新的 endpoint 身份。先在客户端用官方 Moonlight 与**当前** Sunshine 完成手工 PIN 配对，并用新的普通 `moonlight list` 确认唯一 Desktop；这只是配对确认，不是释放原预约的证明。随后由运行 Sunshine 的用户在主机本地终端执行：
 
 ```bash
