@@ -118,7 +118,21 @@ quick-deploy-display-control --enroll
 
 该入口仍做完整官方参考包、unit/进程/配置/Desktop/收据资格检查；必须是同一 UUID、进程出生、配置与 Desktop，旧预约有正数尝试和活跃观察，`releasing` 的 release revision/取消事务与 `owner_lost` 的下一 revision、owner digest 一致，并重复检查 fresh idle/currentgame0 和这些稳定证据。原 operation/reservation/receipt/backup 的字节和 inode 在 `.bak` 保存，永久锁不更换；旧 reservation 到最终原子发布前始终不可 acquire/enroll，遇到后续 busy/资格漂移时保留阻断及持久 journal，待事实恢复后只凭原证据续接。提交前封存的证据与新 reservation 的 revision 下限共同约束重复运行；已提交后允许合法更高 revision 预约及跳过本次控制器版本的后续合格源码发布。新 reservation revision 单调递增到 available、清除本次 lease，**保留 enrollment、当前有效 receipt 和可供后续无重启准备使用的 backup**，无需重新登记，也不改变 UUID。首次证据不足则不改记录；本地 CLI 超时但主机严格确认关闭的未来受管流程将直接用原 ticket 完成释放，仍报告 CLI 本地失败而不误称其退出成功。
 
-独立伴随安装不改 Sunshine 配置、vendor unit、retry 策略、sshd 或设备，不启动/reload/restart/cancel 服务。`NeedDaemonReload=yes` 是实际拒绝条件：本入口不发布 unit，因此不会为了通过资格检查而 reload。应先核实真正的待加载定义及维护权限；不能绕过 guard，更不能用服务重启伪造 readiness。现有 vendor 安装器本身仍可能因包/配置变化重启活动 Sunshine，使用它前须安排获准的维护窗口。
+**已尝试但从未正面观察活动的本地退休恢复（独立 RETIRE 权限）**：只在用户明确授权一次 Sunshine 服务停止/启动的独占窗口，先正常运行 `commands/install-display-control.sh` 发布完全一致的代码，再在运行 Sunshine 的主机用户终端执行：
+
+```bash
+bash commands/install-display-control.sh --reconcile-attempted-launch
+# 先停止全部旧客户端、协调器和 helpers；确认没有其它客户端、认证重放发送者及并发管理。
+# 仔细阅读一次 Sunshine 用户服务 STOP→START 警告后输入 RETIRE。
+```
+
+仅接受 `owner_lost`、已有 attempt、`active_observed=false`、匹配的非空 attested lease/owner/prepared/enrollment/已知无命令或 hooks 的 Desktop；当前支持的 binary/unit/proc/root/env/UUID/配置/有效原 receipt/空闲 endpoint 均须重新验证。这不是 ENROLL、RELEASE、REBIND 或 raw FREE 清锁退路。它只操作精确规范 Sunshine 用户 unit；不 quit、不重新配对、不改 vendor/config/物理显示，不新增 shim/RPC 参数或 sudo。
+
+事务先持久化意图并继续阻止 acquire；STOP 命令完成且子进程被回收后，还必须取得并持久化旧 boot/unit/UID/invocation/PID 出生退休、terminal inactive/dead/MainPID0/ControlPID0、无 jobs/activation/FDstore、递归 cgroup-v2 空或正面确认该停止 scope 已移除的 **StopWitness**，才可唯一一次 START。新 MainPID、stop 返回0、空顶层 cgroup.procs、客户端退出或 FREE 不能替代。随后须为相同 UUID/config/root/build/Desktop 的新 invocation 正面验证稳定空闲；在最后一次外部观察之后重查四原记录的物理归档、live 替代、所有意图/phase/descriptor、历史、reference 与锁，最后唯一一次原子发布 original R+1 的 available。保留 enrollment、原档字节/dev/inode/mode/mtime、旧历史与永久锁；旧 receipt 只是原样历史，恢复不签发新 receipt/loaded digest/capture，下一次普通 prepare 仍必须证明所选捕获。
+
+中断后显式重跑只凭永久已完成/回收的控制命令证据、持久 StopWitness 和合格新 generation 续接，**从不重复已发出的 STOP/START**。若只有 issued、没有 durable completed/reaped 证明，哪怕当前 inactive/无 jobs/新 PID 也拒绝：孤儿控制发送者仍可能迟发 STOP。命令失败、不确定或崩溃后无法正面证明下一阶段时保留所有权和原证据、零 available 发布，必须另行取得有界人工干预授权；不要删除记录或擅自重试控制命令。完整承诺和受限 Linux/systemd/cgroup-v2 条件见 [RETIRE 协议与续接边界](display-control/README.md#attempted-launch-with-no-positive-active-observation-local-retire)。源码夹具 `bash tests/run-attempt-retirement.sh -v` 不代表实机退休或部署验收。
+
+普通独立伴随安装不改 Sunshine 配置、vendor unit、retry 策略、sshd 或设备，不启动/reload/restart/cancel 服务。`NeedDaemonReload=yes` 是实际拒绝条件：本入口不发布 unit，因此不会为了通过资格检查而 reload。应先核实真正的待加载定义及维护权限；不能绕过 guard，更不能用服务重启伪造 readiness。现有 vendor 安装器本身仍可能因包/配置变化重启活动 Sunshine，使用它前须安排获准的维护窗口。
 
 ## 2. 在 B 安装 Moonlight
 

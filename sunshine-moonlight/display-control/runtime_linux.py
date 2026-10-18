@@ -122,11 +122,15 @@ class LocalTransport:
     systemctl restart may already have queued a job: that remains uncertain.
     No shell, sudo, external helper or alternate Sunshine process is used.
     """
-    def run(self, argv, *, timeout, max_output):
+    def environment(self):
         env = {key: os.environ[key] for key in
                ("HOME", "XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS", "XDG_CONFIG_HOME")
                if key in os.environ}
         env.update(LC_ALL="C", PATH="/usr/bin:/bin", SYSTEMD_PAGER="", SYSTEMD_COLORS="0")
+        return env
+
+    def run(self, argv, *, timeout, max_output):
+        env = self.environment()
         process = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                    stderr=subprocess.PIPE, env=env, close_fds=True)
         sinks = [bytearray(), bytearray()]
@@ -904,3 +908,241 @@ class LinuxRuntime:
             except Refusal as exc:
                 raise Refusal("restart_uncertain", "restart dispatch failed/unknown; owner must retain reconciliation block") from exc
             return RestartResult(current.generation, current.config.file.sha256)
+
+
+# Installer-only attempted-launch retirement. None of these properties relax
+# ordinary observe(), receipts, or guarded_restart's PREPARING authority.
+RETIREMENT_PROPERTIES = (
+    "Id", "LoadState", "ActiveState", "SubState", "MainPID", "ControlPID", "InvocationID",
+    "ControlGroup", "KillMode", "SendSIGKILL", "KillSignal", "FinalKillSignal", "TimeoutStopUSec",
+    "Restart", "Delegate", "Triggers", "TriggeredBy", "FileDescriptorStoreMax", "NFileDescriptorStore",
+    "Job", "ExecStop", "ExecStopPost", "Sockets", "BusName", "Type", "NotifyAccess", "RemainAfterExit",
+    "NeedDaemonReload",
+)
+RETIREMENT_POLICY = {
+    "Id": UNIT, "LoadState": "loaded", "KillMode": "control-group", "SendSIGKILL": "yes",
+    "KillSignal": "15", "FinalKillSignal": "9", "TimeoutStopUSec": "1min 30s",
+    "Restart": "on-failure", "Delegate": "no", "Triggers": "", "TriggeredBy": "",
+    # Native systemctl prints the present empty (uo) Job as "Job=". Missing,
+    # numeric zero and nonempty jobs are not this positive no-job observation;
+    # ListJobs below independently requires the typed empty manager array.
+    "FileDescriptorStoreMax": "0", "NFileDescriptorStore": "0", "Job": "",
+    "ExecStop": "", "ExecStopPost": "", "Sockets": "", "BusName": "", "Type": "simple",
+    "NotifyAccess": "none", "RemainAfterExit": "no", "NeedDaemonReload": "no", "ControlPID": "0",
+}
+CGROUP_ROOT = Path("/sys/fs/cgroup")
+
+
+def retirement_refused(detail):
+    raise Refusal("attempt_retirement_unproven", detail)
+
+
+class RetirementTransport(LocalTransport):
+    """One fixed NSS user manager, independent of caller HOME/XDG/D-Bus."""
+    def __init__(self, home, uid):
+        self.home, self.uid = home, uid
+        directory = self.identity(Path("/run/user") / str(uid))
+        if (not stat.S_ISDIR(directory.mode) or directory.uid != uid
+                or stat.S_IMODE(directory.mode) != 0o700):
+            retirement_refused("fixed user runtime directory is not owned/private")
+        bus = self.identity(Path("/run/user") / str(uid) / "bus")
+        if not stat.S_ISSOCK(bus.mode) or bus.uid != uid:
+            retirement_refused("fixed user-manager bus is not owned")
+
+    def environment(self):
+        return {"HOME": str(self.home), "XDG_RUNTIME_DIR": f"/run/user/{self.uid}",
+                "DBUS_SESSION_BUS_ADDRESS": f"unix:path=/run/user/{self.uid}/bus",
+                "LC_ALL": "C", "PATH": "/usr/bin:/bin", "SYSTEMD_PAGER": "", "SYSTEMD_COLORS": "0"}
+
+
+@dataclass(frozen=True)
+class RetirementBoundary:
+    generation: Generation
+    properties: dict[str, str]
+    cgroup: str
+    cgroup_identity: tuple[int, ...]
+    parent_identity: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class StopWitness:
+    """Internal, collected before START; never accepted from RPC/CLI JSON."""
+    boundary: RetirementBoundary
+    terminal: dict[str, str]
+    birth_retirement: str
+    cgroup_retirement: str
+
+
+@dataclass(frozen=True)
+class ControlCompletion:
+    action: str
+    unit: str
+    uid: int
+    result: str = "acknowledged_reaped"
+
+
+class AttemptRetirement:
+    """Exact canonical user unit + cgroup-v2 extinction, separate from restart.
+
+    Command success is only an acknowledgement. The caller durably records
+    issued control and this stopped witness; this class never retries control.
+    """
+    def __init__(self, settings, transport):
+        if settings.unit != UNIT:
+            retirement_refused("attempt retirement requires the canonical unit")
+        self.runtime = LinuxRuntime(settings, transport)
+        self.settings, self.transport = settings, transport
+
+    def properties(self):
+        raw = self.runtime._run(("/usr/bin/systemctl", "--user", "show", "--no-pager", UNIT,
+                                 "--property=" + ",".join(RETIREMENT_PROPERTIES)))
+        props = {}
+        for line in _text(raw).splitlines():
+            key, eq, value = line.partition("=")
+            if not eq or key not in RETIREMENT_PROPERTIES or key in props:
+                retirement_refused("ambiguous retirement unit properties")
+            props[key] = value
+        if set(props) != set(RETIREMENT_PROPERTIES) or any(props.get(k) != v for k, v in RETIREMENT_POLICY.items()):
+            retirement_refused("unsupported kill/delegate/activation/FD-store/job/control policy")
+        # Empty arrays are proved by a typed manager response, never omitted
+        # properties. Reject any job in this exclusive attended window.
+        raw = self.runtime._run(("/usr/bin/busctl", "--user", "--json=short", "--auto-start=no",
+                                 "--allow-interactive-authorization=no", "call", "org.freedesktop.systemd1",
+                                 "/org/freedesktop/systemd1", "org.freedesktop.systemd1.Manager", "ListJobs"))
+        def pairs(items):
+            result = {}
+            for key, value in items:
+                if key in result:
+                    raise ValueError("duplicate job field")
+                result[key] = value
+            return result
+        try:
+            reply = json.loads(_text(raw), object_pairs_hook=pairs)
+            # busctl CALL JSON wraps method return arguments: the sole return
+            # value is itself the job array. Unlike get-property, empty is
+            # data=[[]], never data=[]. Do not infer an omitted return value.
+            if (type(reply) is not dict or set(reply) != {"type", "data"}
+                    or reply["type"] != "a(usssoo)" or type(reply["data"]) is not list
+                    or len(reply["data"]) != 1 or type(reply["data"][0]) is not list):
+                raise ValueError("method envelope")
+            jobs = reply["data"][0]
+            for row in jobs:
+                if (type(row) is not list or len(row) != 6 or type(row[0]) is not int
+                        or not 0 <= row[0] < (1 << 32)
+                        or any(type(v) is not str or "\0" in v for v in row[1:])
+                        or any(not re.fullmatch(r"/(?:[A-Za-z0-9_]+(?:/[A-Za-z0-9_]+)*)?", v) for v in row[4:])):
+                    raise ValueError("typed job row")
+                for value in row[1:]:
+                    value.encode("utf-8", "strict")  # JSON escapes must still be valid D-Bus UTF-8.
+        except (ValueError, UnicodeError, RecursionError):
+            retirement_refused("invalid typed ListJobs method reply")
+        if jobs:
+            retirement_refused("user manager has pending jobs")  # Global, including other units.
+        return props
+
+    def boot(self):
+        boot = _text(self.runtime._read(Path("/proc/sys/kernel/random/boot_id"), 64)).strip().replace("-", "")
+        if not ID128.fullmatch(boot):
+            retirement_refused("unknown boot")
+        return boot
+
+    def directory(self, path):
+        info = self.transport.identity(path)
+        if (not stat.S_ISDIR(info.mode) or info.uid not in (0, self.settings.uid)
+                or self.transport.realpath(path) != path):
+            retirement_refused("cgroup directory is not a canonical owned directory")
+        return (info.device, info.inode, info.mode, info.uid, info.gid)
+
+    def cgroup_path(self, text):
+        expected = f"/user.slice/user-{self.settings.uid}.slice/user@{self.settings.uid}.service/app.slice/{UNIT}"
+        if text != expected:
+            retirement_refused("unsupported cgroup-v2 service scope")
+        self.directory(CGROUP_ROOT)
+        controllers = self.runtime._read(CGROUP_ROOT / "cgroup.controllers", 4096)
+        if not controllers.strip():
+            retirement_refused("unqualified cgroup-v2 hierarchy")
+        return CGROUP_ROOT / text.lstrip("/")
+
+    def populated(self, path):
+        rows = {}
+        for line in _text(self.runtime._read(path / "cgroup.events", 4096)).splitlines():
+            pair = line.split()
+            if len(pair) != 2 or pair[0] in rows or pair[0] not in ("populated", "frozen") or pair[1] not in ("0", "1"):
+                retirement_refused("ambiguous hierarchical cgroup events")
+            rows[pair[0]] = pair[1]
+        if set(rows) != {"populated", "frozen"} or rows["frozen"] != "0":
+            retirement_refused("missing or frozen hierarchical cgroup state")
+        return rows["populated"] == "1"
+
+    def bind(self, current):
+        props = self.properties()
+        gen = current.generation
+        if (gen.unit != UNIT or gen.uid != self.settings.uid or self.boot() != gen.boot_id
+                or props["ActiveState"] != "active" or props["SubState"] != "running"
+                or props["MainPID"] != str(gen.pid) or props["InvocationID"] != gen.invocation_id):
+            retirement_refused("retirement boundary differs from the exact admitted birth")
+        path = self.cgroup_path(props["ControlGroup"])
+        groups = self.runtime._read(Path("/proc") / str(gen.pid) / "cgroup", 16384)
+        if groups != ("0::" + props["ControlGroup"] + "\n").encode() or not self.populated(path):
+            retirement_refused("exact process is not in the populated service subtree")
+        return RetirementBoundary(gen, props, props["ControlGroup"], self.directory(path), self.directory(path.parent))
+
+    def birth_retired(self, generation):
+        try:
+            raw = self.runtime._read(Path("/proc") / str(generation.pid) / "stat", 4096)
+        except FileNotFoundError:
+            return "absent"
+        # Permission errors are intentionally not interpreted as death.
+        text = _text(raw)
+        end = text.rfind(")")
+        fields = text[end + 2:].split() if end > 0 else []
+        if (not text.startswith(str(generation.pid) + " (") or len(fields) < 20
+                or not re.fullmatch("[1-9][0-9]*", fields[19]) or fields[0] not in tuple("RSDZTtWXxKPI")):
+            retirement_refused("old birth is inaccessible or malformed")
+        if int(fields[19]) != generation.start_ticks:
+            return "reused"
+        if fields[0] in ("Z", "X", "x"):
+            return "dead"
+        retirement_refused("exact old birth is still alive")
+
+    def stopped(self, boundary):
+        if type(boundary) is not RetirementBoundary or self.boot() != boundary.generation.boot_id:
+            retirement_refused("no same-boot stopped interval is established")
+        terminal = self.properties()
+        if (terminal["ActiveState"] != "inactive" or terminal["SubState"] != "dead"
+                or terminal["MainPID"] != "0" or terminal["InvocationID"] not in ("", boundary.generation.invocation_id)
+                or terminal["ControlGroup"] not in ("", boundary.cgroup)):
+            retirement_refused("stop has not completed in the exact old unit")
+        birth = self.birth_retired(boundary.generation)
+        path = self.cgroup_path(boundary.cgroup)
+        if self.directory(path.parent) != boundary.parent_identity:
+            retirement_refused("old cgroup parent changed")
+        try:
+            identity = self.directory(path)
+        except FileNotFoundError:
+            if path.name in self.transport.listdir(path.parent):
+                retirement_refused("old stopped scope removal is contradictory")
+            scope = "removed"
+        else:
+            if identity != boundary.cgroup_identity or self.populated(path):
+                retirement_refused("old recursive subtree survives or path was reused before witness")
+            scope = "hierarchical_empty"
+        # A second terminal/job/policy sample bounds the kernel observations.
+        if self.properties() != terminal or self.boot() != boundary.generation.boot_id:
+            retirement_refused("terminal stop facts changed around extinction observation")
+        return StopWitness(boundary, terminal, birth, scope)
+
+    def control(self, action):
+        if action not in ("stop", "start"):
+            retirement_refused("unsupported service action")
+        try:
+            result = self.transport.run(("/usr/bin/systemctl", "--user", "--no-ask-password", action, UNIT),
+                                        timeout=100.0 if action == "stop" else 60.0, max_output=MAX_COMMAND)
+            if type(result) is not CommandResult or type(result.returncode) is not int or result.returncode != 0:
+                raise ValueError("service control not acknowledged")
+        except (OSError, ValueError, subprocess.SubprocessError) as exc:
+            raise Refusal("attempt_control_uncertain", "issued service control is uncertain; retain block, never automatically repeat") from exc
+        # LocalTransport returns only after wait()/pipe closure and reaps its
+        # exact child even on failure. A crashed recovery has no such durable
+        # proof: its issued marker alone must never authorize continuation.
+        return ControlCompletion(action, UNIT, self.settings.uid)

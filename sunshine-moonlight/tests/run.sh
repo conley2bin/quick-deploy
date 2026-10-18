@@ -1541,6 +1541,7 @@ check 'foreign active wrapper makes zero API calls' test ! -s "$CASE/log"
 end_case
 
 check 'independent companion qualification/publication/root fixtures' python3 "$TESTS_DIR/display_install.py"
+check 'attended attempted-launch retirement private fixtures' bash "$TESTS_DIR/run-attempt-retirement.sh"
 
 for script in "$MODULE_DIR"/*.sh "$MODULE_DIR"/commands/*.sh "$MODULE_DIR"/lib/common.sh "$MODULE_DIR"/lib/*.py "$TESTS_DIR"/*.sh "$TESTS_DIR"/*.py; do case "$script" in *.sh) check "syntax: ${script##*/}" bash -n "$script";; *) check "syntax: ${script##*/}" python3 -c 'import ast,sys; ast.parse(open(sys.argv[1], encoding="utf-8").read(), sys.argv[1])' "$script";; esac; done
 check 'scoped diff whitespace' git --no-pager -C "$MODULE_DIR" diff --check -- .

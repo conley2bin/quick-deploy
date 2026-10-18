@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""User-owned companion publication; no vendor update, restart or enrollment.
+"""User-owned companion publication and explicit attended local recoveries.
 
-The shell entry owns common.sh release download/verification. This module owns
-read-only qualification/discovery and create-only version/active publications.
-All deployment I/O is explicit; imports do not inspect the host or HOME.
+Ordinary installation never updates/restarts/enrolls Sunshine. The distinct
+RETIRE command alone authorizes one qualified local STOP/START. The shell owns
+reference download/verification; imports do not inspect the host or HOME.
 """
 from __future__ import annotations
 
@@ -1782,6 +1782,653 @@ def retire_unlaunched(root, version, serial, installed, files, transport, info, 
     return response(True, action="enroll", **lc.HostController.status_fields(new_status))
 
 
+# Distinct installer-only authority for an attempted, never-confirmed launch.
+# Keep it in the existing immutable source set: the fixed shim is byte-frozen.
+ATTEMPT_CONFIRMATION = "RETIRE:one_stop_start:exclusive:old_clients_helpers_stopped:no_replay:no_admin_edits"
+ATTEMPT_PHASES = ("stop-issued", "stop-completed", "stopped", "start-issued", "start-completed", "successor", "committed")
+
+
+def attempt_refused(reason):
+    fail("attempt_retirement_refused", "Attempted launch retirement refused: " + reason)
+
+
+def interactive_retire():
+    try:
+        fd = os.open("/dev/tty", os.O_RDWR | os.O_NOCTTY)
+        try:
+            if not os.isatty(fd):
+                return False
+            os.write(fd, b"WARNING: authorize ONE Sunshine user-service STOP then START. All old Moonlight clients, coordinators and helpers must already be stopped; no other clients, authenticated replay sender, unmanaged/in-flight stream or concurrent administrator. Maintain this exclusive window until completion. Interrupted/uncertain control is NEVER automatically repeated. Type RETIRE: ")
+            return os.read(fd, 64).strip() == b"RETIRE"
+        finally:
+            os.close(fd)
+    except OSError:
+        return False
+
+
+def attempt_shape(installed, records):
+    controller = lc.HostController(installed, None, None, None, None)
+    controller.files = IdentityRecords(records)
+    state = rs._decode(records["reservation.json"], controller.host)
+    status, meta = state.status, controller.meta()
+    lease = meta["lease"]
+    fields = {"owner_digest", "stage", "selection_desktop", "display_id", "selector", "topology",
+              "desktop_digest", "prepared_revision"}
+    restart = {"before_digest", "after_digest", "restart_id", "previous_generation"}
+    if (status.phase is not rs.Phase.RECONCILIATION_REQUIRED or status.uncertainty is not rs.Uncertainty.OWNER_LOST
+            or not status.launch_attempted or status.active_observed or status.desktop is None
+            or status.binding is None or state.owner_digest is None or meta["enrollment"] is None
+            or lease is None or set(lease) not in (fields, fields | restart)
+            or lease["stage"] != "attested" or lease["owner_digest"] != state.owner_digest
+            or not meta["enrollment"]["revision"] < lease["prepared_revision"] < status.attempt_revision
+            or status.revision != status.attempt_revision + 1 or status.revision >= rs.MAX_REVISION
+            or lease["selection_desktop"] != asdict(status.desktop)
+            or lease["desktop_digest"] != status.desktop.definition_digest
+            or lease["topology"] != status.binding.topology_digest):
+        attempt_refused("exact enrolled owner_lost/attempt/active=false/attested lease required")
+    if (type(lease["selector"]) is not str or not 1 <= len(lease["selector"]) <= 80
+            or any(ord(c) < 32 or ord(c) == 127 for c in lease["selector"])
+            or type(lease["display_id"]) is not str
+            or not re.fullmatch(r"kms:card[0-9]+:" + re.escape(lease["selector"]), lease["display_id"])):
+        attempt_refused("recorded selected KMS display is not exact")
+    before = records["prepare-backup.conf"]
+    after = cfg.select_output(before, lease["selector"])
+    if cfg.get_settings(after)["capture"] != "kms" or cfg.digest(after) != status.binding.config_digest:
+        attempt_refused("preserved backup does not produce the exact attempted config")
+    if restart <= set(lease):
+        if (cfg.digest(before) != lease["before_digest"] or cfg.digest(after) != lease["after_digest"]
+                or lc.canonical_uuid(lease["restart_id"]) != lease["restart_id"]):
+            attempt_refused("preparation intent/backup differs")
+        retirement_generation(lease["previous_generation"], installed.runtime.uid)
+    desktop = lc.inspected_desktop(installed, after, installed.runtime.config_file.parent)
+    if desktop != status.desktop or lc.inspected_desktop(installed, before, installed.runtime.config_file.parent) != desktop:
+        attempt_refused("known empty-command no-hook Desktop is required")
+    receipt = controller.receipt(desktop)
+    envelope = controller.files.document("start-receipt.json")
+    if (receipt is None or lc.service_generation(receipt.generation) != status.binding.generation
+            or envelope["issuance"]["enrollment_revision"] != meta["enrollment"]["revision"]
+            or (restart <= set(lease) and (envelope["issuance"]["operation"] != lease["restart_id"]
+                                         or envelope["issuance"]["previous_generation"] != lease["previous_generation"]))):
+        attempt_refused("original current controlled-start receipt is required, not a foreign receipt")
+    return controller, state, meta, desktop, before, after, receipt
+
+
+def attempt_sample(installed, records, transport, info, admitted=None):
+    controller, state, meta, desktop, before, after, receipt = attempt_shape(installed, records)
+    controller.runtime = rt.LinuxRuntime(installed.runtime, transport)
+    controller.info = info
+    facts = cfg.get_settings(after)
+    owned = controller.sample_ownership({"address": facts["bind_address"], "port": installed.base_port}, use_receipt=False)
+    current = owned.current
+    if (owned.content != after or owned.desktop != desktop or owned.endpoint.state != "FREE" or owned.endpoint.currentgame != 0
+            or not current.binary.supported_build or current.binary.process_exe_status != "verified"
+            or current.config.process_environment_status != "verified" or current.generation.unit != rt.UNIT):
+        attempt_refused("current qualified proc/root/build/config/idle/Desktop facts are required")
+    receipt_lease = meta["lease"] if "restart_id" in meta["lease"] else None
+    retirement_receipt(controller, desktop, current, receipt_lease, meta["enrollment"], before, after, transport, committed=True)
+    if admitted is None:
+        controller.runtime._match_receipt(receipt, current)
+        if owned.binding != rs.OwnershipBinding.from_runtime(state.status.binding):
+            attempt_refused("runtime differs from the exact original attempted generation")
+    evidence = {"generation": asdict(current.generation), "unit": asdict(current.unit), "config": asdict(current.config),
+                "binary": asdict(current.binary), "desktop": asdict(desktop),
+                "endpoint": {"uuid": installed.host_uniqueid, "state": "FREE", "currentgame": 0}}
+    if admitted is not None:
+        old = retirement_generation(admitted["evidence"]["generation"], installed.runtime.uid)
+        if (current.generation.boot_id != old.boot_id or current.generation.uid != old.uid
+                or current.generation.invocation_id == old.invocation_id
+                or (current.generation.pid, current.generation.start_ticks) == (old.pid, old.start_ticks)
+                or current.generation.start_monotonic_usec <= old.start_monotonic_usec
+                or any(evidence[k] != admitted["evidence"][k] for k in evidence if k != "generation")):
+            attempt_refused("successor must be a fresh same-UUID/unit/UID/disk/root/build/Desktop generation")
+    boundary = rt.AttemptRetirement(installed.runtime, transport).bind(current)
+    return evidence, boundary
+
+
+def attempt_boundary(value, installed):
+    try:
+        if type(value) is not dict or set(value) != set(rt.RetirementBoundary.__dataclass_fields__):
+            raise ValueError("boundary")
+        gen = retirement_generation(value["generation"], installed.runtime.uid)
+        props = value["properties"]
+        if (type(props) is not dict or set(props) != set(rt.RETIREMENT_PROPERTIES)
+                or any(type(v) is not str for v in props.values())
+                or any(props[k] != v for k, v in rt.RETIREMENT_POLICY.items())
+                or props["ActiveState"] != "active" or props["SubState"] != "running"
+                or props["MainPID"] != str(gen.pid) or props["InvocationID"] != gen.invocation_id
+                or value["cgroup"] != props["ControlGroup"]
+                or value["cgroup"] != f"/user.slice/user-{gen.uid}.slice/user@{gen.uid}.service/app.slice/{rt.UNIT}"):
+            raise ValueError("scope")
+        identities = [value[k] for k in ("cgroup_identity", "parent_identity")]
+        if any(type(row) is not list or len(row) != 5 or any(type(x) is not int or x < 0 for x in row)
+               or not stat.S_ISDIR(row[2]) or row[3] not in (0, gen.uid) for row in identities):
+            raise ValueError("cgroup identity")
+        return rt.RetirementBoundary(gen, props, value["cgroup"], *(tuple(row) for row in identities))
+    except (KeyError, TypeError, ValueError):
+        attempt_refused("invalid internally collected retirement boundary")
+
+
+def attempt_witness(value, boundary):
+    try:
+        terminal = value["terminal"]
+        if (type(value) is not dict or set(value) != set(rt.StopWitness.__dataclass_fields__)
+                or value["boundary"] != json.loads(document(asdict(boundary)))
+                or type(terminal) is not dict or set(terminal) != set(rt.RETIREMENT_PROPERTIES)
+                or any(type(v) is not str for v in terminal.values())
+                or any(terminal[k] != v for k, v in rt.RETIREMENT_POLICY.items())
+                or terminal["ActiveState"] != "inactive" or terminal["SubState"] != "dead" or terminal["MainPID"] != "0"
+                or terminal["InvocationID"] not in ("", boundary.generation.invocation_id)
+                or terminal["ControlGroup"] not in ("", boundary.cgroup)
+                or value["birth_retirement"] not in ("absent", "dead", "reused")
+                or value["cgroup_retirement"] not in ("hierarchical_empty", "removed")):
+            raise ValueError("witness")
+        return rt.StopWitness(boundary, terminal, value["birth_retirement"], value["cgroup_retirement"])
+    except (KeyError, ValueError, TypeError):
+        attempt_refused("invalid persisted STOPPED witness; never infer it from a running successor")
+
+
+def attempt_admission(installed, records, admitted):
+    """Decode the durable promise against the actual originals, including receipt."""
+    _, _, _, desktop, _, after, receipt = attempt_shape(installed, records)
+    evidence = admitted["evidence"]
+    facts = cfg.get_settings(after)
+    expected_config = {"path": receipt.config_path, "root": receipt.config_root, "file": asdict(receipt.config),
+                       "manager_environment_digest": receipt.manager_environment_digest,
+                       "process_environment_status": "verified", "configured_capture": facts["capture"],
+                       "configured_encoder": facts["encoder"], "configured_output": facts["output_name"],
+                       "bind_address": facts["bind_address"], "base_port": facts["port"], "loaded_digest": None}
+    if (set(admitted) != {"evidence", "boundary"}
+            or set(evidence) != {"generation", "unit", "config", "binary", "desktop", "endpoint"}
+            or evidence["generation"] != asdict(receipt.generation) or evidence["config"] != expected_config
+            or set(evidence["unit"]) != set(rt.UnitRecord.__dataclass_fields__)
+            or evidence["unit"]["ownership_digest"] != receipt.unit_digest or evidence["unit"]["name"] != rt.UNIT
+            or evidence["unit"]["fragment_path"] not in ("/usr/lib/systemd/user/"+rt.UNIT, "/lib/systemd/user/"+rt.UNIT)
+            or evidence["binary"] != {"path": str(rt.EXECUTABLE), "file": asdict(receipt.executable),
+                                      "process_exe_status": "verified", "supported_build": True}
+            or evidence["desktop"] != asdict(desktop)
+            or evidence["endpoint"] != {"uuid": installed.host_uniqueid, "state": "FREE", "currentgame": 0}):
+        attempt_refused("intent differs from original controlled-start/host/config/Desktop context")
+    boundary = attempt_boundary(json.loads(document(admitted["boundary"])), installed)
+    if asdict(boundary.generation) != asdict(receipt.generation):
+        attempt_refused("intent boundary differs from the original exact birth")
+    return boundary
+
+
+def attempt_promise(installed, records, evidence, admitted):
+    _, state, meta, _, _, after, _ = attempt_shape(installed, records)
+    old = attempt_admission(installed, records, admitted).generation
+    gen = retirement_generation(evidence["generation"], installed.runtime.uid)
+    if (set(evidence) != set(admitted["evidence"]) or gen.unit != old.unit or gen.boot_id != old.boot_id
+            or gen.invocation_id == old.invocation_id or (gen.pid, gen.start_ticks) == (old.pid, old.start_ticks)
+            or gen.start_monotonic_usec <= old.start_monotonic_usec
+            or any(evidence[k] != admitted["evidence"][k] for k in evidence if k != "generation")):
+        attempt_refused("successor promise differs from the original context/fresh-generation requirement")
+    return attempt_compound(state, meta, records, gen)
+
+
+def attempt_compound(state, meta, records, generation):
+    """Pure byte projection shared by the real promise and size-only specimens."""
+    binding = rs.RuntimeBinding(state.status.host, lc.service_generation(generation), state.status.binding.topology_digest,
+                                state.status.binding.config_digest)
+    available = rs._encode(rs._State(rs.Status(state.status.host, state.status.revision + 1, rs.Phase.AVAILABLE, binding)))
+    blocked = rs._encode(rs._State(rs.Status(state.status.host, state.status.revision, rs.Phase.SELECTING, state.status.binding), state.owner_digest))
+    replacement = {name: data.hex() for name, data in records.items()}
+    replacement["reservation.json"] = available.hex()
+    replacement["operation.json"] = document({"schema": 1, "enrollment": meta["enrollment"], "lease": None}).hex()
+    return state.status.revision + 1, available, blocked, replacement
+
+
+def attempt_phase_data(journal, value):
+    return document({"schema": 1, "journal_sha256": cfg.digest(document(journal)), **value})
+
+
+def attempt_identity_ceiling(size, uid):
+    # New private records are regular0600, own-UID files. Linux stat64 dev_t /
+    # ino_t are unsigned64; nonnegative time_t64 seconds plus nanoseconds bound
+    # mtime_ns. These domains are checked, not guessed decimal headroom.
+    return {"sha256": "f"*64, "device": (1 << 64)-1, "inode": (1 << 64)-1,
+            "mode": stat.S_IFREG | 0o600, "uid": uid, "size": size,
+            "mtime_ns": ((1 << 63)-1)*1_000_000_000 + 999_999_999}
+
+
+def attempt_identity_domain(identity, size, uid):
+    ceiling = attempt_identity_ceiling(size, uid)
+    if (set(identity) != set(ceiling) or identity["mode"] != ceiling["mode"] or identity["uid"] != uid
+            or identity["size"] != size or type(identity["sha256"]) is not str
+            or not re.fullmatch("[0-9a-f]{64}", identity["sha256"])
+            or any(type(v) is not int or not 0 <= v <= ceiling[k] for k, v in identity.items() if k != "sha256")):
+        attempt_refused("private record identity is outside the supported Linux stat64 serialization domain")
+
+
+def attempt_record_bounds(installed, records, journal):
+    """Serialize complete ceilings BEFORE intent/control; specimens are never evidence.
+
+    Successor context must equal admission except generation; ownership PID is
+    uint32 and positive ticks/monotonic fields are below2**63. Every other future
+    choice is finite: terminal strings, witness enums, fixed control completions
+    and stat64 identities. Hex originals remain exact, including whitespace.
+    """
+    _, state, meta, _, _, _, _ = attempt_shape(installed, records)
+    boundary = attempt_admission(installed, records, journal["admission"])
+    uid = installed.runtime.uid
+    sizes = {"intent": len(document(journal))}
+    identities = {}
+    def add(key, value):
+        sizes[key] = len(attempt_phase_data(journal, value))
+        identities[key] = attempt_identity_ceiling(sizes[key], uid)
+    add("stop-issued", {})
+    add("stop-completed", {"issued_identity": identities["stop-issued"],
+                            "completion": asdict(rt.ControlCompletion("stop", rt.UNIT, uid))})
+    terminal = {**boundary.properties, "ActiveState": "inactive", "SubState": "dead", "MainPID": "0"}
+    # Retaining old invocation/cgroup is longer than their allowed empty forms.
+    witness = rt.StopWitness(boundary, terminal, "absent", "hierarchical_empty")
+    add("stopped", {"witness": asdict(witness), "completed_identity": identities["stop-completed"]})
+    add("start-issued", {"stopped_identity": identities["stopped"]})
+    add("start-completed", {"issued_identity": identities["start-issued"],
+                             "completion": asdict(rt.ControlCompletion("start", rt.UNIT, uid))})
+    upper_generation = replace(boundary.generation, invocation_id="f"*32, pid=(1 << 32)-1,
+                               start_ticks=(1 << 63)-1, start_monotonic_usec=(1 << 63)-1)
+    evidence = {**journal["admission"]["evidence"], "generation": asdict(upper_generation)}
+    _, available, blocked, replacement = attempt_compound(state, meta, records, upper_generation)
+    add("successor", {"proofs": dict(identities), "evidence": evidence,
+                      "replacement": replacement, "blocked": blocked.hex()})
+    live = {name: blocked if name == "reservation.json" else bytes.fromhex(replacement[name]) for name in RELEASE_RECORDS}
+    add("committed", {"journal_identity": attempt_identity_ceiling(sizes["intent"], uid), "proofs": dict(identities),
+                      "live_records": {name: attempt_identity_ceiling(len(data), uid) for name, data in live.items()}})
+    sizes["reservation"] = len(available)
+    return sizes
+
+
+def retire_attempt(root, version, serial, installed, files, transport, info, marker, authorize):
+    """One local owner, one monotonic phase chain, one final availability write."""
+    anchors = {p: private_directory(p) for p in (root, root/"versions", root/"active", files.path, root/"versions"/version)}
+    paths = (root/".install.lock", files.path/"operation.lock", files.path/"reservation.lock")
+    if tuple(private_read(p, 1) for p in paths) != (b"\0", b"", b"\0"):
+        attempt_refused("permanent lock bytes differ")
+    permanent = {str(p.relative_to(root)): record_identity(p) for p in paths}
+    pins, record_bounds = {}, {}
+
+    def pin(name, data=None):
+        path = files.path/name
+        if data is None:
+            data = private_read(path, lc.MAX_PRIVATE)
+        identity = unlaunched_identity(path, data, pins[name][1] if name in pins else None)
+        attempt_identity_domain(identity, len(data), installed.runtime.uid)
+        if name in pins and pins[name][0] != data:
+            attempt_refused("intended phase bytes changed within invocation")
+        pins[name] = data, identity
+        return identity
+
+    def check_pins():
+        for name, (data, identity) in pins.items():
+            unlaunched_identity(files.path/name, data, identity)
+
+    def installation():
+        if (any(private_directory(p) != identity for p, identity in anchors.items())
+                or permanent != {str(p.relative_to(root)): record_identity(p) for p in paths}
+                or active(root) != (version, serial) or validate_version(root/"versions"/version) != marker):
+            attempt_refused("installation/source/references/permanent locks changed")
+
+    def phase_name(journal, phase):
+        return "attempt-" + phase + "-" + journal["id"] + ".bak"
+
+    def phase(journal, key, value=None):
+        name = phase_name(journal, key)
+        if value is not None:
+            data = attempt_phase_data(journal, value)
+            if len(data) > min(lc.MAX_PRIVATE, record_bounds[journal["id"]][key]):
+                attempt_refused("phase exceeds its preflight serialization ceiling; not published")
+            if files.read(name) is None:
+                create(files.path/name, data)
+            elif files.read(name) != data:
+                attempt_refused("phase contradicts its intended immutable proof")
+        raw = files.read(name)
+        if raw is None:
+            return None
+        obj = unique_json(raw)
+        if (type(obj) is not dict or obj.get("schema") != 1 or type(obj["schema"]) is not int
+                or obj.get("journal_sha256") != cfg.digest(document(journal)) or raw != document(obj)):
+            attempt_refused("invalid phase/journal binding")
+        pin(name, raw)
+        return obj
+
+    def budget(journal, records):
+        sizes = attempt_record_bounds(installed, records, journal)
+        for key, size in sizes.items():
+            limit = rs.MAX_STATE if key == "reservation" else lc.MAX_PRIVATE
+            if size > limit:
+                attempt_refused(f"{key} serialization ceiling {size} exceeds {limit}; no new intent/control issued")
+        record_bounds[journal["id"]] = sizes
+
+    def originals(journal):
+        result = {}
+        for name in RELEASE_RECORDS:
+            archive = name + "." + journal["id"] + ".bak"
+            raw = files.read(archive, 1024*1024)
+            path = files.path/archive if raw is not None else files.path/name
+            if raw is None:
+                raw = files.read(name, 1024*1024)
+            if raw is None or record_identity(path) != journal["records"][name]:
+                attempt_refused("original record/archive physical identity differs")
+            result[name] = raw
+        return result
+
+    def check_history(journal):
+        if (journal["serial"] > serial or active_prefix(root, journal["serial"]) != journal["active_prefix"]
+                or journal["permanent"] != permanent
+                or any(record_identity(files.path/name) != identity for name, identity in journal["history"].items())):
+            attempt_refused("original history/active prefix/locks differ")
+
+    def identity_map(value):
+        keys = {"sha256", "device", "inode", "mode", "uid", "size", "mtime_ns"}
+        return (type(value) is dict and all(type(row) is dict and set(row) == keys
+                and type(row["sha256"]) is str and re.fullmatch("[0-9a-f]{64}", row["sha256"])
+                and all(type(v) is int and v >= 0 for k, v in row.items() if k != "sha256")
+                for row in value.values()))
+
+    journals = []
+    for path in files.path.glob("attempt-transition-*.bak"):
+        raw = private_read(path, lc.MAX_PRIVATE)
+        item = unique_json(raw)
+        required = {"schema", "id", "version", "serial", "manifest", "admission", "records", "permanent", "history", "active_prefix", "confirmation"}
+        if (type(item) is not dict or set(item) != required or item["schema"] != 1 or type(item["schema"]) is not int
+                or type(item["id"]) is not str or not re.fullmatch("[0-9a-f]{32}", item["id"])
+                or path.name != "attempt-transition-"+item["id"]+".bak" or raw != document(item)
+                or type(item["serial"]) is not int or not 1 <= item["serial"] <= 512
+                or type(item["version"]) is not str or not re.fullmatch(r"v[1-9][0-9]*-[0-9a-f]{64}", item["version"])
+                or item["confirmation"] != ATTEMPT_CONFIRMATION
+                or any(not identity_map(item[k]) for k in ("records", "permanent", "history", "active_prefix"))
+                or set(item["records"]) != set(RELEASE_RECORDS)
+                or set(item["permanent"]) != {str(p.relative_to(root)) for p in paths}
+                or any(type(name) is not str or "/" in name or not name.endswith(".bak") for name in item["history"])
+                or set(item["active_prefix"]) != {f"{n:08d}.json" for n in range(1, item["serial"]+1)}):
+            attempt_refused("invalid durable attempted-launch intent")
+        pin(path.name, raw)
+        records = originals(item)
+        _, state, _, _, _, _, _ = attempt_shape(installed, records)
+        attempt_admission(installed, records, item["admission"])
+        if (validate_version(root/"versions"/item["version"]) != item["manifest"]
+                or unique_json(private_read(root/"active"/f'{item["serial"]:08d}.json'))["version"] != item["version"]):
+            attempt_refused("intent source authority differs from its original active prefix")
+        check_history(item)
+        budget(item, records)
+        journals.append((state.status.revision, item))
+    journals.sort(key=lambda row: row[0])
+    if len({rev for rev, _ in journals}) != len(journals):
+        attempt_refused("duplicate attempted-launch revision")
+    known_phases = {phase_name(j, k) for _, j in journals for k in ATTEMPT_PHASES}
+    if any(p.name not in known_phases for p in files.path.glob("attempt-*.bak") if not p.name.startswith("attempt-transition-")):
+        attempt_refused("phase has no original intent")
+    journal = None
+    for index, (revision, item) in enumerate(journals):
+        prior = None
+        proofs = {}
+        for key in ATTEMPT_PHASES:
+            obj = phase(item, key)
+            if obj is None:
+                if any(files.read(phase_name(item, later)) is not None for later in ATTEMPT_PHASES[ATTEMPT_PHASES.index(key)+1:]):
+                    attempt_refused("phase chain has a missing predecessor")
+                break
+            base = {"schema", "journal_sha256"}
+            if key == "stop-issued" and set(obj) != base:
+                attempt_refused("invalid STOP issued marker")
+            if key in ("stop-completed", "start-completed"):
+                action = key.split("-")[0]
+                if (set(obj) != base | {"issued_identity", "completion"}
+                        or obj["issued_identity"] != proofs[action+"-issued"]
+                        or obj["completion"] != asdict(rt.ControlCompletion(action, rt.UNIT, installed.runtime.uid))):
+                    attempt_refused("control sender completion/reaping is not bound to exact issued control")
+            if key == "stopped":
+                if set(obj) != base | {"witness", "completed_identity"} or obj["completed_identity"] != proofs["stop-completed"]:
+                    attempt_refused("invalid STOPPED phase/completed-control binding")
+                attempt_witness(obj["witness"], attempt_boundary(item["admission"]["boundary"], installed))
+            if key == "start-issued" and (set(obj) != base | {"stopped_identity"}
+                    or obj["stopped_identity"] != proofs["stopped"]):
+                attempt_refused("START is not bound to the persisted STOPPED witness")
+            if key == "successor":
+                if (set(obj) != base | {"proofs", "evidence", "replacement", "blocked"} or obj["proofs"] != proofs):
+                    attempt_refused("successor differs from the ordered service proofs")
+                _, _, blocked, replacement = attempt_promise(installed, originals(item), obj["evidence"], item["admission"])
+                if obj["blocked"] != blocked.hex() or obj["replacement"] != replacement:
+                    attempt_refused("successor promise contradicts original R+1/enrollment/records")
+            if key == "committed":
+                successor = phase(item, "successor")
+                if (set(obj) != base | {"journal_identity", "proofs", "live_records"}
+                        or obj["journal_identity"] != pins["attempt-transition-"+item["id"]+".bak"][1]
+                        or obj["proofs"] != proofs or set(obj["live_records"]) != set(RELEASE_RECORDS)):
+                    attempt_refused("descriptor differs from intent/phase proofs/live record set")
+                for name, identity in obj["live_records"].items():
+                    intended = bytes.fromhex(successor["blocked"] if name == "reservation.json" else successor["replacement"][name])
+                    if (set(identity) != {"sha256", "device", "inode", "mode", "uid", "size", "mtime_ns"}
+                            or any(type(v) is not int or v < 0 for k, v in identity.items() if k != "sha256")
+                            or identity["sha256"] != cfg.digest(intended) or identity["size"] != len(intended)
+                            or stat.S_IMODE(identity["mode"]) != 0o600 or not stat.S_ISREG(identity["mode"])
+                            or identity["uid"] != os.geteuid()):
+                        attempt_refused("descriptor has invalid live physical promise")
+            proofs[key] = pins[phase_name(item, key)][1]
+            prior = key
+        successor = phase(item, "successor")
+        live = files.read("reservation.json", rs.MAX_STATE)
+        floor = revision + 1  # Derived from decoded immutable original, never a declared floor.
+        blocked = bytes.fromhex(successor["blocked"]) if successor else None
+        pending = live is None or live == RELEASE_BLOCKED or live == blocked
+        if not pending:
+            current = rs._decode(live, rs.HostIdentity(installed.host_uniqueid, installed.base_port))
+            if current.status.revision < floor:
+                if (files.read("reservation.json."+item["id"]+".bak") is not None
+                        or record_identity(files.path/"reservation.json") != item["records"]["reservation.json"]):
+                    attempt_refused("reservation rollback below the original-derived R+1 floor")
+                pending = True
+            elif (prior != "committed" or (current.status.revision == floor and live != bytes.fromhex(successor["replacement"]["reservation.json"]))):
+                attempt_refused("live commit contradicts its descriptor and original R+1")
+        if pending:
+            if index != len(journals)-1 or (item["version"], item["serial"], item["manifest"]) != (version, serial, marker):
+                attempt_refused("pending recovery source/serial changed or an earlier transaction is incomplete")
+            journal = item
+        elif index == len(journals)-1:
+            disk = cfg.load(installed.runtime.config_file)[0]
+            desktop = lc.inspected_desktop(installed, disk, installed.runtime.config_file.parent)
+            validate_state(installed, desktop, files)
+            if current.status.phase is not rs.Phase.RECONCILIATION_REQUIRED:
+                # Read-only committed replay permits legitimate later lease,
+                # receipt and source evolution; retained originals stay sealed.
+                replay = lc.HostController(installed, rt.LinuxRuntime(installed.runtime, transport), None, info, None)
+                replay.files = files
+                _, old_state, old_meta, old_desktop, before, after, _ = attempt_shape(installed, originals(item))
+                original_receipt = files.read("start-receipt.json") == originals(item)["start-receipt.json"]
+                context = old_meta["lease"] if original_receipt and "restart_id" in old_meta["lease"] else None
+                retirement_receipt(replay, desktop, replay.runtime.observe(), context, replay.meta()["enrollment"],
+                                   before if original_receipt else disk, after if original_receipt else disk, transport, committed=True)
+                for _, older in journals:
+                    check_history(older)
+                    originals(older)
+                check_pins(); installation()
+                return response(True, action="reconcile-attempted-launch", **lc.HostController.status_fields(current.status))
+
+    records = originals(journal) if journal else {name: files.read(name, 1024*1024) for name in RELEASE_RECORDS}
+    if any(data is None for data in records.values()):
+        attempt_refused("all four original records are required")
+    identities = journal["records"] if journal else {name: record_identity(files.path/name) for name in RELEASE_RECORDS}
+    excluded = set(RELEASE_RECORDS) | {"operation.lock", "reservation.lock"}
+    def exclude(item):
+        excluded.update({"attempt-transition-"+item["id"]+".bak", *(phase_name(item, k) for k in ATTEMPT_PHASES),
+                         *(name+"."+item["id"]+".bak" for name in RELEASE_RECORDS)})
+    if journal:
+        exclude(journal)
+    def history():
+        result = {}
+        for path in files.path.iterdir():
+            if path.name not in excluded:
+                if not path.name.endswith(".bak"):
+                    attempt_refused("unknown/incomplete private publication")
+                result[path.name] = record_identity(path)
+        return result
+    original_history = journal["history"] if journal else history()
+    prefix = journal["active_prefix"] if journal else active_prefix(root, serial)
+    def physical(final=False, ready=None):
+        # This function performs filesystem checks ONLY. Call it after the LAST
+        # external observation, including all current/previous archives.
+        check_pins(); installation()
+        if history() != original_history or active_prefix(root, serial) != prefix:
+            attempt_refused("history or active references changed")
+        for _, prior_item in journals:
+            check_history(prior_item)
+            originals(prior_item)
+        for name, data in records.items():
+            archive = name+"."+journal["id"]+".bak" if journal else None
+            archived = files.read(archive, 1024*1024) if archive else None
+            path = files.path/archive if archived is not None else files.path/name
+            if (final and archived is None) or private_read(path) != data or record_identity(path) != identities[name]:
+                attempt_refused("original archive/live bytes or physical identity changed")
+        if ready is not None:
+            unlaunched_live(files, successor["replacement"], bytes.fromhex(successor["blocked"]), ready)
+        check_pins()
+    if journal is None:
+        evidence, boundary = attempt_sample(installed, records, transport, info)
+        if authorize() is not True:
+            attempt_refused("attended RETIRE exclusive-sender/service-stop-start authorization required")
+        again, again_boundary = attempt_sample(installed, records, transport, info)
+        if evidence != again or boundary != again_boundary:
+            attempt_refused("admission changed after confirmation")
+        physical()
+        journal = {"schema": 1, "id": os.urandom(16).hex(), "version": version, "serial": serial, "manifest": marker,
+                   "admission": {"evidence": evidence, "boundary": asdict(boundary)}, "records": identities,
+                   "permanent": permanent, "history": original_history, "active_prefix": prefix, "confirmation": ATTEMPT_CONFIRMATION}
+        attempt_admission(installed, records, journal["admission"])
+        budget(journal, records)  # ALL future records, before any durable intent or control.
+        data = document(journal)
+        name = "attempt-transition-"+journal["id"]+".bak"
+        create(files.path/name, data); pin(name, data); exclude(journal)
+    boundary = attempt_boundary(json.loads(document(journal["admission"]["boundary"])), installed)
+    adapter = rt.AttemptRetirement(installed.runtime, transport)
+    issued = phase(journal, "stop-issued")
+    if issued is None:
+        evidence, now = attempt_sample(installed, records, transport, info)
+        if evidence != journal["admission"]["evidence"] or now != boundary:
+            attempt_refused("original generation/context drifted before STOP")
+        physical()
+        phase(journal, "stop-issued", {})  # Durable BEFORE control; never repeat uncertain STOP.
+        physical()
+        completion = adapter.control("stop")
+        phase(journal, "stop-completed", {"issued_identity": pins[phase_name(journal, "stop-issued")][1],
+                                          "completion": asdict(completion)})
+    if phase(journal, "stop-completed") is None:
+        attempt_refused("STOP sender completion is unknown; no retry or snapshot-based continuation. Separately approved bounded intervention required")
+    stopped = phase(journal, "stopped")
+    if stopped is None:
+        witness = adapter.stopped(boundary)  # Must happen while terminal, BEFORE path reuse.
+        physical()
+        stopped = phase(journal, "stopped", {"witness": asdict(witness), "completed_identity": pins[phase_name(journal, "stop-completed")][1]})
+    witness = attempt_witness(stopped["witness"], boundary)
+    start = phase(journal, "start-issued")
+    if start is None:
+        if adapter.stopped(boundary) != witness:
+            attempt_refused("stopped interval changed before the sole START")
+        physical()
+        start = phase(journal, "start-issued", {"stopped_identity": pins[phase_name(journal, "stopped")][1]})
+        physical()
+        completion = adapter.control("start")
+        phase(journal, "start-completed", {"issued_identity": pins[phase_name(journal, "start-issued")][1],
+                                           "completion": asdict(completion)})
+    if phase(journal, "start-completed") is None:
+        attempt_refused("START sender completion is unknown; no retry or snapshot-based continuation. Separately approved bounded intervention required")
+    # If START was issued but is still inactive/unknown, observation refuses;
+    # elapsed time, missing process and FREE never authorize a repeated START.
+    successor = phase(journal, "successor")
+    evidence, _ = attempt_sample(installed, records, transport, info, journal["admission"])
+    _, available, blocked, replacement = attempt_promise(installed, records, evidence, journal["admission"])
+    service_proofs = {k: pins[phase_name(journal, k)][1] for k in ATTEMPT_PHASES[:5]}
+    wanted = {"proofs": service_proofs, "evidence": evidence, "replacement": replacement, "blocked": blocked.hex()}
+    if successor is not None and successor != {"schema": 1, "journal_sha256": cfg.digest(document(journal)), **wanted}:
+        attempt_refused("successor facts differ from the durable ordered proof")
+    physical()
+    successor = phase(journal, "successor", wanted)
+    descriptor = phase(journal, "committed")
+    ready = descriptor["live_records"] if descriptor else None
+    if ready is not None:
+        unlaunched_live(files, replacement, blocked, ready)
+    # Accepted archival/sentinel ordering: old dispatchers cannot enroll during
+    # the missing reservation interval or bypass the compound pending repair.
+    for name in RELEASE_RECORDS:
+        archive = name+"."+journal["id"]+".bak"
+        if files.read(archive, 1024*1024) is None:
+            if record_identity(files.path/name) != identities[name]:
+                attempt_refused("original changed before archival")
+            files.anchor(); os.rename(name, archive, src_dir_fd=files.fd, dst_dir_fd=files.fd); os.fsync(files.fd)
+        if record_identity(files.path/archive) != identities[name]:
+            attempt_refused("archive lost original physical identity")
+        if name == "reservation.json" and files.read(name) is None:
+            if files.read("operation.json") != records["operation.json"] or record_identity(files.path/"operation.json") != identities["operation.json"]:
+                attempt_refused("old lease disappeared before sentinel")
+            create(files.path/name, RELEASE_BLOCKED)
+    for name in ("operation.json", "start-receipt.json", "prepare-backup.conf"):
+        data = bytes.fromhex(replacement[name])
+        if files.read(name, 1024*1024) is None:
+            create(files.path/name, data)
+        elif files.read(name, 1024*1024) != data:
+            attempt_refused("live replacement differs")
+        if name == "operation.json":
+            if files.read("reservation.json") == RELEASE_BLOCKED:
+                files.write("reservation.json", blocked, limit=rs.MAX_STATE)
+            elif files.read("reservation.json") != blocked:
+                attempt_refused("actual blocked compound baseline differs")
+    _, ready_ids = unlaunched_live(files, replacement, blocked, ready)
+    for name, identity in ready_ids.items():
+        intended = blocked if name == "reservation.json" else bytes.fromhex(replacement[name])
+        attempt_identity_domain(identity, len(intended), installed.runtime.uid)
+    descriptor_value = {"journal_identity": pins["attempt-transition-"+journal["id"]+".bak"][1],
+                        "proofs": {k: pins[phase_name(journal, k)][1] for k in ATTEMPT_PHASES[:6]}, "live_records": ready_ids}
+    phase(journal, "committed", descriptor_value)
+    # The final external observation is followed by ALL physical/archive/live/
+    # intent/descriptor/history/lock checks. No external call follows this fence.
+    final_evidence, _ = attempt_sample(installed, records, transport, info, journal["admission"])
+    if final_evidence != evidence:
+        attempt_refused("final successor is busy, changed or unknown")
+    physical(final=True, ready=ready_ids)
+    files.write("reservation.json", available, limit=rs.MAX_STATE)  # SOLE availability publication.
+    return response(True, action="reconcile-attempted-launch", **lc.HostController.status_fields(rs._decode(available, rs.HostIdentity(installed.host_uniqueid, installed.base_port)).status))
+
+
+def local_attempt_retirement(*, authorize=interactive_retire, transport=None, info=None):
+    """Installer-only dispatch using NSS and the current immutable installation."""
+    if sys.platform != "linux" or os.geteuid() == 0 or os.getuid() != os.geteuid():
+        attempt_refused("only the unprivileged local Linux desktop user is supported")
+    uid = os.geteuid()
+    home = Path(pwd.getpwuid(uid).pw_dir).resolve(strict=True)
+    root = home/RELATIVE_ROOT
+    if (home.stat().st_uid != uid or root.parent.resolve(strict=True) != root.parent):
+        attempt_refused("fixed NSS home/installation must be canonical and owned")
+    private_read(root/".install.lock", 1)
+    with installation_lock(root):
+        if {p.name for p in root.iterdir()} != {".install.lock", "versions", "active", "state"}:
+            attempt_refused("foreign/incomplete fixed installation")
+        version, serial = active(root)
+        if version is None:
+            attempt_refused("no installed source authority")
+        marker = validate_version(root/"versions"/version)
+        # The shell may live in a checkout, but every executing source module
+        # must be the exact current published source. No checkout-only import.
+        source = Path(__file__).resolve().parent
+        if any(cfg.digest(source_read(source/name)) != marker["files"][name] for name in SOURCES):
+            attempt_refused("publish this exact source normally before attempting local retirement")
+        installed = host.settings(root/"versions"/version/"host-settings.json", "linux")
+        if installed.runtime.home != home or installed.state_directory != root/"state" or installed.runtime.uid != uid:
+            attempt_refused("installed roots/user differ from fixed NSS authority")
+        for path in (root/"versions").iterdir():
+            validate_version(path)
+        private_read(root/"state/operation.lock", 1); private_read(root/"state/reservation.lock", 1)
+        try:
+            with lc.PrivateFiles(root/"state").locked() as files:
+                return retire_attempt(root, version, serial, installed, files, transport or rt.RetirementTransport(home, uid),
+                                      info or host.serverinfo, marker, authorize)
+        except Refusal as exc:
+            if exc.code == "unlaunched_retirement_refused":
+                # Reuse strict private-record/receipt validators, never that
+                # ceremony's admission authority or its operator-facing label.
+                attempt_refused(exc.detail.partition(": ")[2])
+            raise
+
+
 def local_enroll_retirement(manifest, authorize, *, transport=None, info=None):
     """Return None for ordinary onboarding; exceptional authority is fixed-NSS local."""
     installed = host.settings(manifest, "linux")
@@ -2075,6 +2722,15 @@ def rpc_main(*, enroll=False, manifest=host.MANIFEST, handle=host.handle, intera
 
 
 def main():
+    if sys.argv[1:] == ["reconcile-attempted-launch"]:
+        try:
+            sys.stdout.buffer.write(local_attempt_retirement())
+            return 0
+        except Refusal as exc:
+            print(f"Display controller refused [{exc.code}]: {exc.detail}", file=sys.stderr)
+        except Exception:
+            print("Attempt retirement incomplete; ownership/evidence retained. Issued STOP/START is never automatically repeated; rerun only to collect phase-bound evidence.", file=sys.stderr)
+        return 1
     if sys.argv[1:] in (["rpc"], ["enroll"]):
         return rpc_main(enroll=sys.argv[1] == "enroll")
     parser = argparse.ArgumentParser(description=__doc__)
