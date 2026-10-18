@@ -7,6 +7,7 @@ Every child uses isolated HOME/PATH; fixture sitecustomize tripwires networking.
 """
 from __future__ import annotations
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -15,6 +16,7 @@ import subprocess
 import sys
 import threading
 import time
+import types
 import unittest
 from unittest import mock
 
@@ -25,6 +27,7 @@ fixture = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(fixture)
 sys.path.insert(0, str(TESTS.parent / "lib"))
 import display_client as client
+import display_transport as transport
 
 
 
@@ -151,12 +154,37 @@ class EntryTests(fixture.ConnectorFixture, unittest.TestCase):
         result = self.invoke("desktop", extra_env={"FAKE_REFUSE_ACTION":"prepare"})
         self.assertNotEqual(result.returncode, 0)
         self.assert_available()
-        self.assertIn("abort", self.control_actions())
+        self.assertIn("控制器 prepare 拒绝请求（code: backend_unavailable）。", result.stderr)
+        clean_calls = ["construct", "list", "acquire", "prepare", "status", "abort"]
+        self.assertEqual(self.control_actions(), clean_calls)
         result = self.invoke("desktop", extra_env={"FAKE_REFUSE_ACTION":"prepare","FAKE_REFUSE_DIRTY":"1"})
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(self.host()["phase"], "reconciliation_required")
-        self.assertEqual(self.control_actions().count("abort"), 1)
+        self.assertEqual(self.control_actions(), clean_calls + ["construct", "list", "acquire", "prepare", "status"])
         self.assertEqual(self.actions(), ["list"])
+
+    def test_completed_refusal_code_visible_without_repeating_action(self):
+        self.write_default()
+        for action, code in (("acquire", "generation_mismatch"),
+                             ("prepare", "capture_correspondence_unproven")):
+            with self.subTest(action=action):
+                self.control_state.unlink(missing_ok=True)
+                self.control_log.unlink(missing_ok=True)
+                result = self.invoke("desktop", extra_env={
+                    "FAKE_REFUSE_ACTION": action, "FAKE_REFUSE_DIRTY": "1", "FAKE_REFUSE_CODE": code})
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn(f"错误: 控制器 {action} 拒绝请求（code: {code}）。", result.stderr)
+                expected = ["construct", "list", "acquire"]
+                if action == "prepare":
+                    expected += ["prepare", "status"]
+                    self.assertEqual(self.actions(), ["list"])
+                    self.assertIn("未确认释放主机预约", result.stderr)
+                else:
+                    self.assert_no_program()
+                self.assertEqual(self.control_actions(), expected)
+                self.assertEqual(self.host()["phase"], "reconciliation_required")
+                self.assertNotIn("sanitized fixture controller error", result.stderr)
+                self.assertNotIn("b" * 64, result.stderr)
 
     def test_unknown_mutations_never_clean_abort_retry_or_quit(self):
         for action, expected_phase in (("acquire","selecting"),("prepare","preparing"),("launch","connecting")):
@@ -166,6 +194,7 @@ class EntryTests(fixture.ConnectorFixture, unittest.TestCase):
                 self.write_default()
                 result = self.invoke("desktop", extra_env={"FAKE_LOST_ACTION":action})
                 self.assertNotEqual(result.returncode, 0)
+                self.assertIn(f"错误: 控制器 {action} 响应不确定。", result.stderr)
                 self.assertEqual(self.host()["phase"], expected_phase)
                 self.assertEqual(self.control_actions().count(action), 1)
                 self.assertNotIn("abort", self.control_actions())
@@ -246,6 +275,7 @@ class EntryTests(fixture.ConnectorFixture, unittest.TestCase):
         self.assertNotIn("abort", self.control_actions())
         self.assertNotIn("launch", self.control_actions())
         message = str(client.RpcFailure("prepare", "host_identity_changed", True))
+        self.assertEqual(message, client.REFUSAL_MESSAGES["host_identity_changed"])
         self.assertNotIn("sanitized fixture controller error", message)
         self.assertNotIn("--reconcile-host-identity", str(client.RpcFailure("prepare", "host_identity_changed", False)))
 
@@ -473,7 +503,126 @@ class EntryTests(fixture.ConnectorFixture, unittest.TestCase):
             os.close(master)
 
 
+class RefusalBoundaryTests(unittest.TestCase):
+    """Actual protocol validation with dummy bytes instead of any SSH process."""
+    CAP = "b" * 64
+    DETAIL = "synthetic_detail capability=" + CAP + "; PIN=7319; /private/dummy/path; raw_payload"
+
+    def refusal(self, code):
+        return {"version": 1, "ok": False, "error": {"code": code, "detail": self.DETAIL}}
+
+    def rpc_failure(self, response):
+        target = {"address": "100.64.0.2", "port": 47989}
+        runner = mock.Mock(side_effect=AssertionError("real SSH forbidden"))
+        controller = transport.ControllerTransport("dummy-host", None, target, runner=runner)
+        output, official = io.StringIO(), mock.Mock()
+        session = client.Session("dummy", target, controller, mock.Mock(), official, mock.Mock(),
+                                 mock.Mock(), io.StringIO(), output)
+        session.ticket = ticket = client.Ticket(2, "selecting", None, self.CAP)
+        status = {"version": 1, "ok": True, "action": "status", "target": target,
+                  "host_uniqueid": "00000000-0000-0000-0000-000000000001", "revision": 2,
+                  "phase": "selecting", "uncertainty": None, "attempt_revision": None,
+                  "activity": "idle_application", "sampling": "ownership", "runtime": "unverified",
+                  "runtime_reason": "start_receipt_required", "receipt_status": "absent"}
+        wire_response = response if isinstance(response, (bytes, Exception)) else json.dumps(response).encode()
+        with mock.patch.object(controller, "_run", side_effect=[json.dumps(status).encode(), wire_response]) as wire:
+            session.rpc("status")  # Pin the dummy identity through the real validator.
+            with self.assertRaises(client.RpcFailure) as caught:
+                session.owned("prepare", snapshot="a" * 64, display_id="kms:card1:DP-3")
+            session.say("错误: " + str(caught.exception))
+        self.assertEqual([json.loads(call.args[0])["action"] for call in wire.call_args_list],
+                         ["status", "prepare"])
+        self.assertIs(session.ticket, ticket)
+        runner.assert_not_called()
+        self.assertEqual(official.mock_calls, [])
+        failure = caught.exception
+        public = output.getvalue() + str(failure) + repr(failure) + repr(failure.args)
+        for secret in (self.CAP, "7319", "synthetic_detail", "/private/dummy", "raw_payload", '"version"'):
+            self.assertNotIn(secret, public)
+        return session, failure, output.getvalue()
+
+    def test_validated_codes_visible_without_detail_or_envelope(self):
+        for code in ("generation_mismatch", "capture_correspondence_unproven", "readiness_failed", "config_changed"):
+            with self.subTest(code=code):
+                session, failure, output = self.rpc_failure(self.refusal(code))
+                self.assertIs(failure.remote_refusal, True)
+                self.assertFalse(session.uncertain)
+                self.assertEqual(failure.code, code)
+                self.assertEqual(output, f"错误: 控制器 prepare 拒绝请求（code: {code}）。\n")
+
+    def test_installed_rpc_catchall_bytes_are_a_visible_completed_refusal(self):
+        spec = importlib.util.spec_from_file_location(
+            "refusal_installed_adapter", TESTS.parent / "display-control/install_controller.py")
+        installer = importlib.util.module_from_spec(spec)
+        # Import source only; no publication, settings or installed host lookup.
+        with mock.patch.dict(sys.modules, {spec.name: installer}), mock.patch.object(sys, "path", list(sys.path)):
+            spec.loader.exec_module(installer)
+            request = {"version": 1, "action": "prepare", "target": {"address": "100.64.0.2", "port": 47989},
+                       "revision": 2, "capability": self.CAP, "snapshot": "a" * 64, "display_id": "kms:card1:DP-3"}
+            source = types.SimpleNamespace(buffer=io.BytesIO(json.dumps(request).encode()))
+            sink = types.SimpleNamespace(buffer=io.BytesIO())
+            handler = mock.Mock(side_effect=RuntimeError(self.DETAIL))
+            with mock.patch.object(installer.os, "geteuid", return_value=1000), \
+                 mock.patch.object(installer.os, "getuid", return_value=1000), \
+                 mock.patch.object(installer.host, "settings", side_effect=AssertionError("real settings forbidden")), \
+                 mock.patch.object(installer.cfg, "load", side_effect=AssertionError("real config forbidden")), \
+                 mock.patch("socket.socket.connect", side_effect=AssertionError("network forbidden")), \
+                 mock.patch("subprocess.Popen", side_effect=AssertionError("process forbidden")):
+                exit_code = installer.rpc_main(stdin=source, stdout=sink, stderr=io.StringIO(), handle=handler)
+            self.assertEqual(exit_code, 0)
+            handler.assert_called_once()
+            self.assertEqual(json.loads(handler.call_args.args[0]), request)
+            payload = sink.buffer.getvalue()
+            self.assertEqual(json.loads(payload)["error"]["code"], "installation_unavailable")
+            session, failure, output = self.rpc_failure(payload)
+        self.assertIs(failure.remote_refusal, True)
+        self.assertFalse(session.uncertain)
+        self.assertEqual(failure.code, "installation_unavailable")
+        self.assertEqual(output, "错误: 控制器 prepare 拒绝请求（code: installation_unavailable）。\n")
+
+    def test_unknown_code_shaped_private_data_stays_generic_refusal(self):
+        for code in ("future_refusal", "pin_7319", "private_dummy_path", self.CAP,
+                     "capability_" + self.CAP, "generation_mismatch_pin_7319", "x" * 80):
+            with self.subTest(code=code):
+                session, failure, output = self.rpc_failure(self.refusal(code))
+                self.assertIs(failure.remote_refusal, True)
+                self.assertFalse(session.uncertain)
+                self.assertEqual(output, "错误: 控制器 prepare 拒绝请求。\n")
+
+    def test_malformed_response_remains_uncertain_without_payload(self):
+        responses = [self.refusal(code) for code in (
+            None, True, 7319, [], {"capability": self.CAP}, "x" * 81,
+            "generation_mismatch\nPIN=7319", "\x1b[31mpin_7319", "/private/dummy/path", "\u202epin_7319")]
+        responses += [dict(self.refusal("generation_mismatch"), capability=self.CAP),
+                      {"version": 1, "ok": False, "error": {"code": "generation_mismatch", "detail": self.DETAIL * 8}},
+                      {"version": 1, "ok": True, "action": "prepare", "capability": self.CAP}]
+        for response in responses:
+            with self.subTest(response=response):
+                session, failure, output = self.rpc_failure(response)
+                self.assertIs(failure.remote_refusal, False)
+                self.assertTrue(session.uncertain)
+                self.assertEqual(output, "错误: 控制器 prepare 响应不确定。\n")
+
+    def test_transport_failure_never_becomes_refusal_or_exposes_code_detail(self):
+        for code in ("transport_timeout", "invalid_response", "generation_mismatch"):
+            with self.subTest(code=code):
+                session, failure, output = self.rpc_failure(transport.ControllerError(code, self.DETAIL))
+                self.assertIs(failure.remote_refusal, False)
+                self.assertTrue(session.uncertain)
+                self.assertEqual(output, "错误: 控制器 prepare 响应不确定。\n")
+
+
 class PureTests(unittest.TestCase):
+    def test_untrusted_exception_code_and_refusal_flag_stay_generic(self):
+        class StringSubclass(str):
+            pass
+        for code in (None, 7319, ["generation_mismatch"], {"capability": "b" * 64},
+                     StringSubclass("generation_mismatch"), "pin_7319", "x" * 10000):
+            self.assertEqual(str(client.RpcFailure("prepare", code, True)), "控制器 prepare 拒绝请求。")
+        for flag in (False, None, 0, 1, "true", [], {}):
+            self.assertEqual(str(client.RpcFailure("prepare", "generation_mismatch", flag)),
+                             "控制器 prepare 响应不确定。")
+
     def test_plain_catalogue_title_lowercase_without_casefold_or_trim(self):
         client.check_desktop_catalogue("Desktop")
         client.check_desktop_catalogue(" unrelated, title \nDesktop")

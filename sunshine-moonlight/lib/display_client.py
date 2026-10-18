@@ -39,7 +39,7 @@ MAX_CATALOGUE_APPS = 128
 
 
 class ClientError(Exception):
-    """Public, capability-free error constructed only from local fixed messages."""
+    """Public error built from fixed local messages and allowlisted refusal codes."""
 
 
 class Cancelled(ClientError):
@@ -49,6 +49,31 @@ class Cancelled(ClientError):
 class QuitTimeout(ClientError):
     """The one official quit was issued, but its local process did not exit."""
 
+
+# Recognized v1 controller refusals, including the installed RPC catch-all:
+# arbitrary CODE-shaped text could still contain a PIN or private data.
+# Future/unknown codes remain generic until explicitly recognized here.
+REFUSAL_CODES = frozenset({
+    "application_mismatch", "backend_unavailable", "binary_changed", "binding_mismatch",
+    "build_unqualified", "capture_changed", "capture_correspondence_unproven",
+    "closure_unconfirmed", "command_failed", "config_ambiguous", "config_binding_unowned",
+    "config_changed", "config_resolution_ambiguous", "config_resolution_changed", "config_unowned",
+    "desktop_changed", "desktop_unqualified", "endpoint_unknown", "enrollment_refused",
+    "file_changed", "file_unowned", "generation_changed", "generation_mismatch", "generation_unknown",
+    "host_busy", "host_identity_changed", "host_mismatch", "identity_unverified", "installation_unavailable",
+    "internal_error", "invalid_evidence", "invalid_request", "invalid_selection", "launch_unconfirmed", "not_owner",
+    "observation_changed", "observation_overflow", "observation_unavailable", "operation_contended",
+    "operation_corrupt", "operation_unavailable", "operation_unsafe", "operator_authorization_required",
+    "owner_mismatch", "ownership_changed", "ownership_unattested", "persistence_uncertain",
+    "phase_mismatch", "platform_runtime_unavailable", "platform_unsupported", "preparation_unconfirmed",
+    "process_unowned", "readiness_failed", "readiness_pending", "receipt_mismatch",
+    "reconciliation_required", "reservation_contended", "reservation_corrupt", "reservation_io",
+    "reservation_unsafe", "restart_binary_unqualified", "restart_idle_unproven", "restart_owner_required",
+    "restart_snapshot_changed", "restart_uncertain", "runtime_changed", "runtime_unconfigured",
+    "selection_changed", "service_not_running", "stale_observation", "stale_revision", "stale_snapshot",
+    "start_context_changed", "target_mismatch", "termination_unknown", "transport_unavailable",
+    "unit_ambiguous", "unit_unowned",
+})
 
 # Fixed local text for validated host refusals that need an operator action.
 # Only the code selects a message; host detail text is never echoed.
@@ -69,7 +94,12 @@ class RpcFailure(ClientError):
         self.code = code if type(code) is str else "unknown"
         self.remote_refusal = remote_refusal is True
         known = REFUSAL_MESSAGES.get(self.code) if self.remote_refusal else None
-        super().__init__(known or f"控制器 {action} {'拒绝请求' if self.remote_refusal else '响应不确定'}。")
+        outcome = "响应不确定"
+        if self.remote_refusal:
+            outcome = "拒绝请求"
+            if self.code in REFUSAL_CODES:
+                outcome += f"（code: {self.code}）"
+        super().__init__(known or f"控制器 {action} {outcome}。")
 
 
 def check_desktop_catalogue(catalogue: str) -> None:
