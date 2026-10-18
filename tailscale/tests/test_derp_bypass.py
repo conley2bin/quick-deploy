@@ -459,11 +459,157 @@ class RecoveryTests(unittest.TestCase):
         self.assertEqual(self.status()['phase'], 'confirmed')
 
     def test_worker_requires_independent_guard_before_any_write(self):
+        m.record(self.state, 'prepared')
         with self.assertRaisesRegex(RuntimeError, 'guard not ready'):
             m.worker(self.state)
         self.assertEqual(self.service.calls, [])
         self.assertEqual(self.target.read_bytes(), self.new)
         self.assertTrue((self.state/'rollback-now').exists())
+
+
+class WorkerHandoffTests(unittest.TestCase):
+    """Real public dispatch and runtime validator with isolated service state."""
+    def setUp(self):
+        self.c = RecoveryTests()
+        self.c.setUp()
+        self.c.target.unlink()
+        self.c.service.manager = dict(self.c.original)
+        self.c.service.process = dict(self.c.original)
+        self.guard_serving = True
+        self.fingerprints = {'config': 'same', 'rules': 'same', 'selectors': 'same'}
+        self.c.plan.update(original_pid=77, original_upper=self.c.original.get('NO_PROXY', ''),
+                           original_lower=self.c.original.get('no_proxy', ''),
+                           proxy_hashes={k: m.sha(self.c.original.get(k, '').encode()) for k in m.PROXY_KEYS},
+                           no_proxy=m.merged_no_proxy(self.c.original), uid=1000,
+                           clash={'fingerprints': self.fingerprints})
+        (self.c.state/'candidate.conf').write_bytes(self.c.new)
+        (self.c.state/'guard-ready').write_text('permanent readiness file')
+        m.record(self.c.state, 'prepared')
+        self.patches = [mock.patch.object(m, 'guard_alive', side_effect=lambda *args: self.guard_serving),
+                        mock.patch.object(m, 'clash_state', return_value={'fingerprints': self.fingerprints, 'derp_connections': []}),
+                        mock.patch.object(m, 'run', side_effect=self.run_service)]
+        for p in self.patches:
+            p.start()
+
+    def tearDown(self):
+        for p in reversed(self.patches):
+            p.stop()
+        self.c.tearDown()
+
+    def run_service(self, args, timeout=20):
+        if args == ['systemctl', 'show', m.SERVICE, '-p', 'MainPID', '--value']:
+            self.c.service.calls.append(args)
+            return '77\n'
+        if args[0] == 'ss':
+            self.c.service.calls.append(args)
+            return 'ESTAB 0 0 192.168.12.175:55555 39.184.215.16:1443 cgroup:/system.slice/tailscaled.service\n'
+        if args[0] == 'ip':
+            self.c.service.calls.append(args)
+            return json.dumps([{'dev': 'eno1', 'prefsrc': '192.168.12.175'}])
+        result = self.c.service.run(args, timeout)
+        if args == ['systemctl', 'daemon-reload'] and self.c.target.exists():
+            self.c.service.manager.update(NO_PROXY=self.c.plan['no_proxy'], no_proxy=self.c.plan['no_proxy'])
+        return result
+
+    def rollback_and_finish_guard(self):
+        with mock.patch.object(m, 'tmux_window') as launch:
+            self.assertEqual(self.c.command('rollback'), 0)
+        launch.assert_not_called()  # The registered guard is still serving.
+        self.assertEqual(self.c.command('_guard'), 0)
+        self.guard_serving = False  # main returned; that real guard execution has ended.
+
+    def assert_worker_is_strict_noop(self):
+        before = (self.c.state/'status.json').read_bytes()
+        old_lock = self.c.lock.read_bytes() if self.c.lock.exists() else None
+        old_target = self.c.target.read_bytes() if self.c.target.exists() else None
+        old_calls = list(self.c.service.calls)
+        with mock.patch.object(m, 'atomic', wraps=m.atomic) as writes:
+            self.assertEqual(self.c.command('_worker'), 0)
+        self.assertEqual(writes.call_count, 0)
+        self.assertEqual(self.c.service.calls, old_calls)
+        self.assertEqual((self.c.state/'status.json').read_bytes(), before)
+        self.assertEqual(self.c.lock.read_bytes() if self.c.lock.exists() else None, old_lock)
+        self.assertEqual(self.c.target.read_bytes() if self.c.target.exists() else None, old_target)
+
+    def test_public_rollback_guard_completion_then_queued_worker_is_noop(self):
+        self.rollback_and_finish_guard()
+        self.assertEqual(self.c.status()['phase'], 'rolled-back-no-change')
+        self.assertFalse(self.c.lock.exists())
+        self.assertTrue((self.c.state/'guard-ready').exists())
+        self.assertEqual(self.c.restarts(), 0)
+        self.assert_worker_is_strict_noop()
+
+    def test_worker_first_then_public_rollback_restores_and_late_worker_is_noop(self):
+        self.assertEqual(self.c.command('_worker'), 0)  # Actual validate_runtime executes.
+        self.assertEqual(self.c.status()['phase'], 'verified-awaiting-confirmation')
+        self.assertEqual(self.c.restarts(), 1)
+        self.assertTrue(self.c.target.exists())
+        self.assert_worker_is_strict_noop()  # A duplicate cannot reactivate an already handed-off job.
+        self.rollback_and_finish_guard()
+        self.assertEqual(self.c.restarts(), 2)  # Exactly one activation and one recovery.
+        self.assertEqual(self.c.status()['phase'], 'rolled-back')
+        self.assertEqual(self.c.service.process, self.c.original)
+        self.assert_worker_is_strict_noop()
+
+    def test_cancelled_prepared_worker_is_noop_before_guard_finishes(self):
+        self.assertEqual(self.c.command('rollback'), 0)
+        self.assertEqual(self.c.status()['phase'], 'prepared')
+        self.assertTrue(self.c.lock.exists())
+        self.assert_worker_is_strict_noop()
+
+    def test_old_worker_after_another_job_owns_global_lock_is_noop(self):
+        self.c.lock.write_text('/another-job\n')
+        self.c.target.write_bytes(b'another job configuration')
+        self.assert_worker_is_strict_noop()
+
+    def test_recovered_worker_cannot_touch_the_next_job(self):
+        self.rollback_and_finish_guard()
+        self.c.lock.write_text('/another-job\n')
+        self.c.target.write_bytes(b'another job configuration')
+        self.assert_worker_is_strict_noop()
+
+    def test_worker_holds_mutex_through_config_write_and_state_handoff(self):
+        actual_atomic, actual_validate = m.atomic, m.validate_runtime
+        observed = []
+        def check_busy(stage):
+            with self.assertRaisesRegex(RuntimeError, 'already owns this job'):
+                self.c.command('rollback')
+            observed.append(stage)
+        def write(path, data, mode=0o600):
+            if path == self.c.target:
+                check_busy('config-write')
+            return actual_atomic(path, data, mode)
+        def validate(plan):
+            check_busy('state-handoff')
+            return actual_validate(plan)
+        with mock.patch.object(m, 'atomic', side_effect=write), \
+                mock.patch.object(m, 'validate_runtime', side_effect=validate):
+            self.assertEqual(self.c.command('_worker'), 0)
+        self.assertEqual(observed, ['config-write', 'state-handoff'])
+        self.assertFalse((self.c.state/'rollback-now').exists())
+        self.assertEqual(self.c.status()['phase'], 'verified-awaiting-confirmation')
+
+    def test_other_late_service_writer_cannot_touch_another_job(self):
+        self.c.lock.write_text('/another-job\n')
+        self.c.target.write_bytes(b'another job configuration')
+        before = (self.c.state/'status.json').read_bytes()
+        self.c.service.calls.clear()
+        with mock.patch.object(m, 'atomic', wraps=m.atomic) as writes:
+            m.rollback(self.c.state)
+            self.assertEqual(self.c.command('_guard'), 0)
+        self.assertEqual(writes.call_count, 0)
+        self.assertEqual(self.c.service.calls, [])
+        self.assertEqual(self.c.target.read_bytes(), b'another job configuration')
+        self.assertEqual((self.c.state/'status.json').read_bytes(), before)
+
+    def test_stale_ready_file_without_live_owned_guard_cannot_activate(self):
+        self.guard_serving = False
+        self.c.service.calls.clear()
+        with self.assertRaisesRegex(RuntimeError, 'guard not ready'):
+            self.c.command('_worker')
+        self.assertFalse(self.c.target.exists())
+        self.assertEqual(self.c.restarts(), 0)
+        self.assertEqual(self.c.status()['phase'], 'failed-awaiting-rollback')
 
 
 class GuardOwnershipTests(unittest.TestCase):
@@ -529,6 +675,7 @@ class GuardOwnershipTests(unittest.TestCase):
         self.assertEqual(json.loads((self.state/'guard-owner.json').read_text()), self.owner)
         self.pane = '/project\t%8\t999\t0\n'
         with mock.patch.object(m, 'load_plan', return_value=self.plan), \
+                mock.patch.object(m, 'current_job', return_value=True), \
                 mock.patch.dict(os.environ, {'TMUX_PANE': '%8'}):
             with self.assertRaisesRegex(RuntimeError, 'ownership not established'):
                 m.guard(self.state)

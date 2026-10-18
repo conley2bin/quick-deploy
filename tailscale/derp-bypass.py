@@ -290,6 +290,16 @@ def release(state):
         LOCK.unlink()
 
 
+def current_job(state):
+    return LOCK.exists() and LOCK.read_text().strip() == str(state)
+
+
+def activation_pending(state):
+    return (current_job(state) and not (state/'rollback-now').exists()
+            and (state/'status.json').exists()
+            and json.loads((state/'status.json').read_text()).get('phase') == 'prepared')
+
+
 @contextlib.contextmanager
 def recovery_lock(state, blocking=True):
     # One job-local kernel lock covers public handoff, recovery and confirmation.
@@ -363,6 +373,8 @@ def recovery_failed(state, error):
 def rollback(state):
     state = state.resolve(strict=True)
     with recovery_lock(state):
+        if not current_job(state):
+            return
         try:
             plan = load_plan(state)
             # File equality is only one stage, never proof of manager/process recovery.
@@ -432,8 +444,11 @@ def request_rollback(state):
 def guard(state):
     state = state.resolve(strict=True)
     plan = load_plan(state)
-    register_guard(state, plan)
-    atomic(state/'guard-ready', b'ready', 0o644)
+    with recovery_lock(state):
+        if not current_job(state):
+            return
+        register_guard(state, plan)
+        atomic(state/'guard-ready', b'ready', 0o644)
     deadline = time.monotonic()+TIMEOUT
     try:
         while time.monotonic() < deadline:
@@ -441,6 +456,8 @@ def guard(state):
                 break
             if (state/'ack/confirm').exists():
                 with recovery_lock(state):
+                    if not current_job(state):
+                        return
                     if (state/'rollback-now').exists():
                         break
                     status = json.loads((state/'status.json').read_text())
@@ -451,52 +468,63 @@ def guard(state):
                         return
             time.sleep(1)
     except Exception as e:
-        record(state, 'confirmation-failed-rolling-back', error=str(e))
+        with recovery_lock(state):
+            if not current_job(state):
+                return
+            record(state, 'confirmation-failed-rolling-back', error=str(e))
     rollback(state)
 
 
 def worker(state):
-    plan = load_plan(state)
-    try:
-        if not (state/'guard-ready').exists():
-            raise RuntimeError('independent rollback guard not ready')
-        current = TARGET.read_bytes() if TARGET.exists() else None
-        previous = (state/'previous.conf').read_bytes() if plan['previous_exists'] else None
-        env = process_environment()
-        pid = int(run(['systemctl', 'show', SERVICE, '-p', 'MainPID', '--value']).strip())
-        if (current != previous or pid != plan['original_pid'] or other_dropins() != plan['other_dropins']
-                or env.get('NO_PROXY', '') != plan['original_upper'] or env.get('no_proxy', '') != plan['original_lower']
-                or any(sha(env.get(k, '').encode()) != plan['proxy_hashes'][k] for k in PROXY_KEYS)):
-            raise RuntimeError('pre-change service state drifted; no write')
-        candidate = (state/'candidate.conf').read_bytes()
-        if sha(candidate) != plan['candidate_hash']:
-            raise RuntimeError('candidate hash mismatch; no write')
-        atomic(TARGET, candidate, 0o644)
-        record(state, 'restarting-tailscaled')
-        run(['systemctl', 'daemon-reload'])
-        run(['systemctl', 'restart', SERVICE], 60)
-        # One low-rate discovery request opens the relay; no force-region or broad eviction.
-        peer = '100.125.138.103' if '100.123.34.64' in plan['node']['ips'] else '100.123.34.64'
+    state = state.resolve(strict=True)
+    with recovery_lock(state):
+        # A cancelled/recovered/old queued worker is a true no-op, outside the
+        # activation error handler so it cannot overwrite recovery's terminal truth.
+        if not activation_pending(state):
+            return
+        plan = load_plan(state)
         try:
-            run(['tailscale', 'ping', '--c=1', '--until-direct=false', '--timeout=5s', peer], 8)
-        except (RuntimeError, subprocess.TimeoutExpired):
-            pass  # Verification below is authoritative; this trigger may race startup.
-        error = None
-        deadline = time.monotonic()+45
-        while time.monotonic() < deadline:
+            if not (state/'guard-ready').exists():
+                raise RuntimeError('independent rollback guard not ready')
+            current = TARGET.read_bytes() if TARGET.exists() else None
+            previous = (state/'previous.conf').read_bytes() if plan['previous_exists'] else None
+            env = process_environment()
+            pid = int(run(['systemctl', 'show', SERVICE, '-p', 'MainPID', '--value']).strip())
+            if (current != previous or pid != plan['original_pid'] or other_dropins() != plan['other_dropins']
+                    or env.get('NO_PROXY', '') != plan['original_upper'] or env.get('no_proxy', '') != plan['original_lower']
+                    or any(sha(env.get(k, '').encode()) != plan['proxy_hashes'][k] for k in PROXY_KEYS)):
+                raise RuntimeError('pre-change service state drifted; no write')
+            candidate = (state/'candidate.conf').read_bytes()
+            if sha(candidate) != plan['candidate_hash']:
+                raise RuntimeError('candidate hash mismatch; no write')
+            if not guard_alive(state, plan):
+                raise RuntimeError('independent rollback guard not ready/alive')
+            atomic(TARGET, candidate, 0o644)
+            record(state, 'restarting-tailscaled')
+            run(['systemctl', 'daemon-reload'])
+            run(['systemctl', 'restart', SERVICE], 60)
+            # One low-rate discovery request opens the relay; no force-region or broad eviction.
+            peer = '100.125.138.103' if '100.123.34.64' in plan['node']['ips'] else '100.123.34.64'
             try:
-                evidence = validate_runtime(plan)
-                record(state, 'verified-awaiting-confirmation', evidence=evidence,
-                       confirm='After a fresh ShellGate SSH/access check, run the non-root confirm command printed by apply.')
-                return
-            except (RuntimeError, OSError, ValueError) as e:
-                error = str(e)
-                time.sleep(1)
-        raise RuntimeError(error or 'runtime validation timed out')
-    except Exception as e:
-        record(state, 'failed-awaiting-rollback', error=str(e))
-        atomic(state/'rollback-now', b'rollback', 0o644)
-        raise
+                run(['tailscale', 'ping', '--c=1', '--until-direct=false', '--timeout=5s', peer], 8)
+            except (RuntimeError, subprocess.TimeoutExpired):
+                pass  # Verification below is authoritative; this trigger may race startup.
+            error = None
+            deadline = time.monotonic()+45
+            while time.monotonic() < deadline:
+                try:
+                    evidence = validate_runtime(plan)
+                    record(state, 'verified-awaiting-confirmation', evidence=evidence,
+                           confirm='After a fresh ShellGate SSH/access check, run the non-root confirm command printed by apply.')
+                    return
+                except (RuntimeError, OSError, ValueError) as e:
+                    error = str(e)
+                    time.sleep(1)
+            raise RuntimeError(error or 'runtime validation timed out')
+        except Exception as e:
+            record(state, 'failed-awaiting-rollback', error=str(e))
+            atomic(state/'rollback-now', b'rollback', 0o644)
+            raise
 
 
 def tmux_window(repo, task, run_id, command):
@@ -583,23 +611,33 @@ def apply():
         atomic(state/'entry.py', pathlib.Path(__file__).read_bytes())
         (state/'ack').mkdir(mode=0o700)
         os.chown(state/'ack', uid, pwd.getpwuid(uid).pw_gid)
-        record(state, 'prepared', rollback_timeout_seconds=TIMEOUT)
-        guardian = tmux_window(REPO, 'tailscale-derp-guard', state.name,
-                               [sys.executable, str(state/'entry.py'), '_guard', str(state)])
-        guard_started = True
+        with recovery_lock(state):
+            if not current_job(state) or (state/'rollback-now').exists():
+                return
+            record(state, 'prepared', rollback_timeout_seconds=TIMEOUT)
+            guardian = tmux_window(REPO, 'tailscale-derp-guard', state.name,
+                                   [sys.executable, str(state/'entry.py'), '_guard', str(state)])
+            guard_started = True
         for _ in range(30):
             if (state/'guard-ready').exists():
                 break
             time.sleep(.1)
         else:
             raise RuntimeError('rollback guard did not become ready; no configuration written')
-        actor = tmux_window(REPO, 'tailscale-derp-apply', state.name,
-                           [sys.executable, str(state/'entry.py'), '_worker', str(state)])
-        atomic(state/'tmux.json', json.dumps({'guard': guardian, 'worker': actor}, indent=2).encode(), 0o644)
+        with recovery_lock(state):
+            if not activation_pending(state):
+                return
+            if not guard_alive(state, plan):
+                raise RuntimeError('independent rollback guard not ready/alive')
+            actor = tmux_window(REPO, 'tailscale-derp-apply', state.name,
+                               [sys.executable, str(state/'entry.py'), '_worker', str(state)])
+            atomic(state/'tmux.json', json.dumps({'guard': guardian, 'worker': actor}, indent=2).encode(), 0o644)
     except Exception:
-        atomic(state/'rollback-now', b'rollback', 0o644)
-        if not guard_started:
-            release(state)  # No worker was launched and no configuration was written.
+        with recovery_lock(state):
+            if current_job(state):
+                atomic(state/'rollback-now', b'rollback', 0o644)
+                if not guard_started:
+                    release(state)  # No worker was launched and no configuration was written.
         raise
     print('已启动本机独立 tmux 任务；只重启 tailscaled 一次，Clash/其他应用不变。')
     print('状态: '+shlex.join([sys.executable, str(REPO/'tailscale/derp-bypass.py'), 'status', str(state)]))
@@ -646,7 +684,9 @@ def main():
             try:
                 guard(args.state)
             except Exception as e:
-                recovery_failed(args.state, e)
+                with recovery_lock(args.state):
+                    if current_job(args.state.resolve(strict=True)):
+                        recovery_failed(args.state, e)
                 raise
     return 0
 

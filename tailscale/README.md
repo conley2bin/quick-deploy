@@ -116,6 +116,12 @@ NO_PROXY 条目仍保留。IP 条目只匹配 IP 形式请求，不替代域名�
 `daemon-reload` 和 **仅 tailscaled 的 restart**，会短暂中断 tailnet/SSH；不重启
 Clash/主机、不关闭其他应用连接、不改规则、TUN 开关、DNS、MTU 或 NAT。
 
+应用 worker 与恢复、确认共享同一任务互斥锁。写配置/重启前，锁内必须仍属于当前全局
+作业、处于 prepared 且未取消，并由已登记的存活 owned guard 保护；锁持有到激活结果
+状态交接完成。旧 ready 文件不能授权写入。已取消、回滚或被新作业取代的迟到 worker
+直接无操作返回，不写配置、不重启，也不把恢复终态改成失败。guard 登记/ready 发布、
+apply 的启动/取消交接也遵守该协议；非 root confirm 仅投递请求，由 guard 锁内验收。
+
 入口打印任务路径和两条非 root 命令：`status <任务路径>`、`confirm <任务路径>`。
 应用任务必须证明运行中两个环境变量已消费、其他代理变量未变、节点身份/IP 未变、
 Clash 配置/规则/选择未变；还必须看到 tailscaled 自己持有到真实 DERP 的 TCP socket，
@@ -167,7 +173,10 @@ bash -n tailscale/install.sh
 离线测试保留并集/转义、安装器匹配、systemd 实际语法、tmux 归属/槽冲突及 DIRECT 仍进
 TUN 的拒绝检查。恢复故障注入经真实公开命令分支覆盖：reload 失败、文件恢复后 restart
 失败、原文件下停止/错环境/错身份的 daemon、死 guard 留锁、并发明确重试排斥及健康重复
-请求；只有原 manager/实际进程环境与身份验收才成功。系统操作由替身和临时文件隔离，
+请求；只有原 manager/实际进程环境与身份验收才成功。另重放公开 rollback→guard
+完成→迟到 worker、worker 先完成后回滚及旧作业遇到新全局所有者，检查迟到/取消 worker
+的配置/服务/终态写入为零；在配置写入和激活状态交接处验证同一互斥锁仍被持有。
+系统操作由替身和临时文件隔离，
 **不能代替 root 实机恢复/部署验证**。
 
 `--live-parser` 不需要 Go 编译器：使用已安装的 `tailscale debug ts2021 --verbose`
