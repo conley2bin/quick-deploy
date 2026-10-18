@@ -333,6 +333,19 @@ def resolve_app(
         )
 
     _root, executables = valid_roots[0]
+    if app_id == "baidunetdisk":
+        # Directory-derived candidate roots are not supported installations.
+        # Every known helper declaration must belong to the validated layout.
+        unassigned_helpers = sorted({
+            path for path in evidence.package_files.get("baidunetdisk", ())
+            if Path(path).name == "netdisk_service"
+            and path not in roots[_root].get("helper", ())
+        })
+        if unassigned_helpers:
+            return DiscoveryResult(
+                spec.app_id, spec.name, "unsupported", (), tuple(desktop_evidence),
+                "unsupported Baidu helper layout: " + ", ".join(unassigned_helpers),
+            )
     observed_processes = _process_evidence(evidence.processes, {item.path for item in executables})
     enriched = tuple(
         DiscoveredExecutable(

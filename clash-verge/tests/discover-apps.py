@@ -139,9 +139,38 @@ class DiscoveryTests(unittest.TestCase):
             other = elf(prefix / "relocated baidu" / "baidunetdisk")
             ambiguous = self.resolve("baidunetdisk", {"baidunetdisk": manifest + [str(other)]})
             self.assertEqual(ambiguous.status, "ambiguous", ambiguous)
+            mixed = self.resolve("baidunetdisk", {"baidunetdisk": manifest + [
+                str(root / "netdisk_service"), str(other),
+            ]})
+            self.assertEqual(mixed.status, "ambiguous", mixed)
             relocated = self.resolve("baidunetdisk", {"baidunetdisk": [str(other)]})
             self.assertEqual(relocated.status, "resolved", relocated)
             self.assertEqual(relocated.executables[0].path, str(other))
+
+    def test_baidu_misplaced_declared_helper_refuses_even_if_present(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            prefix = Path(temporary)
+            root = prefix / "opt/baidunetdisk"
+            main = elf(root / "baidunetdisk")
+            # /opt is a false candidate root inferred from the app directory.
+            # Its apparent helper must not count as a validated layout.
+            for misplaced in (root / "bin/netdisk_service",
+                              prefix / "usr/lib/baidunetdisk/netdisk_service",
+                              prefix / "opt/netdisk_service"):
+                for present in (False, True):
+                    with self.subTest(path=misplaced, present=present):
+                        if present:
+                            elf(misplaced)
+                        result = self.resolve("baidunetdisk", {"baidunetdisk": [
+                            str(root), str(main), str(misplaced),
+                        ]})
+                        self.assertEqual(result.status, "unsupported", result)
+                        self.assertEqual(result.executables, ())
+                        self.assertIn("unsupported Baidu helper layout", result.reason or "")
+                        self.assertIn(str(misplaced), result.reason or "")
+                        self.assertFalse(any("helper not declared" in item for item in result.evidence))
+                        if present:
+                            misplaced.unlink()
 
     def test_baidu_main_only_still_requires_owned_executable_native_main(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
