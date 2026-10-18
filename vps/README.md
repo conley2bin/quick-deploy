@@ -95,7 +95,17 @@ Xray26.10.10、Caddy2.11.7二进制和 geodata，**不运行上游安装器**。
   作为独立订阅导入；不覆盖机场、Script、TUN或系统代理。使用上游支持的内联规则：
   节点IP/订阅域名/私网与中国/Bili直连，其余 `MATCH,PROXY`，保留手选 PROXY 组。
 - Shadowrocket：导入自己的 base64 URI订阅 URL。URI只更新节点，**不包含手机分流策略**；
-  手机国内/Bili直连及代理选择必须由用户在实际规则模式核验。必要时先停VPN再直连刷新。
+  必要时先停VPN再直连刷新。
+  - 当前固定的 **Xray26.10.10 REALITY** 要求客户端 TLS 指纹提供 `X25519MLKEM768`
+    key share，且位于可选的 `X25519` 之前。到 **设置 → TCP → 指纹** 选择明确标注
+    支持 `X25519MLKEM768` 的 profile；**Chrome140 已经真人手机复测可用**，其他 profile
+    未在本部署实测。以实际握手能力为准，不把浏览器名称/版本当作永久兼容名单。
+    订阅中的泛称 `fp=chrome` 不保证有效指纹满足要求；同时检查节点级指纹覆写，勿假定全局选择必然生效。
+  - 排障可临时设全局路由为「代理」、选自己的节点并关闭回退，再验收实际 HTTPS 浏览；
+    TCP 延迟或 VPN 开关亮起不能证明代理认证成功。成功后保留可用 TLS profile，切回「配置」/规则模式，
+    **单独核验国内/Bili直连及代理选择**，不要把全局代理测试当作日常分流验收。
+  - 维护依据：[固定 REALITY 握手条件](https://github.com/XTLS/REALITY/blob/8cdf7bf9c7f0/tls.go#L214-L238)、
+    [Shadowrocket 指纹选择说明](https://github.com/MHSanaei/3x-ui/issues/6596#issuecomment-5936563160)。
 - 面板通过 `ssh -N -L 2053:127.0.0.1:2053 <已核验目标>` 管理，按需加自己的 `-i/-p`。
   私有备份中 `deployment/manifest.json` 保存 admin_path/admin_user/admin_password；
   在私人本地查看器读取，勿贴聊天/工单。浏览器只访问该 SSH 隧道的本地管理路径。
