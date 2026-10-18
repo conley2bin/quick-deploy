@@ -350,44 +350,60 @@ def register_guard(state, plan):
         raise RuntimeError('frozen recovery guard process/tmux ownership not established')
 
 
+def recovery_failed(state, error):
+    status = json.loads((state/'status.json').read_text()) if (state/'status.json').exists() else {}
+    phase = status.get('phase')
+    if phase == 'recovery-needs-operator' and status.get('error') == str(error):
+        return  # The same failure was already published under the job lock.
+    record(state, 'recovery-needs-operator', error=str(error),
+           last_phase=status.get('last_phase') if phase == 'recovery-needs-operator' else phase,
+           recovery=status.get('recovery'))
+
+
 def rollback(state):
     state = state.resolve(strict=True)
     with recovery_lock(state):
-        plan = load_plan(state)
-        # File equality is only one stage, never proof of manager/process recovery.
-        now = TARGET.read_bytes() if TARGET.exists() else None
-        old = (state/'previous.conf').read_bytes() if plan['previous_exists'] else None
-        if old is not None and sha(old) != plan['previous_hash']:
-            raise RuntimeError('original backup hash mismatch; refusing recovery with corrupt data')
-        if now != old and (now is None or sha(now) != plan['candidate_hash']):
-            raise RuntimeError('drop-in changed outside this job; refusing to overwrite it')
-        if other_dropins() != plan['other_dropins']:
-            raise RuntimeError('another service drop-in changed; manual recovery required')
-        changed = now != old
-        if changed:
-            if old is None:
-                TARGET.unlink()
-            else:
-                atomic(TARGET, old, plan['previous_mode'])
-        progress = {'file_restored': True, 'manager_verified': False, 'process_verified': False}
-        record(state, 'recovery-file-restored', recovery=progress)
-        attempted = False
         try:
-            evidence = original_runtime(plan)
-        except (OSError, ValueError, RuntimeError):
-            # One bounded attempt. Failure retains the lock; only an explicit
-            # operator retry may start one further recovery attempt.
-            attempted = True
-            run(['systemctl', 'daemon-reload'])
-            original_manager(plan)
-            progress['manager_verified'] = True
-            record(state, 'recovery-manager-restored', recovery=progress)
-            run(['systemctl', 'restart', SERVICE], 60)
-            evidence = original_runtime(plan)
-        progress.update(manager_verified=True, process_verified=True)
-        record(state, 'rolled-back' if changed or attempted else 'rolled-back-no-change',
-               recovery=progress, evidence=evidence)
-        release(state)
+            plan = load_plan(state)
+            # File equality is only one stage, never proof of manager/process recovery.
+            now = TARGET.read_bytes() if TARGET.exists() else None
+            old = (state/'previous.conf').read_bytes() if plan['previous_exists'] else None
+            if old is not None and sha(old) != plan['previous_hash']:
+                raise RuntimeError('original backup hash mismatch; refusing recovery with corrupt data')
+            if now != old and (now is None or sha(now) != plan['candidate_hash']):
+                raise RuntimeError('drop-in changed outside this job; refusing to overwrite it')
+            if other_dropins() != plan['other_dropins']:
+                raise RuntimeError('another service drop-in changed; manual recovery required')
+            changed = now != old
+            if changed:
+                if old is None:
+                    TARGET.unlink()
+                else:
+                    atomic(TARGET, old, plan['previous_mode'])
+            progress = {'file_restored': True, 'manager_verified': False, 'process_verified': False}
+            record(state, 'recovery-file-restored', recovery=progress)
+            attempted = False
+            try:
+                evidence = original_runtime(plan)
+            except (OSError, ValueError, RuntimeError):
+                # One bounded attempt. Failure retains the lock; only an explicit
+                # operator retry may start one further recovery attempt.
+                attempted = True
+                run(['systemctl', 'daemon-reload'])
+                original_manager(plan)
+                progress['manager_verified'] = True
+                record(state, 'recovery-manager-restored', recovery=progress)
+                run(['systemctl', 'restart', SERVICE], 60)
+                evidence = original_runtime(plan)
+            progress.update(manager_verified=True, process_verified=True)
+            record(state, 'rolled-back' if changed or attempted else 'rolled-back-no-change',
+                   recovery=progress, evidence=evidence)
+            release(state)
+        except Exception as e:
+            # Publish non-serving state before another public request can acquire
+            # serialization and mistake this exiting guard for a request receiver.
+            recovery_failed(state, e)
+            raise
 
 
 def request_rollback(state):
@@ -630,9 +646,7 @@ def main():
             try:
                 guard(args.state)
             except Exception as e:
-                status = json.loads((args.state/'status.json').read_text()) if (args.state/'status.json').exists() else {}
-                record(args.state, 'recovery-needs-operator', error=str(e),
-                       last_phase=status.get('phase'), recovery=status.get('recovery'))
+                recovery_failed(args.state, e)
                 raise
     return 0
 

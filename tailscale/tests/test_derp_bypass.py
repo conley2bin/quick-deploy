@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Non-root offline tests; --live-parser exercises the installed CLI's real parser."""
 import concurrent.futures
+import contextlib
 import importlib.util
 import json
 import os
@@ -238,6 +239,26 @@ class RecoveryTests(unittest.TestCase):
         self.assertEqual(self.service.process, self.original)
         self.assertFalse(self.lock.exists())
         self.assertEqual(self.status()['phase'], 'rolled-back')
+
+    def test_failure_is_terminal_before_recovery_serialization_is_released(self):
+        phases_at_unlock = []
+        real_lock = m.recovery_lock
+        @contextlib.contextmanager
+        def observed_lock(state, blocking=True):
+            with real_lock(state, blocking):
+                try:
+                    yield
+                except Exception:
+                    phases_at_unlock.append(self.status()['phase'])
+                    raise
+        self.service.fail_reload = 1
+        self.request()
+        with mock.patch.object(m, 'recovery_lock', side_effect=observed_lock):
+            with self.assertRaisesRegex(RuntimeError, 'injected reload failure'):
+                self.command('_guard')
+        self.assertEqual(phases_at_unlock, ['recovery-needs-operator'])
+        self.assertTrue(self.lock.exists())
+        self.assertEqual((self.reloads(), self.restarts()), (1, 0))
 
     def test_restart_failure_after_file_restore_then_explicit_public_retry(self):
         self.service.fail_restart = 1
