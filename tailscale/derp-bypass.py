@@ -174,6 +174,16 @@ def node_identity():
             'state': d.get('BackendState')}
 
 
+def stable_rules(document):
+    # Mihomo 1.19.32 includes live traffic counters in /rules. Retain routing
+    # semantics (including disabled and unknown fields), not hit/miss telemetry.
+    volatile = {'hitCount', 'hitAt', 'missCount', 'missAt'}
+    return {**document, 'rules': [
+        {**rule, **({'extra': {k: v for k, v in rule['extra'].items() if k not in volatile}}
+                   if isinstance(rule.get('extra'), dict) else {})}
+        for rule in document.get('rules', [])]}
+
+
 def clash_state(uid):
     import yaml  # Already a dependency of clash-verge/lib/rules.py; no installation here.
     home = pathlib.Path(pwd.getpwuid(uid).pw_dir)
@@ -201,7 +211,7 @@ def clash_state(uid):
     proxies = get('/proxies')['proxies']
     selectors_now = {k: {x: v.get(x) for x in ('type', 'now', 'all')} for k, v in proxies.items() if 'all' in v}
     fingerprints = {k: sha(json.dumps(v, sort_keys=True).encode()) for k, v in
-                    {'config': config, 'rules': get('/rules'), 'selectors': selectors_now}.items()}
+                    {'config': config, 'rules': stable_rules(get('/rules')), 'selectors': selectors_now}.items()}
     return {'mode': config.get('mode'), 'fingerprints': fingerprints,
             'derp_connections': [{'sourcePort': c.get('metadata', {}).get('sourcePort'),
                                   'sourceIP': c.get('metadata', {}).get('sourceIP'),

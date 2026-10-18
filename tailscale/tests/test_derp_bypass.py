@@ -67,6 +67,18 @@ class PolicyTests(unittest.TestCase):
             r = subprocess.run(['systemd-analyze', '--user', 'verify', str(p)], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             self.assertEqual(r.returncode, 0, r.stderr.decode())
 
+    def test_rule_telemetry_does_not_change_policy_fingerprint(self):
+        a = {'rules': [{'type': 'Domain', 'payload': 'derp.dex-gem.ai', 'proxy': 'DIRECT',
+                        'extra': {'disabled': False, 'hitCount': 1, 'hitAt': 'before', 'missCount': 10, 'missAt': 'before'}}]}
+        b = json.loads(json.dumps(a))
+        b['rules'][0]['extra'].update(hitCount=2, hitAt='after', missCount=20, missAt='after')
+        self.assertEqual(m.stable_rules(a), m.stable_rules(b))
+        b['rules'][0]['extra']['disabled'] = True
+        self.assertNotEqual(m.stable_rules(a), m.stable_rules(b))
+        b['rules'][0]['extra']['disabled'] = False
+        b['rules'][0]['extra']['unknownSemantics'] = True
+        self.assertNotEqual(m.stable_rules(a), m.stable_rules(b))
+
     def test_apply_never_prompts_or_elevates(self):
         with mock.patch.object(m.os, 'geteuid', return_value=1000), mock.patch.object(m, 'run') as call:
             with self.assertRaisesRegex(RuntimeError, 'requires the user'):
