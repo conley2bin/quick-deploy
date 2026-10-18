@@ -132,8 +132,10 @@ class Local(unittest.TestCase):
         with mock.patch.object(vps, 'target_record', return_value=self.record), mock.patch.object(vps, 'remote', side_effect=remote), \
              mock.patch.object(vps, 'confirm'), mock.patch.object(vps, 'inspect_backup', return_value=manifest), \
              mock.patch.object(vps, 'backup_remote', return_value=Path(self.doc['backup'])), mock.patch.object(vps, 'validate_outputs'), \
-             mock.patch.object(vps, 'artifacts', side_effect=AssertionError('release network required')):
+             mock.patch.object(vps, 'artifacts', side_effect=AssertionError('release network required')), \
+             mock.patch.object(vps, 'export_after_commit') as export:
             vps.deploy(self.state, self.doc, self.args('replace'))
+        export.assert_called_once_with(self.state)
         self.assertTrue(all(target != 'old-fixture' for target, _ in calls))
         self.assertEqual([action for _, action in calls], ['preflight', 'prepare', 'commit'])
         saved = vps.load(self.state / 'state.json')
@@ -162,8 +164,10 @@ class Local(unittest.TestCase):
         host.atomic(offnode, 'fixture')
         def remote(record, action, *args):
             return {'committed': True} if action == 'abort' else {'machine_id': self.record['machine_id'], 'healthy': True}
-        with mock.patch.object(vps, 'remote', side_effect=remote) as rem, mock.patch.object(vps, 'backup_remote', return_value=offnode):
+        with mock.patch.object(vps, 'remote', side_effect=remote) as rem, mock.patch.object(vps, 'backup_remote', return_value=offnode), \
+             mock.patch.object(vps, 'export_after_commit') as export:
             vps.recover_local(self.state, self.doc)
+        export.assert_called_once_with(self.state)
         self.assertEqual([c.args[1] for c in rem.call_args_list], ['abort', 'status'])
         self.assertFalse((self.state / 'pending.json').exists())
         self.assertEqual(self.doc['current']['machine_id'], 'a' * 32)

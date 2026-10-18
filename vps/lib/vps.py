@@ -14,6 +14,7 @@ import re
 import secrets
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import tarfile
@@ -313,10 +314,82 @@ def validate_outputs(state, document, record, binary=None, backup=None):
                 host.atomic(config, data)
                 host.run([binary, '-t', '-d', root, '-f', config], timeout=60)
     manifest = inspect_backup(backup, release_lock())
-    urls = {device: {'mihomo': f"https://{document['config']['domain']}:8443/mihomo/{manifest['accounts'][device]['subId']}",
-                     'shadowrocket': f"https://{document['config']['domain']}:8443/sub/{manifest['accounts'][device]['subId']}"}
-            for device in host.DEVICES if manifest['accounts'][device]['enable']}
-    host.atomic(output / 'subscription-urls.json', host.dumps(urls))
+    host.atomic(output / 'subscription-urls.json', host.dumps(subscription_urls(manifest)))
+
+
+def subscription_urls(manifest):
+    return {device: {'mihomo': f"https://{manifest['config']['domain']}:8443/mihomo/{account['subId']}",
+                     'shadowrocket': f"https://{manifest['config']['domain']}:8443/sub/{account['subId']}"}
+            for device in host.DEVICES if (account := manifest['accounts'][device])['enable']}
+
+
+def export_urls(state):
+    """Offline convenience copy from committed authority, never candidate outputs."""
+    if (state / 'pending.json').exists() or (state / 'pending.json').is_symlink():
+        raise host.Error('Pending transaction is ambiguous; use recover before export')
+    document = load(state / 'state.json')
+    if document.get('format') != host.FORMAT or not document.get('current') or not document.get('backup'):
+        raise host.Error('Export requires saved committed state and its verified backup')
+    manifest = inspect_backup(Path(document['backup']), release_lock())
+    if (manifest['owner'] != document['owner'] or manifest['config'] != document['config']
+            or manifest['endpoint'] != document['current']['endpoint']):
+        raise host.Error('Saved backup does not match committed owner/config/endpoint')
+    destination = MODULE / 'subscription-urls.json'
+    temporary = '.subscription-urls-' + secrets.token_hex(12) + '.tmp'
+    if MODULE.is_symlink() or destination.is_symlink():
+        raise host.Error('Refusing symlink subscription export destination')
+    # Check actual Git behavior before placing any credentials in the repository.
+    root = host.run(['git', '-C', MODULE, 'rev-parse', '--show-toplevel']).stdout.decode().strip()
+    if Path(root) != MODULE.parent:
+        raise host.Error('Export requires the complete quick-deploy Git worktree')
+    if host.run(['git', '-C', root, 'ls-files', '--', 'vps/subscription-urls.json', 'vps/.subscription-urls-*.tmp']).stdout:
+        raise host.Error('Refusing tracked subscription export paths; no automatic untracking')
+    for name in (destination.name, temporary):
+        try:
+            host.run(['git', '-C', root, 'check-ignore', '-q', '--', 'vps/' + name])
+        except host.Error as exc:
+            raise host.Error('Subscription export and its temporary files must be Git-ignored') from exc
+    # Pin the existing code directory without changing its normal permissions.
+    directory = os.open(MODULE, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    created = False
+    try:
+        info = os.fstat(directory)
+        if info.st_uid != os.getuid():
+            raise host.Error('Export directory requires current owner')
+        try:
+            info = os.stat(destination.name, dir_fd=directory, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o600:
+                raise host.Error('Existing export must be a regular current-owner mode0600 file, not a symlink')
+        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=directory)
+        created = True
+        with os.fdopen(fd, 'wb') as out:
+            os.fchmod(out.fileno(), 0o600)
+            out.write(host.dumps(subscription_urls(manifest)).encode())
+            out.flush()
+            os.fsync(out.fileno())
+        os.replace(temporary, destination.name, src_dir_fd=directory, dst_dir_fd=directory)
+        os.fsync(directory)
+    finally:
+        try:
+            if created:
+                os.unlink(temporary, dir_fd=directory)
+        except FileNotFoundError:
+            pass
+        finally:
+            os.close(directory)
+    return destination
+
+
+def export_after_commit(state):
+    try:
+        path = export_urls(state)
+    except (host.Error, OSError, ValueError) as exc:
+        raise host.Error('Deployment already committed; local subscription export failed. '
+                         'Fix the local destination/Git exclusion and retry with setup.sh export; no redeploy needed') from exc
+    print('Private subscription URL copy: ' + str(path))
 
 
 def remember_commit(state, document, record, backup, result):
@@ -373,13 +446,14 @@ def deploy(state, document, args):
             confirm('Native core/three full Mihomo profiles and scoped URI feeds validated; trusted TLS and a complete unencrypted OFF-NODE backup exist. Publish the six exact device feed paths? Real phone/desktop connectivity remains a separate user test.')
             result = remote(record, 'commit', dict(request_for(document, record), offnode_sha256=host.digest(offnode)))
         remember_commit(state, document, record, offnode, result)
-        print('Deployment committed. Private native profiles and subscription URLs: ' + str(state / 'outputs'))
-        print('Off-node backup is UNENCRYPTED (0700/0600): ' + str(offnode))
-        if replacing:
-            print('Operator must update grey DNS to the new endpoint and REFRESH clients. Old node was not contacted or revoked; cold replacement has downtime.')
     except BaseException:
         print('Transaction incomplete. Local pending intent is retained; run recover. No SSH, firewall, DNS or PC network policy was changed.', file=sys.stderr)
         raise
+    print('Deployment committed. Private native profiles and subscription URLs: ' + str(state / 'outputs'))
+    print('Off-node backup is UNENCRYPTED (0700/0600): ' + str(offnode))
+    if replacing:
+        print('Operator must update grey DNS to the new endpoint and REFRESH clients. Old node was not contacted or revoked; cold replacement has downtime.')
+    export_after_commit(state)
 
 
 def recover_local(state, document):
@@ -391,6 +465,7 @@ def recover_local(state, document):
         backup = backup_remote(state, document, record)
         remember_commit(state, document, record, backup, status)
         print('Remote commit had succeeded; reconciled ownership and made a new off-node backup.')
+        export_after_commit(state)
     else:
         (state / 'pending.json').unlink()
         print('Candidate stopped/disabled; private failed state retained on the target. Current/old host unchanged.')
@@ -400,7 +475,7 @@ def parser():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--state-dir', type=Path, default=DEFAULT_STATE)
     sub = p.add_subparsers(dest='command', required=True)
-    for name in ('deploy', 'replace', 'restore', 'preflight', 'status', 'backup', 'recover'):
+    for name in ('deploy', 'replace', 'restore', 'preflight', 'status', 'backup', 'recover', 'export'):
         a = sub.add_parser(name)
         if name in ('deploy', 'replace', 'restore', 'preflight'):
             a.add_argument('--ssh', required=True, help='trusted SSH alias or user@public-IPv4; host key must already be verified')
@@ -440,6 +515,8 @@ def main(argv=None):
                 print(host.dumps(remote(record, 'preflight', request_for(document, record))), end='')
             elif args.command == 'recover':
                 recover_local(state, document)
+            elif args.command == 'export':
+                print('Private saved-snapshot subscription URLs: ' + str(export_urls(state)))
             else:
                 record = document['current']
                 if not record:

@@ -16,6 +16,8 @@ __pycache__/
 coding-agent/shared/MCP/deep-research/.env
 codoxear/.env
 codoxear/.runtime/
+/vps/subscription-urls.json
+/vps/.subscription-urls-*.tmp
 
 !.claude/
 !.agents/
