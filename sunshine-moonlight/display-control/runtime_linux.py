@@ -916,7 +916,7 @@ RETIREMENT_PROPERTIES = (
     "Id", "LoadState", "ActiveState", "SubState", "MainPID", "ControlPID", "InvocationID",
     "ControlGroup", "KillMode", "SendSIGKILL", "KillSignal", "FinalKillSignal", "TimeoutStopUSec",
     "Restart", "Delegate", "Triggers", "TriggeredBy", "FileDescriptorStoreMax", "NFileDescriptorStore",
-    "Job", "ExecStop", "ExecStopPost", "Sockets", "BusName", "Type", "NotifyAccess", "RemainAfterExit",
+    "Job", "ExecStop", "ExecStopPost", "BusName", "Type", "NotifyAccess", "RemainAfterExit",
     "NeedDaemonReload",
 )
 RETIREMENT_POLICY = {
@@ -927,7 +927,7 @@ RETIREMENT_POLICY = {
     # numeric zero and nonempty jobs are not this positive no-job observation;
     # ListJobs below independently requires the typed empty manager array.
     "FileDescriptorStoreMax": "0", "NFileDescriptorStore": "0", "Job": "",
-    "ExecStop": "", "ExecStopPost": "", "Sockets": "", "BusName": "", "Type": "simple",
+    "ExecStop": "", "ExecStopPost": "", "BusName": "", "Type": "simple",
     "NotifyAccess": "none", "RemainAfterExit": "no", "NeedDaemonReload": "no", "ControlPID": "0",
 }
 CGROUP_ROOT = Path("/sys/fs/cgroup")
@@ -993,6 +993,49 @@ class AttemptRetirement:
         self.runtime = LinuxRuntime(settings, transport)
         self.settings, self.transport = settings, transport
 
+    def _require_typed_policy(self):
+        """Lossless owned-object facts; absent SHOW arrays are not empty proof.
+
+        Sockets= is not a Service D-Bus property. systemd255 maps that directive
+        to UNIT_TRIGGERED_BY; service_collect_fds uses that relation (or an
+        accepting socket's UNIT_TRIGGERS edge) plus the FD store. Positively
+        empty real activation relations and zero store close those manager
+        handoff routes. Owned fragment/retry policy, receipt equality and the
+        exclusive outside-sender contract remain independent prerequisites.
+        """
+        prefix = ("/usr/bin/busctl", "--user", "--json=short", "--auto-start=no",
+                  "--allow-interactive-authorization=no")
+        expected = _UNIT_BUS_OBJECTS[UNIT]
+        def typed(argv, signature):
+            def unique(items):
+                obj = {}
+                for key, value in items:
+                    if key in obj:
+                        raise ValueError("duplicate property field")
+                    obj[key] = value
+                return obj
+            try:
+                obj = json.loads(_text(self.runtime._run(argv)), object_pairs_hook=unique)
+                if type(obj) is not dict or set(obj) != {"type", "data"} or obj["type"] != signature:
+                    raise ValueError("typed property envelope")
+                return obj["data"]
+            except (ValueError, UnicodeError, RecursionError):
+                retirement_refused("invalid typed retirement property proof")
+        resolved = typed((*prefix, "call", "org.freedesktop.systemd1", "/org/freedesktop/systemd1",
+                          "org.freedesktop.systemd1.Manager", "GetUnit", "s", UNIT), "o")
+        if resolved != [expected]:
+            retirement_refused("GetUnit did not resolve the exact canonical retirement unit object")
+        for interface, name, signature in (
+                ("Service", "ExecStop", "a(sasbttttuii)"),
+                ("Service", "ExecStopPost", "a(sasbttttuii)"),
+                ("Unit", "Triggers", "as"), ("Unit", "TriggeredBy", "as"),
+                ("Service", "FileDescriptorStoreMax", "u"), ("Service", "NFileDescriptorStore", "u")):
+            value = typed((*prefix, "get-property", "org.freedesktop.systemd1", expected,
+                           "org.freedesktop.systemd1." + interface, name), signature)
+            if ((signature == "u" and (type(value) is not int or value != 0))
+                    or (signature != "u" and (type(value) is not list or value != []))):
+                retirement_refused("nonempty/unknown stop-hook, activation or FD-store property")
+
     def properties(self):
         raw = self.runtime._run(("/usr/bin/systemctl", "--user", "show", "--no-pager", UNIT,
                                  "--property=" + ",".join(RETIREMENT_PROPERTIES)))
@@ -1002,8 +1045,13 @@ class AttemptRetirement:
             if not eq or key not in RETIREMENT_PROPERTIES or key in props:
                 retirement_refused("ambiguous retirement unit properties")
             props[key] = value
-        if set(props) != set(RETIREMENT_PROPERTIES) or any(props.get(k) != v for k, v in RETIREMENT_POLICY.items()):
+        missing = set(RETIREMENT_PROPERTIES) - set(props)
+        if (missing - {"ExecStop", "ExecStopPost"}
+                or any(props[k] != v for k, v in RETIREMENT_POLICY.items() if k in props)):
             retirement_refused("unsupported kill/delegate/activation/FD-store/job/control policy")
+        self._require_typed_policy()  # Always require positive facts, even if SHOW prints an empty token.
+        for name in ("ExecStop", "ExecStopPost"):
+            props[name] = ""  # Internal empty-array token, justified ONLY by the typed proof above.
         # Empty arrays are proved by a typed manager response, never omitted
         # properties. Reject any job in this exclusive attended window.
         raw = self.runtime._run(("/usr/bin/busctl", "--user", "--json=short", "--auto-start=no",

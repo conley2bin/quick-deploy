@@ -29,6 +29,14 @@ SHOW = ("/usr/bin/systemctl", "--user", "show", "--no-pager", rt.UNIT,
         "--property="+",".join(rt.RETIREMENT_PROPERTIES))
 JOBS = ("/usr/bin/busctl", "--user", "--json=short", "--auto-start=no", "--allow-interactive-authorization=no",
         "call", "org.freedesktop.systemd1", "/org/freedesktop/systemd1", "org.freedesktop.systemd1.Manager", "ListJobs")
+GET_UNIT = (*rf.BUS_PREFIX,"call","org.freedesktop.systemd1","/org/freedesktop/systemd1",
+            "org.freedesktop.systemd1.Manager","GetUnit","s",rt.UNIT)
+PROPERTY_COMMANDS = {
+    (*rf.BUS_PREFIX,"get-property","org.freedesktop.systemd1",rf.BUS_OBJECT,
+     "org.freedesktop.systemd1."+interface,name):name
+    for interface,name in (("Service","ExecStop"),("Service","ExecStopPost"),("Unit","Triggers"),
+                           ("Unit","TriggeredBy"),("Service","FileDescriptorStoreMax"),("Service","NFileDescriptorStore"))
+}
 
 
 class Kernel:
@@ -37,8 +45,15 @@ class Kernel:
         self.f, self.t = f, f.t
         self.cg = f"/user.slice/user-{os.geteuid()}.slice/user@{os.geteuid()}.service/app.slice/{rt.UNIT}"
         self.path = rt.CGROUP_ROOT/self.cg.lstrip("/")
-        self.props = {key: "" for key in rt.RETIREMENT_PROPERTIES}
-        self.props.update(rt.RETIREMENT_POLICY)
+        # Actual systemctl255 producer omits these special empty arrays even
+        # with --all; Sockets is not a native Service property at all.
+        self.props = {key: "" for key in rt.RETIREMENT_PROPERTIES if key not in ("ExecStop","ExecStopPost")}
+        self.props.update({k:v for k,v in rt.RETIREMENT_POLICY.items() if k not in ("ExecStop","ExecStopPost")})
+        self.get_unit = {"type":"o","data":[rf.BUS_OBJECT]}
+        self.typed = {"ExecStop":{"type":"a(sasbttttuii)","data":[]},
+                      "ExecStopPost":{"type":"a(sasbttttuii)","data":[]},
+                      "Triggers":{"type":"as","data":[]}, "TriggeredBy":{"type":"as","data":[]},
+                      "FileDescriptorStoreMax":{"type":"u","data":0}, "NFileDescriptorStore":{"type":"u","data":0}}
         self.jobs = {"type": "a(usssoo)", "data": [[]]}
         self.controls, self.events = [], []
         self.fault = None
@@ -59,6 +74,13 @@ class Kernel:
             if self.t.on_run:
                 self.t.on_run(self.t, argv)
             return rt.CommandResult(0, "".join(k+"="+v+"\n" for k,v in props.items()).encode())
+        if argv == GET_UNIT or argv in PROPERTY_COMMANDS:
+            self.t.calls.append((argv,timeout,max_output))
+            if self.t.on_run: self.t.on_run(self.t,argv)
+            value = self.get_unit if argv == GET_UNIT else self.typed[PROPERTY_COMMANDS[argv]]
+            if isinstance(value,Exception): raise value
+            if type(value) is rt.CommandResult: return value
+            return rt.CommandResult(0,value if type(value) is bytes else ic.document(value))
         if argv == JOBS:
             self.t.calls.append((argv, timeout, max_output))
             if self.t.on_run:
@@ -200,7 +222,7 @@ class RecoveryTests(unittest.TestCase):
                b"SendSIGKILL=yes\nId=app-dev.lizardbyte.app.Sunshine.service\nTriggers=\nTriggeredBy=\n"
                b"ActiveState=active\nSubState=running\nJob=\nInvocationID=22222222222222222222222222222222\n"
                b"LoadState=loaded\nKillSignal=15\nTimeoutStopUSec=1min 30s\nRestart=on-failure\n"
-               b"ExecStop=\nExecStopPost=\nSockets=\nBusName=\nType=simple\nNotifyAccess=none\nRemainAfterExit=no\nNeedDaemonReload=no\n")
+               b"BusName=\nType=simple\nNotifyAccess=none\nRemainAfterExit=no\nNeedDaemonReload=no\n")
         # Native method-call codec: outer return arguments, then the job array.
         # The separate empty ListUnitsByNames capture proves this codec shape,
         # not real ListJobs quiescence. All values here are private synthetic.
@@ -208,6 +230,8 @@ class RecoveryTests(unittest.TestCase):
         def observe(argv):
             if argv == SHOW: return raw
             if argv == JOBS: return jobs
+            if argv == GET_UNIT: return ic.document(f.kernel.get_unit)
+            if argv in PROPERTY_COMMANDS: return ic.document(f.kernel.typed[PROPERTY_COMMANDS[argv]])
             raise AssertionError("unexpected external observation")
         with mock.patch.object(adapter.runtime,"_run",side_effect=observe):
             self.assertEqual(adapter.properties()["Job"],"")
@@ -240,6 +264,78 @@ class RecoveryTests(unittest.TestCase):
             with self.assertRaises(Refusal): adapter.populated(f.kernel.path)
         self.assertEqual(f.kernel.controls,[])
         self.assertFalse(list((f.controller/"state").glob("attempt-*.bak")))
+
+    def test_typed_native_properties_are_mandatory_and_fail_before_intent(self):
+        f = self.retained()
+        before = self.snapshot(f)
+        for name in ("ExecStop","ExecStopPost","Triggers","TriggeredBy","FileDescriptorStoreMax","NFileDescriptorStore"):
+            original = f.kernel.typed[name]
+            signature = original["type"]
+            nonempty = (1 if signature == "u" else ["fixture.socket"] if signature == "as" else
+                        [["/fixture/hook",["/fixture/hook"],False,0,0,0,0,0,0,0]])
+            cases = (rt.CommandResult(1,stderr=b"Unknown property"),rt.CommandResult(0,b""),
+                     {"type":"t" if signature == "u" else "u","data":0},
+                     {**original,"extra":[]},
+                     ('{"type":'+json.dumps(signature)+',"data":[],"data":[]}').encode(),
+                     {"type":signature,"data":nonempty},
+                     {"type":signature,"data":[0] if signature == "u" else [[]]},
+                     {"type":signature,"data":False if signature == "u" else None})
+            for value in cases:
+                with self.subTest(property=name,value=repr(value)):
+                    f.kernel.typed[name] = value
+                    with mock.patch.object(ic,"create",side_effect=AssertionError("unknown proof must not publish")), self.assertRaises(Refusal):
+                        self.recover(f)
+                    self.assertEqual(self.snapshot(f),before)
+                    self.assertEqual(f.kernel.controls,[])
+            f.kernel.typed[name] = original
+        original = f.kernel.get_unit
+        for value in ({"type":"o","data":["/org/freedesktop/systemd1/unit/sunshine_2eservice"]},
+                      {"type":"o","data":rf.BUS_OBJECT},{"type":"o","data":[]},
+                      {"type":"o","data":[rf.BUS_OBJECT,rf.BUS_OBJECT]},
+                      {"type":"s","data":[rf.BUS_OBJECT]}, {**original,"extra":0},
+                      b'{"type":"o","data":[],"data":[]}',rt.CommandResult(1,stderr=b"unknown unit")):
+            with self.subTest(GetUnit=repr(value)):
+                f.kernel.get_unit = value
+                with mock.patch.object(ic,"create",side_effect=AssertionError("wrong object must not publish")), self.assertRaises(Refusal):
+                    self.recover(f)
+                self.assertEqual(self.snapshot(f),before)
+                self.assertEqual(f.kernel.controls,[])
+        self.assertNotIn("Sockets",rt.RETIREMENT_PROPERTIES)
+        self.assertNotIn("Sockets",rt.RETIREMENT_POLICY)
+        self.assertFalse(any(argv[-1] == "Sockets" for argv,_,_ in f.t.calls))
+
+    def test_hostile_socket_routes_cannot_bypass_real_boundary(self):
+        for case in ("fragment","foreign_dropin","foreign_loaded_dropin","managed_retry","activation"):
+            with self.subTest(case=case):
+                f = di.Fixture(Path(self.temp.name)/case)
+                drop = None
+                if case == "managed_retry":
+                    directory = f.f.home/".config/systemd/user"/(rt.UNIT+".d")
+                    guard,drop = directory/"check-tailnet.py",directory/"quick-deploy-retry.conf"
+                    f.t.put(guard,(di.MODULE/"service/check-tailnet.py").read_bytes())
+                    f.t.put(drop,rt._retry_bytes(guard,f.f.conf.parent))
+                    f.t.props["DropInPaths"] = str(drop)
+                    f.t.props["ExecStartPre"] += " "+rf.command("/usr/bin/python3",f"/usr/bin/python3 {guard} {f.f.conf.parent}")
+                self.retained(f)
+                before = self.snapshot(f)
+                if case == "fragment":
+                    f.t.put(rf.FRAGMENT,di.REFERENCE_UNIT+b"Sockets=fixture.socket\n",uid=0)
+                elif case == "foreign_dropin":
+                    path = f.f.home/".config/systemd/user"/(rt.UNIT+".d")/"foreign-sockets.conf"
+                    f.t.put(path,b"[Service]\nSockets=fixture.socket\n")
+                    f.t.props["DropInPaths"] = str(path)
+                elif case == "foreign_loaded_dropin":
+                    f.t.props["DropInPaths"] = "/fixture/runtime-unit.d/foreign-sockets.conf"
+                elif case == "managed_retry":
+                    f.t.put(drop,f.t.files[drop]+b"Sockets=fixture.socket\n")
+                else:
+                    # A loaded socket association is independently visible as
+                    # TriggeredBy even if the human SHOW text is falsely empty.
+                    f.kernel.typed["TriggeredBy"] = {"type":"as","data":["fixture.socket"]}
+                with mock.patch.object(ic,"create",side_effect=AssertionError("hostile socket policy must not publish")), self.assertRaises(Refusal):
+                    self.recover(f)
+                self.assertEqual(self.snapshot(f),before)
+                self.assertEqual(f.kernel.controls,[])
 
     def test_restarted_attested_attempt_is_also_admitted(self):
         f = self.retained(noop=False)
@@ -299,6 +395,8 @@ class RecoveryTests(unittest.TestCase):
                 elif key == "cgroup-v1": f.t.files.pop(rt.CGROUP_ROOT/"cgroup.controllers")
                 elif key == "cgroup-outside": f.t.put(Path("/proc")/f.t.props["MainPID"]/"cgroup",b"0::/outside\n")
                 elif key == "Id": f.t.props[key] = value
+                elif key in ("ExecStop","ExecStopPost"):
+                    f.kernel.typed[key]["data"] = [["/fixture/hook",["/fixture/hook"],False,0,0,0,0,0,0,0]]
                 else: f.kernel.props[key] = value
                 before = self.snapshot(f)
                 with self.assertRaises((Refusal,FileNotFoundError)):
