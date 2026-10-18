@@ -65,6 +65,102 @@ Clash Verge 的 TUN + Fake-IP 在某些主机会让 `tailscaled` 无法直接连
 systemctl show tailscaled.service -p Environment --value
 ```
 
+## 仅为自建 DERP 绕过 daemon 的显式 HTTP proxy
+
+Clash 的 `DIRECT` 只选择出口，仍经过 Clash 应用转发。两端现有规则已让
+`derp.dex-gem.ai:1443` 命中 `DIRECT`；若 tailscaled socket 仍连接
+`127.0.0.1:7897`，重复加规则不会移除这一跳。为这个目标不要重跑 `install.sh`
+（它还会执行 APT/完整代理收敛），使用下面的独立入口。
+
+从仓库根目录在**公司机器先执行**，确认恢复访问后再到本机执行同一条命令：
+
+```bash
+sudo /usr/bin/python3 tailscale/derp-bypass.py apply
+```
+
+这需要用户在该机终端自行批准 sudo。代理/SSH 密码不会交给脚本，脚本也不尝试提权。
+没有权限时停止，不能用另一个 DIRECT 规则假装已经绕过。
+
+入口只管理一个文件：
+
+```text
+/etc/systemd/system/tailscaled.service.d/zz-quick-deploy-derp-bypass.conf
+```
+
+它只设置 `NO_PROXY` 与 `no_proxy`，保留原有两者条目的并集及 localhost 例外，再加：
+
+```text
+derp.dex-gem.ai:1443,39.184.215.16:1443
+```
+
+这是 **tailscaled 进程内、端口限定的 DERP 域子树**：Go 的域名条目还会匹配
+`child.derp.dex-gem.ai:1443`，并非只匹配一个精确主机。它不新增整个 `dex-gem.ai`
+的例外，不影响同域 443、其他 DexGem 主机、控制/日志或其他应用的代理；原有更宽的
+NO_PROXY 条目仍保留。IP 条目只匹配 IP 形式请求，不替代域名条目。大小写同时设置为
+相同并集，避免不同 Go 版本的优先级差异。
+
+公司原有非受管 `proxy.conf` 不改动；本机旧的 `quick-deploy-clash-proxy.conf`
+也保留。新文件按文件名排在它们之后。若已有其他 EnvironmentFile 定义 NO_PROXY，
+入口会明确拒绝，因为它的值优先于 `Environment=`，不能仅凭文件生成成功声称生效。
+`install.sh` 的受管模板和匹配复用同一策略，保留原有上下写例外并写入两个变量；
+它不接管或删除外部代理 drop-in。
+
+### SSH 中断时的独立恢复
+
+`apply` 在任何服务修改前，将原独立文件、权限、候选、原服务来源 hash、节点身份及
+冻结入口保存到仓库 **git-ignored** 的 `.memory/local/tailscale-derp-bypass/<任务>/`。
+文件有凭据邻近信息，不提交或分享整目录。原代理 URL 只保存 hash，不输出凭据。
+
+随后在执行机上用 **root 所属的 `tmux -L pi-agent`** 创建两个独立任务：先确认回滚
+计时任务已运行，再启动应用任务。不依赖 SSH 会话或之后的仓库文件。应用只执行一次
+`daemon-reload` 和 **仅 tailscaled 的 restart**，会短暂中断 tailnet/SSH；不重启
+Clash/主机、不关闭其他应用连接、不改规则、TUN 开关、DNS、MTU 或 NAT。
+
+入口打印任务路径和两条非 root 命令：`status <任务路径>`、`confirm <任务路径>`。
+应用任务必须证明运行中两个环境变量已消费、其他代理变量未变、节点身份/IP 未变、
+Clash 配置/规则/选择未变；还必须看到 tailscaled 自己持有到真实 DERP 的 TCP socket，
+且其来源端口没有再出现在 Clash 的显式代理/TUN 连接里，marked underlay 路由也不是
+Meta/tailscale0/loopback。仅有 `DIRECT` 不能通过。
+
+**即使这些检查通过，也不会自动取消回滚。** 在 10 分钟内从另一端建立新 SSH
+（自动化仍通过 ShellGate），核验其他代理行为和实际路径后，原用户执行打印的
+`confirm` 命令；计时任务会再次验证，状态必须变为 `confirmed` 才算保留。只看到
+`verified-awaiting-confirmation` 或 confirm 文件存在不能当成完成。不要同时操作两台。
+
+未确认、检查失败、SSH/启动终端中断时，独立计时任务恢复原独立文件（原先不存在则删除），
+重新加载并启动 tailscaled；其他原代理文件不改。若原文件或其他服务来源被别的操作修改，
+恢复会拒绝覆盖并记录 `recovery-needs-operator`，不猜测用户意图。应用/回滚期间不要并行
+编辑服务配置。已确认后仍可使用原任务快照手动恢复：
+
+```bash
+sudo /usr/bin/python3 tailscale/derp-bypass.py rollback <任务路径>
+```
+
+手动恢复也在本机独立 tmux 任务内执行，可能短暂影响 SSH。原状态已恢复的重复回滚不再
+重启；已生效且实际路径验证通过的重复 apply 不改写、不重启。只有状态记录和实际 socket
+共同成立才是部署证据。本入口不承诺消除 DERP/WAN 自身抖动；部署后仍需重复同步测量。
+
+### 非 root 验证
+
+```bash
+python3 -B tailscale/tests/test_derp_bypass.py -v
+python3 -B tailscale/tests/test_derp_bypass.py --live-parser
+bash -n tailscale/install.sh
+```
+
+离线测试覆盖并集/转义、安装器匹配、systemd 实际语法检查、回滚构造、并发编辑拒绝、
+独立 guard 就绪前不写入、确认失败回滚、tmux 归属/槽冲突，以及 DIRECT 仍被 TUN 接管时
+拒绝验收。系统操作由替身隔离，**不能代替 root 实机恢复/部署验证**。
+
+`--live-parser` 不需要 Go 编译器：使用已安装的 `tailscale debug ts2021 --verbose`
+输出的真实 `tshttpproxy.ProxyFromEnvironment` 决策，读取后立即终止这个诊断子进程，
+不调用 daemon debug API、不登录、不更改 prefs。测试只设置子进程的假代理
+`127.0.0.1:9`；一个公开 `/key` GET 可能与终止竞速，不发送真实身份密钥/应用数据。
+它验证域/子域/IP 的 1443 直连，而域/IP 的 443、其他 DexGem 主机 1443 和控制/日志
+仍选择假代理。该测试证明 parser 语义，不证明 daemon 已加载新环境或网络已改善。
+依据：[Tailscale v1.104.1 wrapper](https://github.com/tailscale/tailscale/blob/v1.104.1/net/tshttpproxy/tshttpproxy.go)、
+[对应 x/net v0.59.0 parser](https://github.com/golang/net/blob/v0.59.0/http/httpproxy/proxy.go)。
+
 ## 服务与状态
 
 ```bash

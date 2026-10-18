@@ -151,7 +151,24 @@ proxy 目标写成内置策略（`DIRECT`/`REJECT`/…）、同一选择器相�
 `IP-CIDR,100.64.0.0/10` 与 `IP-CIDR6,fd7a:115c:a1e0::/48` 覆盖 tailnet 的 CGNAT 与
 ULA 对端地址。这组规则只说明规则表会把之后的连接判给 `DIRECT`，不是「当前 SSH 或中继
 流量已经直连」的运行证据：重载前已建立的连接可能继续沿用旧出口，要重连或看实际
-socket/路由才能确认；自建 DERP 域名不在覆盖范围内。
+socket/路由才能确认。自建 DERP 需要它自己的域名/IP 策略；当前来源中已有的
+`DOMAIN-SUFFIX,dex-gem.ai,DIRECT` 覆盖 `derp.dex-gem.ai`，不要为它再加同义规则，
+也不要为处理 DERP 延迟而扩大整个 DexGem 域族的策略。
+
+### 显式 HTTP proxy 不由 DIRECT 规则移除
+
+如果 tailscaled 的 socket 指向 `127.0.0.1:7897`，同时 Clash 的连接元数据显示
+`derp.dex-gem.ai:1443 → DIRECT`，说明出口已经直连，但 Clash 应用转发跳仍存在。
+修改本目录的规则或 `tun.route-exclude-address` 不会覆盖 tailscaled 的
+`HTTP_PROXY`/`HTTPS_PROXY`，重建该连接也仍会使用进程中缓存的代理环境。
+
+两机服务环境由各机 systemd drop-in 拥有，不把它写进 Script 或订阅。仅对当前自建
+DERP 绕过这一跳，使用 [`tailscale/derp-bypass.py` 的窄入口](../tailscale/README.md#仅为自建-derp-绕过-daemon-的显式-http-proxy)：
+它保留两端原代理文件和控制/日志代理，为 tailscaled 增加端口限定的 DERP 域子树/IP
+NO_PROXY 例外，预置同机独立自动回滚，再只重启 tailscaled 一次。需要用户明确 sudo
+授权；本目录 `rules apply` 仍保持原来的 Script-only 写入边界，不会代替执行这个动作。
+验收必须核对 tailscaled 实际 socket、Clash 运行连接和新 SSH，不能把 DIRECT、环境字段
+或平滑的单个短测试窗口当成代理跳已移除或延迟已修复的证明。
 
 ### TUN 与 Tailscale 共存
 

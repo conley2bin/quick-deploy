@@ -7,6 +7,8 @@ OS_RELEASE_FILE="${OS_RELEASE_FILE:-/etc/os-release}"
 KEYRING_FILE="${TAILSCALE_KEYRING_FILE:-/usr/share/keyrings/tailscale-archive-keyring.gpg}"
 SOURCE_LIST_FILE="${TAILSCALE_SOURCE_LIST_FILE:-/etc/apt/sources.list.d/tailscale.list}"
 SERVICE='tailscaled.service'
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+DERP_POLICY="$SCRIPT_DIR/derp-bypass.py"
 MARKER='# Managed by quick-deploy/tailscale/install.sh'
 LEGACY_MARKER='# Managed by quick-deploy/tailscale/configure-clash-proxy.sh'
 DROPIN_DIR="${TAILSCALE_DROPIN_DIR:-/etc/systemd/system/tailscaled.service.d}"
@@ -295,7 +297,7 @@ effective_proxy_matches() {
     environment="$(effective_environment)" || return 1
     grep -Fqx "HTTP_PROXY=$proxy" <<<"${environment// /$'\n'}" \
         && grep -Fqx "HTTPS_PROXY=$proxy" <<<"${environment// /$'\n'}" \
-        && grep -Fqx 'NO_PROXY=localhost,127.0.0.1,::1' <<<"${environment// /$'\n'}"
+        && python3 "$DERP_POLICY" policy-check <<<"$environment"
 }
 
 probe_proxy() {
@@ -330,7 +332,7 @@ require_active_service() {
 }
 
 clash_apply_proxy() {
-    local proxy="$1" tmp state
+    local proxy="$1" tmp state no_proxy_lines
     valid_proxy_url "$proxy" || die '--proxy 只能是无认证、无路径的 http://HOST:PORT，端口必须为 1..65535'
     state="$(managed_dropin_state)"
 
@@ -348,13 +350,17 @@ clash_apply_proxy() {
         die '候选 proxy 无法通过 CONNECT 访问 Tailscale 控制面；未修改 tailscaled'
     fi
 
+    # Keep existing upper/lowercase exceptions, including ones supplied by the
+    # independent DERP-only drop-in. Both spellings agree across Go versions.
+    no_proxy_lines="$(effective_environment | python3 "$DERP_POLICY" environment-lines)" \
+        || die '无法保留现有 NO_PROXY/no_proxy；未修改 tailscaled'
     new_temp tmp
     cat > "$tmp" <<EOF_DROPIN
 $MARKER
 [Service]
 Environment="HTTP_PROXY=$proxy"
 Environment="HTTPS_PROXY=$proxy"
-Environment="NO_PROXY=localhost,127.0.0.1,::1"
+$no_proxy_lines
 EOF_DROPIN
 
     run_root mkdir -p "$DROPIN_DIR"
