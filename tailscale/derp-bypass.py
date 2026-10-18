@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """One narrowly scoped tailscaled DERP proxy exception; no package/Clash changes."""
 import argparse
+import contextlib
+import fcntl
 import hashlib
 import http.client
 import json
@@ -15,7 +17,6 @@ import subprocess
 import sys
 import tempfile
 import time
-import uuid
 
 SERVICE = 'tailscaled.service'
 DERP = ('derp.dex-gem.ai:1443', '39.184.215.16:1443')
@@ -167,6 +168,31 @@ def process_environment():
     return dict(x.decode().split('=', 1) for x in raw.split(b'\0') if b'=' in x)
 
 
+def recovery_env_hashes(env):
+    # Preserve absent versus empty values without storing proxy credentials.
+    return {k: sha(json.dumps(env.get(k)).encode()) for k in PROXY_KEYS+('NO_PROXY', 'no_proxy')}
+
+
+def manager_environment():
+    return environment(run(['systemctl', 'show', SERVICE, '-p', 'Environment', '--value']))
+
+
+def original_manager(plan):
+    if recovery_env_hashes(manager_environment()) != plan['original_manager_hashes']:
+        raise RuntimeError('original manager proxy environment not restored')
+
+
+def original_runtime(plan):
+    original_manager(plan)
+    run(['systemctl', 'is-active', '--quiet', SERVICE])
+    if recovery_env_hashes(process_environment()) != plan['original_process_hashes']:
+        raise RuntimeError('original process proxy environment not restored')
+    node = node_identity()
+    if node != plan['node'] or node.get('state') != 'Running':
+        raise RuntimeError('original node identity/state not restored')
+    return {'node': node}
+
+
 def node_identity():
     d = json.loads(run(['tailscale', 'status', '--json']))
     s = d.get('Self', {})
@@ -264,34 +290,133 @@ def release(state):
         LOCK.unlink()
 
 
+@contextlib.contextmanager
+def recovery_lock(state, blocking=True):
+    # One job-local kernel lock covers public handoff, recovery and confirmation.
+    fd = os.open(state/'recovery.lock', os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
+        except BlockingIOError as e:
+            raise RuntimeError('another recovery task/request already owns this job') from e
+        yield
+    finally:
+        os.close(fd)
+
+
+def frozen_entry(state, plan):
+    entry = state/'entry.py'
+    if (entry.is_symlink() or not entry.is_file() or entry.stat().st_uid != os.geteuid()
+            or sha(entry.read_bytes()) != plan['entry_hash']):
+        raise RuntimeError('frozen recovery entry ownership/hash mismatch')
+    return entry
+
+
+def process_identity(pid):
+    proc = pathlib.Path(f'/proc/{pid}')
+    fields = (proc/'stat').read_text().rsplit(') ', 1)[1].split()
+    return {'pid': pid, 'start': fields[19], 'state': fields[0], 'uid': proc.stat().st_uid,
+            'argv': [x.decode() for x in (proc/'cmdline').read_bytes().split(b'\0') if x]}
+
+
+def guard_owner(state):
+    path = state/'guard-owner.json'
+    if path.is_symlink() or path.stat().st_uid != os.geteuid():
+        raise RuntimeError('unowned guard identity record')
+    return json.loads(path.read_text())
+
+
+def guard_alive(state, plan):
+    try:
+        entry = frozen_entry(state, plan)
+        owner = guard_owner(state)
+        proc = process_identity(owner['pid'])
+        if (proc['uid'] != os.geteuid() or proc['state'] in ('Z', 'X') or proc['start'] != owner['start']
+                or proc['argv'][1:] != [str(entry), '_guard', str(state)]
+                or pathlib.Path(proc['argv'][0]).resolve() != pathlib.Path(sys.executable).resolve()):
+            return False
+        pane = run(['tmux', '-L', 'pi-agent', 'display-message', '-p', '-t', owner['pane'],
+                    '#{session_path}\t#{pane_id}\t#{pane_pid}\t#{pane_dead}']).strip().split('\t')
+        return pane == [plan['repo'], owner['pane'], str(owner['pid']), '0']
+    except (OSError, ValueError, KeyError, IndexError, RuntimeError):
+        return False
+
+
+def register_guard(state, plan):
+    proc = process_identity(os.getpid())
+    atomic(state/'guard-owner.json', json.dumps({'pid': proc['pid'], 'start': proc['start'],
+                                                'pane': os.environ.get('TMUX_PANE', '')}).encode())
+    if not guard_alive(state, plan):
+        raise RuntimeError('frozen recovery guard process/tmux ownership not established')
+
+
 def rollback(state):
-    plan = load_plan(state)
-    # Never overwrite a concurrent operator's change, even during automatic recovery.
-    now = TARGET.read_bytes() if TARGET.exists() else None
-    old = (state/'previous.conf').read_bytes() if plan['previous_exists'] else None
-    if old is not None and sha(old) != plan['previous_hash']:
-        raise RuntimeError('original backup hash mismatch; refusing recovery with corrupt data')
-    if now == old:
+    state = state.resolve(strict=True)
+    with recovery_lock(state):
+        plan = load_plan(state)
+        # File equality is only one stage, never proof of manager/process recovery.
+        now = TARGET.read_bytes() if TARGET.exists() else None
+        old = (state/'previous.conf').read_bytes() if plan['previous_exists'] else None
+        if old is not None and sha(old) != plan['previous_hash']:
+            raise RuntimeError('original backup hash mismatch; refusing recovery with corrupt data')
+        if now != old and (now is None or sha(now) != plan['candidate_hash']):
+            raise RuntimeError('drop-in changed outside this job; refusing to overwrite it')
+        if other_dropins() != plan['other_dropins']:
+            raise RuntimeError('another service drop-in changed; manual recovery required')
+        changed = now != old
+        if changed:
+            if old is None:
+                TARGET.unlink()
+            else:
+                atomic(TARGET, old, plan['previous_mode'])
+        progress = {'file_restored': True, 'manager_verified': False, 'process_verified': False}
+        record(state, 'recovery-file-restored', recovery=progress)
+        attempted = False
+        try:
+            evidence = original_runtime(plan)
+        except (OSError, ValueError, RuntimeError):
+            # One bounded attempt. Failure retains the lock; only an explicit
+            # operator retry may start one further recovery attempt.
+            attempted = True
+            run(['systemctl', 'daemon-reload'])
+            original_manager(plan)
+            progress['manager_verified'] = True
+            record(state, 'recovery-manager-restored', recovery=progress)
+            run(['systemctl', 'restart', SERVICE], 60)
+            evidence = original_runtime(plan)
+        progress.update(manager_verified=True, process_verified=True)
+        record(state, 'rolled-back' if changed or attempted else 'rolled-back-no-change',
+               recovery=progress, evidence=evidence)
         release(state)
-        record(state, 'rolled-back-no-change')
-        return
-    if now is None or sha(now) != plan['candidate_hash']:
-        raise RuntimeError('drop-in changed outside this job; refusing to overwrite it')
-    if other_dropins() != plan['other_dropins']:
-        raise RuntimeError('another service drop-in changed; manual recovery required')
-    if old is None:
-        TARGET.unlink()
-    else:
-        atomic(TARGET, old, plan['previous_mode'])
-    run(['systemctl', 'daemon-reload'])
-    run(['systemctl', 'restart', SERVICE], 60)
-    run(['systemctl', 'is-active', '--quiet', SERVICE])
-    release(state)
-    record(state, 'rolled-back', node=node_identity())
+
+
+def request_rollback(state):
+    state = state.resolve(strict=True)
+    plan = load_plan(state)
+    with recovery_lock(state, blocking=False):
+        if LOCK.exists():
+            if LOCK.read_text().strip() != str(state):
+                raise RuntimeError('a different job is pending')
+        else:
+            fd = os.open(LOCK, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            with os.fdopen(fd, 'w') as f:
+                f.write(str(state)+'\n')
+        status = json.loads((state/'status.json').read_text()) if (state/'status.json').exists() else {}
+        terminal = status.get('phase') in ('confirmed', 'rolled-back', 'rolled-back-no-change', 'recovery-needs-operator')
+        if not terminal and guard_alive(state, plan):
+            atomic(state/'rollback-now', b'rollback', 0o644)
+            return
+        entry = frozen_entry(state, plan)
+        atomic(state/'rollback-now', b'rollback', 0o644)
+        # Stable job slot is a second duplicate-start refusal during handoff.
+        tmux_window(pathlib.Path(plan['repo']), 'tailscale-derp-rollback', state.name,
+                    [sys.executable, str(entry), '_guard', str(state)])
 
 
 def guard(state):
+    state = state.resolve(strict=True)
     plan = load_plan(state)
+    register_guard(state, plan)
     atomic(state/'guard-ready', b'ready', 0o644)
     deadline = time.monotonic()+TIMEOUT
     try:
@@ -299,12 +424,15 @@ def guard(state):
             if (state/'rollback-now').exists():
                 break
             if (state/'ack/confirm').exists():
-                status = json.loads((state/'status.json').read_text())
-                if status['phase'] == 'verified-awaiting-confirmation':
-                    evidence = validate_runtime(plan)
-                    record(state, 'confirmed', evidence=evidence)
-                    release(state)
-                    return
+                with recovery_lock(state):
+                    if (state/'rollback-now').exists():
+                        break
+                    status = json.loads((state/'status.json').read_text())
+                    if status['phase'] == 'verified-awaiting-confirmation':
+                        evidence = validate_runtime(plan)
+                        record(state, 'confirmed', evidence=evidence)
+                        release(state)
+                        return
             time.sleep(1)
     except Exception as e:
         record(state, 'confirmation-failed-rolling-back', error=str(e))
@@ -370,7 +498,10 @@ def tmux_window(repo, task, run_id, command):
     run(prefix+['set-option', '-t', session, 'renumber-windows', 'off'])
     digest = sha(('task='+task+'\0run='+run_id).encode())[:8]
     slot = 100+int(digest, 16)%9000
-    result = run(prefix+['new-window', '-d', '-P', '-F', '#{window_id}:#{pane_id}', '-t', f'{session}:{slot}', '-n', task+'-'+digest, '-c', str(repo), shlex.join(command)]).strip()
+    # Only this newly owned window: failed guards must vacate their fixed slot,
+    # and exec makes the frozen guard itself the pane PID used for ownership.
+    launch = 'tmux -L pi-agent set-option -w -t "$TMUX_PANE" remain-on-exit off && exec '+shlex.join(command)
+    result = run(prefix+['new-window', '-d', '-P', '-F', '#{window_id}:#{pane_id}', '-t', f'{session}:{slot}', '-n', task+'-'+digest, '-c', str(repo), launch]).strip()
     if not re.fullmatch(r'@\d+:%\d+', result):
         raise RuntimeError('invalid tmux creation result')
     return {'session': session, 'slot': slot, 'window_pane': result, 'inventory': inventory}
@@ -402,6 +533,9 @@ def apply():
         raise RuntimeError('unexpected Tailscale identity/state')
     plan = {'uid': uid, 'repo': str(REPO), 'target': str(TARGET), 'node': node,
             'original_pid': int(run(['systemctl', 'show', SERVICE, '-p', 'MainPID', '--value']).strip()),
+            'original_manager_hashes': recovery_env_hashes(manager_environment()),
+            'original_process_hashes': recovery_env_hashes(env),
+            'entry_hash': sha(pathlib.Path(__file__).read_bytes()),
             'no_proxy': merged_no_proxy(env), 'original_upper': env.get('NO_PROXY', ''),
             'original_lower': env.get('no_proxy', ''), 'proxy_hashes': {k: sha(env.get(k, '').encode()) for k in PROXY_KEYS},
             'clash': clash_state(uid), 'other_dropins': other_dropins(), 'parser_test': proxy_parser,
@@ -489,22 +623,16 @@ def main():
         if os.geteuid() != 0:
             raise RuntimeError('root required; no password prompt or alternate elevation attempted')
         if args.action == 'rollback':
-            plan = load_plan(args.state)
-            if LOCK.exists():
-                if LOCK.read_text().strip() != str(args.state.resolve()):
-                    raise RuntimeError('a different job is pending')
-                atomic(args.state/'rollback-now', b'rollback', 0o644)
-            else:
-                tmux_window(pathlib.Path(plan['repo']), 'tailscale-derp-rollback', str(uuid.uuid4()),
-                            [sys.executable, str(args.state/'entry.py'), '_guard', str(args.state)])
-                atomic(args.state/'rollback-now', b'rollback', 0o644)
+            request_rollback(args.state)
         elif args.action == '_worker':
             worker(args.state)
         else:
             try:
                 guard(args.state)
             except Exception as e:
-                record(args.state, 'recovery-needs-operator', error=str(e))
+                status = json.loads((args.state/'status.json').read_text()) if (args.state/'status.json').exists() else {}
+                record(args.state, 'recovery-needs-operator', error=str(e),
+                       last_phase=status.get('phase'), recovery=status.get('recovery'))
                 raise
     return 0
 

@@ -127,18 +127,32 @@ Meta/tailscale0/loopback。仅有 `DIRECT` 不能通过。
 `confirm` 命令；计时任务会再次验证，状态必须变为 `confirmed` 才算保留。只看到
 `verified-awaiting-confirmation` 或 confirm 文件存在不能当成完成。不要同时操作两台。
 
-未确认、检查失败、SSH/启动终端中断时，独立计时任务恢复原独立文件（原先不存在则删除），
-重新加载并启动 tailscaled；其他原代理文件不改。若原文件或其他服务来源被别的操作修改，
-恢复会拒绝覆盖并记录 `recovery-needs-operator`，不猜测用户意图。应用/回滚期间不要并行
-编辑服务配置。已确认后仍可使用原任务快照手动恢复：
+未确认、检查失败、SSH/启动终端中断时，独立计时任务恢复原独立文件（原先不存在则删除）；
+其他原代理文件不改。**原文件已恢复不等于恢复完成**：还必须核对原 systemd manager
+代理环境、实际 daemon 的代理环境、active 服务和原节点身份/IP/Running 状态。原环境的
+大小写、未设置与空值分别校验，只保存相关值的 hash。状态分别记录文件恢复、manager
+验收和运行进程验收；全部通过后才报告 `rolled-back`/`rolled-back-no-change` 并释放任务锁。
+
+若运行状态未恢复，一次恢复只做一次 daemon-reload、一次 tailscaled restart 并重新核验。
+任一步失败均保留锁和最后验证阶段，记录 `recovery-needs-operator`，不自动循环重试。
+原文件或其他服务来源被并行修改、备份损坏时仍拒绝覆盖。应用/回滚期间不要并行编辑服务
+配置。已确认后或恢复部分失败后，可用原任务快照发起一次明确的恢复/重试：
 
 ```bash
 sudo /usr/bin/python3 tailscale/derp-bypass.py rollback <任务路径>
 ```
 
-手动恢复也在本机独立 tmux 任务内执行，可能短暂影响 SSH。原状态已恢复的重复回滚不再
-重启；已生效且实际路径验证通过的重复 apply 不改写、不重启。只有状态记录和实际 socket
-共同成立才是部署证据。本入口不承诺消除 DERP/WAN 自身抖动；部署后仍需重复同步测量。
+公开 rollback 不因锁文件存在就只写请求标记：它核对冻结入口 hash、进程 UID/argv/启动
+时间及准确 tmux pane PID/项目归属，确认原 guard 仍能接收请求；guard 已退出则在同一任务
+锁约束下启动冻结的独立恢复任务。任务内内核锁序列化交接、恢复和确认；固定恢复窗口槽
+再次拒绝并发重复启动，不关闭或接管未知 pane。请求已投递/任务已续接都不代表恢复完成，
+必须查看最终状态。并发请求若任务正被占用会明确拒绝，不另起第二个重启。
+
+手动恢复可能短暂影响 SSH；一个明确重试最多再尝试一次 manager/service 恢复。健康且原
+环境/身份均已恢复的重复请求会重新核验，但不重复重启。已生效且实际路径验证通过的重复
+apply 不改写、不重启。只有状态记录和实际 socket 共同成立才是部署证据；root 实机启动/
+恢复仍需执行验收，离线注入不能代替它。本入口不承诺消除 DERP/WAN 抖动；部署后仍需重复
+同步测量。
 
 ### 非 root 验证
 
@@ -148,9 +162,11 @@ python3 -B tailscale/tests/test_derp_bypass.py --live-parser
 bash -n tailscale/install.sh
 ```
 
-离线测试覆盖并集/转义、安装器匹配、systemd 实际语法检查、回滚构造、并发编辑拒绝、
-独立 guard 就绪前不写入、确认失败回滚、tmux 归属/槽冲突，以及 DIRECT 仍被 TUN 接管时
-拒绝验收。系统操作由替身隔离，**不能代替 root 实机恢复/部署验证**。
+离线测试保留并集/转义、安装器匹配、systemd 实际语法、tmux 归属/槽冲突及 DIRECT 仍进
+TUN 的拒绝检查。恢复故障注入经真实公开命令分支覆盖：reload 失败、文件恢复后 restart
+失败、原文件下停止/错环境/错身份的 daemon、死 guard 留锁、并发明确重试排斥及健康重复
+请求；只有原 manager/实际进程环境与身份验收才成功。系统操作由替身和临时文件隔离，
+**不能代替 root 实机恢复/部署验证**。
 
 `--live-parser` 不需要 Go 编译器：使用已安装的 `tailscale debug ts2021 --verbose`
 输出的真实 `tshttpproxy.ProxyFromEnvironment` 决策，读取后立即终止这个诊断子进程，
