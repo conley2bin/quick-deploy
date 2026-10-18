@@ -88,6 +88,41 @@ post:
             self.assertNotEqual(rules.render(first), rules.render(second))
             self.assertEqual(original, hashlib.sha256(direct_path.read_bytes() + proxy_path.read_bytes()).hexdigest())
 
+    def test_manifest_backed_baidu_layouts_render_stably_without_policy_writeback(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            direct_path, proxy_path = write_sources(
+                directory / "rules", "version: 1\npre:\n  - app: baidunetdisk\npost: []\n",
+                "version: 1\npre: []\npost: []\n",
+            )
+            original = (direct_path.read_bytes(), proxy_path.read_bytes())
+            source = rules.parsed_sources(direct_path, proxy_path)
+            for layout, roles in (("4.17.8", ("main",)), ("8.6.0", ("main", "helper"))):
+                root = directory / f"relocated {layout}"
+                root.mkdir()
+                manifest = []
+                for role, relative, _required in discover_apps.SPECS["baidunetdisk"].programs:
+                    if role in roles:
+                        path = root / relative
+                        path.write_bytes(b"\x7fELFfixture")
+                        path.chmod(0o755)
+                        manifest.append(str(path))
+                evidence = discover_apps.Evidence("linux", {"baidunetdisk": manifest})
+                result = discover_apps.resolve_app("baidunetdisk", evidence)
+                self.assertEqual(result.status, "resolved", result)
+                resolver = fake_discover({"baidunetdisk": result})
+                expanded = rules.resolve_app_rules(source, resolver)
+                self.assertEqual([item.text for item in expanded["pre"]],
+                                 [f"PROCESS-PATH,{path},DIRECT" for path in manifest])
+                self.assertEqual(rules.render(expanded), rules.render(rules.resolve_app_rules(source, resolver)))
+                if "helper" in roles:
+                    (root / "netdisk_service").unlink()
+                    broken = discover_apps.resolve_app("baidunetdisk", evidence)
+                    self.assertEqual(broken.status, "missing", broken)
+                    with self.assertRaisesRegex(rules.SourceError, "cannot resolve PROCESS-PATH"):
+                        rules.resolve_app_rules(source, fake_discover({"baidunetdisk": broken}))
+            self.assertEqual(original, (direct_path.read_bytes(), proxy_path.read_bytes()))
+
     def test_schema_process_validation_and_expanded_collision_fail_explicitly(self) -> None:
         valid_direct = """version: 1
 pre:

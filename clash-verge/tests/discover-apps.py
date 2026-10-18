@@ -116,7 +116,72 @@ class DiscoveryTests(unittest.TestCase):
             self.assertEqual(result.status, "unsupported")
             self.assertIn("shared runtime", result.reason or "")
 
-    def test_missing_or_nonexecutable_required_helper_blocks_baidu(self) -> None:
+    def test_baidu_4178_main_only_manifest_resolves_closed_and_relocated(self) -> None:
+        # Identity-bearing subset of Y9000P's 4.17.8 dpkg manifest, including
+        # directory basenames that must not become installations themselves.
+        with tempfile.TemporaryDirectory() as temporary:
+            prefix = Path(temporary)
+            root = prefix / "opt" / "baidunetdisk"
+            main = elf(root / "baidunetdisk")
+            doc = prefix / "usr/share/doc/baidunetdisk"
+            doc.mkdir(parents=True)
+            manifest = [str(prefix / "opt"), str(root), str(main), str(doc),
+                        str(root / "chrome-sandbox"), str(root / "libkernel.so"),
+                        str(root / "resources/app.asar"),
+                        str(prefix / "usr/share/applications/baidunetdisk.desktop")]
+            # An undeclared leftover must never be emitted as package identity.
+            elf(root / "netdisk_service")
+            result = self.resolve("baidunetdisk", {"baidunetdisk": manifest})
+            self.assertEqual(result.status, "resolved", result)
+            self.assertEqual([(item.role, item.path) for item in result.executables], [("main", str(main))])
+            self.assertTrue(any("helper not declared" in item for item in result.evidence))
+
+            other = elf(prefix / "relocated baidu" / "baidunetdisk")
+            ambiguous = self.resolve("baidunetdisk", {"baidunetdisk": manifest + [str(other)]})
+            self.assertEqual(ambiguous.status, "ambiguous", ambiguous)
+            relocated = self.resolve("baidunetdisk", {"baidunetdisk": [str(other)]})
+            self.assertEqual(relocated.status, "resolved", relocated)
+            self.assertEqual(relocated.executables[0].path, str(other))
+
+    def test_baidu_main_only_still_requires_owned_executable_native_main(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "baidu"
+            main = elf(root / "baidunetdisk")
+            packages = {"baidunetdisk": [str(main)]}
+            main.chmod(0o644)
+            self.assertEqual(self.resolve("baidunetdisk", packages).status, "missing")
+            main.chmod(0o755)
+            main.write_text("#!/bin/sh\n", encoding="utf-8")
+            self.assertEqual(self.resolve("baidunetdisk", packages).status, "unsupported")
+            main.unlink()
+            self.assertEqual(self.resolve("baidunetdisk", packages).status, "missing")
+            target = elf(root / "unowned")
+            main.symlink_to(target)
+            self.assertEqual(self.resolve("baidunetdisk", packages).status, "unsupported")
+
+    def test_declared_baidu_helper_cannot_be_corrupt_unowned_or_shared_runtime(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "baidu"
+            paths = install(root, "baidunetdisk")
+            helper = root / "netdisk_service"
+            helper.write_text("#!/bin/sh\n", encoding="utf-8")
+            result = self.resolve("baidunetdisk", {"baidunetdisk": paths})
+            self.assertEqual(result.status, "unsupported", result)
+            self.assertIn("wrapper or non-native", result.reason or "")
+            helper.unlink()
+            target = elf(root / "unowned")
+            helper.symlink_to(target)
+            result = self.resolve("baidunetdisk", {"baidunetdisk": paths})
+            self.assertEqual(result.status, "unsupported", result)
+            self.assertIn("target lacks package-manifest", result.reason or "")
+            helper.unlink()
+            runtime = elf(root / "node")
+            helper.symlink_to(runtime)
+            result = self.resolve("baidunetdisk", {"baidunetdisk": paths + [str(runtime)]})
+            self.assertEqual(result.status, "unsupported", result)
+            self.assertIn("shared runtime", result.reason or "")
+
+    def test_missing_or_nonexecutable_declared_helper_blocks_baidu(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary) / "baidu"
             paths = install(root, "baidunetdisk")

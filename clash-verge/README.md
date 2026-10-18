@@ -116,7 +116,11 @@ Hy2使用SHA256证书pin，不跳过校验。
   `comm`/`exe`；不扫描磁盘、不启动应用、不读私有数据。
 - 包 launcher 不等于可归属主体：软链必须指向包清单内的原生 ELF，共享 runtime
   （`node`、`python3`、`aria2c`、shell、Wine）不会被归给应用。
-- 百度网盘的 GUI 与 `netdisk_service` 会一起展开。
+- 百度网盘按当前包清单展开：已核实的原生 Debian 4.17.8 只声明
+  `baidunetdisk` 主程序，8.6.0 还声明 `netdisk_service`，后者会一起展开。
+  这按清单区分布局，不按版本号猜路径；只允许清单未声明 helper，若已声明但文件缺失、
+  不可执行、非 ELF 或软链目标不属于该包，仍拒绝发现。只读报告会说明未声明的 helper
+  不在覆盖范围内；不会加入磁盘上的未归属残留文件，也不承诺覆盖其他或未来 helper。
 - Flatpak、AppImage、Wine、RPM 和任意桌面包装器会明确显示为 missing/unsupported，
   不会猜测。
 - 声明的应用未安装、路径不可表示、或多处冲突时，更新在写任何文件之前失败。
