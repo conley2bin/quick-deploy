@@ -675,10 +675,12 @@ class LinuxRuntime:
 
     def _journal(self, current: RuntimeObservation) -> tuple[FinalProbe | None, str | None]:
         gen = current.generation
+        # Select stdout before the bounded journal window; still validate every returned record below.
         argv = ("/usr/bin/journalctl", "--user", "--no-pager", "--output=json", "--all",
                 f"--lines={MAX_JOURNAL + 1}", "--output-fields=" + ",".join(JOURNAL_FIELDS),
                 "_BOOT_ID=" + gen.boot_id, "_SYSTEMD_USER_UNIT=" + gen.unit,
-                "_UID=" + str(gen.uid), "_PID=" + str(gen.pid), "_SYSTEMD_INVOCATION_ID=" + gen.invocation_id)
+                "_UID=" + str(gen.uid), "_PID=" + str(gen.pid), "_SYSTEMD_INVOCATION_ID=" + gen.invocation_id,
+                "_TRANSPORT=stdout")
         try:
             lines = self._run(argv).splitlines()
         except Refusal as exc:

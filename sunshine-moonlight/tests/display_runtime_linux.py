@@ -229,6 +229,28 @@ class FakeTransport:
         return directory, drop, guard
 
 
+class QueryAwareJournalTransport(FakeTransport):
+    """Synthetic journalctl: AND field matches, then tail the bounded window.
+
+    The base fake deliberately ignores query matches for strict-consumer tests.
+    """
+    def __init__(self):
+        super().__init__()
+        self.journal_counts = []
+
+    def run(self, argv, *, timeout, max_output):
+        if argv[:5] != ("/usr/bin/journalctl", "--user", "--no-pager", "--output=json", "--all"):
+            return super().run(argv, timeout=timeout, max_output=max_output)
+        self.calls.append((argv, timeout, max_output))
+        matches = [arg.split("=", 1) for arg in argv if arg.startswith("_")]
+        selected = [record for record in self.entries
+                    if all(record.get(key) == value for key, value in matches)]
+        limit, = [int(arg.split("=", 1)[1]) for arg in argv if arg.startswith("--lines=")]
+        window = selected[-limit:]
+        self.journal_counts.append((len(self.entries), len(selected), len(window)))
+        return rt.CommandResult(0, b"\n".join(json.dumps(record).encode() for record in window))
+
+
 class AuthorityFixture(unittest.TestCase):
     def setUp(self):
         # Tripwire: no accidental real subprocess regardless of fixture contents.
@@ -250,6 +272,84 @@ class AuthorityFixture(unittest.TestCase):
             action()
         self.assertEqual(raised.exception.code, code)
         return raised.exception
+
+
+class JournalStreamSelectionTests(AuthorityFixture):
+    def mixed_stream(self, transport_type=QueryAwareJournalTransport):
+        self.transport = transport_type()
+        # Synthetic matching disk/log expectation only; no real planned-config replay.
+        self.transport.put(CONF, CONFIG.replace(b"output_name = DP-3", b"output_name = DP-2"))
+        messages = startup(output="DP-2") + completed("nvenc", connector=136)
+        messages[-1:-1] = ["Synthetic unrelated stdout diagnostic"] * (185 - len(messages))
+        self.transport.trace(messages)
+        native = dict(self.transport.entries[181], MESSAGE="Synthetic native-library diagnostic",
+                      __CURSOR="fixture-native-cursor", _TRANSPORT="journal")
+        self.transport.entries.insert(181, native)
+        self.runtime = rt.LinuxRuntime(self.settings, self.transport)
+        return native
+
+    def test_stdout_query_excludes_unrecognized_same_generation_native_event(self):
+        native = self.mixed_stream()
+        self.assertEqual(len(self.transport.entries), 186)
+        self.assertEqual(sum(record["_TRANSPORT"] == "stdout" for record in self.transport.entries), 185)
+        self.assertIs(self.transport.entries[181], native)
+        for key in ("_BOOT_ID", "_PID", "_UID", "_SYSTEMD_USER_UNIT", "_SYSTEMD_INVOCATION_ID", "_EXE"):
+            self.assertEqual(native[key], self.transport.entries[0][key])
+        self.assertIsNone(rt.PREFIX.fullmatch(native["MESSAGE"]))
+        self.assertFalse(any(token in native["MESSAGE"] for token in
+                             ("Sunshine version:", "config:", "Trying encoder", "Screencasting with", "Found H.264")))
+        observed = self.runtime.observe()
+        self.assertEqual(self.transport.journal_counts[-1], (186, 185, 185))
+        self.assertEqual(observed.capture.reason, "start_receipt_required")
+        self.assertIsNone(observed.config.loaded_digest)
+        self.assertIsNone(observed.capture.effective_encoder)
+        self.assertEqual((observed.capture.probe.backend, observed.capture.probe.encoder,
+                          observed.capture.probe.h264_codec, observed.capture.probe.mem_type,
+                          observed.capture.probe.connector_ids, observed.capture.probe.source_commit),
+                         ("kms", "nvenc", "h264_nvenc", "cuda", (136,), rt.SOURCE_COMMIT))
+        verified = self.runtime.observe(receipt=self.receipt(observed))
+        self.assertEqual(verified.capture.status, "verified")
+        self.assertFalse(any(ref.cursor == native["__CURSOR"] for ref in verified.capture.probe.evidence))
+
+    def test_stdout_selection_precedes_line_limit_and_keeps_stdout_overflow_guard(self):
+        native = self.mixed_stream()
+        last = int(self.transport.entries[-1]["__MONOTONIC_TIMESTAMP"])
+        self.transport.entries += [dict(native, __CURSOR=f"fixture-native-tail-{index}",
+                                        __MONOTONIC_TIMESTAMP=str(last + index + 1))
+                                   for index in range(rt.MAX_JOURNAL + 1)]
+        observed = self.runtime.observe()
+        self.assertEqual(self.transport.journal_counts[-1], (2235, 185, 185))
+        self.assertEqual(observed.capture.reason, "start_receipt_required")
+        self.assertEqual(observed.capture.probe.connector_ids, (136,))
+        self.transport.trace(["Synthetic stdout diagnostic"] * (rt.MAX_JOURNAL + 1))
+        self.assertEqual(self.runtime.observe().capture.reason, "journal_window_overflow")
+        self.assertEqual(self.transport.journal_counts[-1], (2049, 2049, 2049))
+
+    def test_stdout_query_preserves_actual_disk_configuration_mismatch(self):
+        self.mixed_stream()
+        self.transport.put(CONF, CONFIG)  # Synthetic disk DP-3 still disagrees with stdout's loaded DP-2.
+        observed = self.runtime.observe()
+        self.assertEqual(observed.capture.reason, "journal_config_mismatch")
+        self.assertIsNone(observed.capture.probe)
+        self.assertIsNone(observed.config.loaded_digest)
+
+    def test_transport_ignoring_stdout_query_still_refuses_native_event(self):
+        self.mixed_stream(FakeTransport)
+        observed = self.runtime.observe()
+        self.assertEqual(observed.capture.reason, "journal_generation_mismatch")
+        self.assertIsNone(observed.capture.probe)
+        self.assertEqual(observed.capture.status, "unverified")
+
+    def test_stdout_query_keeps_wrong_executable_and_unsupported_formatter_visible(self):
+        for changes, reason in (({"_EXE": "/old/sunshine"}, "journal_generation_mismatch"),
+                                ({"MESSAGE": "Other formatter: Trying encoder [nvenc]"}, "journal_formatter_unsupported")):
+            with self.subTest(reason=reason):
+                native = self.mixed_stream()
+                native.update(_TRANSPORT="stdout", **changes)
+                observed = self.runtime.observe()
+                self.assertEqual(self.transport.journal_counts[-1], (186, 186, 186))
+                self.assertEqual(observed.capture.reason, reason)
+                self.assertIsNone(observed.capture.probe)
 
 
 class NativePropertyFramingTests(AuthorityFixture):
@@ -405,7 +505,7 @@ class AuthorityTests(AuthorityFixture):
                                    "--lines=2049", "--output-fields=MESSAGE,__CURSOR,__MONOTONIC_TIMESTAMP,_BOOT_ID,_PID,_UID,"
                                    "_SYSTEMD_USER_UNIT,_SYSTEMD_INVOCATION_ID,_EXE,_TRANSPORT",
                                    "_BOOT_ID=" + BOOT, "_SYSTEMD_USER_UNIT=" + rt.UNIT, "_UID=1000", "_PID=42",
-                                   "_SYSTEMD_INVOCATION_ID=" + INVOCATION))
+                                   "_SYSTEMD_INVOCATION_ID=" + INVOCATION, "_TRANSPORT=stdout"))
         self.assertTrue(all(timeout == 5 and bound == 1048576 for _, timeout, bound in self.transport.calls))
         self.assertFalse(any("restart" in argv for argv in commands))
         self.assertNotIn("fixture-secret", repr(asdict(obs)))
@@ -633,7 +733,10 @@ class AuthorityTests(AuthorityFixture):
 
     def test_journal_unique_scalar_fields_order_window_and_formatter(self):
         mutations = [(lambda entries: entries[-1].update(__CURSOR=entries[0]["__CURSOR"]), "journal_order_ambiguous"),
+                     (lambda entries: entries[-1].update(__CURSOR=""), "journal_order_ambiguous"),
                      (lambda entries: entries[-1].update(__MONOTONIC_TIMESTAMP=str(START - 1)), "journal_order_ambiguous"),
+                     (lambda entries: entries[-1].update(__MONOTONIC_TIMESTAMP=str(int(entries[-2]["__MONOTONIC_TIMESTAMP"]) - 1)),
+                      "journal_order_ambiguous"),
                      (lambda entries: entries[-1].update(_PID=["42", "99"]), "journal_fields_ambiguous"),
                      (lambda entries: entries[-1].update(MESSAGE="prefix " + entries[-1]["MESSAGE"]), "journal_formatter_unsupported"),
                      (lambda entries: entries[-1].update(MESSAGE=entries[-1]["MESSAGE"] + "\nsecond line"), "journal_formatter_unsupported")]
