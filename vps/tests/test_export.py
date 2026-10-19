@@ -70,6 +70,31 @@ class Export(unittest.TestCase):
         self.assertFalse(self.git('ls-files', '--', 'vps/subscription-urls.json').stdout)
         self.assertFalse(self.git('status', '--short', '--untracked-files=all', '--', 'vps/subscription-urls.json').stdout)
 
+    def test_dynamic_roster_export_add_rotate_remove_and_empty(self):
+        import uuid
+        original = vps.subscription_urls(self.manifest)
+        for name in ('device4', 'device5'):
+            self.manifest['accounts'][name] = {'email': name, 'id': str(uuid.uuid4()),
+                'subId': uuid.uuid4().hex, 'enable': True, 'flow': 'xtls-rprx-vision'}
+        vps.export_urls(self.state)
+        expanded = json.loads(self.destination.read_bytes())
+        self.assertEqual(len(expanded), 5)
+        self.assertEqual({name: expanded[name] for name in original}, original)
+        self.manifest['accounts']['device4'].update(id=str(uuid.uuid4()), subId=uuid.uuid4().hex)
+        vps.export_urls(self.state)
+        rotated = json.loads(self.destination.read_bytes())
+        self.assertNotEqual(rotated['device4'], expanded['device4'])
+        self.assertEqual({name: rotated[name] for name in original}, original)
+        del self.manifest['accounts']['device5']
+        vps.export_urls(self.state)
+        self.assertNotIn('device5', json.loads(self.destination.read_bytes()))
+        self.manifest['accounts'] = {}
+        vps.export_urls(self.state)
+        self.assertEqual(json.loads(self.destination.read_bytes()), {})
+        self.assertEqual(self.destination.stat().st_mode & 0o777, 0o600)
+        self.assertFalse(self.git('ls-files', '--', 'vps/subscription-urls.json').stdout)
+        self.git('check-ignore', '-q', '--', 'vps/subscription-urls.json')
+
     def test_no_uncommitted_or_mismatched_snapshot_can_replace_export(self):
         vps.export_urls(self.state)
         original = self.destination.read_bytes()

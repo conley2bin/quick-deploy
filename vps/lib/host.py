@@ -1121,7 +1121,7 @@ def device_receipt(request):
         receipt = read_json(path)
         if receipt['request_sha256'] != fingerprint:
             raise Error('Operation ID already bound to a different request')
-        return receipt
+        return receipt if receipt.get('committed') else None
     return None
 
 
@@ -1172,14 +1172,14 @@ def devices_prepare(upload):
         snapshot_accounts(ROOT / 'active/db/x-ui.db', manifest)
         names, action = request['names'], request['device_action']
         existing = set(device_names(manifest))
-        if action == 'add':
-            if set(names) <= existing:
-                return {'unchanged': True}
-            if set(names) & existing:
-                raise Error('Mixed existing/new names; no partial add')
-        elif names[0] not in existing:
-            if action == 'remove':
-                return {'unchanged': True}
+        if (action == 'add' and set(names) <= existing) or (action == 'remove' and names[0] not in existing):
+            result = {'unchanged': True, 'committed': True, 'request_sha256': fingerprint,
+                      'machine_id': request['machine_id'], 'node_id': manifest['node_id']}
+            atomic(ROOT / 'device-receipts' / (request['operation_id'] + '.json'), dumps(result))
+            return result
+        if action == 'add' and set(names) & existing:
+            raise Error('Mixed existing/new names; no partial add')
+        if action == 'rotate' and names[0] not in existing:
             raise Error('Unknown device for rotation')
         process_health()
         tls_probe(manifest)
@@ -1204,6 +1204,8 @@ def devices_prepare(upload):
             os.close(directory)
         # Crash before replacement leaves the old adapter and services unchanged;
         # crash after replacement is recognized by recover's staged-intent branch.
+        atomic(ROOT / 'device-receipts' / (request['operation_id'] + '.json'),
+               dumps({'request_sha256': fingerprint, 'committed': False}))
         atomic(ROOT / 'host.py', adapter, 0o700)
         atomic(ROOT / 'pending.json', dumps(intent))
         active = ROOT / 'active'
@@ -1266,13 +1268,15 @@ def devices_prepare(upload):
 def recover_devices(pending):
     rollback = ROOT / 'device-rollback'
     receipt = ROOT / 'device-receipts' / (pending['operation_id'] + '.json')
-    if receipt.exists():
-        if read_json(receipt)['request_sha256'] != pending['request_sha256']:
-            raise Error('Recovery receipt request mismatch')
+    if receipt.exists() and read_json(receipt)['request_sha256'] != pending['request_sha256']:
+        raise Error('Recovery receipt request mismatch')
+    if receipt.exists() and read_json(receipt).get('committed'):
         (ROOT / 'pending.json').unlink(missing_ok=True)
         if rollback.exists():
             os.replace(rollback, ROOT / ('completed-' + pending['operation_id']))
         return {'committed': True, 'pending': False}
+    if not receipt.exists():
+        atomic(receipt, dumps({'request_sha256': pending['request_sha256'], 'committed': False}))
     # Persist restore intent before stopping; guard permits these recovery starts
     # even with an expired/rebooted lease. Recovery remains restartable throughout.
     restore_db = pending.get('restore_db', pending['phase'] != 'snapshot')
@@ -1292,10 +1296,17 @@ def recover_devices(pending):
         ctl('enable' if state['enabled'] else 'disable', unit)
         if state['running']:
             ctl('start', unit)
+    restored = read_json(active / 'manifest.json')
+    if pending['services'][PANEL]['running']:
+        wait_api(restored)
+    if pending['services'][FRONT]['running']:
+        wait_tls(restored)
+    if all(state['running'] for state in pending['services'].values()):
+        process_health()
     # Disarm BEFORE restoring old guard: it does not understand recovery starts.
     (ROOT / 'pending.json').unlink()
     atomic(ROOT / 'host.py', (rollback / 'host.py').read_bytes(), 0o700)
-    os.replace(rollback, ROOT / ('rolled-back-' + pending['operation_id']))
+    os.replace(rollback, ROOT / ('rolled-back-' + pending['operation_id'] + '-' + secrets.token_hex(4)))
     return {'pending': False, 'restored': 'original device database/front/adapter and service state'}
 
 
@@ -1415,6 +1426,19 @@ def abort(request):
     marker = read_json(ROOT / 'owner.json')
     if marker['owner'] != request['owner'] or marker['machine_id'] != request['machine_id']:
         raise Error('Wrong host/owner for recovery')
+    if request.get('device_action'):
+        fingerprint = device_request(request)
+        receipt = device_receipt(request)
+        if (ROOT / 'pending.json').exists() and read_json(ROOT / 'pending.json').get('request_sha256') != fingerprint:
+            raise Error('Recovery request differs from pending device operation')
+        if (ROOT / 'device-rollback/intent.json').exists() and read_json(ROOT / 'device-rollback/intent.json')['request_sha256'] != fingerprint:
+            raise Error('Recovery request differs from staged device operation')
+        result = recover(force=True)
+        if receipt:
+            return receipt
+        # An old active deployment is not proof that THIS device operation
+        # committed. No durable receipt means unchanged or rolled-back state.
+        return dict(result, committed=False)
     return recover(force=True)
 
 

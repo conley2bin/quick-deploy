@@ -510,7 +510,8 @@ def devices(state, document, args):
 def recover_local(state, document):
     pending = load(state / 'pending.json')
     record = pending['record']
-    result = remote(record, 'abort', request_for(document, record))
+    request = pending['request'] if pending.get('mode') == 'devices' else request_for(document, record)
+    result = remote(record, 'abort', request)
     if result.get('committed'):
         status = remote(record, 'status', request_for(document, record))
         backup = backup_remote(state, document, record)
@@ -521,7 +522,10 @@ def recover_local(state, document):
         export_after_commit(state)
     else:
         (state / 'pending.json').unlink()
-        print('Candidate stopped/disabled; private failed state retained on the target. Current/old host unchanged.')
+        if pending.get('mode') == 'devices':
+            print('Device operation did not commit; original device state restored or unchanged. Private rollback evidence retained.')
+        else:
+            print('Candidate stopped/disabled; private failed state retained on the target. Current/old host unchanged.')
 
 
 def parser():

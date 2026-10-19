@@ -200,7 +200,10 @@ class Native(unittest.TestCase):
         replay = dict(request, names=['different'])
         with self.assertRaisesRegex(host.Error, 'different request'):
             self.device_prepare(replay)
-        self.assertEqual(self.device_prepare(self.device_request('add', 'device4', 'device5')), {'unchanged': True})
+        unchanged = self.device_request('add', 'device4', 'device5')
+        self.assertTrue(self.device_prepare(unchanged)['unchanged'])
+        with self.assertRaisesRegex(host.Error, 'different request'):
+            self.device_prepare(dict(unchanged, names=['other']))
         with self.assertRaisesRegex(host.Error, 'Mixed'):
             self.device_prepare(self.device_request('add', 'device4', 'different'))
         before = copy.deepcopy(self.native_accounts())
@@ -231,7 +234,7 @@ class Native(unittest.TestCase):
             self.device_prepare(request)
             archive_manifest, _ = self.device_finish(request)
             self.assertNotIn(name, archive_manifest['accounts'])
-            self.assertEqual(self.device_prepare(self.device_request('remove', name)), {'unchanged': True})
+            self.assertTrue(self.device_prepare(self.device_request('remove', name))['unchanged'])
         self.assertEqual(self.manifest['accounts'], {}, 'native empty roster must remain valid')
         self.assertEqual(host.backend_health(self.work, self.manifest), {})
 
@@ -255,6 +258,10 @@ class Native(unittest.TestCase):
         self.assertEqual((host.ROOT / 'host.py').read_bytes(), old_adapter)
         self.assertEqual((self.work / 'Caddyfile').read_bytes(), old_front)
         self.assertFalse((host.ROOT / 'pending.json').exists())
+        self.assertIsNone(host.device_receipt(request), 'bound intent must not be mistaken for commit')
+        with self.assertRaisesRegex(host.Error, 'different request'):
+            self.device_prepare(dict(request, names=['other']))
+        self.assertFalse(host.abort(request)['committed'], 'old active tree is not a device commit receipt')
         # Same uncommitted request is retryable; no orphan native account remains.
         self.device_prepare(request)
         self.device_finish(request)
@@ -268,6 +275,8 @@ class Native(unittest.TestCase):
             self.device_prepare(self.device_request('add', 'device4'))
         self.assertEqual(self.native_accounts(), original)
         self.assertFalse((host.ROOT / 'pending.json').exists())
+        rejected = self.device_request('add', 'device4')
+        self.assertFalse(host.abort(rejected)['committed'], 'rejected preparation must not claim old roster was a commit')
         host.atomic(host.ROOT / 'host.py', (vps.MODULE / 'lib/host.py').read_bytes())
         api = host.API(self.manifest)
         extra = dict(id=__import__('uuid').uuid4().hex, subId=os.urandom(24).hex(), email='foreign', enable=True, flow='xtls-rprx-vision')
@@ -280,6 +289,369 @@ class Native(unittest.TestCase):
             host.backend_health(self.work, self.manifest)
         with self.assertRaisesRegex(host.Error, 'snapshot account membership'):
             host.export_backup()
+
+    def stored_adapter(self):
+        import types
+        module = types.ModuleType('stored_device_adapter')
+        path = host.ROOT / 'host.py'
+        exec(compile(path.read_bytes(), str(path), 'exec'), module.__dict__)
+        module.ROOT, module.UNITS = host.ROOT, host.UNITS
+        module.ctl = host.ctl
+        module.check_units = host.check_units
+        module.wait_tls = host.wait_tls
+        module.process_health = host.process_health
+        return module
+
+    def test_devices_stored_adapter_expiry_boot_and_recovery_crash(self):
+        self.device_fixture(legacy=True)
+        original = copy.deepcopy(self.native_accounts())
+        original_adapter = (host.ROOT / 'host.py').read_bytes()
+        for expiry in ('deadline', 'boot'):
+            with self.subTest(expiry=expiry):
+                request = self.device_request('add', 'device4', 'device5')
+                self.device_prepare(request)
+                self.assertEqual(host.digest(host.ROOT / 'host.py'), host.digest(vps.MODULE / 'lib/host.py'))
+                stored = self.stored_adapter()
+                pending = stored.read_json(host.ROOT / 'pending.json')
+                if expiry == 'deadline': pending['deadline'] = 0
+                else: pending['boot_id'] = 'different-boot'
+                stored.atomic(host.ROOT / 'pending.json', stored.dumps(pending))
+                with self.assertRaises(stored.Error): stored.guard()
+                # Crash during restoration, after native DB replacement. The
+                # on-disk adapter must resume despite the expired boot/lease.
+                real_atomic = stored.atomic
+                def fail_front(path, data, mode=0o600):
+                    if Path(path) == self.work / 'Caddyfile':
+                        raise OSError('fixture interrupted rollback front write')
+                    return real_atomic(path, data, mode)
+                with mock.patch.object(stored, 'atomic', side_effect=fail_front):
+                    with self.assertRaises(OSError): stored.recover()
+                self.assertEqual(stored.read_json(host.ROOT / 'pending.json')['phase'], 'recovering')
+                stored.guard()  # recovery service starts are permitted
+                self.assertIn('restored', stored.recover())
+                self.assertEqual(self.native_accounts(), original)
+                self.assertEqual((host.ROOT / 'host.py').read_bytes(), original_adapter)
+                self.assertFalse((host.ROOT / 'pending.json').exists())
+                self.manifest = host.read_json(self.work / 'manifest.json')
+
+    def test_devices_snapshot_and_adapter_install_crash_order(self):
+        self.device_fixture(legacy=True)
+        original = self.native_accounts()
+        before = (self.work / 'manifest.json').read_bytes()
+        request = self.device_request('add', 'device4')
+        with mock.patch.object(host, 'db_snapshot', side_effect=OSError('fixture incomplete snapshot')):
+            with self.assertRaises(OSError): self.device_prepare(request)
+        self.assertEqual(self.native_accounts(), original)
+        self.assertEqual((self.work / 'manifest.json').read_bytes(), before)
+        real_atomic = host.atomic
+        def fail_journal(path, data, mode=0o600):
+            if Path(path) == host.ROOT / 'pending.json':
+                raise OSError('fixture crash after adapter install before journal')
+            return real_atomic(path, data, mode)
+        with mock.patch.object(host, 'atomic', side_effect=fail_journal):
+            with self.assertRaises(OSError): self.device_prepare(request)
+        self.assertFalse((host.ROOT / 'pending.json').exists())
+        self.assertTrue((host.ROOT / 'device-rollback/intent.json').is_file())
+        self.assertIn('restored', self.stored_adapter().recover(force=True))
+        self.assertEqual(self.native_accounts(), original)
+
+    def test_devices_failed_publication_and_lost_commit_ack(self):
+        self.device_fixture()
+        original = self.native_accounts()
+        original_front = (self.work / 'Caddyfile').read_bytes()
+        request = self.device_request('add', 'device4')
+        self.device_prepare(request)
+        archive = host.export_backup()
+        receipt = dict(request, offnode_sha256=host.digest(archive))
+        with mock.patch.object(host, 'wait_tls', side_effect=host.Error('fixture TLS certificate failure')):
+            with self.assertRaisesRegex(host.Error, 'TLS certificate'):
+                host.devices_commit(receipt)
+        self.assertIn('restored', host.recover(force=True))
+        self.assertEqual(self.native_accounts(), original)
+        self.assertEqual((self.work / 'Caddyfile').read_bytes(), original_front)
+        self.manifest = host.read_json(self.work / 'manifest.json')
+        self.device_prepare(request)
+        archive = host.export_backup()
+        receipt['offnode_sha256'] = host.digest(archive)
+        real_replace = os.replace
+        def lost_reply(source, target):
+            if Path(source) == host.ROOT / 'device-rollback':
+                raise OSError('fixture lost acknowledgment after durable receipt')
+            return real_replace(source, target)
+        with mock.patch.object(os, 'replace', side_effect=lost_reply):
+            with self.assertRaises(OSError): host.devices_commit(receipt)
+        self.assertTrue(host.device_receipt(request)['committed'])
+        self.assertTrue(self.stored_adapter().recover(force=True)['committed'])
+        after = copy.deepcopy(self.native_accounts())
+        self.assertEqual(len(after), 4)
+        self.assertTrue(host.devices_commit(receipt)['committed'])
+        self.assertEqual(self.native_accounts(), after)
+
+    def test_devices_dynamic_archive_restore_replace_full_native_outputs(self):
+        self.device_fixture()
+        # Original complete native policy must survive ADD, not just default DTOs.
+        account = self.native_accounts()['company']
+        account.update(totalGB=1234567890, expiryTime=int(time.time()*1000)+86400000,
+                       reset=3, resetMax=7, trafficReset='monthly', trafficResetDay=4, comment='original-policy')
+        host.API(self.manifest).call('/panel/api/clients/update/company', account)
+        for count in (3, 5, 4, 0):
+            if count == 5:
+                request = self.device_request('add', 'device4', 'device5')
+                self.device_prepare(request); self.device_finish(request)
+            elif count == 4:
+                request = self.device_request('remove', 'device5')
+                self.device_prepare(request); self.device_finish(request)
+            elif count == 0:
+                for name in list(self.manifest['accounts']):
+                    request = self.device_request('remove', name)
+                    self.device_prepare(request); self.device_finish(request)
+            archive = host.export_backup()
+            stage = self.root / ('closed-' + str(count))
+            stage.mkdir()
+            with archive.open('rb') as stream: host.safe_unpack(stream, stage)
+            manifest = host.verify_backup(stage, self.lock)
+            self.assertEqual(len(manifest['accounts']), count)
+            original_work, original_manifest = self.work, self.manifest
+            expected = self.native_accounts()
+            self.stop()
+            self.work, self.manifest = stage / 'deployment', manifest
+            host.install_runtime(self.work, self.lock)
+            self.start()
+            host.configure_native(self.work, self.manifest, False)
+            self.assertEqual(len(host.backend_health(self.work, self.manifest)), 2*count)
+            controlled = self.native_accounts()
+            self.assertEqual({n:{k:v for k,v in c.items() if k != 'updated_at'} for n,c in controlled.items()},
+                             {n:{k:v for k,v in c.items() if k != 'updated_at'} for n,c in expected.items()})
+            records = {n:host.API(self.manifest).call('/panel/api/clients/get/' + n)['client'] for n in controlled}
+            subids = {n:c['subId'] for n,c in controlled.items()}
+            self.manifest['reality'] = host.native_keys(self.work)
+            host.configure_native(self.work, self.manifest, False, rotate=True)
+            self.assertEqual(len(host.backend_health(self.work, self.manifest)), 2*count)
+            for name, after in self.native_accounts().items():
+                self.assertNotEqual(after['id'], controlled[name]['id'])
+                self.assertEqual(after['subId'], subids[name])
+                record = host.API(self.manifest).call('/panel/api/clients/get/' + name)['client']
+                self.assertEqual({k:v for k,v in record.items() if k not in ('uuid','updatedAt')},
+                                 {k:v for k,v in records[name].items() if k not in ('uuid','updatedAt')})
+            self.stop()
+            self.work, self.manifest = original_work, original_manifest
+            self.start()
+
+    def test_devices_real_reality_auth_stream_revocation_and_tls_capabilities(self):
+        import socketserver
+        import threading
+        import yaml
+        self.device_fixture()
+        cert, key = self.work / 'fixture.crt', self.work / 'fixture.key'
+        host.run(['openssl','req','-x509','-newkey','ec','-pkeyopt','ec_paramgen_curve:P-256','-nodes',
+                  '-days','1','-subj','/CN=target.example.org','-addext','subjectAltName=DNS:sub.example.org,DNS:target.example.org',
+                  '-keyout',key,'-out',cert], timeout=15)
+        storage = self.work / 'caddy/data/caddy/certificates/fixture'
+        host.atomic(storage / 'sub.example.org.crt', cert.read_bytes())
+        host.atomic(storage / 'sub.example.org.key', key.read_bytes())
+        target_port = free_port()
+        target_config = self.work / 'target.Caddyfile'
+        host.atomic(target_config, '{\n admin off\n auto_https off\n}\nhttps://target.example.org:' + str(target_port) +
+                    ' {\n bind 127.0.0.1\n tls ' + str(cert) + ' ' + str(key) + '\n respond "target"\n}\n')
+        target = subprocess.Popen([str(self.work/'bin/caddy'),'run','--config',str(target_config),'--adapter','caddyfile'],
+                                  env=dict(host.front_env(self.work),XDG_DATA_HOME=str(self.work/'target-fixture-data')),
+                                  stdout=self.log,stderr=self.log)
+        self.addCleanup(lambda: (target.terminate(), target.wait(timeout=10)))
+        class Echo(socketserver.StreamRequestHandler):
+            def handle(self):
+                while line := self.rfile.readline():
+                    self.wfile.write(line); self.wfile.flush()
+        origin = socketserver.ThreadingTCPServer(('127.0.0.1',0), Echo)
+        origin.daemon_threads = True
+        worker = threading.Thread(target=origin.serve_forever, daemon=True); worker.start()
+        self.addCleanup(origin.server_close); self.addCleanup(origin.shutdown)
+        self.stop()
+        # Fixture-only routing exception permits a local echo origin; production
+        # private blocking is unchanged. All listeners/traffic remain loopback.
+        with __import__('sqlite3').connect(self.work / 'db/x-ui.db') as db:
+            template = json.loads(db.execute("select value from settings where key='xrayTemplateConfig'").fetchone()[0])
+        for outbound in template['outbounds']:
+            if outbound['tag'] == 'direct': outbound['settings'] = {'finalRules':[{'action':'allow','ip':['127.0.0.1/32']},{'action':'block'}]}
+        template['routing']['rules'].insert(0, {'type':'field','ip':['127.0.0.1/32'],'port':str(origin.server_address[1]),'outboundTag':'direct'})
+        host.settings_write(self.work / 'db/x-ui.db', {'xrayTemplateConfig':json.dumps(template)})
+        self.start()
+        api = host.wait_api(self.manifest)
+        inbound = api.call('/panel/api/inbounds/list')[0]
+        stream = inbound['streamSettings']
+        stream = json.loads(stream) if isinstance(stream,str) else stream
+        stream['realitySettings']['dest'] = '127.0.0.1:'+str(target_port)
+        inbound['streamSettings'] = json.dumps(stream)
+        api.call('/panel/api/inbounds/update/'+str(inbound['id']), inbound)
+        self.stop(); self.start(); host.wait_api(self.manifest)
+        def node(name):
+            return yaml.safe_load(host.get_feed(self.manifest, name, 'mihomo'))['proxies'][0]
+        def client(proxy):
+            directory = self.work / ('auth-'+str(time.monotonic_ns())); directory.mkdir()
+            proxy = copy.deepcopy(proxy); proxy['server'] = '127.0.0.1'
+            proxy['port'] = self.manifest['config']['proxy_port']
+            port = free_port()
+            config = {'socks-port':port,'bind-address':'127.0.0.1','allow-lan':False,'log-level':'silent',
+                      'dns':{'enable':False},'tun':{'enable':False},'proxies':[proxy],
+                      'proxy-groups':[{'name':'PROXY','type':'select','proxies':[proxy['name']]}],'rules':['MATCH,PROXY']}
+            host.atomic(directory / 'config.yaml', yaml.safe_dump(config))
+            process = subprocess.Popen([shutil.which('verge-mihomo') or shutil.which('mihomo'),'-d',str(directory),
+                                        '-f',str(directory/'config.yaml')], stdout=self.log, stderr=self.log)
+            self.addCleanup(lambda: (process.terminate(), process.wait(timeout=10)))
+            for _ in range(100):
+                try:
+                    with socket.create_connection(('127.0.0.1',port),timeout=.1): break
+                except OSError: time.sleep(.05)
+            return port
+        def echo(port):
+            stream = socket.create_connection(('127.0.0.1',port),timeout=3)
+            stream.settimeout(3)
+            try:
+                stream.sendall(b'\x05\x01\x00'); self.assertEqual(stream.recv(2),b'\x05\x00')
+                stream.sendall(b'\x05\x01\x00\x01\x7f\x00\x00\x01'+origin.server_address[1].to_bytes(2,'big'))
+                self.assertEqual(stream.recv(10)[1],0)
+                stream.sendall(b'credential-proof\n')
+                if stream.recv(1024) != b'credential-proof\n': raise OSError('no authenticated echo')
+                return stream
+            except BaseException:
+                stream.close(); raise
+        # Real Caddy reloads the adapter's exact allowlist on fresh loopback
+        # TLS/HTTP ports, using a test CA explicitly trusted by this test only.
+        https, http = free_port(), free_port()
+        front = [None]
+        def stop_front():
+            if front[0] is not None:
+                front[0].terminate(); front[0].wait(timeout=10); front[0] = None
+        self.addCleanup(stop_front)
+        panel_ctl = host.ctl.side_effect
+        def ctl(action, unit):
+            if unit == host.PANEL: return panel_ctl(action,unit)
+            if action in ('stop','restart'): stop_front()
+            if action in ('start','restart'):
+                if front[0] is not None: return
+                text = (self.work/'Caddyfile').read_text().replace('http_port 80',f'http_port {http}').replace('https_port 8443',f'https_port {https}')
+                text = text.replace(':8443 {',f':{https} {{\n    bind 127.0.0.1').replace(':80 {',f':{http} {{\n    bind 127.0.0.1')
+                start = text.index('    tls {'); end = text.index('    @feed',start) if '    @feed' in text else text.index('    respond 404',start)
+                text = text[:start]+f'    tls {cert} {key}\n'+text[end:]
+                config = self.work/'tls-fixture.Caddyfile'; host.atomic(config,text)
+                front[0] = subprocess.Popen([str(self.work/'bin/caddy'),'run','--config',str(config),'--adapter','caddyfile'],
+                                           env=dict(host.front_env(self.work), XDG_DATA_HOME=str(self.work/'front-fixture-data')),stdout=self.log,stderr=self.log)
+                for _ in range(100):
+                    try:
+                        with socket.create_connection(('127.0.0.1',https),timeout=.1): break
+                    except OSError: time.sleep(.05)
+        mock.patch.object(host,'ctl',side_effect=ctl).start()
+        ctl('start',host.FRONT)
+        context = ssl.create_default_context(cafile=str(cert))
+        def public_get(path):
+            with socket.create_connection(('127.0.0.1',https),timeout=3) as raw:
+                with context.wrap_socket(raw,server_hostname='sub.example.org') as connection:
+                    connection.sendall(('GET '+path+' HTTP/1.1\r\nHost: sub.example.org\r\nConnection: close\r\n\r\n').encode())
+                    result = b''
+                    while chunk := connection.recv(65536): result += chunk
+                    return result
+        old_paths = host.feed_paths(self.manifest)
+        request = self.device_request('add','device4','device5')
+        self.device_prepare(request)
+        candidate = host.read_json(self.work/'manifest.json')
+        new_path = '/sub/'+candidate['accounts']['device4']['subId']
+        self.assertTrue(public_get(new_path).startswith(b'HTTP/1.1 404'))
+        for path in old_paths: self.assertTrue(public_get(path).startswith(b'HTTP/1.1 200'))
+        self.device_finish(request)
+        for name in self.manifest['accounts']:
+            for fmt in ('sub','mihomo'):
+                path = '/'+fmt+'/'+self.manifest['accounts'][name]['subId']
+                response = public_get(path)
+                self.assertTrue(response.startswith(b'HTTP/1.1 200'))
+                host.validate_feed_scope(self.manifest,name,response.split(b'\r\n\r\n',1)[1],fmt)
+        old_node, home_node = node('device4'), node('home')
+        old_client, home_client = client(old_node), client(home_node)
+        existing = echo(old_client)
+        echo(home_client).close()
+        request = self.device_request('rotate','device4')
+        self.device_prepare(request); self.device_finish(request)
+        try:
+            existing.sendall(b'after-rotation\n')
+            self.assertEqual(existing.recv(1024),b'','established old UUID stream must close')
+        except (ConnectionResetError,BrokenPipeError): pass
+        finally: existing.close()
+        self.assertTrue(public_get(new_path).startswith(b'HTTP/1.1 404'))
+        with self.assertRaises((OSError,IndexError)): echo(old_client)
+        new_client = client(node('device4'))
+        echo(new_client).close(); echo(home_client).close()
+        rotated_path = '/sub/'+self.manifest['accounts']['device4']['subId']
+        self.assertTrue(public_get(rotated_path).startswith(b'HTTP/1.1 200'))
+        request = self.device_request('remove','device4')
+        open_rotated = echo(new_client)
+        self.device_prepare(request); self.device_finish(request)
+        self.assertTrue(public_get(rotated_path).startswith(b'HTTP/1.1 404'))
+        with self.assertRaises((OSError,IndexError)): echo(new_client)
+        try:
+            open_rotated.sendall(b'after-remove\n'); self.assertEqual(open_rotated.recv(1024),b'')
+        except (ConnectionResetError,BrokenPipeError): pass
+        finally: open_rotated.close()
+        echo(home_client).close()
+        for path in ('/', '/sub/', '/sub/unknown', self.manifest['admin_path']+'panel/api/inbounds/list'):
+            self.assertTrue(public_get(path).startswith(b'HTTP/1.1 404'))
+
+    def test_devices_cli_native_postcommit_backup_failure_reconciles_without_rotation(self):
+        import argparse
+        self.device_fixture()
+        state = self.root / 'operator-state'; state.mkdir(mode=0o700)
+        record = {'endpoint':self.manifest['endpoint'], 'machine_id':host.machine_id()}
+        document = {'format':host.FORMAT,'owner':self.manifest['owner'],'config':self.manifest['config'],
+                    'current':record,'previous':[],'backup':None}
+        counts = {'backup':0}; fail_after = [False]; exports = []
+        def remote(record, action, request=None, stdin=None, stdout=None):
+            if action == 'devices-prepare': return host.devices_prepare(stdin)
+            if action == 'devices-commit': return host.devices_commit(request)
+            if action == 'abort': return host.abort(request)
+            if action == 'backup':
+                counts['backup'] += 1
+                if fail_after[0] and counts['backup'] == 3:
+                    raise host.Error('fixture transport lost after committed rotation')
+                with host.export_backup().open('rb') as source: shutil.copyfileobj(source, stdout)
+                return
+            if action == 'outputs':
+                manifest = host.read_json(self.work/'manifest.json')
+                return {n:base64.b64encode(data).decode() for n,data in host.backend_health(self.work,manifest).items()}
+            if action == 'devices-list':
+                manifest = host.read_json(self.work/'manifest.json')
+                return {name:{'enabled':account['enable']} for name,account in host.snapshot_accounts(self.work/'db/x-ui.db',manifest).items()}
+            if action == 'status':
+                return {'machine_id':host.machine_id(),'node_id':self.manifest['node_id'],'healthy':True}
+            raise AssertionError(action)
+        def exported(state):
+            committed = vps.load(state/'state.json')
+            manifest = vps.inspect_backup(Path(committed['backup']),self.lock)
+            self.assertTrue(manifest['published'])
+            self.assertFalse((state/'pending.json').exists())
+            exports.append(copy.deepcopy(manifest))
+        with mock.patch.object(vps,'remote',side_effect=remote), mock.patch.object(vps,'confirm'), \
+                mock.patch.object(vps,'export_after_commit',side_effect=exported):
+            vps.devices(state,document,argparse.Namespace(device_action='add',names=['device4','device5'],mihomo=None))
+            self.assertEqual(len(exports[-1]['accounts']),5)
+            with mock.patch('sys.stdout',new_callable=__import__('io').StringIO) as output:
+                self.assertEqual(vps.main(['--state-dir',str(state),'devices','list']),0)
+            self.assertEqual(len(output.getvalue().splitlines()),5)
+            for account in exports[-1]['accounts'].values():
+                self.assertNotIn(account['id'],output.getvalue())
+                self.assertNotIn(account['subId'],output.getvalue())
+            self.manifest = host.read_json(self.work/'manifest.json')
+            prior = self.native_accounts()['device4']['id']
+            counts['backup'] = 0; fail_after[0] = True
+            with self.assertRaisesRegex(host.Error,'transport lost'):
+                vps.devices(state,document,argparse.Namespace(device_action='rotate',names=['device4'],mihomo=None))
+            current = self.native_accounts()['device4']['id']
+            self.assertNotEqual(prior,current)
+            self.assertTrue((state/'pending.json').exists())
+            self.assertEqual(len(exports),1,'failed postcommit backup must not publish stale export')
+            with self.assertRaisesRegex(host.Error,'pending'):
+                vps.devices(state,document,argparse.Namespace(device_action='rotate',names=['device4'],mihomo=None))
+            fail_after[0] = False
+            vps.recover_local(state,document)
+            self.assertEqual(self.native_accounts()['device4']['id'],current)
+            self.assertEqual(exports[-1]['accounts']['device4']['id'],current)
+            self.assertFalse((state/'pending.json').exists())
 
     def test_review_snapshot_revocation_and_full_policy_restore(self):
         self.prepare_export_fixture()
