@@ -257,6 +257,17 @@ class Recovery(unittest.TestCase):
         result=adapter.recover(); self.assertFalse(result['pending']); self.assertFalse(result['front_running'])
         self.assertFalse(self.graph.state(host.FRONT)['running']); self.assertTrue(self.graph.state(host.FRONT)['enabled'])
         self.assertEqual(self.graph.probes,[])
+        # Timer has already disarmed the remote stop intent. A later operator
+        # recover must still preserve inactive front, not require public health.
+        def remote(record,action,request=None,**kwargs):
+            self.assertEqual(action,'abort')
+            return adapter.abort(request)
+        with mock.patch.object(vps,'remote',side_effect=remote), \
+                mock.patch.object(vps,'backup_remote',return_value=self.state/'inactive.tar'), \
+                mock.patch.object(vps,'export_after_commit'):
+            vps.recover_local(self.state,self.document)
+        self.assertFalse((self.state/'pending.json').exists())
+        self.assertFalse(self.graph.state(host.FRONT)['running'])
 
 
 if __name__=='__main__': unittest.main()

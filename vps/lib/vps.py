@@ -535,7 +535,10 @@ def recover_local(state, document, mihomo=None):
         print('Recovery queued/waiting; local pending retained. Retry recover after the owned recovery unit exits.')
         return
     if result.get('committed'):
-        status = result if pending.get('mode') == 'backup' and result.get('front_running') is False else remote(record, 'status', request_for(document, record))
+        # A standalone backup preserves an intentionally inactive front; its
+        # verified DB/artifact snapshot does not require publishing feeds. The
+        # timer may already have completed and removed the remote stop intent.
+        status = {'machine_id': record['machine_id']} if pending.get('mode') == 'backup' else remote(record, 'status', request_for(document, record))
         backup = backup_remote(state, document, record)
         if pending.get('mode') == 'devices':
             binary = resolve_mihomo(mihomo or pending.get('mihomo'))
