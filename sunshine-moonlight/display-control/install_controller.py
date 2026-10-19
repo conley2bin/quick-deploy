@@ -2844,7 +2844,13 @@ def external_version_prefix(root):
     for folder in (root/"versions").iterdir():
         marker = validate_version(folder)
         if marker["version"] != "v"+str(marker["release"])+"-"+cfg.digest(document(marker["files"])):
-            external_refused("unknown/forked source version in preserved installation")
+            # Archival objects only: this audited v1 publisher named SOURCES
+            # before adding settings. validate_version above still verifies the
+            # settings hash; the physical commitment below still includes it.
+            if not (marker["release"] == 1
+                    and marker["files"]["install_controller.py"] == "4af7b73adbd39e0768356e5067e5aba9b054551d6ceab58fa8582021ed76a71f"
+                    and marker["version"] == "v1-"+cfg.digest(document({n: h for n, h in marker["files"].items() if n != "host-settings.json"}))):
+                external_refused("unknown/forked source version in preserved installation")
         result[folder.name] = cfg.digest(document({p.name: record_identity(p) for p in folder.iterdir()}))
     return result
 

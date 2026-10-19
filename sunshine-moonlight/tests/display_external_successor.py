@@ -7,6 +7,7 @@ synthetic facts, never a claim about the real operator's unanswered account.
 """
 from contextlib import ExitStack
 from dataclasses import asdict, is_dataclass
+import ast
 from datetime import datetime, timedelta, timezone
 import copy
 import hashlib
@@ -35,6 +36,9 @@ import reservation as rs
 import runtime_linux as rt
 
 LEGACY = "06e45978a0fb87561fd7e3c6066a5c1dd8841050"
+ARCHIVE_COMMIT = "fece0dd9b58bdee2c158e7a6b8a001415fd98672"
+ARCHIVE_LATER_COMMIT = "e0f49015677f7e4b9fcdf42108d83d2ee40cc53e"
+ARCHIVE_PUBLISHER = "4af7b73adbd39e0768356e5067e5aba9b054551d6ceab58fa8582021ed76a71f"
 
 
 def utc_ns(value):
@@ -70,6 +74,36 @@ class ExternalTests(unittest.TestCase):
                 if cfg.digest(raw) != ic.EXTERNAL_LEGACY_SOURCE[name]:
                     raise AssertionError("legacy source differs from audited ef471 bytes: "+name)
                 cls.legacy_bytes[name] = raw
+            cls.archive_bytes = {name:subprocess.check_output(("/usr/bin/git","show",ARCHIVE_COMMIT+":sunshine-moonlight/display-control/"+name),
+                cwd=di.MODULE,env={"PATH":"/usr/bin:/bin","HOME":home,"GIT_CONFIG_NOSYSTEM":"1"},timeout=10) for name in ic.SOURCES}
+            cls.archive_later_bytes = {name:subprocess.check_output(("/usr/bin/git","show",ARCHIVE_LATER_COMMIT+":sunshine-moonlight/display-control/"+name),
+                cwd=di.MODULE,env={"PATH":"/usr/bin:/bin","HOME":home,"GIT_CONFIG_NOSYSTEM":"1"},timeout=10) for name in ic.SOURCES}
+        public=cls.archive_bytes["install_controller.py"]
+        if cfg.digest(public)!=ARCHIVE_PUBLISHER or cls.archive_later_bytes["install_controller.py"]!=public:
+            raise AssertionError("wrong public archival publisher")
+        tree=ast.parse(public);document=next(n for n in tree.body if isinstance(n,ast.FunctionDef) and n.name=="document")
+        install=next(n for n in tree.body if isinstance(n,ast.FunctionDef) and n.name=="install")
+        # Execute exactly the old producer's four pure statements in source
+        # order: source hash/name, THEN settings insertion, THEN full marker.
+        statements=sorted((n for n in ast.walk(install) if isinstance(n,ast.Assign) and
+            ((isinstance(n.targets[0],ast.Name) and n.targets[0].id in ("version_hash","version","marker")) or
+             (isinstance(n.targets[0],ast.Subscript) and isinstance(n.targets[0].value,ast.Name) and n.targets[0].value.id=="payload"))),key=lambda n:n.lineno)
+        if len(statements)!=4:raise AssertionError("old pure publication block changed")
+        cls.archive_algorithm=compile(ast.fix_missing_locations(ast.Module(body=[copy.deepcopy(document),*copy.deepcopy(statements)],type_ignores=[])),"<audited-public4af-pure-publication>","exec")
+
+    def archive_version(self, f, variant="", settings=None):
+        payload=dict(self.archive_later_bytes if variant else self.archive_bytes)
+        if settings is None:
+            obj=json.loads(f.manifest().read_bytes());obj["host_uniqueid"]="33333333-3333-4333-8333-333333333333";settings=ic.document(obj)
+        ns={"json":json,"cfg":cfg,"RELEASE":1,"payload":payload,"data":settings}
+        exec(self.archive_algorithm,ns)
+        folder=f.controller/"versions"/ns["version"];ic.make_directory(folder)
+        for name,data in ns["payload"].items():ic.create(folder/name,data)
+        ic.create(folder/".owned.json",ic.document(ns["marker"]))
+        self.assertEqual(ic.validate_version(folder),ns["marker"])
+        self.assertEqual(ns["version"],"v1-"+cfg.digest(ic.document({n:cfg.digest(b) for n,b in ns["payload"].items() if n!="host-settings.json"})))
+        self.assertNotEqual(ns["version"],"v1-"+cfg.digest(ic.document(ns["marker"]["files"])))
+        return folder
 
     def materialize_legacy(self, f):
         source = f.root/"legacy-source"
@@ -978,6 +1012,119 @@ class ExternalTests(unittest.TestCase):
         before=self.snapshot(g)
         with mock.patch.object(ic,"create",side_effect=AssertionError("no partial completion")),self.assertRaises(Refusal):self.reconcile(g,read_only=True)
         self.assertEqual(self.snapshot(g),before);self.assertEqual(g.kernel.controls,["stop"])
+
+    def test_audited_archival_producer_names_keep_full_settings_and_references(self):
+        f=self.fixture;f.install(publish=True);current_settings=f.manifest().read_bytes()
+        first=self.archive_version(f);second=self.archive_version(f,variant="later")
+        self.assertEqual(first.name,"v1-33968ff1677a0c11c6500979f91a4454a6997bedc71e135893ce4d9cd37d1df8")
+        self.assertEqual(second.name,"v1-d0708408f21a6aba9ed129fc1bdaec39d20fdf9f66ada2d252997a37c97a00d6")
+        self.assertNotEqual((first/"host-settings.json").read_bytes(),current_settings)
+        # Referenced and unreferenced archives are preservation objects only;
+        # this private historical reference is never executed/adopted.
+        ic.create(f.controller/"active/00000002.json",ic.document({"schema":1,"version":first.name}))
+        before=self.snapshot(f);prefix=ic.external_version_prefix(f.controller)
+        for folder in (first,second):
+            expected=cfg.digest(ic.document({p.name:ic.record_identity(p) for p in folder.iterdir()}))
+            self.assertEqual(prefix[folder.name],expected)
+            self.assertIn("host-settings.json",{p.name for p in folder.iterdir()});self.assertIn(".owned.json",{p.name for p in folder.iterdir()})
+        self.assertEqual(self.snapshot(f),before)
+        other=di.Fixture(Path(self.temp.name)/"different-settings");other.install(publish=True)
+        alternate=self.archive_version(other)
+        self.assertEqual(alternate.name,first.name)
+        self.assertNotEqual(ic.validate_version(alternate)["files"]["host-settings.json"],ic.validate_version(first)["files"]["host-settings.json"])
+        self.assertIn(ic.active(other.controller)[0],ic.external_version_prefix(other.controller))  # Modern name unaffected.
+
+    def test_archival_name_exception_rejects_unknown_or_damaged_objects(self):
+        for kind in ("wrong-name","unknown-publisher","source","settings","marker","file-owner","symlink","hardlink","directory-alias","prefix-key"):
+            with self.subTest(kind=kind):
+                f=di.Fixture(Path(self.temp.name)/kind);f.install(publish=True);folder=self.archive_version(f)
+                marker=json.loads((folder/".owned.json").read_bytes());host_file=folder/"host.py"
+                if kind in ("wrong-name","prefix-key"):
+                    renamed=folder.parent/("v1-"+"f"*64);folder.rename(renamed);folder=renamed
+                    if kind=="wrong-name":marker["version"]=folder.name;(folder/".owned.json").write_bytes(ic.document(marker));ic.validate_version(folder)
+                elif kind=="unknown-publisher":
+                    p=folder/"install_controller.py";p.write_bytes(p.read_bytes()+b"# unaudited publisher\n");marker["files"][p.name]=cfg.digest(p.read_bytes())
+                    marker["version"]="v1-"+cfg.digest(ic.document({n:h for n,h in marker["files"].items() if n!="host-settings.json"}))
+                    renamed=folder.parent/marker["version"];folder.rename(renamed);folder=renamed
+                    (folder/".owned.json").write_bytes(ic.document(marker));ic.validate_version(folder)
+                elif kind=="source":host_file.write_bytes(host_file.read_bytes()+b"# changed source bytes\n")
+                elif kind=="settings":
+                    p=folder/"host-settings.json";p.write_bytes(p.read_bytes()+b" ")
+                elif kind=="marker":
+                    marker["files"]["host-settings.json"]="f"*64;(folder/".owned.json").write_bytes(ic.document(marker))
+                elif kind=="symlink":host_file.rename(f.root/"moved-host");host_file.symlink_to(f.root/"moved-host")
+                elif kind=="hardlink":os.link(host_file,f.root/"second-host-name")
+                elif kind=="directory-alias":(folder.parent/("v1-"+"f"*64)).symlink_to(folder,target_is_directory=True)
+                before=self.snapshot(f)
+                with ExitStack() as patches:
+                    if kind=="file-owner":
+                        target=host_file.stat();real=lc.os.fstat
+                        class ForeignOwner:
+                            def __init__(self,info):self.info=info;self.st_uid=0
+                            def __getattr__(self,key):return getattr(self.info,key)
+                        def foreign(fd):
+                            info=real(fd)
+                            return ForeignOwner(info) if (info.st_dev,info.st_ino)==(target.st_dev,target.st_ino) else info
+                        patches.enter_context(mock.patch.object(lc.os,"fstat",side_effect=foreign))
+                    with self.assertRaises((Refusal,OSError,ValueError)):ic.external_version_prefix(f.controller)
+                self.assertEqual(self.snapshot(f),before)
+
+    def test_archival_compatibility_never_promotes_code_and_original_map_stays_sealed(self):
+        for fault in ("settings-marker","clone","missing","shrink-reseal"):
+            with self.subTest(fault=fault):
+                f=self.ready(di.Fixture(Path(self.temp.name)/fault),native_shape=True)
+                # Equal settings eliminate that veto: archival-only code must
+                # still fail the existing source bridge, even if a test-only
+                # trusted-code hint gets as far as its strict modern-name check.
+                folder=self.archive_version(f,settings=f.manifest().read_bytes());marker=ic.validate_version(folder)
+                candidate=copy.deepcopy(f.old);candidate.update(version=folder.name,manifest=marker)
+                with self.assertRaises(Refusal):ic.external_source_bridge(f.controller,candidate,*ic.active(f.controller),ic.validate_version(f.manifest().parent))
+                with self.assertRaisesRegex(Refusal,"source/settings manifest"):
+                    ic.external_source_bridge(f.controller,candidate,*ic.active(f.controller),ic.validate_version(f.manifest().parent),trusted=(marker,))
+                self.assertNotEqual(ic.EXTERNAL_LEGACY_SOURCE["install_controller.py"],ARCHIVE_PUBLISHER)
+                self.change(f,"certificate",lambda c:c.update(source_version_prefix=ic.external_version_prefix(f.controller)))
+                self.reconcile(f);original=ic.record_identity(f.inputs["certificate"])
+                if fault=="settings-marker":
+                    p=folder/"host-settings.json";obj=json.loads(p.read_bytes());obj["host_uniqueid"]="44444444-4444-4444-8444-444444444444";p.write_bytes(ic.document(obj))
+                    marker["files"][p.name]=cfg.digest(p.read_bytes());(folder/".owned.json").write_bytes(ic.document(marker))
+                    self.assertIn(folder.name,ic.external_version_prefix(f.controller))  # Name is valid; immutable promise detects change.
+                elif fault=="clone":
+                    p=folder/"host.py";data=p.read_bytes();p.rename(f.root/"moved-host-after-commit");ic.create(p,data)
+                elif fault=="missing":folder.rename(f.root/"removed-archive")
+                else:
+                    p=folder/"host.py";data=p.read_bytes();p.rename(f.root/"moved-host-for-reseal");ic.create(p,data)
+                    f.root_victim=folder.name;self.coordinated_certificate_reseal(f,"unreferenced-omit")
+                before=self.snapshot(f)
+                with mock.patch.object(lc.PrivateFiles,"write",side_effect=AssertionError("no replay availability")), \
+                     mock.patch.object(rt.AttemptRetirement,"control",side_effect=AssertionError("no replay control")),self.assertRaises((Refusal,OSError,ValueError)):
+                    self.ordinary_retire(f,original_certificates=(f.inputs["certificate"],))
+                self.assertEqual(self.snapshot(f),before);self.assertEqual(ic.record_identity(f.inputs["certificate"]),original);self.assertEqual(f.kernel.controls,["stop"])
+
+    def test_two_actual_legacy_archives_survive_native_shaped_publication_and_recovery(self):
+        f=self.paused(native_shape=True);state=f.controller/"state"
+        first=self.archive_version(f);settings=json.loads(f.manifest().read_bytes());settings["host_uniqueid"]="44444444-4444-4444-8444-444444444444"
+        second=self.archive_version(f,variant="later",settings=ic.document(settings))
+        archives={p.name:{child.name:ic.record_identity(child) for child in p.iterdir()} for p in (first,second)}
+        records={p.name:ic.record_identity(p) for p in state.iterdir()};refs=ic.active_prefix(f.controller,6)
+        self.assertEqual((len(records),ic.active(f.controller)[1]),(25,6));self.assertTrue(set(archives)<=set(ic.external_version_prefix(f.controller)))
+        f.native_before=self.snapshot(f)
+        self.external_start(f);self.publish_and_inputs(f)  # Ordinary ACTIVE publication, not a legacy publisher/adoption path.
+        self.assertEqual(ic.active(f.controller)[1],7);self.assertEqual(ic.active_prefix(f.controller,6),refs)
+        self.assertEqual({p.name:ic.record_identity(p) for p in state.iterdir()},records)
+        self.change(f,"certificate",lambda c:c["account"].update(actor="PRIVATE HYPOTHETICAL operator; NOT the real09:49 startup account"))
+        writes=[];write=lc.PrivateFiles.write
+        def count(files,name,data,**kw):
+            if name=="reservation.json" and data!=ic.RELEASE_BLOCKED and json.loads(data)["phase"]=="available":writes.append(data)
+            return write(files,name,data,**kw)
+        with mock.patch.object(lc.PrivateFiles,"write",count):result=self.reconcile(f)
+        self.assertTrue(result["ok"]);self.assertEqual(len(writes),1);self.assertEqual(f.kernel.controls,["stop"])
+        for name,identity in records.items():
+            path=state/(name+"."+f.identifier+".bak") if name in ic.RELEASE_RECORDS else state/name
+            self.assertEqual(ic.record_identity(path),identity)
+        for name,preserved in archives.items():self.assertEqual({p.name:ic.record_identity(p) for p in (f.controller/"versions"/name).iterdir()},preserved)
+        for phase in ic.ATTEMPT_PHASES[2:]:self.assertFalse((state/("attempt-"+phase+"-"+f.identifier+".bak")).exists())
+        print("LEGACY_ARCHIVES_PRIVATE_FLOW="+json.dumps({"legacy_names":sorted(archives),"original_records":25,"old_serial":6,"new_serial":7,
+            "additional_controls":0,"availability_writes":1,"archive_settings_and_markers_physically_preserved":True,"account":"explicitly PRIVATE HYPOTHETICAL"},sort_keys=True))
 
     def test_reconcile_token_is_exact_tty_and_rpc_source_set_remain_unchanged(self):
         cert={"predecessor":{"id":"synthetic"},"approved_source":{"version":"synthetic"},"external":{"job_id":"77"},"source_version_prefix":{},
