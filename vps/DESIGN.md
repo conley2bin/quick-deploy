@@ -248,7 +248,8 @@ Xray26.10.10、Caddy2.11.7二进制和 geodata，**不运行上游安装器**。
 任意合规设备名都可使用，不存在第二套五设备白名单。manifest 的 `accounts` 键拥有成员关系，
 原生 SQLite/API 拥有完整策略与凭据；校验所有 global clients 和唯一入站的全部关联，
 包含禁用、未挂载账户及悬空关联。未知成员、不同 owner/machine、Host归属冲突、重复名字或
-凭据碰撞会拒绝，不使用直接修改账户表的 SQL。旧3、新5、删除后的4以及空名册均可备份/恢复；
+凭据碰撞会拒绝，不使用直接修改账户表的 SQL。UUID按解析后的字节身份比较，
+不改已有DB/元数据的大小写拼写；新增/轮换要避开整个旧名册（包括目标自己的旧UUID和SubID）及本批新钥匙。旧3、新5、删除后的4以及空名册均可备份/恢复；
 恢复不会隐式添加默认账户。移除最后一个设备是原生支持的空名册，前端全部404。
 
 - `add <name> [<name> ...]` 通过原生客户端新增接口建立独立 UUID/SubID，只写新账户；
@@ -263,7 +264,7 @@ Xray26.10.10、Caddy2.11.7二进制和 geodata，**不运行上游安装器**。
 设备变更沿用既有 operation flock、15分钟 boot/deadline pending、guard及非阻塞周期恢复。
 不增加后台管理服务或另一套数据库：
 
-1. 管理端先检查名字/原生Mihomo可用性，以只读status核对存储adapter摘要（未知摘要不触发备份停前端），
+1. 管理端先检查名字/原生Mihomo可用性（命令名按PATH解析为绝对路径并存入pending），以只读status核对存储adapter摘要（未知摘要不触发备份停前端），
    确认所有设备可能短暂重连，再取得变更前离机备份。
 2. 远端核对 owner/machine、单一Host/入站、全局账户/关联、unit及二进制。
    存储适配器只接受当前上传源码摘要或已审阅的18d1b3b摘要 `30430e73…09a000e`；
@@ -284,10 +285,16 @@ Xray26.10.10、Caddy2.11.7二进制和 geodata，**不运行上游安装器**。
    验证输出，先保存本地最新backup指针/清pending，再导出便利JSON。
 
 `recover` 在未提交时恢复关闭的原DB、manifest、front、旧adapter及原服务启用/运行状态。
-恢复前先持久写`recovering`，允许新guard在旧lease过期/换boot后启动恢复服务；恢复中再次失败
-仍可重试。启动原服务并核验API/TLS/进程后先清pending，再恢复旧adapter，防止旧guard误拒新恢复阶段。
+恢复前先持久写`recovering`并停止相关服务；此时guard无论lease是否到期都拒绝启动，防止半恢复DB运行。
+原DB/manifest/front全部恢复后才写`restore-queued`，按原enabled/running状态用`start --no-block`排队，
+立即返回恢复oneshot，**本轮不等待API/TLS**。PANEL/FRONT均After=recover，必须等该oneshot退出才可启动。
+下一轮既有timer或显式recover先确认服务已实际active，才能核验API/TLS/进程、清pending和备份停机意图，
+最后恢复旧adapter。服务尚未起来则重排并返回queued；就绪失败停止相关服务并保留意图，绝不假报恢复完成。
+中断/重启可以重试；仅完整恢复后的`restore-queued`可以越过旧候选lease启动，过期候选本身不能复活。
 已提交与未开始/已回滚由设备操作receipt区分，旧active目录存在不代表设备操作已提交。
 已提交后的离机备份/传输失败保留本地pending，运行recover取新备份并对齐指针；不谎称回滚。
+queued/pending响应（即使committed为true）也不会清本地pending或导出；等oneshot退出后重跑recover。
+`--mihomo`选择会保留；旧pending或原路径失效可用`recover --mihomo /path/to/mihomo`覆盖，仍必须通过原生解析门槛。
 仅便利JSON失败时，本地权威已提交，修正权限/忽略后运行export即可，不需要重新轮换。
 成功/失败的私有回滚目录和历史备份保留供审阅，容量手动管理。
 
@@ -310,6 +317,16 @@ replace从完整、新读取的原生Client/账户对象仅更换UUID，并保�
 这不是对旧sing-box归档的自动导入。备份不要求受限/过期账户能成功下载feed；但部署发布的feed门槛仍独立检查。
 导出前拒绝来源树中的文件/目录symlink，复制时也保留链接再拒绝，不跟随到树外秘密。
 损坏DB、账户元数据不一致、缺证书/私钥或版本不匹配会拒绝。
+
+所有共享备份入口（包括首次变更前、提交后、recover核对及独立backup）在停止前端前都会：
+核验并安装当前已审阅恢复adapter，仅接受当前摘要/已知18d1b3b；旧adapter先存私有摘要命名文件并收入
+`previous-host.py`。安装前中断旧服务未动；安装后中断已有新adapter可恢复，旧adapter不会忽略新停机意图。
+随后持久写`backup-stop.json`，绑定owner/machine/node及front原running/enabled状态，再stop FRONT。
+正常finally启动/等待可信TLS后清意图；硬退出不依赖finally，由既有recover先排队非阻塞恢复front，退出oneshot，
+下一轮验证TLS后清意图。原front未运行就保持不运行。已提交情形只恢复当前front，不回滚已提交钥匙。
+过期未提交候选优先走设备/新机回滚，不能借备份恢复启动过期候选。每次恢复核对中的再次备份也用同一停机意图。
+管理端在没有已有pending时先保存backup模式意图；没有本地pending也可凭已保存current运行recover修复远端停机。
+这次经过核验的恢复adapter迁移是共享备份恢复的一部分，不升级原生包/DB，也不改变账户/路由/系统unit依赖。
 
 **备份是未加密 TAR。** SSH传输加密、0700/0600权限不是静态加密；请另用既有的
 加密存储/导出流程保存到第二个离机位置。工具没有内置加密导出。定期演练新管理PC恢复，
@@ -351,7 +368,9 @@ TLS精确路径和错误证书拒绝。TLS正向测试使用fixture CA，**不�
 旧UUID拒绝和rotate/remove已有流关闭，并核对真实Caddy旧URL404/新URL200、未影响的其他设备。
 echo测试的精确origin端口路由例外和freedom最终规则只存在于临时fixture，绝不写入生产；
 原统计API阻断仍保留。systemd控制/公网CA探测以fixture替代，存储adapter代码被独立载入验证
-boot/deadline及恢复中断；这不等于真正OS重启/生产服务验收。
+boot/deadline及恢复中断。额外fork/os._exit测试绕过finally，覆盖首次/提交后/核对备份stop；
+根据真实unit的Before/After/oneshot构造的任务图只在oneshot退出后执行排队start，并禁止提前等待就绪；
+旧82235b2源码在同图内重现自等超时，新源码通过崩溃/换boot/失败关闭对照。这不等于真正OS重启/生产服务验收。
 真实systemd、云防火墙、HTTP01签发和真实客户端公网HTTPS/出口必须逐部署验收；
 当前节点已有的验收不能证明未来续期、重启恢复、持续资源峰值或其他网络路径。
 新的生产接触仍须单独授权，本地快照导出不接触生产。

@@ -84,7 +84,8 @@ bash vps/setup.sh devices remove device5         # 撤销该设备代理认证�
 ```
 
 变更会重启自有核心/订阅前端，**所有设备可能短暂重连**。成功后自动更新离机备份及上方JSON；
-失败先运行 `bash vps/setup.sh recover`，不要直接重复轮换。旧备份含历史钥匙，恢复旧备份可能恢复已撤销账户；
+失败先运行 `bash vps/setup.sh recover`；提示 queued 时等恢复服务退出后再跑，不要重复轮换。
+自选核心会保存路径；失效时可用 `recover --mihomo /path/to/mihomo` 替换。旧备份含历史钥匙，恢复可能复活旧账户；
 请用最新撤销后备份。[事务、重试和恢复边界](DESIGN.md#设备名册与钥匙事务)。
 
 ## 日常查看与备份
