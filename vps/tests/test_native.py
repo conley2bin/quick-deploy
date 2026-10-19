@@ -619,7 +619,7 @@ class Native(unittest.TestCase):
                 manifest = host.read_json(self.work/'manifest.json')
                 return {name:{'enabled':account['enable']} for name,account in host.snapshot_accounts(self.work/'db/x-ui.db',manifest).items()}
             if action == 'status':
-                return {'machine_id':host.machine_id(),'node_id':self.manifest['node_id'],'healthy':True}
+                return {'machine_id':host.machine_id(),'node_id':self.manifest['node_id'],'healthy':True,'adapter_sha256':host.digest(host.ROOT/'host.py')}
             raise AssertionError(action)
         def exported(state):
             committed = vps.load(state/'state.json')

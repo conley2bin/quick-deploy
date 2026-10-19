@@ -1379,7 +1379,10 @@ def status(request):
     backend_health(active, manifest)
     tls_probe(manifest)
     process_health()
+    if (ROOT / 'host.py').is_symlink():
+        raise Error('Symlink recovery adapter')
     return {'healthy': True, 'published': manifest['published'], 'node_id': manifest['node_id'],
+            'adapter_sha256': digest(ROOT / 'host.py'),
             'machine_id': marker['machine_id'], 'versions': {k: read_json(active / 'release-lock.json')[k]['version'] for k in ('panel', 'core', 'front')}}
 
 

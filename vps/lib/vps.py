@@ -479,6 +479,9 @@ def devices(state, document, args):
     binary = args.mihomo or shutil.which('verge-mihomo') or shutil.which('mihomo')
     if not binary:
         raise host.Error('Native Mihomo required before device mutation')
+    checked = remote(record, 'status', request_for(document, record))
+    if checked.get('adapter_sha256') not in (host.LEGACY_ADAPTER_SHA256, request['adapter_sha256']):
+        raise host.Error('Unknown stored adapter digest; no device backup/service mutation')
     confirm('Device management restarts the owned core/front: ALL devices may briefly reconnect. '
             'Remove/rotate revoke old credentials; historical backups still contain them. Proceed?')
     before = backup_remote(state, document, record)

@@ -31,6 +31,20 @@ class Local(unittest.TestCase):
     def args(self, command='deploy', extra=()):
         return vps.parser().parse_args([command, '--ssh', 'root@93.184.216.34', *extra])
 
+    def test_device_unknown_adapter_or_transport_refuses_before_backup_stop(self):
+        self.doc['current'] = self.record
+        args = vps.parser().parse_args(['devices', 'add', 'device4', 'device5'])
+        for status in ({'healthy': True, 'adapter_sha256': 'unknown'}, host.Error('fixture transport unavailable')):
+            kwargs = {'side_effect': status} if isinstance(status, Exception) else {'return_value': status}
+            with mock.patch.object(vps, 'remote', **kwargs) as remote, mock.patch.object(vps, 'backup_remote') as backup, \
+                    mock.patch.object(vps.shutil, 'which', return_value='/fixture/mihomo'), mock.patch.object(vps, 'confirm') as confirm:
+                with self.assertRaises(host.Error):
+                    vps.devices(self.state, self.doc, args)
+                remote.assert_called_once_with(self.record, 'status', vps.request_for(self.doc, self.record))
+                backup.assert_not_called()
+                confirm.assert_not_called()
+                self.assertFalse((self.state / 'pending.json').exists())
+
     def test_private_atomic_noop_and_failed_write_preserves_old(self):
         path = self.state / 'state.json'
         host.atomic(path, 'original')

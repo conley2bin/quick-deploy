@@ -66,7 +66,8 @@ bash vps/setup.sh replace --ssh root@203.0.113.20
 | `company` | 公司电脑 | `mihomo`：Verge 独立完整 profile 订阅 |
 | `home` | 家里电脑 | `mihomo`：Verge 独立完整 profile 订阅 |
 | `phone` | 手机 | `shadowrocket`：Shadowrocket URI 订阅 |
-| `device4` / `device5` | 执行下方 add 后新增的设备 | 按客户端选择 `mihomo` / `shadowrocket` |
+| `device4` | 执行下方 add 后新增的设备4 | 按客户端选择 `mihomo` / `shadowrocket` |
+| `device5` | 执行下方 add 后新增的设备5 | 按客户端选择 `mihomo` / `shadowrocket` |
 
 已禁用设备不会导出。Shadowrocket 请保留实测可用的 **Chrome140 / X25519MLKEM768**
 TCP 指纹；URI 不带手机分流策略，国内/Bili 直连需单独核验。[手机设置与排障](DESIGN.md#导入管理和设备变更)。
