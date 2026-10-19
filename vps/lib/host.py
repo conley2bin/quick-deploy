@@ -271,7 +271,7 @@ def device_names(manifest):
             raise Error('Invalid owned device UUID') from exc
         if not re.fullmatch(r'[A-Za-z0-9_-]{16,128}', account.get('subId', '')):
             raise Error('Invalid owned subscription identity')
-        identities.append(account['id'])
+        identities.append(uuid.UUID(account['id']))
         subscriptions.append(account['subId'])
     if len(set(identities)) != len(identities) or len(set(subscriptions)) != len(subscriptions):
         raise Error('Duplicate owned device credential')
@@ -547,7 +547,7 @@ def validate_feed_scope(manifest, device, data, fmt):
                 raise ValueError()
             parsed = urlsplit(links[0])
             query = parse_qs(parsed.query)
-            valid = (parsed.scheme == 'vless' and parsed.username == current['id'] and
+            valid = (parsed.scheme == 'vless' and uuid.UUID(parsed.username) == uuid.UUID(current['id']) and
                      parsed.hostname == manifest['endpoint'] and parsed.port == manifest['config']['proxy_port'] and
                      query.get('security') == ['reality'] and query.get('flow') == ['xtls-rprx-vision'] and
                      query.get('pbk') == [manifest['reality']['publicKey']] and
@@ -1224,7 +1224,8 @@ def devices_prepare(upload):
                     account = {'id': str(uuid.uuid4()), 'subId': secrets.token_hex(24), 'email': name,
                                'enable': True, 'flow': 'xtls-rprx-vision'}
                     # Collision checking covers ALL global native accounts above.
-                    if any(account[k] == c[k] for c in manifest['accounts'].values() for k in ('id', 'subId')):
+                    if any(uuid.UUID(account['id']) == uuid.UUID(c['id']) or account['subId'] == c['subId']
+                           for c in manifest['accounts'].values()):
                         raise Error('Generated credential collision; recover and retry')
                     api.call('/panel/api/clients/add', {'client': account, 'inboundIds': [inbound['id']]})
                     manifest['accounts'][name] = account
@@ -1239,7 +1240,8 @@ def devices_prepare(upload):
                 account = next(c for c in settings['clients'] if c['email'] == name)
                 account['limitHwid'] = api.call('/panel/api/clients/get/' + name)['client']['limitHwid']
                 account.update(id=str(uuid.uuid4()), subId=secrets.token_hex(24))
-                if any(account[k] == c[k] for d, c in manifest['accounts'].items() if d != name for k in ('id', 'subId')):
+                if any(uuid.UUID(account['id']) == uuid.UUID(c['id']) or account['subId'] == c['subId']
+                       for c in manifest['accounts'].values()):
                     raise Error('Generated credential collision; recover and retry')
                 check_lease()
                 api.call('/panel/api/clients/update/' + name, account)

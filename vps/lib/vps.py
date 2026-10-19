@@ -290,10 +290,16 @@ def backup_remote(state, document, record):
         raise
 
 
+def resolve_mihomo(binary=None):
+    selected = binary or shutil.which('verge-mihomo') or shutil.which('mihomo')
+    resolved = shutil.which(os.path.expanduser(str(selected))) if selected else None
+    if not resolved:
+        raise host.Error('Install native Mihomo or use --mihomo with an available executable; no skipped format gate')
+    return str(Path(resolved).absolute())
+
+
 def validate_outputs(state, document, record, binary=None, backup=None):
-    binary = binary or shutil.which('verge-mihomo') or shutil.which('mihomo')
-    if not binary:
-        raise host.Error('Install native Mihomo or use --mihomo; no version whitelist or skipped format gate')
+    binary = resolve_mihomo(binary)
     manifest = inspect_backup(backup, release_lock())
     outputs = remote(record, 'outputs', request_for(document, record))
     expected = {d + ext for d in host.device_names(manifest) if manifest['accounts'][d]['enable'] for ext in ('.yaml', '.txt')}
@@ -476,16 +482,14 @@ def devices(state, document, args):
     request.update(device_action=args.device_action, names=args.names,
                    operation_id=secrets.token_hex(16), adapter_sha256=host.digest(MODULE / 'lib/host.py'))
     host.device_request(request)  # names/shape before any remote backup/restart
-    binary = args.mihomo or shutil.which('verge-mihomo') or shutil.which('mihomo')
-    if not binary:
-        raise host.Error('Native Mihomo required before device mutation')
+    binary = resolve_mihomo(args.mihomo)
     checked = remote(record, 'status', request_for(document, record))
     if checked.get('adapter_sha256') not in (host.LEGACY_ADAPTER_SHA256, request['adapter_sha256']):
         raise host.Error('Unknown stored adapter digest; no device backup/service mutation')
     confirm('Device management restarts the owned core/front: ALL devices may briefly reconnect. '
             'Remove/rotate revoke old credentials; historical backups still contain them. Proceed?')
     before = backup_remote(state, document, record)
-    pending = {'record': record, 'mode': 'devices', 'request': request, 'backup': None, 'before': str(before)}
+    pending = {'record': record, 'mode': 'devices', 'request': request, 'backup': None, 'before': str(before), 'mihomo': binary}
     host.atomic(state / 'pending.json', host.dumps(pending))
     try:
         with upload_bundle(request) as stream:
@@ -510,7 +514,7 @@ def devices(state, document, args):
     print('Device roster committed; latest off-node backup and protected URL export updated.')
 
 
-def recover_local(state, document):
+def recover_local(state, document, mihomo=None):
     pending = load(state / 'pending.json')
     record = pending['record']
     request = pending['request'] if pending.get('mode') == 'devices' else request_for(document, record)
@@ -519,7 +523,10 @@ def recover_local(state, document):
         status = remote(record, 'status', request_for(document, record))
         backup = backup_remote(state, document, record)
         if pending.get('mode') == 'devices':
-            validate_outputs(state, document, record, backup=backup)
+            binary = resolve_mihomo(mihomo or pending.get('mihomo'))
+            pending['mihomo'] = binary
+            host.atomic(state / 'pending.json', host.dumps(pending))
+            validate_outputs(state, document, record, binary=binary, backup=backup)
         remember_commit(state, document, record, backup, status)
         print('Remote commit had succeeded; reconciled ownership and made a new off-node backup.')
         export_after_commit(state)
@@ -548,6 +555,8 @@ def parser():
         if name in ('deploy', 'replace', 'restore'):
             a.add_argument('--backup', type=Path, help='existing private unencrypted recovery archive')
             a.add_argument('--mihomo', help='native core executable for profile validation')
+        if name == 'recover':
+            a.add_argument('--mihomo', help='override retained native core path for committed recovery')
         if name == 'restore':
             a.set_defaults(backup_required=True)
     a = sub.add_parser('devices', help='manage manifest-owned device credentials')
@@ -583,7 +592,7 @@ def main(argv=None):
                 record = target_record(args, document['current'])
                 print(host.dumps(remote(record, 'preflight', request_for(document, record))), end='')
             elif args.command == 'recover':
-                recover_local(state, document)
+                recover_local(state, document, args.mihomo)
             elif args.command == 'export':
                 print('Private saved-snapshot subscription URLs: ' + str(export_urls(state)))
             else:

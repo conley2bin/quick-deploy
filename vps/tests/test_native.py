@@ -290,6 +290,42 @@ class Native(unittest.TestCase):
         with self.assertRaisesRegex(host.Error, 'snapshot account membership'):
             host.export_backup()
 
+    def test_device_credentials_reject_uuid_alias_old_rotation_keys_and_batch_duplicates(self):
+        import uuid
+        self.device_fixture()
+        client = self.native_accounts()['company']
+        client['id'] = client['id'].upper()
+        client['limitHwid'] = host.API(self.manifest).call('/panel/api/clients/get/company')['client']['limitHwid']
+        host.API(self.manifest).call('/panel/api/clients/update/company', client)
+        before = copy.deepcopy(self.native_accounts())
+        original_id, original_sub = before['company']['id'], before['company']['subId']
+        cases = [('alias-add','add',['alias-device'],uuid.UUID(original_id),None,0),
+                 ('old-uuid-rotate','rotate',['company'],uuid.UUID(original_id),None,0),
+                 ('old-sub-rotate','rotate',['company'],None,original_sub,0),
+                 ('batch-duplicate','add',['device4','device5'],uuid.uuid4(),None,1)]
+        real_call = host.API.call
+        for label, action, names, forced_id, forced_sub, expected_writes in cases:
+            with self.subTest(label=label):
+                writes = []
+                def watched(api, path, data=None):
+                    if path == '/panel/api/clients/add' or path.startswith('/panel/api/clients/update/'):
+                        writes.append(path)
+                    return real_call(api,path,data)
+                request = self.device_request(action,*names)
+                with __import__('contextlib').ExitStack() as stack:
+                    stack.enter_context(mock.patch.object(host.API,'call',new=watched))
+                    if forced_id is not None: stack.enter_context(mock.patch.object(host.uuid,'uuid4',return_value=forced_id))
+                    if forced_sub is not None: stack.enter_context(mock.patch.object(host.secrets,'token_hex',return_value=forced_sub))
+                    with self.assertRaisesRegex(host.Error,'credential collision'):
+                        self.device_prepare(request)
+                self.assertEqual(len(writes),expected_writes)
+                self.assertEqual(self.native_accounts(),before)
+                self.assertEqual(self.native_accounts()['company']['id'],original_id,'native spelling must be preserved')
+        alias = copy.deepcopy(self.manifest)
+        alias['accounts']['other'] = dict(alias['accounts']['company'], email='other', id=original_id.lower(), subId=os.urandom(24).hex())
+        with self.assertRaisesRegex(host.Error,'Duplicate'):
+            host.device_names(alias)
+
     def stored_adapter(self):
         import types
         module = types.ModuleType('stored_device_adapter')

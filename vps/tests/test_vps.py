@@ -45,6 +45,30 @@ class Local(unittest.TestCase):
                 confirm.assert_not_called()
                 self.assertFalse((self.state / 'pending.json').exists())
 
+    def test_recover_retains_custom_core_and_accepts_override_for_legacy_pending(self):
+        executable = self.state / 'custom-mihomo'
+        host.atomic(executable, '#!/bin/sh\nexit 0\n', 0o700)
+        with mock.patch.dict(os.environ, PATH=str(self.state)):
+            self.assertEqual(vps.resolve_mihomo('custom-mihomo'), str(executable))
+        self.assertEqual(vps.parser().parse_args(['recover','--mihomo',str(executable)]).mihomo,str(executable))
+        self.doc['current'] = self.record
+        for saved, override in ((str(executable), None), ('/vanished/core',str(executable)), (None,str(executable))):
+            pending = {'record':self.record,'mode':'devices','request':{},'mihomo':saved}
+            host.atomic(self.state/'pending.json',host.dumps(pending))
+            with mock.patch.object(vps,'remote',return_value={'committed':True,'machine_id':'a'*32}), \
+                    mock.patch.object(vps,'backup_remote',return_value=self.state/'fixture.tar'), \
+                    mock.patch.object(vps,'validate_outputs') as validate, mock.patch.object(vps,'export_after_commit'):
+                vps.recover_local(self.state,self.doc,override)
+                self.assertEqual(validate.call_args.kwargs['binary'],str(executable))
+        host.atomic(self.state/'pending.json',host.dumps({'record':self.record,'mode':'devices','request':{},'mihomo':'/vanished/core'}))
+        with mock.patch.object(vps,'remote',return_value={'committed':True,'machine_id':'a'*32}), \
+                mock.patch.object(vps,'backup_remote',return_value=self.state/'fixture.tar'), \
+                mock.patch.object(vps,'validate_outputs') as validate:
+            with self.assertRaisesRegex(host.Error,'Mihomo'):
+                vps.recover_local(self.state,self.doc)
+            validate.assert_not_called()
+            self.assertTrue((self.state/'pending.json').exists())
+
     def test_private_atomic_noop_and_failed_write_preserves_old(self):
         path = self.state / 'state.json'
         host.atomic(path, 'original')
