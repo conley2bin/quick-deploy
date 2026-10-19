@@ -296,6 +296,7 @@ class Native(unittest.TestCase):
         path = host.ROOT / 'host.py'
         exec(compile(path.read_bytes(), str(path), 'exec'), module.__dict__)
         module.ROOT, module.UNITS = host.ROOT, host.UNITS
+        module.ADMIN_PORT, module.SUB_PORT, module.API_PORT = host.ADMIN_PORT, host.SUB_PORT, host.API_PORT
         module.ctl = host.ctl
         module.check_units = host.check_units
         module.wait_tls = host.wait_tls
