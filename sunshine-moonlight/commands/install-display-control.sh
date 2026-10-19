@@ -10,10 +10,14 @@ PUBLISH=false
 RECONCILE=false
 RELEASE=false
 RETIRE=false
+EXTERNAL=false
+EVIDENCE=()
+ORIGINALS=()
 usage() {
     cat <<'USAGE'
 用法: ./commands/install-display-control.sh [--publish-shim] [--reconcile-host-identity | --reconcile-owned-release]
-      ./commands/install-display-control.sh --reconcile-attempted-launch
+      ./commands/install-display-control.sh --reconcile-attempted-launch [--original-certificate FILE ...]
+      ./commands/install-display-control.sh --reconcile-external-successor --certificate FILE [--kernel FILE --anchored FILE --context FILE --lifecycle FILE] [--original-certificate FILE ...]
 只读资格检查已安装的 Sunshine v2026.914.233613/source63d35f7 的官方 Ubuntu deb、
 实际用户服务/配置/apps/assets 和公开 serverinfo UUID；独立发布私人控制器与持久状态。
 不安装/更新 Sunshine、不修改 unit/config、不 reload/restart/cancel、不收集管理员/TLS 凭据。
@@ -37,6 +41,19 @@ usage() {
                  保留四原记录、历史、锁和登记；不 quit/配对/改配置、不增加 shim/RPC 动作。
                  不自动重复不确定的服务命令；无法证明下一阶段时保留阻塞。
                  不可与其它选项混用，不下载或重新资格安装 vendor。
+  --reconcile-external-successor 独立本地 RECONCILE：仅适用于旧 STOP 已确认回收、旧链恰好三个阶段，
+                 随后由已明确归因的外部动作启动新实例；先正常发布新源码，设置必须原字节不变。
+                 五个 FILE 是 owned/mode0600 的有界事实证书及原始 kernel/anchored/context/lifecycle 证据。
+                 终端逐项确认具体 actor/action/issuer/helpers、无挂起控制/旧请求或FD持有者/重放及独占窗口；
+                 未知事实拒绝，允许本身不是事实。历史未观察字段保持 unknown，绝不伪造 StopWitness。
+                 所有路径零 STOP/START/restart/quit/prepare；原始旧链保留 INCOMPLETE/SUPERSEDED，
+                 永久放弃原未使用 START；四原记录物理归档、登记/历史/锁/原收据保留，收据仅为历史。
+                 不可与其它仪式或安装/shim选项混用。完整证书格式见 display-control/README.md。
+  --original-certificate FILE 只读独立原证书输入，可重复：RETIRE 必须逐项提供全部已封存 supersession
+                 的原始 owned/mode0600 证书；RECONCILE 的 --certificate 已是本次原证书，此选项提供其它历史。
+                 文件须保留在控制器安装目录之外，由本地操作者明确选择；缓存/日志路径或自报hash不能代替。
+                 缺失/重复/未知原证书在写入或服务控制前拒绝；此输入不扩大 RETIRE 资格或控制授权，不进入 RPC/shim。
+                 已提交的 RECONCILE 只读重放可省略全部四个组件文件，仅提供各原证书；不能用此完成待提交事务。
 没有该固定 shim 时仍可完成私人发布，但返回失败并明确报告 SSH RPC 尚未就绪。
 用运行 Sunshine 的桌面用户操作；root 不创建其它用户的私人控制器。
 安装绝不自动 enrollment。受控准备重启前必须完成官方 PIN 配对（配对才持久化实例 UUID）；
@@ -51,6 +68,13 @@ while [ "$#" -gt 0 ]; do
         --reconcile-host-identity) RECONCILE=true;;
         --reconcile-owned-release) RELEASE=true;;
         --reconcile-attempted-launch) RETIRE=true;;
+        --reconcile-external-successor) EXTERNAL=true;;
+        --original-certificate)
+            [ "$#" -ge 2 ] || qd_die '原证书选项缺少本地文件'
+            ORIGINALS+=("$1" "$2"); shift;;
+        --certificate|--kernel|--anchored|--context|--lifecycle)
+            [ "$#" -ge 2 ] || qd_die '证据选项缺少本地文件'
+            EVIDENCE+=("$1" "$2"); shift;;
         -h|--help) usage; exit 0;;
         *) qd_die "未知参数: $1";;
     esac
@@ -59,12 +83,20 @@ done
 [ "$RECONCILE" = false ] || [ "$RELEASE" = false ] || qd_die '两种本地对账仪式不可同时选择'
 [ "$RELEASE" = false ] || [ "$PUBLISH" = false ] || qd_die '受管释放对账不可发布系统 shim'
 qd_require_not_root
+if [ "$EXTERNAL" = true ]; then
+    [ "$PUBLISH" = false ] && [ "$RECONCILE" = false ] && [ "$RELEASE" = false ] && [ "$RETIRE" = false ] \
+        || qd_die 'RECONCILE 是独立零控制仪式，不可混用安装/shim/其它恢复'
+    [ -x /usr/bin/python3 ] || qd_die '需要系统 /usr/bin/python3'
+    exec /usr/bin/python3 -I -B "$SCRIPT_DIR/display-control/install_controller.py" reconcile-external-successor "${EVIDENCE[@]}" "${ORIGINALS[@]}"
+fi
+[ "${#EVIDENCE[@]}" -eq 0 ] || qd_die '事实证据仅用于 --reconcile-external-successor'
 if [ "$RETIRE" = true ]; then
     [ "$PUBLISH" = false ] && [ "$RECONCILE" = false ] && [ "$RELEASE" = false ] \
         || qd_die 'RETIRE 是独立本地仪式，不可与安装/shim/REBIND/RELEASE 混用'
     [ -x /usr/bin/python3 ] || qd_die '需要系统 /usr/bin/python3'
-    exec /usr/bin/python3 -I -B "$SCRIPT_DIR/display-control/install_controller.py" reconcile-attempted-launch
+    exec /usr/bin/python3 -I -B "$SCRIPT_DIR/display-control/install_controller.py" reconcile-attempted-launch "${ORIGINALS[@]}"
 fi
+[ "${#ORIGINALS[@]}" -eq 0 ] || qd_die '只读原证书仅用于本地 RETIRE/RECONCILE'
 qd_require_ubuntu
 for command in python3 curl sha256sum dpkg-deb dpkg-query systemctl busctl journalctl stat; do
     qd_require_cmd "$command"

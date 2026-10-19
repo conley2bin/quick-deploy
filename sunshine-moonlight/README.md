@@ -132,6 +132,17 @@ bash commands/install-display-control.sh --reconcile-attempted-launch
 
 中断后显式重跑只凭永久已完成/回收的控制命令证据、持久 StopWitness 和合格新 generation 续接，**从不重复已发出的 STOP/START**。若只有 issued、没有 durable completed/reaped 证明，哪怕当前 inactive/无 jobs/新 PID 也拒绝：孤儿控制发送者仍可能迟发 STOP。命令失败、不确定或崩溃后无法正面证明下一阶段时保留所有权和原证据、零 available 发布，必须另行取得有界人工干预授权；不要删除记录或擅自重试控制命令。完整承诺和受限 Linux/systemd/cgroup-v2 条件见 [RETIRE 协议与续接边界](display-control/README.md#attempted-launch-with-no-positive-active-observation-local-retire)。源码夹具 `bash tests/run-attempt-retirement.sh -v` 不代表实机退休或部署验收。
 
+**旧 STOP 已确认回收、随后由独立外部动作启动新实例**：另有只恢复预约的本地 `RECONCILE`，所有路径零服务控制。它要求原链恰好为 intent/stop-issued/stop-completed、旧进程与原 parent 锚定移除的历史正面组件、具体外部 actor/action/issuer/helpers/无旧请求或 FD 持有者及重放的完整事实账户，以及 fresh 合格同 UUID 空闲新实例。未知启动事实必须拒绝；“允许”本身不是事实。先用普通资格发布完成**唯一一次**受审阅的新源码 append、保持设置原字节不变，再在主机用户终端提供五个 owned/mode0600 本地证据文件并输入 `RECONCILE`：
+
+```bash
+bash commands/install-display-control.sh --reconcile-external-successor \
+  --certificate /owned/private/certificate.json --kernel /owned/private/kernel.json \
+  --anchored /owned/private/anchored.json --context /owned/private/context.json \
+  --lifecycle /owned/private/lifecycle.json
+```
+
+历史未观察 jobs/FD/proc/loaded/capture 字段保持 unknown，不伪造 StopWitness。原三阶段链保留 **INCOMPLETE/SUPERSEDED**，永久放弃原未用 START；原四物理归档、旧源码/历史/登记/锁和历史收据保留，最后外部观察后完整物理检查才唯一发布原 R+1。不得先发布中间候选、改旧版本/阶段、清状态或用 RETIRE 收养已运行实例。完整 [证书格式、证据品牌和精确续接要求](display-control/external-successor.md) 必须先阅读；源码夹具 `bash tests/run-external-successor.sh -v` 不代表实机事实账户或恢复验收。
+
 普通独立伴随安装不改 Sunshine 配置、vendor unit、retry 策略、sshd 或设备，不启动/reload/restart/cancel 服务。`NeedDaemonReload=yes` 是实际拒绝条件：本入口不发布 unit，因此不会为了通过资格检查而 reload。应先核实真正的待加载定义及维护权限；不能绕过 guard，更不能用服务重启伪造 readiness。现有 vendor 安装器本身仍可能因包/配置变化重启活动 Sunshine，使用它前须安排获准的维护窗口。
 
 ## 2. 在 B 安装 Moonlight

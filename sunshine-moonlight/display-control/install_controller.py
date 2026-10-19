@@ -2039,7 +2039,7 @@ def attempt_record_bounds(installed, records, journal):
     return sizes
 
 
-def retire_attempt(root, version, serial, installed, files, transport, info, marker, authorize):
+def retire_attempt(root, version, serial, installed, files, transport, info, marker, authorize, certificate_originals=None):
     """One local owner, one monotonic phase chain, one final availability write."""
     anchors = {p: private_directory(p) for p in (root, root/"versions", root/"active", files.path, root/"versions"/version)}
     paths = (root/".install.lock", files.path/"operation.lock", files.path/"reservation.lock")
@@ -2047,6 +2047,10 @@ def retire_attempt(root, version, serial, installed, files, transport, info, mar
         attempt_refused("permanent lock bytes differ")
     permanent = {str(p.relative_to(root)): record_identity(p) for p in paths}
     pins, record_bounds = {}, {}
+    external = external_authorities(root, installed, files, originals=certificate_originals)
+    if any(not entry[3] for entry in external):
+        attempt_refused("incomplete zero-control authority; RETIRE must not issue any service control")
+    sealed_external = {entry[0]["id"] for entry in external}
 
     def pin(name, data=None):
         path = files.path/name
@@ -2062,12 +2066,14 @@ def retire_attempt(root, version, serial, installed, files, transport, info, mar
     def check_pins():
         for name, (data, identity) in pins.items():
             unlaunched_identity(files.path/name, data, identity)
+        external_original_fence(certificate_originals)
 
     def installation():
         if (any(private_directory(p) != identity for p, identity in anchors.items())
                 or permanent != {str(p.relative_to(root)): record_identity(p) for p in paths}
                 or active(root) != (version, serial) or validate_version(root/"versions"/version) != marker):
             attempt_refused("installation/source/references/permanent locks changed")
+        external_original_fence(certificate_originals)
 
     def phase_name(journal, phase):
         return "attempt-" + phase + "-" + journal["id"] + ".bak"
@@ -2161,6 +2167,8 @@ def retire_attempt(root, version, serial, installed, files, transport, info, mar
         attempt_refused("phase has no original intent")
     journal = None
     for index, (revision, item) in enumerate(journals):
+        if item["id"] in sealed_external:
+            continue  # Exact, physically validated external seal; old chain stays INCOMPLETE.
         prior = None
         proofs = {}
         for key in ATTEMPT_PHASES:
@@ -2245,6 +2253,10 @@ def retire_attempt(root, version, serial, installed, files, transport, info, mar
                 check_pins(); installation()
                 return response(True, action="reconcile-attempted-launch", **lc.HostController.status_fields(current.status))
 
+    if journals and all(item["id"] in sealed_external for _, item in journals):
+        current = rs._decode(files.read("reservation.json", rs.MAX_STATE), rs.HostIdentity(installed.host_uniqueid, installed.base_port))
+        if current.status.phase is not rs.Phase.RECONCILIATION_REQUIRED:
+            return external_replay(installed, files, transport, info, certificate_originals)
     records = originals(journal) if journal else {name: files.read(name, 1024*1024) for name in RELEASE_RECORDS}
     if any(data is None for data in records.values()):
         attempt_refused("all four original records are required")
@@ -2389,7 +2401,7 @@ def retire_attempt(root, version, serial, installed, files, transport, info, mar
     return response(True, action="reconcile-attempted-launch", **lc.HostController.status_fields(rs._decode(available, rs.HostIdentity(installed.host_uniqueid, installed.base_port)).status))
 
 
-def local_attempt_retirement(*, authorize=interactive_retire, transport=None, info=None):
+def local_attempt_retirement(*, authorize=interactive_retire, transport=None, info=None, original_certificates=()):
     """Installer-only dispatch using NSS and the current immutable installation."""
     if sys.platform != "linux" or os.geteuid() == 0 or os.getuid() != os.geteuid():
         attempt_refused("only the unprivileged local Linux desktop user is supported")
@@ -2398,6 +2410,7 @@ def local_attempt_retirement(*, authorize=interactive_retire, transport=None, in
     root = home/RELATIVE_ROOT
     if (home.stat().st_uid != uid or root.parent.resolve(strict=True) != root.parent):
         attempt_refused("fixed NSS home/installation must be canonical and owned")
+    certificate_originals = external_originals(original_certificates, root)
     private_read(root/".install.lock", 1)
     with installation_lock(root):
         if {p.name for p in root.iterdir()} != {".install.lock", "versions", "active", "state"}:
@@ -2420,13 +2433,890 @@ def local_attempt_retirement(*, authorize=interactive_retire, transport=None, in
         try:
             with lc.PrivateFiles(root/"state").locked() as files:
                 return retire_attempt(root, version, serial, installed, files, transport or rt.RetirementTransport(home, uid),
-                                      info or host.serverinfo, marker, authorize)
+                                      info or host.serverinfo, marker, authorize, certificate_originals)
         except Refusal as exc:
             if exc.code == "unlaunched_retirement_refused":
                 # Reuse strict private-record/receipt validators, never that
                 # ceremony's admission authority or its operator-facing label.
                 attempt_refused(exc.detail.partition(": ")[2])
             raise
+
+
+# This compatibility allowlist names audited SOURCE BYTES, never a host, UUID,
+# transaction, pathname, or native generation. Later authorities may also name
+# an exact source already approved by a validated earlier external authority.
+EXTERNAL_LEGACY_SOURCE = {
+    "host.py": "d895a8c28ba2daac2b2de9d5c26aab3a0db97cd37e2d3b5cbe5b95c541bad004",
+    "lifecycle.py": "23ef4b2522d1d3570917c8f05074d03c31df82d8c9d87b612d5a48323d41d5a0",
+    "configuration.py": "0dd34a836917e6d13dcc7796d74da85ad4422fac87886ed22910c9a175d26cdc",
+    "protocol.py": "3f8e5ca758ee67fb1c14950ed292c18a61d8f11f3fe8460ef7c690ab2e49e63d",
+    "reservation.py": "225d78a8ab20bec9a8d4818b147cc72f8aac8bc22328abfe23acf569c41b8049",
+    "runtime_linux.py": "545eb7586a927879b671b5c859e77877c357bd6d148e3eda0697891a02c119f3",
+    "linux_kms.py": "83740b9afe3c2ced6a3fa4777b681d14940f2b918acaaef36862d8bf5af5a780",
+    "windows_display.py": "eeea165ae1f3871af65daf0945e8b0d58dddfb35de99e59c4dcff0e503c4160c",
+    "macos_display.py": "c03a3b02a49a8c829a80689f194e235ba52b3c305dec706a3efbbdd948b59053",
+    "qualification.py": "3e2db06317780d7e6f6298e1e7dc8b62fa4210b7a73a04bbfe6f3909b3409e04",
+    "install_controller.py": "aed69ce362bd607317cb43c54a65311293b87aa98226dec06cca395dc46682c3",
+}
+EXTERNAL_COMPONENT_RUNTIME = "5991cec9370266e6ed2ad203cbc3cee4d146cda685004fa76498245699f35f02"
+EXTERNAL_ROLES = ("kernel", "anchored", "context", "lifecycle")
+EXTERNAL_UNKNOWN = {key: "unknown" for key in
+                    ("historical_global_jobs", "historical_repeated_typed_policy", "historical_process_fds",
+                     "historical_loaded_config", "historical_capture", "historical_monotonic_observation")}
+EXTERNAL_KIND = "operator_attested_components_not_stop_witness"
+
+
+def external_refused(reason):
+    fail("external_successor_refused", "Zero-control reconciliation refused: " + reason)
+
+
+def external_object(value, keys):
+    if type(value) is not dict or set(value) != set(keys):
+        external_refused("unknown/missing authority fields")
+    return value
+
+
+def external_text(value, limit=512):
+    if (type(value) is not str or not 1 <= len(value.encode("utf-8", "strict")) <= limit
+            or value.strip().casefold() in ("unknown", "unaccounted", "unsure", "n/a", "none", "?", "pending")
+            or any(ord(c) < 32 or ord(c) == 127 for c in value)):
+        external_refused("concrete actor/action/issuer/helper/provenance facts required")
+    return value
+
+
+def external_hash(value):
+    if type(value) is not str or not re.fullmatch("[0-9a-f]{64}", value):
+        external_refused("invalid content/source digest")
+    return value
+
+
+def external_utc(value):
+    """Declared UTC point instant as exact integer nanoseconds; no float,
+    fractional truncation or implicit precision/clock-drift allowance.
+    """
+    from datetime import datetime
+    external_text(value, 64)
+    match = re.fullmatch(r"([0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2})(?:\.([0-9]{1,9}))?(?:Z|\+00:00)", value)
+    try:
+        if match is None:
+            raise ValueError("clock")
+        delta = datetime.fromisoformat(match[1]) - datetime(1970, 1, 1)
+        return (delta.days * 86400 + delta.seconds) * 1_000_000_000 + int((match[2] or "0").ljust(9, "0"))
+    except ValueError:
+        external_refused("component clock must be an explicit UTC point with at most nanosecond precision")
+
+
+def external_certificate(certificate, raw, predecessor, original_set, approved, serial, boundary, version_prefix):
+    """Bounded attested components, NOT attempt_witness() or a machine proof importer.
+
+    Raw producer objects supply positive birth/dirfd/terminal and manager links.
+    The informed local operator supplies the historical causal order and the
+    external action/holder/issuer envelope. Neither brand silently becomes the
+    other. Missing past jobs/FD/proc/loaded/capture samples stay explicitly unknown.
+    This function is pure; it performs no service, process, endpoint or file I/O.
+    """
+    external_object(certificate, {"schema", "kind", "predecessor", "approved_source", "external", "account",
+                                  "ordering", "unknown", "attachments", "source_version_prefix"})
+    if (type(certificate["schema"]) is not int or certificate["schema"] != 1
+            or certificate["kind"] != EXTERNAL_KIND or certificate["unknown"] != EXTERNAL_UNKNOWN
+            or set(raw) != set(EXTERNAL_ROLES)):
+        external_refused("unsupported certificate/unknown historical evidence brand")
+    old = predecessor["admission"]["boundary"]
+    oldgen = old["generation"]
+    gen = asdict(boundary.generation)
+    if tuple(boundary.parent_identity) != tuple(old["parent_identity"]):
+        external_refused("fresh successor parent differs from original anchored parent")
+    expected = {"id": predecessor["id"], "intent_sha256": cfg.digest(document(predecessor)),
+                "records_sha256": cfg.digest(document(original_set)),
+                "source_manifest_sha256": cfg.digest(document(predecessor["manifest"])),
+                "settings_sha256": predecessor["manifest"]["files"]["host-settings.json"]}
+    if certificate["predecessor"] != expected or certificate["approved_source"] != {
+            "version": approved["version"], "serial": serial, "manifest_sha256": cfg.digest(document(approved)),
+            "settings_sha256": approved["files"]["host-settings.json"]}:
+        external_refused("certificate does not bind exact originals and approved source append")
+    preserved = certificate["source_version_prefix"]
+    if (type(preserved) is not dict or not {predecessor["version"], approved["version"]} <= set(preserved)
+            or any(type(n) is not str or not re.fullmatch("v1-[0-9a-f]{64}", n) for n in preserved)):
+        external_refused("invalid complete certificate source-version prefix")
+    for digest in preserved.values():
+        external_hash(digest)
+    if preserved != version_prefix:
+        external_refused("immutable certificate source-prefix commitment differs from the full preservation promise")
+    external_object(certificate["external"], {"generation", "job_id", "start_cursor", "completed_cursor"})
+    ext = certificate["external"]
+    if (ext["generation"] != gen or type(ext["job_id"]) is not str
+            or not re.fullmatch("[1-9][0-9]{0,9}", ext["job_id"])):
+        external_refused("external generation/job differs from fresh qualified successor")
+    external_text(ext["start_cursor"]); external_text(ext["completed_cursor"])
+    if ext["start_cursor"] == ext["completed_cursor"]:
+        external_refused("external start/completion provenance is not distinct")
+    external_object(certificate["account"], {"actor", "action", "issuer", "issuer_completion", "issuer_completion_brand",
+        "helpers", "specific_outstanding_work", "outside_request_holders", "request_fd_handoff", "process_migration",
+        "authenticated_replay", "other_deviations", "policy_config_changes", "exclusive_window"})
+    account = certificate["account"]
+    for key in ("actor", "action", "issuer", "issuer_completion"):
+        external_text(account[key])
+    if (account["issuer_completion_brand"] != "operator_attested_action_finished_not_child_reaping"
+            or type(account["helpers"]) is not list or len(account["helpers"]) > 16
+            or any(account[key] != "none" for key in ("specific_outstanding_work", "outside_request_holders",
+                "request_fd_handoff", "process_migration", "authenticated_replay", "other_deviations", "policy_config_changes"))
+            or account["exclusive_window"] != "renewed_until_commit"):
+        external_refused("unaccounted specific controls/helpers/holders/replay or changed policy/exclusive window")
+    helper_ids = set()
+    for helper in account["helpers"]:
+        external_object(helper, {"identity", "work", "completion", "state"})
+        for key in ("identity", "work", "completion"):
+            external_text(helper[key])
+        if helper["state"] != "finished_no_committed_work" or helper["identity"] in helper_ids:
+            external_refused("unfinished/duplicate external helper")
+        helper_ids.add(helper["identity"])
+    retirement_generation(ext["generation"], gen["uid"])
+    if (type(certificate["ordering"]) is not dict
+            or any(type(certificate["ordering"].get(k)) is not bool for k in
+                   ("components_after_old_admission", "scope_absence_before_external_start", "unaccounted_clock_changes"))):
+        external_refused("causal ordering assertions must be explicit booleans")
+    admission_identity = original_set["attempt-transition-" + predecessor["id"] + ".bak"]
+    attested_identity = external_object(certificate["ordering"].get("old_admission_intent_identity"), admission_identity)
+    attempt_identity_domain(attested_identity, admission_identity["size"], gen["uid"])
+    if certificate["ordering"] != {"brand": "operator_attested_causal_order", "old_invocation": oldgen["invocation_id"],
+            "external_invocation": gen["invocation_id"], "scope_absence_before_external_start": True,
+            "components_after_old_admission": True, "old_admission_intent_identity": admission_identity,
+            "clock_basis": "same_host_realtime_utc_and_sealed_mtime_ns", "unaccounted_clock_changes": False}:
+        external_refused("historical post-admission causal interval/same-host clock envelope is not attested")
+    external_object(certificate["attachments"], EXTERNAL_ROLES)
+    objects = {}
+    for role in EXTERNAL_ROLES:
+        meta = external_object(certificate["attachments"][role], {"sha256", "observer", "clock"})
+        external_text(meta["observer"])
+        external_object(meta["clock"], {"basis", "value"})
+        if (meta["sha256"] != cfg.digest(raw[role]) or meta["clock"]["basis"] != "UTC"
+                or len(raw[role]) > lc.MAX_PRIVATE):
+            external_refused("raw component hash/clock/bound differs")
+        objects[role] = unique_json(raw[role])  # Includes duplicate/type rejection, never filenames.
+        if type(objects[role]) is not dict:
+            external_refused("component attachment is not an object")
+        observed = objects[role].get("utc" if role == "kernel" else "observed_utc")
+        if meta["clock"]["value"] != observed:
+            external_refused("component provenance clock differs from raw producer")
+        external_utc(observed)
+    kernel, anchored, context, lifecycle = (objects[k] for k in EXTERNAL_ROLES)
+    components = kernel.get("components")
+    target = str(rt.CGROUP_ROOT / old["cgroup"].lstrip("/"))
+    if (type(components) is not dict or components.get("boot") != {"value": oldgen["boot_id"]}
+            or components.get("old_birth") != {"value": "absent"}
+            or components.get("cgroup_path") != {"value": target}
+            or components.get("parent_identity") != {"value": old["parent_identity"]}):
+        external_refused("positive historical old-birth/boot/parent component links absent")
+    terminal = {"MainPID": "0", "ControlPID": "0", "ControlGroup": "", "ActiveState": "inactive", "SubState": "dead",
+                "Job": "", "InvocationID": oldgen["invocation_id"]}
+    if (anchored.get("transaction") != predecessor["id"] or anchored.get("target") != target
+            or anchored.get("expected_parent") != old["parent_identity"] or anchored.get("targeted_scope_removed") is not True
+            or anchored.get("runtime_sha256") != EXTERNAL_COMPONENT_RUNTIME
+            or anchored.get("native_unit_properties") != terminal or type(anchored.get("native_unit_query_exit")) is not int
+            or anchored["native_unit_query_exit"] != 0 or anchored.get("start_issued_record_exists") is not False):
+        external_refused("anchored positive dirfd/terminal component is missing or from an unknown collector")
+    external_hash(anchored.get("source_snapshot_sha256"))  # Provenance only; not an imported source authority.
+    unit, proc = context.get("native_unit"), context.get("current_proc")
+    if (context.get("old_generation") != oldgen or context.get("current_boot_id") != gen["boot_id"]
+            or context.get("same_boot") is not True or context.get("old_scope_identity") != old["cgroup_identity"]
+            or type(unit) is not dict or type(proc) is not dict or unit.get("MainPID") != str(gen["pid"])
+            or unit.get("InvocationID") != gen["invocation_id"] or unit.get("Id") != rt.UNIT
+            or unit.get("ActiveState") != "active" or unit.get("SubState") != "running"
+            or unit.get("ControlPID") != "0" or unit.get("NRestarts") != "0" or unit.get("Job") != ""
+            or unit.get("ControlGroup") != boundary.cgroup or proc.get("pid") != str(gen["pid"])
+            or type(proc.get("birth")) is not int or proc["birth"] != gen["start_ticks"]
+            or proc.get("exe") != str(rt.EXECUTABLE) or proc.get("cgroup") != "0::" + boundary.cgroup + "\n"
+            or unit.get("ExecMainStartTimestampMonotonic") != str(gen["start_monotonic_usec"])):
+        external_refused("raw external context does not link the exact old and fresh current generations")
+    scope = context.get("current_old_path_identity")
+    if (type(scope) is not dict or [scope.get(k) for k in ("device", "inode", "mode", "uid", "gid")] != list(boundary.cgroup_identity)
+            or list(boundary.cgroup_identity) == old["cgroup_identity"]):
+        external_refused("external scope replacement/current physical identity differs")
+    if (type(lifecycle.get("journal_exit")) is not int or lifecycle["journal_exit"] != 0
+            or lifecycle.get("journal_stderr") != "" or type(lifecycle.get("manager_events")) is not list
+            or len(lifecycle["manager_events"]) > 256):
+        external_refused("invalid scoped manager-event provenance")
+    linked = []
+    for cursor in (ext["start_cursor"], ext["completed_cursor"]):
+        rows = [row for row in lifecycle["manager_events"] if type(row) is dict and row.get("__CURSOR") == cursor]
+        if len(rows) != 1:
+            external_refused("missing/duplicate exact external manager event")
+        row = rows[0]
+        if (any(row.get(k) != v for k, v in {"_BOOT_ID": gen["boot_id"], "_UID": str(gen["uid"]),
+                "_COMM": "systemd", "USER_UNIT": rt.UNIT, "USER_INVOCATION_ID": gen["invocation_id"],
+                "JOB_TYPE": "start", "JOB_ID": ext["job_id"]}.items())
+                or any(type(row.get(k)) is not str or not re.fullmatch("[1-9][0-9]{0,19}", row[k])
+                       for k in ("__MONOTONIC_TIMESTAMP", "__REALTIME_TIMESTAMP"))):
+            external_refused("manager event has wrong causal generation/unit/job/clock links")
+        linked.append(row)
+    if (linked[0].get("MESSAGE_ID") != "7d4958e842da4a758f6c1cdc7b36dcc5"
+            or linked[1].get("MESSAGE_ID") != "39f53479d3a045ac8e11786248231fbf"
+            or not oldgen["start_monotonic_usec"] < int(linked[0]["__MONOTONIC_TIMESTAMP"]) <= gen["start_monotonic_usec"]
+                    <= int(linked[1]["__MONOTONIC_TIMESTAMP"])
+            or int(linked[0]["__REALTIME_TIMESTAMP"]) > int(linked[1]["__REALTIME_TIMESTAMP"])):
+        external_refused("manager start/completion ordering contradicts the linked invocation")
+    # The original intent was created AFTER qualified old-generation admission.
+    # Its already sealed mtime supplies a conservative observable lower bound,
+    # not an invented admission wall/monotonic timestamp. Equality is allowed:
+    # admission precedes intent creation. UTC strings denote point instants at
+    # their stated decimal precision; even 1ns predating is rejected, with no
+    # spare headroom. These consistency checks require the separate truthful
+    # same-host/no-unaccounted-clock-change and causal-interval attestation.
+    control_times = [original_set["attempt-" + role + "-" + predecessor["id"] + ".bak"]["mtime_ns"]
+                     for role in ("transition", "stop-issued", "stop-completed")]
+    start_ns = int(linked[0]["__REALTIME_TIMESTAMP"]) * 1000
+    if (any(type(value) is not int for value in control_times)
+            or not control_times[0] <= control_times[1] <= control_times[2] <= start_ns):
+        external_refused("sealed original admission/control realtime anchors contradict the external Start")
+    if not control_times[0] <= external_utc(kernel["utc"]) <= external_utc(anchored["observed_utc"]) < start_ns:
+        external_refused("component realtime interval predates old admission intent or contradicts external Start order")
+    return certificate
+
+
+def external_name(identifier, role):
+    return "external-" + role + "-" + identifier + ".bak"
+
+
+def external_predecessor(root, installed, files, identifier):
+    """Read the exact incomplete three-phase predecessor; never repair a phase."""
+    if type(identifier) is not str or not re.fullmatch("[0-9a-f]{32}", identifier):
+        external_refused("invalid predecessor identifier")
+    name = "attempt-transition-" + identifier + ".bak"
+    data = private_read(files.path/name, lc.MAX_PRIVATE)
+    old = external_object(unique_json(data), {"schema", "id", "version", "serial", "manifest", "admission", "records",
+                                            "permanent", "history", "active_prefix", "confirmation"})
+    if (data != document(old) or old["id"] != identifier or type(old["schema"]) is not int or old["schema"] != 1
+            or old["confirmation"] != ATTEMPT_CONFIRMATION or type(old["serial"]) is not int
+            or not 1 <= old["serial"] < 512 or type(old["version"]) is not str
+            or not re.fullmatch("v1-[0-9a-f]{64}", old["version"])
+            or set(old["records"]) != set(RELEASE_RECORDS) or type(old["history"]) is not dict
+            or any(type(n) is not str or "/" in n or not n.endswith(".bak") for n in old["history"])
+            or old["manifest"] != validate_version(root/"versions"/old["version"])
+            or old["active_prefix"] != active_prefix(root, old["serial"])
+            or unique_json(private_read(root/"active"/f'{old["serial"]:08d}.json')) != {"schema": 1, "version": old["version"]}):
+        external_refused("unknown predecessor source/schema/reference prefix")
+    locks = (root/".install.lock", files.path/"operation.lock", files.path/"reservation.lock")
+    permanent = {str(p.relative_to(root)): record_identity(p) for p in locks}
+    if old["permanent"] != permanent or tuple(private_read(p, 1) for p in locks) != (b"\0", b"", b"\0"):
+        external_refused("predecessor permanent lock identity/bytes differ")
+    original_set = dict(old["history"])
+    records = {}
+    for record in RELEASE_RECORDS:
+        archive = files.path/(record + "." + identifier + ".bak")
+        path = archive if archive.exists() or archive.is_symlink() else files.path/record
+        records[record] = private_read(path)
+        if record_identity(path) != old["records"][record] or record in original_set:
+            external_refused("predecessor original physical record differs")
+        original_set[record] = old["records"][record]
+    attempt_admission(installed, records, old["admission"])
+    phase_ids = {}
+    for phase in ("stop-issued", "stop-completed"):
+        path = files.path/("attempt-" + phase + "-" + identifier + ".bak")
+        raw = private_read(path, lc.MAX_PRIVATE)
+        wanted = {} if phase == "stop-issued" else {
+            "issued_identity": phase_ids["stop-issued"],
+            "completion": asdict(rt.ControlCompletion("stop", rt.UNIT, installed.runtime.uid))}
+        if raw != attempt_phase_data(old, wanted):
+            external_refused("STOP is issued-only or not internally acknowledged/reaped against exact issued marker")
+        phase_ids[phase] = record_identity(path)
+        if path.name in original_set:
+            external_refused("predecessor phase was already declared as old history")
+        original_set[path.name] = phase_ids[phase]
+    if any(files.read("attempt-"+phase+"-"+identifier+".bak") is not None for phase in ATTEMPT_PHASES[2:]):
+        external_refused("only the incomplete intent/STOP-issued/STOP-completed chain may be superseded")
+    for path in (files.path/name, files.path/"operation.lock", files.path/"reservation.lock"):
+        if path.name in original_set:
+            external_refused("predecessor evidence/history aliases a permanent record")
+        original_set[path.name] = record_identity(path)
+    for n, ident in original_set.items():
+        attempt_identity_domain(ident, ident["size"], installed.runtime.uid)
+        if n not in RELEASE_RECORDS and record_identity(files.path/n) != ident:
+            external_refused("predecessor history physical identity differs")
+    return old, records, original_set
+
+
+def external_source_bridge(root, predecessor, version, serial, marker, trusted=()):
+    """Exactly one normal ACTIVE publication, unchanged settings, no adoption."""
+    old = predecessor["manifest"]
+    code = {n: old["files"][n] for n in SOURCES}
+    corrected = {**EXTERNAL_LEGACY_SOURCE, "runtime_linux.py": EXTERNAL_COMPONENT_RUNTIME}
+    permitted = [EXTERNAL_LEGACY_SOURCE, corrected,
+                 {n: cfg.digest(source_read(Path(__file__).resolve().parent/n)) for n in SOURCES}]
+    permitted.extend({n: item["files"][n] for n in SOURCES} for item in trusted)
+    if (code not in permitted or serial != predecessor["serial"]+1 or version == predecessor["version"]
+            or marker != validate_version(root/"versions"/version)
+            or old["files"]["host-settings.json"] != marker["files"]["host-settings.json"]
+            or private_read(root/"versions"/version/"host-settings.json")
+               != private_read(root/"versions"/predecessor["version"]/"host-settings.json")):
+        external_refused("unknown/forked predecessor source or not one qualified unchanged-settings source append")
+    sources = {}
+    for item in (old, marker):
+        if item["version"] != "v"+str(item["release"])+"-"+cfg.digest(document(item["files"])):
+            external_refused("source version does not derive from its exact source/settings manifest")
+        folder = root/"versions"/item["version"]
+        sources[item["version"]] = {n: record_identity(folder/n) for n in (*SOURCES, "host-settings.json", ".owned.json")}
+    return sources
+
+
+def interactive_external(certificate):
+    try:
+        fd = os.open("/dev/tty", os.O_RDWR | os.O_NOCTTY)
+        try:
+            if not os.isatty(fd):
+                return False
+            summary = {key: certificate[key] for key in ("predecessor", "approved_source", "external", "source_version_prefix")}
+            summary["account"] = {key: certificate["account"][key] for key in ("actor", "action", "issuer", "issuer_completion", "helpers")}
+            os.write(fd, b"ZERO service controls. Attest this bounded factual external-START account: " + document(summary)
+                + b"Historical components are operator-attested AFTER the bound old admission, under the same host UTC/realtime/mtime clock with no unaccounted changes, NOT a machine StopWitness; unknown past fields remain unknown. "
+                  b"Confirm the recorded Start was the sole deviation, all specific issuer/helper work is finished, no outside old request/FD holder, "
+                  b"handoff/migration/authenticated replay or outstanding/queued control remains, unchanged config/policy, and exclusive use until commit. "
+                  b"Preserve the old receipt as history and permanently relinquish the original unused START. Type RECONCILE: ")
+            return os.read(fd, 64).strip() == b"RECONCILE"
+        finally:
+            os.close(fd)
+    except OSError:
+        return False
+
+
+@dataclass(frozen=True)
+class OriginalCertificate:
+    """One explicitly selected local input, never a path/hash from a journal."""
+    path: Path
+    data: bytes
+    identity: dict
+
+
+def external_originals(paths, root):
+    """Snapshot bounded owned originals selected by local argv/API, not cache.
+
+    Original selection is the local operator's trust boundary. No source/state
+    record may select or redirect these files, and copies inside the mutable
+    controller installation are deliberately ineligible as independent inputs.
+    """
+    if type(paths) not in (tuple, list) or len(paths) > 512:
+        external_refused("at most512 explicit local original certificates are supported")
+    result, physical = {}, set()
+    for selected in paths:
+        path = Path(selected).absolute()
+        data = private_read(path, lc.MAX_PRIVATE)
+        identity = record_identity(path)
+        if path.resolve(strict=True).is_relative_to(root):
+            external_refused("select the retained original certificate outside the controller installation, never its cache")
+        obj = external_object(unique_json(data), {"schema", "kind", "predecessor", "approved_source", "external", "account",
+            "ordering", "unknown", "attachments", "source_version_prefix"})
+        predecessor = external_object(obj["predecessor"], {"id", "intent_sha256", "records_sha256", "source_manifest_sha256", "settings_sha256"})
+        identifier = predecessor["id"]
+        if (data != document(obj) or type(obj["schema"]) is not int or obj["schema"] != 1 or obj["kind"] != EXTERNAL_KIND
+                or type(identifier) is not str or not re.fullmatch("[0-9a-f]{32}", identifier)
+                or identity["sha256"] != cfg.digest(data)):
+            external_refused("original certificate must be canonical, owned and linked to an exact predecessor")
+        attempt_identity_domain(identity, len(data), os.geteuid())
+        key = identity["device"], identity["inode"]
+        if identifier in result or key in physical:
+            external_refused("duplicate original certificate/predecessor/physical input")
+        physical.add(key)
+        result[identifier] = OriginalCertificate(path, data, identity)
+    external_original_fence(result)
+    return result
+
+
+def external_original_fence(originals):
+    """Filesystem-only check; callers repeat AFTER their last external sample."""
+    if originals is None:
+        return
+    if type(originals) is not dict:
+        external_refused("explicit local original-certificate snapshots required")
+    for proof in originals.values():
+        if (type(proof) is not OriginalCertificate or record_identity(proof.path) != proof.identity
+                or private_read(proof.path, lc.MAX_PRIVATE) != proof.data):
+            external_refused("selected original certificate changed physically/bytes after observation")
+
+
+def external_original(originals, identifier):
+    if type(originals) is not dict or identifier not in originals:
+        external_refused("explicit original certificate required for every supersession; cached evidence is not an independent root")
+    external_original_fence(originals)
+    return originals[identifier]
+
+
+def external_version_prefix(root):
+    result = {}
+    for folder in (root/"versions").iterdir():
+        marker = validate_version(folder)
+        if marker["version"] != "v"+str(marker["release"])+"-"+cfg.digest(document(marker["files"])):
+            external_refused("unknown/forked source version in preserved installation")
+        result[folder.name] = cfg.digest(document({p.name: record_identity(p) for p in folder.iterdir()}))
+    return result
+
+
+def external_original_path(files, identifier, name):
+    archived = files.path/(name+"."+identifier+".bak")
+    return archived if archived.exists() or archived.is_symlink() else files.path/name
+
+
+def external_descendant_floor(root, installed, files, identifier, floor, sealed, originals=None):
+    """A later exact attempted intent can preserve an earlier published floor
+    while its own reservation is temporarily missing/sentinel/SELECTING. Its
+    sealed history MUST physically include this complete authority and archives;
+    an invented .bak or a declared numeric floor supplies no such lineage.
+    """
+    original = external_original(originals, identifier)
+    if files.read(external_name(identifier, "certificate")) != original.data:
+        external_refused("descendant floor cache differs from explicitly selected original certificate")
+    for path in files.path.glob("attempt-transition-*.bak"):
+        if path.name == "attempt-transition-"+identifier+".bak":
+            continue
+        raw = private_read(path, lc.MAX_PRIVATE)
+        later = unique_json(raw)
+        if (type(later) is not dict or raw != document(later) or type(later.get("history")) is not dict
+                or any(later["history"].get(n) != ident for n, ident in sealed.items())):
+            continue
+        required = {"schema", "id", "version", "serial", "manifest", "admission", "records", "permanent", "history", "active_prefix", "confirmation"}
+        if (set(later) != required or type(later["id"]) is not str or not re.fullmatch("[0-9a-f]{32}", later["id"])
+                or path.name != "attempt-transition-"+later["id"]+".bak"
+                or later["confirmation"] != ATTEMPT_CONFIRMATION or type(later["schema"]) is not int or later["schema"] != 1
+                or type(later["version"]) is not str or not re.fullmatch("v1-[0-9a-f]{64}", later["version"])
+                or any(type(n) is not str or "/" in n or not n.endswith(".bak") for n in later["history"])
+                or type(later["serial"]) is not int or not 1 <= later["serial"] <= 512
+                or later["active_prefix"] != active_prefix(root, later["serial"])
+                or later["manifest"] != validate_version(root/"versions"/later["version"])
+                or set(later["records"]) != set(RELEASE_RECORDS)):
+            external_refused("later floor witness has unknown source/schema/history")
+        locks = (root/".install.lock", files.path/"operation.lock", files.path/"reservation.lock")
+        if later["permanent"] != {str(p.relative_to(root)): record_identity(p) for p in locks}:
+            external_refused("later floor witness changed permanent locks")
+        for name, identity in later["history"].items():
+            attempt_identity_domain(identity, identity["size"], installed.runtime.uid)
+            if record_identity(files.path/name) != identity:
+                external_refused("later floor witness has changed physical history")
+        if unique_json(private_read(root/"active"/f'{later["serial"]:08d}.json')) != {"schema": 1, "version": later["version"]}:
+            external_refused("later floor witness source reference contradicts manifest")
+        records = {}
+        for name in RELEASE_RECORDS:
+            original = external_original_path(files, later["id"], name)
+            if record_identity(original) != later["records"][name]:
+                external_refused("later original floor witness was replaced")
+            records[name] = private_read(original)
+        attempt_admission(installed, records, later["admission"])
+        _, state, _, _, _, _, _ = attempt_shape(installed, records)
+        if state.status.revision >= floor:
+            return True
+    return False
+
+
+def external_authorities(root, installed, files, *, supplied=None, originals=None, current=None):
+    """Validate exact sealed supersessions; never ignore an incomplete journal.
+
+    Returns ordered (intent, promise, descriptor, committed) tuples. This is
+    filesystem-only and performs no writes. A partial authority without its
+    original supplied attachments stays blocked, including in ordinary RETIRE.
+    """
+    entries, known, trusted = [], set(), []
+    candidates = []
+    for path in files.path.glob("external-transition-*.bak"):
+        raw = private_read(path, lc.MAX_PRIVATE)
+        item = external_object(unique_json(raw), {"schema", "kind", "id", "predecessor_sha256", "original_set", "version", "serial",
+            "manifest", "sources", "version_prefix", "prefix", "permanent", "certificate", "input_provenance", "promise_sha256",
+            "confirmation", "predecessor_disposition", "unused_original_start"})
+        if (type(item["schema"]) is not int or item["schema"] != 1 or item["kind"] != EXTERNAL_KIND
+                or raw != document(item) or type(item["id"]) is not str or not re.fullmatch("[0-9a-f]{32}", item["id"])
+                or path.name != external_name(item["id"], "transition") or item["confirmation"] != "RECONCILE"
+                or item["predecessor_disposition"] != "INCOMPLETE_SUPERSEDED"
+                or item["unused_original_start"] != "PERMANENTLY_RELINQUISHED_NO_CONTROL"
+                or type(item["version"]) is not str or not re.fullmatch("v1-[0-9a-f]{64}", item["version"])
+                or type(item["serial"]) is not int or not 2 <= item["serial"] <= 512):
+            external_refused("invalid external authority/schema/disposition")
+        candidates.append(item)
+    candidates.sort(key=lambda item: item["serial"])
+    if len({item["id"] for item in candidates}) != len(candidates) or len({item["serial"] for item in candidates}) != len(candidates):
+        external_refused("duplicate/resealed external authority/source append")
+    required = {item["id"] for item in candidates} | ({current} if current is not None else set())
+    if required and (type(originals) is not dict or not required <= set(originals)):
+        external_refused("explicit original certificate required for every supersession; cached evidence is not an independent root")
+    if originals is not None and set(originals) != required:
+        external_refused("unknown/unused original certificate; select exactly the supersession history and current authority")
+    external_original_fence(originals)
+    for item in candidates:
+        identifier = item["id"]
+        original = external_original(originals, identifier)
+        bound_certificate = unique_json(original.data)
+        if (document(item["certificate"]) != original.data or type(item["input_provenance"]) is not dict
+                or item["input_provenance"].get("certificate") != original.identity):
+            external_refused("cached certificate/provenance differs from explicitly selected original certificate")
+        roles = ("transition", "certificate", *EXTERNAL_ROLES, "successor", "committed")
+        known.update(external_name(identifier, role) for role in roles)
+        old, records, original_set = external_predecessor(root, installed, files, identifier)
+        source_ids = external_source_bridge(root, old, item["version"], item["serial"], item["manifest"], trusted)
+        all_versions = external_version_prefix(root)
+        if (item["predecessor_sha256"] != cfg.digest(document(old)) or item["original_set"] != original_set
+                or item["sources"] != source_ids or item["prefix"] != active_prefix(root, item["serial"])
+                or item["permanent"] != old["permanent"]):
+            external_refused("external predecessor/source/prefix/physical lineage differs")
+        external_object(item["input_provenance"], ("certificate", *EXTERNAL_ROLES))
+        raw_inputs = {}
+        attachment_ids = {}
+        for role in ("certificate", *EXTERNAL_ROLES):
+            expected = item["input_provenance"][role]
+            attempt_identity_domain(expected, expected["size"], installed.runtime.uid)
+            stored = files.read(external_name(identifier, role))
+            if stored is not None:
+                attachment_ids[role] = record_identity(files.path/external_name(identifier, role))
+            if role == "certificate":
+                if stored is not None and stored != original.data:
+                    external_refused("cached certificate bytes differ from selected independent original")
+                stored = original.data
+            elif stored is None:
+                if supplied is None or role not in supplied:
+                    external_refused("pending authority attachment missing; exact local input required, no controls")
+                stored = supplied[role]
+            if cfg.digest(stored) != expected["sha256"] or len(stored) != expected["size"]:
+                external_refused("raw attachment differs from bound owned input provenance")
+            raw_inputs[role] = stored
+        if raw_inputs["certificate"] != document(item["certificate"]):
+            external_refused("certificate bytes differ from bound canonical operator account")
+        # Only the operator-selected external original defines the promise.
+        # Every cache/provenance/link may be coherently resealed; none selects
+        # this input or its path. The same pinned original is mandatory on the
+        # ordinary RETIRE, explicit-entry, partial, floor and read-only paths.
+        preserved = bound_certificate.get("source_version_prefix")
+        if type(preserved) is not dict or item["version_prefix"] != preserved:
+            external_refused("non-shrinkable source prefix differs from original raw certificate")
+        referenced = set()
+        for number in range(1, item["serial"] + 1):
+            ref = unique_json(private_read(root/"active"/f"{number:08d}.json"))
+            if (type(ref) is not dict or set(ref) != {"schema", "version"} or type(ref["schema"]) is not int or ref["schema"] != 1
+                    or type(ref["version"]) is not str or not re.fullmatch("v1-[0-9a-f]{64}", ref["version"])):
+                external_refused("unknown preserved source reference")
+            referenced.add(ref["version"])
+        if not referenced <= set(preserved) or any(all_versions.get(n) != digest for n, digest in preserved.items()):
+            external_refused("complete certificate source-version physical prefix or sealed-reference coverage differs")
+        promised = files.read(external_name(identifier, "successor"))
+        descriptor = files.read(external_name(identifier, "committed"))
+        promise = None
+        if promised is not None:
+            obj = external_object(unique_json(promised), {"schema", "intent_sha256", "intent_identity", "attachments", "promise"})
+            if (promised != document(obj) or type(obj["schema"]) is not int or obj["schema"] != 1
+                    or obj["intent_sha256"] != cfg.digest(document(item))
+                    or obj["intent_identity"] != record_identity(files.path/external_name(identifier, "transition"))
+                    or set(attachment_ids) != {"certificate", *EXTERNAL_ROLES} or obj["attachments"] != attachment_ids):
+                external_refused("successor does not seal exact intent/attachment physical identities")
+            promise = external_object(obj["promise"], {"evidence", "boundary", "replacement", "blocked"})
+            if cfg.digest(document(promise)) != item["promise_sha256"]:
+                external_refused("successor differs from pre-authority fixed promise")
+            _, _, blocked, replacement = attempt_promise(installed, records, promise["evidence"], old["admission"])
+            if promise["replacement"] != replacement or promise["blocked"] != blocked.hex():
+                external_refused("external promise redefines original-derived R+1/records/enrollment")
+            boundary = attempt_boundary(promise["boundary"], installed)
+            if asdict(boundary.generation) != promise["evidence"]["generation"]:
+                external_refused("successor scope generation differs from its qualified evidence")
+        else:
+            # Partial intent has no machine-generated successor evidence yet.
+            # The provided raw context can validate the bounded certificate, but
+            # only the real current attempt_sample may authorize its publication.
+            context = unique_json(raw_inputs["context"])
+            gen = retirement_generation(item["certificate"]["external"]["generation"], installed.runtime.uid)
+            raw_scope = context.get("current_old_path_identity", {})
+            boundary = rt.RetirementBoundary(gen, {}, old["admission"]["boundary"]["cgroup"],
+                tuple(raw_scope.get(k) for k in ("device", "inode", "mode", "uid", "gid")),
+                tuple(old["admission"]["boundary"]["parent_identity"]))
+        external_certificate(bound_certificate, {k: raw_inputs[k] for k in EXTERNAL_ROLES}, old, original_set,
+                             item["manifest"], item["serial"], boundary, preserved)
+        desc = None
+        if descriptor is not None:
+            desc = external_object(unique_json(descriptor), {"schema", "intent_identity", "successor_identity", "live_records"})
+            if (descriptor != document(desc) or type(desc["schema"]) is not int or desc["schema"] != 1 or promise is None
+                    or desc["intent_identity"] != record_identity(files.path/external_name(identifier, "transition"))
+                    or desc["successor_identity"] != record_identity(files.path/external_name(identifier, "successor"))
+                    or set(desc["live_records"]) != set(RELEASE_RECORDS)):
+                external_refused("invalid sealed-supersession descriptor")
+            for name, identity in desc["live_records"].items():
+                intended = bytes.fromhex(promise["blocked"] if name == "reservation.json" else promise["replacement"][name])
+                attempt_identity_domain(identity, len(intended), installed.runtime.uid)
+                if identity["sha256"] != cfg.digest(intended):
+                    external_refused("descriptor live records contradict original-derived promise")
+        floor = attempt_shape(installed, records)[1].status.revision + 1
+        live = files.read("reservation.json", rs.MAX_STATE)
+        pending = live is None or live == RELEASE_BLOCKED or (promise is not None and live == bytes.fromhex(promise["blocked"]))
+        if not pending:
+            current = rs._decode(live, rs.HostIdentity(installed.host_uniqueid, installed.base_port))
+            if current.status.revision < floor:
+                if desc is not None or record_identity(files.path/"reservation.json") != old["records"]["reservation.json"]:
+                    external_refused("reservation rollback below exact original-derived external floor")
+                pending = True
+            elif desc is None or (current.status.revision == floor and live != bytes.fromhex(promise["replacement"]["reservation.json"])):
+                external_refused("unsealed or counterfeit external availability")
+        if pending and desc is not None:
+            sealed = {external_name(identifier, role): record_identity(files.path/external_name(identifier, role)) for role in roles}
+            sealed.update({name+"."+identifier+".bak": old["records"][name] for name in RELEASE_RECORDS})
+            if external_descendant_floor(root, installed, files, identifier, floor, sealed, originals):
+                pending = False
+        if pending and all_versions != preserved:
+            external_refused("pending authority source set differs from its complete original certificate prefix")
+        entries.append((item, promise, desc, not pending))
+        if not pending:
+            # All four originals MUST still be real archives, not live aliases.
+            for name in RELEASE_RECORDS:
+                if record_identity(files.path/(name+"."+identifier+".bak")) != old["records"][name]:
+                    external_refused("sealed original archive missing/replaced")
+            trusted.append(item["manifest"])
+    if any(p.name not in known for p in files.path.glob("external-*.bak")):
+        external_refused("orphan/unknown external authority artifact")
+    external_original_fence(originals)
+    return entries
+
+
+def external_replay(installed, files, transport, info, originals=None):
+    root = installed.state_directory.parent
+    external_authorities(root, installed, files, originals=originals)
+    version, serial = active(root)
+    directories = (root, root/"versions", root/"active", files.path, *(root/"versions").iterdir())
+    anchors = {p: private_directory(p) for p in directories}
+    def snapshot():
+        paths = [root/".install.lock", *files.path.iterdir(), *(root/"active").iterdir()]
+        paths.extend(p for folder in (root/"versions").iterdir() for p in folder.iterdir())
+        return {str(p.relative_to(root)): record_identity(p) for p in paths}
+    before = snapshot()
+    disk = cfg.load(installed.runtime.config_file)[0]
+    desktop = lc.inspected_desktop(installed, disk, installed.runtime.config_file.parent)
+    validate_state(installed, desktop, files)
+    controller = lc.HostController(installed, rt.LinuxRuntime(installed.runtime, transport), None, info, None)
+    controller.files = files
+    current = controller.runtime.observe()
+    retirement_receipt(controller, desktop, current, None, controller.meta()["enrollment"], disk, disk, transport, committed=True)
+    state = rs._decode(files.read("reservation.json", rs.MAX_STATE), controller.host)
+    if (active(root) != (version, serial) or any(private_directory(p) != ident for p, ident in anchors.items())
+            or before != snapshot()):
+        external_refused("replay source/history/live evidence changed after last observation")
+    external_authorities(root, installed, files, originals=originals)
+    external_original_fence(originals)
+    return response(True, action="reconcile-external-successor", **lc.HostController.status_fields(state.status))
+
+
+def reconcile_external(root, version, serial, installed, files, transport, info, marker, inputs, input_ids, authorize, origin_fence=lambda: None, originals=None):
+    """Distinct attended authority: NO control call, on any branch or replay."""
+    certificate = unique_json(inputs["certificate"])
+    if inputs["certificate"] != document(certificate):
+        external_refused("certificate must be bounded canonical unique JSON")
+    external_object(certificate, {"schema", "kind", "predecessor", "approved_source", "external", "account", "ordering", "unknown", "attachments", "source_version_prefix"})
+    identifier = certificate["predecessor"]["id"]
+    selected = external_original(originals, identifier)
+    if selected.data != inputs["certificate"] or selected.identity != input_ids["certificate"]:
+        external_refused("current certificate differs from its explicitly selected original snapshot")
+    entries = external_authorities(root, installed, files, supplied=inputs, originals=originals, current=identifier)
+    existing = next((entry for entry in entries if entry[0]["id"] == identifier), None)
+    if existing is not None and (existing[0]["certificate"] != certificate or existing[0]["input_provenance"] != input_ids):
+        external_refused("supplied operator account/provenance contradicts the original authority")
+    if any(not entry[3] and entry is not existing for entry in entries):
+        external_refused("another external authority is incomplete")
+    if existing is not None and existing[3]:
+        result = external_replay(installed, files, transport, info, originals)
+        external_authorities(root, installed, files, supplied=inputs, originals=originals, current=identifier)
+        origin_fence(); external_original_fence(originals)
+        return result
+    old, records, original_set = external_predecessor(root, installed, files, identifier)
+    if existing is None and any(files.read(name+"."+identifier+".bak") is not None for name in RELEASE_RECORDS):
+        external_refused("originals were archived without their exact external authority; never reseal/restart recovery")
+    sources = external_source_bridge(root, old, version, serial, marker, [entry[0]["manifest"] for entry in entries if entry[3]])
+    anchors = {p: private_directory(p) for p in (root, root/"versions", root/"active", files.path,
+                                              root/"versions"/old["version"], root/"versions"/version)}
+    prefix = active_prefix(root, serial)
+    version_prefix = external_version_prefix(root)
+    pins = {}
+    item = existing[0] if existing else None
+    successor = existing[1] if existing else None
+    descriptor = existing[2] if existing else None
+    def pin(role):
+        name = external_name(identifier, role)
+        data = private_read(files.path/name, lc.MAX_PRIVATE)
+        identity = record_identity(files.path/name)
+        if name in pins and pins[name] != (data, identity):
+            external_refused("new authority artifact changed physically")
+        pins[name] = data, identity
+        return identity
+    for role in ("transition", "certificate", *EXTERNAL_ROLES, "successor", "committed"):
+        if files.read(external_name(identifier, role)) is not None:
+            pin(role)
+    def physical(final=False, ready=None):
+        # Filesystem-only: MUST follow the last external observation.
+        if (any(private_directory(p) != identity for p, identity in anchors.items()) or active(root) != (version, serial)
+                or active_prefix(root, serial) != prefix or validate_version(root/"versions"/version) != marker
+                or external_version_prefix(root) != version_prefix):
+            external_refused("installation/source/active references changed")
+        old_now, records_now, set_now = external_predecessor(root, installed, files, identifier)
+        if old_now != old or records_now != records or set_now != original_set:
+            external_refused("original predecessor evidence/history/locks changed")
+        if external_source_bridge(root, old, version, serial, marker, [entry[0]["manifest"] for entry in entries if entry[3]]) != sources:
+            external_refused("old/new source physical identities changed")
+        allowed = set(original_set) | {name+"."+identifier+".bak" for name in RELEASE_RECORDS} | set(pins)
+        if any(p.name not in allowed for p in files.path.iterdir()):
+            external_refused("unknown artifact/history after last observation")
+        for name, (data, identity) in pins.items():
+            if private_read(files.path/name) != data or record_identity(files.path/name) != identity:
+                external_refused("new authority/attachment/descriptor replaced after observation")
+        for entry in entries:
+            if entry[0]["id"] != identifier:
+                external_authorities(root, installed, files, supplied=inputs, originals=originals, current=identifier)
+                break
+        if final:
+            for name in RELEASE_RECORDS:
+                if record_identity(files.path/(name+"."+identifier+".bak")) != old["records"][name]:
+                    external_refused("final original archive missing/replaced")
+        if ready is not None:
+            unlaunched_live(files, successor["replacement"], bytes.fromhex(successor["blocked"]), ready)
+        origin_fence(); external_original_fence(originals)
+    evidence, boundary = attempt_sample(installed, records, transport, info, old["admission"])
+    external_certificate(certificate, {k: inputs[k] for k in EXTERNAL_ROLES}, old, original_set, marker, serial, boundary, version_prefix)
+    _, available, blocked, replacement = attempt_promise(installed, records, evidence, old["admission"])
+    promise = unique_json(document({"evidence": evidence, "boundary": asdict(boundary), "replacement": replacement, "blocked": blocked.hex()}))
+    if successor is not None and successor != promise:
+        external_refused("current successor differs from durable qualified promise")
+    wanted = {"schema": 1, "kind": EXTERNAL_KIND, "id": identifier, "predecessor_sha256": cfg.digest(document(old)),
+        "original_set": original_set, "version": version, "serial": serial, "manifest": marker, "sources": sources,
+        "version_prefix": version_prefix, "prefix": prefix, "permanent": old["permanent"], "certificate": certificate, "input_provenance": input_ids,
+        "promise_sha256": cfg.digest(document(promise)), "confirmation": "RECONCILE", "predecessor_disposition": "INCOMPLETE_SUPERSEDED",
+        "unused_original_start": "PERMANENTLY_RELINQUISHED_NO_CONTROL"}
+    if item is not None and item != wanted:
+        external_refused("pending authority/source/fixed promise differs")
+    # Complete specimens, including future physical identities, BEFORE the first
+    # durable authority. These ceilings are serialization only, never evidence.
+    ceiling = lambda data: attempt_identity_ceiling(len(data), installed.runtime.uid)
+    intent_data = document(wanted)
+    future_successor = document({"schema": 1, "intent_sha256": cfg.digest(intent_data), "intent_identity": ceiling(intent_data),
+        "attachments": {k: ceiling(inputs[k]) for k in inputs}, "promise": promise})
+    future_descriptor = document({"schema": 1, "intent_identity": ceiling(intent_data), "successor_identity": ceiling(future_successor),
+        "live_records": {k: ceiling(blocked if k == "reservation.json" else bytes.fromhex(replacement[k])) for k in RELEASE_RECORDS}})
+    specimens = {"transition": intent_data, "successor": future_successor, "committed": future_descriptor, **inputs,
+                 **{"live-"+n: bytes.fromhex(data) for n, data in replacement.items()}}
+    for key, data in specimens.items():
+        limit = rs.MAX_STATE if key == "live-reservation.json" else lc.MAX_PRIVATE
+        if len(data) > limit:
+            external_refused(f"{key} complete serialization ceiling {len(data)} exceeds {limit}; no authority written")
+    bounds = {k: len(v) for k, v in specimens.items()}
+    def publish(role, data):
+        if len(data) > bounds[role]:
+            external_refused("new phase exceeds its complete pre-authority ceiling")
+        name = external_name(identifier, role)
+        if files.read(name) is None:
+            create(files.path/name, data)
+        elif files.read(name) != data:
+            external_refused("new phase differs from exact intended bytes")
+        pin(role)
+    if item is None:
+        if authorize(certificate) is not True:
+            external_refused("informed local RECONCILE factual attestation/exclusive window required")
+        again, again_boundary = attempt_sample(installed, records, transport, info, old["admission"])
+        if again != evidence or again_boundary != boundary:
+            external_refused("successor changed after factual confirmation")
+        physical()
+        publish("transition", intent_data)
+        item = wanted
+    physical()
+    for role in ("certificate", *EXTERNAL_ROLES):
+        publish(role, inputs[role])
+    successor_data = document({"schema": 1, "intent_sha256": cfg.digest(intent_data), "intent_identity": pin("transition"),
+        "attachments": {role: pin(role) for role in ("certificate", *EXTERNAL_ROLES)}, "promise": promise})
+    publish("successor", successor_data)
+    successor = promise
+    if descriptor is not None:
+        unlaunched_live(files, replacement, blocked, descriptor["live_records"])
+    # Old lease first; missing reservation -> invalid sentinel -> lease-free
+    # SELECTING. Existing dispatchers cannot acquire or enroll at any cut.
+    for name in RELEASE_RECORDS:
+        archive = name+"."+identifier+".bak"
+        if files.read(archive) is None:
+            if record_identity(files.path/name) != old["records"][name]:
+                external_refused("original changed before archival")
+            files.anchor(); os.rename(name, archive, src_dir_fd=files.fd, dst_dir_fd=files.fd); os.fsync(files.fd)
+        if record_identity(files.path/archive) != old["records"][name]:
+            external_refused("archive lost original physical identity")
+        if name == "reservation.json" and files.read(name) is None:
+            if record_identity(files.path/"operation.json") != old["records"]["operation.json"]:
+                external_refused("old lease disappeared before sentinel")
+            create(files.path/name, RELEASE_BLOCKED)
+    for name in ("operation.json", "start-receipt.json", "prepare-backup.conf"):
+        data = bytes.fromhex(replacement[name])
+        if files.read(name) is None:
+            create(files.path/name, data)
+        elif files.read(name) != data:
+            external_refused("live replacement contradicts original-derived compound")
+        if name == "operation.json":
+            if files.read("reservation.json") == RELEASE_BLOCKED:
+                files.write("reservation.json", blocked, limit=rs.MAX_STATE)
+            elif files.read("reservation.json") != blocked:
+                external_refused("lease-free compound baseline differs")
+    _, ready = unlaunched_live(files, replacement, blocked, descriptor["live_records"] if descriptor else None)
+    for name, identity in ready.items():
+        attempt_identity_domain(identity, len(blocked if name == "reservation.json" else bytes.fromhex(replacement[name])), installed.runtime.uid)
+    publish("committed", document({"schema": 1, "intent_identity": pin("transition"), "successor_identity": pin("successor"), "live_records": ready}))
+    final, final_boundary = attempt_sample(installed, records, transport, info, old["admission"])
+    if final != evidence or final_boundary != boundary:
+        external_refused("final successor/typed policy/jobs/scope changed or busy")
+    physical(final=True, ready=ready)
+    files.write("reservation.json", available, limit=rs.MAX_STATE)  # Sole availability publication; no later external call.
+    return response(True, action="reconcile-external-successor", **lc.HostController.status_fields(
+        rs._decode(available, rs.HostIdentity(installed.host_uniqueid, installed.base_port)).status))
+
+
+def local_external_successor(certificate, kernel=None, anchored=None, context=None, lifecycle=None, *, authorize=interactive_external, transport=None, info=None, original_certificates=()):
+    """Installer-only fixed NSS/TTY authority; input paths are local evidence,
+    never settings/source selectors. No environment-selected or RPC dispatch.
+    """
+    if sys.platform != "linux" or os.geteuid() == 0 or os.getuid() != os.geteuid():
+        external_refused("unprivileged local Linux desktop user required")
+    uid = os.geteuid()
+    home = Path(pwd.getpwuid(uid).pw_dir).resolve(strict=True)
+    root = home/RELATIVE_ROOT
+    if home.stat().st_uid != uid or root.parent.resolve(strict=True) != root.parent:
+        external_refused("fixed canonical owned NSS installation required")
+    if type(original_certificates) not in (tuple, list):
+        external_refused("earlier original certificates must be explicit local file inputs")
+    certificate_originals = external_originals((certificate, *original_certificates), root)
+    components = (kernel, anchored, context, lifecycle)
+    if any(p is None for p in components) and not all(p is None for p in components):
+        external_refused("provide all four current component files, or none for sealed read-only replay")
+    read_only = all(p is None for p in components)
+    paths = {"certificate": certificate} if read_only else dict(zip(("certificate", *EXTERNAL_ROLES), (certificate, *components)))
+    if len({Path(p).absolute() for p in paths.values()}) != len(paths):
+        external_refused("distinct owned local certificate/component inputs required")
+    inputs = {k: private_read(Path(p), lc.MAX_PRIVATE) for k, p in paths.items()}
+    identities = {k: record_identity(Path(p)) for k, p in paths.items()}
+    if any(identities[k]["sha256"] != cfg.digest(data) for k, data in inputs.items()):
+        external_refused("input changed during owned provenance snapshot")
+    private_read(root/".install.lock", 1)
+    with installation_lock(root):
+        if {p.name for p in root.iterdir()} != {".install.lock", "versions", "active", "state"}:
+            external_refused("foreign/incomplete installation")
+        version, serial = active(root)
+        if version is None:
+            external_refused("normal qualified ACTIVE source publication required")
+        marker = validate_version(root/"versions"/version)
+        source = Path(__file__).resolve().parent
+        if any(cfg.digest(source_read(source/n)) != marker["files"][n] for n in SOURCES):
+            external_refused("publish this exact source normally; no checkout/source adoption")
+        installed = host.settings(root/"versions"/version/"host-settings.json", "linux")
+        if installed.runtime.home != home or installed.state_directory != root/"state" or installed.runtime.uid != uid:
+            external_refused("installed host/user/root differs from fixed NSS authority")
+        for path in (root/"versions").iterdir():
+            validate_version(path)
+        private_read(root/"state/operation.lock", 1); private_read(root/"state/reservation.lock", 1)
+        with lc.PrivateFiles(root/"state").locked() as files:
+            if read_only:
+                # A selected original alone suffices for an ALREADY sealed
+                # history. It never creates/completes an authority, restores a
+                # missing component, or publishes availability.
+                entries = external_authorities(root, installed, files, originals=certificate_originals)
+                identifier = unique_json(inputs["certificate"])["predecessor"]["id"]
+                if not any(item["id"] == identifier and committed for item, _, _, committed in entries):
+                    external_refused("component-free input is only for an already committed read-only supersession")
+                result = external_replay(installed, files, transport or rt.RetirementTransport(home, uid), info or host.serverinfo, certificate_originals)
+                external_original_fence(certificate_originals)
+                return result
+            def origin_fence():
+                for key, path in paths.items():
+                    if record_identity(Path(path)) != identities[key] or private_read(Path(path), lc.MAX_PRIVATE) != inputs[key]:
+                        external_refused("original owned input changed after last observation")
+            return reconcile_external(root, version, serial, installed, files, transport or rt.RetirementTransport(home, uid),
+                                      info or host.serverinfo, marker, inputs, identities, authorize, origin_fence, certificate_originals)
 
 
 def local_enroll_retirement(manifest, authorize, *, transport=None, info=None):
@@ -2722,9 +3612,40 @@ def rpc_main(*, enroll=False, manifest=host.MANIFEST, handle=host.handle, intera
 
 
 def main():
-    if sys.argv[1:] == ["reconcile-attempted-launch"]:
+    if sys.argv[1:2] == ["reconcile-external-successor"]:
+        parser = argparse.ArgumentParser(description="Attended local zero-service-control reconciliation")
+        parser.add_argument("action", choices=("reconcile-external-successor",))
+        parser.add_argument("--certificate", required=True, type=Path)
+        for key in EXTERNAL_ROLES:
+            parser.add_argument("--"+key, type=Path)
+        parser.add_argument("--original-certificate", action="append", type=Path, default=[], help="retained original for each earlier supersession; repeat per history")
+        args = parser.parse_args()
+        components = [getattr(args, key) for key in EXTERNAL_ROLES]
+        if any(value is None for value in components) and not all(value is None for value in components):
+            parser.error("provide all four current components, or none for committed read-only replay")
+        present = ("certificate",) if all(value is None for value in components) else ("certificate", *EXTERNAL_ROLES)
+        if (len(sys.argv[2:]) != 2*len(present) + 2*len(args.original_certificate)
+                or any(sys.argv[2:].count("--"+k) != 1 for k in present)
+                or sys.argv[2:].count("--original-certificate") != len(args.original_certificate)):
+            parser.error("supply each current input once and earlier originals as explicit flag/file pairs")
         try:
-            sys.stdout.buffer.write(local_attempt_retirement())
+            sys.stdout.buffer.write(local_external_successor(*(getattr(args, k) for k in ("certificate", *EXTERNAL_ROLES)), original_certificates=args.original_certificate))
+            return 0
+        except Refusal as exc:
+            print(f"Display controller refused [{exc.code}]: {exc.detail}", file=sys.stderr)
+        except Exception:
+            print("Zero-control reconciliation incomplete or final publication outcome unconfirmed; original evidence retained. No service controls were issued. Re-run only the exact sealed continuation; unknown actor/helper facts require a bounded factual account, never another STOP/START.", file=sys.stderr)
+        return 1
+    if sys.argv[1:2] == ["reconcile-attempted-launch"]:
+        parser = argparse.ArgumentParser(description="Attended local RETIRE with read-only original supersession proofs")
+        parser.add_argument("action", choices=("reconcile-attempted-launch",))
+        parser.add_argument("--original-certificate", action="append", type=Path, default=[], help="retained original for every prior supersession; repeat per history")
+        args = parser.parse_args()
+        if (len(sys.argv[2:]) != 2*len(args.original_certificate)
+                or sys.argv[2:].count("--original-certificate") != len(args.original_certificate)):
+            parser.error("supply original certificates as explicit repeated flag/file pairs")
+        try:
+            sys.stdout.buffer.write(local_attempt_retirement(original_certificates=args.original_certificate))
             return 0
         except Refusal as exc:
             print(f"Display controller refused [{exc.code}]: {exc.detail}", file=sys.stderr)
