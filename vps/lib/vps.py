@@ -274,15 +274,23 @@ def inspect_backup(path, lock):
 def backup_remote(state, document, record):
     directory = private_dir(state / 'backups')
     path = directory / (time.strftime('%Y%m%dT%H%M%S') + '-' + secrets.token_hex(4) + '.tar')
+    own_pending = not (state / 'pending.json').exists()
+    if own_pending:
+        host.atomic(state / 'pending.json', host.dumps({'record': record, 'mode': 'backup'}))
     try:
         with path.open('xb') as out:
             os.chmod(path, 0o600)
-            remote(record, 'backup', request_for(document, record), stdout=out)
+            source = (MODULE / 'lib/host.py').read_bytes()
+            request = dict(request_for(document, record), adapter_b64=base64.b64encode(source).decode(),
+                           adapter_sha256=host.digest(MODULE / 'lib/host.py'))
+            remote(record, 'backup', request, stdout=out)
             out.flush()
             os.fsync(out.fileno())
         manifest = inspect_backup(path, release_lock())
         if manifest['owner'] != document['owner'] or manifest['endpoint'] != record['endpoint']:
             raise host.Error('Exported backup owner/endpoint mismatch')
+        if own_pending:
+            (state / 'pending.json').unlink()
         return path
     except BaseException:
         if path.exists():
@@ -515,12 +523,19 @@ def devices(state, document, args):
 
 
 def recover_local(state, document, mihomo=None):
+    if not (state / 'pending.json').exists():
+        if not document.get('current'):
+            raise host.Error('No saved current node or pending transaction')
+        host.atomic(state / 'pending.json', host.dumps({'record': document['current'], 'mode': 'backup'}))
     pending = load(state / 'pending.json')
     record = pending['record']
     request = pending['request'] if pending.get('mode') == 'devices' else request_for(document, record)
     result = remote(record, 'abort', request)
+    if result.get('pending'):
+        print('Recovery queued/waiting; local pending retained. Retry recover after the owned recovery unit exits.')
+        return
     if result.get('committed'):
-        status = remote(record, 'status', request_for(document, record))
+        status = result if pending.get('mode') == 'backup' and result.get('front_running') is False else remote(record, 'status', request_for(document, record))
         backup = backup_remote(state, document, record)
         if pending.get('mode') == 'devices':
             binary = resolve_mihomo(mihomo or pending.get('mihomo'))

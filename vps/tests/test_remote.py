@@ -55,6 +55,7 @@ class FakeHost(unittest.TestCase):
         self.patch(self.h.shutil, 'which', side_effect=lambda name: '/fake/' + name)
         self.patch(self.h.shutil, 'disk_usage', return_value=shutil._ntuple_diskusage(10 * 1024**3, 1, 9 * 1024**3))
         self.patch(self.h, 'run', side_effect=self.run_command)
+        self.patch(self.h, 'adapter_source', return_value=(vps.MODULE / 'lib/host.py').read_bytes())
         self.control_service = self.h.ctl
         self.patch(self.h, 'ctl', side_effect=self.ctl)
         self.patch(self.h, 'check_target')

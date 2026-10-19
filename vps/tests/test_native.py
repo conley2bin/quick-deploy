@@ -115,6 +115,7 @@ class Native(unittest.TestCase):
         for name, text in host.unit_texts().items():
             host.atomic(units / name, text)
         host.atomic(owned / 'host.py', (vps.MODULE / 'lib/host.py').read_bytes())
+        host.atomic(owned / 'owner.json', host.dumps({'format':host.FORMAT,'owner':self.manifest['owner'],'machine_id':host.machine_id()}))
         host.atomic(self.work / 'manifest.json', host.dumps(self.manifest))
         host.atomic(self.work / 'Caddyfile', host.caddyfile(self.manifest, False))
         certs = self.work / 'caddy/data/caddy/certificates/fixture'
@@ -126,7 +127,7 @@ class Native(unittest.TestCase):
         original_run = subprocess.run
         def no_systemctl(argv, **kwargs):
             if argv[0] == 'systemctl':
-                self.assertEqual(argv, ['systemctl', 'is-active', '--quiet', host.FRONT])
+                self.assertIn(argv, (['systemctl','is-active','--quiet',host.FRONT], ['systemctl','is-enabled','--quiet',host.FRONT]))
                 return subprocess.CompletedProcess(argv, 3, b'', b'')
             return original_run(argv, **kwargs)
         with mock.patch.object(subprocess, 'run', side_effect=no_systemctl), mock.patch.object(host, 'ctl'), mock.patch.object(host, 'check_units'):
@@ -142,7 +143,8 @@ class Native(unittest.TestCase):
             source = subprocess.check_output(['git', 'show', '18d1b3b:vps/lib/host.py'])
             self.assertEqual(__import__('hashlib').sha256(source).hexdigest(), host.LEGACY_ADAPTER_SHA256)
             host.atomic(host.ROOT / 'host.py', source, 0o700)
-        def ctl(action, unit):
+        def ctl(action, *arguments):
+            unit = arguments[-1]
             if unit == host.PANEL:
                 if action == 'stop': self.stop()
                 elif action == 'start': self.start()
@@ -167,7 +169,12 @@ class Native(unittest.TestCase):
 
     def device_prepare(self, request):
         with vps.upload_bundle(request) as stream:
-            return host.devices_prepare(stream)
+            try:
+                return host.devices_prepare(stream)
+            except Exception:
+                if (host.ROOT/'pending.json').exists() and host.read_json(host.ROOT/'pending.json').get('phase') == 'restore-queued':
+                    host.recover(force=True)
+                raise
 
     def device_finish(self, request):
         archive = host.export_backup()
@@ -364,7 +371,8 @@ class Native(unittest.TestCase):
                 with mock.patch.object(stored, 'atomic', side_effect=fail_front):
                     with self.assertRaises(OSError): stored.recover()
                 self.assertEqual(stored.read_json(host.ROOT / 'pending.json')['phase'], 'recovering')
-                stored.guard()  # recovery service starts are permitted
+                with self.assertRaises(stored.Error): stored.guard()  # incomplete restore stays fail-closed
+                self.assertTrue(stored.recover()['queued'])
                 self.assertIn('restored', stored.recover())
                 self.assertEqual(self.native_accounts(), original)
                 self.assertEqual((host.ROOT / 'host.py').read_bytes(), original_adapter)
@@ -389,6 +397,7 @@ class Native(unittest.TestCase):
             with self.assertRaises(OSError): self.device_prepare(request)
         self.assertFalse((host.ROOT / 'pending.json').exists())
         self.assertTrue((host.ROOT / 'device-rollback/intent.json').is_file())
+        self.assertTrue(self.stored_adapter().recover(force=True)['queued'])
         self.assertIn('restored', self.stored_adapter().recover(force=True))
         self.assertEqual(self.native_accounts(), original)
 
@@ -403,6 +412,7 @@ class Native(unittest.TestCase):
         with mock.patch.object(host, 'wait_tls', side_effect=host.Error('fixture TLS certificate failure')):
             with self.assertRaisesRegex(host.Error, 'TLS certificate'):
                 host.devices_commit(receipt)
+        self.assertTrue(host.recover(force=True)['queued'])
         self.assertIn('restored', host.recover(force=True))
         self.assertEqual(self.native_accounts(), original)
         self.assertEqual((self.work / 'Caddyfile').read_bytes(), original_front)
@@ -560,7 +570,8 @@ class Native(unittest.TestCase):
                 front[0].terminate(); front[0].wait(timeout=10); front[0] = None
         self.addCleanup(stop_front)
         panel_ctl = host.ctl.side_effect
-        def ctl(action, unit):
+        def ctl(action, *arguments):
+            unit = arguments[-1]
             if unit == host.PANEL: return panel_ctl(action,unit)
             if action in ('stop','restart'): stop_front()
             if action in ('start','restart'):
@@ -637,6 +648,8 @@ class Native(unittest.TestCase):
         record = {'endpoint':self.manifest['endpoint'], 'machine_id':host.machine_id()}
         document = {'format':host.FORMAT,'owner':self.manifest['owner'],'config':self.manifest['config'],
                     'current':record,'previous':[],'backup':None}
+        custom_core = state/'custom-core'
+        custom_core.symlink_to(shutil.which('verge-mihomo') or shutil.which('mihomo'))
         counts = {'backup':0}; fail_after = [False]; exports = []
         def remote(record, action, request=None, stdin=None, stdout=None):
             if action == 'devices-prepare': return host.devices_prepare(stdin)
@@ -646,7 +659,7 @@ class Native(unittest.TestCase):
                 counts['backup'] += 1
                 if fail_after[0] and counts['backup'] == 3:
                     raise host.Error('fixture transport lost after committed rotation')
-                with host.export_backup().open('rb') as source: shutil.copyfileobj(source, stdout)
+                with host.export_backup(request).open('rb') as source: shutil.copyfileobj(source, stdout)
                 return
             if action == 'outputs':
                 manifest = host.read_json(self.work/'manifest.json')
@@ -665,7 +678,7 @@ class Native(unittest.TestCase):
             exports.append(copy.deepcopy(manifest))
         with mock.patch.object(vps,'remote',side_effect=remote), mock.patch.object(vps,'confirm'), \
                 mock.patch.object(vps,'export_after_commit',side_effect=exported):
-            vps.devices(state,document,argparse.Namespace(device_action='add',names=['device4','device5'],mihomo=None))
+            vps.devices(state,document,argparse.Namespace(device_action='add',names=['device4','device5'],mihomo=str(custom_core)))
             self.assertEqual(len(exports[-1]['accounts']),5)
             with mock.patch('sys.stdout',new_callable=__import__('io').StringIO) as output:
                 self.assertEqual(vps.main(['--state-dir',str(state),'devices','list']),0)
@@ -677,15 +690,18 @@ class Native(unittest.TestCase):
             prior = self.native_accounts()['device4']['id']
             counts['backup'] = 0; fail_after[0] = True
             with self.assertRaisesRegex(host.Error,'transport lost'):
-                vps.devices(state,document,argparse.Namespace(device_action='rotate',names=['device4'],mihomo=None))
+                vps.devices(state,document,argparse.Namespace(device_action='rotate',names=['device4'],mihomo=str(custom_core)))
             current = self.native_accounts()['device4']['id']
             self.assertNotEqual(prior,current)
             self.assertTrue((state/'pending.json').exists())
             self.assertEqual(len(exports),1,'failed postcommit backup must not publish stale export')
             with self.assertRaisesRegex(host.Error,'pending'):
-                vps.devices(state,document,argparse.Namespace(device_action='rotate',names=['device4'],mihomo=None))
+                vps.devices(state,document,argparse.Namespace(device_action='rotate',names=['device4'],mihomo=str(custom_core)))
             fail_after[0] = False
-            vps.recover_local(state,document)
+            self.assertEqual(vps.load(state/'pending.json')['mihomo'],str(custom_core))
+            real_which = shutil.which
+            with mock.patch.object(vps.shutil,'which',side_effect=lambda name:None if name in ('verge-mihomo','mihomo') else real_which(name)):
+                vps.recover_local(state,document)
             self.assertEqual(self.native_accounts()['device4']['id'],current)
             self.assertEqual(exports[-1]['accounts']['device4']['id'],current)
             self.assertFalse((state/'pending.json').exists())
@@ -974,6 +990,7 @@ class Native(unittest.TestCase):
         for name, text in host.unit_texts().items():
             host.atomic(units / name, text)
         host.atomic(self.root / 'host.py', (vps.MODULE / 'lib/host.py').read_bytes())
+        host.atomic(self.root / 'owner.json', host.dumps({'format':host.FORMAT,'owner':self.manifest['owner'],'machine_id':host.machine_id()}))
         host.atomic(self.work / 'manifest.json', host.dumps(self.manifest))
         host.atomic(self.work / 'Caddyfile', host.caddyfile(self.manifest, False))
         # Certificate content belongs to the separate actual TLS-front test;
@@ -985,7 +1002,7 @@ class Native(unittest.TestCase):
         original_run = subprocess.run
         def no_real_systemctl(argv, **kwargs):
             if argv[0] == 'systemctl':
-                self.assertEqual(argv, ['systemctl', 'is-active', '--quiet', host.FRONT])
+                self.assertIn(argv, (['systemctl','is-active','--quiet',host.FRONT], ['systemctl','is-enabled','--quiet',host.FRONT]))
                 return subprocess.CompletedProcess(argv, 3, b'', b'')
             return original_run(argv, **kwargs)
         with mock.patch.object(subprocess, 'run', side_effect=no_real_systemctl), mock.patch.object(host, 'ctl') as ctl, mock.patch.object(host, 'check_units'):

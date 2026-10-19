@@ -738,8 +738,11 @@ def check_lease():
 
 def guard():
     if (ROOT / 'pending.json').exists():
-        if read_json(ROOT / 'pending.json').get('phase') == 'recovering':
-            return
+        phase = read_json(ROOT / 'pending.json').get('phase')
+        if phase == 'recovering':
+            raise Error('Restoration incomplete; dependent services must remain stopped')
+        if phase == 'restore-queued':
+            return  # Only the fully restored database/front may restart.
         check_lease()
 
 
@@ -927,7 +930,82 @@ def reject_symlinks(root):
             raise Error('Symlink in owned export source')
 
 
-def export_backup():
+def adapter_source():
+    return Path(__file__).read_bytes()
+
+
+def install_backup_adapter(request=None):
+    """Install capable recovery BEFORE publishing any backup stop intent."""
+    source = adapter_source() if request is None else base64.b64decode(request['adapter_b64'], validate=True)
+    sha = hashlib.sha256(source).hexdigest()
+    if request is not None and sha != request.get('adapter_sha256'):
+        raise Error('Backup adapter upload digest mismatch')
+    stored = ROOT / 'host.py'
+    if stored.is_symlink() or digest(stored) not in (LEGACY_ADAPTER_SHA256, sha):
+        raise Error('Unknown stored backup adapter; no service stop')
+    check_units()
+    if digest(stored) != sha:
+        atomic(ROOT / ('adapter-before-' + digest(stored) + '.py'), stored.read_bytes(), 0o700)
+        atomic(stored, source, 0o700)
+
+
+def service_state(unit):
+    return {key: subprocess.run(['systemctl', command, '--quiet', unit], capture_output=True).returncode == 0
+            for key, command in [('running', 'is-active'), ('enabled', 'is-enabled')]}
+
+
+def disarm(path):
+    path.unlink(missing_ok=True)
+    directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
+
+
+def queue_services(services):
+    for unit, state in services.items():
+        ctl('enable' if state['enabled'] else 'disable', unit)
+        if state['running']:
+            ctl('start', '--no-block', unit)
+        else:
+            ctl('stop', unit)
+
+
+def services_active(services):
+    return all(service_state(unit)['running'] == state['running'] for unit, state in services.items())
+
+
+def recover_backup():
+    path = ROOT / 'backup-stop.json'
+    intent = read_json(path)
+    manifest = read_json(ROOT / 'active/manifest.json')
+    marker = read_json(ROOT / 'owner.json')
+    if (intent['owner'] != marker['owner'] or intent['machine_id'] != marker['machine_id'] or
+            intent['node_id'] != manifest['node_id']):
+        raise Error('Backup stop intent owner/machine/node mismatch')
+    check_units()
+    services = {FRONT: intent['front']}
+    if intent['phase'] != 'queued' or not services_active(services):
+        intent['phase'] = 'queued'
+        atomic(path, dumps(intent))
+        queue_services(services)
+        return {'pending': True, 'queued': True, 'backup': True, 'committed': manifest['published']}
+    # This is a LATER recovery invocation. The dependent start job has already
+    # completed; never wait for it from the oneshot that queued that job.
+    try:
+        if intent['front']['running']:
+            wait_tls(manifest)
+    except BaseException:
+        ctl('stop', FRONT)
+        raise
+    disarm(path)
+    return {'pending': (ROOT / 'pending.json').exists(), 'backup_restored': True,
+            'committed': manifest['published'], 'front_running': intent['front']['running'],
+            'machine_id': marker['machine_id'], 'node_id': manifest['node_id']}
+
+
+def export_backup(request=None):
     if (ROOT / 'pending.json').exists():
         pending = read_json(ROOT / 'pending.json')
         if pending.get('kind') == 'devices' and pending.get('phase') != 'prepared':
@@ -946,8 +1024,13 @@ def export_backup():
     # authoritative snapshot, not successful feed access, defines this export.
     # Caddy storage uses atomic file writes, but its cert/key pair must be taken
     # together. Briefly stop ONLY our subscription front, not Xray or SSH.
-    check_units()
-    was_active = subprocess.run(['systemctl', 'is-active', '--quiet', FRONT], capture_output=True).returncode == 0
+    if (ROOT / 'backup-stop.json').exists():
+        raise Error('Interrupted backup stop; run recover first')
+    install_backup_adapter(request)
+    marker = read_json(ROOT / 'owner.json')
+    front = service_state(FRONT)
+    atomic(ROOT / 'backup-stop.json', dumps({'owner': marker['owner'], 'machine_id': marker['machine_id'],
+           'node_id': manifest['node_id'], 'phase': 'stopping', 'front': front}))
     ctl('stop', FRONT)
     try:
         with tempfile.TemporaryDirectory(prefix='export-', dir=ROOT) as tmp:
@@ -965,13 +1048,18 @@ def export_backup():
             for name in UNIT_NAMES:
                 atomic(stage / 'units' / name, (UNITS / name).read_bytes())
             atomic(stage / 'host.py', (ROOT / 'host.py').read_bytes())
+            previous_adapter = ROOT / ('adapter-before-' + LEGACY_ADAPTER_SHA256 + '.py')
+            if previous_adapter.exists():
+                atomic(stage / 'previous-host.py', previous_adapter.read_bytes())
             archive_tree(stage, ROOT / 'export.tar')
         sha = digest(ROOT / 'export.tar')
         atomic(ROOT / 'export-sha256', sha)
         return ROOT / 'export.tar'
     finally:
-        if was_active:
+        if front['running']:
             ctl('start', FRONT)
+            wait_tls(manifest)
+        disarm(ROOT / 'backup-stop.json')
 
 
 def verify_backup(folder, lock):
@@ -1279,34 +1367,45 @@ def recover_devices(pending):
         return {'committed': True, 'pending': False}
     if not receipt.exists():
         atomic(receipt, dumps({'request_sha256': pending['request_sha256'], 'committed': False}))
-    # Persist restore intent before stopping; guard permits these recovery starts
-    # even with an expired/rebooted lease. Recovery remains restartable throughout.
-    restore_db = pending.get('restore_db', pending['phase'] != 'snapshot')
-    pending.update(phase='recovering', restore_db=restore_db)
-    atomic(ROOT / 'pending.json', dumps(pending))
+    services = pending['services']
+    if pending['phase'] != 'restore-queued':
+        restore_db = pending.get('restore_db', pending['phase'] != 'snapshot')
+        pending.update(phase='recovering', restore_db=restore_db)
+        atomic(ROOT / 'pending.json', dumps(pending))
+        check_units()
+        ctl('stop', FRONT)
+        ctl('stop', PANEL)
+        active = ROOT / 'active'
+        if restore_db:
+            atomic(active / 'db/x-ui.db', (rollback / 'x-ui.db').read_bytes())
+            for suffix in ('-wal', '-shm'):
+                (active / ('db/x-ui.db' + suffix)).unlink(missing_ok=True)
+        for name in ('manifest.json', 'Caddyfile'):
+            atomic(active / name, (rollback / name).read_bytes())
+        # Persist restored-state authorization BEFORE queueing dependent jobs.
+        pending['phase'] = 'restore-queued'
+        atomic(ROOT / 'pending.json', dumps(pending))
+        queue_services(services)
+        return {'pending': True, 'queued': True, 'committed': False}
     check_units()
-    ctl('stop', FRONT)
-    ctl('stop', PANEL)
-    active = ROOT / 'active'
-    if restore_db:
-        atomic(active / 'db/x-ui.db', (rollback / 'x-ui.db').read_bytes())
-        for suffix in ('-wal', '-shm'):
-            (active / ('db/x-ui.db' + suffix)).unlink(missing_ok=True)
-    for name in ('manifest.json', 'Caddyfile'):
-        atomic(active / name, (rollback / name).read_bytes())
-    for unit, state in pending['services'].items():
-        ctl('enable' if state['enabled'] else 'disable', unit)
-        if state['running']:
-            ctl('start', unit)
-    restored = read_json(active / 'manifest.json')
-    if pending['services'][PANEL]['running']:
-        wait_api(restored)
-    if pending['services'][FRONT]['running']:
-        wait_tls(restored)
-    if all(state['running'] for state in pending['services'].values()):
-        process_health()
-    # Disarm BEFORE restoring old guard: it does not understand recovery starts.
-    (ROOT / 'pending.json').unlink()
+    if not services_active(services):
+        queue_services(services)
+        return {'pending': True, 'queued': True, 'committed': False}
+    restored = read_json(ROOT / 'active/manifest.json')
+    try:
+        if services[PANEL]['running']:
+            wait_api(restored)
+        if services[FRONT]['running']:
+            wait_tls(restored)
+        if all(state['running'] for state in services.values()):
+            process_health()
+    except BaseException:
+        ctl('stop', FRONT)
+        ctl('stop', PANEL)
+        raise
+    # Both journals must be disarmed before restoring a legacy adapter.
+    disarm(ROOT / 'backup-stop.json')
+    disarm(ROOT / 'pending.json')
     atomic(ROOT / 'host.py', (rollback / 'host.py').read_bytes(), 0o700)
     os.replace(rollback, ROOT / ('rolled-back-' + pending['operation_id'] + '-' + secrets.token_hex(4)))
     return {'pending': False, 'restored': 'original device database/front/adapter and service state'}
@@ -1341,7 +1440,7 @@ def devices_commit(request):
     return result
 
 
-def recover(force=False):
+def recover_transaction(force=False):
     pending_path = ROOT / 'pending.json'
     if not pending_path.exists() and (ROOT / 'device-rollback/intent.json').exists():
         staged = read_json(ROOT / 'device-rollback/intent.json')
@@ -1352,7 +1451,7 @@ def recover(force=False):
     if not pending_path.exists():
         return {'pending': False, 'committed': (ROOT / 'active/manifest.json').exists()}
     pending = read_json(pending_path)
-    if not force and pending.get('phase') != 'recovering' and pending['boot_id'] == boot_id() and time.time() < pending['deadline']:
+    if not force and pending.get('phase') not in ('recovering', 'restore-queued') and pending['boot_id'] == boot_id() and time.time() < pending['deadline']:
         return {'pending': True, 'waiting': True}
     if pending.get('kind') == 'devices':
         return recover_devices(pending)
@@ -1368,6 +1467,27 @@ def recover(force=False):
         raise Error('Unexpected recovery state; preserve files and inspect from console')
     pending_path.unlink()
     return {'pending': False, 'restored': 'pristine; proxy/front stopped and disabled; failed private candidate retained'}
+
+
+def recover(force=False):
+    backup = ROOT / 'backup-stop.json'
+    if not backup.exists():
+        return recover_transaction(force)
+    pending_path = ROOT / 'pending.json'
+    if pending_path.exists():
+        pending = read_json(pending_path)
+        receipt = ROOT / 'device-receipts' / (pending.get('operation_id', 'none') + '.json')
+        committed = receipt.exists() and read_json(receipt).get('committed')
+        due = (force or pending['boot_id'] != boot_id() or time.time() >= pending['deadline'] or
+               pending.get('phase') in ('recovering', 'restore-queued'))
+        if committed or due:
+            result = recover_transaction(force=True)
+            if result.get('pending') or not backup.exists():
+                return result
+            if not result.get('committed'):
+                disarm(backup)  # pristine candidate recovery never revives its front
+                return result
+    return recover_backup()
 
 
 def status(request):
@@ -1439,6 +1559,8 @@ def abort(request):
         if (ROOT / 'device-rollback/intent.json').exists() and read_json(ROOT / 'device-rollback/intent.json')['request_sha256'] != fingerprint:
             raise Error('Recovery request differs from staged device operation')
         result = recover(force=True)
+        if result.get('pending'):
+            return result
         if receipt:
             return receipt
         # An old active deployment is not proof that THIS device operation
@@ -1499,7 +1621,7 @@ def main():
                     if marker['owner'] != request['owner'] or marker['machine_id'] != request['machine_id'] or marker['machine_id'] != machine_id():
                         raise Error('Wrong host/owner for private export')
                     if action == 'backup':
-                        backup = export_backup()
+                        backup = export_backup(request)
                         with backup.open('rb') as stream:
                             shutil.copyfileobj(stream, sys.stdout.buffer)
                         return
