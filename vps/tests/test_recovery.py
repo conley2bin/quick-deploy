@@ -248,6 +248,115 @@ class Recovery(unittest.TestCase):
         self.assertFalse((h.ROOT/'backup-stop.json').exists())
         self.assertEqual(h.snapshot_accounts(h.ROOT/'active/db/x-ui.db',original),original['accounts'])
 
+    def test_previous_adapter_unsafe_inputs_refuse_before_stop_or_migration(self):
+        import signal
+        import stat
+        h = self.f.h
+        predecessor = h.ROOT/('adapter-before-'+h.LEGACY_ADAPTER_SHA256+'.py')
+        outside = self.f.root/'outside-sentinel'
+        h.atomic(outside,'SYNTHETIC-OUTSIDE-ARCHIVE-SENTINEL')
+        sources = {'current':(vps.MODULE/'lib/host.py').read_bytes(),
+                   'legacy':subprocess.check_output(['git','show','18d1b3b:vps/lib/host.py'])}
+        def io_timeout(*args):
+            raise AssertionError('FIFO input blocked')
+        for source_name, source in sources.items():
+            for kind in ('outside-link','dangling-link','directory','fifo','wrong-digest'):
+                with self.subTest(source=source_name,kind=kind):
+                    h.atomic(h.ROOT/'host.py',source,0o700)
+                    if kind == 'outside-link': predecessor.symlink_to(outside)
+                    elif kind == 'dangling-link': predecessor.symlink_to(self.f.root/'missing-sentinel')
+                    elif kind == 'directory': predecessor.mkdir()
+                    elif kind == 'fifo': os.mkfifo(predecessor)
+                    else: h.atomic(predecessor,'not-the-pinned-legacy-source')
+                    before = predecessor.lstat()
+                    old_handler = signal.signal(signal.SIGALRM,io_timeout)
+                    try:
+                        signal.alarm(2)
+                        with mock.patch.object(h,'ctl',wraps=h.ctl) as control, \
+                                mock.patch.object(h,'atomic',wraps=h.atomic) as writes, \
+                                mock.patch.object(h,'retain_previous_adapter',wraps=h.retain_previous_adapter) as retention:
+                            with self.assertRaisesRegex(h.Error,'[Pp]redecessor'):
+                                h.export_backup()
+                            control.assert_not_called(); writes.assert_not_called(); retention.assert_not_called()
+                        self.assertEqual((h.ROOT/'host.py').read_bytes(),source)
+                        self.assertEqual(predecessor.lstat().st_ino,before.st_ino)
+                        self.assertEqual(predecessor.lstat().st_mode,before.st_mode)
+                        self.assertFalse((h.ROOT/'backup-stop.json').exists())
+                        self.assertFalse((h.ROOT/'export.tar').exists())
+                        self.assertEqual(outside.read_text(),'SYNTHETIC-OUTSIDE-ARCHIVE-SENTINEL')
+                    finally:
+                        signal.alarm(0); signal.signal(signal.SIGALRM,old_handler)
+                        if stat.S_ISDIR(before.st_mode): predecessor.rmdir()
+                        else: predecessor.unlink()
+
+    def test_previous_adapter_absent_genuine_migration_and_current_reuse_exports(self):
+        import tarfile
+        h = self.f.h
+        predecessor = h.ROOT/('adapter-before-'+h.LEGACY_ADAPTER_SHA256+'.py')
+        legacy = subprocess.check_output(['git','show','18d1b3b:vps/lib/host.py'])
+        with tarfile.open(h.export_backup()) as archive:
+            self.assertNotIn('previous-host.py',archive.getnames())
+        self.assertFalse(predecessor.exists())
+        h.atomic(h.ROOT/'host.py',legacy,0o700)
+        for state in ('migration','current-reuse'):
+            with self.subTest(state=state):
+                with tarfile.open(h.export_backup()) as archive:
+                    self.assertEqual(archive.extractfile('previous-host.py').read(),legacy)
+                self.assertEqual(predecessor.read_bytes(),legacy)
+                self.assertEqual(host.digest(h.ROOT/'host.py'),host.digest(vps.MODULE/'lib/host.py'))
+                self.assertTrue(self.graph.state(h.FRONT)['running'])
+        # Even with an already genuine predecessor, migration must not overwrite it.
+        inode = predecessor.stat().st_ino
+        h.atomic(h.ROOT/'host.py',legacy,0o700)
+        h.export_backup()
+        self.assertEqual(predecessor.stat().st_ino,inode)
+
+    def test_previous_adapter_cache_prevents_link_laundering_after_validation(self):
+        import tarfile
+        h = self.f.h
+        predecessor = h.ROOT/('adapter-before-'+h.LEGACY_ADAPTER_SHA256+'.py')
+        legacy = subprocess.check_output(['git','show','18d1b3b:vps/lib/host.py'])
+        h.atomic(predecessor,legacy)
+        outside = self.f.root/'raced-outside-sentinel'; h.atomic(outside,'outside-race-sentinel')
+        real_control = h.ctl
+        def raced_stop(action,*args):
+            if action == 'stop' and args[-1] == h.FRONT:
+                predecessor.unlink(); predecessor.symlink_to(outside)
+            return real_control(action,*args)
+        with mock.patch.object(h,'ctl',side_effect=raced_stop):
+            archive_path = h.export_backup()
+        with tarfile.open(archive_path) as archive:
+            self.assertEqual(archive.extractfile('previous-host.py').read(),legacy)
+        self.assertTrue(predecessor.is_symlink(),'do not delete or chmod the raced-in unknown path')
+        self.assertEqual(outside.read_text(),'outside-race-sentinel')
+
+    def test_previous_adapter_raced_creation_and_post_install_tamper_refuse(self):
+        h = self.f.h
+        predecessor = h.ROOT/('adapter-before-'+h.LEGACY_ADAPTER_SHA256+'.py')
+        legacy = subprocess.check_output(['git','show','18d1b3b:vps/lib/host.py'])
+        h.atomic(h.ROOT/'host.py',legacy,0o700)
+        real_link = os.link
+        def raced_link(source,target,**kwargs):
+            h.atomic(predecessor,'raced-in-unknown-input')
+            return real_link(source,target,**kwargs)
+        with mock.patch.object(h.os,'link',side_effect=raced_link),mock.patch.object(h,'ctl') as control:
+            with self.assertRaisesRegex(h.Error,'appeared'):
+                h.export_backup()
+            control.assert_not_called()
+        self.assertEqual(predecessor.read_text(),'raced-in-unknown-input')
+        self.assertEqual((h.ROOT/'host.py').read_bytes(),legacy)
+        predecessor.unlink()
+        real_atomic = h.atomic
+        def tamper_after_install(path,data,mode=0o600):
+            real_atomic(path,data,mode)
+            if path == h.ROOT/'host.py': predecessor.write_bytes(b'tampered-after-adapter-install')
+        with mock.patch.object(h,'atomic',side_effect=tamper_after_install),mock.patch.object(h,'ctl') as control:
+            with self.assertRaisesRegex(h.Error,'digest mismatch'):
+                h.export_backup()
+            control.assert_not_called()
+        self.assertEqual(predecessor.read_bytes(),b'tampered-after-adapter-install')
+        self.assertFalse((h.ROOT/'backup-stop.json').exists())
+
     def test_backup_initially_inactive_stays_inactive(self):
         h=self.f.h; value=host.read_json(self.graph.file); value['active'][host.FRONT]=False; self.graph.save(value)
         h.atomic(h.ROOT/'backup-stop.json',h.dumps({'owner':self.document['owner'],'machine_id':'a'*32,

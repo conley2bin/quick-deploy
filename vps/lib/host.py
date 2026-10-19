@@ -24,6 +24,7 @@ import shutil
 import socket
 import sqlite3
 import ssl
+import stat
 import subprocess
 import sys
 import tarfile
@@ -934,6 +935,46 @@ def adapter_source():
     return Path(__file__).read_bytes()
 
 
+def read_previous_adapter():
+    """Optional, pinned public source; never follow a link or block on a FIFO."""
+    path = ROOT / ('adapter-before-' + LEGACY_ADAPTER_SHA256 + '.py')
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise Error('Invalid retained predecessor adapter; no service stop') from exc
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise Error('Retained predecessor adapter must be a regular file')
+        with os.fdopen(fd, 'rb', closefd=False) as stream:
+            # The fixed historical script is small. Bound corrupt/untrusted input.
+            data = stream.read(1024 * 1024 + 1)
+    finally:
+        os.close(fd)
+    if len(data) > 1024 * 1024 or hashlib.sha256(data).hexdigest() != LEGACY_ADAPTER_SHA256:
+        raise Error('Retained predecessor adapter digest mismatch')
+    return data
+
+
+def retain_previous_adapter(data):
+    path = ROOT / ('adapter-before-' + LEGACY_ADAPTER_SHA256 + '.py')
+    # Publish a complete saved copy without replacing a raced-in unknown input.
+    with tempfile.NamedTemporaryFile(prefix='.adapter-before-', dir=ROOT) as stream:
+        stream.write(data)
+        stream.flush()
+        os.fsync(stream.fileno())
+        try:
+            os.link(stream.name, path, follow_symlinks=False)
+        except FileExistsError as exc:
+            raise Error('Retained predecessor appeared during migration; preserve and inspect') from exc
+        directory = os.open(ROOT, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+
+
 def install_backup_adapter(request=None):
     """Install capable recovery BEFORE publishing any backup stop intent."""
     source = adapter_source() if request is None else base64.b64decode(request['adapter_b64'], validate=True)
@@ -943,10 +984,17 @@ def install_backup_adapter(request=None):
     stored = ROOT / 'host.py'
     if stored.is_symlink() or digest(stored) not in (LEGACY_ADAPTER_SHA256, sha):
         raise Error('Unknown stored backup adapter; no service stop')
+    previous = read_previous_adapter()  # Reject unknown input before migration can overwrite it.
     check_units()
     if digest(stored) != sha:
-        atomic(ROOT / ('adapter-before-' + digest(stored) + '.py'), stored.read_bytes(), 0o700)
+        if previous is None:
+            retain_previous_adapter(stored.read_bytes())
+            previous = read_previous_adapter()
         atomic(stored, source, 0o700)
+    verified = read_previous_adapter()  # Recheck fresh retention/current-adapter reuse before stop.
+    if previous is not None and verified is None:
+        raise Error('Retained predecessor disappeared during migration')
+    return verified
 
 
 def service_state(unit):
@@ -1026,7 +1074,7 @@ def export_backup(request=None):
     # together. Briefly stop ONLY our subscription front, not Xray or SSH.
     if (ROOT / 'backup-stop.json').exists():
         raise Error('Interrupted backup stop; run recover first')
-    install_backup_adapter(request)
+    previous_adapter = install_backup_adapter(request)
     marker = read_json(ROOT / 'owner.json')
     front = service_state(FRONT)
     atomic(ROOT / 'backup-stop.json', dumps({'owner': marker['owner'], 'machine_id': marker['machine_id'],
@@ -1048,9 +1096,8 @@ def export_backup(request=None):
             for name in UNIT_NAMES:
                 atomic(stage / 'units' / name, (UNITS / name).read_bytes())
             atomic(stage / 'host.py', (ROOT / 'host.py').read_bytes())
-            previous_adapter = ROOT / ('adapter-before-' + LEGACY_ADAPTER_SHA256 + '.py')
-            if previous_adapter.exists():
-                atomic(stage / 'previous-host.py', previous_adapter.read_bytes())
+            if previous_adapter is not None:
+                atomic(stage / 'previous-host.py', previous_adapter)
             archive_tree(stage, ROOT / 'export.tar')
         sha = digest(ROOT / 'export.tar')
         atomic(ROOT / 'export-sha256', sha)

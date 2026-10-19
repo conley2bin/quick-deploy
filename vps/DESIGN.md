@@ -320,7 +320,10 @@ replace从完整、新读取的原生Client/账户对象仅更换UUID，并保�
 
 所有共享备份入口（包括首次变更前、提交后、recover核对及独立backup）在停止前端前都会：
 核验并安装当前已审阅恢复adapter，仅接受当前摘要/已知18d1b3b；旧adapter先存私有摘要命名文件并收入
-`previous-host.py`。安装前中断旧服务未动；安装后中断已有新adapter可恢复，旧adapter不会忽略新停机意图。
+`previous-host.py`。可选旧副本不存在是合法的；已存在时以no-follow/nonblocking文件描述符读取，
+仅接受普通文件且字节摘要必须匹配固定legacy摘要，链接（含悬空）、FIFO/目录或坏摘要在迁移/停前端前拒绝。
+新副本完整落盘后以不覆盖方式发布并复验，迁移后再复验；归档只用已验证缓存字节，不再按路径读取外部输入。
+安装前中断旧服务未动；安装后中断已有新adapter可恢复，旧adapter不会忽略新停机意图。
 随后持久写`backup-stop.json`，绑定owner/machine/node及front原running/enabled状态，再stop FRONT。
 正常finally启动/等待可信TLS后清意图；硬退出不依赖finally，由既有recover先排队非阻塞恢复front，退出oneshot，
 下一轮验证TLS后清意图。原front未运行就保持不运行。已提交情形只恢复当前front，不回滚已提交钥匙。
