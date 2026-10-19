@@ -1,6 +1,6 @@
 # 单台 VPS 快速上手
 
-为公司电脑、家里电脑、手机提供各自独立的代理账户和订阅。
+新安装默认为公司电脑、家里电脑、手机创建独立账户；可继续添加、删除和轮换设备。
 VPS 上运行 3x-ui / Xray，Caddy 提供 HTTPS 订阅；脚本不修改客户端或现有机场。
 
 ## 先准备好
@@ -66,9 +66,25 @@ bash vps/setup.sh replace --ssh root@203.0.113.20
 | `company` | 公司电脑 | `mihomo`：Verge 独立完整 profile 订阅 |
 | `home` | 家里电脑 | `mihomo`：Verge 独立完整 profile 订阅 |
 | `phone` | 手机 | `shadowrocket`：Shadowrocket URI 订阅 |
+| `device4` / `device5` | 执行下方 add 后新增的设备 | 按客户端选择 `mihomo` / `shadowrocket` |
 
 已禁用设备不会导出。Shadowrocket 请保留实测可用的 **Chrome140 / X25519MLKEM768**
 TCP 指纹；URI 不带手机分流策略，国内/Bili 直连需单独核验。[手机设置与排障](DESIGN.md#导入管理和设备变更)。
+
+## 设备与钥匙管理
+
+以下是**独立操作示例，按需选择**；名字须以小写字母开头，仅含小写字母、数字、短横线，最长32字符：
+
+```bash
+bash vps/setup.sh devices list                  # 只列名称/启用状态，不打印钥匙
+bash vps/setup.sh devices add device4 device5    # 一次新增多个独立账户；原3个不变
+bash vps/setup.sh devices rotate device4         # 仅换该设备 UUID + 订阅钥匙，需重新导入
+bash vps/setup.sh devices remove device5         # 撤销该设备代理认证和订阅地址
+```
+
+变更会重启自有核心/订阅前端，**所有设备可能短暂重连**。成功后自动更新离机备份及上方JSON；
+失败先运行 `bash vps/setup.sh recover`，不要直接重复轮换。旧备份含历史钥匙，恢复旧备份可能恢复已撤销账户；
+请用最新撤销后备份。[事务、重试和恢复边界](DESIGN.md#设备名册与钥匙事务)。
 
 ## 日常查看与备份
 

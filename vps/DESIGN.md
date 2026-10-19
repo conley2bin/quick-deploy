@@ -11,9 +11,11 @@ operator gate; a source implementation is not deployed-client acceptance.
   converter and no local node-format engine.
 - **Xray** serves VLESS/TCP/REALITY/Vision on TCP443 by default. One validated
   `config.proxy_port` setting owns inbound, native export, health and backup;
-  optional `--port` still means SSH only. Each of company/home/phone has its own
-  UUID and SubID. A native Clients operation can revoke one device.
-- **Caddy** serves trusted HTTPS on TCP8443, proxying only up to six exact feed paths.
+  optional `--port` still means SSH only. Fresh installations default to
+  company/home/phone; every manifest-owned device has an independent UUID
+  and SubID. Native Clients operations own changes.
+- **Caddy** serves trusted HTTPS on TCP8443, proxying exactly two paths per
+  enabled manifest-owned device, without wildcards.
   Panel2053 and subscription2096 bind127.0.0.1. Management is through SSH forwarding.
 - **TCP80** belongs exclusively to HTTP01 validation. All normal HTTP requests
   return404. Automatic redirects and TLS-ALPN challenges are disabled; Caddy
@@ -55,7 +57,7 @@ an arbitrary allow-list.
    Ubuntu24.04 amd64 machine; other platforms stop before installation.
 2. Create/reuse native accounts without rotating them on repeated deploy.
    Missing/corrupt or legacy private state must not be regenerated silently.
-3. Candidate feeds remain unpublished while native Xray checks, all three
+3. Candidate feeds remain unpublished while native Xray checks, all enabled devices'
    native Mihomo profiles, URI scope and public-CA TLS are validated. An
    off-node complete backup receipt and a fresh SSH call precede publication.
 4. Persistent pending state records boot identity/deadline. Recovery must work
@@ -124,7 +126,7 @@ OpenSSL、systemd/`systemd-analyze`、`ss`、`nft`、可信 CA 包及至少2GiB�
 | 入口 | 归属 |
 |---|---|
 | TCP443（默认） | Xray VLESS/TCP/REALITY/Vision |
-| TCP8443 | Caddy 可信 HTTPS；仅最多六条精确设备订阅路径 |
+| TCP8443 | Caddy 可信 HTTPS；每个启用设备仅两条精确订阅路径 |
 | TCP80 | Caddy HTTP01 证书签发/续期；普通 HTTP 请求全部404 |
 | 127.0.0.1:2053 / :2096 / :62789 | 面板 / 原生订阅后端 / Xray API；不公开 |
 | 实际 SSH 端口 | 原样保留，`--port` **只代表 SSH** |
@@ -166,7 +168,7 @@ bash vps/setup.sh --state-dir /private/vps-state status
 
 首次可选 `--proxy-port 4443` 更换代理监听端口；这不是 SSH 端口。
 仅在明确愿意提供联系人时首次加 `--acme-email operator@example.org`，默认不提供。
-需要指定管理端原生核心时，deploy/replace/restore 可加 `--mihomo /path/to/mihomo`。
+需要指定管理端原生核心时，deploy/replace/restore 和设备变更命令可加 `--mihomo /path/to/mihomo`。
 
 `preflight` 不保存部署配置或创建远端目录。所有远端命令都使用正常 host-key
 验证和新 SSH 进程，禁用复用、跳板和转发；显式传递的身份路径只保存引用，不复制私钥。
@@ -182,7 +184,7 @@ bash vps/setup.sh --state-dir /private/vps-state status
 部署只解包 [release-lock.json](release-lock.json) 中核验的官方3x-ui3.10.2、
 Xray26.10.10、Caddy2.11.7二进制和 geodata，**不运行上游安装器**。
 候选先运行回环订阅；Caddy取得可信证书但返回404。原生 Xray检查/运行版本、
-三设备 Mihomo解析和URI隔离、实际进程/监听、可信证书及完整离机备份通过后，
+全部启用设备的 Mihomo解析和URI隔离、实际进程/监听、可信证书及完整离机备份通过后，
 再次明确确认才公开订阅。任何证书错误均不能降级为公网 HTTP 订阅。
 这一步的程序门槛不替代真实客户端连接/刷新验收。
 
@@ -195,7 +197,7 @@ Xray26.10.10、Caddy2.11.7二进制和 geodata，**不运行上游安装器**。
 正常部署的备份在发布前生成，其 manifest 的 published 标志可能为 false；本地提交记录及匹配备份
 才是离线导出的依据，不能单凭备份中 published 字段判断提交结果。
 
-- deploy（包括同状态重跑）、replace、restore 在本地保存提交并移除 pending 后导出。
+- deploy（包括同状态重跑）、replace、restore、devices 变更在本地保存提交并移除 pending 后导出。
   recover 仅在确认远端早已提交、健康核对并取回新备份、保存本地提交后导出；中止候选不导出。
 - 导出失败不会回滚服务器、伪造 pending 或擦除恢复依据；命令以失败码明确说明**部署已经提交**。
   修正本地目录/权限/Git 忽略后，运行 `bash vps/setup.sh export`，无需重装或联系 VPS。
@@ -231,12 +233,66 @@ Xray26.10.10、Caddy2.11.7二进制和 geodata，**不运行上游安装器**。
 - 面板通过 `ssh -N -L 2053:127.0.0.1:2053 <已核验目标>` 管理，按需加自己的 `-i/-p`。
   私有备份中 `deployment/manifest.json` 保存 admin_path/admin_user/admin_password；
   在私人本地查看器读取，勿贴聊天/工单。浏览器只访问该 SSH 隧道的本地管理路径。
-- 原生 **Clients** 操作可单独禁用设备、轮换 UUID/SubID；之后重跑同目标 `deploy`
-  校验并同步精确公开路径、生成新离机备份。固定设备成员之外的更改需手动审阅。
+- 首选脚本 `devices list/add/remove/rotate` 管理名册和钥匙，见下节。面板 **Clients** 可单独禁用
+  已有设备或修改其策略；之后重跑同目标 `deploy` 同步精确公开路径及备份。面板擅自新增/删除成员会拒绝，
+  status/backup/export 不会把未知原生账户静默收编。
   v3.10.2 的全量 inbound 更新会保护全局 client 记录，不能把旧表单当作凭据轮换接口。
 
 重跑同一状态不改变 UUID、SubID、REALITY密钥或Xray进程。为一致地复制证书/密钥，
 每次完整备份会短暂停止并恢复**自己的订阅前端**；不停止Xray或SSH。
+
+## 设备名册与钥匙事务
+
+命令配方见 [README](README.md#设备与钥匙管理)。`devices list` 只读当前原生名称/启用状态，
+不输出 UUID、SubID、URL。新装仍默认3个；`devices add device4 device5` 才扩到5个。
+任意合规设备名都可使用，不存在第二套五设备白名单。manifest 的 `accounts` 键拥有成员关系，
+原生 SQLite/API 拥有完整策略与凭据；校验所有 global clients 和唯一入站的全部关联，
+包含禁用、未挂载账户及悬空关联。未知成员、不同 owner/machine、Host归属冲突、重复名字或
+凭据碰撞会拒绝，不使用直接修改账户表的 SQL。旧3、新5、删除后的4以及空名册均可备份/恢复；
+恢复不会隐式添加默认账户。移除最后一个设备是原生支持的空名册，前端全部404。
+
+- `add <name> [<name> ...]` 通过原生客户端新增接口建立独立 UUID/SubID，只写新账户；
+  原账户完整对象、禁用/到期/配额/HWID/reset策略及 Reality密钥保留。全部名字已存在时幂等；
+  新旧混合名字、重复名字明确拒绝。已删除账户不会因重跑 deploy 自动复活。
+- `remove <name>` 删除该原生账户并移除其两条前端路径，旧 UUID 不能建立新代理连接，旧 URL404。
+  已不存在的名字为幂等无变化。便利JSON不再列它，历史归档不自动删除。
+- `rotate <name>` 从新读取的完整 Client DTO及独立LimitHwid只更换该设备 UUID和SubID，
+  保留完整策略与禁用状态、其他设备、全局Reality密钥；旧订阅不能取回新钥匙。
+  客户端必须重新导入新 URL。它不是幂等的新操作：每次明确发起都会产生新钥匙，失败先 recover。
+
+设备变更沿用既有 operation flock、15分钟 boot/deadline pending、guard及非阻塞周期恢复。
+不增加后台管理服务或另一套数据库：
+
+1. 管理端先检查名字/原生Mihomo可用性、确认所有设备可能短暂重连，再取得变更前离机备份。
+2. 远端核对 owner/machine、单一Host/入站、全局账户/关联、unit及二进制。
+   存储适配器只接受当前上传源码摘要或已审阅的18d1b3b摘要 `30430e73…09a000e`；
+   未知摘要在任何适配器/服务变更前拒绝。不是包/数据库版本升级，也不能用任意scp替代。
+3. 旧manifest/front/adapter及服务启用/运行状态、恢复意图先写入临时私有目录，再原子发布为
+   `device-rollback/`。操作ID绑定owner/machine/端点/config/动作/名字的请求摘要；未提交绑定
+   与已提交receipt区分，回滚后也不能用同一ID偷换请求。无变化操作同样留提交receipt。
+4. 安装经摘要核验的当前guard/recover适配器后才写pending、停止自有front/panel，生成关闭的
+   原始DB快照；`snapshot`阶段失败仅恢复原服务，不用不完整快照覆盖原DB。完整快照后先写`ready`
+   再执行原生API。逐项新增失败会恢复整个原名册，不遗留未知第4账户。快照前适配器安装中断
+   可由已落盘的恢复意图识别；尚未发布的暂存目录不影响旧服务。
+5. API后显式停止并启动自有panel/core进程：旧已建立流会关闭，**所有设备都可能短暂重连**。
+   原公开精确路径在前端恢复后继续使用；新增/轮换后的路径在此时仍404。原生feed策略受限时
+   不放松HWID/到期等策略来通过验证；需单独授权设备上下文，否则验证失败并回滚。
+6. 原生feed校验和候选离机备份通过后commit才写新精确allowlist，等待可信TLS/进程及lease验证，
+   然后持久记录提交receipt。发布尝试与receipt之间失败会恢复原状态；它不是跨DB/HTTPS的零停机原子切换。
+   receipt之后丢失SSH回应按已提交恢复，不再次轮换。变更后另取一份已发布状态的离机备份，
+   验证输出，先保存本地最新backup指针/清pending，再导出便利JSON。
+
+`recover` 在未提交时恢复关闭的原DB、manifest、front、旧adapter及原服务启用/运行状态。
+恢复前先持久写`recovering`，允许新guard在旧lease过期/换boot后启动恢复服务；恢复中再次失败
+仍可重试。启动原服务并核验API/TLS/进程后先清pending，再恢复旧adapter，防止旧guard误拒新恢复阶段。
+已提交与未开始/已回滚由设备操作receipt区分，旧active目录存在不代表设备操作已提交。
+已提交后的离机备份/传输失败保留本地pending，运行recover取新备份并对齐指针；不谎称回滚。
+仅便利JSON失败时，本地权威已提交，修正权限/忽略后运行export即可，不需要重新轮换。
+成功/失败的私有回滚目录和历史备份保留供审阅，容量手动管理。
+
+历史归档不是撤销账本：**恢复删除/轮换之前的旧归档会恢复旧账户/钥匙**，应选择最新撤销后备份。
+replace继续轮换该归档名册全部UUID及Reality、保留其SubID/策略；restore保留该归档全部身份，
+两者都不访问或撤销旧节点。设备管理没有另建PKI或自动清理历史凭据。
 
 ## 备份、冷替换与恢复边界
 
@@ -290,7 +346,12 @@ bash -n vps/setup.sh
 未给包目录时native测试明确skip，其余是假主机/文件/API边界测试。Native测试启动临时
 **高端口回环**3x-ui/Xray/Caddy，检查真正输出、凭据轮换/禁用、Mihomo解析、闭合数据库恢复、
 TLS精确路径和错误证书拒绝。TLS正向测试使用fixture CA，**不是公网ACME签发证据**。
-真实systemd、云防火墙、HTTP01签发、REALITY握手、错认证和实际客户端必须逐部署验收；
+设备测试还使用本地Caddy混合TLS目标、原生Mihomo经REALITY到回环echo服务，证明新钥匙可用、
+旧UUID拒绝和rotate/remove已有流关闭，并核对真实Caddy旧URL404/新URL200、未影响的其他设备。
+echo测试的精确origin端口路由例外和freedom最终规则只存在于临时fixture，绝不写入生产；
+原统计API阻断仍保留。systemd控制/公网CA探测以fixture替代，存储adapter代码被独立载入验证
+boot/deadline及恢复中断；这不等于真正OS重启/生产服务验收。
+真实systemd、云防火墙、HTTP01签发和真实客户端公网HTTPS/出口必须逐部署验收；
 当前节点已有的验收不能证明未来续期、重启恢复、持续资源峰值或其他网络路径。
 新的生产接触仍须单独授权，本地快照导出不接触生产。
 

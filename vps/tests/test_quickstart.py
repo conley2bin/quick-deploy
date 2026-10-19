@@ -46,6 +46,11 @@ class Quickstart(unittest.TestCase):
         self.assertEqual(commands[:3], ['preflight', 'deploy', 'replace'])
         for required in ('status', 'backup', 'recover', 'restore'):
             self.assertIn(required, commands)
+        devices = [args for args in parsed if args.command == 'devices']
+        self.assertEqual([args.device_action for args in devices], ['list', 'add', 'rotate', 'remove'])
+        self.assertEqual(devices[1].names, ['device4', 'device5'])
+        self.assertEqual(devices[2].names, ['device4'])
+        self.assertEqual(devices[3].names, ['device5'])
 
 
 if __name__ == '__main__':
