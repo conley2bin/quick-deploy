@@ -255,6 +255,29 @@ def new_manifest(owner, config, endpoint):
                              'enable': True, 'flow': 'xtls-rprx-vision'} for d in DEVICES}, 'published': False}
 
 
+def device_names(manifest):
+    """The manifest owns membership; native rows can never extend it implicitly."""
+    accounts = manifest.get('accounts')
+    if not isinstance(accounts, dict) or any(not isinstance(d, str) or
+            not re.fullmatch(r'[a-z][a-z0-9-]{0,31}', d) for d in accounts):
+        raise Error('Invalid owned device roster; use lowercase names up to32 characters')
+    identities, subscriptions = [], []
+    for name, account in accounts.items():
+        if account.get('email') != name or not isinstance(account.get('enable'), bool):
+            raise Error('Invalid owned device identity')
+        try:
+            uuid.UUID(account['id'])
+        except (ValueError, KeyError, TypeError, AttributeError) as exc:
+            raise Error('Invalid owned device UUID') from exc
+        if not re.fullmatch(r'[A-Za-z0-9_-]{16,128}', account.get('subId', '')):
+            raise Error('Invalid owned subscription identity')
+        identities.append(account['id'])
+        subscriptions.append(account['subId'])
+    if len(set(identities)) != len(identities) or len(set(subscriptions)) != len(subscriptions):
+        raise Error('Duplicate owned device credential')
+    return tuple(accounts)
+
+
 def native_keys(folder):
     text = run([folder / 'bin/xray-linux-amd64', 'x25519'], timeout=10).stdout.decode()
     private = re.search(r'^PrivateKey:\s*([\w-]{43})$', text, re.M)
@@ -409,7 +432,7 @@ def configure_native(folder, manifest, fresh, rotate=False):
         if rotate:
             # Each complete fresh native object carries quota/expiry/reset and
             # disabled state. Change only UUID, never reconstruct a Client DTO.
-            for device in DEVICES:
+            for device in device_names(manifest):
                 current = api.call('/panel/api/inbounds/list')[0]['settings']
                 current = json.loads(current) if isinstance(current, str) else current
                 account = next(c for c in current['clients'] if c['email'] == device)
@@ -439,7 +462,7 @@ def core_check(folder):
 
 def feed_paths(manifest):
     return ['/' + fmt + '/' + manifest['accounts'][device]['subId']
-            for device in DEVICES if manifest['accounts'][device]['enable'] for fmt in ('sub', 'mihomo')]
+            for device in device_names(manifest) if manifest['accounts'][device]['enable'] for fmt in ('sub', 'mihomo')]
 
 
 def caddyfile(manifest, published):
@@ -515,7 +538,7 @@ def get_feed(manifest, device, fmt):
 
 def validate_feed_scope(manifest, device, data, fmt):
     current = manifest['accounts'][device]
-    others = [manifest['accounts'][d]['id'] for d in DEVICES if d != device]
+    others = [manifest['accounts'][d]['id'] for d in device_names(manifest) if d != device]
     if fmt == 'sub':
         try:
             text = base64.b64decode(data, validate=True).decode()
@@ -562,19 +585,22 @@ def backend_health(folder, manifest):
     inbound, _ = owned_host_group(folder, api, manifest)
     settings = inbound['settings']
     clients = (json.loads(settings) if isinstance(settings, str) else settings)['clients']
-    if len(clients) != len(DEVICES) or {c['email'] for c in clients} != set(DEVICES):
+    if len(clients) != len(device_names(manifest)) or {c['email'] for c in clients} != set(device_names(manifest)):
         raise Error('Unexpected native account membership; manual ownership review required')
     # SQLite/API is the source of truth. Supported native per-device credential,
     # SubID and enabled changes must survive backup/replacement, not be undone by
-    # an old wrapper copy. Only the fixed device membership is wrapper-owned.
+    # an old wrapper copy. Only explicit manifest membership is wrapper-owned.
     for client in clients:
         uuid.UUID(client['id'])
         if not re.fullmatch(r'[A-Za-z0-9_-]{16,128}', client['subId']) or not isinstance(client['enable'], bool):
             raise Error('Invalid native account identity')
         manifest['accounts'][client['email']] = {k: client[k] for k in ('id', 'subId', 'email', 'enable', 'flow')}
+    # Count global accounts AND joins, including unattached/foreign native rows.
+    snapshot_accounts(folder / 'db/x-ui.db', manifest)
+    device_names(manifest)
     core_check(folder)
     outputs = {}
-    for device in DEVICES:
+    for device in device_names(manifest):
         if not manifest['accounts'][device]['enable']:
             continue
         for fmt in ('sub', 'mihomo'):
@@ -712,6 +738,8 @@ def check_lease():
 
 def guard():
     if (ROOT / 'pending.json').exists():
+        if read_json(ROOT / 'pending.json').get('phase') == 'recovering':
+            return
         check_lease()
 
 
@@ -853,12 +881,19 @@ def db_snapshot(source, target):
                 'schema_sha256': hashlib.sha256(schema.encode()).hexdigest(), 'schema': schema}
 
 
-def snapshot_accounts(database):
+def snapshot_accounts(database, manifest=None):
     """Read only publication metadata from the same authoritative closed DB."""
     with contextlib.closing(sqlite3.connect('file:' + str(database) + '?mode=ro', uri=True)) as db:
         rows = db.execute('select email,uuid,sub_id,enable,flow from clients order by email').fetchall()
-    if len(rows) != len(DEVICES) or {row[0] for row in rows} != set(DEVICES):
+    expected = set(DEVICES if manifest is None else device_names(manifest))
+    if len(rows) != len(expected) or {row[0] for row in rows} != expected:
         raise Error('Unexpected snapshot account membership')
+    if manifest is not None:
+        with contextlib.closing(sqlite3.connect('file:' + str(database) + '?mode=ro', uri=True)) as db:
+            inbounds = db.execute('select id from inbounds').fetchall()
+            joins = db.execute('select c.email,ci.inbound_id from client_inbounds ci left join clients c on c.id=ci.client_id').fetchall()
+        if len(inbounds) != 1 or len(joins) != len(expected) or set(joins) != {(name, inbounds[0][0]) for name in expected}:
+            raise Error('Unexpected snapshot account inbound membership')
     return {email: {'email': email, 'id': identity, 'subId': sub_id, 'enable': bool(enabled), 'flow': flow}
             for email, identity, sub_id, enabled, flow in rows}
 
@@ -893,6 +928,10 @@ def reject_symlinks(root):
 
 
 def export_backup():
+    if (ROOT / 'pending.json').exists():
+        pending = read_json(ROOT / 'pending.json')
+        if pending.get('kind') == 'devices' and pending.get('phase') != 'prepared':
+            raise Error('Device transaction not ready for backup')
     if ROOT.is_symlink():
         raise Error('Symlink owned root cannot be exported')
     active = ROOT / 'active'
@@ -900,6 +939,7 @@ def export_backup():
     if (ROOT / 'host.py').is_symlink():
         raise Error('Symlink recovery adapter cannot be exported')
     manifest = read_json(active / 'manifest.json')
+    snapshot_accounts(active / 'db/x-ui.db', manifest)
     binary_health(active)
     verify_artifacts(active / 'artifacts', read_json(active / 'release-lock.json'))
     # Backups must also work for expired/quota/HWID-restricted accounts. Their
@@ -916,7 +956,7 @@ def export_backup():
                             ignore=shutil.ignore_patterns('logs', '*.db-wal', '*.db-shm', 'x-ui.db'))
             reject_symlinks(stage / 'deployment')
             metadata = db_snapshot(active / 'db/x-ui.db', stage / 'deployment/db/x-ui.db')
-            manifest['accounts'] = snapshot_accounts(stage / 'deployment/db/x-ui.db')
+            manifest['accounts'] = snapshot_accounts(stage / 'deployment/db/x-ui.db', manifest)
             manifest['host_group_id'] = snapshot_host_group(stage / 'deployment/db/x-ui.db', manifest)
             atomic(stage / 'deployment/manifest.json', dumps(manifest))
             metadata.update(format=FORMAT, encryption='none', panel_version=read_json(active / 'release-lock.json')['panel']['version'])
@@ -946,7 +986,7 @@ def verify_backup(folder, lock):
         if not (folder / 'units' / name).is_file():
             raise Error('Backup missing unit configuration')
     manifest = read_json(active / 'manifest.json')
-    if manifest.get('format') != FORMAT or set(manifest['accounts']) != set(DEVICES):
+    if manifest.get('format') != FORMAT:
         raise Error('Backup missing account mapping')
     certs = list((active / 'caddy/data/caddy/certificates').rglob(manifest['config']['domain'] + '.crt'))
     if not certs or any(not cert.with_suffix('.key').is_file() or not cert.with_suffix('.key').stat().st_size for cert in certs):
@@ -956,7 +996,7 @@ def verify_backup(folder, lock):
     with contextlib.closing(sqlite3.connect('file:' + str(active / 'db/x-ui.db') + '?mode=ro', uri=True)) as db:
         if db.execute('pragma integrity_check').fetchone()[0] != 'ok':
             raise Error('Corrupt backup database')
-    if manifest['accounts'] != snapshot_accounts(active / 'db/x-ui.db'):
+    if manifest['accounts'] != snapshot_accounts(active / 'db/x-ui.db', manifest):
         raise Error('Backup metadata disagrees with native snapshot accounts')
     # This is the only source-era metadata migration: derive from the verified
     # closed OLD-endpoint snapshot; never alter the archive or adopt a conflict.
@@ -1056,13 +1096,253 @@ def prepare(upload):
             raise
 
 
+# The deployed optional-contact adapter is the only supported source-era upgrade.
+LEGACY_ADAPTER_SHA256 = '30430e73199f175099d509f056b31c38b17f3eb6ec7ff07972a75003409a000e'
+
+
+def device_request(request):
+    names = request.get('names')
+    action = request.get('device_action')
+    if (action not in ('add', 'remove', 'rotate') or not isinstance(names, list) or not names or
+            len(set(names)) != len(names) or any(not isinstance(n, str) or
+                not re.fullmatch(r'[a-z][a-z0-9-]{0,31}', n) for n in names) or
+            (action != 'add' and len(names) != 1) or
+            not re.fullmatch(r'[0-9a-f]{32}', request.get('operation_id', ''))):
+        raise Error('Invalid device operation/names/operation ID')
+    bound = {k: request[k] for k in ('owner', 'machine_id', 'endpoint', 'config',
+                                    'device_action', 'names', 'operation_id')}
+    return hashlib.sha256(dumps(bound).encode()).hexdigest()
+
+
+def device_receipt(request):
+    fingerprint = device_request(request)
+    path = ROOT / 'device-receipts' / (request['operation_id'] + '.json')
+    if path.exists():
+        receipt = read_json(path)
+        if receipt['request_sha256'] != fingerprint:
+            raise Error('Operation ID already bound to a different request')
+        return receipt
+    return None
+
+
+def device_owner(request):
+    marker = read_json(ROOT / 'owner.json')
+    if marker != {'format': FORMAT, 'owner': request['owner'], 'machine_id': machine_id()} or request['machine_id'] != machine_id():
+        raise Error('Wrong host/owner for device operation')
+    manifest = read_json(ROOT / 'active/manifest.json')
+    if manifest['owner'] != request['owner'] or manifest['config'] != request['config'] or manifest['endpoint'] != request['endpoint']:
+        raise Error('Device operation differs from owned deployment')
+    return manifest
+
+
+def devices_prepare(upload):
+    with tempfile.TemporaryDirectory(prefix='qd-device-upload-') as tmp:
+        stage = Path(tmp)
+        safe_unpack(upload, stage)
+        request = read_json(stage / 'request.json')
+        check_request_identity(request)
+        manifest = device_owner(request)
+        fingerprint = device_request(request)
+        receipt = device_receipt(request)
+        if receipt:
+            return receipt
+        if (ROOT / 'pending.json').exists():
+            pending = read_json(ROOT / 'pending.json')
+            if pending.get('request_sha256') != fingerprint:
+                raise Error('Different pending operation; recover first')
+            check_lease()
+            if pending.get('phase') == 'prepared':
+                return {'prepared': True}
+            raise Error('Interrupted device preparation; recover before retry')
+        rollback = ROOT / 'device-rollback'
+        if rollback.exists():
+            raise Error('Retained device recovery intent; run recover first')
+        reject_symlinks(ROOT / 'active')
+        if (ROOT / 'host.py').is_symlink():
+            raise Error('Symlink recovery adapter')
+        adapter = (stage / 'host.py').read_bytes()
+        current_sha = hashlib.sha256(adapter).hexdigest()
+        if current_sha != request['adapter_sha256'] or digest(ROOT / 'host.py') not in (LEGACY_ADAPTER_SHA256, current_sha):
+            raise Error('Unknown stored/uploaded adapter digest; no device writes')
+        check_units()
+        binary_health(ROOT / 'active')
+        # Publication probes are not an ownership test: restricted feeds may deny.
+        api = API(manifest)
+        inbound, _ = owned_host_group(ROOT / 'active', api, manifest)
+        snapshot_accounts(ROOT / 'active/db/x-ui.db', manifest)
+        names, action = request['names'], request['device_action']
+        existing = set(device_names(manifest))
+        if action == 'add':
+            if set(names) <= existing:
+                return {'unchanged': True}
+            if set(names) & existing:
+                raise Error('Mixed existing/new names; no partial add')
+        elif names[0] not in existing:
+            if action == 'remove':
+                return {'unchanged': True}
+            raise Error('Unknown device for rotation')
+        process_health()
+        tls_probe(manifest)
+        # All rollback inputs and durable intent precede adapter/service mutation.
+        preparation = Path(tempfile.mkdtemp(prefix='device-snapshot-', dir=ROOT))
+        for name, source in [('manifest.json', ROOT / 'active/manifest.json'),
+                             ('Caddyfile', ROOT / 'active/Caddyfile'), ('host.py', ROOT / 'host.py')]:
+            atomic(preparation / name, source.read_bytes())
+        services = {}
+        for unit in (PANEL, FRONT):
+            services[unit] = {key: subprocess.run(['systemctl', command, '--quiet', unit], capture_output=True).returncode == 0
+                              for key, command in [('running', 'is-active'), ('enabled', 'is-enabled')]}
+        intent = {'boot_id': boot_id(), 'deadline': time.time() + 900, 'had_active': True,
+                  'kind': 'devices', 'phase': 'snapshot', 'operation_id': request['operation_id'],
+                  'request_sha256': fingerprint, 'services': services}
+        atomic(preparation / 'intent.json', dumps(intent))
+        os.replace(preparation, rollback)
+        directory = os.open(ROOT, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+        # Crash before replacement leaves the old adapter and services unchanged;
+        # crash after replacement is recognized by recover's staged-intent branch.
+        atomic(ROOT / 'host.py', adapter, 0o700)
+        atomic(ROOT / 'pending.json', dumps(intent))
+        active = ROOT / 'active'
+        try:
+            ctl('stop', FRONT)
+            ctl('stop', PANEL)
+            db_snapshot(active / 'db/x-ui.db', rollback / 'x-ui.db')
+            manifest['accounts'] = snapshot_accounts(rollback / 'x-ui.db', manifest)
+            intent['phase'] = 'ready'
+            atomic(ROOT / 'pending.json', dumps(intent))
+            ctl('start', PANEL)
+            api = wait_api(manifest)
+            if action == 'add':
+                for name in names:
+                    check_lease()
+                    account = {'id': str(uuid.uuid4()), 'subId': secrets.token_hex(24), 'email': name,
+                               'enable': True, 'flow': 'xtls-rprx-vision'}
+                    # Collision checking covers ALL global native accounts above.
+                    if any(account[k] == c[k] for c in manifest['accounts'].values() for k in ('id', 'subId')):
+                        raise Error('Generated credential collision; recover and retry')
+                    api.call('/panel/api/clients/add', {'client': account, 'inboundIds': [inbound['id']]})
+                    manifest['accounts'][name] = account
+            elif action == 'remove':
+                check_lease()
+                api.call('/panel/api/clients/del/' + names[0], {})
+                del manifest['accounts'][names[0]]
+            else:
+                name = names[0]
+                settings = api.call('/panel/api/inbounds/list')[0]['settings']
+                settings = json.loads(settings) if isinstance(settings, str) else settings
+                account = next(c for c in settings['clients'] if c['email'] == name)
+                account['limitHwid'] = api.call('/panel/api/clients/get/' + name)['client']['limitHwid']
+                account.update(id=str(uuid.uuid4()), subId=secrets.token_hex(24))
+                if any(account[k] == c[k] for d, c in manifest['accounts'].items() if d != name for k in ('id', 'subId')):
+                    raise Error('Generated credential collision; recover and retry')
+                check_lease()
+                api.call('/panel/api/clients/update/' + name, account)
+            # Restart the owned panel/core process, not only Xray's live user API:
+            # this closes existing streams as well as rejecting new old UUIDs.
+            ctl('stop', PANEL)
+            ctl('start', PANEL)
+            wait_api(manifest)
+            backend_health(active, manifest)
+            manifest['published'] = False
+            atomic(active / 'manifest.json', dumps(manifest))
+            # Keep the OLD exact front paths until backup receipt/commit. New
+            # capabilities are never exposed before off-node verification.
+            ctl('start', FRONT)
+            wait_tls(manifest, pending=True)
+            process_health()
+            check_lease()
+            intent['phase'] = 'prepared'
+            atomic(ROOT / 'pending.json', dumps(intent))
+            return {'prepared': True}
+        except BaseException:
+            recover(force=True)
+            raise
+
+
+def recover_devices(pending):
+    rollback = ROOT / 'device-rollback'
+    receipt = ROOT / 'device-receipts' / (pending['operation_id'] + '.json')
+    if receipt.exists():
+        if read_json(receipt)['request_sha256'] != pending['request_sha256']:
+            raise Error('Recovery receipt request mismatch')
+        (ROOT / 'pending.json').unlink(missing_ok=True)
+        if rollback.exists():
+            os.replace(rollback, ROOT / ('completed-' + pending['operation_id']))
+        return {'committed': True, 'pending': False}
+    # Persist restore intent before stopping; guard permits these recovery starts
+    # even with an expired/rebooted lease. Recovery remains restartable throughout.
+    restore_db = pending.get('restore_db', pending['phase'] != 'snapshot')
+    pending.update(phase='recovering', restore_db=restore_db)
+    atomic(ROOT / 'pending.json', dumps(pending))
+    check_units()
+    ctl('stop', FRONT)
+    ctl('stop', PANEL)
+    active = ROOT / 'active'
+    if restore_db:
+        atomic(active / 'db/x-ui.db', (rollback / 'x-ui.db').read_bytes())
+        for suffix in ('-wal', '-shm'):
+            (active / ('db/x-ui.db' + suffix)).unlink(missing_ok=True)
+    for name in ('manifest.json', 'Caddyfile'):
+        atomic(active / name, (rollback / name).read_bytes())
+    for unit, state in pending['services'].items():
+        ctl('enable' if state['enabled'] else 'disable', unit)
+        if state['running']:
+            ctl('start', unit)
+    # Disarm BEFORE restoring old guard: it does not understand recovery starts.
+    (ROOT / 'pending.json').unlink()
+    atomic(ROOT / 'host.py', (rollback / 'host.py').read_bytes(), 0o700)
+    os.replace(rollback, ROOT / ('rolled-back-' + pending['operation_id']))
+    return {'pending': False, 'restored': 'original device database/front/adapter and service state'}
+
+
+def devices_commit(request):
+    manifest = device_owner(request)
+    fingerprint = device_request(request)
+    receipt = device_receipt(request)
+    if receipt:
+        return receipt
+    pending = read_json(ROOT / 'pending.json')
+    if pending.get('kind') != 'devices' or pending.get('phase') != 'prepared' or pending['request_sha256'] != fingerprint:
+        raise Error('Device commit does not match prepared intent')
+    check_lease()
+    if (ROOT / 'export-sha256').read_text() != request.get('offnode_sha256'):
+        raise Error('Require verified off-node device backup receipt')
+    backend_health(ROOT / 'active', manifest)
+    check_lease()
+    front_config(ROOT / 'active', manifest, True)
+    ctl('restart', FRONT)
+    wait_tls(manifest, pending=True)
+    process_health()
+    check_lease()
+    manifest['published'] = True
+    atomic(ROOT / 'active/manifest.json', dumps(manifest))
+    result = {'committed': True, 'published': True, 'request_sha256': fingerprint,
+              'machine_id': request['machine_id'], 'node_id': manifest['node_id']}
+    atomic(ROOT / 'device-receipts' / (request['operation_id'] + '.json'), dumps(result))
+    (ROOT / 'pending.json').unlink()
+    os.replace(ROOT / 'device-rollback', ROOT / ('completed-' + request['operation_id']))
+    return result
+
+
 def recover(force=False):
     pending_path = ROOT / 'pending.json'
+    if not pending_path.exists() and (ROOT / 'device-rollback/intent.json').exists():
+        staged = read_json(ROOT / 'device-rollback/intent.json')
+        # A completed journal was disarmed before old-adapter restoration.
+        if (ROOT / 'device-receipts' / (staged['operation_id'] + '.json')).exists():
+            return recover_devices(staged)
+        atomic(pending_path, dumps(staged))
     if not pending_path.exists():
         return {'pending': False, 'committed': (ROOT / 'active/manifest.json').exists()}
     pending = read_json(pending_path)
-    if not force and pending['boot_id'] == boot_id() and time.time() < pending['deadline']:
+    if not force and pending.get('phase') != 'recovering' and pending['boot_id'] == boot_id() and time.time() < pending['deadline']:
         return {'pending': True, 'waiting': True}
+    if pending.get('kind') == 'devices':
+        return recover_devices(pending)
     check_units(require_all=False)
     for service in (FRONT, PANEL):
         if (UNITS / service).is_file():
@@ -1160,7 +1440,9 @@ def main():
                 # service start is itself ordered after this recovery oneshot.
                 print(dumps({'pending': True, 'busy': True}), end='')
                 return
-            if action == 'prepare':
+            if action == 'devices-prepare':
+                result = devices_prepare(sys.stdin.buffer)
+            elif action == 'prepare':
                 result = prepare(sys.stdin.buffer)
             elif action == 'recover':
                 result = recover()
@@ -1171,6 +1453,14 @@ def main():
                     result = preflight(request)
                 elif action == 'status':
                     result = status(request)
+                elif action == 'devices-commit':
+                    result = devices_commit(request)
+                elif action == 'devices-list':
+                    manifest = device_owner(request)
+                    if (ROOT / 'pending.json').exists():
+                        raise Error('Pending transaction; recover first')
+                    snapshot_accounts(ROOT / 'active/db/x-ui.db', manifest)
+                    result = {name: {'enabled': account['enable']} for name, account in snapshot_accounts(ROOT / 'active/db/x-ui.db', manifest).items()}
                 elif action == 'commit':
                     result = commit(request)
                 elif action == 'abort':
@@ -1184,6 +1474,10 @@ def main():
                         with backup.open('rb') as stream:
                             shutil.copyfileobj(stream, sys.stdout.buffer)
                         return
+                    if (ROOT / 'pending.json').exists():
+                        pending = read_json(ROOT / 'pending.json')
+                        if pending.get('kind') == 'devices' and pending.get('phase') != 'prepared':
+                            raise Error('Device transaction not ready for output export')
                     active = ROOT / 'active'
                     result = {name: base64.b64encode(data).decode() for name, data in backend_health(active, read_json(active / 'manifest.json')).items()}
                 else:

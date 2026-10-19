@@ -132,6 +132,155 @@ class Native(unittest.TestCase):
         with mock.patch.object(subprocess, 'run', side_effect=no_systemctl), mock.patch.object(host, 'ctl'), mock.patch.object(host, 'check_units'):
             return host.export_backup()
 
+    def device_fixture(self, legacy=False):
+        self.prepare_export_fixture()
+        self.manifest['published'] = True
+        host.atomic(self.work / 'manifest.json', host.dumps(self.manifest))
+        host.atomic(self.work / 'Caddyfile', host.caddyfile(self.manifest, True))
+        host.atomic(host.ROOT / 'owner.json', host.dumps({'format': host.FORMAT, 'owner': self.manifest['owner'], 'machine_id': host.machine_id()}))
+        if legacy:
+            source = subprocess.check_output(['git', 'show', '18d1b3b:vps/lib/host.py'])
+            self.assertEqual(__import__('hashlib').sha256(source).hexdigest(), host.LEGACY_ADAPTER_SHA256)
+            host.atomic(host.ROOT / 'host.py', source, 0o700)
+        def ctl(action, unit):
+            if unit == host.PANEL:
+                if action == 'stop': self.stop()
+                elif action == 'start': self.start()
+                elif action not in ('enable', 'disable'): raise AssertionError(action)
+            elif unit != host.FRONT:
+                raise AssertionError(unit)
+        mock.patch.object(host, 'ctl', side_effect=ctl).start()
+        for function in ('check_units', 'process_health', 'tls_probe', 'wait_tls', 'check_request_identity'):
+            mock.patch.object(host, function).start()
+        real_run = subprocess.run
+        def systemctl(argv, **kwargs):
+            if argv[0] == 'systemctl':
+                self.assertIn(argv[1], ('is-active', 'is-enabled'))
+                return subprocess.CompletedProcess(argv, 0, b'', b'')
+            return real_run(argv, **kwargs)
+        mock.patch.object(subprocess, 'run', side_effect=systemctl).start()
+
+    def device_request(self, action, *names):
+        return dict(owner=self.manifest['owner'], config=self.manifest['config'], endpoint=self.manifest['endpoint'],
+                    machine_id=host.machine_id(), device_action=action, names=list(names), operation_id=os.urandom(16).hex(),
+                    adapter_sha256=host.digest(vps.MODULE / 'lib/host.py'))
+
+    def device_prepare(self, request):
+        with vps.upload_bundle(request) as stream:
+            return host.devices_prepare(stream)
+
+    def device_finish(self, request):
+        archive = host.export_backup()
+        stage = self.root / ('verify-' + str(time.monotonic_ns()))
+        stage.mkdir()
+        with archive.open('rb') as stream:
+            host.safe_unpack(stream, stage)
+        manifest = host.verify_backup(stage, self.lock)
+        result = host.devices_commit(dict(request, offnode_sha256=host.digest(archive)))
+        self.manifest = host.read_json(self.work / 'manifest.json')
+        return manifest, result
+
+    def test_devices_native_add_rotate_remove_archives_and_idempotence(self):
+        self.device_fixture(legacy=True)
+        original = copy.deepcopy(self.native_accounts())
+        original_reality = copy.deepcopy(self.manifest['reality'])
+        old_paths = host.feed_paths(self.manifest)
+        request = self.device_request('add', 'device4', 'device5')
+        self.assertEqual(self.device_prepare(request), {'prepared': True})
+        # New capability is private until commit, while the old exact paths stay.
+        self.assertEqual((self.work / 'Caddyfile').read_text(), host.caddyfile(self.manifest, True))
+        self.assertEqual(self.device_prepare(request), {'prepared': True})
+        candidate, result = self.device_finish(request)
+        self.assertEqual(len(candidate['accounts']), 5)
+        self.assertEqual(len(host.feed_paths(self.manifest)), 10)
+        self.assertTrue(set(old_paths) <= set(host.feed_paths(self.manifest)))
+        self.assertEqual(self.manifest['reality'], original_reality)
+        self.assertEqual({d: c for d, c in self.native_accounts().items() if d in original}, original)
+        self.assertEqual(self.device_prepare(request), result, 'lost commit reply must not apply twice')
+        replay = dict(request, names=['different'])
+        with self.assertRaisesRegex(host.Error, 'different request'):
+            self.device_prepare(replay)
+        self.assertEqual(self.device_prepare(self.device_request('add', 'device4', 'device5')), {'unchanged': True})
+        with self.assertRaisesRegex(host.Error, 'Mixed'):
+            self.device_prepare(self.device_request('add', 'device4', 'different'))
+        before = copy.deepcopy(self.native_accounts())
+        target = before['device4']
+        target.update(totalGB=1234567890, expiryTime=int(time.time()*1000)+86400000, limitIp=2,
+                      trafficReset='monthly', trafficResetDay=6, reset=7, resetMax=9, comment='policy-fixture', limitHwid=3,
+                      enable=False)
+        host.API(self.manifest).call('/panel/api/clients/update/device4', target)
+        before = copy.deepcopy(self.native_accounts())
+        details = host.API(self.manifest).call('/panel/api/clients/get/device4')['client']
+        request = self.device_request('rotate', 'device4')
+        self.device_prepare(request)
+        self.device_finish(request)
+        after = self.native_accounts()
+        self.assertNotEqual(after['device4']['id'], before['device4']['id'])
+        self.assertNotEqual(after['device4']['subId'], before['device4']['subId'])
+        self.assertFalse(after['device4']['enable'])
+        for name in before:
+            excluded = ('id', 'subId', 'updated_at') if name == 'device4' else ()
+            self.assertEqual({k:v for k,v in after[name].items() if k not in excluded},
+                             {k:v for k,v in before[name].items() if k not in excluded})
+        new_detail = host.API(self.manifest).call('/panel/api/clients/get/device4')['client']
+        self.assertEqual({k:v for k,v in new_detail.items() if k not in ('uuid','subId','updatedAt')},
+                         {k:v for k,v in details.items() if k not in ('uuid','subId','updatedAt')})
+        self.assertEqual(self.manifest['reality'], original_reality)
+        for name in ('device4', 'device5', 'company', 'home', 'phone'):
+            request = self.device_request('remove', name)
+            self.device_prepare(request)
+            archive_manifest, _ = self.device_finish(request)
+            self.assertNotIn(name, archive_manifest['accounts'])
+            self.assertEqual(self.device_prepare(self.device_request('remove', name)), {'unchanged': True})
+        self.assertEqual(self.manifest['accounts'], {}, 'native empty roster must remain valid')
+        self.assertEqual(host.backend_health(self.work, self.manifest), {})
+
+    def test_devices_native_partial_api_failure_restores_old_db_adapter(self):
+        self.device_fixture(legacy=True)
+        original = self.native_accounts()
+        old_adapter = (host.ROOT / 'host.py').read_bytes()
+        old_front = (self.work / 'Caddyfile').read_bytes()
+        request = self.device_request('add', 'device4', 'device5')
+        real_call = host.API.call
+        def fail_second(api, path, data=None):
+            if path == '/panel/api/clients/add' and data['client']['email'] == 'device5':
+                # The FIRST native API operation already committed device4.
+                self.assertIn('device4', self.native_accounts())
+                raise host.Error('fixture second API failure')
+            return real_call(api, path, data)
+        with mock.patch.object(host.API, 'call', new=fail_second):
+            with self.assertRaisesRegex(host.Error, 'second API failure'):
+                self.device_prepare(request)
+        self.assertEqual(self.native_accounts(), original)
+        self.assertEqual((host.ROOT / 'host.py').read_bytes(), old_adapter)
+        self.assertEqual((self.work / 'Caddyfile').read_bytes(), old_front)
+        self.assertFalse((host.ROOT / 'pending.json').exists())
+        # Same uncommitted request is retryable; no orphan native account remains.
+        self.device_prepare(request)
+        self.device_finish(request)
+        self.assertEqual(len(self.native_accounts()), 5)
+
+    def test_devices_native_unknown_global_account_and_adapter_refuse(self):
+        self.device_fixture()
+        original = self.native_accounts()
+        host.atomic(host.ROOT / 'host.py', b'foreign-adapter')
+        with self.assertRaisesRegex(host.Error, 'adapter digest'):
+            self.device_prepare(self.device_request('add', 'device4'))
+        self.assertEqual(self.native_accounts(), original)
+        self.assertFalse((host.ROOT / 'pending.json').exists())
+        host.atomic(host.ROOT / 'host.py', (vps.MODULE / 'lib/host.py').read_bytes())
+        api = host.API(self.manifest)
+        extra = dict(id=__import__('uuid').uuid4().hex, subId=os.urandom(24).hex(), email='foreign', enable=True, flow='xtls-rprx-vision')
+        inbound_id = api.call('/panel/api/inbounds/list')[0]['id']
+        api.call('/panel/api/clients/add', {'client':extra, 'inboundIds':[inbound_id]})
+        api.call('/panel/api/clients/foreign/detach', {'inboundIds':[inbound_id]})
+        with self.assertRaisesRegex(host.Error, 'snapshot account membership'):
+            self.device_prepare(self.device_request('add', 'device4'))
+        with self.assertRaisesRegex(host.Error, 'snapshot account membership'):
+            host.backend_health(self.work, self.manifest)
+        with self.assertRaisesRegex(host.Error, 'snapshot account membership'):
+            host.export_backup()
+
     def test_review_snapshot_revocation_and_full_policy_restore(self):
         self.prepare_export_fixture()
         for device, client in self.native_accounts().items():

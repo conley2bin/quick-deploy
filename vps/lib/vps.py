@@ -254,7 +254,7 @@ def upload_bundle(request, folder=None, backup=None):
         archive.add(MODULE / 'lib/host.py', arcname='host.py', recursive=False)
         if backup:
             archive.add(backup, arcname='restore.tar', recursive=False)
-        else:
+        elif 'device_action' not in request:
             for component in ('panel', 'core', 'front'):
                 path = folder / request['lock'][component]['file']
                 archive.add(path, arcname='artifacts/' + path.name, recursive=False)
@@ -294,7 +294,11 @@ def validate_outputs(state, document, record, binary=None, backup=None):
     binary = binary or shutil.which('verge-mihomo') or shutil.which('mihomo')
     if not binary:
         raise host.Error('Install native Mihomo or use --mihomo; no version whitelist or skipped format gate')
+    manifest = inspect_backup(backup, release_lock())
     outputs = remote(record, 'outputs', request_for(document, record))
+    expected = {d + ext for d in host.device_names(manifest) if manifest['accounts'][d]['enable'] for ext in ('.yaml', '.txt')}
+    if set(outputs) != expected:
+        raise host.Error('Native outputs disagree with verified backup roster')
     output = private_dir(state / 'outputs')
     with tempfile.TemporaryDirectory(prefix='qd-native-check-') as tmp:
         root = Path(tmp)
@@ -305,9 +309,10 @@ def validate_outputs(state, document, record, binary=None, backup=None):
                 data = archive.extractfile('deployment/bin/' + name).read()
                 host.atomic(root / name, data)
         for name, encoded in outputs.items():
-            if name not in {d + ext for d in host.DEVICES for ext in ('.yaml', '.txt')}:
+            if name not in expected:
                 raise host.Error('Unexpected native output filename')
             data = base64.b64decode(encoded, validate=True)
+            host.validate_feed_scope(manifest, name.rsplit('.', 1)[0], data, 'sub' if name.endswith('.txt') else 'mihomo')
             host.atomic(output / name, data)
             if name.endswith('.yaml'):
                 config = root / name
@@ -320,7 +325,7 @@ def validate_outputs(state, document, record, binary=None, backup=None):
 def subscription_urls(manifest):
     return {device: {'mihomo': f"https://{manifest['config']['domain']}:8443/mihomo/{account['subId']}",
                      'shadowrocket': f"https://{manifest['config']['domain']}:8443/sub/{account['subId']}"}
-            for device in host.DEVICES if (account := manifest['accounts'][device])['enable']}
+            for device in host.device_names(manifest) if (account := manifest['accounts'][device])['enable']}
 
 
 def export_urls(state):
@@ -456,6 +461,52 @@ def deploy(state, document, args):
     export_after_commit(state)
 
 
+def devices(state, document, args):
+    record = document['current']
+    if not record:
+        raise host.Error('No committed node')
+    if (state / 'pending.json').exists():
+        raise host.Error('Local transaction pending; run recover before devices')
+    request = request_for(document, record)
+    if args.device_action == 'list':
+        roster = remote(record, 'devices-list', request)
+        for name, item in roster.items():
+            print(name + (' enabled' if item['enabled'] else ' disabled'))
+        return
+    request.update(device_action=args.device_action, names=args.names,
+                   operation_id=secrets.token_hex(16), adapter_sha256=host.digest(MODULE / 'lib/host.py'))
+    host.device_request(request)  # names/shape before any remote backup/restart
+    binary = args.mihomo or shutil.which('verge-mihomo') or shutil.which('mihomo')
+    if not binary:
+        raise host.Error('Native Mihomo required before device mutation')
+    confirm('Device management restarts the owned core/front: ALL devices may briefly reconnect. '
+            'Remove/rotate revoke old credentials; historical backups still contain them. Proceed?')
+    before = backup_remote(state, document, record)
+    pending = {'record': record, 'mode': 'devices', 'request': request, 'backup': None, 'before': str(before)}
+    host.atomic(state / 'pending.json', host.dumps(pending))
+    try:
+        with upload_bundle(request) as stream:
+            prepared = remote(record, 'devices-prepare', stdin=stream)
+        if not prepared.get('committed') and not prepared.get('unchanged'):
+            candidate = backup_remote(state, document, record)
+            pending['backup'] = str(candidate)
+            host.atomic(state / 'pending.json', host.dumps(pending))
+            validate_outputs(state, document, record, binary, candidate)
+            remote(record, 'devices-commit', dict(request, offnode_sha256=host.digest(candidate)))
+        # The post-publication snapshot, not the candidate backup, becomes local
+        # authority. A failure here leaves pending intent for committed recovery.
+        after = backup_remote(state, document, record)
+        validate_outputs(state, document, record, binary, after)
+        result = remote(record, 'status', request_for(document, record))
+        remember_commit(state, document, record, after, result)
+    except BaseException:
+        print('Device operation incomplete or already committed: pending intent retained. Run recover; '
+              'do not repeat rotate until reconciliation completes.', file=sys.stderr)
+        raise
+    export_after_commit(state)
+    print('Device roster committed; latest off-node backup and protected URL export updated.')
+
+
 def recover_local(state, document):
     pending = load(state / 'pending.json')
     record = pending['record']
@@ -463,6 +514,8 @@ def recover_local(state, document):
     if result.get('committed'):
         status = remote(record, 'status', request_for(document, record))
         backup = backup_remote(state, document, record)
+        if pending.get('mode') == 'devices':
+            validate_outputs(state, document, record, backup=backup)
         remember_commit(state, document, record, backup, status)
         print('Remote commit had succeeded; reconciled ownership and made a new off-node backup.')
         export_after_commit(state)
@@ -490,6 +543,13 @@ def parser():
             a.add_argument('--mihomo', help='native core executable for profile validation')
         if name == 'restore':
             a.set_defaults(backup_required=True)
+    a = sub.add_parser('devices', help='manage manifest-owned device credentials')
+    operations = a.add_subparsers(dest='device_action', required=True)
+    operations.add_parser('list', help='names/enabled status only, no credentials')
+    for action in ('add', 'remove', 'rotate'):
+        operation = operations.add_parser(action)
+        operation.add_argument('names', nargs='+' if action == 'add' else 1)
+        operation.add_argument('--mihomo', help='native core executable for format validation')
     return p
 
 
@@ -510,6 +570,8 @@ def main(argv=None):
                 document = state_document(state, args, args.command in ('deploy', 'preflight'))
             if args.command in ('deploy', 'replace', 'restore'):
                 deploy(state, document, args)
+            elif args.command == 'devices':
+                devices(state, document, args)
             elif args.command == 'preflight':
                 record = target_record(args, document['current'])
                 print(host.dumps(remote(record, 'preflight', request_for(document, record))), end='')

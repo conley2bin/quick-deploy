@@ -121,9 +121,11 @@ class FakeHost(unittest.TestCase):
             db.execute('insert into inbounds values(1,1,?,?,?)', ('SELF-main', 'vless', manifest['config']['proxy_port']))
             db.execute('create table hosts(group_id text,inbound_id integer,address text,port integer,is_disabled integer,is_hidden integer)')
             db.execute('insert into hosts values(?,1,?,?,0,0)', ('owned-fixture-host', manifest['endpoint'], manifest['config']['proxy_port']))
-            db.execute('create table clients(email text, uuid text, sub_id text, enable integer, flow text)')
-            db.executemany('insert into clients values(?,?,?,?,?)',
+            db.execute('create table clients(email text, uuid text, sub_id text, enable integer, flow text, id integer primary key)')
+            db.execute('create table client_inbounds(client_id integer, inbound_id integer)')
+            db.executemany('insert into clients(email,uuid,sub_id,enable,flow) values(?,?,?,?,?)',
                 [(d, c['id'], c['subId'], c['enable'], c['flow']) for d, c in manifest['accounts'].items()])
+            db.execute('insert into client_inbounds select id,1 from clients')
         self.h.settings_write(folder / 'db/x-ui.db', self.h.backend_settings(manifest))
 
     def configure(self, folder, manifest, fresh, rotate=False):
