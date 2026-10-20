@@ -251,17 +251,19 @@ class Recovery(unittest.TestCase):
     def test_previous_adapter_unsafe_inputs_refuse_before_stop_or_migration(self):
         import signal
         import stat
+        import itertools
         h = self.f.h
-        predecessor = h.ROOT/('adapter-before-'+h.LEGACY_ADAPTER_SHA256+'.py')
         outside = self.f.root/'outside-sentinel'
         h.atomic(outside,'SYNTHETIC-OUTSIDE-ARCHIVE-SENTINEL')
         sources = {'current':(vps.MODULE/'lib/host.py').read_bytes(),
-                   'legacy':subprocess.check_output(['git','show','18d1b3b:vps/lib/host.py'])}
+                   'legacy':subprocess.check_output(['git','show','18d1b3b:vps/lib/host.py']),
+                   'deployed918':subprocess.check_output(['git','show','918103e:vps/lib/host.py'])}
         def io_timeout(*args):
             raise AssertionError('FIFO input blocked')
-        for source_name, source in sources.items():
+        for (source_name, source), pin in itertools.product(sources.items(), h.ADAPTER_PREDECESSORS):
+            predecessor = h.ROOT/('adapter-before-'+pin+'.py')
             for kind in ('outside-link','dangling-link','directory','fifo','wrong-digest'):
-                with self.subTest(source=source_name,kind=kind):
+                with self.subTest(source=source_name,pin=pin,kind=kind):
                     h.atomic(h.ROOT/'host.py',source,0o700)
                     if kind == 'outside-link': predecessor.symlink_to(outside)
                     elif kind == 'dangling-link': predecessor.symlink_to(self.f.root/'missing-sentinel')
@@ -310,6 +312,26 @@ class Recovery(unittest.TestCase):
         h.atomic(h.ROOT/'host.py',legacy,0o700)
         h.export_backup()
         self.assertEqual(predecessor.stat().st_ino,inode)
+
+    def test_reviewed_918_adapter_migration_retains_both_pinned_sources(self):
+        import tarfile
+        h = self.f.h
+        legacy = subprocess.check_output(['git','show','18d1b3b:vps/lib/host.py'])
+        deployed = subprocess.check_output(['git','show','918103e:vps/lib/host.py'])
+        self.assertEqual(__import__('hashlib').sha256(deployed).hexdigest(), h.DEPLOYED_ADAPTER_SHA256)
+        old_path = h.ROOT/('adapter-before-'+h.LEGACY_ADAPTER_SHA256+'.py')
+        h.atomic(old_path,legacy)
+        inode = old_path.stat().st_ino
+        h.atomic(h.ROOT/'host.py',deployed,0o700)
+        for attempt in range(2):
+            with tarfile.open(h.export_backup()) as archive:
+                self.assertEqual(archive.extractfile('previous-host.py').read(),legacy)
+                self.assertEqual(archive.extractfile('previous-host-918103e.py').read(),deployed)
+            self.assertEqual(host.digest(h.ROOT/'host.py'),host.digest(vps.MODULE/'lib/host.py'))
+            self.assertEqual(old_path.stat().st_ino,inode)
+        self.assertFalse(h.accepted_adapter_digest('f'*64,host.digest(vps.MODULE/'lib/host.py')))
+        with self.assertRaisesRegex(h.Error,'Unreviewed'):
+            h.read_previous_adapter('f'*64)
 
     def test_previous_adapter_cache_prevents_link_laundering_after_validation(self):
         import tarfile

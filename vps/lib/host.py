@@ -935,9 +935,12 @@ def adapter_source():
     return Path(__file__).read_bytes()
 
 
-def read_previous_adapter():
+def read_previous_adapter(expected_sha=None):
     """Optional, pinned public source; never follow a link or block on a FIFO."""
-    path = ROOT / ('adapter-before-' + LEGACY_ADAPTER_SHA256 + '.py')
+    expected_sha = LEGACY_ADAPTER_SHA256 if expected_sha is None else expected_sha
+    if expected_sha not in ADAPTER_PREDECESSORS:
+        raise Error('Unreviewed predecessor adapter digest')
+    path = ROOT / ('adapter-before-' + expected_sha + '.py')
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except FileNotFoundError:
@@ -952,13 +955,16 @@ def read_previous_adapter():
             data = stream.read(1024 * 1024 + 1)
     finally:
         os.close(fd)
-    if len(data) > 1024 * 1024 or hashlib.sha256(data).hexdigest() != LEGACY_ADAPTER_SHA256:
+    if len(data) > 1024 * 1024 or hashlib.sha256(data).hexdigest() != expected_sha:
         raise Error('Retained predecessor adapter digest mismatch')
     return data
 
 
-def retain_previous_adapter(data):
-    path = ROOT / ('adapter-before-' + LEGACY_ADAPTER_SHA256 + '.py')
+def retain_previous_adapter(data, expected_sha=None):
+    expected_sha = LEGACY_ADAPTER_SHA256 if expected_sha is None else expected_sha
+    if expected_sha not in ADAPTER_PREDECESSORS or hashlib.sha256(data).hexdigest() != expected_sha:
+        raise Error('Unverified predecessor adapter bytes')
+    path = ROOT / ('adapter-before-' + expected_sha + '.py')
     # Publish a complete saved copy without replacing a raced-in unknown input.
     with tempfile.NamedTemporaryFile(prefix='.adapter-before-', dir=ROOT) as stream:
         stream.write(data)
@@ -982,19 +988,24 @@ def install_backup_adapter(request=None):
     if request is not None and sha != request.get('adapter_sha256'):
         raise Error('Backup adapter upload digest mismatch')
     stored = ROOT / 'host.py'
-    if stored.is_symlink() or digest(stored) not in (LEGACY_ADAPTER_SHA256, sha):
+    if stored.is_symlink():
         raise Error('Unknown stored backup adapter; no service stop')
-    previous = read_previous_adapter()  # Reject unknown input before migration can overwrite it.
+    stored_sha = digest(stored)
+    if not accepted_adapter_digest(stored_sha, sha):
+        raise Error('Unknown stored backup adapter; no service stop')
+    # Every explicitly reviewed slot is optional, but any existing input must
+    # satisfy the no-link/pinned-byte contract before ANY migration write.
+    previous = {pin: read_previous_adapter(pin) for pin in ADAPTER_PREDECESSORS}
     check_units()
-    if digest(stored) != sha:
-        if previous is None:
-            retain_previous_adapter(stored.read_bytes())
-            previous = read_previous_adapter()
+    if stored_sha != sha:
+        if previous[stored_sha] is None:
+            retain_previous_adapter(stored.read_bytes(), stored_sha)
+            previous[stored_sha] = read_previous_adapter(stored_sha)
         atomic(stored, source, 0o700)
-    verified = read_previous_adapter()  # Recheck fresh retention/current-adapter reuse before stop.
-    if previous is not None and verified is None:
+    verified = {pin: read_previous_adapter(pin) for pin in ADAPTER_PREDECESSORS}
+    if any(previous[pin] is not None and verified[pin] is None for pin in previous):
         raise Error('Retained predecessor disappeared during migration')
-    return verified
+    return {ADAPTER_PREDECESSORS[pin]: data for pin, data in verified.items() if data is not None}
 
 
 def service_state(unit):
@@ -1074,7 +1085,7 @@ def export_backup(request=None):
     # together. Briefly stop ONLY our subscription front, not Xray or SSH.
     if (ROOT / 'backup-stop.json').exists():
         raise Error('Interrupted backup stop; run recover first')
-    previous_adapter = install_backup_adapter(request)
+    previous_adapters = install_backup_adapter(request)
     marker = read_json(ROOT / 'owner.json')
     front = service_state(FRONT)
     atomic(ROOT / 'backup-stop.json', dumps({'owner': marker['owner'], 'machine_id': marker['machine_id'],
@@ -1096,8 +1107,8 @@ def export_backup(request=None):
             for name in UNIT_NAMES:
                 atomic(stage / 'units' / name, (UNITS / name).read_bytes())
             atomic(stage / 'host.py', (ROOT / 'host.py').read_bytes())
-            if previous_adapter is not None:
-                atomic(stage / 'previous-host.py', previous_adapter)
+            for name, data in previous_adapters.items():
+                atomic(stage / name, data)
             archive_tree(stage, ROOT / 'export.tar')
         sha = digest(ROOT / 'export.tar')
         atomic(ROOT / 'export-sha256', sha)
@@ -1231,8 +1242,15 @@ def prepare(upload):
             raise
 
 
-# The deployed optional-contact adapter is the only supported source-era upgrade.
+# Explicit reviewed public-source predecessors; never infer trust from a remote hash.
 LEGACY_ADAPTER_SHA256 = '30430e73199f175099d509f056b31c38b17f3eb6ec7ff07972a75003409a000e'
+DEPLOYED_ADAPTER_SHA256 = '8777a3d47b07b91bc85de2ce88016efb6de9c3b0568f5688f5bd8d929ed701f1'
+ADAPTER_PREDECESSORS = {LEGACY_ADAPTER_SHA256: 'previous-host.py',
+                        DEPLOYED_ADAPTER_SHA256: 'previous-host-918103e.py'}
+
+
+def accepted_adapter_digest(stored, current):
+    return stored == current or stored in ADAPTER_PREDECESSORS
 
 
 def device_request(request):
@@ -1297,7 +1315,7 @@ def devices_prepare(upload):
             raise Error('Symlink recovery adapter')
         adapter = (stage / 'host.py').read_bytes()
         current_sha = hashlib.sha256(adapter).hexdigest()
-        if current_sha != request['adapter_sha256'] or digest(ROOT / 'host.py') not in (LEGACY_ADAPTER_SHA256, current_sha):
+        if current_sha != request['adapter_sha256'] or not accepted_adapter_digest(digest(ROOT / 'host.py'), current_sha):
             raise Error('Unknown stored/uploaded adapter digest; no device writes')
         check_units()
         binary_health(ROOT / 'active')

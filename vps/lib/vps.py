@@ -492,7 +492,7 @@ def devices(state, document, args):
     host.device_request(request)  # names/shape before any remote backup/restart
     binary = resolve_mihomo(args.mihomo)
     checked = remote(record, 'status', request_for(document, record))
-    if checked.get('adapter_sha256') not in (host.LEGACY_ADAPTER_SHA256, request['adapter_sha256']):
+    if not host.accepted_adapter_digest(checked.get('adapter_sha256'), request['adapter_sha256']):
         raise host.Error('Unknown stored adapter digest; no device backup/service mutation')
     confirm('Device management restarts the owned core/front: ALL devices may briefly reconnect. '
             'Remove/rotate revoke old credentials; historical backups still contain them. Proceed?')
