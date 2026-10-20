@@ -383,6 +383,46 @@ class Native(unittest.TestCase):
         receipt=self.device_prepare(request);self.assertTrue(receipt['committed'])
         self.assertEqual(self.native_accounts(),after)
 
+    def test_rename_native_orphan_target_history_refuses_preflight_and_prepare(self):
+        import sqlite3
+        import uuid
+        import argparse
+        self.device_fixture();api=host.wait_api(self.manifest)
+        inbound=api.call('/panel/api/inbounds/list')[0]['id']
+        account={'id':str(uuid.uuid4()),'subId':os.urandom(24).hex(),'email':'tablet','enable':True,'flow':'xtls-rprx-vision'}
+        api.call('/panel/api/clients/add',{'client':account,'inboundIds':[inbound]})
+        api.call('/panel/api/clients/updateTraffic/tablet',{'upload':777777,'download':888888})
+        api.call('/panel/api/clients/del/tablet?keepTraffic=1',{})
+        api.call('/panel/api/clients/updateTraffic/home',{'upload':123456,'download':654321})
+        before=copy.deepcopy(self.native_accounts())
+        def traffic():
+            with sqlite3.connect(self.work/'db/x-ui.db') as db:
+                return db.execute('select email,up,down from client_traffics where email in (?,?) order by email',('home','tablet')).fetchall()
+        history=traffic();self.assertEqual(history,[('home',123456,654321),('tablet',777777,888888)])
+        self.assertNotIn('tablet',before)
+        state=self.root/'history-operator';state.mkdir(mode=0o700)
+        record={'endpoint':self.manifest['endpoint'],'machine_id':host.machine_id()}
+        doc={'owner':self.manifest['owner'],'config':self.manifest['config'],'current':record}
+        def remote(record,action,request=None,**kwargs):
+            self.assertEqual(action,'status');self.assertEqual(request['rename_target'],'tablet')
+            return host.status(request)
+        real_call=host.API.call;writes=[]
+        def watch(api,path,data=None):
+            if path.startswith('/panel/api/clients/') and data is not None:writes.append(path)
+            return real_call(api,path,data)
+        with mock.patch.object(host.API,'call',new=watch),mock.patch.object(host,'ctl',wraps=host.ctl) as ctl, \
+                mock.patch.object(host,'atomic',wraps=host.atomic) as atomic, \
+                mock.patch.object(vps,'remote',side_effect=remote),mock.patch.object(vps,'backup_remote') as backup, \
+                mock.patch.object(vps,'confirm') as confirm:
+            with self.assertRaisesRegex(host.Error,'history'):
+                vps.devices(state,doc,argparse.Namespace(device_action='rename',names=['home','tablet'],mihomo=None))
+            backup.assert_not_called();confirm.assert_not_called();ctl.assert_not_called();atomic.assert_not_called()
+            with self.assertRaisesRegex(host.Error,'history'):
+                self.device_prepare(self.device_request('rename','home','tablet'))
+            ctl.assert_not_called();atomic.assert_not_called();self.assertEqual(writes,[])
+        self.assertEqual(self.native_accounts(),before);self.assertEqual(traffic(),history)
+        self.assertFalse((host.ROOT/'pending.json').exists());self.assertFalse((state/'pending.json').exists())
+
     def test_rename_five_native_urls_outputs_and_closed_archives(self):
         self.device_fixture()
         add=self.device_request('add','device4','device5');self.device_prepare(add);self.device_finish(add)
@@ -773,7 +813,10 @@ class Native(unittest.TestCase):
                 manifest = host.read_json(self.work/'manifest.json')
                 return {name:{'enabled':account['enable']} for name,account in host.snapshot_accounts(self.work/'db/x-ui.db',manifest).items()}
             if action == 'status':
-                return {'machine_id':host.machine_id(),'node_id':self.manifest['node_id'],'healthy':True,'adapter_sha256':host.digest(host.ROOT/'host.py'),'devices':list(host.read_json(self.work/'manifest.json')['accounts'])}
+                result={'machine_id':host.machine_id(),'node_id':self.manifest['node_id'],'healthy':True,'adapter_sha256':host.digest(host.ROOT/'host.py'),'devices':list(host.read_json(self.work/'manifest.json')['accounts'])}
+                if 'rename_target' in request:
+                    result['rename_target_has_history']=bool(host.rename_target_has_history(self.work/'db/x-ui.db',request['rename_target']))
+                return result
             raise AssertionError(action)
         def exported(state):
             committed = vps.load(state/'state.json')

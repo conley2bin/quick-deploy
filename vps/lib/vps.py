@@ -513,13 +513,18 @@ def devices(state, document, args):
                    operation_id=secrets.token_hex(16), adapter_sha256=host.digest(MODULE / 'lib/host.py'))
     host.device_request(request)  # names/shape before any remote backup/restart
     binary = resolve_mihomo(args.mihomo)
-    checked = remote(record, 'status', request_for(document, record))
+    status_request = request_for(document, record)
+    if request['device_action'] == 'rename':
+        status_request['rename_target'] = request['names'][1]
+    checked = remote(record, 'status', status_request)
     if not host.accepted_adapter_digest(checked.get('adapter_sha256'), request['adapter_sha256']):
         raise host.Error('Unknown stored adapter digest; no device backup/service mutation')
     if request['device_action'] == 'rename':
         if not isinstance(checked.get('devices'), list):
             raise host.Error('Missing owned roster in read-only status')
         host.validate_rename_names(request['names'], checked['devices'])
+        if checked.get('rename_target_has_history') is not False:
+            raise host.Error('Rename target history is occupied or unverified; no changes made')
     confirm('Device management restarts the owned core/front: ALL devices may briefly reconnect. '
             'Remove/reset revoke old credentials; rename preserves keys/URLs. Historical backups contain old keys. Proceed?')
     before = backup_remote(state, document, record)

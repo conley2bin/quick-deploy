@@ -1264,6 +1264,17 @@ def validate_rename_names(names, roster):
         raise Error('Rename target already exists')
 
 
+def rename_target_has_history(database, target):
+    if not isinstance(target, str) or not re.fullmatch(r'[a-z][a-z0-9-]{0,31}', target):
+        raise Error('Invalid rename target')
+    # Match the pinned native equality predicates: its rename can reuse target
+    # traffic and delete target IP tracking even without a target ClientRecord.
+    with contextlib.closing(sqlite3.connect('file:' + str(database) + '?mode=ro', uri=True)) as db:
+        return any(db.execute('select 1 from ' + table + ' where ' + column + '=? limit 1',
+                              (target,)).fetchone() for table, column in
+                   (('client_traffics', 'email'), ('inbound_client_ips', 'client_email')))
+
+
 def device_request(request):
     names = request.get('names')
     action = canonical_device_action(request.get('device_action'))
@@ -1352,6 +1363,8 @@ def devices_prepare(upload):
             raise Error('Unknown device for reset')
         if action == 'rename':
             validate_rename_names(names, existing)
+            if rename_target_has_history(ROOT / 'active/db/x-ui.db', names[1]):
+                raise Error('Rename target has retained native history; no changes made')
         process_health()
         tls_probe(manifest)
         # All rollback inputs and durable intent precede adapter/service mutation.
@@ -1411,6 +1424,8 @@ def devices_prepare(upload):
                 account = next(c for c in settings['clients'] if c['email'] == name)
                 account['limitHwid'] = api.call('/panel/api/clients/get/' + name)['client']['limitHwid']
                 if action == 'rename':
+                    if rename_target_has_history(active / 'db/x-ui.db', names[1]):
+                        raise Error('Rename target has retained native history; recover before retry')
                     account['email'] = names[1]
                 else:
                     account.update(id=str(uuid.uuid4()), subId=secrets.token_hex(24))
@@ -1595,9 +1610,12 @@ def status(request):
     process_health()
     if (ROOT / 'host.py').is_symlink():
         raise Error('Symlink recovery adapter')
-    return {'healthy': True, 'published': manifest['published'], 'node_id': manifest['node_id'],
+    result = {'healthy': True, 'published': manifest['published'], 'node_id': manifest['node_id'],
             'adapter_sha256': digest(ROOT / 'host.py'), 'devices': list(device_names(manifest)),
             'machine_id': marker['machine_id'], 'versions': {k: read_json(active / 'release-lock.json')[k]['version'] for k in ('panel', 'core', 'front')}}
+    if 'rename_target' in request:
+        result['rename_target_has_history'] = bool(rename_target_has_history(active / 'db/x-ui.db', request['rename_target']))
+    return result
 
 
 def commit(request):
