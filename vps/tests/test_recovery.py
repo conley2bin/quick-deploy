@@ -178,7 +178,7 @@ class Recovery(unittest.TestCase):
                     with sqlite3.connect(h.ROOT/'active/db/x-ui.db') as db:
                         c=manifest['accounts']['company']; db.execute('update clients set uuid=?,sub_id=? where email=?',(c['id'],c['subId'],'company'))
                 expected = copy.deepcopy(manifest['accounts'])
-                request=dict(vps.request_for(self.document,self.record),device_action='rotate',names=['company'],
+                request=dict(vps.request_for(self.document,self.record),device_action='reset',names=['company'],
                              operation_id=os.urandom(16).hex(),adapter_sha256=host.digest(vps.MODULE/'lib/host.py'))
                 if phase != 'prechange':
                     h.atomic(h.ROOT/'device-receipts'/(request['operation_id']+'.json'),h.dumps({'committed':True,

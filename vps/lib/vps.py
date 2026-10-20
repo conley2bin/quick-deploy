@@ -509,7 +509,7 @@ def devices(state, document, args):
         for name, item in roster.items():
             print(name + (' enabled' if item['enabled'] else ' disabled'))
         return
-    request.update(device_action=host.canonical_device_action(args.device_action), names=args.names,
+    request.update(device_action=args.device_action, names=args.names,
                    operation_id=secrets.token_hex(16), adapter_sha256=host.digest(MODULE / 'lib/host.py'))
     host.device_request(request)  # names/shape before any remote backup/restart
     binary = resolve_mihomo(args.mihomo)
@@ -561,6 +561,8 @@ def recover_local(state, document, mihomo=None):
     pending = load(state / 'pending.json')
     record = pending['record']
     request = pending['request'] if pending.get('mode') == 'devices' else request_for(document, record)
+    if pending.get('mode') == 'devices':
+        host.device_request(request)  # Unknown/removed actions are preserved, never translated or replayed.
     result = remote(record, 'abort', request)
     if result.get('pending'):
         print('Recovery queued/waiting; local pending retained. Retry recover after the owned recovery unit exits.')
@@ -612,8 +614,8 @@ def parser():
     operations = a.add_subparsers(dest='device_action', required=True)
     operations.add_parser('list', help='names/enabled status only, no credentials')
     for action in ('add', 'remove', 'rename', 'reset'):
-        operation = operations.add_parser(action, aliases=['rotate'] if action == 'reset' else [],
-            help=('reset UUID and subscription key (rotate is compatible)' if action == 'reset' else
+        operation = operations.add_parser(action,
+            help=('reset UUID and subscription key' if action == 'reset' else
                   'rename OLD NEW without changing keys/URLs' if action == 'rename' else None))
         operation.add_argument('names', nargs='+' if action == 'add' else (2 if action == 'rename' else 1),
             metavar='NAME')

@@ -1253,10 +1253,6 @@ def accepted_adapter_digest(stored, current):
     return stored == current or stored in ADAPTER_PREDECESSORS
 
 
-def canonical_device_action(action):
-    return 'rotate' if action == 'reset' else action
-
-
 def validate_rename_names(names, roster):
     if names[0] not in roster:
         raise Error('Unknown source device for rename')
@@ -1277,10 +1273,12 @@ def rename_target_has_history(database, target):
 
 def device_request(request):
     names = request.get('names')
-    action = canonical_device_action(request.get('device_action'))
+    action = request.get('device_action')
+    if action not in ('add', 'remove', 'reset', 'rename'):
+        raise Error('Unsupported device action; no conversion or replay; preserve pending for manual review')
     if action == 'rename' and isinstance(names, list) and len(names) == 2 and names[0] == names[1]:
         raise Error('Rename requires two distinct names; no changes made')
-    if (action not in ('add', 'remove', 'rotate', 'rename') or not isinstance(names, list) or not names or
+    if (action not in ('add', 'remove', 'reset', 'rename') or not isinstance(names, list) or not names or
             len(set(names)) != len(names) or any(not isinstance(n, str) or
                 not re.fullmatch(r'[a-z][a-z0-9-]{0,31}', n) for n in names) or
             (action == 'rename' and len(names) != 2) or
@@ -1289,7 +1287,6 @@ def device_request(request):
         raise Error('Invalid device operation/names/operation ID')
     bound = {k: request[k] for k in ('owner', 'machine_id', 'endpoint', 'config',
                                     'device_action', 'names', 'operation_id')}
-    bound['device_action'] = action  # reset aliases the existing rotate protocol before hashing.
     return hashlib.sha256(dumps(bound).encode()).hexdigest()
 
 
@@ -1319,7 +1316,6 @@ def devices_prepare(upload):
         stage = Path(tmp)
         safe_unpack(upload, stage)
         request = read_json(stage / 'request.json')
-        request['device_action'] = canonical_device_action(request.get('device_action'))
         check_request_identity(request)
         manifest = device_owner(request)
         fingerprint = device_request(request)
@@ -1359,7 +1355,7 @@ def devices_prepare(upload):
             return result
         if action == 'add' and set(names) & existing:
             raise Error('Mixed existing/new names; no partial add')
-        if action == 'rotate' and names[0] not in existing:
+        if action == 'reset' and names[0] not in existing:
             raise Error('Unknown device for reset')
         if action == 'rename':
             validate_rename_names(names, existing)

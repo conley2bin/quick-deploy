@@ -84,7 +84,7 @@ bash vps/setup.sh devices reset tablet           # 重置该设备 UUID + 订阅
 bash vps/setup.sh devices remove device5         # 撤销该设备代理认证和订阅地址
 ```
 
-旧命令 `devices rotate NAME` 兼容 `reset NAME`。同名重命名、旧名不存在或新名已占用会拒绝。
+同名重命名、旧名不存在或新名已占用会拒绝。
 变更会重启自有核心/订阅前端，**所有设备可能短暂重连**。成功后自动更新离机备份及上方JSON；
 失败先运行 `bash vps/setup.sh recover`；提示 queued 时等恢复服务退出后再跑，不要重复重置/改名。
 自选核心会保存路径；失效时可用 `recover --mihomo /path/to/mihomo` 替换。旧备份含历史钥匙，恢复可能复活旧账户；

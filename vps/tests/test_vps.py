@@ -52,15 +52,16 @@ class Local(unittest.TestCase):
             self.assertEqual(vps.resolve_mihomo('custom-mihomo'), str(executable))
         self.assertEqual(vps.parser().parse_args(['recover','--mihomo',str(executable)]).mihomo,str(executable))
         self.doc['current'] = self.record
+        request=dict(vps.request_for(self.doc,self.record),device_action='reset',names=['home'],operation_id='c'*32)
         for saved, override in ((str(executable), None), ('/vanished/core',str(executable)), (None,str(executable))):
-            pending = {'record':self.record,'mode':'devices','request':{},'mihomo':saved}
+            pending = {'record':self.record,'mode':'devices','request':request,'mihomo':saved}
             host.atomic(self.state/'pending.json',host.dumps(pending))
             with mock.patch.object(vps,'remote',return_value={'committed':True,'machine_id':'a'*32}), \
                     mock.patch.object(vps,'backup_remote',return_value=self.state/'fixture.tar'), \
                     mock.patch.object(vps,'validate_outputs') as validate, mock.patch.object(vps,'export_after_commit'):
                 vps.recover_local(self.state,self.doc,override)
                 self.assertEqual(validate.call_args.kwargs['binary'],str(executable))
-        host.atomic(self.state/'pending.json',host.dumps({'record':self.record,'mode':'devices','request':{},'mihomo':'/vanished/core'}))
+        host.atomic(self.state/'pending.json',host.dumps({'record':self.record,'mode':'devices','request':request,'mihomo':'/vanished/core'}))
         with mock.patch.object(vps,'remote',return_value={'committed':True,'machine_id':'a'*32}), \
                 mock.patch.object(vps,'backup_remote',return_value=self.state/'fixture.tar'), \
                 mock.patch.object(vps,'validate_outputs') as validate:
@@ -80,16 +81,23 @@ class Local(unittest.TestCase):
                 backup.assert_not_called();confirm.assert_not_called()
                 self.assertFalse((self.state/'pending.json').exists())
 
-    def test_reset_rotate_canonical_fingerprint_keeps_existing_receipts(self):
-        for action in ('reset','rotate'):
-            args=vps.parser().parse_args(['devices',action,'home'])
-            self.assertEqual(host.canonical_device_action(args.device_action),'rotate')
+    def test_removed_rotate_refuses_and_old_pending_is_preserved(self):
+        args=vps.parser().parse_args(['devices','reset','home'])
+        self.assertEqual(args.device_action,'reset')
+        with mock.patch('sys.stderr'),mock.patch.object(vps,'remote') as remote,mock.patch.object(vps,'backup_remote') as backup:
+            with self.assertRaises(SystemExit) as exit:
+                vps.main(['devices','rotate','home'])
+            self.assertEqual(exit.exception.code,2);remote.assert_not_called();backup.assert_not_called()
         request=dict(vps.request_for(self.doc,self.record),device_action='rotate',names=['home'],operation_id='a'*32)
-        expected=host.device_request(request)
-        old_namespace={'__name__':'reviewed_918_protocol'}
-        exec(compile(subprocess.check_output(['git','show','918103e:vps/lib/host.py']), '918103e-host.py', 'exec'),old_namespace)
-        self.assertEqual(old_namespace['device_request'](request),expected)
-        self.assertEqual(host.device_request(dict(request,device_action='reset')),expected)
+        with self.assertRaisesRegex(host.Error,'Unsupported device action'):host.device_request(request)
+        self.assertTrue(host.device_request(dict(request,device_action='reset')))
+        original=host.dumps({'record':self.record,'mode':'devices','request':request})
+        host.atomic(self.state/'pending.json',original)
+        with mock.patch.object(vps,'remote') as remote,mock.patch.object(vps,'backup_remote') as backup:
+            with self.assertRaisesRegex(host.Error,'Unsupported device action'):
+                vps.recover_local(self.state,self.doc)
+            remote.assert_not_called();backup.assert_not_called()
+        self.assertEqual((self.state/'pending.json').read_text(),original)
         request.update(device_action='rename',names=['home','tablet'])
         self.assertNotEqual(host.device_request(request),host.device_request(dict(request,names=['tablet','home'])))
 

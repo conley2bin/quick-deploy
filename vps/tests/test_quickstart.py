@@ -52,7 +52,7 @@ class Quickstart(unittest.TestCase):
         self.assertEqual(devices[2].names, ['device4', 'tablet'])
         self.assertEqual(devices[3].names, ['tablet'])
         self.assertEqual(devices[4].names, ['device5'])
-        for action in ('rename', 'reset', 'rotate'):
+        for action in ('rename', 'reset'):
             with mock.patch('sys.stdout'):
                 with self.assertRaises(SystemExit) as exit:
                     vps.parser().parse_args(['devices', action, '--help'])

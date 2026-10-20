@@ -221,7 +221,7 @@ class Native(unittest.TestCase):
         host.API(self.manifest).call('/panel/api/clients/update/device4', target)
         before = copy.deepcopy(self.native_accounts())
         details = host.API(self.manifest).call('/panel/api/clients/get/device4')['client']
-        request = self.device_request('rotate', 'device4')
+        request = self.device_request('reset', 'device4')
         self.device_prepare(request)
         self.device_finish(request)
         after = self.native_accounts()
@@ -307,8 +307,8 @@ class Native(unittest.TestCase):
         before = copy.deepcopy(self.native_accounts())
         original_id, original_sub = before['company']['id'], before['company']['subId']
         cases = [('alias-add','add',['alias-device'],uuid.UUID(original_id),None,0),
-                 ('old-uuid-rotate','rotate',['company'],uuid.UUID(original_id),None,0),
-                 ('old-sub-rotate','rotate',['company'],None,original_sub,0),
+                 ('old-uuid-reset','reset',['company'],uuid.UUID(original_id),None,0),
+                 ('old-sub-reset','reset',['company'],None,original_sub,0),
                  ('batch-duplicate','add',['device4','device5'],uuid.uuid4(),None,1)]
         real_call = host.API.call
         for label, action, names, forced_id, forced_sub, expected_writes in cases:
@@ -459,7 +459,7 @@ class Native(unittest.TestCase):
             self.assertEqual({k:v for k,v in record.items() if k not in ('uuid','updatedAt')},
                              {k:v for k,v in records[name].items() if k not in ('uuid','updatedAt')})
 
-    def test_rename_native_refusals_and_reset_rotate_receipt_alias(self):
+    def test_rename_native_refusals_and_reset_receipt_replay(self):
         self.device_fixture();before=self.native_accounts()
         for old,new in [('home','home'),('missing','tablet'),('home','phone'),('home','Bad/Name')]:
             with self.subTest(old=old,new=new),mock.patch.object(host,'ctl',wraps=host.ctl) as control, \
@@ -467,13 +467,13 @@ class Native(unittest.TestCase):
                 with self.assertRaises(host.Error):self.device_prepare(self.device_request('rename',old,new))
                 control.assert_not_called();writes.assert_not_called()
                 self.assertEqual(self.native_accounts(),before)
-        request=self.device_request('reset','home');alias=dict(request,device_action='rotate')
-        self.assertEqual(host.device_request(request),host.device_request(alias))
-        self.device_prepare(request);self.device_finish(alias)
+        request=self.device_request('reset','home')
+        removed=dict(request,device_action='rotate')
+        with self.assertRaisesRegex(host.Error,'Unsupported device action'):self.device_prepare(removed)
+        self.device_prepare(request);self.device_finish(request)
         after=self.native_accounts()
         self.assertNotEqual(after['home']['id'],before['home']['id'])
         self.assertNotEqual(after['home']['subId'],before['home']['subId'])
-        self.assertTrue(self.device_prepare(alias)['committed'])
         self.assertTrue(self.device_prepare(request)['committed'])
         self.assertEqual(self.native_accounts(),after)
         self.assertEqual(after['company'],before['company']);self.assertEqual(after['phone'],before['phone'])
@@ -851,7 +851,7 @@ class Native(unittest.TestCase):
             current = self.native_accounts()['tablet']['id']
             self.assertNotEqual(prior,current)
             self.assertTrue((state/'pending.json').exists())
-            self.assertEqual(vps.load(state/'pending.json')['request']['device_action'],'rotate')
+            self.assertEqual(vps.load(state/'pending.json')['request']['device_action'],'reset')
             self.assertEqual(len(exports),2,'failed postcommit backup must not publish stale export')
             with self.assertRaisesRegex(host.Error,'pending'):
                 vps.devices(state,document,argparse.Namespace(device_action='reset',names=['tablet'],mihomo=str(custom_core)))
