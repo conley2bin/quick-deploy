@@ -333,6 +333,111 @@ class Native(unittest.TestCase):
         with self.assertRaisesRegex(host.Error,'Duplicate'):
             host.device_names(alias)
 
+    def test_rename_native_policy_usage_hwid_and_918_rollback(self):
+        import sqlite3
+        self.device_fixture()
+        deployed = subprocess.check_output(['git','show','918103e:vps/lib/host.py'])
+        host.atomic(host.ROOT/'host.py',deployed,0o700)
+        client=self.native_accounts()['company']
+        client.update(enable=False,totalGB=1234567890,expiryTime=int(time.time()*1000)+30*86400000,
+            limitIp=2,trafficReset='monthly',trafficResetDay=6,reset=7,resetMax=9,limitHwid=3,
+            comment='rename-policy',group='fixture-group',adTag='fixture-ad')
+        api=host.API(self.manifest);api.call('/panel/api/clients/update/company',client)
+        api.call('/panel/api/clients/updateTraffic/company',{'upload':123456,'download':789012})
+        before=copy.deepcopy(self.native_accounts());record=api.call('/panel/api/clients/get/company')['client']
+        def rows(table):
+            with sqlite3.connect(self.work/'db/x-ui.db') as db:
+                db.row_factory=sqlite3.Row
+                return [dict(row) for row in db.execute('select * from '+table)]
+        traffic=next(r for r in rows('client_traffics') if r['email']=='company');joins=rows('client_inbounds')
+        request=self.device_request('rename','company','tablet');real_call=host.API.call
+        def after_write(api,path,data=None):
+            value=real_call(api,path,data)
+            if path=='/panel/api/clients/update/company' and data['email']=='tablet':
+                self.assertIn('tablet',self.native_accounts())
+                raise host.Error('fixture loss after native rename')
+            return value
+        with mock.patch.object(host.API,'call',new=after_write):
+            with self.assertRaisesRegex(host.Error,'after native rename'):self.device_prepare(request)
+        self.assertEqual(self.native_accounts(),before)
+        self.assertEqual((host.ROOT/'host.py').read_bytes(),deployed)
+        self.assertEqual(rows('client_inbounds'),joins)
+        self.assertEqual(next(r for r in rows('client_traffics') if r['email']=='company'),traffic)
+        with self.assertRaisesRegex(host.Error,'different request'):
+            self.device_prepare(dict(request,names=['company','different']))
+        self.device_prepare(request);self.device_finish(request)
+        after=self.native_accounts();updated=host.API(self.manifest).call('/panel/api/clients/get/tablet')['client']
+        self.assertNotIn('company',after);self.assertIn('tablet',after)
+        self.assertEqual({k:v for k,v in updated.items() if k not in ('email','updatedAt')},
+                         {k:v for k,v in record.items() if k not in ('email','updatedAt')})
+        self.assertEqual(after['tablet']['id'],before['company']['id'])
+        self.assertEqual(after['tablet']['subId'],before['company']['subId'])
+        self.assertFalse(after['tablet']['enable'])
+        self.assertEqual(rows('client_inbounds'),joins)
+        newtraffic=next(r for r in rows('client_traffics') if r['email']=='tablet')
+        self.assertEqual({k:v for k,v in newtraffic.items() if k!='email'},
+                         {k:v for k,v in traffic.items() if k!='email'})
+        self.assertEqual((newtraffic['up'],newtraffic['down']),(123456,789012))
+        self.assertEqual({n:after[n] for n in ('home','phone')},{n:before[n] for n in ('home','phone')})
+        with self.assertRaises(host.Error):host.API(self.manifest).call('/panel/api/clients/get/company')
+        receipt=self.device_prepare(request);self.assertTrue(receipt['committed'])
+        self.assertEqual(self.native_accounts(),after)
+
+    def test_rename_five_native_urls_outputs_and_closed_archives(self):
+        self.device_fixture()
+        add=self.device_request('add','device4','device5');self.device_prepare(add);self.device_finish(add)
+        original=copy.deepcopy(self.manifest);before=self.native_accounts();paths=host.feed_paths(original)
+        request=self.device_request('rename','home','home-laptop')
+        self.device_prepare(request);self.device_finish(request)
+        self.assertCountEqual(host.feed_paths(self.manifest),paths)
+        self.assertEqual(len(set(host.feed_paths(self.manifest))),10)
+        self.assertEqual(len(paths),10)
+        self.assertEqual(vps.subscription_urls(self.manifest)['home-laptop'],vps.subscription_urls(original)['home'])
+        self.assertNotIn('home',self.manifest['accounts'])
+        self.assertEqual(self.manifest['reality'],original['reality'])
+        for name in self.manifest['accounts']:
+            for fmt in ('sub','mihomo'):
+                host.validate_feed_scope(self.manifest,name,host.get_feed(self.manifest,name,fmt),fmt)
+        archive=host.export_backup();stage=self.root/'renamed-archive';stage.mkdir()
+        with archive.open('rb') as stream:host.safe_unpack(stream,stage)
+        renamed=host.verify_backup(stage,self.lock)
+        self.assertIn('home-laptop',renamed['accounts']);self.assertNotIn('home',renamed['accounts'])
+        self.stop();self.work=stage/'deployment';self.manifest=renamed;host.install_runtime(self.work,self.lock);self.start()
+        host.configure_native(self.work,self.manifest,False)
+        self.assertEqual(len(host.backend_health(self.work,self.manifest)),10)
+        controlled=self.native_accounts()
+        self.assertEqual(controlled['home-laptop']['id'],before['home']['id'])
+        self.assertEqual(controlled['home-laptop']['subId'],before['home']['subId'])
+        records={name:host.API(self.manifest).call('/panel/api/clients/get/'+name)['client'] for name in controlled}
+        self.manifest['reality']=host.native_keys(self.work)
+        host.configure_native(self.work,self.manifest,False,rotate=True)
+        self.assertEqual(len(host.backend_health(self.work,self.manifest)),10)
+        for name,client in self.native_accounts().items():
+            self.assertNotEqual(client['id'],controlled[name]['id'])
+            self.assertEqual(client['subId'],controlled[name]['subId'])
+            record=host.API(self.manifest).call('/panel/api/clients/get/'+name)['client']
+            self.assertEqual({k:v for k,v in record.items() if k not in ('uuid','updatedAt')},
+                             {k:v for k,v in records[name].items() if k not in ('uuid','updatedAt')})
+
+    def test_rename_native_refusals_and_reset_rotate_receipt_alias(self):
+        self.device_fixture();before=self.native_accounts()
+        for old,new in [('home','home'),('missing','tablet'),('home','phone'),('home','Bad/Name')]:
+            with self.subTest(old=old,new=new),mock.patch.object(host,'ctl',wraps=host.ctl) as control, \
+                    mock.patch.object(host,'atomic',wraps=host.atomic) as writes:
+                with self.assertRaises(host.Error):self.device_prepare(self.device_request('rename',old,new))
+                control.assert_not_called();writes.assert_not_called()
+                self.assertEqual(self.native_accounts(),before)
+        request=self.device_request('reset','home');alias=dict(request,device_action='rotate')
+        self.assertEqual(host.device_request(request),host.device_request(alias))
+        self.device_prepare(request);self.device_finish(alias)
+        after=self.native_accounts()
+        self.assertNotEqual(after['home']['id'],before['home']['id'])
+        self.assertNotEqual(after['home']['subId'],before['home']['subId'])
+        self.assertTrue(self.device_prepare(alias)['committed'])
+        self.assertTrue(self.device_prepare(request)['committed'])
+        self.assertEqual(self.native_accounts(),after)
+        self.assertEqual(after['company'],before['company']);self.assertEqual(after['phone'],before['phone'])
+
     def stored_adapter(self):
         import types
         module = types.ModuleType('stored_device_adapter')
@@ -615,7 +720,7 @@ class Native(unittest.TestCase):
         old_client, home_client = client(old_node), client(home_node)
         existing = echo(old_client)
         echo(home_client).close()
-        request = self.device_request('rotate','device4')
+        request = self.device_request('reset','device4')
         self.device_prepare(request); self.device_finish(request)
         try:
             existing.sendall(b'after-rotation\n')
@@ -668,7 +773,7 @@ class Native(unittest.TestCase):
                 manifest = host.read_json(self.work/'manifest.json')
                 return {name:{'enabled':account['enable']} for name,account in host.snapshot_accounts(self.work/'db/x-ui.db',manifest).items()}
             if action == 'status':
-                return {'machine_id':host.machine_id(),'node_id':self.manifest['node_id'],'healthy':True,'adapter_sha256':host.digest(host.ROOT/'host.py')}
+                return {'machine_id':host.machine_id(),'node_id':self.manifest['node_id'],'healthy':True,'adapter_sha256':host.digest(host.ROOT/'host.py'),'devices':list(host.read_json(self.work/'manifest.json')['accounts'])}
             raise AssertionError(action)
         def exported(state):
             committed = vps.load(state/'state.json')
@@ -687,23 +792,33 @@ class Native(unittest.TestCase):
                 self.assertNotIn(account['id'],output.getvalue())
                 self.assertNotIn(account['subId'],output.getvalue())
             self.manifest = host.read_json(self.work/'manifest.json')
-            prior = self.native_accounts()['device4']['id']
+            old_url=vps.subscription_urls(self.manifest)['device4']
+            host.atomic(state/'outputs/operator-notes.txt','unrelated-output')
+            vps.devices(state,document,argparse.Namespace(device_action='rename',names=['device4','tablet'],mihomo=str(custom_core)))
+            self.manifest = host.read_json(self.work/'manifest.json')
+            self.assertEqual(vps.subscription_urls(self.manifest)['tablet'],old_url)
+            self.assertNotIn('device4',self.manifest['accounts'])
+            self.assertFalse((state/'outputs/device4.yaml').exists());self.assertFalse((state/'outputs/device4.txt').exists())
+            self.assertTrue((state/'outputs/tablet.yaml').is_file())
+            self.assertEqual((state/'outputs/operator-notes.txt').read_text(),'unrelated-output')
+            prior = self.native_accounts()['tablet']['id']
             counts['backup'] = 0; fail_after[0] = True
             with self.assertRaisesRegex(host.Error,'transport lost'):
-                vps.devices(state,document,argparse.Namespace(device_action='rotate',names=['device4'],mihomo=str(custom_core)))
-            current = self.native_accounts()['device4']['id']
+                vps.devices(state,document,argparse.Namespace(device_action='reset',names=['tablet'],mihomo=str(custom_core)))
+            current = self.native_accounts()['tablet']['id']
             self.assertNotEqual(prior,current)
             self.assertTrue((state/'pending.json').exists())
-            self.assertEqual(len(exports),1,'failed postcommit backup must not publish stale export')
+            self.assertEqual(vps.load(state/'pending.json')['request']['device_action'],'rotate')
+            self.assertEqual(len(exports),2,'failed postcommit backup must not publish stale export')
             with self.assertRaisesRegex(host.Error,'pending'):
-                vps.devices(state,document,argparse.Namespace(device_action='rotate',names=['device4'],mihomo=str(custom_core)))
+                vps.devices(state,document,argparse.Namespace(device_action='reset',names=['tablet'],mihomo=str(custom_core)))
             fail_after[0] = False
             self.assertEqual(vps.load(state/'pending.json')['mihomo'],str(custom_core))
             real_which = shutil.which
             with mock.patch.object(vps.shutil,'which',side_effect=lambda name:None if name in ('verge-mihomo','mihomo') else real_which(name)):
                 vps.recover_local(state,document)
-            self.assertEqual(self.native_accounts()['device4']['id'],current)
-            self.assertEqual(exports[-1]['accounts']['device4']['id'],current)
+            self.assertEqual(self.native_accounts()['tablet']['id'],current)
+            self.assertEqual(exports[-1]['accounts']['tablet']['id'],current)
             self.assertFalse((state/'pending.json').exists())
 
     def test_review_snapshot_revocation_and_full_policy_restore(self):

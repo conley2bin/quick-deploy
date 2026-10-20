@@ -233,7 +233,7 @@ Xray26.10.10、Caddy2.11.7二进制和 geodata，**不运行上游安装器**。
 - 面板通过 `ssh -N -L 2053:127.0.0.1:2053 <已核验目标>` 管理，按需加自己的 `-i/-p`。
   私有备份中 `deployment/manifest.json` 保存 admin_path/admin_user/admin_password；
   在私人本地查看器读取，勿贴聊天/工单。浏览器只访问该 SSH 隧道的本地管理路径。
-- 首选脚本 `devices list/add/remove/rotate` 管理名册和钥匙，见下节。面板 **Clients** 可单独禁用
+- 首选脚本 `devices list/add/rename/remove/reset`（`rotate`兼容） 管理名册和钥匙，见下节。面板 **Clients** 可单独禁用
   已有设备或修改其策略；之后重跑同目标 `deploy` 同步精确公开路径及备份。面板擅自新增/删除成员会拒绝，
   status/backup/export 不会把未知原生账户静默收编。
   v3.10.2 的全量 inbound 更新会保护全局 client 记录，不能把旧表单当作凭据轮换接口。
@@ -257,9 +257,18 @@ Xray26.10.10、Caddy2.11.7二进制和 geodata，**不运行上游安装器**。
   新旧混合名字、重复名字明确拒绝。已删除账户不会因重跑 deploy 自动复活。
 - `remove <name>` 删除该原生账户并移除其两条前端路径，旧 UUID 不能建立新代理连接，旧 URL404。
   已不存在的名字为幂等无变化。便利JSON不再列它，历史归档不自动删除。
-- `rotate <name>` 从新读取的完整 Client DTO及独立LimitHwid只更换该设备 UUID和SubID，
+- `reset <name>` 从新读取的完整 Client DTO及独立LimitHwid只更换该设备 UUID和SubID，
   保留完整策略与禁用状态、其他设备、全局Reality密钥；旧订阅不能取回新钥匙。
-  客户端必须重新导入新 URL。它不是幂等的新操作：每次明确发起都会产生新钥匙，失败先 recover。
+  客户端必须重新导入新 URL。它不是幂等的新操作：每次明确发起都会产生新钥匙，失败先 recover。`rotate <name>` 是同一操作的兼容拼写；两者在请求摘要/receipt比较前
+  都规范为既有内部动作`rotate`，旧pending/receipt不换协议、不引入第二条重置路径。
+- `rename <old> <new>` 使用原生`/clients/update/<old>`，提交完整新读取Client及LimitHwid，只改email。
+  原生稳定ClientRecord ID、入站join、UUID/SubID、完整策略、HWID限制及已持久化用量随新名保留；
+  不删除重建，也不直接改账户SQL。已用名称/不存在旧名/非法名拒绝，同名明确无写入拒绝。
+  本地先通过只读status核对名册再备份，远端事务写入前复核；operationID绑定有序OLD/NEW。
+  最新JSON键改为new，URL和全部公开能力路径不变，无需重新导入；仍沿用核心重启，所有设备可能重连。
+  本地提交先保存权威backup指针，再仅移除原名两个受管理0600普通profile文件，最后清pending；
+  未知文件/链接拒绝删除并保留已提交pending供recover重试，不清理无关输出/历史归档。
+  旧`outputs/`或失败候选不是导出权威；canonical JSON始终从最新已提交备份生成。
 
 设备变更沿用既有 operation flock、15分钟 boot/deadline pending、guard及非阻塞周期恢复。
 不增加后台管理服务或另一套数据库：
@@ -369,7 +378,7 @@ bash -n vps/setup.sh
 **高端口回环**3x-ui/Xray/Caddy，检查真正输出、凭据轮换/禁用、Mihomo解析、闭合数据库恢复、
 TLS精确路径和错误证书拒绝。TLS正向测试使用fixture CA，**不是公网ACME签发证据**。
 设备测试还使用本地Caddy混合TLS目标、原生Mihomo经REALITY到回环echo服务，证明新钥匙可用、
-旧UUID拒绝和rotate/remove已有流关闭，并核对真实Caddy旧URL404/新URL200、未影响的其他设备。
+旧UUID拒绝和reset/remove已有流关闭，并核对真实Caddy旧URL404/新URL200、未影响的其他设备。
 echo测试的精确origin端口路由例外和freedom最终规则只存在于临时fixture，绝不写入生产；
 原统计API阻断仍保留。systemd控制/公网CA探测以fixture替代，存储adapter代码被独立载入验证
 boot/deadline及恢复中断。额外fork/os._exit测试绕过finally，覆盖首次/提交后/核对备份stop；

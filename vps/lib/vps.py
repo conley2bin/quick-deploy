@@ -411,6 +411,26 @@ def export_after_commit(state):
     print('Private subscription URL copy: ' + str(path))
 
 
+def retire_renamed_outputs(state, request):
+    if request.get('device_action') != 'rename':
+        return
+    host.device_request(request)
+    directory = os.open(state / 'outputs', os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        for extension in ('.yaml', '.txt'):
+            name = request['names'][0] + extension
+            try:
+                info = os.stat(name, dir_fd=directory, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o600:
+                raise host.Error('Rename already committed; refusing unknown old profile output. Preserve it and retry recover')
+            os.unlink(name, dir_fd=directory)
+        os.fsync(directory)
+    finally:
+        os.close(directory)
+
+
 def remember_commit(state, document, record, backup, result):
     previous = document['current']
     if previous and previous['endpoint'] != record['endpoint'] and previous not in document['previous']:
@@ -419,6 +439,8 @@ def remember_commit(state, document, record, backup, result):
     document.update(current=record, backup=str(backup.absolute()))
     host.atomic(state / 'state.json', host.dumps(document))
     if (state / 'pending.json').exists():
+        pending = load(state / 'pending.json')
+        retire_renamed_outputs(state, pending.get('request', {}))
         (state / 'pending.json').unlink()
 
 
@@ -487,15 +509,19 @@ def devices(state, document, args):
         for name, item in roster.items():
             print(name + (' enabled' if item['enabled'] else ' disabled'))
         return
-    request.update(device_action=args.device_action, names=args.names,
+    request.update(device_action=host.canonical_device_action(args.device_action), names=args.names,
                    operation_id=secrets.token_hex(16), adapter_sha256=host.digest(MODULE / 'lib/host.py'))
     host.device_request(request)  # names/shape before any remote backup/restart
     binary = resolve_mihomo(args.mihomo)
     checked = remote(record, 'status', request_for(document, record))
     if not host.accepted_adapter_digest(checked.get('adapter_sha256'), request['adapter_sha256']):
         raise host.Error('Unknown stored adapter digest; no device backup/service mutation')
+    if request['device_action'] == 'rename':
+        if not isinstance(checked.get('devices'), list):
+            raise host.Error('Missing owned roster in read-only status')
+        host.validate_rename_names(request['names'], checked['devices'])
     confirm('Device management restarts the owned core/front: ALL devices may briefly reconnect. '
-            'Remove/rotate revoke old credentials; historical backups still contain them. Proceed?')
+            'Remove/reset revoke old credentials; rename preserves keys/URLs. Historical backups contain old keys. Proceed?')
     before = backup_remote(state, document, record)
     pending = {'record': record, 'mode': 'devices', 'request': request, 'backup': None, 'before': str(before), 'mihomo': binary}
     host.atomic(state / 'pending.json', host.dumps(pending))
@@ -516,7 +542,7 @@ def devices(state, document, args):
         remember_commit(state, document, record, after, result)
     except BaseException:
         print('Device operation incomplete or already committed: pending intent retained. Run recover; '
-              'do not repeat rotate until reconciliation completes.', file=sys.stderr)
+              'do not repeat reset/rename until reconciliation completes.', file=sys.stderr)
         raise
     export_after_commit(state)
     print('Device roster committed; latest off-node backup and protected URL export updated.')
@@ -580,9 +606,12 @@ def parser():
     a = sub.add_parser('devices', help='manage manifest-owned device credentials')
     operations = a.add_subparsers(dest='device_action', required=True)
     operations.add_parser('list', help='names/enabled status only, no credentials')
-    for action in ('add', 'remove', 'rotate'):
-        operation = operations.add_parser(action)
-        operation.add_argument('names', nargs='+' if action == 'add' else 1)
+    for action in ('add', 'remove', 'rename', 'reset'):
+        operation = operations.add_parser(action, aliases=['rotate'] if action == 'reset' else [],
+            help=('reset UUID and subscription key (rotate is compatible)' if action == 'reset' else
+                  'rename OLD NEW without changing keys/URLs' if action == 'rename' else None))
+        operation.add_argument('names', nargs='+' if action == 'add' else (2 if action == 'rename' else 1),
+            metavar='NAME')
         operation.add_argument('--mihomo', help='native core executable for format validation')
     return p
 

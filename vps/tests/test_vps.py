@@ -69,6 +69,52 @@ class Local(unittest.TestCase):
             validate.assert_not_called()
             self.assertTrue((self.state/'pending.json').exists())
 
+    def test_rename_refuses_invalid_missing_or_collision_before_backup(self):
+        self.doc['current']=self.record
+        for names in (['home','home'],['missing','tablet'],['home','phone'],['home','Bad/Name']):
+            args=vps.parser().parse_args(['devices','rename',*names])
+            status={'adapter_sha256':host.DEPLOYED_ADAPTER_SHA256,'devices':['company','home','phone']}
+            with mock.patch.object(vps,'remote',return_value=status),mock.patch.object(vps,'backup_remote') as backup, \
+                    mock.patch.object(vps,'confirm') as confirm,mock.patch.object(vps,'resolve_mihomo',return_value='/core'):
+                with self.assertRaises(host.Error):vps.devices(self.state,self.doc,args)
+                backup.assert_not_called();confirm.assert_not_called()
+                self.assertFalse((self.state/'pending.json').exists())
+
+    def test_reset_rotate_canonical_fingerprint_keeps_existing_receipts(self):
+        for action in ('reset','rotate'):
+            args=vps.parser().parse_args(['devices',action,'home'])
+            self.assertEqual(host.canonical_device_action(args.device_action),'rotate')
+        request=dict(vps.request_for(self.doc,self.record),device_action='rotate',names=['home'],operation_id='a'*32)
+        expected=host.device_request(request)
+        old_namespace={'__name__':'reviewed_918_protocol'}
+        exec(compile(subprocess.check_output(['git','show','918103e:vps/lib/host.py']), '918103e-host.py', 'exec'),old_namespace)
+        self.assertEqual(old_namespace['device_request'](request),expected)
+        self.assertEqual(host.device_request(dict(request,device_action='reset')),expected)
+        request.update(device_action='rename',names=['home','tablet'])
+        self.assertNotEqual(host.device_request(request),host.device_request(dict(request,names=['tablet','home'])))
+
+    def test_committed_rename_cleanup_is_exact_and_recoverable(self):
+        self.doc['current']=self.record
+        output=vps.private_dir(self.state/'outputs')
+        outside=self.state/'outside';host.atomic(outside,'outside-unchanged')
+        request=dict(vps.request_for(self.doc,self.record),device_action='rename',names=['home','tablet'],operation_id='b'*32)
+        host.atomic(self.state/'pending.json',host.dumps({'record':self.record,'mode':'devices','request':request}))
+        (output/'home.yaml').symlink_to(outside)
+        host.atomic(output/'home.txt','managed-old');host.atomic(output/'tablet.yaml','new-current')
+        host.atomic(output/'unrelated.txt','unrelated')
+        backup=self.state/'postcommit.tar'
+        with self.assertRaisesRegex(host.Error,'already committed'):
+            vps.remember_commit(self.state,self.doc,self.record,backup,{'machine_id':'a'*32})
+        self.assertTrue((self.state/'pending.json').exists())
+        self.assertEqual(outside.read_text(),'outside-unchanged')
+        (output/'home.yaml').unlink();host.atomic(output/'home.yaml','managed-old')
+        vps.remember_commit(self.state,self.doc,self.record,backup,{'machine_id':'a'*32})
+        self.assertFalse((self.state/'pending.json').exists())
+        self.assertFalse((output/'home.yaml').exists());self.assertFalse((output/'home.txt').exists())
+        self.assertEqual((output/'tablet.yaml').read_text(),'new-current')
+        self.assertEqual((output/'unrelated.txt').read_text(),'unrelated')
+        self.assertEqual(outside.read_text(),'outside-unchanged')
+
     def test_private_atomic_noop_and_failed_write_preserves_old(self):
         path = self.state / 'state.json'
         host.atomic(path, 'original')

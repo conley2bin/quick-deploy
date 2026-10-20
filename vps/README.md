@@ -1,6 +1,6 @@
 # 单台 VPS 快速上手
 
-新安装默认为公司电脑、家里电脑、手机创建独立账户；可继续添加、删除和轮换设备。
+新安装默认为公司电脑、家里电脑、手机创建独立账户；可继续添加、重命名、删除和重置设备钥匙。
 VPS 上运行 3x-ui / Xray，Caddy 提供 HTTPS 订阅；脚本不修改客户端或现有机场。
 
 ## 先准备好
@@ -79,12 +79,14 @@ TCP 指纹；URI 不带手机分流策略，国内/Bili 直连需单独核验。
 ```bash
 bash vps/setup.sh devices list                  # 只列名称/启用状态，不打印钥匙
 bash vps/setup.sh devices add device4 device5    # 一次新增多个独立账户；原3个不变
-bash vps/setup.sh devices rotate device4         # 仅换该设备 UUID + 订阅钥匙，需重新导入
+bash vps/setup.sh devices rename device4 tablet  # 只改名，钥匙/链接不变，无需重新导入
+bash vps/setup.sh devices reset tablet           # 重置该设备 UUID + 订阅钥匙，需重新导入
 bash vps/setup.sh devices remove device5         # 撤销该设备代理认证和订阅地址
 ```
 
+旧命令 `devices rotate NAME` 兼容 `reset NAME`。同名重命名、旧名不存在或新名已占用会拒绝。
 变更会重启自有核心/订阅前端，**所有设备可能短暂重连**。成功后自动更新离机备份及上方JSON；
-失败先运行 `bash vps/setup.sh recover`；提示 queued 时等恢复服务退出后再跑，不要重复轮换。
+失败先运行 `bash vps/setup.sh recover`；提示 queued 时等恢复服务退出后再跑，不要重复重置/改名。
 自选核心会保存路径；失效时可用 `recover --mihomo /path/to/mihomo` 替换。旧备份含历史钥匙，恢复可能复活旧账户；
 请用最新撤销后备份。[事务、重试和恢复边界](DESIGN.md#设备名册与钥匙事务)。
 

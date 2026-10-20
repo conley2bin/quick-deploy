@@ -1253,17 +1253,32 @@ def accepted_adapter_digest(stored, current):
     return stored == current or stored in ADAPTER_PREDECESSORS
 
 
+def canonical_device_action(action):
+    return 'rotate' if action == 'reset' else action
+
+
+def validate_rename_names(names, roster):
+    if names[0] not in roster:
+        raise Error('Unknown source device for rename')
+    if names[1] in roster:
+        raise Error('Rename target already exists')
+
+
 def device_request(request):
     names = request.get('names')
-    action = request.get('device_action')
-    if (action not in ('add', 'remove', 'rotate') or not isinstance(names, list) or not names or
+    action = canonical_device_action(request.get('device_action'))
+    if action == 'rename' and isinstance(names, list) and len(names) == 2 and names[0] == names[1]:
+        raise Error('Rename requires two distinct names; no changes made')
+    if (action not in ('add', 'remove', 'rotate', 'rename') or not isinstance(names, list) or not names or
             len(set(names)) != len(names) or any(not isinstance(n, str) or
                 not re.fullmatch(r'[a-z][a-z0-9-]{0,31}', n) for n in names) or
-            (action != 'add' and len(names) != 1) or
+            (action == 'rename' and len(names) != 2) or
+            (action not in ('add', 'rename') and len(names) != 1) or
             not re.fullmatch(r'[0-9a-f]{32}', request.get('operation_id', ''))):
         raise Error('Invalid device operation/names/operation ID')
     bound = {k: request[k] for k in ('owner', 'machine_id', 'endpoint', 'config',
                                     'device_action', 'names', 'operation_id')}
+    bound['device_action'] = action  # reset aliases the existing rotate protocol before hashing.
     return hashlib.sha256(dumps(bound).encode()).hexdigest()
 
 
@@ -1293,6 +1308,7 @@ def devices_prepare(upload):
         stage = Path(tmp)
         safe_unpack(upload, stage)
         request = read_json(stage / 'request.json')
+        request['device_action'] = canonical_device_action(request.get('device_action'))
         check_request_identity(request)
         manifest = device_owner(request)
         fingerprint = device_request(request)
@@ -1333,7 +1349,9 @@ def devices_prepare(upload):
         if action == 'add' and set(names) & existing:
             raise Error('Mixed existing/new names; no partial add')
         if action == 'rotate' and names[0] not in existing:
-            raise Error('Unknown device for rotation')
+            raise Error('Unknown device for reset')
+        if action == 'rename':
+            validate_rename_names(names, existing)
         process_health()
         tls_probe(manifest)
         # All rollback inputs and durable intent precede adapter/service mutation.
@@ -1392,12 +1410,21 @@ def devices_prepare(upload):
                 settings = json.loads(settings) if isinstance(settings, str) else settings
                 account = next(c for c in settings['clients'] if c['email'] == name)
                 account['limitHwid'] = api.call('/panel/api/clients/get/' + name)['client']['limitHwid']
-                account.update(id=str(uuid.uuid4()), subId=secrets.token_hex(24))
-                if any(uuid.UUID(account['id']) == uuid.UUID(c['id']) or account['subId'] == c['subId']
-                       for c in manifest['accounts'].values()):
-                    raise Error('Generated credential collision; recover and retry')
+                if action == 'rename':
+                    account['email'] = names[1]
+                else:
+                    account.update(id=str(uuid.uuid4()), subId=secrets.token_hex(24))
+                    if any(uuid.UUID(account['id']) == uuid.UUID(c['id']) or account['subId'] == c['subId']
+                           for c in manifest['accounts'].values()):
+                        raise Error('Generated credential collision; recover and retry')
                 check_lease()
                 api.call('/panel/api/clients/update/' + name, account)
+                if action == 'rename':
+                    # Preserve ordering/capability paths; only the roster key and
+                    # native name change. Full policy/usage stays with native ID.
+                    manifest['accounts'] = {names[1] if key == name else key:
+                        dict(value, email=names[1]) if key == name else value
+                        for key, value in manifest['accounts'].items()}
             # Restart the owned panel/core process, not only Xray's live user API:
             # this closes existing streams as well as rejecting new old UUIDs.
             ctl('stop', PANEL)
@@ -1569,7 +1596,7 @@ def status(request):
     if (ROOT / 'host.py').is_symlink():
         raise Error('Symlink recovery adapter')
     return {'healthy': True, 'published': manifest['published'], 'node_id': manifest['node_id'],
-            'adapter_sha256': digest(ROOT / 'host.py'),
+            'adapter_sha256': digest(ROOT / 'host.py'), 'devices': list(device_names(manifest)),
             'machine_id': marker['machine_id'], 'versions': {k: read_json(active / 'release-lock.json')[k]['version'] for k in ('panel', 'core', 'front')}}
 
 

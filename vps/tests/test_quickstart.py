@@ -47,10 +47,16 @@ class Quickstart(unittest.TestCase):
         for required in ('status', 'backup', 'recover', 'restore'):
             self.assertIn(required, commands)
         devices = [args for args in parsed if args.command == 'devices']
-        self.assertEqual([args.device_action for args in devices], ['list', 'add', 'rotate', 'remove'])
+        self.assertEqual([args.device_action for args in devices], ['list', 'add', 'rename', 'reset', 'remove'])
         self.assertEqual(devices[1].names, ['device4', 'device5'])
-        self.assertEqual(devices[2].names, ['device4'])
-        self.assertEqual(devices[3].names, ['device5'])
+        self.assertEqual(devices[2].names, ['device4', 'tablet'])
+        self.assertEqual(devices[3].names, ['tablet'])
+        self.assertEqual(devices[4].names, ['device5'])
+        for action in ('rename', 'reset', 'rotate'):
+            with mock.patch('sys.stdout'):
+                with self.assertRaises(SystemExit) as exit:
+                    vps.parser().parse_args(['devices', action, '--help'])
+                self.assertEqual(exit.exception.code, 0)
 
 
 if __name__ == '__main__':
