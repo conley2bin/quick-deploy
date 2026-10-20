@@ -1,3 +1,0 @@
-# 本机清单可能包含个人主机名与地址：安装器生成/刷新的默认清单与旧文件名都忽略，避免入库。
-/machines.yaml
-/machines.local.yaml
