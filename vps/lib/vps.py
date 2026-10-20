@@ -76,11 +76,6 @@ def locked(state):
         os.close(fd)
 
 
-def confirm(message):
-    if input(message + '\nType YES: ').strip() != 'YES':
-        raise host.Error('Not confirmed; no publication authorized')
-
-
 def configuration(args, saved=None):
     values = dict(saved or {})
     for key, prompt in [('domain', 'Grey DNS subscription hostname'), ('reality_target', 'Verified REALITY TLS1.3+h2 target hostname')]:
@@ -466,7 +461,7 @@ def deploy(state, document, args):
     record['machine_id'] = info['machine_id']
     request = dict(request_for(document, record), lock=lock, mode=args.command,
                    adapter_sha256=host.digest(MODULE / 'lib/host.py'))
-    confirm(f"Preflight passed for the explicit SSH target. This dedicated node will run REALITY{document['config']['proxy_port']}, TLS subscriptions8443 and HTTP01 only on80. SSH/firewall/Tailscale stay unchanged. Proceed?")
+    print(f"Preflight passed for the explicit SSH target. This dedicated node will run REALITY{document['config']['proxy_port']}, TLS subscriptions8443 and HTTP01 only on80. SSH/firewall/Tailscale stay unchanged.")
     folder = None if backup else artifacts(state, lock)
     pending = {'record': record, 'mode': args.command, 'backup': None}
     host.atomic(state / 'pending.json', host.dumps(pending))
@@ -484,7 +479,7 @@ def deploy(state, document, args):
         if prepared['unchanged']:
             result = remote(record, 'status', request_for(document, record))
         else:
-            confirm('Native core/three full Mihomo profiles and scoped URI feeds validated; trusted TLS and a complete unencrypted OFF-NODE backup exist. Publish the six exact device feed paths? Real phone/desktop connectivity remains a separate user test.')
+            print('Native core/full Mihomo profiles and scoped URI feeds validated; trusted TLS and a complete unencrypted OFF-NODE backup exist. Publishing validated device feed paths. Real phone/desktop connectivity remains a separate user test.')
             result = remote(record, 'commit', dict(request_for(document, record), offnode_sha256=host.digest(offnode)))
         remember_commit(state, document, record, offnode, result)
     except BaseException:
@@ -525,8 +520,8 @@ def devices(state, document, args):
         host.validate_rename_names(request['names'], checked['devices'])
         if checked.get('rename_target_has_history') is not False:
             raise host.Error('Rename target history is occupied or unverified; no changes made')
-    confirm('Device management restarts the owned core/front: ALL devices may briefly reconnect. '
-            'Remove/reset revoke old credentials; rename preserves keys/URLs. Historical backups contain old keys. Proceed?')
+    print('Device management restarts the owned core/front: ALL devices may briefly reconnect. '
+          'Remove/reset revoke old credentials; rename preserves keys/URLs. Historical backups contain old keys.')
     before = backup_remote(state, document, record)
     pending = {'record': record, 'mode': 'devices', 'request': request, 'backup': None, 'before': str(before), 'mihomo': binary}
     host.atomic(state / 'pending.json', host.dumps(pending))

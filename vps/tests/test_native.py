@@ -413,10 +413,10 @@ class Native(unittest.TestCase):
         with mock.patch.object(host.API,'call',new=watch),mock.patch.object(host,'ctl',wraps=host.ctl) as ctl, \
                 mock.patch.object(host,'atomic',wraps=host.atomic) as atomic, \
                 mock.patch.object(vps,'remote',side_effect=remote),mock.patch.object(vps,'backup_remote') as backup, \
-                mock.patch.object(vps,'confirm') as confirm:
+                mock.patch('builtins.input', side_effect=AssertionError('Unexpected input')) as no_input:
             with self.assertRaisesRegex(host.Error,'history'):
                 vps.devices(state,doc,argparse.Namespace(device_action='rename',names=['home','tablet'],mihomo=None))
-            backup.assert_not_called();confirm.assert_not_called();ctl.assert_not_called();atomic.assert_not_called()
+            backup.assert_not_called();no_input.assert_not_called();ctl.assert_not_called();atomic.assert_not_called()
             with self.assertRaisesRegex(host.Error,'history'):
                 self.device_prepare(self.device_request('rename','home','tablet'))
             ctl.assert_not_called();atomic.assert_not_called();self.assertEqual(writes,[])
@@ -824,7 +824,7 @@ class Native(unittest.TestCase):
             self.assertTrue(manifest['published'])
             self.assertFalse((state/'pending.json').exists())
             exports.append(copy.deepcopy(manifest))
-        with mock.patch.object(vps,'remote',side_effect=remote), mock.patch.object(vps,'confirm'), \
+        with mock.patch.object(vps,'remote',side_effect=remote), mock.patch('builtins.input', side_effect=AssertionError('Unexpected input')), \
                 mock.patch.object(vps,'export_after_commit',side_effect=exported):
             vps.devices(state,document,argparse.Namespace(device_action='add',names=['device4','device5'],mihomo=str(custom_core)))
             self.assertEqual(len(exports[-1]['accounts']),5)

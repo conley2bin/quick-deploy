@@ -203,7 +203,7 @@ class Export(unittest.TestCase):
                 original_export = vps.export_urls
                 with mock.patch.object(vps, 'target_record', return_value=self.record), \
                      mock.patch.object(vps, 'remote', side_effect=remote) as rem, \
-                     mock.patch.object(vps, 'confirm'), mock.patch.object(vps, 'artifacts'), \
+                     mock.patch('builtins.input', side_effect=AssertionError('Unexpected input')), mock.patch.object(vps, 'artifacts'), \
                      mock.patch.object(vps, 'upload_bundle', return_value=io.BytesIO()), \
                      mock.patch.object(vps, 'backup_remote', return_value=Path(self.doc['backup'])), \
                      mock.patch.object(vps, 'validate_outputs'), \
@@ -225,7 +225,7 @@ class Export(unittest.TestCase):
                     return {'unchanged': False}
                 return {'machine_id': self.record['machine_id'], 'committed': True}
             with mock.patch.object(vps, 'target_record', return_value=self.record), \
-                 mock.patch.object(vps, 'remote', side_effect=remote), mock.patch.object(vps, 'confirm'), \
+                 mock.patch.object(vps, 'remote', side_effect=remote), mock.patch('builtins.input', side_effect=AssertionError('Unexpected input')), \
                  mock.patch.object(vps, 'artifacts'), mock.patch.object(vps, 'upload_bundle', return_value=io.BytesIO()), \
                  mock.patch.object(vps, 'backup_remote', return_value=Path(self.doc['backup'])), \
                  mock.patch.object(vps, 'validate_outputs'), \
@@ -246,7 +246,7 @@ class Export(unittest.TestCase):
         original = self.destination.read_bytes()
         with mock.patch.object(vps, 'target_record', return_value=self.record), \
              mock.patch.object(vps, 'remote', return_value={'machine_id': self.record['machine_id'], 'unchanged': False}) as rem, \
-             mock.patch.object(vps, 'confirm'), mock.patch.object(vps, 'artifacts'), \
+             mock.patch('builtins.input', side_effect=AssertionError('Unexpected input')), mock.patch.object(vps, 'artifacts'), \
              mock.patch.object(vps, 'upload_bundle', return_value=io.BytesIO()), \
              mock.patch.object(vps, 'backup_remote', return_value=Path(self.doc['backup'])), \
              mock.patch.object(vps, 'validate_outputs', side_effect=host.Error('candidate failed')), \

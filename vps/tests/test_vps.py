@@ -31,18 +31,163 @@ class Local(unittest.TestCase):
     def args(self, command='deploy', extra=()):
         return vps.parser().parse_args([command, '--ssh', 'root@93.184.216.34', *extra])
 
+    def test_complete_cli_commands_execute_without_stdin(self):
+        cases = [('deploy',), ('deploy', 'unchanged'), ('replace',), ('restore',),
+                 ('devices', 'add', 'tablet'), ('devices', 'rename', 'home', 'tablet'),
+                 ('devices', 'reset', 'home'), ('devices', 'remove', 'home')]
+        for index, case in enumerate(cases):
+            with self.subTest(command=case):
+                state = vps.private_dir(self.state / str(index))
+                vps.private_dir(state / 'outputs')
+                document = dict(self.doc, current=dict(self.record, endpoint='93.184.216.35'))
+                archive = state / 'saved.tar'
+                host.atomic(archive, 'isolated backup')
+                document['backup'] = str(archive)
+                argv = ['--state-dir', str(state), case[0]]
+                if case[0] == 'devices':
+                    document['current'] = dict(self.record)
+                    argv += list(case[1:])
+                else:
+                    argv += ['--ssh', self.record['target']]
+                if case[0] == 'deploy':
+                    # First setup: all configuration data supplied explicitly.
+                    argv += ['--domain', self.config['domain'], '--reality-target', self.config['reality_target'],
+                             '--acme-email', self.config['acme_email']]
+                elif case[0] == 'restore':
+                    # Fresh local restore gets its configuration from the archive.
+                    argv += ['--backup', str(archive)]
+                if case[0] not in ('deploy', 'restore'):
+                    host.atomic(state / 'state.json', host.dumps(document))
+                events = []
+                def remote(record, action, request=None, **kwargs):
+                    events.append(action)
+                    if action in ('commit', 'devices-commit'):
+                        self.assertEqual(request['offnode_sha256'], host.digest(archive))
+                    return {'machine_id': self.record['machine_id'], 'unchanged': case == ('deploy', 'unchanged'),
+                            'adapter_sha256': host.DEPLOYED_ADAPTER_SHA256,
+                            'devices': ['company', 'home', 'phone'], 'rename_target_has_history': False}
+                def backup(*args):
+                    events.append('backup')
+                    return archive
+                def validate(*args):
+                    events.append('validate')
+                def export(state):
+                    events.append('export')
+                    self.assertFalse((state / 'pending.json').exists())
+                with mock.patch('builtins.input', side_effect=AssertionError('Unexpected input')) as no_input, \
+                     mock.patch('sys.stdin', io.StringIO('')), mock.patch('sys.stdout', new_callable=io.StringIO) as out, \
+                     mock.patch.object(host, 'run', side_effect=AssertionError('No external process')), \
+                     mock.patch.object(vps.subprocess, 'run', side_effect=AssertionError('No external process')), \
+                     mock.patch.object(vps, 'target_record', return_value=dict(self.record)), \
+                     mock.patch.object(vps, 'remote', side_effect=remote), \
+                     mock.patch.object(vps, 'inspect_backup', return_value={'owner': document['owner'], 'config': self.config}), \
+                     mock.patch.object(vps, 'artifacts', return_value=state), \
+                     mock.patch.object(vps, 'upload_bundle', return_value=io.BytesIO()), \
+                     mock.patch.object(vps, 'resolve_mihomo', return_value='/fixture/mihomo'), \
+                     mock.patch.object(vps, 'backup_remote', side_effect=backup), \
+                     mock.patch.object(vps, 'validate_outputs', side_effect=validate), \
+                     mock.patch.object(vps, 'export_after_commit', side_effect=export):
+                    self.assertEqual(vps.main(argv), 0)
+                no_input.assert_not_called()
+                self.assertNotRegex(out.getvalue(), r'Type YES|Proceed\?|Not confirmed|three full|six exact')
+                if case[0] == 'devices':
+                    expected = ['status', 'backup', 'devices-prepare', 'backup', 'validate', 'devices-commit',
+                                'backup', 'validate', 'status', 'export']
+                    self.assertIn('ALL devices may briefly reconnect', out.getvalue())
+                else:
+                    expected = ['preflight', 'prepare', 'backup', 'validate',
+                                'status' if case == ('deploy', 'unchanged') else 'commit', 'export']
+                self.assertEqual(events, expected)
+                self.assertEqual(vps.load(state / 'state.json')['current'], self.record)
+                self.assertFalse((state / 'pending.json').exists())
+
+    def test_no_input_deploy_keeps_preflight_backup_and_publication_gates(self):
+        for failure in ('owner', 'preflight', 'backup', 'native/TLS'):
+            with self.subTest(failure=failure):
+                state = vps.private_dir(self.state / failure.replace('/', '-'))
+                archive = state / 'backup.tar'
+                host.atomic(archive, 'isolated backup')
+                argv = ['--state-dir', str(state), 'restore', '--ssh', self.record['target'], '--backup', str(archive)]
+                inspected = [{'owner': self.doc['owner'], 'config': self.config},
+                             {'owner': 'foreign' if failure == 'owner' else self.doc['owner'], 'config': self.config}]
+                with mock.patch('builtins.input', side_effect=AssertionError('Unexpected input')) as no_input, \
+                     mock.patch('sys.stdin', io.StringIO('')), mock.patch('sys.stdout', new_callable=io.StringIO), \
+                     mock.patch('sys.stderr', new_callable=io.StringIO), \
+                     mock.patch.object(vps, 'target_record', return_value=dict(self.record)), \
+                     mock.patch.object(vps, 'inspect_backup', side_effect=inspected), \
+                     mock.patch.object(vps, 'remote', side_effect=host.Error('owner/machine preflight') if failure == 'preflight'
+                                       else lambda *a, **kw: {'machine_id': 'a' * 32, 'unchanged': False}) as remote, \
+                     mock.patch.object(vps, 'upload_bundle', return_value=io.BytesIO()) as bundle, \
+                     mock.patch.object(vps, 'backup_remote', side_effect=host.Error('off-node receipt failed') if failure == 'backup'
+                                       else None, return_value=archive), \
+                     mock.patch.object(vps, 'validate_outputs', side_effect=host.Error('native/TLS failed')) as validate, \
+                     mock.patch.object(vps, 'export_after_commit') as export:
+                    self.assertEqual(vps.main(argv), 1)
+                no_input.assert_not_called()
+                export.assert_not_called()
+                self.assertNotIn('commit', [c.args[1] for c in remote.call_args_list])
+                if failure in ('owner', 'preflight'):
+                    bundle.assert_not_called()
+                    self.assertFalse((state / 'pending.json').exists())
+                else:
+                    self.assertTrue((state / 'pending.json').exists())
+                if failure != 'native/TLS':
+                    validate.assert_not_called()
+
+    def test_no_input_device_prechecks_still_refuse_before_backup(self):
+        self.doc['current'] = self.record
+        host.atomic(self.state / 'state.json', host.dumps(self.doc))
+        for failure in ('pending', 'core', 'rename-history'):
+            with self.subTest(failure=failure):
+                pending = self.state / 'pending.json'
+                if failure == 'pending':
+                    host.atomic(pending, 'preserved pending intent')
+                with mock.patch('builtins.input', side_effect=AssertionError('Unexpected input')) as no_input, \
+                     mock.patch('sys.stdin', io.StringIO('')), mock.patch('sys.stderr', new_callable=io.StringIO), \
+                     mock.patch.object(vps, 'resolve_mihomo', side_effect=host.Error('Missing native core') if failure == 'core'
+                                       else None, return_value='/fixture/mihomo'), \
+                     mock.patch.object(vps, 'remote', return_value={'adapter_sha256': host.DEPLOYED_ADAPTER_SHA256,
+                                       'devices': ['home'], 'rename_target_has_history': True}) as remote, \
+                     mock.patch.object(vps, 'backup_remote') as backup, mock.patch.object(vps, 'upload_bundle') as bundle:
+                    self.assertEqual(vps.main(['--state-dir', str(self.state), 'devices', 'rename', 'home', 'tablet']), 1)
+                no_input.assert_not_called()
+                backup.assert_not_called()
+                bundle.assert_not_called()
+                if failure == 'pending':
+                    self.assertEqual(pending.read_text(), 'preserved pending intent')
+                    pending.unlink()
+                else:
+                    self.assertFalse(pending.exists())
+                if failure != 'rename-history':
+                    remote.assert_not_called()
+
+    def test_missing_configuration_is_data_not_confirmation(self):
+        args = self.args()
+        with mock.patch('sys.stdin', io.StringIO('')), \
+             mock.patch('builtins.input', side_effect=AssertionError('No input on EOF')) as no_input:
+            with self.assertRaisesRegex(host.Error, 'requires --domain and --reality-target'):
+                vps.configuration(args)
+        no_input.assert_not_called()
+        with mock.patch.object(sys.stdin, 'isatty', return_value=True), \
+             mock.patch('builtins.input', side_effect=['sub.example.org', 'target.example.org']) as data:
+            config = vps.configuration(args)
+        self.assertEqual(data.call_count, 2)
+        self.assertEqual(config, dict(self.config, acme_email=''))
+        self.assertEqual([call.args[0] for call in data.call_args_list],
+                         ['Grey DNS subscription hostname: ', 'Verified REALITY TLS1.3+h2 target hostname: '])
+
     def test_device_unknown_adapter_or_transport_refuses_before_backup_stop(self):
         self.doc['current'] = self.record
         args = vps.parser().parse_args(['devices', 'add', 'device4', 'device5'])
         for status in ({'healthy': True, 'adapter_sha256': 'unknown'}, host.Error('fixture transport unavailable')):
             kwargs = {'side_effect': status} if isinstance(status, Exception) else {'return_value': status}
             with mock.patch.object(vps, 'remote', **kwargs) as remote, mock.patch.object(vps, 'backup_remote') as backup, \
-                    mock.patch.object(vps.shutil, 'which', return_value='/fixture/mihomo'), mock.patch.object(vps, 'confirm') as confirm:
+                    mock.patch.object(vps.shutil, 'which', return_value='/fixture/mihomo'), mock.patch('builtins.input', side_effect=AssertionError('Unexpected input')) as no_input:
                 with self.assertRaises(host.Error):
                     vps.devices(self.state, self.doc, args)
                 remote.assert_called_once_with(self.record, 'status', vps.request_for(self.doc, self.record))
                 backup.assert_not_called()
-                confirm.assert_not_called()
+                no_input.assert_not_called()
                 self.assertFalse((self.state / 'pending.json').exists())
 
     def test_recover_retains_custom_core_and_accepts_override_for_legacy_pending(self):
@@ -76,9 +221,9 @@ class Local(unittest.TestCase):
             args=vps.parser().parse_args(['devices','rename',*names])
             status={'adapter_sha256':host.DEPLOYED_ADAPTER_SHA256,'devices':['company','home','phone']}
             with mock.patch.object(vps,'remote',return_value=status),mock.patch.object(vps,'backup_remote') as backup, \
-                    mock.patch.object(vps,'confirm') as confirm,mock.patch.object(vps,'resolve_mihomo',return_value='/core'):
+                    mock.patch('builtins.input', side_effect=AssertionError('Unexpected input')) as no_input,mock.patch.object(vps,'resolve_mihomo',return_value='/core'):
                 with self.assertRaises(host.Error):vps.devices(self.state,self.doc,args)
-                backup.assert_not_called();confirm.assert_not_called()
+                backup.assert_not_called();no_input.assert_not_called()
                 self.assertFalse((self.state/'pending.json').exists())
 
     def test_removed_rotate_refuses_and_old_pending_is_preserved(self):
@@ -222,7 +367,7 @@ class Local(unittest.TestCase):
                 return {'unchanged': False}
             return {'machine_id': self.record['machine_id'], 'node_id': 'fixture-node'}
         with mock.patch.object(vps, 'target_record', return_value=self.record), mock.patch.object(vps, 'remote', side_effect=remote), \
-             mock.patch.object(vps, 'confirm'), mock.patch.object(vps, 'inspect_backup', return_value=manifest), \
+             mock.patch('builtins.input', side_effect=AssertionError('Unexpected input')), mock.patch.object(vps, 'inspect_backup', return_value=manifest), \
              mock.patch.object(vps, 'backup_remote', return_value=Path(self.doc['backup'])), mock.patch.object(vps, 'validate_outputs'), \
              mock.patch.object(vps, 'artifacts', side_effect=AssertionError('release network required')), \
              mock.patch.object(vps, 'export_after_commit') as export:
@@ -241,7 +386,7 @@ class Local(unittest.TestCase):
         path = self.state / 'backup.tar'
         host.atomic(path, 'fixture')
         with mock.patch.object(vps, 'target_record', return_value=self.record), mock.patch.object(vps, 'remote', side_effect=remote) as rem, \
-             mock.patch.object(vps, 'confirm'), mock.patch.object(vps, 'artifacts', return_value=self.state), \
+             mock.patch('builtins.input', side_effect=AssertionError('Unexpected input')), mock.patch.object(vps, 'artifacts', return_value=self.state), \
              mock.patch.object(vps, 'upload_bundle', return_value=io.BytesIO()), mock.patch.object(vps, 'backup_remote', return_value=path), \
              mock.patch.object(vps, 'validate_outputs', side_effect=host.Error('native format failed')):
             with self.assertRaisesRegex(host.Error, 'native format failed'):
