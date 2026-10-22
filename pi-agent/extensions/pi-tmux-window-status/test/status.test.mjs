@@ -6,7 +6,7 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { HEARTBEAT_MS, LEASE_TTL_MS, acquireAnimatorLock, aggregateLogicalState, leasePath, projectAsyncStatus, publishLease, readLease, releaseAnimatorLock, seedAttentionWatermarksFromSnapshot, windowLeaseStates } from "../state.mjs";
-import { CANCEL_SENTINEL, RECOVERY_ARMED_OPTION, animatorSpawnNeeded, childFromStartedPayload, childStillRunning, classifyModelUnavailable, defaultAsyncRoot, isManualEscapePress, isRetryExhaustedAbort, mergedChildSnapshot, monitorNeeded, nestedProjectionFromChildren, nestedPublisherDisabled, nextLastAssistantErrorMatched, nextModelErrorState, readNestedRegistryProjection, recoveryTerminalInput, restoredChildren, sessionIdOf, validateNestedRoute } from "../index.ts";
+import { CANCEL_SENTINEL, RECOVERY_ARMED_OPTION, animatorSpawnNeeded, childFromStartedPayload, childStillRunning, defaultAsyncRoot, isAssistantError, isManualEscapePress, isRetryExhaustedAbort, mergedChildSnapshot, monitorNeeded, nestedProjectionFromChildren, nestedPublisherDisabled, nextAssistantErrorState, nextAutoContinueArmed, readNestedRegistryProjection, recoveryTerminalInput, restoredChildren, sessionIdOf, validateNestedRoute } from "../index.ts";
 import { ANIMATOR_URGENT_SIGNAL, ERROR_BG, ERROR_FG, ERROR_MS, FRAME_BLUE, FRAME_COUNT, FRAME_MS, FRAMES, GRAY_RANGE, MAX_CONSECUTIVE_FAILURES, PERIOD_MS, activeWindows, frameAt, isDirectExecution, leaseWindowStates, listClients, listRecoveryArmedPanes, paneRecoveryOptionArgs, requestAnimatorTick, runAnimator, sweepWindows, windowOptionArgs } from "../animator.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -40,6 +40,9 @@ const styledCells = (value) => {
 };
 const ident = (socket = "/tmp/tmux-status") => ({ socketPath: socket, windowId: "@8", paneId: "%9" });
 const real = (runId = "root", lastActivityAt = 100, state = "running", steps = []) => ({ runId, state, lastUpdate: lastActivityAt, steps });
+const assistantFailure = (errorMessage) => ({ role: "assistant", stopReason: "error", ...(errorMessage === undefined ? {} : { errorMessage }) });
+const SESSION_SOURCE_ERROR = "The session source could not complete this request.";
+const ACCOUNT_CONCURRENCY_ERROR = "This session's account is handling its maximum concurrent requests; retry shortly.";
 const waitFor = async (read, expected, timeoutMs = 1_500) => {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
@@ -54,7 +57,7 @@ async function statusHarness(label) {
   const tmux = (args, options = {}) => isolatedTmux(args, options);
   tmux(["-S", socket, "-f", join(process.env.HOME, ".tmux.conf"), "new-session", "-d", "-s", label]);
   const paneId = tmux(["-S", socket, "display-message", "-p", "#{pane_id}"], { encoding: "utf8" }).trim();
-  const handlers = {}, sent = [];
+  const handlers = {}, sent = [], sentAt = [];
   let terminalInput, terminalInputUnsubscribed = 0, currentSignal;
   const ctx = {
     mode: "tui",
@@ -67,7 +70,7 @@ async function statusHarness(label) {
   const pi = {
     on: (name, fn) => { (handlers[name] ||= []).push(fn); },
     events: { on: () => () => {} },
-    sendUserMessage: (content) => sent.push(content),
+    sendUserMessage: (content) => { sent.push(content); sentAt.push(Date.now()); },
   };
   const fire = (name, ...args) => (handlers[name] || []).map((fn) => fn(...args));
   const env = { QUICK_DEPLOY_PI_TMUX_WINDOW_STATUS_RUNTIME: runtime, TMUX_PANE: paneId, TMUX: `${socket},0,0` };
@@ -84,7 +87,7 @@ async function statusHarness(label) {
     throw error;
   }
   return {
-    handlers, sent, ctx, fire,
+    handlers, sent, sentAt, ctx, fire,
     get terminalInput() { return terminalInput; },
     setSignal(signal) { currentSignal = signal; },
     errorOption: () => tmux(["-S", socket, "show-options", "-wqv", "@quick_deploy_pi_error"], { encoding: "utf8" }).trim(),
@@ -185,89 +188,88 @@ test("installed fullscreen search consumes real Esc only after the private senti
   assert.equal(tui.activeSearch, undefined, "the same first real Esc still closes fullscreen search");
 });
 
-test("model/provider unavailable classifier accepts provider failures and rejects non-availability errors", () => {
-  const assistantError = (errorMessage) => ({ role: "assistant", stopReason: "error", errorMessage });
-  for (const message of [
-    "OpenAI API error (403): insufficient_user_quota: available balance is 0",
-    "429: No deployments available for selected model",
-    "OpenAI API error (502): bad gateway",
-    "provider returned HTTP 524 timeout",
-    "401 unauthorized invalid API key",
-    "invalid model name 'gpt-x'",
-    "model not found: gpt-x",
-    "model does not exist: gpt-x",
-    "model unavailable; 503 upstream",
-    "408 request timeout from provider",
-    "stream ended before completion",
-    "fetch failed: connection reset by peer during streaming transport",
-    "stream_read_error",
-    "service unavailable: model overloaded",
-    "OpenAI API error (520)",
-    "LiteLLMCompletionStreamingIterator missing completed_response adapter signature",
-    "permission_error: concurrent request limit reached",
+test("assistant error eligibility depends only on role and stopReason, never error text", () => {
+  for (const errorMessage of [
+    SESSION_SOURCE_ERROR,
+    `Error: ${SESSION_SOURCE_ERROR}`,
+    ACCOUNT_CONCURRENCY_ERROR,
     "gateway_concurrency_limit: Concurrency limit exceeded for account, please retry later",
-    "OpenAI API error (402): your 余额 is 不足; please top up",
-    "OpenAI API error (400): invalid model id 'gpt-x'",
-  ]) assert.equal(classifyModelUnavailable(assistantError(message)), true, message);
+    "stream_read_error",
+    "unexpected provider failure",
+    "401 unauthorized invalid API key",
+    "quota exceeded; billing balance is 0",
+    "400 bad request schema validation failed",
+    "context length exceeded max tokens",
+    "content policy refusal",
+    "asyncio: concurrency limit exceeded, 8 tasks already running",
+    "Operation aborted",
+    "",
+    "   ",
+    undefined,
+    null,
+    0,
+    {},
+  ]) {
+    const message = assistantFailure(errorMessage);
+    assert.equal(isAssistantError(message), true, JSON.stringify(message));
+    assert.equal(nextAutoContinueArmed(false, message), true);
+    assert.equal(nextAssistantErrorState(false, "message_end", message), true);
+  }
   for (const message of [
-    assistantError("aborted by user"),
-    assistantError("context length exceeded max tokens"),
-    assistantError("content policy safety refusal"),
-    assistantError("400 bad request schema validation failed"),
-    assistantError("stream parser failed unexpectedly"),
-    assistantError("OpenAI API error (409): conflict on resource"),
-    { role: "tool", stopReason: "error", errorMessage: "OpenAI API error (502)" },
-    { role: "tool", stopReason: "error", errorMessage: "stream_read_error" },
-    { role: "assistant", stopReason: "stop", errorMessage: "OpenAI API error (502)" },
-  ]) assert.equal(classifyModelUnavailable(message), false, JSON.stringify(message));
-  assert.equal(classifyModelUnavailable(assistantError("400 bad request: insufficient_user_quota")), true, "strong quota phrase wins over ordinary 400 wording");
-  assert.equal(classifyModelUnavailable(assistantError("OpenAI API error (409): too many concurrent requests")), true, "409 becomes positive only with rate/overload/capacity/concurrency phrasing");
-  assert.equal(classifyModelUnavailable(assistantError("model field missing validation")), false, "schema 'missing' phrasing does not match model unavailable positives");
+    undefined,
+    null,
+    "Error: 503",
+    {},
+    { role: "assistant", errorMessage: SESSION_SOURCE_ERROR },
+    { role: "tool", stopReason: "error", errorMessage: SESSION_SOURCE_ERROR },
+    { role: "toolResult", stopReason: "error", isError: true, errorMessage: SESSION_SOURCE_ERROR },
+    { role: "user", stopReason: "error", errorMessage: SESSION_SOURCE_ERROR },
+    { role: "assistant", stopReason: "stop", errorMessage: SESSION_SOURCE_ERROR, content: [{ type: "text", text: `Error: ${SESSION_SOURCE_ERROR}` }] },
+    { role: "assistant", stopReason: "toolUse", content: [{ type: "toolCall", name: "bash" }] },
+    { role: "assistant", stopReason: "aborted", errorMessage: "Operation aborted" },
+  ]) assert.equal(isAssistantError(message), false, JSON.stringify(message));
 });
 
 test("semanticAssistantOutput recognises text, ThinkingContent.thinking, and toolCall content shapes", () => {
-  assert.equal(nextModelErrorState(true, "message_update", { role: "assistant", content: [{ type: "text", text: "hello" }] }), false);
-  assert.equal(nextModelErrorState(true, "message_update", { role: "assistant", content: [{ type: "thinking", thinking: "reasoning" }] }), false);
-  assert.equal(nextModelErrorState(true, "message_update", { role: "assistant", content: [{ type: "toolCall", name: "bash" }] }), false);
-  assert.equal(nextModelErrorState(true, "message_update", { role: "tool", content: [{ type: "text", text: "out" }] }), true, "tool-role delta does not clear");
-  assert.equal(nextModelErrorState(true, "message_update", { role: "assistant", content: [{ type: "text_start" }, { type: "text", text: "" }] }), true, "empty text start/end without payload keeps the latch");
-  assert.equal(nextModelErrorState(true, "message_update", { role: "assistant", content: [{ type: "thinking_start" }, { type: "thinking", thinking: "   " }] }), true, "whitespace-only thinking keeps the latch");
-  assert.equal(nextModelErrorState(true, "message_update", { role: "assistant", content: [{ type: "text" }, { type: "thinking" }] }), true, "type-only text/thinking without payload keeps the latch");
-  assert.equal(nextModelErrorState(true, "message_update", { role: "assistant", content: [{ type: "text_start" }, { type: "thinking_start" }, { type: "text", text: "ok" }] }), false, "later nonempty text clears after start markers");
+  assert.equal(nextAssistantErrorState(true, "message_update", { role: "assistant", content: [{ type: "text", text: "hello" }] }), false);
+  assert.equal(nextAssistantErrorState(true, "message_update", { role: "assistant", content: [{ type: "thinking", thinking: "reasoning" }] }), false);
+  assert.equal(nextAssistantErrorState(true, "message_update", { role: "assistant", content: [{ type: "toolCall", name: "bash" }] }), false);
+  assert.equal(nextAssistantErrorState(true, "message_update", { role: "tool", content: [{ type: "text", text: "out" }] }), true, "tool-role delta does not clear");
+  assert.equal(nextAssistantErrorState(true, "message_update", { role: "assistant", content: [{ type: "text_start" }, { type: "text", text: "" }] }), true, "empty text start/end without payload keeps the latch");
+  assert.equal(nextAssistantErrorState(true, "message_update", { role: "assistant", content: [{ type: "thinking_start" }, { type: "thinking", thinking: "   " }] }), true, "whitespace-only thinking keeps the latch");
+  assert.equal(nextAssistantErrorState(true, "message_update", { role: "assistant", content: [{ type: "text" }, { type: "thinking" }] }), true, "type-only text/thinking without payload keeps the latch");
+  assert.equal(nextAssistantErrorState(true, "message_update", { role: "assistant", content: [{ type: "text_start" }, { type: "thinking_start" }, { type: "text", text: "ok" }] }), false, "later nonempty text clears after start markers");
 });
 
-test("model error state latches and clears only on semantic assistant/model success paths", () => {
-  const unavailable = { role: "assistant", stopReason: "error", errorMessage: "429 No deployments available for selected model" };
-  assert.equal(nextModelErrorState(false, "message_update", unavailable), true);
-  assert.equal(nextModelErrorState(true, "agent_start"), true, "retry agent_start does not clear");
-  assert.equal(nextModelErrorState(true, "agent_settled"), true);
-  assert.equal(nextModelErrorState(true, "message_update", { role: "assistant", delta: { content: [{ type: "text", text: "ok" }] } }), false);
-  assert.equal(nextModelErrorState(true, "message_end", { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "done" }] }), false);
-  assert.equal(nextModelErrorState(true, "model_select"), false);
-  assert.equal(nextModelErrorState(false, "message_end", { role: "assistant", stopReason: "error", errorMessage: "context length exceeded" }), false);
-  assert.equal(nextModelErrorState(true, "message_end", { role: "assistant", stopReason: "error", errorMessage: "context length exceeded" }), true, "nonmatching error does not clear existing latch");
-  assert.equal(nextModelErrorState(true, "message_end", { role: "assistant", stopReason: "aborted", errorMessage: "aborted" }), true);
+test("assistant error state latches every failure and clears only on assistant/model success paths", () => {
+  assert.equal(nextAssistantErrorState(false, "message_update", assistantFailure()), true);
+  assert.equal(nextAssistantErrorState(true, "agent_start"), true, "native retry agent_start does not clear");
+  assert.equal(nextAssistantErrorState(true, "agent_settled"), true);
+  assert.equal(nextAssistantErrorState(true, "message_update", { role: "assistant", delta: { content: [{ type: "text", text: "ok" }] } }), false);
+  assert.equal(nextAssistantErrorState(true, "message_end", { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "done" }] }), false);
+  assert.equal(nextAssistantErrorState(true, "model_select"), false);
+  assert.equal(nextAssistantErrorState(false, "message_end", assistantFailure("context length exceeded")), true);
+  assert.equal(nextAssistantErrorState(true, "message_end", { role: "assistant", stopReason: "aborted", errorMessage: "Operation aborted" }), true, "ordinary abort disarms recovery without clearing the existing red latch");
+  assert.equal(nextAssistantErrorState(false, "message_end", { role: "toolResult", isError: true }), false);
 });
 
-test("auto-continue flag survives pi retry-exhaustion abort tail but not user abort or normal output", () => {
-  const terminated = { role: "assistant", stopReason: "error", errorMessage: "terminated" };
+test("auto-continue stays armed across legacy retry-exhaustion tails but not user abort or normal output", () => {
+  const failure = assistantFailure();
   const retryAbort = (n) => ({ role: "assistant", stopReason: "aborted", errorMessage: `Aborted after ${n} retry attempt${n > 1 ? "s" : ""}` });
   const userAbort = { role: "assistant", stopReason: "aborted", errorMessage: "Operation aborted" };
   assert.equal(isRetryExhaustedAbort(retryAbort(1)), true);
   assert.equal(isRetryExhaustedAbort(retryAbort(5)), true);
   assert.equal(isRetryExhaustedAbort(userAbort), false);
-  assert.equal(isRetryExhaustedAbort(terminated), false);
+  assert.equal(isRetryExhaustedAbort(failure), false);
   assert.equal(isRetryExhaustedAbort({ role: "tool", stopReason: "aborted", errorMessage: "Aborted after 3 retry attempts" }), false);
-  // 重现会话日志中的失败链：terminated →（pi 内部重试）→ "Aborted after N retry attempts" → settle
-  let flag = false;
-  flag = nextLastAssistantErrorMatched(flag, terminated);
-  assert.equal(flag, true, "classified provider error arms the continue gate");
-  flag = nextLastAssistantErrorMatched(flag, retryAbort(1));
-  assert.equal(flag, true, "retry-exhaustion abort tail preserves the gate so agent_settled can send continue");
-  assert.equal(nextLastAssistantErrorMatched(false, retryAbort(3)), false, "abort tail alone does not arm without a prior classified error");
-  assert.equal(nextLastAssistantErrorMatched(true, userAbort), false, "user Esc abort clears the gate");
-  assert.equal(nextLastAssistantErrorMatched(true, { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "ok" }] }), false, "normal assistant completion clears the gate");
-  assert.equal(nextLastAssistantErrorMatched(true, { role: "assistant", stopReason: "error", errorMessage: "context length exceeded" }), false, "non-availability error clears the gate");
+  let armed = nextAutoContinueArmed(false, failure);
+  assert.equal(armed, true, "even an error without text arms recovery");
+  armed = nextAutoContinueArmed(armed, retryAbort(1));
+  assert.equal(armed, true, "retry-exhaustion tail preserves an already-armed recovery");
+  assert.equal(nextAutoContinueArmed(false, retryAbort(3)), false, "legacy tail alone does not arm");
+  assert.equal(nextAutoContinueArmed(true, userAbort), false, "user abort clears recovery eligibility");
+  assert.equal(nextAutoContinueArmed(true, { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "ok" }] }), false);
+  assert.equal(nextAutoContinueArmed(true, assistantFailure("context length exceeded")), true);
 });
 
 test("0.56 async-started ownership filters on root Pi session file identity", () => {
@@ -707,73 +709,247 @@ test("partial tmux batch failure retains attempted window and pane cleanup respo
   }
 });
 
-test("auto-continue classifier additions cover terminated, weekly quota, mixed and cloudflare errors", () => {
-  const assistantError = (errorMessage) => ({ role: "assistant", stopReason: "error", errorMessage });
-  for (const message of [
-    "Error: terminated",
-    "terminated",
-    "{\"error\":{\"type\":\"new_api_error\",\"message\":\"用户额度不足：模型 claude-opus-5\"}} ... {\"error\":{\"type\":\"permission_error\",\"message\":\"You've reached your weekly (7-day) usage limit. Your quota will reset when the current 7-day window ends. To continue now, purchase extra usage or upgrade your plan\"}}",
-    "OpenAI API error (403): 用户额度不足：模型 gpt-5.6-sol ... Error doing the fallback: litellm.BadRequestError: {\"error\":{\"message\":\"An assistant message with 'tool_calls' must be followed by tool messages\",\"type\":\"invalid_request_error\"}} LiteLLM Retried: 3 times",
-    "Error: 502 {\"status\":502,\"error_code\":502,\"retryable\":true,\"retry_after\":60,\"cloudflare_error\":true}",
-  ]) assert.equal(classifyModelUnavailable(assistantError(message)), true, message);
-  assert.equal(classifyModelUnavailable(assistantError("the task terminated normally")), false);
-});
-
-test("gateway account concurrency-limit classifier accepts the exact provider failure and near-miss variants", () => {
-  const assistantError = (errorMessage) => ({ role: "assistant", stopReason: "error", errorMessage });
-  const gatewayText = "Concurrency limit exceeded for account, please retry later";
-  const gateway = `gateway_concurrency_limit: ${gatewayText}`;
-  for (const message of [
-    gateway,
-    `Error: ${gateway}`,
-    `{"error":{"code":"gateway_concurrency_limit","message":"${gatewayText}"}}`,
-    gatewayText,
-    `gateway concurrency limit: Concurrency limit exceeded for accounts, please retry later`,
-    `400 ${gateway}`,
-  ]) assert.equal(classifyModelUnavailable(assistantError(message)), true, message);
-  for (const message of [
-    assistantError("concurrency limit exceeded, task queue full"),
-    assistantError("asyncio: concurrency limit exceeded, 8 tasks already running"),
-    assistantError("concurrency limit exceeded for parallel import slots in my_app.py"),
-    assistantError(`Operation aborted: ${gateway}`),
-    { role: "tool", stopReason: "error", errorMessage: gateway },
-    { role: "assistant", stopReason: "aborted", errorMessage: gateway },
-    { role: "assistant", stopReason: "stop", errorMessage: gateway },
-  ]) assert.equal(classifyModelUnavailable(message), false, JSON.stringify(message));
-  assert.equal(nextLastAssistantErrorMatched(false, assistantError(gateway)), true, "real gateway failure arms the continue gate");
-  assert.equal(nextLastAssistantErrorMatched(true, assistantError("concurrency limit exceeded, task queue full")), false, "local concurrency wording neither arms nor preserves the gate");
-});
-
-test("real gateway concurrency error auto-continues once while local concurrency wording does not", async () => {
-  const h = await statusHarness("gateway-concurrency");
-  const run = new AbortController();
-  const gateway = "gateway_concurrency_limit: Concurrency limit exceeded for account, please retry later";
-  const local = "asyncio: concurrency limit exceeded, 8 tasks already running";
+for (const [label, errorMessage] of [
+  ["session-source", SESSION_SOURCE_ERROR],
+  ["account-concurrency", ACCOUNT_CONCURRENCY_ERROR],
+  ["unknown", "unexpected provider failure"],
+  ["empty", ""],
+  ["missing", undefined],
+  ["auth", "401 unauthorized invalid API key"],
+  ["quota", "quota exceeded; billing balance is 0"],
+]) test(`assistant error auto-continue waits for settled and debounce: ${label}`, async (t) => {
+  const h = await statusHarness(`assistant-error-${label}`);
+  const message = assistantFailure(errorMessage);
   try {
-    // 同一个 harness 内的 A/B：负例必须先证明该 harness 确实具备发送能力，否则「没发送」可能只是时序假象。
-    h.setSignal(run.signal);
+    h.setSignal(new AbortController().signal);
     h.fire("agent_start", {}, h.ctx);
-    h.fire("message_update", { message: { role: "assistant", stopReason: "error", errorMessage: local } }, h.ctx);
-    h.fire("message_end", { message: { role: "assistant", stopReason: "error", errorMessage: local } }, h.ctx);
-    h.fire("agent_settled", {}, h.ctx);
-    await new Promise((resolve) => setTimeout(resolve, 350));
-    assert.deepEqual(h.sent, [], "local program concurrency wording schedules no continue");
-    assert.equal(h.paneArmed(), "", "local program concurrency wording publishes no error lease");
-
-    const run2 = new AbortController();
-    h.setSignal(run2.signal);
-    h.fire("agent_start", {}, h.ctx);
-    h.fire("message_update", { message: { role: "assistant", stopReason: "error", errorMessage: gateway } }, h.ctx);
+    h.fire("message_update", { message }, h.ctx);
+    h.fire("message_end", { message }, h.ctx);
     await waitFor(h.paneArmed, "1");
     await waitFor(h.errorOption, "1");
-    h.fire("message_end", { message: { role: "assistant", stopReason: "error", errorMessage: gateway } }, h.ctx);
-    h.fire("agent_settled", {}, h.ctx);
-    await waitFor(() => h.sent.length, 1);
-    assert.deepEqual(h.sent, ["continue"], "the screenshot error sends the user continue");
-    h.fire("agent_settled", {}, h.ctx);
-    await new Promise((resolve) => setTimeout(resolve, 350));
-    assert.deepEqual(h.sent, ["continue"], "a repeated settle stays inside the 30 s send throttle");
+    t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: Date.now() });
+    t.mock.timers.tick(1_000);
+    h.fire("agent_end", {}, h.ctx);
+    t.mock.timers.tick(1_000);
+    assert.deepEqual(h.sent, [], "native retry/compaction still owns the unsettled run");
+    h.fire("agent_settled", { aborted: false }, h.ctx);
+    t.mock.timers.tick(249);
+    assert.deepEqual(h.sent, [], "settlement does not bypass the debounce");
+    t.mock.timers.tick(1);
+    assert.deepEqual(h.sent, ["continue"]);
+    assert.equal(h.errorOption(), "1", "sending continue does not clear the error latch");
+    t.diagnostic(`${label}: error -> red; before settled=0 sends; settled+249ms=0; +250ms=continue`);
   } finally {
+    t.mock.timers.reset();
+    await h.cleanup();
+  }
+});
+
+test("auto-continue ignores tool failures, ordinary Error text and aborted messages", async (t) => {
+  const h = await statusHarness("non-assistant-errors");
+  try {
+    t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: Date.now() });
+    for (const message of [
+      { role: "toolResult", toolName: "bash", isError: true, content: [{ type: "text", text: `Error: ${SESSION_SOURCE_ERROR}` }] },
+      { role: "tool", stopReason: "error", errorMessage: SESSION_SOURCE_ERROR },
+      { role: "assistant", stopReason: "stop", content: [{ type: "text", text: `Error: ${SESSION_SOURCE_ERROR}` }] },
+      { role: "assistant", stopReason: "aborted", errorMessage: "Operation aborted" },
+    ]) {
+      h.fire("agent_start", {}, h.ctx);
+      h.fire("message_update", { message }, h.ctx);
+      h.fire("message_end", { message }, h.ctx);
+      h.fire("agent_settled", {}, h.ctx);
+      t.mock.timers.tick(30_000);
+      assert.deepEqual(h.sent, [], JSON.stringify(message));
+      assert.equal(h.paneArmed(), "", "non-errors do not publish recovery ownership");
+    }
+    h.fire("agent_start", {}, h.ctx);
+    h.fire("message_end", { message: assistantFailure() }, h.ctx);
+    h.fire("agent_settled", {}, h.ctx);
+    t.mock.timers.tick(250);
+    assert.deepEqual(h.sent, ["continue"], "the same harness can send for an actual assistant error");
+  } finally {
+    t.mock.timers.reset();
+    await h.cleanup();
+  }
+});
+
+test("auto-continue requires idle and no pending messages at settlement and send time", async (t) => {
+  const h = await statusHarness("idle-pending-gates");
+  let idle = false, pending = false;
+  h.ctx.isIdle = () => idle;
+  h.ctx.hasPendingMessages = () => pending;
+  try {
+    h.fire("agent_start", {}, h.ctx);
+    h.fire("message_end", { message: assistantFailure(SESSION_SOURCE_ERROR) }, h.ctx);
+    await waitFor(h.errorOption, "1");
+    t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: Date.now() });
+    h.fire("agent_settled", {}, h.ctx);
+    t.mock.timers.tick(1_000);
+    assert.deepEqual(h.sent, [], "busy settlement schedules nothing");
+    idle = true; pending = true;
+    h.fire("agent_settled", {}, h.ctx);
+    t.mock.timers.tick(1_000);
+    assert.deepEqual(h.sent, [], "queued input at settlement schedules nothing");
+    pending = false;
+    h.fire("agent_settled", {}, h.ctx);
+    pending = true;
+    t.mock.timers.tick(250);
+    assert.deepEqual(h.sent, [], "queued input appearing during debounce blocks the send");
+    pending = false;
+    h.fire("agent_settled", {}, h.ctx);
+    idle = false;
+    t.mock.timers.tick(250);
+    assert.deepEqual(h.sent, [], "becoming busy during debounce blocks the send");
+    idle = true;
+    h.fire("agent_settled", {}, h.ctx);
+    t.mock.timers.tick(250);
+    assert.deepEqual(h.sent, ["continue"]);
+  } finally {
+    t.mock.timers.reset();
+    await h.cleanup();
+  }
+});
+
+test("native retry success settles without an injected continue", async (t) => {
+  const h = await statusHarness("native-retry-success");
+  try {
+    h.fire("agent_start", {}, h.ctx);
+    h.fire("message_end", { message: assistantFailure(SESSION_SOURCE_ERROR) }, h.ctx);
+    await waitFor(h.errorOption, "1");
+    t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: Date.now() });
+    h.fire("agent_end", {}, h.ctx);
+    t.mock.timers.tick(60_000);
+    assert.deepEqual(h.sent, []);
+    h.fire("agent_start", {}, h.ctx);
+    h.fire("message_end", { message: { role: "assistant", stopReason: "toolUse", content: [{ type: "toolCall", name: "bash" }] } }, h.ctx);
+    h.fire("message_end", { message: { role: "toolResult", toolName: "bash", isError: false, content: [{ type: "text", text: "ok" }] } }, h.ctx);
+    h.fire("agent_settled", {}, h.ctx);
+    t.mock.timers.tick(60_000);
+    assert.deepEqual(h.sent, [], "successful native recovery clears eligibility before settlement");
+    t.mock.timers.reset();
+    await waitFor(h.errorOption, "");
+  } finally {
+    t.mock.timers.reset();
+    await h.cleanup();
+  }
+});
+
+test("user abort disarms recovery, including aborted settlement without a new assistant message", async (t) => {
+  const h = await statusHarness("user-abort");
+  const userAbort = { role: "assistant", stopReason: "aborted", errorMessage: "Operation aborted" };
+  try {
+    h.fire("agent_start", {}, h.ctx);
+    h.fire("message_end", { message: assistantFailure() }, h.ctx);
+    await waitFor(h.errorOption, "1");
+    t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: Date.now() });
+    h.fire("message_end", { message: userAbort }, h.ctx);
+    h.fire("agent_settled", {}, h.ctx);
+    t.mock.timers.tick(1_000);
+    assert.deepEqual(h.sent, []);
+    assert.equal(h.errorOption(), "1", "ordinary abort preserves the existing red latch");
+    h.fire("agent_start", {}, h.ctx);
+    h.fire("message_end", { message: assistantFailure(SESSION_SOURCE_ERROR) }, h.ctx);
+    h.fire("agent_settled", {}, h.ctx);
+    h.fire("message_end", { message: userAbort }, h.ctx);
+    t.mock.timers.tick(250);
+    assert.deepEqual(h.sent, [], "late user abort invalidates an already-scheduled timer");
+    h.fire("agent_start", {}, h.ctx);
+    h.fire("message_end", { message: assistantFailure(ACCOUNT_CONCURRENCY_ERROR) }, h.ctx);
+    h.fire("agent_settled", { aborted: true }, h.ctx);
+    t.mock.timers.tick(60_000);
+    assert.deepEqual(h.sent, [], "abort during native retry sleep may have no aborted message");
+  } finally {
+    t.mock.timers.reset();
+    await h.cleanup();
+  }
+});
+
+test("raw Esc cancels a pending continue for an unfamiliar assistant error", async (t) => {
+  const h = await statusHarness("raw-escape");
+  try {
+    h.setSignal(new AbortController().signal);
+    h.fire("agent_start", {}, h.ctx);
+    h.fire("message_end", { message: assistantFailure(SESSION_SOURCE_ERROR) }, h.ctx);
+    await waitFor(h.errorOption, "1");
+    t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: Date.now() });
+    h.fire("agent_settled", {}, h.ctx);
+    assert.equal(h.terminalInput("\x1b"), undefined, "raw Esc remains passthrough");
+    h.fire("message_end", { message: assistantFailure() }, h.ctx);
+    h.fire("agent_settled", {}, h.ctx);
+    t.mock.timers.tick(60_000);
+    assert.deepEqual(h.sent, [], "Esc suppresses both the timer and same-run late errors");
+    t.mock.timers.reset();
+    await waitFor(h.paneArmed, "");
+    await waitFor(h.errorOption, "");
+  } finally {
+    t.mock.timers.reset();
+    await h.cleanup();
+  }
+});
+
+test("legacy retry-exhausted abort tail preserves only an already-armed recovery", async (t) => {
+  const h = await statusHarness("legacy-retry-tail");
+  const tail = { role: "assistant", stopReason: "aborted", errorMessage: "Aborted after 5 retry attempts" };
+  try {
+    t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: Date.now() });
+    h.fire("agent_start", {}, h.ctx);
+    h.fire("message_end", { message: tail }, h.ctx);
+    h.fire("agent_settled", { aborted: false }, h.ctx);
+    t.mock.timers.tick(1_000);
+    assert.deepEqual(h.sent, [], "legacy tail alone never arms");
+    h.fire("agent_start", {}, h.ctx);
+    h.fire("message_end", { message: assistantFailure("") }, h.ctx);
+    h.fire("message_end", { message: tail }, h.ctx);
+    h.fire("agent_settled", { aborted: false }, h.ctx);
+    t.mock.timers.tick(250);
+    assert.deepEqual(h.sent, ["continue"]);
+  } finally {
+    t.mock.timers.reset();
+    await h.cleanup();
+  }
+});
+
+for (const reset of ["success", "model-select"]) test(`auto-continue preserves 30s throttle and ten-send cap until ${reset}`, async (t) => {
+  const h = await statusHarness(`recovery-cap-${reset}`);
+  const failAndSettle = () => {
+    h.setSignal(new AbortController().signal);
+    h.fire("agent_start", {}, h.ctx);
+    h.fire("message_end", { message: assistantFailure(ACCOUNT_CONCURRENCY_ERROR) }, h.ctx);
+    h.fire("agent_settled", {}, h.ctx);
+  };
+  try {
+    h.fire("agent_start", {}, h.ctx);
+    h.fire("message_end", { message: assistantFailure(SESSION_SOURCE_ERROR) }, h.ctx);
+    await waitFor(h.errorOption, "1");
+    t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: Date.now() });
+    h.fire("agent_settled", {}, h.ctx);
+    t.mock.timers.tick(250);
+    assert.equal(h.sent.length, 1);
+    for (let n = 2; n <= 10; n++) {
+      failAndSettle();
+      t.mock.timers.tick(29_999);
+      assert.equal(h.sent.length, n - 1, "a new error cannot bypass the 30s throttle");
+      t.mock.timers.tick(1);
+      assert.equal(h.sent.length, n);
+      assert.equal(h.sentAt[n - 1] - h.sentAt[n - 2], 30_000);
+    }
+    failAndSettle();
+    t.mock.timers.tick(60_000);
+    assert.equal(h.sent.length, 10, "the eleventh failure stays capped");
+    assert.equal(h.errorOption(), "1", "the cap retains the red latch");
+    h.terminalInput(CANCEL_SENTINEL);
+    failAndSettle();
+    t.mock.timers.tick(60_000);
+    assert.equal(h.sent.length, 10, "Esc does not reset the failure cap");
+    if (reset === "success") h.fire("message_end", { message: { role: "assistant", stopReason: "toolUse", content: [{ type: "toolCall", name: "bash" }] } }, h.ctx);
+    else h.fire("model_select", {}, h.ctx);
+    failAndSettle();
+    t.mock.timers.tick(250);
+    assert.equal(h.sent.length, 11, "normal assistant completion or model selection resets the streak");
+    t.diagnostic(`10 sends exactly 30s apart -> capped at 10 -> Esc still capped -> ${reset} permits next send`);
+  } finally {
+    t.mock.timers.reset();
     await h.cleanup();
   }
 });
@@ -781,7 +957,7 @@ test("real gateway concurrency error auto-continues once while local concurrency
 test("sentinel cancellation invalidates delayed events from one run while a distinct run auto-continues", async () => {
   const h = await statusHarness("delayed-cancel");
   const firstRun = new AbortController(), secondRun = new AbortController(), thirdRun = new AbortController();
-  const errMsg = { role: "assistant", stopReason: "error", errorMessage: "stream_read_error" };
+  const errMsg = assistantFailure(SESSION_SOURCE_ERROR);
   try {
     h.setSignal(firstRun.signal);
     h.fire("agent_start", {}, h.ctx);

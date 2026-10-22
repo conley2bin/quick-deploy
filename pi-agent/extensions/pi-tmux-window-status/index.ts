@@ -15,26 +15,8 @@ type Child = { id: string; asyncDir?: string; nestedRoute?: NestedRoute; rootTer
 type SessionManager = { getSessionFile?: () => string | null | undefined; getSessionId?: () => string | null | undefined };
 const object = (x: unknown): Record<string, unknown> | undefined => x && typeof x === "object" ? x as Record<string, unknown> : undefined;
 const NESTED_TERMINAL = new Set(["complete", "failed", "paused", "stopped", "rejected"]);
-const HARD_EXCLUDE = /(abort|aborted|cancelled|context (length|overflow|window)|maximum context|max tokens|token limit|content policy|safety|refusal|refused)/i;
-const POSITIVE_QUOTA = /(insufficient_user_quota|quota|quota exceeded|billing|balance(?!\s*transfer)|out of (balance|credit)|zero (balance|credit)|payment required|usage limit|quota will reset|weekly.{0,12}limit|purchase extra usage|upgrade your plan|(?:余额|额度|配额|套餐).{0,12}(?:不足|耗尽|用尽|为 0|为0))/i;
-const POSITIVE_AUTH = /(api[-_ ]?key|authentication|unauthorized|forbidden|\b401\b|\b403\b)/i;
-const POSITIVE_MODEL = /(invalid model|unknown model|model (id|name).*(invalid|unknown)|model not found|model does not exist|model.*(unavailable|not available))/i;
-const POSITIVE_RATE = /(no deployments? available|deployment unavailable|\b429\b|rate[- ]limit|overloaded?|capacity|too many requests)/i;
-const POSITIVE_TIMEOUT = /\b408\b|timeout|timed out/i;
-const POSITIVE_TRANSPORT = /(^|\bError:\s*)terminated\s*$|network failure|fetch failed|connection (refused|reset|dropped)|econn(refused|reset)|socket hang up|stream[_ -]+read[_ -]+error|streaming error|streaming failed|stream ended[- ]before|stream interrupted|transport error|transport.*failed/i;
-const POSITIVE_5XX = /\b5\d\d\b|\b520\b|\b524\b|\b529\b/i;
-const POSITIVE_ADAPTER = /LiteLLMCompletionStreamingIterator|completed_response/i;
-const POSITIVE_CONCURRENCY = /(permission[_ ]?error.*concurrent|concurrent request limit)/i;
-// 供应商网关的账号级并发上限，截图原文 "gateway_concurrency_limit: Concurrency limit exceeded for account,
-// please retry later"。必须同时命中网关错误码或 "for account" 归属短语：裸的 "concurrency limit
-// exceeded" 也会出现在用户代码/本地程序的并发错误里，那种错误不是供应商可用性问题，不该自动 continue。
-const POSITIVE_GATEWAY_CONCURRENCY = /gateway[_ -]?concurrency[_ -]?limit|concurrency limit exceeded for accounts?\b/i;
-const POSITIVE_PROVIDER = /(service unavailable|provider (unavailable|error)|backend unavailable|upstream (unavailable|error))/i;
-const POSITIVE_ANY = new RegExp([POSITIVE_QUOTA.source, POSITIVE_AUTH.source, POSITIVE_MODEL.source, POSITIVE_RATE.source, POSITIVE_TIMEOUT.source, POSITIVE_TRANSPORT.source, POSITIVE_5XX.source, POSITIVE_ADAPTER.source, POSITIVE_CONCURRENCY.source, POSITIVE_GATEWAY_CONCURRENCY.source, POSITIVE_PROVIDER.source].join("|"), "i");
-const ORDINARY_BAD_REQUEST = /(\b400\b|bad request|invalid request|schema|validation(?! failed))/i;
-const CONFLICT_RATELIMIT = /too many concurrent requests/i;
-// Pi 自动重试耗尽后的收尾消息（retryAttempt>0）；用户主动 Esc 是 "Operation aborted"
-// （retryAttempt=0），两者必须区分：前者是被分类错误的事实尾巴，后者是用户意图。
+// Older Pi versions can end native retries with this aborted tail. It preserves
+// an already-armed recovery, unlike a user abort; current Pi may retain the error.
 const RETRY_EXHAUSTED_ABORT = /^aborted after \d+ retry attempts?$/i;
 export const CANCEL_SENTINEL = "\x1b[997;1~";
 
@@ -56,31 +38,17 @@ export function recoveryTerminalInput(data: string, cancel: () => void) {
   return undefined;
 }
 
-export function classifyModelUnavailable(message: unknown) {
+// Recovery follows Pi's terminal assistant state, never provider wording.
+export function isAssistantError(message: unknown) {
   const msg = object(message);
-  const error = typeof msg?.errorMessage === "string" ? msg.errorMessage.trim() : "";
-  if (msg?.role !== "assistant" || msg?.stopReason !== "error" || !error) return false;
-  if (HARD_EXCLUDE.test(error)) return false;
-  if (CONFLICT_RATELIMIT.test(error)) return true;
-  if (ORDINARY_BAD_REQUEST.test(error)) {
-    if (POSITIVE_MODEL.test(error)) return true;
-    if (POSITIVE_QUOTA.test(error)) return true;
-    if (POSITIVE_AUTH.test(error)) return true;
-    if (POSITIVE_GATEWAY_CONCURRENCY.test(error)) return true;
-    return false;
-  }
-  return POSITIVE_ANY.test(error);
+  return msg?.role === "assistant" && msg?.stopReason === "error";
 }
 function partHasSemanticOutput(part: Record<string, unknown> | undefined) { if (!part) return false; if (typeof part.text === "string" && part.text.trim()) return true; if (typeof part.thinking === "string" && (part.thinking as string).trim()) return true; const t = String(part.type || ""); return t === "toolCall" || t === "tool_call" || t === "tool_use"; }
 function assistantHasSemanticOutput(msg: Record<string, unknown> | undefined) { if (!msg || msg.role !== "assistant") return false; if (typeof msg.text === "string" && msg.text.trim()) return true; if (typeof msg.thinking === "string" && msg.thinking.trim()) return true; const content = Array.isArray(msg.content) ? msg.content : []; const delta = object(msg.delta); if (Array.isArray(delta?.content) && delta!.content.some((part) => partHasSemanticOutput(object(part)))) return true; return content.some((part) => partHasSemanticOutput(object(part))); }
 function semanticAssistantOutput(message: unknown) { const p = object(message); if (!p) return false; if (assistantHasSemanticOutput(p)) return true; const inner = object(p.message); if (inner) return assistantHasSemanticOutput(inner); return false; }
 export function isRetryExhaustedAbort(message: unknown) { const msg = object(message); return msg?.role === "assistant" && msg?.stopReason === "aborted" && RETRY_EXHAUSTED_ABORT.test(typeof msg?.errorMessage === "string" ? msg.errorMessage.trim() : ""); }
-// auto-continue 的门控标志：跟 modelError 一样要扛过 Pi 内部重试耗尽后的 aborted 尾巴
-// （pi 对 stopReason:"error" 会自动重试，放弃时把消息改成 stopReason:"aborted" +
-// "Aborted after N retry attempts"——该消息命中 HARD_EXCLUDE，若直接覆盖标志，
-// 真正 settle 时 lastAssistantErrorMatched 必为 false，continue 永远发不出去）。
-export function nextLastAssistantErrorMatched(current: boolean, message: unknown) { return classifyModelUnavailable(message) || (isRetryExhaustedAbort(message) && current); }
-export function nextModelErrorState(current: boolean, eventType: string, message?: unknown) { if (eventType === "model_select") return false; if (eventType === "message_update") { if (classifyModelUnavailable(message)) return true; return current && semanticAssistantOutput(message) ? false : current; } if (eventType === "message_end") { const msg = object(message); if (classifyModelUnavailable(message)) return true; if (msg?.role === "assistant" && msg?.stopReason !== "error" && msg?.stopReason !== "aborted") return false; return current; } return current; }
+export function nextAutoContinueArmed(current: boolean, message: unknown) { return isAssistantError(message) || (isRetryExhaustedAbort(message) && current); }
+export function nextAssistantErrorState(current: boolean, eventType: string, message?: unknown) { if (eventType === "model_select") return false; if (eventType === "message_update") { if (isAssistantError(message)) return true; return current && semanticAssistantOutput(message) ? false : current; } if (eventType === "message_end") { const msg = object(message); if (isAssistantError(message)) return true; if (msg?.role === "assistant" && msg?.stopReason !== "error" && msg?.stopReason !== "aborted") return false; return current; } return current; }
 function eventMessage(args: unknown[]) { for (const arg of args) { const p = object(arg); if (object(p?.message)) return p?.message; if (p?.role === "assistant" || p?.role === "tool") return p; } return undefined; }
 function unwrapAssistantMessage(value: unknown) { const p = object(value); if (object(p?.message)) return p?.message; if (p?.role === "assistant") return p; return undefined; }
 function identity(): Identity { const pane = process.env.TMUX_PANE; if (!pane) throw new Error("pi-tmux-window-status: TMUX_PANE is missing; Pi is outside tmux"); const socketPath = execFileSync("tmux", ["display-message", "-p", "#{socket_path}"], { encoding: "utf8" }).trim(); const [windowId, paneId] = execFileSync("tmux", ["-S", socketPath, "display-message", "-p", "-t", pane, "#{window_id}|#{pane_id}"], { encoding: "utf8" }).trim().split("|"); if (!socketPath || !windowId || !paneId) throw new Error("pi-tmux-window-status: cannot resolve tmux socket/window/pane"); return { socketPath, windowId, paneId }; }
@@ -109,28 +77,28 @@ function hasLiveDescendant(node: unknown): boolean { if (!node || typeof node !=
 export function hasLiveNestedDescendant(node: unknown): boolean { return hasLiveDescendant(node); }
 export function readNestedRegistryProjection(route: NestedRoute, read = readFileSync) { try { const registry = JSON.parse(String(read(route.registryPath, "utf8"))); if (!registry || registry.rootRunId !== route.rootRunId || !Array.isArray(registry.children)) return { resolved: false as const, live: true, reason: "mismatched" }; const live = registry.children.some((child: Record<string, unknown>) => hasLiveDescendant(child)); return { resolved: true as const, live, projection: nestedProjectionFromChildren(route.rootRunId, registry.children) || { runId: route.rootRunId, state: "complete" } }; } catch { return { resolved: false as const, live: true, reason: "unresolved" }; } }
 export function mergedChildSnapshot(child: Child, rawStatus: unknown) { if (!child.rootTerminal) return rawStatus || child.nestedProjection; if (child.nestedProjection) return child.nestedProjection; if (child.nestedRoute) return undefined; return rawStatus; }
-export function monitorNeeded(mainActive: boolean, childCount: number, modelError = false) { return Boolean(modelError || mainActive || childCount > 0); }
+export function monitorNeeded(mainActive: boolean, childCount: number, assistantErrorLatched = false) { return Boolean(assistantErrorLatched || mainActive || childCount > 0); }
 
 export default function piTmuxWindowStatus(pi: ExtensionAPI) {
   if (nestedPublisherDisabled()) return;
   let tmux: Identity; try { tmux = identity(); } catch (error) { console.error(error instanceof Error ? error.message : String(error)); return; }
-  let mainActive = false, modelError = false, rootSessionId: string | undefined, beat: ReturnType<typeof setInterval> | undefined, animator: ReturnType<typeof spawn> | undefined, previousLeaseState: false | "active" | "error" = false;
-  let lastAssistantErrorMatched = false, continueTimer: ReturnType<typeof setTimeout> | undefined, lastContinueSentAt = 0, autoContinueCount = 0, terminalInputUnsubscribe: (() => void) | undefined, activeRunSignal: AbortSignal | undefined;
+  let mainActive = false, assistantErrorLatched = false, rootSessionId: string | undefined, beat: ReturnType<typeof setInterval> | undefined, animator: ReturnType<typeof spawn> | undefined, previousLeaseState: false | "active" | "error" = false;
+  let autoContinueArmed = false, continueTimer: ReturnType<typeof setTimeout> | undefined, lastContinueSentAt = 0, autoContinueCount = 0, terminalInputUnsubscribe: (() => void) | undefined, activeRunSignal: AbortSignal | undefined;
   const cancelledRunSignals = new WeakSet<AbortSignal>();
   const AUTO_CONTINUE_MAX = 10, AUTO_CONTINUE_MIN_INTERVAL_MS = 30_000, AUTO_CONTINUE_DEBOUNCE_MS = 250;
   const owner = `${process.pid}:${tmux.paneId}`, children = new Map<string, Child>(), watchers = new Map<string, FSWatcher>(), routeWatchers = new Map<string, FSWatcher>(), attention = new Map<string, number>();
   const snapshots = () => new Map([...children].map(([id, c]) => { const snapshot = mergedChildSnapshot(c, readStatus(c.asyncDir)); seedAttentionWatermarksFromSnapshot(snapshot, attention); return [id, snapshot]; }));
   const logical = () => aggregateLogicalState({ mainActive, roots: new Set(children.keys()), snapshots: snapshots(), attentionWatermarks: attention });
   const diagnostic = () => { const state = logical(); return { parentSessionId: rootSessionId, activeRunIds: [...state.activeRoots].sort(), activeNodeIds: [...state.activeIds].sort() }; };
-  const desiredLeaseState = () => modelError ? "error" : logical().active ? "active" : false;
+  const desiredLeaseState = () => assistantErrorLatched ? "error" : logical().active ? "active" : false;
   const kick = (force = false) => { if (!animatorSpawnNeeded(animator, Boolean(desiredLeaseState()), force)) return; animator = spawn(process.execPath, [ANIMATOR, tmux.socketPath], { detached: true, stdio: "ignore", env: process.env }); animator.unref(); };
   const closeChild = (id: string) => { const child = children.get(id); if (!child) return; for (const key of [...attention.keys()]) if (containsRun(child.nestedProjection, key) || containsRun(readStatus(child.asyncDir), key)) attention.delete(key); children.delete(id); watchers.get(id)?.close(); watchers.delete(id); routeWatchers.get(id)?.close(); routeWatchers.delete(id); };
   const watchNestedRoute = (id: string) => { const child = children.get(id); if (!child?.nestedRoute || routeWatchers.has(id)) return; try { const watcher = watch(child.nestedRoute.registryDir, (_event, name) => { if (!name || String(name) === "registry.json") { refreshNestedRegistry(id); sync(); } }); watcher.unref?.(); routeWatchers.set(id, watcher); } catch {} };
   const refreshNestedRegistry = (id: string) => { const child = children.get(id); if (!child?.nestedRoute) return; watchNestedRoute(id); const result = readNestedRegistryProjection(child.nestedRoute); if (!result.resolved) return; child.nestedProjection = result.projection; if (child.rootTerminal && !result.live) closeChild(id); };
   const refreshRetainedTerminalRoots = () => { for (const [id, child] of [...children]) if (child.rootTerminal && child.nestedRoute) refreshNestedRegistry(id); };
   const publishDesiredLease = () => { const next = desiredLeaseState(); publishLease(tmux, owner, next, Date.now(), process.env, diagnostic()); if (next) kick(); else if (previousLeaseState === "error") kick(true); previousLeaseState = next; return next; };
-  const monitorTick = () => { refreshRetainedTerminalRoots(); publishDesiredLease(); if (!monitorNeeded(mainActive, children.size, modelError) && beat) { clearInterval(beat); beat = undefined; } };
-  const sync = () => { publishDesiredLease(); if (monitorNeeded(mainActive, children.size, modelError)) { if (!beat) beat = setInterval(monitorTick, HEARTBEAT_MS); } else if (beat) { clearInterval(beat); beat = undefined; } };
+  const monitorTick = () => { refreshRetainedTerminalRoots(); publishDesiredLease(); if (!monitorNeeded(mainActive, children.size, assistantErrorLatched) && beat) { clearInterval(beat); beat = undefined; } };
+  const sync = () => { publishDesiredLease(); if (monitorNeeded(mainActive, children.size, assistantErrorLatched)) { if (!beat) beat = setInterval(monitorTick, HEARTBEAT_MS); } else if (beat) { clearInterval(beat); beat = undefined; } };
   const refresh = (id: string) => { const child = children.get(id); if (!child) return; const status = readStatus(child.asyncDir); if (status && statusTerminal(status)) { child.rootTerminal = true; if (child.nestedRoute) refreshNestedRegistry(id); if (children.has(id) && !child.nestedRoute && !child.nestedProjection) closeChild(id); } else if (status) child.rootTerminal = false; sync(); };
   const watchChild = (id: string) => { const child = children.get(id); if (!child?.asyncDir || watchers.has(id)) return; try { const watcher = watch(child.asyncDir, (_event, name) => { if (!name || String(name) === "status.json") refresh(id); }); watcher.unref?.(); watchers.set(id, watcher); } catch (error) { console.error("pi-tmux-window-status: cannot watch async status", error); } };
   const started = (value: unknown) => { const p = object(value), id = typeof p?.id === "string" ? p.id : undefined, sessionId = typeof p?.sessionId === "string" ? p.sessionId : undefined; const child = childFromStartedPayload(value, rootSessionId); if (!child) { if (!id || typeof p?.asyncDir !== "string" || !sessionId) console.error("pi-tmux-window-status: malformed async-started payload (id, sessionId, and asyncDir required)"); else console.error(`pi-tmux-window-status: ignored foreign async-started '${id}'`); return; } children.set(child.id, { ...children.get(child.id), ...child }); watchChild(child.id); watchNestedRoute(child.id); sync(); };
@@ -140,32 +108,32 @@ export default function piTmuxWindowStatus(pi: ExtensionAPI) {
   const restore = () => { if (!rootSessionId) return; for (const child of restoredChildren(defaultAsyncRoot(), rootSessionId)) { children.set(child.id, child); watchChild(child.id); watchNestedRoute(child.id); } sync(); };
   const captureSession = (ctx: { sessionManager?: SessionManager }) => { rootSessionId ||= sessionIdOf(ctx.sessionManager); if (!rootSessionId) console.error("pi-tmux-window-status: root Pi session identity is unavailable"); };
   const urgentAnimatorTick = () => { requestAnimatorTick(tmux); };
-  const updateModelError = (eventType: string, message?: unknown) => { const next = nextModelErrorState(modelError, eventType, message); if (next !== modelError) { modelError = next; sync(); urgentAnimatorTick(); } };
+  const updateAssistantError = (eventType: string, message?: unknown) => { const next = nextAssistantErrorState(assistantErrorLatched, eventType, message); if (next !== assistantErrorLatched) { assistantErrorLatched = next; sync(); urgentAnimatorTick(); } };
   const cancelContinue = () => { if (continueTimer) { clearTimeout(continueTimer); continueTimer = undefined; } };
   const signalFor = (ctx?: { signal?: AbortSignal }) => ctx?.signal || activeRunSignal;
   const eventFromCancelledRun = (ctx?: { signal?: AbortSignal }) => { const signal = signalFor(ctx); return Boolean(signal && cancelledRunSignals.has(signal)); };
   const cancelErroredAutoContinue = (signal?: AbortSignal) => {
-    if (!modelError && !lastAssistantErrorMatched && !continueTimer) return false;
+    if (!assistantErrorLatched && !autoContinueArmed && !continueTimer) return false;
     if (signal) cancelledRunSignals.add(signal);
     cancelContinue();
-    modelError = false;
-    lastAssistantErrorMatched = false;
+    assistantErrorLatched = false;
+    autoContinueArmed = false;
     sync();
     urgentAnimatorTick();
     return true;
   };
   const sendContinue = () => { continueTimer = undefined; lastContinueSentAt = Date.now(); autoContinueCount += 1; pi.sendUserMessage("continue"); };
-  const scheduleContinue = (delay: number) => { cancelContinue(); continueTimer = setTimeout(() => { if (mainActive) { continueTimer = undefined; return; } const idle = lastCtx?.isIdle?.() ?? false; const pending = lastCtx?.hasPendingMessages?.() ?? false; if (!idle || pending) { continueTimer = undefined; return; } const elapsed = Date.now() - lastContinueSentAt; if (elapsed < AUTO_CONTINUE_MIN_INTERVAL_MS) { scheduleContinue(AUTO_CONTINUE_MIN_INTERVAL_MS - elapsed); return; } if (autoContinueCount >= AUTO_CONTINUE_MAX) { continueTimer = undefined; return; } sendContinue(); }, delay); };
-  const maybeAutoContinue = (ctx: { isIdle?: () => boolean; hasPendingMessages?: () => boolean }) => { lastCtx = ctx; if (!modelError || !lastAssistantErrorMatched || autoContinueCount >= AUTO_CONTINUE_MAX) return; if (!ctx.isIdle?.() || ctx.hasPendingMessages?.()) return; scheduleContinue(AUTO_CONTINUE_DEBOUNCE_MS); };
+  const scheduleContinue = (delay: number) => { cancelContinue(); continueTimer = setTimeout(() => { if (mainActive || !assistantErrorLatched || !autoContinueArmed) { continueTimer = undefined; return; } const idle = lastCtx?.isIdle?.() ?? false; const pending = lastCtx?.hasPendingMessages?.() ?? false; if (!idle || pending) { continueTimer = undefined; return; } const elapsed = Date.now() - lastContinueSentAt; if (elapsed < AUTO_CONTINUE_MIN_INTERVAL_MS) { scheduleContinue(AUTO_CONTINUE_MIN_INTERVAL_MS - elapsed); return; } if (autoContinueCount >= AUTO_CONTINUE_MAX) { continueTimer = undefined; return; } sendContinue(); }, delay); };
+  const maybeAutoContinue = (ctx: { isIdle?: () => boolean; hasPendingMessages?: () => boolean }) => { lastCtx = ctx; if (!assistantErrorLatched || !autoContinueArmed || autoContinueCount >= AUTO_CONTINUE_MAX) return; if (!ctx.isIdle?.() || ctx.hasPendingMessages?.()) return; scheduleContinue(AUTO_CONTINUE_DEBOUNCE_MS); };
   let lastCtx: { isIdle?: () => boolean; hasPendingMessages?: () => boolean } | undefined;
   const resetFailureStreak = () => { autoContinueCount = 0; };
   const unsub = [pi.events.on(STARTED, started), pi.events.on(COMPLETE, complete), pi.events.on(CONTROL, control)];
   pi.on("session_start", (_event, ctx) => { captureSession(ctx); terminalInputUnsubscribe?.(); terminalInputUnsubscribe = undefined; if (ctx.mode === "tui") terminalInputUnsubscribe = ctx.ui.onTerminalInput((data) => recoveryTerminalInput(data, () => cancelErroredAutoContinue(signalFor(ctx)))); restore(); });
   pi.on("agent_start", (_event, ctx) => { captureSession(ctx); activeRunSignal = ctx.signal; mainActive = true; cancelContinue(); restore(); sync(); });
-  pi.on("agent_settled", (_event, ctx) => { mainActive = false; sync(); maybeAutoContinue(ctx); });
+  pi.on("agent_settled", (event, ctx) => { mainActive = false; sync(); if (event.aborted) { cancelContinue(); autoContinueArmed = false; return; } maybeAutoContinue(ctx); });
   pi.on("input", () => { cancelContinue(); });
-  pi.on("message_update", (event, ctx) => { if (eventFromCancelledRun(ctx)) return; const msg = unwrapAssistantMessage(eventMessage([event])) || eventMessage([event]); updateModelError("message_update", msg); });
-  pi.on("message_end", (event, ctx) => { if (eventFromCancelledRun(ctx)) return; const msg = eventMessage([event]); const matched = classifyModelUnavailable(msg); lastAssistantErrorMatched = nextLastAssistantErrorMatched(lastAssistantErrorMatched, msg); updateModelError("message_end", msg); if (!matched && object(msg)?.role === "assistant" && object(msg)?.stopReason !== "error" && object(msg)?.stopReason !== "aborted") resetFailureStreak(); });
-  pi.on("model_select", () => { resetFailureStreak(); updateModelError("model_select"); });
-  pi.on("session_shutdown", () => { const hadError = previousLeaseState === "error" || modelError; mainActive = false; modelError = false; lastAssistantErrorMatched = false; cancelContinue(); terminalInputUnsubscribe?.(); terminalInputUnsubscribe = undefined; children.clear(); if (beat) clearInterval(beat); for (const watcher of watchers.values()) watcher.close(); watchers.clear(); for (const watcher of routeWatchers.values()) watcher.close(); routeWatchers.clear(); publishLease(tmux, owner, false); if (hadError) { kick(true); urgentAnimatorTick(); } for (const unsubscribe of unsub) if (typeof unsubscribe === "function") unsubscribe(); });
+  pi.on("message_update", (event, ctx) => { if (eventFromCancelledRun(ctx)) return; const msg = unwrapAssistantMessage(eventMessage([event])) || eventMessage([event]); updateAssistantError("message_update", msg); });
+  pi.on("message_end", (event, ctx) => { if (eventFromCancelledRun(ctx)) return; const msg = eventMessage([event]); autoContinueArmed = nextAutoContinueArmed(autoContinueArmed, msg); updateAssistantError("message_end", msg); if (object(msg)?.role === "assistant" && object(msg)?.stopReason !== "error" && object(msg)?.stopReason !== "aborted") resetFailureStreak(); });
+  pi.on("model_select", () => { resetFailureStreak(); updateAssistantError("model_select"); });
+  pi.on("session_shutdown", () => { const hadError = previousLeaseState === "error" || assistantErrorLatched; mainActive = false; assistantErrorLatched = false; autoContinueArmed = false; cancelContinue(); terminalInputUnsubscribe?.(); terminalInputUnsubscribe = undefined; children.clear(); if (beat) clearInterval(beat); for (const watcher of watchers.values()) watcher.close(); watchers.clear(); for (const watcher of routeWatchers.values()) watcher.close(); routeWatchers.clear(); publishLease(tmux, owner, false); if (hadError) { kick(true); urgentAnimatorTick(); } for (const unsubscribe of unsub) if (typeof unsubscribe === "function") unsubscribe(); });
 }
