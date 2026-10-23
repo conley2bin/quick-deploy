@@ -26,6 +26,7 @@ const shot = name => run('screenshot', join(output, name + '.png'));
 const row = id => `.session[data-session-id="${id}"]`;
 const group = id => `[data-owner-group="${id}"]`;
 const sequences = () => evaluate(`Object.fromEntries([...document.querySelectorAll('#sessions > .owner-team')].map(n=>[n.dataset.ownerGroup,[...n.querySelectorAll('.session')].map(r=>r.dataset.sessionId)]))`);
+const sectionCounts = () => evaluate(`Object.fromEntries([...document.querySelectorAll('#sessions > .sessionGroupHeader')].map(n=>[n.dataset.sessionGroup,Number(n.querySelector('.sessionGroupCount').textContent)]))`);
 const refresh = () => evaluate('CodoxearOwnerPanel.controller.refresh().then(()=>true)');
 const control = state => evaluate(`fetch('/demo/__fixture__/state',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(${JSON.stringify(state)})}).then(r=>r.json())`);
 function update(state) {
@@ -89,8 +90,37 @@ try {
   assert.deepEqual(evaluate(`[...document.querySelectorAll('.owner-root-star')].map(n=>n.parentElement.dataset.sessionId)`), ['demo-ops','demo-other']);
   assert(evaluate(`(()=>{const s=document.querySelector('.owner-root-star').getBoundingClientRect(),r=document.querySelector(${JSON.stringify(row('demo-ops'))}).getBoundingClientRect();return s.left>r.left+r.width*.8&&s.top<r.top+10})()`));
   assert.equal(evaluate('document.querySelector(".sessionRestoreLead")?.nextElementSibling?.id'), 'sessions');
+  click(row('demo-office-opaque-123'));
+  wait(`document.querySelector('#sessions .session.active')?.dataset.sessionId==='demo-office-opaque-123'`);
+  assert(evaluate(`document.querySelector('#sessions').firstElementChild.matches('.sessionGroupHeader')`));
+  assert.deepEqual(sectionCounts(), {now:12});
+  const rootCards = evaluate(`([...document.querySelectorAll('.owner-root:not(.active)')].map(n=>{
+    const s=getComputedStyle(n),c=getComputedStyle(n.querySelector('.sessionContent'));
+    return {id:n.dataset.sessionId,border:s.borderTopWidth,color:s.borderTopColor,radius:s.borderRadius,fill:s.backgroundColor,content:c.backgroundColor};
+  }))`);
+  assert.deepEqual(rootCards.map(n=>n.id),['demo-ops','demo-other']);
+  assert(rootCards.every(n=>n.border==='1px'&&n.color!=='rgba(0, 0, 0, 0)'&&n.radius==='12px'&&n.fill===n.content));
   unique(); shot('native-desktop-initial');
   console.log('ORDER initial '+JSON.stringify(initial));
+  console.log('ROOT CARDS '+JSON.stringify(rootCards));
+
+  update({variant:'all-now-bound'});
+  assert.deepEqual(sectionCounts(),{now:8});
+  assert(evaluate(`document.querySelector('#sessions').firstElementChild.matches('.sessionGroupHeader')&&document.querySelectorAll('#sessions > .session').length===0`));
+  shot('native-desktop-all-bound');
+  update({variant:'empty-root'});
+  assert.deepEqual(Object.keys(sequences()),['other']);
+  assert.equal(evaluate(`document.querySelectorAll('${group('ops')}').length`),0);
+  assert(evaluate(`JSON.parse(localStorage.getItem('quick-deploy.owner-groups.order:'+location.pathname)).indexOf('ops')<JSON.parse(localStorage.getItem('quick-deploy.owner-groups.order:'+location.pathname)).indexOf('other')`));
+  shot('native-desktop-empty-root');
+  update({variant:'normal',sections:'mixed'});
+  assert.deepEqual(Object.keys(sequences()),['ops','other']); // returning root retains its slot
+  assert.deepEqual(sectionCounts(),{now:10,waiting:1,later:1});
+  control({variant:'bridge-down'}); refresh();
+  assert.deepEqual(sectionCounts(),{now:8,waiting:2,later:2});
+  assert.equal(evaluate(`document.querySelectorAll('.owner-root').length`),0);
+  update({variant:'normal',sections:''});
+  console.log('PASS leading NOW retains total even with every row boxed; empty root hidden and returns to saved slot; later section counts and native restore correct.');
 
   update({ activity:'demo-task-office' });
   let seq = sequences(); assert.deepEqual(Object.keys(seq), ['ops','other']); assert.deepEqual(seq.ops, initial.ops);
@@ -168,6 +198,8 @@ try {
   openSidebar(); update({variant:'normal',activity:'',add:false,new_group:false});
   assert.equal(evaluate('document.querySelectorAll("#sessions .session.desktop").length'),0);
   assert(!evaluate('document.body.scrollWidth>innerWidth'));
+  assert(evaluate(`document.querySelector('#sessions').firstElementChild.matches('.sessionGroupHeader')`));
+  assert.equal(sectionCounts().now,evaluate(`document.querySelectorAll('#sessions .session').length`));
   evaluate('document.getElementById("sessions").scrollTop=0'); shot('native-mobile-initial');
   click(row('demo-ops')); wait('!document.body.classList.contains("sidebar-open")');
   wait(`document.querySelector('#sessions .session.active')?.dataset.sessionId==='demo-ops'`); openSidebar();

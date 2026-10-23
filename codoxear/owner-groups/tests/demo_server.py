@@ -49,7 +49,6 @@ async def serve(static_dir, port):
             result[0]['thread_id'] = 'pi-synthetic-switched'
         if state['variant'] == 'duplicate-thread':
             result.append({**result[0], 'session_id': 'demo-second-thread'})
-        result[0]['alias'] += f" v{state['version']}"
         if state['activity']:
             target = next(r for r in result if r['session_id'] == state['activity'])
             target['updated_ts'] = time.time() + state['version']
@@ -61,7 +60,19 @@ async def serve(static_dir, port):
             result.append({**result[0], 'session_id': 'demo-orphan', 'thread_id': 'pi-synthetic-orphan', 'alias': '上级待确认方向'})
         if state.get('new_group'):
             result.append({**result[0], 'session_id': 'demo-third', 'thread_id': 'pi-synthetic-third', 'alias': '新团队'})
+        if state['variant'] == 'empty-root':
+            absent = {'demo-ops', 'demo-office-opaque-123', 'demo-legacy', 'demo-web', 'demo-qa'}
+            result = [r for r in result if r['session_id'] not in absent]
+        if state['variant'] == 'all-now-bound':
+            result = [r for r in result if r['session_id'] in {
+                'demo-ops', 'demo-office-opaque-123', 'demo-legacy', 'demo-web', 'demo-qa',
+                'demo-other', 'demo-task-web', 'demo-task-office'}]
+        if state.get('sections') == 'mixed':
+            for row in result:
+                row['blocked'] = row['session_id'] in {'demo-web', 'demo-unrelated'}
+                row['snoozed'] = row['session_id'] in {'demo-task-office', 'demo-alias-only'}
         if state['variant'] == 'no-sessions': result = []
+        if result: result[0]['alias'] += f" v{state['version']}"
         return result
 
     def projector():
@@ -88,7 +99,7 @@ async def serve(static_dir, port):
             options = await request.json()
             if options.pop('reset', False):
                 rows[:] = copy.deepcopy(original_rows); actions.clear()
-                state.update(variant='normal', auth=True, version=0, activity='', add=False, new_group=False)
+                state.update(variant='normal', auth=True, version=0, activity='', add=False, new_group=False, sections='')
             state.update(options); state['version'] += 1
             return web.json_response({'ok': True, 'actions': actions})
         if path == '/api/login':

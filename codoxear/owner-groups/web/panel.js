@@ -8,6 +8,9 @@
     #sessions > .owner-team{border:2px solid #fff;border-radius:16px;padding:5px;margin:3px 0 12px;
       box-shadow:0 1px 4px #00000024;min-width:0;background:transparent}
     #sessions > .owner-team > .session{position:relative}
+    #sessions .owner-team > .session.owner-root:not(.active){border:1px solid var(--border-subtle,#e4e4e4);
+      border-radius:var(--radius-card);background:var(--surface-subtle,#f5f5f5)}
+    #sessions .owner-team > .session.owner-root:not(.active) .sessionContent{background:var(--surface-subtle,#f5f5f5)}
     #sessions .owner-root-star{position:absolute;right:2px;top:-6px;z-index:3;color:#bea04b;
       font:20px/1 system-ui,sans-serif;pointer-events:none;text-shadow:0 1px 1px #fff8}
     #sessions .owner-unavailable{font:inherit;font-size:11px;color:var(--muted,#777);padding:7px 10px}
@@ -45,6 +48,7 @@
     }
     function cleanDecorations(n) {
       n?.querySelectorAll('.owner-root-star').forEach(s => s.remove());
+      n?.querySelectorAll('.session.owner-root').forEach(row => row.classList.remove('owner-root'));
       for (const [header, saved] of headers) {
         const count = header.querySelector('.sessionGroupCount'); if (count) count.textContent = saved.count;
         if (saved.label === null) header.removeAttribute('aria-label'); else header.setAttribute('aria-label', saved.label);
@@ -78,11 +82,12 @@
       const byId = new Map(rows.map(n => [n.dataset.sessionId, n]));
       const projection = Core.groups(tree, bound, ids, order); order = projection.order;
       try { localStorage.setItem(storageKey, JSON.stringify(order.slice(-1000))); } catch (_) { /* No required storage writes. */ }
-      const desired = [], used = new Set();
+      const leading = original[0]?.matches('.sessionGroupHeader') ? original[0] : null;
+      const desired = leading ? [leading] : [], used = new Set();
       cleanDecorations(anchor);
       for (const team of projection.teams) {
-        // Empty true roots remain an explicit unavailable label, never a fabricated live row.
-        if (team.unresolved && !team.sessions.length) continue;
+        // Keep its saved order slot, but don't accumulate frames for absent teams.
+        if (!team.sessions.length) continue;
         let box = [...anchor.children].find(n => n.classList.contains('owner-team') && n.dataset.ownerGroup === team.id);
         if (!box) { box = el('div', 'owner-team'); box.dataset.ownerGroup = team.id; box.setAttribute('role', 'group'); }
         box.setAttribute('aria-label', team.root ? tree.nodes.get(team.root).name : '上级待确认');
@@ -98,6 +103,7 @@
         for (const item of team.sessions) {
           const row = byId.get(item.session); used.add(row); contents.push(row);
           if (item.owner === team.root) {
+            row.classList.add('owner-root');
             const star = el('span', 'owner-root-star', '★'); star.title = '最高负责人'; star.setAttribute('aria-label', '最高负责人'); row.append(star);
           }
         }
@@ -105,16 +111,18 @@
         for (const child of [...box.children]) if (!contents.includes(child)) child.remove();
         desired.push(box);
       }
-      // Retain native date/status headers only for rows still outside the frames.
+      // Frames belong under the original leading section header. Count every
+      // boxed row there, plus its unboxed rows; later sections count only leftovers.
       let header = null, bucket = [];
       function flush() {
-        if (!bucket.length) return;
+        const renderedCount = bucket.length + (header === leading ? used.size : 0);
+        if (!renderedCount && header !== leading) return;
         if (header) {
           const count = header.querySelector('.sessionGroupCount');
           headers.set(header, { count: count?.textContent, label: header.getAttribute('aria-label') });
-          if (count) count.textContent = String(bucket.length);
-          header.setAttribute('aria-label', `${header.querySelector('.sessionGroupLabel')?.textContent || ''}: ${bucket.length} sessions`);
-          desired.push(header);
+          if (count) count.textContent = String(renderedCount);
+          header.setAttribute('aria-label', `${header.querySelector('.sessionGroupLabel')?.textContent || ''}: ${renderedCount} sessions`);
+          if (header !== leading) desired.push(header);
         }
         desired.push(...bucket);
       }
