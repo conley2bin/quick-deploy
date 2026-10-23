@@ -19,7 +19,7 @@ Defaults:
 Layout:
   - Own skills live directly under pi-agent/skills/<name>/SKILL.md.
   - Vendored skills live one level deeper, grouped by upstream source:
-    pi-agent/skills/<source>/<name>/SKILL.md (e.g. mattpocock/grilling).
+    pi-agent/skills/<source>/<name>/SKILL.md (e.g. vendor/example-skill).
   - Skill names must be unique across both levels; duplicates are an error.
 
 Upstream sync:
