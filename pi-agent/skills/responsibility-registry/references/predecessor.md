@@ -69,14 +69,18 @@ pi --fork "$CONSULT/predecessor.jsonl" --session-dir "$CONSULT/forks" \
 ```bash
 # CONSULT 指向上面的新私有目录；OWNER_CONTACT 取自本 owner fresh intercom status。
 # SESSION/FREE_SLOT 必须按 tmux skill 核验归属与空闲，不从 cwd 猜别人的 pane。
+NOTIFY=$(type -P pi-notify || true) # 先找 PATH 上的实际可执行文件，不依赖别名/函数
+[[ -n "$NOTIFY" ]] || NOTIFY="$HOME/.pi/agent/scripts/pi-notify" # pi-notify skill 提供的直接入口
+[[ -f "$NOTIFY" && -x "$NOTIFY" ]] || { printf 'pi-notify executable unavailable: %s\n' "$NOTIFY" >&2; exit 1; }
+NOTIFY=$(python3 -c 'from pathlib import Path; import sys; print(Path(sys.argv[1]).resolve(strict=True))' "$NOTIFY")
 ORIGINAL_CWD=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["cwd"])' "$CONSULT/plan.json")
-CMD=$(python3 -c 'import shlex,sys; print(shlex.join(["pi-notify","run","--to",sys.argv[1],"--","timeout","180s","bash",sys.argv[2]]))' \
-  "$OWNER_CONTACT" "$CONSULT/launch.sh")
+CMD=$(python3 -c 'import shlex,sys; print(shlex.join([sys.argv[1],"run","--to",sys.argv[2],"--","timeout","180s","bash",sys.argv[3]]))' \
+  "$NOTIFY" "$OWNER_CONTACT" "$CONSULT/launch.sh")
 tmux -L pi-agent new-window -d -P -F '#{window_id}:#{pane_id}' \
   -t "$SESSION:$FREE_SLOT" -n predecessor-consult -c "$ORIGINAL_CWD" "$CMD"
 ```
 
-先核验 `pi-notify`/broker、GNU timeout 可用；只向当前 owner 通知。保留返回的精确 window/pane ID 和任务目录。owner 让出本轮，完成通知到达后处理；不 sleep/status 轮询，不为了同轮答复阻塞等 subagent。若通知设施不可用，明确记录通知/运行缺口并安排可用的受治理完成通知，不悄悄丢弃任务。
+上面的解析不创建全局链接；PATH 不含入口时使用 skill 已提供的 `~/.pi/agent/scripts/pi-notify`，两处都不可执行则在创建 tmux window 前明确退出。再核验所选通知入口的 broker、GNU timeout 可用；只向当前 owner 通知。保留返回的精确 window/pane ID 和任务目录。owner 让出本轮，完成通知到达后处理；不 sleep/status 轮询，不为了同轮答复阻塞等 subagent。若通知设施不可用，明确记录通知/运行缺口并安排可用的受治理完成通知，不悄悄丢弃任务。
 
 ## 3. 解读、标注和记录
 
@@ -93,7 +97,7 @@ python3 "$PR" record --directory "$CONSULT" --kind predecessor-context \
 # 若只由 readonly child 重建：使用 --kind reconstruction，答案路径换为其交付文件。
 ```
 
-私有 consultation.jsonl 追加保留问题、前任/来源、答案、证据、未决不确定性、递增顺序和含时区秒级时间；prepare 先写 prepared，不能算已得到答复。在线答复用同样字段记入私有任务记录（无需为了记日志伪造离线 prepare）。相关正式责任/目标变化再由现任按登记流程更新，咨询本身不产生 owner。
+私有 consultation.jsonl 追加保留问题、前任/来源、答案、证据、未决不确定性、递增顺序和含时区秒级时间；prepare 先写 prepared，不能算已得到答复。`record --kind` 是调用者根据证据作出的标注，不是机器验证的推理成功证明；失败的 Pi 运行也可能留下 fork 文件，文件存在不等于已有回答。在线答复用同样字段记入私有任务记录（无需为了记日志伪造离线 prepare）。相关正式责任/目标变化再由现任按登记流程更新，咨询本身不产生 owner。
 
 缺实际 Pi ID、文件不可读、header 不符、原 cwd/worktree 消失时，helper 拒绝生成启动计划，错误明确指向缺失项。不得扫描所有 session 补一个“类似”的。把阻塞/需要的准确定位证据交直属上级，同时继续独立工作。
 
