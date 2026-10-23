@@ -90,8 +90,28 @@ def goal_source(value):
             'goal issuer must be user or owner:<stable-id>')
 
 
+def recovery_context(value):
+    keys(value, ['session_file', 'cwd', 'repo', 'worktree', 'summary', 'decisions', 'pending_issues',
+                 'context_refs', 'source', 'unknown_reason'])
+    for field in ['session_file', 'cwd', 'repo', 'worktree']:
+        if value[field] is not None:
+            require(Path(text(value[field], 'recovery.' + field)).is_absolute(), 'recovery locator must be absolute: ' + field)
+    for field in ['summary', 'decisions', 'pending_issues']:
+        if value[field] is not None:
+            text(value[field], 'recovery.' + field)
+    require(isinstance(value['context_refs'], list), 'context_refs must be explicit known pointers, not a session search')
+    for ref in value['context_refs']:
+        text(ref, 'context reference')
+    text(value['source'], 'recovery verification evidence')
+    require(isinstance(value['unknown_reason'], str), 'recovery unknown_reason must be string')
+    if any(value[field] is None for field in ['session_file', 'cwd', 'repo', 'worktree', 'summary', 'decisions', 'pending_issues']):
+        text(value['unknown_reason'], 'missing recovery context reason')
+
+
 def owner(value):
-    keys(value, ['id', 'name', 'role', 'parent', 'identity'])
+    keys(value, ['id', 'name', 'role', 'parent', 'identity'], ['recovery'])
+    if value.get('recovery') is not None:
+        recovery_context(value['recovery'])
     for field in ['id', 'name', 'role', 'parent']:
         text(value[field], field)
     require(value['id'] != 'user' and not value['id'].startswith('owner:'), 'owner ID must be bare and not user')
@@ -142,7 +162,7 @@ def validate(state):
     require(isinstance(state['owners'], dict) and isinstance(state['assignments'], dict)
             and isinstance(state['history'], list), 'invalid canonical containers')
     for oid, record in state['owners'].items():
-        keys(record, ['id', 'name', 'role', 'parent', 'identity', 'created_at', 'updated_at'], ['appointment_source'])
+        keys(record, ['id', 'name', 'role', 'parent', 'identity', 'created_at', 'updated_at'], ['appointment_source', 'recovery'])
         owner({k: v for k, v in record.items() if k not in ['created_at', 'updated_at', 'appointment_source']})
         if 'appointment_source' in record:
             goal_source(record['appointment_source'])
@@ -161,7 +181,7 @@ def validate(state):
         if 'handover_request' in record:
             require(isinstance(record['handover_request'], dict), 'invalid handover receipt')
         if 'handover_obligations' in record:
-            keys(record['handover_obligations'], ['predecessor', 'pending_work', 'previous_pending_work', 'coordination_ids', 'coordination_plan', 'reporting_change'])
+            keys(record['handover_obligations'], ['predecessor', 'pending_work', 'previous_pending_work', 'coordination_ids', 'coordination_plan', 'reporting_change'], ['predecessor_context'])
             require(record['handover_obligations']['predecessor'] in state['assignments'], 'missing handover predecessor')
             require(isinstance(record['handover_obligations']['coordination_ids'], list), 'invalid inherited coordination')
         scope({k: record[k] for k in base + ['repo', 'goal_source'] if k in record}, legacy=True)
@@ -379,13 +399,25 @@ def time_label(value):
                                      '（发生时间未知）' if value['precision'] == 'unknown' else '')
 
 
+def recovery_label(value):
+    if not value:
+        return '恢复定位未登记，不能猜会话路径'
+    return ('session file: ' + (value['session_file'] or '未知') + '; cwd: ' + (value['cwd'] or '未知') +
+            '; repo: ' + (value['repo'] or '未知') + '; worktree: ' + (value['worktree'] or '未知') +
+            '; 摘要: ' + (value['summary'] or '未知') + '; 决策: ' + (value['decisions'] or '未知') +
+            '; 待解决: ' + (value['pending_issues'] or '未知') + '; 指针: ' + ', '.join(value['context_refs']) +
+            '; 依据: ' + value['source'] + '; 缺失: ' + value['unknown_reason'])
+
+
 def obligation_label(value):
     if not value:
         return '—'
     return ('来自 ' + value['predecessor'] + '；child: ' + value['pending_work'] +
             ('；前次安排: ' + value['previous_pending_work'] if value['previous_pending_work'] else '') +
             '；协调: ' + ', '.join(value['coordination_ids']) + '；计划: ' + value['coordination_plan'] +
-            '；汇报: ' + value['reporting_change'])
+            '；汇报: ' + value['reporting_change'] +
+            ('；旧 owner context: ' + recovery_label(value['predecessor_context'].get('recovery'))
+             if value.get('predecessor_context') else '；旧会话定位未登记'))
 
 
 def owner_label(value):
@@ -415,8 +447,8 @@ def dashboard(state):
         children = ', '.join(k for k, v in sorted(owners.items()) if v['parent'] == 'owner:' + oid) or '无已登记下级'
         rows.append([oid, o['name'], o['role'], parent_label(state, o['parent']), children,
                      i['pi_session_id'], i['intercom_id'], i['source'] + ('；' + i['unknown_reason'] if i['unknown_reason'] else ''),
-                     source_label(o.get('appointment_source')), o['updated_at']])
-    lines += [table(['owner ID', '名称', '角色', '上级', '下级（推导）', 'Pi session ID', 'Intercom 联系 ID', '身份依据 / 缺失原因', '任命签发 / 来源', '更新于'], rows), '', '## 项目 / 任务 / 责任范围', '']
+                     source_label(o.get('appointment_source')), recovery_label(o.get('recovery')), o['updated_at']])
+    lines += [table(['owner ID', '名称', '角色', '上级', '下级（推导）', 'Pi session ID', 'Intercom 联系 ID', '身份依据 / 缺失原因', '任命签发 / 来源', '旧上下文恢复定位 / 交接决策', '更新于'], rows), '', '## 项目 / 任务 / 责任范围', '']
     rows = []
     for aid, a in sorted(assignments.items()):
         p = a['project']
@@ -640,7 +672,15 @@ def mutate(state, args, payload):
                            handover_obligations=dict(predecessor=args.assignment, pending_work=args.pending_work,
                                previous_pending_work=inherited.get('pending_work'), coordination_ids=obligations,
                                coordination_plan=args.coordination_plan or 'No active agreements found at recording time',
-                               reporting_change=args.reporting_change or 'Superior unchanged: ' + old_parent),
+                               reporting_change=args.reporting_change or 'Superior unchanged: ' + old_parent,
+                               predecessor_context=dict(owner=owner_fact(state['owners'], a['owner']),
+                                   pi_session_id=state['owners'][a['owner']]['identity']['pi_session_id'],
+                                   intercom_id=state['owners'][a['owner']]['identity']['intercom_id'],
+                                   recovery=copy.deepcopy(state['owners'][a['owner']].get('recovery')),
+                                   project=copy.deepcopy(a['project']), repo=copy.deepcopy(a.get('repo')),
+                                   superior=old_parent, objective=a['objective'], acceptance=a['acceptance'],
+                                   handover_summary=reason, pending_work=args.pending_work,
+                                   recorded_at=datetime.fromisoformat(stamp).isoformat(timespec='seconds'))),
                            goal_source={'issuer': 'user' if actor == 'user' else 'owner:' + actor, 'source': reason})
                 new.pop('handover_request', None)
                 state['assignments'][args.new_assignment] = new

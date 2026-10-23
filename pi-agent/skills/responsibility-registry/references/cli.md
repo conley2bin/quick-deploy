@@ -22,7 +22,7 @@ python3 "$RR" rebuild
 ## 输入字段
 
 - `register --actor <owner-ID|user> --input FILE`，FILE 缺省 `-` 从 stdin 读 JSON。顶层 `owner, appointment, capacity, goal_source` 必需，`assignment` 可选（交接前仅登记接任 owner）。`capacity` 必须是 `accountable-owner`，临时 helper 拒绝登记。appointment 保存真实任命依据，不能只因需要占位编造任务。
-- owner 输入：`id, name, role, parent, identity`。parent 是 `user` 或 `owner:<id>`；未登记上级显示待解析并澄清，不提升为顶层；自环/间接环拒绝。仅顶层向用户报告，其他层向直属上级；用户任命也不解除已有链路。一个 owner 一条汇报链，peer 协作不改 parent。
+- owner 输入：`id, name, role, parent, identity`，可带 `recovery`（已核验 session 文件、原 cwd/repo/worktree、交接摘要/决策/问题/指针与缺失原因，格式见 [前任恢复](predecessor.md)）。parent 是 `user` 或 `owner:<id>`；未登记上级显示待解析并澄清，不提升为顶层；自环/间接环拒绝。仅顶层向用户报告，其他层向直属上级；用户任命也不解除已有链路。一个 owner 一条汇报链，peer 协作不改 parent。
 - `goal_source: {"issuer":"user 或 owner:<ID>","source":"真实目标/任命依据"}` 记录签发者和来源。顶层由用户下达；授权直属上级可在范围内任命下级，issuer 应匹配 parent；register 的 actor 可为本人、用户或与该 issuer 相符的直属上级。owner 保存初次 `appointment_source`；责任保存当前 `goal_source`。目标/验收变更时在 update 中保留/更新真实来源，不伪造用户决策。历史缺失来源只显示待确认，不补造。
 - identity：`pi_session_id, intercom_id, source, unknown_reason`。source 是 `current-session`（已验证真实 Pi ID；联系地址可缺失）、`intercom-status`（只能证明联系 ID，Pi ID 必须 null）、`unavailable`（两 ID 必须 null）。任一 ID 缺失须写原因。字段不执行身份认证；不得把未核验值标为 verified。已知真实 Pi ID 与联系 ID 可以不同。
 - assignment：`id, project, repo, task, objective, acceptance`，可选 `depends_on` 数组；register 可从顶层继承 goal_source，update 必须带完整 goal_source。repo 是 `{path, id?}`，path 为已核验的**规范 Git common dir**，所有 worktree 使用同一个 repo ID（缺省 `repo:<规范路径>`）。在对应仓库只读执行 `git rev-parse --path-format=absolute --git-common-dir` 取得路径再规范化，不能用每个 worktree cwd 当成不同 repo。项目和 repo 身份独立，多个项目/方向可共享 repo。project 有 `name, path`，可选 `id`；path 解析为规范绝对路径，缺省项目 ID 为 `path:<规范路径>`，不按 basename 聚合。逻辑项目已有稳定 ID 时复用以跨 worktree/迁移关联，并复用已登记规范 name/path；工作 worktree 放目标/队列里而不是改变该项目事实。跨机器不共享此本地数据库。
@@ -53,6 +53,8 @@ python3 "$RR" handover --actor 'stable-owner-id' --assignment 'scope-id' \
 更新不能改责任的 owner 或任务身份，结束 ID 不复用；权限范围之外的转移不能用 update 绕过。`--actor user` 只在用户确实授权该次变更时使用。同一任命重复 register、相同内容 update/update-owner 不增加历史。close 重复请求拒绝且不追加事件；handover 原样重复请求（包括原 expected-revision）返回 unchanged，不制造假历史。不同参数不能冒充同一交接，先 query 核实当前归属。
 
 ## 长期历史、交接与发生时间
+
+交接还保存 immutable `predecessor_context`（前任实际 Pi ID/contact、recovery、原目标/验收/上级和交接摘要），使旧 owner 后来换会话也不覆盖该次来源。确切离线咨询命令、受治理 child 与 parent 的启动分工、错误处理和咨询记录见 [predecessor.md](predecessor.md)。
 
 owner、旧任命、旧责任不删除。会话离线不自动交接；有变化时现任 owner/授权直属上级主动更新文档，不等用户提醒。handover 必须给 `--pending-work`：逐个写活动 child 的 run ID、实际托管 owner、结果回报/验收路径；没有则核验后明确写无。运行 child 不会因登记自动更换 supervisor。若上级不同必须给 `--reporting-change` 明确依据；目标、验收、依赖由旧责任继承，不能偷偷改变。
 
