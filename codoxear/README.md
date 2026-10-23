@@ -19,6 +19,7 @@ run_server.sh
 .internal/       # 两个入口调用的内部实现，不直接运行
 .runtime/        # upstream checkout、独立 venv、安装状态；Git 忽略
 .env             # 本机配置；Git 忽略
+owner-groups/    # 可选、独立维护的负责人分组服务端适配器（不修改上游）
 ```
 
 `.internal/` 包含远程 main 同步、安装、dotenv 加载、server/broker 启动和 shell rc 更新逻辑。它不是第三组用户命令。
@@ -136,6 +137,18 @@ tailscale serve --bg --yes --https=8443 http://127.0.0.1:8743
 ```dotenv
 CODEX_WEB_COOKIE_SECURE=1
 ```
+
+## 可选：跨电脑/手机的负责人侧栏分组
+
+[owner-groups/README.md](owner-groups/README.md) 维护独立源码、依赖、测试、兼容边界和回退步骤。先运行 `./owner-groups/setup.sh` 安装其独立 `.venv`，不改变正在运行的服务。获准维护窗口切换后，可用：
+
+```bash
+./run_server.sh --owner-groups
+```
+
+前端仍使用现有 host/port/prefix/登录，上游不变并运行在私有 loopback 后端；每次启动仍执行既有远程 main 更新流程。普通 `./run_server.sh` 不加载该增强。停止可选入口后改用普通启动即可回退。**安装源码/依赖不等于当前服务已启用**，不要在原端口仍被现有进程占用时重启或杀未知服务。
+
+分组按真实登记的上级关系（不是项目/目录）；最高负责人左上角有 ★，缺失上级不冒充顶层。保留原生全部会话和操作；真实登记为空时显示空状态，演示仅使用隔离合成数据。
 
 ## 已知限制
 

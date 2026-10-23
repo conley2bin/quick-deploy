@@ -54,7 +54,7 @@ def build(root):
 def sessions():
     def row(broker, pi, **kwargs):
         return {'session_id': broker, 'thread_id': pi, 'agent_backend': 'pi',
-                'log_path': '/example/synthetic.jsonl', 'log_exists': True, **kwargs}
+                'has_bound_log': True, **kwargs}
     return {'sessions': [row('demo-office-opaque-123', 'pi-synthetic-office'),
         row('demo-legacy', 'pi-synthetic-legacy'), row('demo-web', 'pi-synthetic-web'),
         row('demo-qa', 'pi-synthetic-qa'), row('demo-conflict', 'pi-synthetic-duplicate'),

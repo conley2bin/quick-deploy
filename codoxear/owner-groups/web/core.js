@@ -55,7 +55,7 @@
       ids.add(row.session_id);
       // Retain only linkage. Paths, titles and transcript contents never leave this transform.
       return { session_id: row.session_id, thread_id: row.thread_id,
-        pi: row.agent_backend === 'pi', bound: nonempty(row.log_path) && row.log_exists === true };
+        pi: row.agent_backend === 'pi', bound: row.has_bound_log === true };
     });
   }
 
