@@ -9,6 +9,7 @@ import hashlib
 import json
 from pathlib import Path
 import socket
+import stat
 import sys
 from urllib.parse import urlsplit
 
@@ -110,6 +111,21 @@ async def limited_read(response, limit):
     return b''.join(chunks)
 
 
+def session_linkage(rows):
+    """Public upstream rows only; stat trusted log paths without reading content."""
+    def bound(value):
+        if not isinstance(value, str) or not value.strip():
+            return False
+        path = Path(value)
+        try:
+            return path.is_absolute() and stat.S_ISREG(path.stat().st_mode)
+        except (OSError, ValueError):
+            return False
+    return [{'session_id': row['session_id'], 'thread_id': row.get('thread_id'),
+             'agent_backend': row['agent_backend'], 'has_bound_log': bound(row.get('log_path'))}
+            for row in rows]
+
+
 async def snapshot(request):
     # Read-only POST bypasses upstream service-worker GET cache/fallback behavior.
     if request.method != 'POST':
@@ -137,14 +153,12 @@ async def snapshot(request):
                     isinstance(row, dict) and isinstance(row.get('session_id'), str) and row['session_id'] and
                     isinstance(row.get('agent_backend'), str) and
                     (row.get('thread_id') is None or isinstance(row['thread_id'], str)) and
-                    (row.get('log_path') is None or isinstance(row['log_path'], str)) and
-                    type(row.get('log_exists')) is bool
+                    (row.get('log_path') is None or isinstance(row['log_path'], str))
                     for row in payload['sessions']):
                 raise ValueError('unsupported authentication schema')
-            sessions = [{'session_id': row['session_id'], 'thread_id': row.get('thread_id'),
-                         'agent_backend': row['agent_backend'],
-                         'has_bound_log': isinstance(row.get('log_path'), str) and bool(row['log_path'].strip()) and row['log_exists'] is True}
-                        for row in payload['sessions']]
+        # log_exists is an INTERNAL upstream field, stripped from public API rows.
+        # Filesystem metadata work must not block aiohttp's event loop.
+        sessions = await asyncio.to_thread(session_linkage, payload['sessions'])
         # Never cache credentials or export paths/transcripts through the bridge.
         data = await asyncio.to_thread(config['projector'])
         if not data['ok']:

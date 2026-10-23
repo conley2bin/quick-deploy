@@ -50,8 +50,10 @@
 session_id (完整 opaque broker route key)
 thread_id (Pi backend 的实际会话身份)
 agent_backend
-has_bound_log (仅由非空 log_path 且 log_exists===true 推导；不返回路径)
+has_bound_log (仅对可信上游返回的非空绝对 log_path 做只读 regular-file stat 推导；不读正文、不返回路径)
 ```
+
+上游公开列表会删除内部 `log_exists` 字段，适配器不依赖该字段；stat 在线程中执行，避免阻塞 aiohttp。缺失/相对/目录/不可访问路径均视为未绑定，错误不含路径。浏览器不能提交 stat 目标。
 
 无 cookie/认证失败 401；上游/API/目录不可用 503。无 CORS，拒绝跨 Origin / Sec-Fetch-Site:cross-site，不接受外部 URL、文件路径、owner 过滤或浏览器指定身份。服务不保存 cookie，不输出密码/token/访问 URL 日志。此路由的权限与当前 Codoxear 登录相同，已经登录的用户可读取以上最小目录；不另建账号体系。保留现有 HTTPS/VPN 边界；本功能不把现有明文 HTTP 变成 TLS。
 

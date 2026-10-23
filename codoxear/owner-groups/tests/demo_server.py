@@ -9,6 +9,7 @@ import copy
 import mimetypes
 from pathlib import Path
 import sys
+import tempfile
 import time
 
 from aiohttp import web
@@ -35,8 +36,11 @@ async def serve(static_dir, port):
         'qa': 'Office 验收', 'task-web': '发布 web 管理', 'task-office': 'office 采集任务发布',
         'unrelated': 'quick-deploy', 'alias-only': 'stage-harness-observer'}
     rows = []
+    logs = tempfile.TemporaryDirectory(prefix='owner-demo-public-logs-')
     for index, item in enumerate(data['sessions']['sessions']):
-        rows.append({**item, 'log_path': '/example/synthetic-' + str(index) + '.jsonl', 'log_exists': True,
+        log = Path(logs.name) / (str(index) + '.jsonl'); log.touch()
+        public = {k: v for k, v in item.items() if k != 'has_bound_log'}
+        rows.append({**public, 'log_path': str(log),
             'alias': titles.get(item['session_id'].removeprefix('demo-'), '未绑定 · ' + item['session_id']), 'cwd': '/example/Dexathlon',
             'model': 'gpt-6-astra',
             'owned': False, 'transport': 'socket', 'busy': False, 'lost': False,
@@ -155,7 +159,7 @@ async def serve(static_dir, port):
     try:
         await asyncio.Event().wait()
     finally:
-        await front_runner.cleanup(); await runner.cleanup()
+        await front_runner.cleanup(); await runner.cleanup(); logs.cleanup()
 
 
 if __name__ == '__main__':

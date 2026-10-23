@@ -5,7 +5,9 @@ import importlib.util
 import json
 from pathlib import Path
 import sys
+import tempfile
 import unittest
+from unittest.mock import patch
 
 from aiohttp import web, ClientSession, DummyCookieJar, ClientTimeout
 from aiohttp.test_utils import TestServer
@@ -128,19 +130,38 @@ class ProxyTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(response.headers['Content-Encoding'], 'gzip')
 
     async def test_snapshot_linkage_whitelist_and_auth_schema(self):
+        temp = tempfile.TemporaryDirectory(prefix='owner-public-schema-'); self.addCleanup(temp.cleanup)
+        log = Path(temp.name) / 'native-log.jsonl'; log.touch()
         self.session_rows = [{'session_id': 'opaque-broker-123', 'thread_id': 'pi-synthetic-id',
-            'agent_backend': 'pi', 'log_path': '/private/MUST-NOT-EXPORT.jsonl', 'log_exists': True,
+            'agent_backend': 'pi', 'log_path': str(log),
             'title': 'PRIVATE-TITLE', 'cwd': '/private/repo', 'transcript': 'PRIVATE-CONTENT'}]
         async with self.client.post(self.url('__owner_groups__/snapshot'), headers={'Cookie': 'synthetic=valid'}) as response:
             text = await response.text(); data = json.loads(text)
             self.assertEqual(data['sessions']['sessions'], [{'session_id': 'opaque-broker-123',
                 'thread_id': 'pi-synthetic-id', 'agent_backend': 'pi', 'has_bound_log': True}])
-            for forbidden in ('/private', 'PRIVATE', 'log_path', 'title', 'transcript', 'private_extra'):
+            for forbidden in (str(log), '/private', 'PRIVATE', 'log_path', 'title', 'transcript', 'private_extra'):
                 self.assertNotIn(forbidden, text)
-        for row in ({'session_id': 'missing-contract'}, {'session_id': 'bad', 'agent_backend': 'pi', 'log_exists': 'true'}):
+        for row in ({'session_id': 'missing-contract'}, {'session_id': 'bad', 'agent_backend': 'pi', 'log_path': 42}):
             self.session_rows = [row]
             async with self.client.post(self.url('__owner_groups__/snapshot'), headers={'Cookie': 'synthetic=valid'}) as response:
                 self.assertEqual(response.status, 503)
+
+    async def test_public_nonempty_rows_stat_only_regular_absolute_logs(self):
+        with tempfile.TemporaryDirectory(prefix='owner-public-logs-') as root:
+            log = Path(root) / 'regular.jsonl'; log.write_bytes(b'PRIVATE-CONTENT-NOT-READ')
+            variants = [str(log), str(Path(root) / 'missing'), None, '', 'relative.jsonl', root, '/bad\x00path']
+            self.session_rows = [{'session_id': 'row-' + str(i), 'agent_backend': 'pi', 'thread_id': 'pi-' + str(i), 'log_path': value}
+                                 for i, value in enumerate(variants)]
+            # Internal optional fields do not decide binding, including contradictory values.
+            self.session_rows[0]['log_exists'] = False
+            self.session_rows[1]['log_exists'] = True
+            async with self.client.post(self.url('__owner_groups__/snapshot'), headers={'Cookie': 'synthetic=valid'}) as response:
+                self.assertEqual(response.status, 200)
+                text = await response.text(); data = json.loads(text)
+                self.assertEqual([r['has_bound_log'] for r in data['sessions']['sessions']], [True, False, False, False, False, False, False])
+                self.assertNotIn(root, text); self.assertNotIn('PRIVATE-CONTENT', text)
+            with patch.object(proxy.Path, 'stat', side_effect=PermissionError('private path must not leak')):
+                self.assertFalse(proxy.session_linkage(self.session_rows[:1])[0]['has_bound_log'])
 
     async def test_sse_first_event_arrives_before_upstream_finishes(self):
         async with self.client.get(self.url('events'), timeout=ClientTimeout(total=3)) as response:
