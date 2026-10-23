@@ -88,7 +88,7 @@ try {
   assert.deepEqual(initial.ops, ['demo-ops','demo-office-opaque-123','demo-legacy','demo-web','demo-qa']);
   assert.deepEqual(initial.other, ['demo-other','demo-task-web','demo-task-office']);
   assert.deepEqual(evaluate(`[...document.querySelectorAll('.owner-root-star')].map(n=>n.parentElement.dataset.sessionId)`), ['demo-ops','demo-other']);
-  assert(evaluate(`(()=>{const s=document.querySelector('.owner-root-star').getBoundingClientRect(),r=document.querySelector(${JSON.stringify(row('demo-ops'))}).getBoundingClientRect();return s.left>r.left+r.width*.8&&s.top<r.top+10})()`));
+  assert(evaluate(`(()=>{const star=document.querySelector('svg.owner-root-star'),s=star.getBoundingClientRect(),r=star.parentElement.getBoundingClientRect();return s.width===20&&s.height===20&&s.top>=r.top&&s.bottom<=r.bottom&&s.right<=r.right&&s.left>r.right-25&&star.getAttribute('aria-label')==='最高负责人'&&!star.querySelector('[id]')})()`));
   assert.equal(evaluate('document.querySelector(".sessionRestoreLead")?.nextElementSibling?.id'), 'sessions');
   click(row('demo-office-opaque-123'));
   wait(`document.querySelector('#sessions .session.active')?.dataset.sessionId==='demo-office-opaque-123'`);

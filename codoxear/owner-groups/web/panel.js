@@ -11,8 +11,12 @@
     #sessions .owner-team > .session.owner-root:not(.active){border:1px solid var(--border-subtle,#e4e4e4);
       border-radius:var(--radius-card);background:var(--surface-subtle,#f5f5f5)}
     #sessions .owner-team > .session.owner-root:not(.active) .sessionContent{background:var(--surface-subtle,#f5f5f5)}
-    #sessions .owner-root-star{position:absolute;right:2px;top:-6px;z-index:3;color:#bea04b;
-      font:20px/1 system-ui,sans-serif;pointer-events:none;text-shadow:0 1px 1px #fff8}
+    #sessions .owner-root-star{position:absolute;right:2px;top:2px;width:20px;height:20px;z-index:3;pointer-events:none}
+    #sessions .session:has(.sessionActionsInline :focus-visible) > .owner-root-star,
+    #sessions .session:has(.sessionContent[data-swipe-x]:not([data-swipe-x="0"])) > .owner-root-star{visibility:hidden}
+    @media (hover:hover) and (pointer:fine) and (min-width:881px){
+      #sessions .session.desktop:hover > .owner-root-star{visibility:hidden}
+    }
     #sessions .owner-unavailable{font:inherit;font-size:11px;color:var(--muted,#777);padding:7px 10px}
     #sessions > .owner-team[data-unresolved]{border-style:dashed}
     #quick-deploy-owner-groups{font:11px/1.4 system-ui,sans-serif;color:var(--muted,#777);padding:4px 12px;flex:0 0 auto}
@@ -20,6 +24,28 @@
   function el(tag, cls, text) {
     const n = document.createElement(tag); if (cls) n.className = cls;
     if (text !== undefined) n.textContent = text; return n;
+  }
+  function rootStar() {
+    const ns = 'http://www.w3.org/2000/svg', star = document.createElementNS(ns, 'svg');
+    for (const [name, value] of Object.entries({ class: 'owner-root-star', viewBox: '0 0 100 104',
+      role: 'img', 'aria-label': '最高负责人', title: '最高负责人', focusable: 'false' })) star.setAttribute(name, value);
+    const title = document.createElementNS(ns, 'title'); title.textContent = '最高负责人'; star.append(title);
+    // Rounded tips AND valleys, with ID-free gloss so multiple teams cannot collide.
+    for (const attrs of [
+      { d: 'M50 3C55 3 59 16 67 29Q70 34 76 35L91 38C102 40 102 47 94 55L82 67Q78 71 79 77L81 91C83 102 77 102 69 98L55 91Q50 88 45 91L31 98C23 102 17 102 19 91L21 77Q22 71 18 67L6 55C-2 47-2 40 9 38L24 35Q30 34 33 29C41 16 45 3 50 3Z',
+        fill: '#ffdf00', stroke: '#efb900', 'stroke-width': '2', 'stroke-linejoin': 'round' },
+      { d: 'M22 80L21 92Q20 99 28 96L45 88Q50 85 55 88L73 97Q80 101 79 92L77 79Q70 91 57 86Q50 83 43 87Q29 94 22 80Z',
+        fill: '#ffc400', opacity: '.65' },
+      { d: 'M47 10C42 17 38 29 32 35Q29 39 23 40L10 43Q4 44 10 50L21 61',
+        fill: 'none', stroke: '#fff88a', 'stroke-width': '4', 'stroke-linecap': 'round', opacity: '.85' },
+      { d: 'M25 74L23 90M91 44L94 46', fill: 'none', stroke: '#fffbd0',
+        'stroke-width': '3', 'stroke-linecap': 'round', opacity: '.7' },
+    ]) {
+      const path = document.createElementNS(ns, 'path');
+      for (const [name, value] of Object.entries(attrs)) path.setAttribute(name, value);
+      star.append(path);
+    }
+    return star;
   }
   function start({ readSnapshot, pollMs = 10000 }) {
     scope.CodoxearOwnerPanel?.controller?.stop();
@@ -104,7 +130,7 @@
           const row = byId.get(item.session); used.add(row); contents.push(row);
           if (item.owner === team.root) {
             row.classList.add('owner-root');
-            const star = el('span', 'owner-root-star', '★'); star.title = '最高负责人'; star.setAttribute('aria-label', '最高负责人'); row.append(star);
+            row.append(rootStar());
           }
         }
         sync(box, contents);
