@@ -8,6 +8,7 @@ import html
 import json
 import os
 from pathlib import Path
+import re
 import sys
 import tempfile
 
@@ -65,6 +66,20 @@ def identity(value):
                 'intercom status proves only the intercom ID, not the Pi session ID')
     if value['source'] == 'current-session':
         text(value['pi_session_id'], 'verified Pi session ID')
+
+
+def validate_time(value):
+    keys(value, ['at', 'precision'])
+    require(value['precision'] in ['exact', 'unknown', 'approximate'], 'invalid time precision')
+    if value['precision'] == 'unknown':
+        require(value['at'] is None, 'unknown time must not fabricate seconds')
+    elif value['precision'] == 'approximate':
+        text(value['at'], 'approximate time description')
+    else:
+        text(value['at'], 'exact time')
+        require(re.fullmatch(r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(Z|[+-]\d{2}:\d{2})', value['at']),
+                'exact time requires ISO8601 seconds with explicit timezone')
+        datetime.fromisoformat(value['at'].replace('Z', '+00:00'))
 
 
 def goal_source(value):
@@ -138,7 +153,17 @@ def validate(state):
     leads, projects = {}, {}
     for aid, record in state['assignments'].items():
         base = ['id', 'project', 'task', 'objective', 'acceptance', 'depends_on']
-        keys(record, base + ['owner', 'status', 'appointment', 'created_at', 'updated_at', 'end_reason', 'successor'], ['repo', 'goal_source'])
+        keys(record, base + ['owner', 'status', 'appointment', 'created_at', 'updated_at', 'end_reason', 'successor'],
+             ['repo', 'goal_source', 'start_time', 'end_time', 'handover_obligations', 'handover_request'])
+        for field in ['start_time', 'end_time']:
+            if record.get(field) is not None:
+                validate_time(record[field])
+        if 'handover_request' in record:
+            require(isinstance(record['handover_request'], dict), 'invalid handover receipt')
+        if 'handover_obligations' in record:
+            keys(record['handover_obligations'], ['predecessor', 'pending_work', 'previous_pending_work', 'coordination_ids', 'coordination_plan', 'reporting_change'])
+            require(record['handover_obligations']['predecessor'] in state['assignments'], 'missing handover predecessor')
+            require(isinstance(record['handover_obligations']['coordination_ids'], list), 'invalid inherited coordination')
         scope({k: record[k] for k in base + ['repo', 'goal_source'] if k in record}, legacy=True)
         require(aid == record['id'] and record['owner'] in state['owners'], 'invalid assignment owner/id')
         require(record['status'] in ['active', 'ended', 'handed-over'], 'invalid responsibility lifecycle')
@@ -163,7 +188,20 @@ def validate(state):
         require(cid == agreement['id'], 'coordination key/id mismatch')
     require(len(state['history']) == state['revision'], 'history/revision mismatch')
     for index, event in enumerate(state['history'], 1):
-        keys(event, ['revision', 'at', 'actor', 'action', 'reason', 'before', 'after'])
+        keys(event, ['revision', 'at', 'actor', 'action', 'reason', 'before', 'after'], ['id', 'occurred', 'authority', 'changes'])
+        if 'id' in event:
+            require(event['id'] == f'event-{index:08d}', 'invalid stable event ID/order')
+            validate_time(event['occurred'])
+            validate_time({'at': event['at'], 'precision': 'exact'})
+            require(event['authority'] is None or isinstance(event['authority'], str), 'invalid authority evidence')
+            require(isinstance(event['changes'], list), 'invalid semantic changes')
+            for change in event['changes']:
+                keys(change, ['project', 'task', 'old_owner', 'new_owner', 'from_assignment', 'to_assignment', 'from_parent', 'to_parent', 'summary'])
+                text(change['summary'], 'semantic change summary')
+                for field in ['old_owner', 'new_owner']:
+                    if change[field] is not None:
+                        keys(change[field], ['id', 'name', 'role'])
+                        text(change[field]['id'], 'historical owner ID')
         require(event['revision'] == index, 'invalid history revision')
         for field in ['at', 'actor', 'action', 'reason']:
             text(event[field], 'history.' + field)
@@ -257,6 +295,63 @@ def coordinate(state, args, payload, stamp):
         value['updated_at'] = stamp
 
 
+def occurrence(args, stamp):
+    precision = getattr(args, 'occurrence_precision', None) or 'exact'
+    value = getattr(args, 'occurred_at', None)
+    if precision == 'exact':
+        value = value or datetime.fromisoformat(stamp).isoformat(timespec='seconds')
+    result = {'at': value, 'precision': precision}
+    validate_time(result)
+    if precision == 'exact':
+        result['at'] = datetime.fromisoformat(value.replace('Z', '+00:00')).isoformat(timespec='seconds')
+    return result
+
+
+def owner_fact(owners, oid):
+    if oid is None:
+        return None
+    value = owners.get(oid, {})
+    return dict(id=oid, name=value.get('name'), role=value.get('role'))
+
+
+def semantic_changes(before, state, action, args):
+    def change(old, new, summary):
+        old_id, new_id = (old or {}).get('owner'), (new or {}).get('owner')
+        scope_record = new or old or {}
+        return dict(project=scope_record.get('project'), task=scope_record.get('task'),
+                    old_owner=owner_fact(before['owners'], old_id), new_owner=owner_fact(state['owners'], new_id),
+                    from_assignment=(old or {}).get('id'), to_assignment=(new or {}).get('id'),
+                    from_parent=before['owners'].get(old_id, {}).get('parent'),
+                    to_parent=state['owners'].get(new_id, {}).get('parent'), summary=summary)
+    if action == 'handover':
+        return [change(before['assignments'][args.assignment], state['assignments'][args.new_assignment],
+                       'handover; pending work: ' + args.pending_work + '; reporting: ' +
+                       (args.reporting_change or 'superior unchanged'))]
+    rows = []
+    for aid, current in state['assignments'].items():
+        old = before['assignments'].get(aid)
+        owner_changed = before['owners'].get(current['owner']) != state['owners'][current['owner']]
+        if old != current or (action == 'update-owner' and owner_changed):
+            rows.append(change(old, current, action + ': ' + (old or {}).get('status', 'unassigned') + ' → ' + current['status']))
+    if not rows and action.startswith('coord-'):
+        for cid, agreement in state['coordination'].items():
+            if before['coordination'].get(cid) != agreement:
+                for aid in agreement['scopes']:
+                    rows.append(change(before['assignments'].get(aid), state['assignments'].get(aid), action + ': ' + cid))
+    if not rows:
+        for oid, current in state['owners'].items():
+            if before['owners'].get(oid) != current:
+                rows.append(dict(project=None, task=None, old_owner=owner_fact(before['owners'], oid) if oid in before['owners'] else None,
+                                 new_owner=owner_fact(state['owners'], oid), from_assignment=None, to_assignment=None,
+                                 from_parent=before['owners'].get(oid, {}).get('parent'), to_parent=current['parent'], summary=action))
+    return rows
+
+
+def handover_request(args):
+    return {key: getattr(args, key, None) for key in ['actor', 'assignment', 'to_owner', 'new_assignment', 'reason',
+            'pending_work', 'coordination_plan', 'reporting_change', 'occurred_at', 'occurrence_precision', 'authority']}
+
+
 def empty():
     return dict(version=1, revision=0, owners={}, assignments={}, coordination={}, history=[])
 
@@ -275,6 +370,26 @@ def cell(value):
 def table(headers, rows):
     return '\n'.join(['| ' + ' | '.join(headers) + ' |', '| ' + ' | '.join(['---'] * len(headers)) + ' |'] +
                      ['| ' + ' | '.join(cell(v) for v in row) + ' |' for row in rows])
+
+
+def time_label(value):
+    if not value:
+        return '历史未记录，发生时间未知'
+    return (value['at'] or '未知') + ('（约略，不保证秒）' if value['precision'] == 'approximate' else
+                                     '（发生时间未知）' if value['precision'] == 'unknown' else '')
+
+
+def obligation_label(value):
+    if not value:
+        return '—'
+    return ('来自 ' + value['predecessor'] + '；child: ' + value['pending_work'] +
+            ('；前次安排: ' + value['previous_pending_work'] if value['previous_pending_work'] else '') +
+            '；协调: ' + ', '.join(value['coordination_ids']) + '；计划: ' + value['coordination_plan'] +
+            '；汇报: ' + value['reporting_change'])
+
+
+def owner_label(value):
+    return '—' if value is None else f'{value["id"]} / {value.get("name") or "名称未知"} / {value.get("role") or "角色未知"}'
 
 
 def source_label(value):
@@ -307,8 +422,10 @@ def dashboard(state):
         p = a['project']
         rows.append([aid, p['id'], p['name'], p['path'], a['task'], a['owner'], a['status'], a['objective'],
                      a['acceptance'], source_label(a.get('goal_source')), a.get('repo', {}).get('id', '历史未录入，待核验'),
-                     a['appointment'], a['end_reason'] or '—', a['successor'] or '—', a['created_at'], a['updated_at']])
-    lines += [table(['责任 ID', '项目 ID', '项目名', '项目路径', '任务 ID', 'owner ID', '状态', '目标 / 范围', '验收目标', '目标签发 / 来源', '规范 repo ID', '任命依据', '结束原因', '接任责任 ID', '建立于', '更新于'], rows), '', '## 依赖关系（与汇报关系独立）', '']
+                     a['appointment'], time_label(a.get('start_time')), time_label(a.get('end_time')) if a['status'] != 'active' else '进行中',
+                     a['end_reason'] or '—', a['successor'] or '—',
+                     obligation_label(a.get('handover_obligations')), a['created_at'], a['updated_at']])
+    lines += [table(['责任 ID', '项目 ID', '项目名', '项目路径', '任务 ID', 'owner ID', '状态', '目标 / 范围', '验收目标', '目标签发 / 来源', '规范 repo ID', '任命依据', '责任开始（发生）', '责任结束（发生）', '结束原因', '接任责任 ID', '继承的子任务 / 协调 / 汇报安排', '建立记录于', '更新记录于'], rows), '', '## 依赖关系（与汇报关系独立）', '']
     rows = []
     for aid, a in sorted(assignments.items()):
         for d in a['depends_on']:
@@ -329,7 +446,23 @@ def dashboard(state):
                      ', '.join(view['participants']), acks, value['shared_interfaces'],
                      value['workspace']['mode'] + ': ' + value['workspace']['plan'], value['sequencing'],
                      value['integration_owner'], value['acceptance']])
-    lines += [table(['协议 ID', 'repo ID', '规范 repo 路径', '方向责任 / owner / 写入范围', '状态', '写入协议可用', '参与者', '明确确认依据', '共享文件 / 接口', '分支 / worktree', '顺序', '集成 owner', '验收约定'], rows), '']
+    lines += [table(['协议 ID', 'repo ID', '规范 repo 路径', '方向责任 / owner / 写入范围', '状态', '写入协议可用', '参与者', '明确确认依据', '共享文件 / 接口', '分支 / worktree', '顺序', '集成 owner', '验收约定'], rows), '',
+              '## 责任变更历史（追加保留，事件顺序区分同秒变更）', '',
+              '所有历史负责人和任命长期保留；会话离线不触发交接。发生时间与登记时间分列；未知或约略时间不补造秒。姓名/角色为事件登记时保存的事实。', '']
+    rows = []
+    for event in state['history']:
+        details = event.get('changes') or [dict(project=None, task=None, old_owner=None, new_owner=None,
+                                               from_parent=None, to_parent=None, from_assignment=None, to_assignment=None,
+                                               summary=event['action'] + '（旧事件无语义字段，见 canonical snapshots）')]
+        for detail in details:
+            p = detail.get('project') or {}
+            rows.append([event.get('id', f'legacy-{event["revision"]:08d}'), event['revision'],
+                         time_label(event.get('occurred')), event['at'], event['action'], p.get('id', '—') + (' / ' + p['name'] if p.get('name') else ''), detail.get('task') or '—',
+                         owner_label(detail.get('old_owner')), owner_label(detail.get('new_owner')),
+                         (detail.get('from_assignment') or '—') + ' → ' + (detail.get('to_assignment') or '—'),
+                         (detail.get('from_parent') or '—') + ' → ' + (detail.get('to_parent') or '—'),
+                         event['actor'], event.get('authority') or '未单列（见原因/任命依据）', event['reason'], detail['summary']])
+    lines += [table(['事件 ID', '顺序', '发生时间 / 精度', '登记时间（含时区）', '动作', '项目 ID', '任务 / 方向', '从谁（ID / 名称 / 角色）', '交给谁（ID / 名称 / 角色）', '责任链', '上级变化', '操作者', '授权依据', '原因', '变更说明'], rows), '']
     return '\n'.join(lines)
 
 
@@ -403,8 +536,11 @@ def normalize_scope(value, source=None):
     return value
 
 
-def authorize(actor, oid):
-    require(actor in [oid, 'user'], f'actor must be responsible owner {oid} or explicitly authorized user')
+def authorize(actor, oid, state=None):
+    permitted = [oid, 'user']
+    if state and state['owners'][oid]['parent'].startswith('owner:'):
+        permitted.append(state['owners'][oid]['parent'][6:])
+    require(actor in permitted, f'actor must be responsible owner {oid}, authorized immediate superior (handover), or explicitly authorized user')
 
 
 def mutate(state, args, payload):
@@ -413,6 +549,12 @@ def mutate(state, args, payload):
     state.setdefault('coordination', {})
     before = {kind: copy.deepcopy(state[kind]) for kind in ['owners', 'assignments', 'coordination']}
     stamp = now()
+    occurred = occurrence(args, stamp)
+    if action == 'handover':
+        prior = state['assignments'].get(args.assignment, {})
+        if prior.get('status') == 'handed-over' and prior.get('handover_request') == handover_request(args):
+            return {'unchanged': True, 'revision': state['revision'], 'successor': prior['successor'],
+                    'note': 'original transfer already recorded; query --task --active for current owner'}
     if action == 'register':
         keys(payload, ['owner', 'appointment', 'capacity', 'goal_source'], ['assignment'])
         goal_source(payload['goal_source'])
@@ -440,7 +582,8 @@ def mutate(state, args, payload):
             return {'unchanged': True, 'revision': state['revision'], 'assignment': existing}
         if a:
             state['assignments'][a['id']] = dict(a, owner=o['id'], status='active', appointment=payload['appointment'],
-                                                 created_at=stamp, updated_at=stamp, end_reason=None, successor=None)
+                                                 created_at=stamp, updated_at=stamp, start_time=occurred, end_time=None,
+                                                 end_reason=None, successor=None)
         reason = payload['appointment']
     else:
         require(args.expected_revision == state['revision'],
@@ -462,7 +605,7 @@ def mutate(state, args, payload):
             aid = args.assignment
             require(aid in state['assignments'], 'responsibility ID not registered')
             a = state['assignments'][aid]
-            authorize(actor, a['owner'])
+            authorize(actor, a['owner'], state if action == 'handover' else None)
             require(a['status'] == 'active', 'responsibility already ended; use a new ID for new appointment')
             if action == 'update':
                 updated = normalize_scope(payload)
@@ -474,17 +617,35 @@ def mutate(state, args, payload):
                 a.update(updated)
                 a['updated_at'] = stamp
             elif action == 'close':
-                a.update(status='ended', end_reason=reason, updated_at=stamp)
+                a.update(status='ended', end_reason=reason, updated_at=stamp, end_time=occurred)
             elif action == 'handover':
                 require(args.to_owner in state['owners'], 'successor owner must register its verified identity first')
                 require(args.to_owner != a['owner'], 'successor must be a different owner')
                 text(args.new_assignment, 'new assignment ID')
                 require(args.new_assignment not in state['assignments'], 'successor assignment ID already used')
+                text(args.pending_work, 'explicit active-child custody/reporting plan, or verified none')
+                old_parent = state['owners'][a['owner']]['parent']
+                new_parent = state['owners'][args.to_owner]['parent']
+                require(old_parent == new_parent or args.reporting_change,
+                        'successor reports to a different superior; explicit --reporting-change authorization/evidence required')
+                affected = [cid for cid, c in state['coordination'].items() if args.assignment in c['scopes'] and c['status'] != 'released']
+                inherited = a.get('handover_obligations', {})
+                obligations = sorted(set(affected + inherited.get('coordination_ids', [])))
+                require(not obligations or args.coordination_plan,
+                        'active/inherited coordination requires --coordination-plan; old acknowledgements cannot transfer')
+                for cid in affected:
+                    state['coordination'][cid].update(status='released', updated_at=stamp)
                 new = dict(copy.deepcopy(a), id=args.new_assignment, owner=args.to_owner, created_at=stamp,
-                           updated_at=stamp, appointment=reason,
+                           updated_at=stamp, start_time=occurred, end_time=None, appointment=reason,
+                           handover_obligations=dict(predecessor=args.assignment, pending_work=args.pending_work,
+                               previous_pending_work=inherited.get('pending_work'), coordination_ids=obligations,
+                               coordination_plan=args.coordination_plan or 'No active agreements found at recording time',
+                               reporting_change=args.reporting_change or 'Superior unchanged: ' + old_parent),
                            goal_source={'issuer': 'user' if actor == 'user' else 'owner:' + actor, 'source': reason})
+                new.pop('handover_request', None)
                 state['assignments'][args.new_assignment] = new
-                a.update(status='handed-over', successor=args.new_assignment, end_reason=reason, updated_at=stamp)
+                a.update(status='handed-over', successor=args.new_assignment, end_reason=reason, updated_at=stamp,
+                         end_time=occurred, handover_request=handover_request(args))
     validate({**state, 'history': state['history'], 'revision': state['revision']})
     state['revision'] += 1
     after = {kind: state[kind] for kind in ['owners', 'assignments', 'coordination']}
@@ -493,8 +654,11 @@ def mutate(state, args, payload):
                             if before[kind].get(key) != after[kind].get(key)}
                       for kind, records in snapshot.items()}
                for side, snapshot in [('before', before), ('after', after)]}
-    state['history'].append(dict(revision=state['revision'], at=stamp, actor=actor, action=action,
-                                 reason=reason, before=changes['before'], after=changes['after']))
+    state['history'].append(dict(revision=state['revision'], id=f'event-{state["revision"]:08d}',
+                                 at=datetime.fromisoformat(stamp).isoformat(timespec='seconds'), occurred=occurred,
+                                 actor=actor, authority=getattr(args, 'authority', None), action=action,
+                                 reason=reason, changes=semantic_changes(before, state, action, args),
+                                 before=changes['before'], after=changes['after']))
     return {'revision': state['revision'], 'action': action}
 
 
@@ -514,7 +678,14 @@ def query(state, args):
                   if (not args.repo or args.repo in [value['repo']['id'], value['repo']['path']])
                   and (not args.owner or args.owner in {b['owner'] for b in value['scopes'].values()})
                   and (not (args.project or args.task) or set(value['scopes']) & set(selected))}
-    return dict(revision=state['revision'], assignments=selected, coordination=agreements,
+    current = {aid: dict(owner=owner_fact(state['owners'], a['owner']), project=a['project'], task=a['task'],
+                         superior=state['owners'][a['owner']]['parent'], handover_obligations=a.get('handover_obligations'))
+               for aid, a in selected.items() if a['status'] == 'active'}
+    history = [event for event in state['history'] if not any([args.owner, args.project, args.task, args.repo]) or
+               any(d.get('from_assignment') in selected or d.get('to_assignment') in selected
+                   or (args.owner and args.owner in [(d.get('old_owner') or {}).get('id'), (d.get('new_owner') or {}).get('id')])
+                   for d in event.get('changes', []))]
+    return dict(revision=state['revision'], assignments=selected, current_owners=current, history=history, coordination=agreements,
                 owners={oid: o for oid, o in state['owners'].items() if oid in ids},
                 hierarchy=[dict(owner=oid, parent=o['parent'],
                                 parent_resolved=o['parent'] == 'user' or o['parent'][6:] in state['owners'],
@@ -536,6 +707,9 @@ def main(argv=None):
     for name in ['register', 'update-owner', 'update', 'close', 'handover', 'coord-propose', 'coord-ack', 'coord-release']:
         p = commands.add_parser(name)
         p.add_argument('--actor', required=True, help='owner ID or user; authorization attestation, not authentication')
+        p.add_argument('--authority', help='known authorization/decision evidence; absent remains unknown')
+        p.add_argument('--occurred-at', help='known ISO seconds+timezone, or approximate human description')
+        p.add_argument('--occurrence-precision', choices=['exact', 'approximate', 'unknown'])
         if name in ['register', 'update-owner', 'update', 'coord-propose']:
             p.add_argument('--input', default='-', help='JSON file or - for stdin')
         if name in ['coord-ack', 'coord-release']:
@@ -548,6 +722,9 @@ def main(argv=None):
         if name == 'handover':
             p.add_argument('--to-owner', required=True)
             p.add_argument('--new-assignment', required=True)
+            p.add_argument('--pending-work', required=True, help='active child custody/reporting plan, or explicitly verified none')
+            p.add_argument('--coordination-plan', help='renegotiation/integration plan for active/inherited agreements')
+            p.add_argument('--reporting-change', help='explicit evidence if successor superior differs')
     args = parser.parse_args(argv)
     try:
         payload = None

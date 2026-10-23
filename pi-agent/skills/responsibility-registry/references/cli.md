@@ -15,7 +15,9 @@ python3 "$RR" query --repo 'repo:/canonical/repo/.git' --active
 python3 "$RR" rebuild
 ```
 
-`init` 只创建空状态或验证已有状态，不清空。输出 dashboard 的实际路径。`query` 返回责任、owner、上下级 hierarchy、依赖 relations、写入协调 coordination、当前 revision；项目/repo 过滤为精确 ID 或规范绝对路径，任务过滤为 task/objective 子串；缺省包括已结束记录。完整目录读 `dashboard.md`。同项目同 repo 的不同方向可以有不同 owner，不是项目级排他锁。
+`init` 只创建空状态或验证已有状态，不清空。输出 dashboard 的实际路径。`query` 返回责任、owner、当前归属 current_owners、语义 history、上下级 hierarchy、依赖 relations、写入协调 coordination、当前 revision；项目/repo 过滤为精确 ID 或规范绝对路径，任务过滤为 task/objective 子串；缺省包括已结束记录。完整目录读 `dashboard.md`。同项目同 repo 的不同方向可以有不同 owner，不是项目级排他锁。
+
+以下仅是用户给出的领域示例，**不构成真实任命，不创建登记记录**：例如同一项目下，可以同时有office场景评测负责人,kitchen场景评测负责人等,又或者同一个Dexathlon_task-proposals仓库,可以同时有发布web管理负责人,也可以同时有office场景采集任务发布负责人,也可以同时有kitchen场景采集任务发布负责人,各自有明确的目标和上级。
 
 ## 输入字段
 
@@ -41,10 +43,36 @@ python3 "$RR" close --actor 'stable-owner-id' --assignment 'scope-id' \
 # 接任 owner 已登记；原记录 handed-over，新责任 active；保存原负责人和历史。
 python3 "$RR" handover --actor 'stable-owner-id' --assignment 'scope-id' \
   --to-owner 'successor-id' --new-assignment 'new-scope-id' \
-  --expected-revision 9 --reason '用户明确批准接任，未完验收目标不变'
+  --expected-revision 9 --reason '有权上级明确批准接任，未完验收目标不变' \
+  --pending-work '已核验无运行 child；未完材料随目标交接' \
+  --authority '真实授权记录/消息依据'
+# 若继承活动或历史待办协调，另加 --coordination-plan '由谁重新确认哪些边界/接口/顺序'。
+# 接任者上级不同时，另加 --reporting-change '明确批准的新汇报对象与依据'，不静默改 parent。
 ```
 
-更新不能改责任的 owner 或任务身份，结束 ID 不复用；权限范围之外的转移不能用 update 绕过。`--actor user` 只在用户确实授权该次变更时使用。同一任命重复 register、相同内容 update/update-owner 不增加历史。close/handover 重复请求会拒绝，先 query 确认已有结果。
+更新不能改责任的 owner 或任务身份，结束 ID 不复用；权限范围之外的转移不能用 update 绕过。`--actor user` 只在用户确实授权该次变更时使用。同一任命重复 register、相同内容 update/update-owner 不增加历史。close 重复请求拒绝且不追加事件；handover 原样重复请求（包括原 expected-revision）返回 unchanged，不制造假历史。不同参数不能冒充同一交接，先 query 核实当前归属。
+
+## 长期历史、交接与发生时间
+
+owner、旧任命、旧责任不删除。会话离线不自动交接；有变化时现任 owner/授权直属上级主动更新文档，不等用户提醒。handover 必须给 `--pending-work`：逐个写活动 child 的 run ID、实际托管 owner、结果回报/验收路径；没有则核验后明确写无。运行 child 不会因登记自动更换 supervisor。若上级不同必须给 `--reporting-change` 明确依据；目标、验收、依赖由旧责任继承，不能偷偷改变。
+
+有活动写入协议或继承协调时，`--coordination-plan` 必需。原子交接会把受影响旧协议 released，并把协议 ID、前次/当前 child 安排、再确认计划、汇报安排写进新责任 `handover_obligations`。旧 owner 的 ack 不迁给新 owner，新 owner 在重叠 mutation 前重新协商；原协议/owner/责任和历史仍留存。`query --task ... --active` / `current_owners` 查现任，默认查询和 dashboard 保留历任。
+
+同一 JSON 原子提交同时保存责任变化和追加历史。每个事件有 `event-00000001` 式稳定 ID、revision 顺序、`at`（登记时间，ISO8601 秒+时区）、`occurred`（发生时间及精度）、old/new owner 的 ID/名称/角色快照、项目/任务、操作者、授权/原因和 before/after 快照；同一秒的 A→B→C 按事件顺序区分。历史在**同一 dashboard** 渲染，不仅给 JSON 链接。姓名/角色是登记该事件时已知的事实，不猜过去未知姓名。
+
+所有变更命令支持 `--authority '已知授权证据'`，未提供就保留未知；实时事件缺省记录当前发生秒。**补录过去事件不可用当前秒冒充发生时间**：
+
+```bash
+# 时间精确且已知：保留明确时区秒；登记时间仍是现在。
+# 将这些选项加到实际 register/update/close/handover 等命令：
+# --occurred-at '2025-05-06T07:08:09+08:00' --occurrence-precision exact
+# 不知道过去具体时间：不填 occurred-at，也不制造秒。
+# --occurrence-precision unknown
+# 只知道范围：原样存约略描述，明确不保证秒。
+# --occurred-at '约2025年5月，具体秒未知' --occurrence-precision approximate
+```
+
+责任的 start_time/end_time 单列发生时间/精度，created_at/updated_at 是建立/更新记录的时间，不混为一谈。旧 schema 缺失的历史发生时间展示未知，不反推或补造。
 
 ## 同仓库写入协议
 
@@ -149,7 +177,11 @@ python3 "$RR" --root "$R" coord-ack --actor demo-beta --coordination demo-agreem
   --expected-revision 5 --reason '演练：乙明确确认全部条款，非送达回执'
 python3 "$RR" --root "$R" query --repo 'repo:/example/project-alpha/.git' # agreement_ready=true
 python3 "$RR" --root "$R" handover --actor demo-alpha --assignment demo-release-v1 \
-  --to-owner demo-beta --new-assignment demo-release-v2 --expected-revision 6 --reason '演练：用户批准交接；甲向乙下达接任目标'
+  --to-owner demo-beta --new-assignment demo-release-v2 --expected-revision 6 \
+  --reason '演练：用户批准交接；甲向乙下达接任目标' \
+  --pending-work '演练：已核验无运行 child，甲把现有验收材料交乙' \
+  --reporting-change '演练：用户明确乙接任后仍向甲报告' \
+  --coordination-plan '演练：释放旧协议，乙接任后与构建方向重新确认共享配置和集成顺序'
 python3 "$RR" --root "$R" query --owner demo-beta --active
 python3 "$RR" --root "$R" close --actor demo-beta --assignment demo-release-v2 \
   --expected-revision 7 --reason '演练：直属上级甲已接受目标'
@@ -161,7 +193,7 @@ cat "$R/dashboard.md"
 
 ## 存储与恢复
 
-`registry.json` 版本 1 是唯一事实源，保存 owners、assignments、coordination、递增 revision 和每次变更的 before/after 历史快照。兼容旧版 v1 缺失的 coordination/repo/goal_source 字段：缺失按未记录展示，不补造；新登记/更新要求明确事实。`registry.lock` 使用 flock，读/校验/修改/替换/投影都在同一锁内；锁文件不得删除或更换 inode，所有写入必须经过 CLI。文件 0600、新目录 0700。JSON 与 Markdown 各自临时文件 + fsync + replace，不能把两文件当一次原子事务。
+`registry.json` 版本 1 是唯一事实源，保存 owners、assignments、coordination、递增 revision 和每次变更的 before/after 历史快照。兼容旧版 v1 缺失的 coordination/repo/goal_source 字段：缺失按未记录展示，不补造；新登记/更新要求明确事实。history 新语义字段也向后兼容；旧事件的原始快照保留，未知发生时间不猜造。`registry.lock` 使用 flock，读/校验/修改/替换/投影都在同一锁内；锁文件不得删除或更换 inode，所有写入必须经过 CLI。文件 0600、新目录 0700。JSON 与 Markdown 各自临时文件 + fsync + replace，不能把两文件当一次原子事务。
 
 - CLI 成功后 dashboard 对应同一 revision。进程在两次替换之间中断会留下旧投影；运行 `rebuild`（query 也重建）。若报“canonical revision … retained; dashboard failed”，变更可能已提交，先 query，不要盲目重做交接。
 - JSON 格式/结构/关系损坏直接退出 2，保留原始字节；不回退空库，不从 Markdown 猜造事实。有 dashboard 却缺 JSON 时 init 也拒绝。先保存损坏副本并从已知备份人工恢复；没有备份必须让用户明确处理丢失的事实，不能冒充成功。
