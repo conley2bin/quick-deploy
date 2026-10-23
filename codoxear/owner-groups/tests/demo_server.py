@@ -20,13 +20,29 @@ import fixture
 
 async def serve(static_dir, port):
     data = fixture.demo()
-    state = {'variant': 'normal', 'auth': True, 'version': 0}
+    state = {'variant': 'normal', 'auth': True, 'version': 0, 'activity': '', 'add': False}
+    actions = []
+    # Additional SYNTHETIC native rows for approved two-frame visual/interaction tests.
+    for oid, parent, title in [('task-web', 'owner:other', '发布 web 管理'), ('task-office', 'owner:other', 'office 采集任务发布')]:
+        data['owners']['owners'].append({**copy.deepcopy(data['owners']['owners'][0]),
+            'id': oid, 'parent': parent, 'name': title, 'pi_session_id': 'pi-synthetic-' + oid,
+            'registration_order': len(data['owners']['owners'])})
+    for oid in ('ops', 'other', 'task-web', 'task-office'):
+        data['sessions']['sessions'].append({'session_id': 'demo-' + oid, 'thread_id': 'pi-synthetic-' + oid,
+            'agent_backend': 'pi', 'has_bound_log': True})
+    titles = {'ops': 'Dexathlon 场景评测', 'other': 'Dexathlon_task-proposals',
+        'office-opaque-123': 'office 场景评测', 'legacy': '前任 office · 已交接', 'web': 'kitchen 场景评测',
+        'qa': 'Office 验收', 'task-web': '发布 web 管理', 'task-office': 'office 采集任务发布',
+        'unrelated': 'quick-deploy', 'alias-only': 'stage-harness-observer'}
     rows = []
     for index, item in enumerate(data['sessions']['sessions']):
         rows.append({**item, 'log_path': '/example/synthetic-' + str(index) + '.jsonl', 'log_exists': True,
-            'alias': 'DEMO ' + item['session_id'].removeprefix('demo-'), 'cwd': '/example/shared',
+            'alias': titles.get(item['session_id'].removeprefix('demo-'), '未绑定 · ' + item['session_id']), 'cwd': '/example/Dexathlon',
+            'model': 'gpt-6-astra',
             'owned': False, 'transport': 'socket', 'busy': False, 'lost': False,
             'start_ts': time.time() - index * 60, 'updated_ts': time.time() - index * 60, 'transcript_state': 'bound'})
+    original_rows = copy.deepcopy(rows)
+
     def current_rows():
         result = copy.deepcopy(rows)
         if state['variant'] == 'rebind':
@@ -34,6 +50,18 @@ async def serve(static_dir, port):
         if state['variant'] == 'duplicate-thread':
             result.append({**result[0], 'session_id': 'demo-second-thread'})
         result[0]['alias'] += f" v{state['version']}"
+        if state['activity']:
+            target = next(r for r in result if r['session_id'] == state['activity'])
+            target['updated_ts'] = time.time() + state['version']
+            target['busy'] = True; target['unread_count'] = 3
+        if state['add']:
+            result.append({**result[0], 'session_id': 'demo-new', 'thread_id': 'pi-synthetic-new', 'alias': '新成员', 'updated_ts': time.time() + 100})
+        if state['variant'] == 'root-missing': result = [r for r in result if r['session_id'] != 'demo-ops']
+        if state['variant'] == 'unresolved':
+            result.append({**result[0], 'session_id': 'demo-orphan', 'thread_id': 'pi-synthetic-orphan', 'alias': '上级待确认方向'})
+        if state.get('new_group'):
+            result.append({**result[0], 'session_id': 'demo-third', 'thread_id': 'pi-synthetic-third', 'alias': '新团队'})
+        if state['variant'] == 'no-sessions': result = []
         return result
 
     def projector():
@@ -44,19 +72,40 @@ async def serve(static_dir, port):
         if state['variant'] == 'cycle': result['owners'][0]['parent'] = 'owner:' + result['owners'][0]['id']
         if state['variant'] == 'xss':
             result['owners'][0]['name'] = '<img src=x onerror="window.fixtureXSS=true">'
+        if state['variant'] == 'handover':
+            next(o for o in result['owners'] if o['id'] == 'office')['parent'] = 'owner:other'
+        if state.get('new_group'):
+            result['owners'].append({**copy.deepcopy(result['owners'][0]), 'id': 'third', 'name': '新团队',
+                'parent': 'user', 'pi_session_id': 'pi-synthetic-third', 'registration_order': 100})
+        if state['add']:
+            result['owners'].append({**copy.deepcopy(result['owners'][0]), 'id': 'new', 'name': '新成员',
+                'parent': 'owner:other', 'pi_session_id': 'pi-synthetic-new', 'registration_order': 99})
         return result
 
     async def backend(request):
         path = request.path.removeprefix('/demo')
         if path == '/__fixture__/state' and request.method == 'POST':
-            options = await request.json(); state.update(options); state['version'] += 1
-            return web.json_response({'ok': True})
+            options = await request.json()
+            if options.pop('reset', False):
+                rows[:] = copy.deepcopy(original_rows); actions.clear()
+                state.update(variant='normal', auth=True, version=0, activity='', add=False, new_group=False)
+            state.update(options); state['version'] += 1
+            return web.json_response({'ok': True, 'actions': actions})
         if path == '/api/login':
             # Synthetic fixture access only. Never a production credential.
             result = web.json_response({'ok': True}); result.set_cookie('fixture', 'demo', httponly=True, path='/demo/'); return result
         if path.startswith('/api/'):
             if request.cookies.get('fixture') != 'demo' or not state['auth']:
                 return web.json_response({'error': 'Demo login required'}, status=401)
+            if request.method == 'POST' and path != '/api/logout':
+                body = await request.json(); actions.append({'path': path, 'body': body})
+                if path == '/api/sessions':
+                    if not any(r['session_id'] == 'demo-created' for r in rows):
+                        rows.append({**rows[0], 'session_id': 'demo-created', 'thread_id': '', 'alias': '原生复制 · 未绑定', 'broker_pid': 42001})
+                    return web.json_response({'broker_pid': 42001})
+                if path.endswith('/edit'):
+                    target = next((r for r in rows if r['session_id'] == path.split('/')[3]), None)
+                    if target: target['alias'] = body['name']
             if path == '/api/me': return web.json_response({'ok': True})
             if path == '/api/sessions':
                 return web.json_response({'sessions': current_rows(), 'recent_cwds': [], 'new_session_defaults': {}, 'tmux_available': False})

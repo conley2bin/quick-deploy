@@ -12,6 +12,8 @@
     for (const owner of snapshot.owners) {
       fail(owner && nonempty(owner.id) && !nodes.has(owner.id) && nonempty(owner.name) &&
         nonempty(owner.role) && nonempty(owner.parent), '目录含重复或无效负责人。');
+      fail(owner.registration_order === undefined || Number.isSafeInteger(owner.registration_order) && owner.registration_order >= 0,
+        '目录登记顺序无效。');
       fail(['current-session', 'intercom-status', 'unavailable'].includes(owner.identity_source) &&
         (owner.pi_session_id === null || nonempty(owner.pi_session_id)) &&
         (owner.identity_source === 'current-session' ? nonempty(owner.pi_session_id) : owner.pi_session_id === null),
@@ -34,7 +36,9 @@
         }
       }
     }
-    const sort = ids => ids.sort((a, b) => nodes.get(a).name.localeCompare(nodes.get(b).name) || a.localeCompare(b));
+    const sort = ids => ids.sort((a, b) =>
+      (nodes.get(a).registration_order ?? Number.MAX_SAFE_INTEGER) -
+      (nodes.get(b).registration_order ?? Number.MAX_SAFE_INTEGER) || a.localeCompare(b));
     sort(roots); for (const ids of children.values()) sort(ids); for (const ids of unresolved.values()) sort(ids);
     const visited = new Set();
     function visit(id, depth) {
@@ -93,7 +97,25 @@
     const params = new URLSearchParams(hash.replace(/^#/, ''));
     params.set('session', session); return '#' + params.toString();
   }
-  const api = { forest, catalog, bindings, route };
+  // rank is captured from an upstream render, never from our regrouped DOM.
+  function groups(tree, bound, nativeIds, priorOrder = []) {
+    const rank = new Map(nativeIds.map((id, index) => [id, index]));
+    const walk = id => [id, ...tree.children.get(id).flatMap(walk)];
+    const teams = tree.roots.map(id => ({ id, root: id, owners: walk(id), unresolved: false }));
+    for (const [parent, ids] of tree.unresolved) {
+      teams.push({ id: parent, root: null, owners: ids.flatMap(walk), unresolved: true });
+    }
+    const order = [...new Set([...priorOrder, ...teams.map(t => t.id)])];
+    teams.sort((a, b) => order.indexOf(a.id) - order.indexOf(b.id));
+    for (const team of teams) {
+      team.sessions = team.owners.map(id => ({ owner: id, session: bound.get(id)?.session }))
+        .filter(item => rank.has(item.session))
+        .sort((a, b) => Number(b.owner === team.root) - Number(a.owner === team.root) ||
+          rank.get(a.session) - rank.get(b.session));
+    }
+    return { teams, order };
+  }
+  const api = { forest, catalog, bindings, route, groups };
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   else scope.CodoxearOwnerCore = api;
 })(globalThis);

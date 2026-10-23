@@ -60,3 +60,30 @@ test('hash adapter preserves parameters and opaque route IDs without suffix pars
   const params = new URLSearchParams(Core.route('#view=chat&session=old', id).slice(1));
   assert.equal(params.get('view'), 'chat'); assert.equal(params.get('session'), id);
 });
+
+test('fixed team order; only descendants follow authoritative native ranks', () => {
+  const bound = Core.bindings(tree, rows());
+  bound.set('ops', { session: 'root-a' }); bound.set('other', { session: 'root-b' });
+  const first = Core.groups(tree, bound, ['demo-office-opaque-123', 'demo-legacy', 'demo-web', 'root-b', 'root-a']);
+  assert.deepEqual(first.teams.slice(0, 2).map(t => t.id), ['ops', 'other']);
+  assert.deepEqual(first.teams[0].sessions.map(x => x.session), ['root-a', 'demo-office-opaque-123', 'demo-legacy', 'demo-web']);
+  const next = Core.groups(tree, bound, ['root-b', 'demo-web', 'demo-office-opaque-123', 'demo-legacy', 'root-a'], first.order);
+  assert.deepEqual(next.teams.slice(0, 2).map(t => t.id), ['ops', 'other']);
+  assert.deepEqual(next.teams[0].sessions.map(x => x.session), ['root-a', 'demo-web', 'demo-office-opaque-123', 'demo-legacy']);
+  const unbound = Core.groups(tree, Core.bindings(tree, rows()), ['demo-office-opaque-123']);
+  assert.equal(unbound.teams[0].root, 'ops');
+  assert.equal(unbound.teams[0].sessions[0].owner, 'office'); // no promoted root
+  assert(unbound.teams.find(t => t.unresolved).root === null);
+});
+
+test('registration ordinal beats names; new roots append to saved order', () => {
+  const changed = structuredClone(fixture.owners);
+  changed.owners.find(o => o.id === 'ops').name = 'ZZZ';
+  changed.owners.find(o => o.id === 'other').name = 'AAA';
+  const newer = {...changed.owners[0], id:'new-root', parent:'user', registration_order:999};
+  changed.owners.push(newer);
+  const t = Core.forest(changed);
+  assert.deepEqual(t.roots, ['ops', 'other', 'new-root']);
+  const g = Core.groups(t, Core.bindings(t, rows()), [], ['other', 'ops']);
+  assert.deepEqual(g.teams.filter(x => x.root).map(x => x.id), ['other', 'ops', 'new-root']);
+});

@@ -1,218 +1,178 @@
-/* Own only the shadow panel. Native Codoxear DOM and listeners stay in place. */
+/* Reconcile complete ORIGINAL native cards. No cloned rows or navigation callbacks. */
 (function (scope) {
   'use strict';
   const Core = scope.CodoxearOwnerCore;
-  const HOST = 'quick-deploy-owner-groups';
-  const states = { active: '责任进行中', ended: '责任已结束', 'handed-over': '已交接', mixed: '含多种责任状态', 'no-scope': '无已登记职责' };
+  const STYLE = 'quick-deploy-owner-groups-style';
+  const NOTICE = 'quick-deploy-owner-groups';
   const css = `
-    :host{display:block;flex:0 0 auto;max-height:55vh;max-height:55dvh;min-height:0;overflow:auto;color:#e7edf5;font:12px/1.5 system-ui,sans-serif;--muted:#a7b5c7;--border:#40516b}
-    *{box-sizing:border-box}section{padding:12px 10px;border-bottom:1px solid var(--border);background:#172333}
-    h2{font-size:14px;letter-spacing:.02em;margin:0}p{margin:5px 0;color:var(--muted)}
-    .heading,.tools{display:flex;gap:8px;align-items:center;justify-content:space-between}.heading{position:sticky;top:0;z-index:4;background:#172333;padding:4px 0}.tools{justify-content:flex-start;margin:8px 0}
-    button{cursor:pointer;border:1px solid #566d8c;border-radius:5px;background:#243750;color:#ecf3ff;padding:4px 8px;font:inherit}
-    button:hover{background:#35506f}button:focus-visible,summary:focus-visible{outline:2px solid #88bfff;outline-offset:2px}
-    button:disabled{opacity:.6;cursor:wait}.badge{font-size:10px;border:1px solid #71829c;border-radius:4px;padding:1px 5px;white-space:nowrap}
-    .demo{color:#ffdc99;border-color:#ad8546}.count{font-size:11px;color:var(--muted)}
-    details.owner{margin:7px 0;border:1px solid var(--border);border-radius:7px;background:#1c2a3c}
-    summary{padding:8px;cursor:pointer;overflow-wrap:anywhere}summary .name{font-weight:650;font-size:13px}.availability{display:block;margin-left:14px;color:var(--muted);font-size:10px}.root-summary{position:sticky;top:32px;z-index:2;background:#1c2a3c;padding-left:29px;list-style:none}.root-summary::-webkit-details-marker{display:none}.root-star{position:absolute;left:8px;top:7px;font-size:17px;line-height:1.2;color:#ffd989}.root-summary .role,.root-summary .summary-count{margin-left:0}
-    .role{display:block;color:#c0cfe1;margin-left:14px;font-size:11px}.summary-count{margin-left:14px;color:var(--muted);font-size:10px}
-    .body{padding:0 9px 9px}.children{margin:7px 0 0 6px;padding-left:8px;border-left:2px solid #576b87}
-    .children .owner{background:#223247}ul{padding-left:16px;margin:5px 0;color:var(--muted)}li{margin-bottom:4px;overflow-wrap:anywhere}
-    .reason{overflow-wrap:anywhere;font-size:11px}.current{display:none;color:#b6dcff;margin-left:6px}
-    details[aria-current="true"]>summary{background:#2c4e70;box-shadow:inset 3px 0 #8bc6ff}details[aria-current="true"]>summary .current{display:inline}
-    .warning{border:1px solid #b48a4b;border-radius:6px;padding:8px;background:#3d3020;color:#ffdfa5}
-    .empty{border:1px dashed #65748a;border-radius:7px;padding:10px;margin:8px 0}.native{border-top:1px solid var(--border);padding-top:8px;font-weight:600;color:#c2cfe0}
-    .unresolved{border:1px dashed #bd954e;border-radius:7px;padding:8px;margin-top:8px}.unresolved>strong{color:#ffdfa5}
-    :host([data-floating]){position:fixed;left:12px;bottom:12px;z-index:2147483647;max-width:340px;box-shadow:0 3px 18px #0008}
+    #sessions > .owner-team{border:2px solid #fff;border-radius:16px;padding:5px;margin:3px 0 12px;
+      box-shadow:0 1px 4px #00000024;min-width:0;background:transparent}
+    #sessions > .owner-team > .session{position:relative}
+    #sessions .owner-root-star{position:absolute;right:2px;top:-6px;z-index:3;color:#bea04b;
+      font:20px/1 system-ui,sans-serif;pointer-events:none;text-shadow:0 1px 1px #fff8}
+    #sessions .owner-unavailable{font:inherit;font-size:11px;color:var(--muted,#777);padding:7px 10px}
+    #sessions > .owner-team[data-unresolved]{border-style:dashed}
+    #quick-deploy-owner-groups{font:11px/1.4 system-ui,sans-serif;color:var(--muted,#777);padding:4px 12px;flex:0 0 auto}
   `;
-  function element(tag, text, className) {
-    const node = document.createElement(tag);
-    if (text !== undefined) node.textContent = text;
-    if (className) node.className = className;
-    return node;
+  function el(tag, cls, text) {
+    const n = document.createElement(tag); if (cls) n.className = cls;
+    if (text !== undefined) n.textContent = text; return n;
   }
-
-  function start({ readSnapshot, demo = false, pollMs = 10000 }) {
+  function start({ readSnapshot, pollMs = 10000 }) {
     scope.CodoxearOwnerPanel?.controller?.stop();
-    // A stale host from an invalidated extension must never cause two mount points.
-    document.getElementById(HOST)?.remove();
-    let stopped = false, pending = false, host = null, shadow = null, tree = null, bound = new Map();
-    let status = '正在读取负责人目录…', compatibility = false, busy = false, activating = false;
-    const expanded = new Map();
-    let timer;
-
+    document.getElementById(STYLE)?.remove(); document.getElementById(NOTICE)?.remove();
+    const style = el('style', '', css); style.id = STYLE; document.head.append(style);
+    let stopped = false, busy = false, pending = false, anchor = null, original = [], layout = [], tree = null, bound = new Map();
+    let message = '', demo = false, order = [];
+    const storageKey = 'quick-deploy.owner-groups.order:' + location.pathname;
+    try { const saved = JSON.parse(localStorage.getItem(storageKey)); if (Array.isArray(saved) && saved.every(x => typeof x === 'string') && saved.length <= 1000) order = saved; } catch (_) { /* Storage is optional. Registration order remains deterministic. */ }
+    const headers = new Map();
+    const observer = new MutationObserver(() => {
+      if (stopped || pending) return;
+      pending = true; queueMicrotask(() => { pending = false; reconcile(); });
+    });
+    function observe() {
+      if (!stopped) observer.observe(document.documentElement, { childList: true, subtree: true,
+        attributes: true, attributeFilter: ['class', 'data-session-id'] });
+    }
+    function mutate(fn) {
+      observer.disconnect();
+      try { fn(); } finally { observe(); }
+    }
     function nativeAnchor() {
-      const anchor = document.querySelector('.sidebar > #sessions.sessions');
-      return anchor && document.querySelectorAll('#sessions').length === 1 ? anchor : null;
+      const n = document.querySelector('.sidebar > #sessions.sessions');
+      return n && document.querySelectorAll('#sessions').length === 1 ? n : null;
     }
-    function ensureMount() {
-      if (stopped || !document.body) return;
-      const anchor = nativeAnchor();
-      if (!anchor && document.getElementById('loginForm')) {
-        host?.remove(); host = null; shadow = null; return;
+    function cleanDecorations(n) {
+      n?.querySelectorAll('.owner-root-star').forEach(s => s.remove());
+      for (const [header, saved] of headers) {
+        const count = header.querySelector('.sessionGroupCount'); if (count) count.textContent = saved.count;
+        if (saved.label === null) header.removeAttribute('aria-label'); else header.setAttribute('aria-label', saved.label);
       }
-      const incompatible = !anchor;
-      // Preserve native restore-lead + list adjacency as well as the list itself.
-      const insertion = anchor?.parentElement.querySelector(':scope > .sessionRestoreLead') || anchor;
-      if (!host || !host.isConnected || compatibility !== incompatible) {
-        host?.remove(); host = element('div'); host.id = HOST;
-        compatibility = incompatible;
-        if (incompatible) { host.dataset.floating = ''; document.body.append(host); }
-        else insertion.before(host);
-        shadow = host.attachShadow({ mode: 'open' }); render();
-      } else if (insertion && host.nextElementSibling !== insertion) insertion.before(host);
-      updateActive();
+      headers.clear();
     }
-    function activeSession() {
-      const row = nativeAnchor()?.querySelector('.session.active[data-session-id]');
-      return row ? row.dataset.sessionId : new URLSearchParams(location.hash.slice(1)).get('session');
+    function restore() {
+      if (!anchor) return;
+      cleanDecorations(anchor);
+      // Disconnected old native rows were invalidated by upstream; never resurrect them.
+      const retained = original.filter(n => anchor.contains(n) || n.matches?.('.sessionGroupHeader') && !n.isConnected);
+      sync(anchor, retained);
+      anchor.querySelectorAll(':scope > .owner-team').forEach(n => n.remove());
+      original = [...anchor.children];
     }
-    function updateActive() {
-      if (!shadow) return;
-      const current = activeSession();
-      for (const node of shadow.querySelectorAll('[data-owner]')) {
-        node.setAttribute('aria-current', String(Boolean(current && bound.get(node.dataset.owner)?.session === current)));
-      }
+    function notice() {
+      document.getElementById(NOTICE)?.remove();
+      if (document.getElementById('loginForm') || (!message && !demo)) return;
+      const n = el('div', '', message || 'DEMO · 合成数据'); n.id = NOTICE; n.setAttribute('role', 'status');
+      const sidebar = document.querySelector('.sidebar'); if (sidebar) sidebar.append(n);
     }
-    function tool(label, fn) {
-      const button = element('button', label); button.type = 'button'; button.addEventListener('click', fn); return button;
+    function sync(parent, desired) {
+      desired.forEach((node, index) => {
+        if (parent.children[index] !== node) parent.insertBefore(node, parent.children[index] || null);
+      });
     }
-    function renderOwner(id) {
-      const owner = tree.nodes.get(id), binding = bound.get(id);
-      const details = element('details', undefined, 'owner');
-      details.dataset.owner = id;
-      details.open = expanded.has(id) ? expanded.get(id) : tree.children.get(id).length > 0;
-      details.addEventListener('toggle', () => expanded.set(id, details.open));
-      const summary = element('summary');
-      if (owner.parent === 'user') {
-        summary.classList.add('root-summary');
-        const star = element('span', '★', 'root-star');
-        star.title = '最高负责人'; star.setAttribute('aria-label', '最高负责人');
-        summary.append(star);
-      }
-      summary.append(element('span', owner.name, 'name'), element('span', '当前', 'badge current'), element('span', owner.role, 'role'));
-      const descendants = count(id) - 1;
-      if (descendants) summary.append(element('span', `${descendants} 位下级 · 跨项目按上级归组`, 'summary-count'));
-      const availability = element('span', `${binding.session ? '会话可定位' : '未绑定会话'} · ${states[owner.state]}`, 'availability');
-      availability.title = binding.reason; summary.append(availability);
-      details.append(summary);
-      const body = element('div', undefined, 'body');
-      body.append(element('span', states[owner.state], 'badge'));
-      if (owner.scopes.length) {
-        const scopes = element('ul');
-        owner.scopes.forEach(s => scopes.append(element('li', `${s.task} · ${s.project} · ${states[s.status]}`)));
-        body.append(scopes);
-      }
-      body.append(element('p', binding.reason, 'reason'));
-      if (binding.session) {
-        const button = tool('打开会话', () => activate(id, binding.session));
-        button.disabled = activating; button.dataset.openOwner = id;
-        button.setAttribute('aria-label', `打开 ${owner.name} 的已登记会话`); body.append(button);
-      }
-      const children = element('div', undefined, 'children');
-      tree.children.get(id).forEach(child => children.append(renderOwner(child)));
-      if (children.childElementCount) body.append(children);
-      details.append(body); return details;
-    }
-    function count(id) { return 1 + tree.children.get(id).reduce((sum, child) => sum + count(child), 0); }
-    function render() {
-      if (!shadow) return;
-      const style = element('style', css), section = element('section');
-      section.setAttribute('aria-label', '负责人分组');
-      const heading = element('div', undefined, 'heading'); heading.append(element('h2', '负责人分组'));
-      if (demo) heading.append(element('span', 'DEMO · 合成数据', 'badge demo'));
-      section.append(heading, element('p', '按登记上级归组 · 会话可定位 ≠ 在线'));
-      if (compatibility) {
-        section.append(element('p', '兼容性提示：未找到受支持的 Codoxear 侧栏；增强已停用，原应用保持可用。', 'warning'));
-      } else {
-        const tools = element('div', undefined, 'tools');
-        tools.append(tool(busy ? '读取中…' : '刷新', refresh), tool('全部展开', () => expand(true)), tool('全部折叠', () => expand(false)));
-        tools.firstElementChild.disabled = busy; section.append(tools);
-        if (status) section.append(element('p', status, 'warning'));
-        if (tree) {
-          const available = [...bound.values()].filter(b => b.session).length;
-          section.append(element('p', `${tree.nodes.size} 位负责人 · ${available} 个会话可定位 · ${tree.unresolved.size} 个上级待登记`, 'count'));
-          if (!tree.nodes.size) {
-            const empty = element('div', undefined, 'empty');
-            empty.append(element('strong', '尚无已登记负责人'), element('p', '明确任命后，责任登记中的顶层负责人及下级会出现在这里。普通会话仍在下方原生列表。不会按标题或目录猜测归属。'));
-            section.append(empty);
-          }
-          tree.roots.forEach(id => section.append(renderOwner(id)));
-          for (const [token, ids] of tree.unresolved) {
-            const missing = element('div', undefined, 'unresolved');
-            missing.append(element('strong', '上级待确认：' + token), element('p', '保留原上级关系；以下负责人未提升为顶层。'));
-            ids.forEach(id => missing.append(renderOwner(id))); section.append(missing);
+    function apply() {
+      const rows = original.filter(n => n.matches?.('.session[data-session-id]'));
+      const ids = rows.map(n => n.dataset.sessionId);
+      if (new Set(ids).size !== ids.length || original.some(n => !n.matches?.('.session[data-session-id],.sessionGroupHeader,.sidebarEmptyHint'))) throw Error('Unsupported native item wrapper');
+      const byId = new Map(rows.map(n => [n.dataset.sessionId, n]));
+      const projection = Core.groups(tree, bound, ids, order); order = projection.order;
+      try { localStorage.setItem(storageKey, JSON.stringify(order.slice(-1000))); } catch (_) { /* No required storage writes. */ }
+      const desired = [], used = new Set();
+      cleanDecorations(anchor);
+      for (const team of projection.teams) {
+        // Empty true roots remain an explicit unavailable label, never a fabricated live row.
+        if (team.unresolved && !team.sessions.length) continue;
+        let box = [...anchor.children].find(n => n.classList.contains('owner-team') && n.dataset.ownerGroup === team.id);
+        if (!box) { box = el('div', 'owner-team'); box.dataset.ownerGroup = team.id; box.setAttribute('role', 'group'); }
+        box.setAttribute('aria-label', team.root ? tree.nodes.get(team.root).name : '上级待确认');
+        if (team.unresolved) box.dataset.unresolved = '';
+        const contents = [];
+        const rootSession = team.sessions.find(item => item.owner === team.root);
+        if (!rootSession) {
+          let label = box.querySelector(':scope > .owner-unavailable');
+          if (!label) label = el('div', 'owner-unavailable');
+          label.textContent = team.unresolved ? '上级待确认 · 未提升下级' : tree.nodes.get(team.root).name + ' · 会话不可用';
+          contents.push(label);
+        }
+        for (const item of team.sessions) {
+          const row = byId.get(item.session); used.add(row); contents.push(row);
+          if (item.owner === team.root) {
+            const star = el('span', 'owner-root-star', '★'); star.title = '最高负责人'; star.setAttribute('aria-label', '最高负责人'); row.append(star);
           }
         }
-        section.append(element('div', '全部会话 · 原生列表 ↓', 'native'));
+        sync(box, contents);
+        for (const child of [...box.children]) if (!contents.includes(child)) child.remove();
+        desired.push(box);
       }
-      shadow.replaceChildren(style, section); updateActive();
-    }
-    function expand(open) {
-      for (const node of shadow.querySelectorAll('details.owner')) {
-        expanded.set(node.dataset.owner, open); node.open = open;
+      // Retain native date/status headers only for rows still outside the frames.
+      let header = null, bucket = [];
+      function flush() {
+        if (!bucket.length) return;
+        if (header) {
+          const count = header.querySelector('.sessionGroupCount');
+          headers.set(header, { count: count?.textContent, label: header.getAttribute('aria-label') });
+          if (count) count.textContent = String(bucket.length);
+          header.setAttribute('aria-label', `${header.querySelector('.sessionGroupLabel')?.textContent || ''}: ${bucket.length} sessions`);
+          desired.push(header);
+        }
+        desired.push(...bucket);
       }
+      for (const node of original) {
+        if (node.matches('.sessionGroupHeader')) { flush(); header = node; bucket = []; }
+        else if (!used.has(node)) bucket.push(node);
+      }
+      flush(); sync(anchor, desired);
+      for (const child of [...anchor.children]) if (!desired.includes(child)) child.remove();
     }
-    async function snapshot() {
-      const payload = await readSnapshot();
-      demo = payload.demo === true;
-      const nextTree = Core.forest(payload.owners), nextBound = Core.bindings(nextTree, Core.catalog(payload.sessions));
-      return { nextTree, nextBound };
+    function reconcile() {
+      if (stopped) return;
+      mutate(() => {
+        const next = nativeAnchor();
+        if (anchor !== next) {
+          restore(); anchor = next; original = []; layout = [];
+          if (next) queueMicrotask(refresh);
+        }
+        if (!anchor) {
+          if (document.getElementById('loginForm')) { tree = null; bound = new Map(); message = ''; demo = false; }
+          else message = '负责人分组：原生侧栏不兼容，增强已停用。';
+          notice(); return;
+        }
+        // Only direct ORIGINAL native cards mean a fresh upstream render. Our cards
+        // are descendants of .owner-team, so our own layout cannot become activity.
+        const direct = [...anchor.children];
+        if (!anchor.querySelector(':scope > .owner-team') &&
+            (direct.length !== layout.length || direct.some((n, i) => layout[i] !== n))) {
+          cleanDecorations(anchor); original = [...anchor.children];
+        } else if (!original.length) original = [...anchor.children];
+        if (!tree) restore();
+        else {
+          try { apply(); } catch (_) { restore(); tree = null; bound = new Map(); message = '负责人分组：原生行结构不兼容，增强已停用。'; }
+        }
+        layout = [...anchor.children];
+        notice();
+      });
     }
     async function refresh() {
-      if (stopped || busy || activating) return;
+      if (stopped || busy) return;
       busy = true;
       try {
-        const { nextTree, nextBound } = await snapshot();
-        if (stopped) return;
-        tree = nextTree; bound = nextBound; status = '';
+        const payload = await readSnapshot();
+        const nextTree = Core.forest(payload.owners), nextBound = Core.bindings(nextTree, Core.catalog(payload.sessions));
+        if (!stopped) { tree = nextTree; bound = nextBound; demo = payload.demo === true; message = ''; }
       } catch (_) {
-        // Never keep an old clickable mapping after any failed read/validation.
-        tree = null; bound = new Map();
-        status = '目录桥接或会话 API 不可用 / 不兼容。增强已停止定位；请确认安装与登录，原生列表仍可使用。';
-      } finally { busy = false; if (!stopped) { ensureMount(); render(); } }
+        if (!stopped) { tree = null; bound = new Map(); message = '负责人分组暂不可用，请检查登录或桥接；已恢复原生列表。'; }
+      } finally { busy = false; if (!stopped) reconcile(); }
     }
-    async function activate(id, expectedSession) {
-      if (stopped || activating || busy) return;
-      activating = true; render();
-      try {
-        const { nextTree, nextBound } = await snapshot();
-        if (stopped) return;
-        const prior = tree.nodes.get(id), next = nextTree.nodes.get(id), selected = nextBound.get(id);
-        tree = nextTree; bound = nextBound;
-        if (!next || next.pi_session_id !== prior.pi_session_id || selected?.session !== expectedSession) {
-          status = '会话身份或路由已变化；本次未跳转。请核对更新后的登记。';
-        } else {
-          status = '';
-          // Assign hash: real hashchange invokes Codoxear's native selection lifecycle.
-          location.hash = Core.route(location.hash, selected.session);
-          if (document.body.classList.contains('sidebar-open') && window.matchMedia('(max-width: 880px)').matches) {
-            document.getElementById('toggleSidebarBtn')?.click();
-          }
-        }
-      } catch (_) {
-        tree = null; bound = new Map(); status = '重新核验失败，未跳转。原生列表仍可使用。';
-      } finally { activating = false; if (!stopped) render(); }
-    }
-    const observer = new MutationObserver(records => {
-      if (stopped || pending || records.every(r => host && (r.target === host || host.contains(r.target)))) return;
-      pending = true;
-      queueMicrotask(() => { pending = false; ensureMount(); });
-    });
-    observer.observe(document.documentElement, { childList: true, subtree: true, attributes: true,
-      attributeFilter: ['class', 'data-session-id'] });
-    const onHash = () => updateActive();
-    window.addEventListener('hashchange', onHash);
-    const stop = () => {
+    function stop() {
       stopped = true; observer.disconnect(); clearInterval(timer);
-      window.removeEventListener('hashchange', onHash); window.removeEventListener('pagehide', stop);
-      host?.remove();
-    };
+      restore(); style.remove(); document.getElementById(NOTICE)?.remove();
+      window.removeEventListener('pagehide', stop);
+    }
+    observe(); reconcile(); refresh();
+    const timer = setInterval(() => { if (!document.hidden) refresh(); }, pollMs);
     window.addEventListener('pagehide', stop);
-    ensureMount(); refresh(); timer = setInterval(() => { if (!document.hidden) refresh(); }, pollMs);
-    const controller = { stop, refresh };
-    scope.CodoxearOwnerPanel.controller = controller;
-    return controller;
+    const controller = { stop, refresh }; scope.CodoxearOwnerPanel.controller = controller; return controller;
   }
   scope.CodoxearOwnerPanel = { start, controller: scope.CodoxearOwnerPanel?.controller || null };
 })(globalThis);

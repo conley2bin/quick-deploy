@@ -79,7 +79,9 @@ def project(state):
         scopes[oid].append({'task': display(assignment['task']),
                             'project': display(assignment['project']['name']), 'status': status})
     result, claims = [], {}
-    for oid in sorted(owners):
+    # The canonical CLI appends owners and preserves object insertion order on save.
+    # Export only the ordinal, not timestamps or private appointment history.
+    for registration_order, oid in enumerate(owners):
         owner, identity = owners[oid], owners[oid]['identity']
         pi = identity['pi_session_id'] if identity['source'] == 'current-session' else None
         if pi:
@@ -88,7 +90,7 @@ def project(state):
         responsibility = next(iter(statuses)) if len(statuses) == 1 else ('mixed' if statuses else 'no-scope')
         parent = owner['parent']
         result.append({'id': oid, 'name': display(owner['name']), 'role': display(owner['role']),
-                       'parent': parent,
+                       'parent': parent, 'registration_order': registration_order,
                        'parent_status': 'root' if parent == 'user' else
                            ('resolved' if parent[6:] in owners else 'unresolved'),
                        'pi_session_id': pi, 'identity_source': identity['source'],

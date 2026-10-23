@@ -40,6 +40,17 @@ class ProjectionTests(unittest.TestCase):
         changed['history'][0]['after'] = {'pi_session_id': 'HISTORY-ONLY-ID'}
         self.assertNotIn('HISTORY-ONLY-ID', json.dumps(p.project(changed)))
 
+    def test_registration_ordinal_is_stable_and_append_only(self):
+        before = {o['id']: o['registration_order'] for o in p.project(self.state)['owners']}
+        changed = copy.deepcopy(self.state)
+        changed['owners']['ops']['name'] = 'ZZZ'
+        changed['owners']['other']['name'] = 'AAA'
+        changed['owners']['new'] = {**copy.deepcopy(changed['owners']['ops']), 'id': 'new'}
+        after = {o['id']: o['registration_order'] for o in p.project(changed)['owners']}
+        self.assertEqual({oid: after[oid] for oid in before}, before)
+        self.assertEqual(after['new'], len(before))
+        self.assertLess(before['ops'], before['other'])
+
     def test_read_only_including_dashboard_lock_and_modes(self):
         def snapshot():
             return {f.name: (f.read_bytes(), f.stat().st_mtime_ns, f.stat().st_mode, f.stat().st_ino)
