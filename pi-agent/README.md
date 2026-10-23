@@ -9,6 +9,7 @@
 ```bash
 bash pi-agent/install.sh            # 安装扩展，保存全局 fullscreen 默认值
 bash pi-agent/install.sh --skills   # 同时交互式安装 skills（菜单选择 + API key 提示）
+bash pi-agent/install.sh --skills-only # 仅交互式选择/复制 skills，不碰扩展或 fullscreen 设置
 pi                                 # 新会话直接使用 fullscreen；无需另做 /settings
 ```
 
@@ -18,8 +19,8 @@ pi                                 # 新会话直接使用 fullscreen；无需�
 
 - 仅浅层发现 `extensions/*/install.sh`，逐个执行；新增带 `install.sh` 的 Pi 功能即自动纳入，无需改本脚本。嵌套在功能目录内的组件不会被一键安装器单独执行或链接，按各功能 README 的步骤安装。Pi home 无需初始化 Git；是 Git worktree 时才做对应安装器的 index/exclude 保护。
 - 各扩展安装器都是幂等的：已安装的跳过；旧 checkout 或旧名字的受管链接先备份再迁移；外部文件/目录/链接一律拒绝覆盖。
-- 默认不碰 skills（其安装器是交互式的）；不加 `--skills` 时只打印提示。
-- 所有安装步骤成功后，只将全局 `settings.json` 的 `tuiMode` 保存为 `fullscreen`：位置为 `PI_CODING_AGENT_DIR/settings.json`，未指定时为 `$HOME/.pi/agent/settings.json`。已有全局 `regular` 会有意改为 `fullscreen`；其他字段保留，已是 `fullscreen` 时不重写文件。
+- 默认不碰 skills（其安装器是交互式的）；`--skills` 随扩展一起安装，`--skills-only` 只运行现有技能菜单/复制流程并退出，不调用扩展安装或全局设置写入。只选需要的技能即可保留其他已安装项；支持 `PI_AGENT_SKILLS_DIR` / `PI_AGENT_SKILLS_ZSHRC` 指定隔离目标。
+- 扩展安装路径的所有步骤成功后，只将全局 `settings.json` 的 `tuiMode` 保存为 `fullscreen`（`--skills-only` 不执行此步骤）：位置为 `PI_CODING_AGENT_DIR/settings.json`，未指定时为 `$HOME/.pi/agent/settings.json`。已有全局 `regular` 会有意改为 `fullscreen`；其他字段保留，已是 `fullscreen` 时不重写文件。
 - 首次创建设置应在首次启动 Pi **之前**运行；更新已有设置时与 Pi 共用锁，在锁内读取、合并并原子写入。保留已有软链接及其目标文件的权限、所有者、ACL 和扩展属性；无效/非对象 JSON、断开的软链接、需要修改的多硬链接、不可写文件或锁/写入失败会明确报错，不会重置配置。支持 UTF-8 BOM 和带空格的 Pi home。
 - 项目 `.pi/settings.json` 与启动参数（如 `pi --tui-mode regular`）仍可覆盖全局默认，本脚本不改它们。脚本也不切换当前 TUI、不 reload 或重启 Pi；已有会话需在空闲时手动 `/reload` 或重启来加载更新，确认当前模式仍可用 `/settings`。
 
@@ -58,7 +59,9 @@ pi                                 # 新会话直接使用 fullscreen；无需�
 | `extensions/pi-remote-clipboard/{src,pi-extension}/` | 本机 provider（systemd user service）与 Pi 入口 | 由该功能顶层 `install.sh` 一并安装 |
 | `extensions/pi-inline-images/{patches,vendor}/` | 与本功能桥接协议共同演进的 pi-tmux-images 补丁与 vendored 代码 | 手动 guarded replay（见功能 README） |
 | `patches/<包>-<版本>/` | 不属于任何自有功能的第三方 Pi 包修复 | 手动 guarded replay，仅适用于指定版本；`apply.sh --check` 先核验版本与哈希 |
-| `skills/` | 自有技能 `skills/<name>/`；vendored `skills/<来源>/<name>/` + `UPSTREAM.txt` | `skills/install-skills.sh` 交互式复制到 `~/.pi/agent/skills/` |
+| `skills/` | 自有技能 `skills/<name>/`；vendored `skills/<来源>/<name>/` + `UPSTREAM.txt` | `install.sh --skills-only` 调用现有 `skills/install-skills.sh`，交互式选中后复制到 `~/.pi/agent/skills/` |
+
+`skills/responsibility-registry/` 是全局责任登记技能的源码；安装时在 `--skills-only` 菜单只选 `responsibility-registry`。`~/.pi/agent/skills/responsibility-registry/` 是安装副本，不在该目录开发。运行态登记簿位于 `~/.pi/agent/.memory/local/responsibility-registry/`，不随源码或安装复制；已有 Pi 会话 `/reload` 后加载更新。
 
 `pi-copy-links` 提供代码块右下角复制按钮和 Ctrl+左键打开网页及 Pi 服务器文件；需使用 Pi 的 `fullscreen` 模式。扩展运行时及其单独的叶安装器不修改全局设置；全局 fullscreen 默认策略由本目录的一键安装器负责。版本号仅作诊断：TUI 启动时在自有隔离对象上检查实际接口与关键行为，契约成立即启用，无需用户逐版验证或编辑版本名单。具体接口/行为不兼容时只停用增强并提示原因，原生 Markdown/Pi 保持可用；`/copy-links` 查看实际状态。更新源码后须在 Pi 空闲时手动 `/reload` 或重启才会生效，详见 [使用说明](extensions/pi-copy-links/README.md)。
 

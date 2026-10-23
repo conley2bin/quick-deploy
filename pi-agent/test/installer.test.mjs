@@ -371,6 +371,49 @@ test("child failure means no setting creation/change and no later leaf", t => {
   }
 });
 
+test("skills-only copies only the selected real skill and preserves configs and unrelated skills", async t => {
+  const f = fixture(t);
+  f.seed('{"tuiMode":"regular","owned":42}\n');
+  const before = snapshot(f.settings);
+  const shellConfig = join(f.home, '.zshrc');
+  writeFileSync(shellConfig, '# unchanged shell config\n');
+  const shellBefore = snapshot(shellConfig);
+  const unrelated = join(f.agent, 'skills/unrelated/SKILL.md');
+  mkdirSync(dirname(unrelated), { recursive: true });
+  writeFileSync(unrelated, 'unrelated installed skill\n');
+  const unrelatedBefore = snapshot(unrelated);
+  copyFileSync(join(source, 'skills/install-skills.sh'), join(f.checkout, 'skills/install-skills.sh'));
+  cpSync(join(source, 'skills/responsibility-registry'), join(f.checkout, 'skills/responsibility-registry'), {
+    recursive: true, filter: path => basename(path) !== '__pycache__' && !path.endsWith('.pyc'),
+  });
+  // Prove the main skill-only route does not need or execute any leaf installer.
+  rmSync(join(f.checkout, 'extensions'), { recursive: true });
+  const result = spawnSync('bash', [join(f.checkout, 'install.sh'), '--skills-only'], { ...f.options(), input: '1\n' });
+  passed(result);
+  assert.match(result.stdout, /installed responsibility-registry/);
+  assert.equal(existsSync(f.trace), false);
+  unchanged(f.settings, before); unchanged(shellConfig, shellBefore); unchanged(unrelated, unrelatedBefore);
+  assert.deepEqual(readdirSync(join(f.agent, 'skills')).sort(), ['responsibility-registry', 'unrelated']);
+  const target = join(f.agent, 'skills/responsibility-registry');
+  for (const path of ['SKILL.md', 'scripts/registry.py', 'references/cli.md', 'tests/test_registry.py']) {
+    assert.deepEqual(readFileSync(join(target, path)), readFileSync(join(source, 'skills/responsibility-registry', path)));
+  }
+  const { loadSkillsFromDir } = await import(pathToFileURL(join(packageDir, 'dist/core/skills.js')).href);
+  const loaded = loadSkillsFromDir({ dir: target, source: 'user' });
+  assert.deepEqual(loaded.diagnostics, []);
+  assert.equal(loaded.skills[0].name, 'responsibility-registry');
+  assert.equal(loaded.skills[0].disableModelInvocation, false);
+});
+
+test("skills-only reports selection-install failure without touching settings", t => {
+  const f = fixture(t); f.seed('{"tuiMode":"regular"}\n');
+  const before = snapshot(f.settings);
+  writeFileSync(join(f.checkout, 'skills/install-skills.sh'), '#!/bin/sh\necho "controlled skill-only failure" >&2\nexit 24\n');
+  const result = f.run(['--skills-only']);
+  assert.equal(result.status, 24); failed(result, /controlled skill-only failure/);
+  unchanged(f.settings, before); assert.equal(existsSync(f.trace), false);
+});
+
 test("optional skills complete before persistence; their failure leaves settings alone", t => {
   const f = fixture(t); f.seed('{"tuiMode":"regular"}\n');
   const skills = join(f.checkout, "skills/install-skills.sh");
