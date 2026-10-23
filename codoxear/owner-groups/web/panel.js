@@ -11,12 +11,7 @@
     #sessions .owner-team > .session.owner-root:not(.active){border:1px solid var(--border-subtle,#e4e4e4);
       border-radius:var(--radius-card);background:var(--surface-subtle,#f5f5f5)}
     #sessions .owner-team > .session.owner-root:not(.active) .sessionContent{background:var(--surface-subtle,#f5f5f5)}
-    #sessions .owner-root-star{position:absolute;right:2px;top:2px;width:20px;height:20px;z-index:3;pointer-events:none}
-    #sessions .session:has(.sessionActionsInline :focus-visible) > .owner-root-star,
-    #sessions .session:has(.sessionContent[data-swipe-x]:not([data-swipe-x="0"])) > .owner-root-star{visibility:hidden}
-    @media (hover:hover) and (pointer:fine) and (min-width:881px){
-      #sessions .session.desktop:hover > .owner-root-star{visibility:hidden}
-    }
+    #sessions .owner-root-star{display:block;width:20px;height:20px;flex:0 0 20px;pointer-events:none}
     #sessions .owner-unavailable{font:inherit;font-size:11px;color:var(--muted,#777);padding:7px 10px}
     #sessions > .owner-team[data-unresolved]{border-style:dashed}
     #quick-deploy-owner-groups{font:11px/1.4 system-ui,sans-serif;color:var(--muted,#777);padding:4px 12px;flex:0 0 auto}
@@ -130,7 +125,9 @@
           const row = byId.get(item.session); used.add(row); contents.push(row);
           if (item.owner === team.root) {
             row.classList.add('owner-root');
-            row.append(rootStar());
+            const title = row.querySelector('.titleText');
+            if (!title) throw Error('Unsupported native title');
+            title.after(rootStar());
           }
         }
         sync(box, contents);

@@ -34,16 +34,17 @@ function settleNativeSelection(){
 }
 function geometry(label){
   const result=evaluate(`([...document.querySelectorAll('svg.owner-root-star')].map(s=>{
-    const row=s.parentElement,r=row.getBoundingClientRect(),b=s.getBoundingClientRect();
+    const row=s.closest('.session'),r=row.getBoundingClientRect(),b=s.getBoundingClientRect(),title=s.previousElementSibling,t=title.getBoundingClientRect();
     return {id:row.dataset.sessionId,active:row.classList.contains('active'),width:b.width,height:b.height,
-      top:b.top-r.top,right:r.right-b.right,bottom:r.bottom-b.bottom,
-      ownCard:row.matches('.session.owner-root')&&getComputedStyle(row).position==='relative'&&getComputedStyle(s).position==='absolute',
+      gap:b.left-t.right,centerDelta:Math.abs((b.top+b.bottom-t.top-t.bottom)/2),withinCard:b.left>=r.left&&b.right<=r.right&&b.top>=r.top&&b.bottom<=r.bottom,
+      afterName:title.matches('.titleText')&&s.parentElement.matches('.titleLine')&&row.matches('.owner-root'),
+      ellipsis:getComputedStyle(title).textOverflow,position:getComputedStyle(s).position,
       pointer:getComputedStyle(s).pointerEvents,visibility:getComputedStyle(s).visibility,
       label:s.getAttribute('aria-label'),title:s.querySelector('title')?.textContent,
       ids:s.querySelectorAll('[id]').length,fill:s.querySelector('path').getAttribute('fill')};
   }))`);
   assert.deepEqual(result.map(x=>x.id),['demo-ops','demo-other']);
-  assert(result.every(x=>x.width===20&&x.height===20&&x.top>=0&&x.top<=4&&x.right>=0&&x.right<=4&&x.bottom>=0&&x.ownCard&&x.pointer==='none'&&x.visibility==='visible'&&x.label==='最高负责人'&&x.title===x.label&&x.ids===0&&x.fill==='#ffdf00'));
+  assert(result.every(x=>x.width===20&&x.height===20&&x.gap>=0&&x.gap<=8&&x.centerDelta<=1&&x.withinCard&&x.afterName&&x.ellipsis==='ellipsis'&&x.position==='static'&&x.pointer==='none'&&x.visibility==='visible'&&x.label==='最高负责人'&&x.title===x.label&&x.ids===0&&x.fill==='#ffdf00'));
   console.log('GEOMETRY '+label+' '+JSON.stringify(result));return result;
 }
 // Send trusted input/capture only to this isolated agent-browser's own page.
@@ -82,16 +83,21 @@ try{
       const gesture=evaluate(`({connected:starSwipeTarget.isConnected,swipe:document.querySelector('${row('ops')} .sessionContent').dataset.swipeX})`);
       console.log('TOUCH '+JSON.stringify(gesture));assert(gesture.connected&&Number(gesture.swipe)<-50);
     }else run('hover',row('ops'));
-    assert.equal(evaluate(`getComputedStyle(document.querySelector('${row('ops')} .owner-root-star')).visibility`),'hidden');
+    assert(evaluate(`(()=>{const star=document.querySelector('${row('ops')} .owner-root-star'),s=star.getBoundingClientRect();return getComputedStyle(star).visibility==='visible'&&[...document.querySelectorAll('${row('ops')} button')].every(n=>{const b=n.getBoundingClientRect();return Math.min(s.right,b.right)<=Math.max(s.left,b.left)||Math.min(s.bottom,b.bottom)<=Math.max(s.top,b.top)})})()`));
     run('click',row('ops')+' button[aria-label="Edit conversation"]');run('wait','#editViewer[open]');run('press','Escape');
     if(mobile)openSidebar();run('click',row('office-opaque-123'));if(mobile)openSidebar();moveAway();geometry((mobile?'mobile':'desktop')+' after native Edit');
     for(const variant of ['root-missing','unresolved']){
       control({variant});refresh();
-      const stars=evaluate(`[...document.querySelectorAll('svg.owner-root-star')].map(s=>s.parentElement.dataset.sessionId)`);
+      const stars=evaluate(`[...document.querySelectorAll('svg.owner-root-star')].map(s=>s.closest('.session').dataset.sessionId)`);
       if(variant==='root-missing')assert(!stars.includes('demo-ops'));
       assert(!stars.includes('demo-orphan'));assert(stars.every(id=>['demo-ops','demo-other'].includes(id)));
     }
-    console.log('PASS '+(mobile?'mobile':'desktop')+' root-only rounded SVG, own-card geometry active/inactive, controls unobscured and native Edit works.');
+    control({variant:'normal'});refresh();
+    run('click',row('ops')+' .sessionContent');if(mobile)openSidebar();moveAway();settleNativeSelection();
+    evaluate(`fetch('/demo/api/sessions/demo-ops/edit',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:'Dexathlon 场景评测 · very long native root title for ellipsis testing'})}).then(r=>r.json())`);
+    settleNativeSelection();geometry((mobile?'mobile':'desktop')+' long updated native name');
+    assert(evaluate(`(()=>{const t=document.querySelector('${row('ops')} .titleText');return t.scrollWidth>t.clientWidth&&t.nextElementSibling.matches('svg.owner-root-star')})()`));
+    console.log('PASS '+(mobile?'mobile':'desktop')+' inline-after-name rounded SVG active/inactive, native title update+ellipsis, controls unobscured and native Edit works.');
     control({variant:'normal'});refresh();run('close');
   }
   console.log('SCREENSHOTS '+output);
