@@ -21,3 +21,6 @@ codoxear/.runtime/
 
 !.claude/
 !.agents/
+
+# Runtime authority is private; source ships only the blank template.
+/pi-agent/skills/responsibility-registry/RESPONSIBILITIES.md
