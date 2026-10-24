@@ -232,7 +232,7 @@ class SwitchTests(DocumentFixture):
         self.assertEqual(self.store.snapshot_bytes(record)[0], original)
         self.assertFalse(self.store.switch_journal.exists())
         self.assertEqual(self.store.backup_candidates(), [])
-        with self.assertRaisesRegex(registry.RegistryError, 'no completed'):
+        with self.assertRaisesRegex(registry.RegistryError, 'previous is ambiguous'):
             self.store.resolve_backup('previous')
         self.register(appointment('beta', 'next', path='/example/beta'))
         self.switch()
@@ -259,6 +259,58 @@ class SwitchTests(DocumentFixture):
         self.switch()
         self.assertEqual(len(self.store.backup_candidates()), 1)
         self.assertNotEqual(self.store.resolve_backup('previous')['id'], record['id'])
+
+    def test_newer_superseded_previous_requires_choice_and_explicit_id_restores_latest(self):
+        self.register()
+        self.switch()  # R1 is completed, snapshot alpha.
+        self.register(appointment('beta', 'new', path='/example/beta'))
+        b = self.domain()
+        with patch.object(self.store, 'switch_checkpoint', side_effect=lambda phase: (_ for _ in ()).throw(OSError('after publication')) if phase == 'switched' else None):
+            with self.assertRaisesRegex(registry.RegistryError, 'switched; index incomplete'):
+                self.switch()
+        self.document.unlink()
+        shutil.copyfile(SKILL / 'RESPONSIBILITIES.template.md', self.document)
+        self.assertEqual(self.recover()['recovered'], 'superseded-manual')
+        first, second = self.store.read_backup_index()
+        raw, inode = self.document.read_bytes(), self.document.stat().st_ino
+        index = self.store.backup_index.read_bytes()
+        with self.assertRaisesRegex(registry.RegistryError, 'previous is ambiguous') as failure:
+            self.switch('restore', 'previous')
+        for record in [first, second]:
+            self.assertIn(record['id'], str(failure.exception))
+        self.assertIn('"utc"', str(failure.exception))
+        self.assertIn('"local"', str(failure.exception))
+        self.assertEqual((self.document.read_bytes(), self.document.stat().st_ino), (raw, inode))
+        self.assertEqual(self.store.backup_index.read_bytes(), index)
+        self.assertEqual(len(list((self.document.parent / 'backups').iterdir())), 2)
+        self.assertEqual(self.store.resolve_backup(second['snapshot'])['id'], second['id'])
+        self.switch('restore', second['id'])
+        self.assertEqual(self.domain(), b)
+        self.assertEqual(list(self.domain()['owners']), ['beta'])
+
+    def test_never_published_superseded_snapshot_is_explicitly_restorable(self):
+        self.register()
+        original = self.domain()
+        real_index = self.store.write_backup_index
+        def race(phase):
+            if phase == 'prepared':
+                state, era = codec.parse_document(self.document.read_text())
+                state['owners']['alpha']['role'] = 'valid manual role'
+                self.document.write_text(codec.serialize_document(state, era))
+        def fail_abort(records):
+            if records[-1]['status'] == 'aborted':
+                raise OSError('abort index unavailable')
+            return real_index(records)
+        with patch.object(self.store, 'switch_checkpoint', race), patch.object(self.store, 'write_backup_index', fail_abort):
+            with self.assertRaises(registry.RegistryError):
+                self.switch()
+        self.assertEqual(self.recover()['recovered'], 'superseded-manual')
+        record = self.store.read_backup_index()[0]
+        with self.assertRaisesRegex(registry.RegistryError, 'previous is ambiguous'):
+            self.switch('restore', 'previous')
+        self.assertEqual(self.store.resolve_backup(Path(record['snapshot']).name)['id'], record['id'])
+        self.switch('restore', record['id'])
+        self.assertEqual(self.domain(), original)
 
     def test_rename_succeeded_before_fsync_error_is_never_recorded_aborted(self):
         self.register()

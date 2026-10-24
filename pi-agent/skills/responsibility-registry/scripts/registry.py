@@ -614,15 +614,20 @@ class Store:
         return [r for r in self.read_backup_index() if r['status'] == 'completed']
 
     def resolve_backup(self, target):
-        records = self.backup_candidates()
+        history = self.read_backup_index()
+        records = [r for r in history if r['status'] == 'completed']
+        superseded = [r for r in history if r['status'] == 'superseded-manual']
         def candidates(values):
-            return json.dumps([dict(id=r['id'], utc=datetime.fromisoformat(r['time'].replace('Z', '+00:00')).astimezone(timezone.utc).isoformat(),
+            return json.dumps([dict(id=r['id'], status=r['status'], utc=datetime.fromisoformat(r['time'].replace('Z', '+00:00')).astimezone(timezone.utc).isoformat(),
                                     local=datetime.fromisoformat(r['time'].replace('Z', '+00:00')).astimezone().isoformat(),
                                     snapshot=r['snapshot'], summary=r['summary']) for r in values], ensure_ascii=False)
         if target == 'previous':
-            matches = records[-1:]  # resolved BEFORE the new current backup exists
+            latest = max(records, key=lambda r: r['sequence'], default=None)
+            newer = [r for r in superseded if r['sequence'] > (latest['sequence'] if latest else 0)]
+            require(not newer, 'previous is ambiguous after a newer superseded switch; ask user to choose exact ID/filename: ' + candidates(([latest] if latest else []) + newer))
+            matches = [latest] if latest else []  # resolved BEFORE the current backup exists
         else:
-            matches = [r for r in records if target in [r['id'], r['snapshot'], Path(r['snapshot']).name]]
+            matches = [r for r in records + superseded if target in [r['id'], r['snapshot'], Path(r['snapshot']).name]]
             if not matches:
                 timestamp = re.fullmatch(r'\d{4}-\d{2}-\d{2}[T ](?P<clock>\d{2}:\d{2}(?::\d{2})?)(?:Z|[+-]\d{2}(?::?\d{2})?)?', target)
                 require(timestamp, 'no completed Markdown snapshot matches; timestamp requires minute or second precision and explicit timezone; candidates: ' + candidates(records))
