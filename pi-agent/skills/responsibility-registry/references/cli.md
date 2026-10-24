@@ -230,8 +230,10 @@ cp -- "$LIVE/RESPONSIBILITIES.template.md" "$LIVE/RESPONSIBILITIES.md"
 
 ## 维护验证
 
+在 quick-deploy 源码根运行；跨消费者测试同时使用仓库内的外部 projector，不能把安装副本当作完整测试工作区。所有状态写入临时隔离目录：
+
 ```bash
-python3 -m unittest discover -s "$HOME/.pi/agent/skills/responsibility-registry/tests" -v
+python3 -m unittest discover -s pi-agent/skills/responsibility-registry/tests -v
 ```
 
 Pi 文档依据：安装包 `docs/skills.md`（发现、模型加载、/reload）、`docs/sessions.md` 和 `docs/session-format.md`（/session 与真实 ID）；pi-intercom README 的 status/list 与当前源实现（联系 ID 可独立配置）；pi-subagents `docs/tool-reference.md`（能力发现、async、status、通知/等待）。运行时以实际安装版本和可用工具为准，不复制安装路径或修改包。
