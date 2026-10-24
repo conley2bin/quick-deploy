@@ -2,11 +2,12 @@
 """Private accountability directory. POSIX, Python stdlib; Markdown is authoritative."""
 import argparse
 import copy
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import fcntl
 import html
 import json
 import os
+import re
 from pathlib import Path
 import sys
 import tempfile
@@ -554,12 +555,17 @@ class Store:
         seen = set()
         for record in records:
             keys(record, ['id', 'sequence', 'time', 'action', 'actor', 'reason', 'authority', 'snapshot', 'sha256',
-                          'status', 'summary', 'before_token', 'after_sha256', 'after_era', 'target_id', 'readiness_changes'])
+                          'status', 'summary', 'before_token', 'after_sha256', 'after_era', 'target_id', 'readiness_changes'],
+                 ['reconciliation'])
             require(record['id'] not in seen and type(record['sequence']) is int and record['sequence'] > 0,
                     'duplicate/invalid backup ID/sequence')
             seen.add(record['id'])
-            require(record['status'] in ['pending', 'completed', 'aborted', 'switched-index-incomplete'], 'invalid backup status')
+            require(record['status'] in ['pending', 'completed', 'aborted', 'switched-index-incomplete', 'superseded-manual'], 'invalid backup status')
             require(record['action'] in ['clear', 'restore'] and record['actor'] == 'user', 'invalid switch action/actor')
+            if 'reconciliation' in record:
+                keys(record['reconciliation'], ['observed_sha256', 'journal_phase'])
+                require(re.fullmatch(r'[0-9a-f]{64}', record['reconciliation']['observed_sha256']), 'invalid observed digest')
+                text(record['reconciliation']['journal_phase'], 'reconciled journal phase')
             validate_time(dict(at=record['time'], precision='exact'))
             for field in ['id', 'reason', 'authority', 'snapshot', 'sha256', 'after_sha256', 'after_era']:
                 text(record[field], 'backup.' + field)
@@ -575,12 +581,18 @@ class Store:
                       '- ID: ' + record['id'] + ' · sequence: ' + str(record['sequence']),
                       '- Reason: ' + cell(record['reason']) + ' · user authority: ' + cell(record['authority']),
                       '- Prior era/revision: ' + summary['era'] + ' / ' + str(summary['revision']),
+                      '- Restored from: ' + (record['target_id'] or '(none; clear)') + ' · new era: ' + record['after_era'],
                       '- Counts: owners=' + str(summary['owners']) + ', assignments=' + str(summary['assignments']) +
                       ', coordination=' + str(summary['coordination']) + ', history=' + str(summary['history']),
                       '- Roots: ' + (', '.join(cell(x) for x in summary['roots']) or '(none)'),
                       '- Relationships (parent → child / role): ' + ('; '.join(cell(x) for x in summary['relations']) or '(none)'),
                       '- Snapshot: [' + record['id'] + '](' + record['snapshot'] + ')',
-                      '- SHA-256: `' + record['sha256'] + '`', '']
+                      '- SHA-256: `' + record['sha256'] + '`']
+            if 'reconciliation' in record:
+                evidence = record['reconciliation']
+                lines.append('- Reconciled phase: ' + evidence['journal_phase'] +
+                             ' · observed current SHA-256: `' + evidence['observed_sha256'] + '`')
+            lines.append('')
         lines += ['## Switch records (audit JSON)', '```json', json.dumps(records, ensure_ascii=False, indent=2, allow_nan=False), '```', '']
         require(not self.backup_index.is_symlink(), 'backup index cannot be a symlink')
         atomic_write(self.backup_index, '\n'.join(lines))
@@ -603,13 +615,28 @@ class Store:
 
     def resolve_backup(self, target):
         records = self.backup_candidates()
+        def candidates(values):
+            return json.dumps([dict(id=r['id'], utc=datetime.fromisoformat(r['time'].replace('Z', '+00:00')).astimezone(timezone.utc).isoformat(),
+                                    local=datetime.fromisoformat(r['time'].replace('Z', '+00:00')).astimezone().isoformat(),
+                                    snapshot=r['snapshot'], summary=r['summary']) for r in values], ensure_ascii=False)
         if target == 'previous':
             matches = records[-1:]  # resolved BEFORE the new current backup exists
         else:
-            matches = [r for r in records if target in [r['id'], r['snapshot'], Path(r['snapshot']).name] or r['time'].startswith(target)]
+            matches = [r for r in records if target in [r['id'], r['snapshot'], Path(r['snapshot']).name]]
+            if not matches:
+                timestamp = re.fullmatch(r'\d{4}-\d{2}-\d{2}[T ](?P<clock>\d{2}:\d{2}(?::\d{2})?)(?:Z|[+-]\d{2}(?::?\d{2})?)?', target)
+                require(timestamp, 'no completed Markdown snapshot matches; timestamp requires minute or second precision and explicit timezone; candidates: ' + candidates(records))
+                try:
+                    start = datetime.fromisoformat(target.replace('Z', '+00:00'))
+                except ValueError as exc:
+                    raise RegistryError('invalid ISO timestamp; candidates: ' + candidates(records)) from exc
+                require(start.tzinfo is not None and start.utcoffset() is not None,
+                        'timestamp requires explicit timezone; ask user, never assume UTC; candidates: ' + candidates(records))
+                start = start.astimezone(timezone.utc)
+                end = start + timedelta(seconds=1 if timestamp['clock'].count(':') == 2 else 60)
+                matches = [r for r in records if start <= datetime.fromisoformat(r['time'].replace('Z', '+00:00')).astimezone(timezone.utc) < end]
         require(matches, 'no completed Markdown snapshot matches; legacy JSON/dashboard are never candidates')
-        require(len(matches) == 1, 'ambiguous restore target; ask user to select: ' +
-                json.dumps([dict(id=r['id'], time=r['time'], snapshot=r['snapshot'], summary=r['summary']) for r in matches], ensure_ascii=False))
+        require(len(matches) == 1, 'ambiguous restore target; ask user to select: ' + candidates(matches))
         self.snapshot_bytes(matches[0])
         return matches[0]
 
@@ -668,10 +695,15 @@ class Store:
             atomic_write(self.switch_journal, json.dumps(journal, ensure_ascii=False, indent=2) + '\n')
             records.append(record)
             did_switch = False
+            publication_started = False
+            def before_replace():
+                nonlocal publication_started
+                self.recheck(raw, stat)
+                publication_started = True
             try:
                 self.write_backup_index(records)  # durable pending index before replacing live
                 self.switch_checkpoint('prepared')
-                atomic_write(self.document, content, before_replace=lambda: self.recheck(raw, stat))
+                atomic_write(self.document, content, before_replace=before_replace)
                 did_switch = True
                 self.switch_checkpoint('switched')
                 check, current, _, _ = self.read_document()
@@ -683,16 +715,40 @@ class Store:
                 return dict(action=action, backup=record['snapshot'], restored_from=record['target_id'],
                             readiness_changes=readiness_changes, **current)
             except (OSError, RegistryError, ValueError) as exc:
-                # The durable journal contains both hashes even if index writes fail.
-                # A conflicting manual replacement is not overwritten or reconstructed.
-                current_raw = self.document.read_bytes() if self.document.exists() else None
-                switched = did_switch or (current_raw is not None and hashlib.sha256(current_raw).hexdigest() == record['after_sha256'])
-                record['status'] = 'switched-index-incomplete' if switched else 'aborted'
+                # The journal is audit evidence, not authority over later manual MD.
+                # A rename can succeed even when its directory fsync/readback fails.
+                observed = None
+                unchanged = False
                 try:
-                    atomic_write(self.switch_journal, json.dumps(dict(record=record, phase=record['status']), ensure_ascii=False, indent=2) + '\n')
+                    observed = hashlib.sha256(self.document.read_bytes()).hexdigest()
+                    unchanged = observed == record['sha256'] and fingerprint(self.document.stat()) == stat
                 except OSError:
-                    pass  # Original pending journal remains explicit recoverable evidence.
-                raise RegistryError(('switched; index incomplete' if switched else 'switch not performed; recovery required') + ': ' + str(exc)) from exc
+                    pass
+                switched = did_switch or observed == record['after_sha256']
+                not_published = not switched and (not publication_started or unchanged)
+                record['status'] = 'switched-index-incomplete' if switched else ('aborted' if not_published else 'pending')
+                phase = record['status'] if switched or not_published else 'publishing'
+                try:
+                    atomic_write(self.switch_journal, json.dumps(dict(record=record, phase=phase), ensure_ascii=False, indent=2) + '\n')
+                except OSError:
+                    pass  # Original pending journal still binds both hashes for recovery.
+                if not_published:
+                    try:
+                        self.write_backup_index(records)
+                        self.switch_journal.unlink()
+                        fsync_directory(self.root)
+                    except (OSError, RegistryError, ValueError):
+                        # If unlink succeeded but its directory sync failed, retain a
+                        # recoverable journal too; never imply durable cleanup.
+                        if not self.switch_journal.exists():
+                            try:
+                                atomic_write(self.switch_journal, json.dumps(dict(record=record, phase=phase), ensure_ascii=False, indent=2) + '\n')
+                            except OSError:
+                                pass  # The terminal index remains explicit audit evidence.
+                    else:
+                        raise RegistryError('switch not performed; aborted recorded: ' + str(exc)) from exc
+                message = 'switched; index incomplete' if switched else ('switch not performed; recovery required' if not_published else 'switch outcome unresolved; recovery required')
+                raise RegistryError(message + ': ' + str(exc)) from exc
         return self.locked(operation)
 
     def recover_switch(self, expected_document, actor, reason, authority):
@@ -705,12 +761,18 @@ class Store:
             record = journal['record']
             self.snapshot_bytes(record)
             digest = hashlib.sha256(raw).hexdigest()
-            require(digest in [record['sha256'], record['after_sha256']], 'pending switch diverged; preserve current and reconcile explicitly')
-            record['status'] = 'completed' if digest == record['after_sha256'] else 'aborted'
+            phase = journal['phase']
+            if digest == record['after_sha256']:
+                record['status'] = 'completed'
+            elif digest == record['sha256'] and phase != 'switched-index-incomplete':
+                record['status'] = 'aborted'
+            else:
+                record['status'] = 'superseded-manual'
+                record['reconciliation'] = dict(observed_sha256=digest, journal_phase=phase)
             records = self.read_backup_index()
             prior = next((r for r in records if r['id'] == record['id']), None)
             if prior:
-                require(all(prior[k] == record[k] for k in record if k != 'status'), 'backup index/journal mismatch; preserve evidence')
+                require(all(prior[k] == record[k] for k in record if k not in ['status', 'reconciliation']), 'backup index/journal mismatch; preserve evidence')
                 records[records.index(prior)] = record
             else:
                 records.append(record)
@@ -926,7 +988,7 @@ def main(argv=None):
         p.add_argument('--reason', required=True)
         p.add_argument('--authority', required=True, help='actual direct user authorization evidence')
         if command == 'restore':
-            p.add_argument('--target', required=True, help='previous, exact backup ID/name, or unambiguous timezone timestamp prefix')
+            p.add_argument('--target', required=True, help='previous, exact backup ID/name, or aware ISO minute/second (for example 2026-10-24T16:13+08:00)')
     q = commands.add_parser('query', help='JSON including hierarchy and dependency relations')
     for name in ['owner', 'project', 'task', 'repo']:
         q.add_argument('--' + name)
@@ -983,8 +1045,9 @@ def main(argv=None):
             require(output not in [store.document.resolve(), (store.root / 'dashboard.md').resolve(),
                                    (store.root / 'registry.json').resolve(), (store.root / 'registry.lock').resolve(),
                                    (store.root / 'document-control.json').resolve(), (store.root / 'switch-pending.json').resolve(),
-                                   store.document.parent / 'BACKUPS.md'] and
-                    store.document.parent / 'backups' not in output.parents,
+                                   (store.document.parent / 'BACKUPS.md').resolve()] and
+                    (store.document.parent / 'backups').resolve() not in [output, *output.parents] and
+                    not (output.parent == store.root.resolve() and output.name.startswith('legacy-')),
                     'report output cannot replace authority, legacy tombstone or backups')
             atomic_write(output, result.pop('report'))
             result['output'] = str(output)

@@ -28,8 +28,9 @@ description: "全局负责人登记与协作：用户或有授权的直属上级
 - 用户直接说“取消所有的负责人关系”或“重建负责人关系”：先 query 当前 MD 并核验真实用户授权，调用 `clear --actor user --expected-document TOKEN --reason ... --authority ...`。**不需要后续任命也能保持为空**。仅有 role-bound peer/上级身份不授予清空全局的权限。
 - 同一用户消息另有“我任命你为…”：先完成带备份 clear，再 query 新 era，**只登记该明确新任命**；不从旧记忆推导其他职责。模板仍可手工复制；agent clear 自动使用新的空 UUID era，无需用户提供 ID。
 - 每次 agent clear/restore 在同一锁内先保存当前 MD **原始字节**到同目录私有 `backups/`，以时区秒级时间、序号和 UUID 命名（目录0700/快照0600）；`BACKUPS.md`（0600）列时间、用户依据、根姓名与 parent→child/角色、计数、路径/ID、hash和状态。这个索引与快照是历史证据，不是当前授权源。
-- “恢复上一次/指定时间关系”：`backup-list` 列 completed 候选；先解析并 hash/格式核验目标，歧义列候选向用户问清，不猜。previous 指**本次请求开始时最近 completed 的 pre-switch 快照**，先选目标再备份当前，因此反复 previous 可在前两状态间切换。`restore --target ...` 先备份 CURRENT，再以新 UUID era 恢复目标关系/原样历史，旧 token/plan 不恢复。只允许本技能已登记 `backups/*.md`，不能恢复 legacy JSON/dashboard。恢复不重启 agent/job、不恢复执行态。旧快照缺少协议 terms 证据时明确 not-ready，不自动补确认。
-- 备份/索引写失败时禁止切换。切换后索引失败会非零报 `switched; index incomplete`，先 query 核验当前图，再以用户授权 `recover-switch` 逐 hash 对账；pending/incomplete 不作为 previous，也阻止后续写命令。不得把非零当作未切换而盲重做。
+- “恢复上一次/指定时间关系”：`backup-list` 列 completed 候选；先解析并 hash/格式核验目标，歧义列候选向用户问清，不猜。previous 指**本次请求开始时最近 completed 的 pre-switch 快照**，先选目标再备份当前，因此反复 previous 可在前两状态间切换。按时间恢复必须明确时区（如 `2026-10-24T16:13+08:00` 或 `2026-10-24T08:13:05Z`），按该分钟/秒的瞬时区间匹配；无时区或多候选时列 UTC/本机带偏移时间向用户问清，不猜 UTC。`restore --target ...` 先备份 CURRENT，再以新 UUID era 恢复目标关系/原样历史，旧 token/plan 不恢复。只允许本技能已登记 `backups/*.md`，不能恢复 legacy JSON/dashboard。恢复不重启 agent/job、不恢复执行态。旧快照缺少协议 terms 证据时明确 not-ready，不自动补确认。
+- 备份/索引写失败时禁止切换。切换后索引失败会非零报 `switched; index incomplete`，先 query 核验当前图，再以用户授权 `recover-switch` 逐 hash 对账；pending/incomplete 不作为 previous，也阻止后续写命令。已知未发布的失败会尽力记 aborted 并解除 journal；若期间用户手改/手工 rm+cp 成为另一个**有效**当前 MD，recover 只记终态 `superseded-manual`（观察 hash/原 phase），保留快照、完成索引并解除 pending，不写 live；该记录不能作 previous。索引失败时保留显式恢复证据。不得把非零当作未切换而盲重做。
+- 若 live 缺失/损坏，先报告准确诊断并让用户决定修复/手工替换，**不得自行 cp 模板来“修好”**。用户决定替换前，先把现存损坏原始字节作私有0600 dated copy；文件已缺失则明确无现存字节可备份。原始损坏备份是证据，不冒充可解析的 restore 候选。
 - **OS 手工 rm 无法拦截**：它会删除该 era 在此文件中的历史（包括迁移后的新事件），不会自动备份未观察到的人工编辑。要完整留存请优先用 agent clear；手工删除前自行做一份私有 dated copy。手工删除后复制同目录模板仍立即表示零当前图，缺失/损坏从不导入旧 JSON/缓存，不需删 JSON或服务重启。
 - 若手工 reset 要与 CLI 串行，可使用 [CLI](references/cli.md) 的同一 `flock` rm+cp 示例。非协作 editor 仍有最后重检到 rename 的竞态；不要宣称绝对无覆盖。重置只改变登记授权，不停止正在运行的 agent/child，所有负责人必须重读当前 MD。
 

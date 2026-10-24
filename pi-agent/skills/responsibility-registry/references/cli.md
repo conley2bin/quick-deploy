@@ -256,7 +256,7 @@ python3 "$RR" backup-list
 # 恢复前再次独立 query、核验目标与当前图，重新提取 TOKEN：
 python3 "$RR" restore --target previous --expected-document "$TOKEN" --actor user \
   --reason '用户明确恢复上一次关系' --authority '实际用户消息依据'
-# 也可 --target 精确ID/文件名/无歧义时区时间前缀；歧义会列候选，需向用户问清。
+# 也可 --target 精确ID/文件名/明确时区的ISO分钟或秒（T或空格均可）；歧义会列候选，需向用户问清。
 # 失败后先 query 看当前图，重新取 TOKEN，并经用户授权：
 python3 "$RR" recover-switch --expected-document "$TOKEN" --actor user \
   --reason '核对未完成关系切换' --authority '用户授权恢复索引'
@@ -264,7 +264,11 @@ python3 "$RR" recover-switch --expected-document "$TOKEN" --actor user \
 
 `backups/` 中的 exact-byte MD 是不可变 pre-switch 快照；`BACKUPS.md` 显示秒+时区时间、根姓名/parent→child角色、计数、理由/授权、snapshot/hash/status。只有 completed 且匹配 hash/严格 v2 解析的快照可恢复；query/projector 从不读索引/备份作为当前状态，JSON/dashboard永不候选。previous 在创建新备份**之前**解析：A→clear(s1=A)→restore previous(A,s2=empty)→restore previous(empty,s3=A)。目标选定后先备份 CURRENT，再用 fresh UUID era 恢复目标原 revision/history；不复用快照 era，不新增伪历史，不重启任务/进程。旧 terms_digest 缺失的确认保持 not-ready 并报告 readiness_changes，不暗中重签。
 
-快照目录0700，快照/索引0600，时间+序号+UUID且 O_EXCL/fsync 保证同秒不碰撞。快照或 pre-switch 索引失败，live字节/inode不变；pending证据须显式 recover。切换后索引失败会非零报 `switched; index incomplete`；不要认为未切换。`recover-switch` 比较 journal 的 before/after hash与当前真实MD，匹配 before 则aborted，匹配 after 则completed；任何人工分歧只报错保留，不重放旧数据。非completed记录不入 previous，pending会阻止后续mutation。
+快照目录0700，快照/索引0600，时间+序号+UUID且 O_EXCL/fsync 保证同秒不碰撞。快照或 pre-switch 索引失败，live字节/inode不变；pending证据须显式 recover。切换后索引失败会非零报 `switched; index incomplete`；不要认为未切换。`recover-switch` 比较 journal 的 before/after hash与当前真实MD：匹配 after 则completed；匹配 before 且无已发布证据则aborted。若用户已改成另一个**有效** MD（包括手工 rm+cp），恢复只记非候选终态 `superseded-manual`，保存观察到的 hash/原 journal phase，保留原快照，持久化索引后删除 journal；不改 live 的字节/inode。即使已发布后被用户改回 before 字节，也不冒称从未发布。已知未发布的失败会尽力自动完成 aborted 索引/清理；任何索引清理失败仍显式报恢复需要，不静默解锁。非completed（含 superseded-manual）记录不入 previous，未完成 journal 会阻止后续mutation。
+
+时间选择按瞬时区间，不是UTC字符串前缀：`2026-10-24T16:13+08:00` 选择 UTC08:13这一分钟，`2026-10-24 16:13:05+08:00` 选择 UTC08:13:05这一秒；区间含起点、不含下一分钟/秒。`2026-10-24T16:13Z` 是另一个瞬时区间。无时区的 `2026-10-24T16:13`、仅日期或不支持的精度会拒绝，不创建 CURRENT备份或切换；候选列UTC与本机带偏移时间，请向用户问清。多个匹配同样列候选，不猜。完整ID/文件名和previous不变，若两次clear后要找更旧状态应使用backup-list中的具体ID。BACKUPS.md可见条目同时显示 restored-from目标与新era。
+
+live 缺失或格式损坏时，query/clear/restore/recover 先报准确诊断，保留现存字节。agent不得自行用模板cp绕过错误；应让用户决定修复或手工替换。在用户选择替换**之前**，把现存损坏原始字节保存到私有0600 dated copy并核对；已缺失则说明没有现存字节可备份，不伪称备份成功。损坏原始副本只是证据，不能当作已校验的restore候选。
 
 OS级 rm 无法拦截，故手工路径没有 guaranteed backup。需要保留本era全部历史/未观察人工编辑时，用 clear；如果必须手工，可先做私有 dated copy，并在同一 CLI lock 内执行：
 
