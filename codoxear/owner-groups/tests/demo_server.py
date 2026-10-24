@@ -83,7 +83,12 @@ async def serve(static_dir, port):
         if state['variant'] == 'bridge-down':
             return {'schema': 'codoxear-owner-groups/v1', 'ok': False, 'error': 'Synthetic unavailable', 'owners': []}
         result = copy.deepcopy(data['owners'])
-        if state['variant'] == 'empty': result['owners'] = []
+        if state['variant'] == 'empty':
+            result['owners'] = []; result['era'] = 'template'
+        if state.get('era'): result['era'] = state['era']
+        if state.get('reverse_order'):
+            for owner in result['owners']:
+                owner['registration_order'] = 1000 - owner['registration_order']
         if state['variant'] == 'cycle': result['owners'][0]['parent'] = 'owner:' + result['owners'][0]['id']
         if state['variant'] == 'xss':
             result['owners'][0]['name'] = '<img src=x onerror="window.fixtureXSS=true">'
@@ -103,7 +108,7 @@ async def serve(static_dir, port):
             options = await request.json()
             if options.pop('reset', False):
                 rows[:] = copy.deepcopy(original_rows); actions.clear()
-                state.update(variant='normal', auth=True, version=0, activity='', add=False, new_group=False, sections='')
+                state.update(variant='normal', auth=True, version=0, activity='', add=False, new_group=False, sections='', era='', reverse_order=False)
             state.update(options); state['version'] += 1
             return web.json_response({'ok': True, 'actions': actions})
         if path == '/api/login':

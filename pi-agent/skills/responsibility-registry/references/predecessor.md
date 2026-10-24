@@ -23,7 +23,7 @@
 
 已知项填真实绝对路径：session_file 来自**已确认的当前会话**元数据或 `/session`；cwd 为其 header 中原工作目录，repo 是规范 Git common dir，worktree 是原 checkout 根目录。summary/decisions/pending_issues 可为真实说明或 null，context_refs 只列已知交接/决策/任务文档或消息指针。登记校验格式；文件可能日后消失，不能因不可读而删除历史。准备咨询时重新核验实际文件 header.id 与所存 Pi ID、header.cwd 与原 cwd。
 
-handover 已保存目标/验收/依赖及汇报/child/协调安排；现在还把该时点的前任 ID、contact、recovery、交接摘要复制到新责任的 `handover_obligations.predecessor_context`。owner 后来换会话时旧快照不变；JSON 历史的 before/after 同样保留。更早前任沿明确 predecessor 责任链查找，不遍历无关会话目录。
+handover 已保存目标/验收/依赖及汇报/child/协调安排；现在还把该时点的前任 ID、contact、recovery、交接摘要复制到新责任的 `handover_obligations.predecessor_context`。owner 后来换会话时旧快照不变；live Markdown 审计历史的 before/after 同样保留。更早前任沿明确 predecessor 责任链查找，不遍历无关会话目录。
 
 ## 1. 优先在线精确咨询
 
@@ -46,6 +46,8 @@ python3 "$PR" prepare --actor 'current-owner-id' --assignment 'successor-scope-i
   --question-file '/absolute/private/question.md' --model 'verified-provider/verified-model' \
   --output '/absolute/private/consultation-001'
 ```
+
+prepare 从当前 live MD 经同一个 Store 选择现任 actor/责任，并把 era/document_token 保存到 plan；自定义路径同时传 `--root PRIVATE --document LIVE.md`。模板重置后旧 actor/assignment 不再可选。已复制的 plan/回答只是旧 era 建议；record 只追加私有咨询日志，不恢复身份或职责。迁移前已准备的 plan 若没有 era/token，记录为 null（未知历史来源），不推定为当前 era。
 
 prepare **不启动模型/Pi**。它只读取指定责任快照和这一个已知 transcript，检查 ID/cwd、文件/目录存在性，复制到私有 `predecessor.jsonl`（0400），保存其 hash，写 plan.json、question.md、advisor.txt、launch.sh、consultation.jsonl。输出必须在原 cwd/worktree 外，且为新目录，拒绝覆盖。原 transcript 不被写入；CLI 将从副本再 fork，避免旧 session 同文件并发 writer。
 

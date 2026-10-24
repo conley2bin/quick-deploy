@@ -671,7 +671,28 @@ for i in "${!skill_dirs[@]}"; do
     echo "would install $name -> $dest"
   else
     mkdir -p "$dest"
-    cp -a "$skill_dir/." "$dest/"
+    if [[ "$name" == responsibility-registry ]]; then
+      # Never remove/recreate this directory or copy the live authority file,
+      # including one accidentally present in a source checkout.
+      tar -C "$skill_dir" --exclude='./RESPONSIBILITIES.md' --exclude='__pycache__' -cf - . |
+        tar -C "$dest" -xf -
+      registry_root="$(python3 - "$dest" <<'PYROOT'
+from pathlib import Path
+import sys
+installed = Path(sys.argv[1]).resolve()
+default = Path.home() / '.pi/agent/skills/responsibility-registry'
+print(Path.home() / '.pi/agent/.memory/local/responsibility-registry'
+      if installed == default.resolve() else installed / '.registry-private')
+PYROOT
+)"
+      if [[ -e "$registry_root/registry.json" || -e "$registry_root/dashboard.md" || -e "$registry_root/document-control.json" ]]; then
+        echo "responsibility-registry: preserving runtime state; explicit migration/recovery if Markdown is absent"
+      else
+        python3 "$dest/scripts/registry.py" --root "$registry_root" --document "$dest/RESPONSIBILITIES.md" init
+      fi
+    else
+      cp -a "$skill_dir/." "$dest/"
+    fi
     echo "installed $name -> $dest"
   fi
   installed=$((installed + 1))

@@ -111,7 +111,7 @@ try {
   update({variant:'empty-root'});
   assert.deepEqual(Object.keys(sequences()),['other']);
   assert.equal(evaluate(`document.querySelectorAll('${group('ops')}').length`),0);
-  assert(evaluate(`JSON.parse(localStorage.getItem('quick-deploy.owner-groups.order:'+location.pathname)).indexOf('ops')<JSON.parse(localStorage.getItem('quick-deploy.owner-groups.order:'+location.pathname)).indexOf('other')`));
+  assert(evaluate(`JSON.parse(localStorage.getItem('quick-deploy.owner-groups.order:'+location.pathname)).order.indexOf('ops')<JSON.parse(localStorage.getItem('quick-deploy.owner-groups.order:'+location.pathname)).order.indexOf('other')`));
   shot('native-desktop-empty-root');
   update({variant:'normal',sections:'mixed'});
   assert.deepEqual(Object.keys(sequences()),['ops','other']); // returning root retains its slot
@@ -136,6 +136,24 @@ try {
   const beforeReload = seq; run('reload'); wait(`!!document.querySelector('${group('third')} ${row('demo-third')}')`);
   assert.deepEqual(sequences(), beforeReload); console.log('ORDER additions/reload '+JSON.stringify(beforeReload)); unique();
   update({activity:'',add:false,new_group:false});
+
+  // Era transition with reused IDs while the browser MISSES the intervening reset.
+  const orderKey = 'quick-deploy.owner-groups.order:';
+  const era2 = '00000000-0000-0000-0000-000000000002';
+  update({era:era2,reverse_order:true});
+  assert.deepEqual(evaluate(`[...document.querySelectorAll('#sessions > .owner-team')].map(n=>n.dataset.ownerGroup)`), ['other','ops']);
+  assert.equal(evaluate(`JSON.parse(localStorage.getItem(${JSON.stringify(orderKey)}+location.pathname)).era`),era2);
+  // Old array format cannot set order even on a newly loaded controller.
+  evaluate(`localStorage.setItem(${JSON.stringify(orderKey)}+location.pathname,JSON.stringify(['ops','other']))`);
+  run('reload'); wait(`document.querySelectorAll('.owner-team').length===2`);
+  assert.deepEqual(evaluate(`[...document.querySelectorAll('#sessions > .owner-team')].map(n=>n.dataset.ownerGroup)`), ['other','ops']);
+  control({variant:'empty',era:'',reverse_order:false}); refresh();
+  assert.equal(evaluate(`document.querySelectorAll('.owner-team').length`),0);
+  const emptyCache = evaluate(`localStorage.getItem(${JSON.stringify(orderKey)}+location.pathname)`);
+  assert(emptyCache === null || JSON.parse(emptyCache).order.length === 0);
+  update({variant:'normal',era:'00000000-0000-0000-0000-000000000003',reverse_order:false});
+  assert.deepEqual(Object.keys(sequences()), ['ops','other']);
+  console.log('PASS new era ignores reused-ID cache even without empty poll; old array rejected; template clears order.');
 
   // Native desktop row callbacks and keyboard controls remain on the same objects.
   evaluate(`window.originalNativeRow=document.querySelector('${row('demo-office-opaque-123')}')`); refresh();
@@ -205,7 +223,7 @@ try {
   wait(`document.querySelector('#sessions .session.active')?.dataset.sessionId==='demo-ops'`); openSidebar();
   swipe('demo-office-opaque-123','left');
   shot('native-mobile-swipe');
-  click(row('demo-office-opaque-123')+' button[aria-label="Edit conversation"]'); run('wait','#editViewer[open]'); run('press','Escape');
+  click(row('demo-office-opaque-123')+' button[aria-label="Edit conversation"]'); run('wait','#editViewer[open]'); run('press','Escape'); wait('!document.getElementById("editViewer").open');
   openSidebar(); swipe('demo-ops','right'); click(row('demo-ops')+' button[aria-label="Delete session"]'); run('find','role','button','click','--name','Cancel','--exact');
   openSidebar(); click(row('demo-ops')); openSidebar();
   update({activity:'demo-task-office'}); assert.deepEqual(Object.keys(sequences()),['ops','other']); assert.equal(sequences().other[1],'demo-task-office');

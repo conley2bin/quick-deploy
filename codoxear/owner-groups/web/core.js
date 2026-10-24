@@ -105,7 +105,8 @@
     for (const [parent, ids] of tree.unresolved) {
       teams.push({ id: parent, root: null, owners: ids.flatMap(walk), unresolved: true });
     }
-    const order = [...new Set([...priorOrder, ...teams.map(t => t.id)])];
+    const current = new Set(teams.map(t => t.id));
+    const order = [...new Set([...priorOrder.filter(id => current.has(id)), ...current])];
     teams.sort((a, b) => order.indexOf(a.id) - order.indexOf(b.id));
     for (const team of teams) {
       team.sessions = team.owners.map(id => ({ owner: id, session: bound.get(id)?.session }))

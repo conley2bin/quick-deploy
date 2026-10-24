@@ -1,15 +1,18 @@
 #!/usr/bin/env python3
-"""Read-only owner sidebar projection. No skill imports, discovery or mutations.
+"""Read-only owner sidebar projection. Shared pure installed codec; no Store, discovery or mutations.
 
 Transport entry points must call read_registry() with its fixed default path.
 project()/read_registry(root) are also usable by isolated tests.
 """
 import fcntl
-import json
+import importlib.util
 from pathlib import Path
 import re
 
 ROOT = Path.home() / '.pi/agent/.memory/local/responsibility-registry'
+DOCUMENT = Path.home() / '.pi/agent/skills/responsibility-registry/RESPONSIBILITIES.md'
+CODEC = DOCUMENT.parent / 'scripts/registry_document.py'
+FORMAT = 'responsibility-registry/v2'
 SCHEMA = 'codoxear-owner-groups/v1'
 MAX_BYTES = 8 * 1024 * 1024
 MAX_OWNERS = 500
@@ -102,26 +105,31 @@ def project(state):
     return {'schema': SCHEMA, 'ok': True, 'revision': state['revision'], 'owners': result}
 
 
-def unique_pairs(pairs):
-    result = {}
-    for key, value in pairs:
-        require(key not in result)
-        result[key] = value
-    return result
+def load_codec(path):
+    spec = importlib.util.spec_from_file_location('owner_registry_document', path)
+    require(spec is not None and spec.loader is not None)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    require(module.FORMAT == FORMAT)
+    return module
 
 
-def read_registry(root=ROOT):
+def read_registry(root=ROOT, document=DOCUMENT, codec_path=CODEC):
+    """Transport calls only fixed defaults; parameters are for isolated internal tests."""
     try:
-        # Existing lock opened read-only. Never mkdir/create/repair/query the registry.
+        codec = load_codec(codec_path)
         with (root / 'registry.lock').open('rb') as lock:
             fcntl.flock(lock, fcntl.LOCK_SH)
-            with (root / 'registry.json').open('rb') as source:
+            require(not document.is_symlink())
+            with document.open('rb') as source:
                 raw = source.read(MAX_BYTES + 1)
             require(len(raw) <= MAX_BYTES)
-            state = json.loads(raw, object_pairs_hook=unique_pairs,
-                               parse_constant=lambda _: require(False))
-            return project(state)
-    except (OSError, PermissionError):
+            try:
+                state, era = codec.parse_document(raw.decode('utf-8'))
+            except codec.RegistryError as exc:
+                raise ValueError('invalid document') from exc
+            return dict(project(state), era=era)
+    except (OSError, PermissionError, ImportError, SyntaxError):
         return failure('unavailable')
-    except (ValueError, TypeError, KeyError, RecursionError):
+    except (ValueError, TypeError, KeyError, AttributeError, RecursionError):
         return failure('invalid')

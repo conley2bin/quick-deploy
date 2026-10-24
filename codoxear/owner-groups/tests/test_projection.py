@@ -56,14 +56,14 @@ class ProjectionTests(unittest.TestCase):
             return {f.name: (f.read_bytes(), f.stat().st_mtime_ns, f.stat().st_mode, f.stat().st_ino)
                     for f in self.root.iterdir() if f.is_file()}
         before = snapshot()
-        self.assertTrue(p.read_registry(self.root)['ok'])
+        self.assertTrue(p.read_registry(self.root, self.root / 'RESPONSIBILITIES.md', fixture.CODEC)['ok'])
         self.assertEqual(snapshot(), before)
 
     def test_lock_precedes_snapshot_read(self):
         original = Path.open
         locked = []
         def opened(path, *args, **kwargs):
-            if path.name == 'registry.json':
+            if path.name == 'RESPONSIBILITIES.md':
                 self.assertEqual(locked, [True])
             return original(path, *args, **kwargs)
         real_lock = p.fcntl.flock
@@ -72,7 +72,7 @@ class ProjectionTests(unittest.TestCase):
             locked.append(True)
             return real_lock(fd, operation)
         with patch.object(Path, 'open', opened), patch.object(p.fcntl, 'flock', lock):
-            self.assertTrue(p.read_registry(self.root)['ok'])
+            self.assertTrue(p.read_registry(self.root, self.root / 'RESPONSIBILITIES.md', fixture.CODEC)['ok'])
 
     def test_invalid_snapshots_fail_closed(self):
         variants = []
@@ -86,17 +86,23 @@ class ProjectionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp); (root / 'registry.lock').touch()
             for state in variants:
-                (root / 'registry.json').write_text(json.dumps(state))
-                result = p.read_registry(root)
+                if state.get('version') != 1 or not isinstance(state.get('owners'), dict) or not isinstance(state.get('assignments'), dict):
+                    with self.assertRaises(ValueError):
+                        p.project(state)
+                    continue
+                with patch.object(fixture.registry_document, 'validate_envelope'):
+                    raw = fixture.registry_document.serialize_document(state, '00000000-0000-0000-0000-000000000001')
+                (root / 'RESPONSIBILITIES.md').write_text(raw)
+                result = p.read_registry(root, root / 'RESPONSIBILITIES.md', fixture.CODEC)
                 self.assertFalse(result['ok']); self.assertEqual(result['owners'], [])
             for raw in ('{', '{"version":1,"version":1}', '{"version":NaN}'):
-                (root / 'registry.json').write_text(raw)
-                self.assertFalse(p.read_registry(root)['ok'])
+                (root / 'RESPONSIBILITIES.md').write_text(raw)
+                self.assertFalse(p.read_registry(root, root / 'RESPONSIBILITIES.md', fixture.CODEC)['ok'])
 
     def test_missing_store_does_not_create_anything(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp) / 'absent'
-            self.assertFalse(p.read_registry(root)['ok']); self.assertFalse(root.exists())
+            self.assertFalse(p.read_registry(root, root / 'RESPONSIBILITIES.md', fixture.CODEC)['ok']); self.assertFalse(root.exists())
 
     def test_display_controls_clipped_and_text_retained(self):
         state = copy.deepcopy(self.state)

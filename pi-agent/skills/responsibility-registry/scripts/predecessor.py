@@ -60,7 +60,8 @@ def prepare(args):
         require(context is not None, 'predecessor locator snapshot unavailable; ask immediate superior, do not guess a session')
         return copy.deepcopy(context)
 
-    context = Store(args.root).run(select)
+    store = Store(args.root, args.document)
+    context = store.run(select)
     recovery = context.get('recovery')
     require(recovery is not None, 'predecessor recovery context not recorded; no recent/same-cwd search permitted')
     session_id = text(context.get('pi_session_id'), 'verified actual predecessor Pi session ID unavailable')
@@ -103,7 +104,7 @@ def prepare(args):
             '--no-extensions', '--no-mcp', '--no-skills', '--no-prompt-templates', '--no-context-files',
             '--no-tools', '--no-approve', '--print', '--system-prompt', str(output / 'advisor.txt'),
             '@' + str(output / 'question.md')]
-    plan = dict(actor=args.actor, assignment=args.assignment, predecessor=context, question=question,
+    plan = dict(era=store.envelope['era'], document_token=store.envelope['document_token'], actor=args.actor, assignment=args.assignment, predecessor=context, question=question,
                 source=dict(session_id=session_id, file=str(source), sha256=hashlib.sha256(original).hexdigest()),
                 cwd=str(cwd), argv=argv, kind='prepared-only; no Pi process launched', prepared_at=timestamp())
     private_write(output / 'plan.json', json.dumps(plan, ensure_ascii=False, indent=2) + '\n')
@@ -124,7 +125,7 @@ def record(args):
     text(args.evidence, 'answer evidence')
     text(args.uncertainty, 'unresolved uncertainty (or explicit none known)')
     return append_log(directory, dict(action='advice', kind=args.kind, actor=plan['actor'], predecessor=plan['predecessor']['owner'],
-                                      source=plan['source'], question=plan['question'], answer=answer,
+                                      source=plan['source'], era=plan.get('era'), document_token=plan.get('document_token'), question=plan['question'], answer=answer,
                                       evidence=args.evidence, uncertainty=args.uncertainty,
                                       ownership_restored=False))
 
@@ -134,6 +135,7 @@ def main():
     commands = parser.add_subparsers(dest='action', required=True)
     p = commands.add_parser('prepare')
     p.add_argument('--root', type=Path, default=DEFAULT_ROOT)
+    p.add_argument('--document', type=Path)
     for field in ['actor', 'assignment', 'question-file', 'model', 'output']:
         p.add_argument('--' + field, required=True)
     p = commands.add_parser('record')

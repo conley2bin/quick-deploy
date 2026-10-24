@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Private accountability directory. POSIX, Python stdlib; JSON is authoritative."""
+"""Private accountability directory. POSIX, Python stdlib; Markdown is authoritative."""
 import argparse
 import copy
 from datetime import datetime, timezone
@@ -8,273 +8,19 @@ import html
 import json
 import os
 from pathlib import Path
-import re
 import sys
 import tempfile
+import hashlib
+import uuid
 
 DEFAULT_ROOT = Path.home() / '.pi/agent/.memory/local/responsibility-registry'
+DEFAULT_DOCUMENT = Path.home() / '.pi/agent/skills/responsibility-registry/RESPONSIBILITIES.md'
 
 
-class RegistryError(Exception):
-    pass
-
-
-def require(condition, message):
-    if not condition:
-        raise RegistryError(message)
-
-
-def parse_json(content):
-    def pairs(items):
-        result = {}
-        for key, value in items:
-            require(key not in result, f'duplicate JSON key: {key}')
-            result[key] = value
-        return result
-
-    def invalid(value):
-        raise RegistryError(f'invalid JSON constant: {value}')
-
-    return json.loads(content, object_pairs_hook=pairs, parse_constant=invalid)
-
-
-def text(value, label):
-    require(isinstance(value, str) and bool(value.strip()), f'{label}: nonempty string required')
-    return value
-
-
-def keys(value, required, optional=()):
-    require(isinstance(value, dict), 'object required')
-    require(set(required) <= set(value) <= set(required) | set(optional),
-            f'fields required={sorted(required)}, optional={sorted(optional)}; got={sorted(value)}')
-
-
-def identity(value):
-    keys(value, ['pi_session_id', 'intercom_id', 'source', 'unknown_reason'])
-    require(value['source'] in ['current-session', 'intercom-status', 'unavailable'], 'invalid identity source')
-    for field in ['pi_session_id', 'intercom_id']:
-        if value[field] is not None:
-            text(value[field], field)
-    require(isinstance(value['unknown_reason'], str), 'unknown_reason must be string')
-    if value['pi_session_id'] is None or value['intercom_id'] is None:
-        text(value['unknown_reason'], 'unknown_reason')
-    if value['source'] == 'unavailable':
-        require(value['pi_session_id'] is None and value['intercom_id'] is None,
-                'unavailable identity cannot contain guessed IDs')
-    if value['source'] == 'intercom-status':
-        require(value['pi_session_id'] is None and value['intercom_id'] is not None,
-                'intercom status proves only the intercom ID, not the Pi session ID')
-    if value['source'] == 'current-session':
-        text(value['pi_session_id'], 'verified Pi session ID')
-
-
-def validate_time(value):
-    keys(value, ['at', 'precision'])
-    require(value['precision'] in ['exact', 'unknown', 'approximate'], 'invalid time precision')
-    if value['precision'] == 'unknown':
-        require(value['at'] is None, 'unknown time must not fabricate seconds')
-    elif value['precision'] == 'approximate':
-        text(value['at'], 'approximate time description')
-    else:
-        text(value['at'], 'exact time')
-        require(re.fullmatch(r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(Z|[+-]\d{2}:\d{2})', value['at']),
-                'exact time requires ISO8601 seconds with explicit timezone')
-        datetime.fromisoformat(value['at'].replace('Z', '+00:00'))
-
-
-def goal_source(value):
-    keys(value, ['issuer', 'source'])
-    text(value['source'], 'goal source evidence')
-    issuer = text(value['issuer'], 'goal issuer')
-    require(issuer == 'user' or (issuer.startswith('owner:') and issuer[6:].strip()),
-            'goal issuer must be user or owner:<stable-id>')
-
-
-def recovery_context(value):
-    keys(value, ['session_file', 'cwd', 'repo', 'worktree', 'summary', 'decisions', 'pending_issues',
-                 'context_refs', 'source', 'unknown_reason'])
-    for field in ['session_file', 'cwd', 'repo', 'worktree']:
-        if value[field] is not None:
-            require(Path(text(value[field], 'recovery.' + field)).is_absolute(), 'recovery locator must be absolute: ' + field)
-    for field in ['summary', 'decisions', 'pending_issues']:
-        if value[field] is not None:
-            text(value[field], 'recovery.' + field)
-    require(isinstance(value['context_refs'], list), 'context_refs must be explicit known pointers, not a session search')
-    for ref in value['context_refs']:
-        text(ref, 'context reference')
-    text(value['source'], 'recovery verification evidence')
-    require(isinstance(value['unknown_reason'], str), 'recovery unknown_reason must be string')
-    if any(value[field] is None for field in ['session_file', 'cwd', 'repo', 'worktree', 'summary', 'decisions', 'pending_issues']):
-        text(value['unknown_reason'], 'missing recovery context reason')
-
-
-def owner(value):
-    keys(value, ['id', 'name', 'role', 'parent', 'identity'], ['recovery'])
-    if value.get('recovery') is not None:
-        recovery_context(value['recovery'])
-    for field in ['id', 'name', 'role', 'parent']:
-        text(value[field], field)
-    require(value['id'] != 'user' and not value['id'].startswith('owner:'), 'owner ID must be bare and not user')
-    require(value['parent'] == 'user' or
-            (value['parent'].startswith('owner:') and value['parent'][6:].strip()),
-            'parent must be user or owner:<stable-id> (unregistered allowed)')
-    identity(value['identity'])
-
-
-def scope(value, legacy=False):
-    base = ['id', 'project', 'task', 'objective', 'acceptance', 'depends_on']
-    keys(value, base if legacy else base + ['repo', 'goal_source'], ['repo', 'goal_source'] if legacy else [])
-    if 'goal_source' in value:
-        goal_source(value['goal_source'])
-    if 'repo' in value:
-        keys(value['repo'], ['id', 'path'])
-        text(value['repo']['id'], 'repo.id')
-        require(Path(text(value['repo']['path'], 'repo.path')).is_absolute(), 'repo.path must be canonical absolute Git common dir')
-    for field in ['id', 'task', 'objective', 'acceptance']:
-        text(value[field], field)
-    keys(value['project'], ['id', 'name', 'path'])
-    for field in ['id', 'name', 'path']:
-        text(value['project'][field], 'project.' + field)
-    require(Path(value['project']['path']).is_absolute(), 'project.path must be absolute')
-    require(isinstance(value['depends_on'], list), 'depends_on must be array')
-    for dep in value['depends_on']:
-        require(isinstance(dep, dict) and dep.get('kind') in ['project', 'task'], 'dependency kind must be project/task')
-        keys(dep, ['kind', 'project'] + (['task'] if dep['kind'] == 'task' else []))
-        for field in dep:
-            text(dep[field], 'dependency.' + field)
-
-
-def check_graph(owners):
-    for start in owners:
-        seen, here = set(), start
-        while here in owners:
-            require(here not in seen, f'hierarchy cycle involving {here}; change parent explicitly')
-            seen.add(here)
-            parent = owners[here]['parent']
-            here = parent[6:] if parent.startswith('owner:') else None
-
-
-def validate(state):
-    keys(state, ['version', 'revision', 'owners', 'assignments', 'history'], ['coordination'])
-    require(isinstance(state.get('coordination', {}), dict), 'invalid coordination container')
-    require(type(state['version']) is int and state['version'] == 1, 'unsupported canonical version')
-    require(type(state['revision']) is int and state['revision'] >= 0, 'invalid revision')
-    require(isinstance(state['owners'], dict) and isinstance(state['assignments'], dict)
-            and isinstance(state['history'], list), 'invalid canonical containers')
-    for oid, record in state['owners'].items():
-        keys(record, ['id', 'name', 'role', 'parent', 'identity', 'created_at', 'updated_at'], ['appointment_source', 'recovery'])
-        owner({k: v for k, v in record.items() if k not in ['created_at', 'updated_at', 'appointment_source']})
-        if 'appointment_source' in record:
-            goal_source(record['appointment_source'])
-        require(record['id'] == oid, 'owner key/id mismatch')
-        for field in ['created_at', 'updated_at']:
-            text(record[field], field)
-    check_graph(state['owners'])
-    leads, projects = {}, {}
-    for aid, record in state['assignments'].items():
-        base = ['id', 'project', 'task', 'objective', 'acceptance', 'depends_on']
-        keys(record, base + ['owner', 'status', 'appointment', 'created_at', 'updated_at', 'end_reason', 'successor'],
-             ['repo', 'goal_source', 'start_time', 'end_time', 'handover_obligations', 'handover_request'])
-        for field in ['start_time', 'end_time']:
-            if record.get(field) is not None:
-                validate_time(record[field])
-        if 'handover_request' in record:
-            require(isinstance(record['handover_request'], dict), 'invalid handover receipt')
-        if 'handover_obligations' in record:
-            keys(record['handover_obligations'], ['predecessor', 'pending_work', 'previous_pending_work', 'coordination_ids', 'coordination_plan', 'reporting_change'], ['predecessor_context'])
-            require(record['handover_obligations']['predecessor'] in state['assignments'], 'missing handover predecessor')
-            require(isinstance(record['handover_obligations']['coordination_ids'], list), 'invalid inherited coordination')
-        scope({k: record[k] for k in base + ['repo', 'goal_source'] if k in record}, legacy=True)
-        require(aid == record['id'] and record['owner'] in state['owners'], 'invalid assignment owner/id')
-        require(record['status'] in ['active', 'ended', 'handed-over'], 'invalid responsibility lifecycle')
-        for field in ['appointment', 'created_at', 'updated_at']:
-            text(record[field], field)
-        require(record['end_reason'] is None or isinstance(record['end_reason'], str), 'invalid end reason')
-        require(record['successor'] is None or record['successor'] in state['assignments'], 'missing handover successor')
-        if record['status'] != 'active':
-            text(record['end_reason'], 'ended responsibility reason')
-        require((record['status'] == 'handed-over') == (record['successor'] is not None), 'invalid handover lifecycle')
-        project = record['project']
-        require(project['id'] not in projects or projects[project['id']] == project,
-                f'project identity mismatch for {project["id"]}; reuse its canonical name/path')
-        projects[project['id']] = project
-        if record['status'] == 'active':
-            key = (project['id'], record['task'])
-            require(key not in leads,
-                    f'lead conflict for {key}: existing {leads.get(key)}, attempted {aid}; query and use authorized handover')
-            leads[key] = aid
-    for cid, agreement in state.get('coordination', {}).items():
-        validate_agreement(state, agreement)
-        require(cid == agreement['id'], 'coordination key/id mismatch')
-    require(len(state['history']) == state['revision'], 'history/revision mismatch')
-    for index, event in enumerate(state['history'], 1):
-        keys(event, ['revision', 'at', 'actor', 'action', 'reason', 'before', 'after'], ['id', 'occurred', 'authority', 'changes'])
-        if 'id' in event:
-            require(event['id'] == f'event-{index:08d}', 'invalid stable event ID/order')
-            validate_time(event['occurred'])
-            validate_time({'at': event['at'], 'precision': 'exact'})
-            require(event['authority'] is None or isinstance(event['authority'], str), 'invalid authority evidence')
-            require(isinstance(event['changes'], list), 'invalid semantic changes')
-            for change in event['changes']:
-                keys(change, ['project', 'task', 'old_owner', 'new_owner', 'from_assignment', 'to_assignment', 'from_parent', 'to_parent', 'summary'])
-                text(change['summary'], 'semantic change summary')
-                for field in ['old_owner', 'new_owner']:
-                    if change[field] is not None:
-                        keys(change[field], ['id', 'name', 'role'])
-                        text(change[field]['id'], 'historical owner ID')
-        require(event['revision'] == index, 'invalid history revision')
-        for field in ['at', 'actor', 'action', 'reason']:
-            text(event[field], 'history.' + field)
-        require(isinstance(event['before'], dict) and isinstance(event['after'], dict), 'invalid history snapshots')
-
-
-def validate_agreement(state, value):
-    keys(value, ['id', 'repo', 'scopes', 'shared_interfaces', 'workspace', 'sequencing', 'integration_owner',
-                 'acceptance', 'status', 'acknowledgements', 'created_at', 'updated_at'])
-    for field in ['id', 'shared_interfaces', 'sequencing', 'acceptance', 'created_at', 'updated_at']:
-        text(value[field], 'coordination.' + field)
-    keys(value['repo'], ['id', 'path'])
-    require(Path(text(value['repo']['path'], 'repo.path')).is_absolute(), 'canonical repo path required')
-    text(value['repo']['id'], 'repo.id')
-    keys(value['workspace'], ['mode', 'plan'])
-    require(value['workspace']['mode'] in ['shared-cwd', 'isolated-worktrees'], 'invalid workspace mode')
-    text(value['workspace']['plan'], 'branch/worktree plan')
-    require(isinstance(value['scopes'], dict) and value['scopes'], 'affected direction scopes required')
-    participants = set()
-    for aid, boundary in value['scopes'].items():
-        keys(boundary, ['owner', 'write_scope', 'assignment_updated_at'])
-        require(aid in state['assignments'] and boundary['owner'] in state['owners'], 'unknown scope/owner in agreement')
-        require(isinstance(boundary['write_scope'], list) and boundary['write_scope'], 'explicit file/module write boundaries required')
-        for path in boundary['write_scope']:
-            text(path, 'write scope')
-        text(boundary['assignment_updated_at'], 'scope version')
-        participants.add(boundary['owner'])
-    require(value['integration_owner'] in participants, 'integration owner must be participant')
-    require(value['status'] in ['proposed', 'confirmed', 'released'], 'invalid coordination status')
-    require(isinstance(value['acknowledgements'], dict), 'invalid acknowledgements')
-    require(set(value['acknowledgements']) <= participants, 'acknowledgement from nonparticipant')
-    for ack in value['acknowledgements'].values():
-        keys(ack, ['at', 'evidence'])
-        text(ack['at'], 'ack timestamp')
-        text(ack['evidence'], 'explicit acknowledgement evidence, not sent-message receipt')
-    require(value['status'] != 'confirmed' or set(value['acknowledgements']) == participants,
-            'unacknowledged agreement cannot be confirmed')
-
-
-def agreement_view(state, value):
-    reasons = []
-    participants = sorted({b['owner'] for b in value['scopes'].values()})
-    if value['status'] != 'confirmed':
-        reasons.append('agreement is ' + value['status'])
-    missing = sorted(set(participants) - set(value['acknowledgements']))
-    if missing:
-        reasons.append('explicit acknowledgement missing: ' + ', '.join(missing))
-    for aid, b in value['scopes'].items():
-        a = state['assignments'].get(aid, {})
-        if (a.get('status') != 'active' or a.get('owner') != b['owner'] or
-                a.get('updated_at') != b['assignment_updated_at'] or a.get('repo') != value['repo']):
-            reasons.append('scope changed/ended; renegotiate: ' + aid)
-    return dict(value, participants=participants, agreement_ready=not reasons, not_ready_reasons=reasons)
+from registry_document import (RegistryError, require, parse_json, text, keys, identity,
+    validate_time, goal_source, recovery_context, owner, scope, check_graph, validate,
+    validate_agreement, agreement_view, assignment_digest, parse_document, serialize_document,
+    FORMAT, TEMPLATE_ERA)
 
 
 def coordinate(state, args, payload, stamp):
@@ -291,7 +37,7 @@ def coordinate(state, args, payload, stamp):
             require(a['status'] == 'active' and 'repo' in a, 'coordination requires active scope and verified repo identity')
             repo = a['repo'] if repo is None else repo
             require(a['repo'] == repo, 'affected scopes must share canonical repository identity')
-            scopes[aid] = dict(owner=a['owner'], write_scope=boundary, assignment_updated_at=a['updated_at'])
+            scopes[aid] = dict(owner=a['owner'], write_scope=boundary, assignment_updated_at=a['updated_at'], assignment_digest=assignment_digest(a))
         require(args.actor in {b['owner'] for b in scopes.values()}, 'proposer must be participating responsible owner')
         value = dict(copy.deepcopy(payload), repo=copy.deepcopy(repo), scopes=scopes, status='proposed',
                      acknowledgements={}, created_at=stamp, updated_at=stamp)
@@ -498,13 +244,15 @@ def dashboard(state):
     return '\n'.join(lines)
 
 
-def atomic_write(path, content):
+def atomic_write(path, content, before_replace=None):
     fd, temp = tempfile.mkstemp(prefix='.' + path.name + '-', dir=path.parent)
     try:
         with os.fdopen(fd, 'w', encoding='utf-8') as out:
             out.write(content)
             out.flush()
             os.fsync(out.fileno())
+        if before_replace is not None:
+            before_replace()
         os.replace(temp, path)
         directory = os.open(path.parent, os.O_RDONLY)
         try:
@@ -516,39 +264,248 @@ def atomic_write(path, content):
             os.unlink(temp)
 
 
-class Store:
-    def __init__(self, root):
-        self.root = Path(root).expanduser().resolve()
+def fingerprint(stat):
+    return [stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns]
 
-    def run(self, fn, initialize=False):
-        self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
-        lock_fd = os.open(self.root / 'registry.lock', os.O_CREAT | os.O_RDWR, 0o600)
-        with os.fdopen(lock_fd, 'a') as lock:
+
+def fsync_directory(path):
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def exclusive_file(path, content):
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, 'wb') as out:
+        out.write(content if isinstance(content, bytes) else content.encode('utf-8'))
+        out.flush()
+        os.fsync(out.fileno())
+    fsync_directory(path.parent)
+
+
+class Store:
+    def __init__(self, root=DEFAULT_ROOT, document=None):
+        self.root = Path(root).expanduser().resolve()
+        require(document is not None or self.root == DEFAULT_ROOT.resolve(),
+                'alternate --root requires explicit --document (never infer runtime from source)')
+        # Do not resolve away a replacement/symlink at the live filename.
+        self.document = Path(os.path.abspath(Path(document or DEFAULT_DOCUMENT).expanduser()))
+        self.envelope = None
+
+    def locked(self, action, create=False):
+        if create:
+            self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        flags = os.O_RDWR | (os.O_CREAT if create else 0)
+        fd = os.open(self.root / 'registry.lock', flags, 0o600)
+        with os.fdopen(fd, 'a') as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
-            path = self.root / 'registry.json'
-            if not path.exists():
-                require(initialize, 'registry missing; run init (never reconstruct JSON from dashboard)')
-                require(not (self.root / 'dashboard.md').exists(),
-                        'dashboard exists but canonical JSON missing; restore JSON backup, do not reset')
-                state = empty()
-            else:
-                try:
-                    state = parse_json(path.read_text(encoding='utf-8'))
-                    validate(state)
-                except (ValueError, RegistryError, TypeError, KeyError) as exc:
-                    raise RegistryError(f'canonical data corrupt; preserved unchanged: {exc}') from exc
+            return action()
+
+    def read_document(self):
+        try:
+            require(not self.document.is_symlink(), 'live document cannot be a symlink')
+            with self.document.open('rb') as source:
+                before = fingerprint(os.fstat(source.fileno()))
+                raw = source.read()
+                after = fingerprint(os.fstat(source.fileno()))
+            require(before == after == fingerprint(self.document.stat()),
+                    'document changed while reading; query again deliberately')
+            state, era = parse_document(raw.decode('utf-8'))
+        except FileNotFoundError as exc:
+            raise RegistryError('missing live Markdown document; no legacy import or reconstruction') from exc
+        except (ValueError, TypeError, KeyError, RegistryError) as exc:
+            raise RegistryError('document invalid/changed; preserved unchanged: ' + str(exc)) from exc
+        digest = hashlib.sha256(raw).hexdigest()
+        token = hashlib.sha256(json.dumps([era, digest, after], separators=(',', ':')).encode()).hexdigest()
+        return state, dict(era=era, revision=state['revision'], document_token=token), raw, after
+
+    def control(self):
+        path = self.root / 'document-control.json'
+        if not path.exists():
+            return None
+        control = parse_json(path.read_text(encoding='utf-8'))
+        keys(control, ['kind', 'status', 'document'],
+             ['migration_id', 'source_sha256', 'backup', 'staged', 'staged_sha256', 'era'])
+        require(control['kind'] in ['initialization', 'migration'] and control['status'] in ['pending', 'completed'],
+                'invalid document control marker; preserve and reconcile explicitly')
+        require(control['document'] == str(self.document), 'document control path mismatch')
+        if control['kind'] == 'migration':
+            require(all(k in control for k in ['migration_id', 'source_sha256', 'backup', 'staged', 'staged_sha256', 'era']),
+                    'incomplete migration control marker')
+        return control
+
+    def run(self, fn, expected_document=None, rebuild=False):
+        def operation():
+            state, envelope, raw, stat = self.read_document()
+            self.envelope = envelope
+            control = self.control()
+            envelope['cutover_status'] = control['status'] if control else 'unmanaged'
+            if expected_document is not None:
+                require(not control or control.get('status') == 'completed',
+                        'pending initialization/cutover; explicit recovery required before mutation')
+                require(expected_document == envelope['document_token'],
+                        'stale expected document; query current Markdown and decide again deliberately')
             original = copy.deepcopy(state)
             result = fn(state)
             validate(state)
-            changed = state != original or not path.exists()
-            if changed:
-                atomic_write(path, json.dumps(state, ensure_ascii=False, indent=2) + '\n')
-            # Every successful read also repairs a stale/missing projection under the same lock.
-            try:
+            if state != original:
+                require(expected_document is not None, 'every mutation requires --expected-document from current query')
+                era = str(uuid.uuid4()) if envelope['era'] == TEMPLATE_ERA else envelope['era']
+                require(envelope['era'] != TEMPLATE_ERA or
+                        (state['history'] and state['history'][0]['action'] == 'register'),
+                        'first mutation of blank template must be a genuine registration')
+                content = serialize_document(state, era)
+                require(parse_document(content) == (state, era), 'post-serialization state mismatch')
+                # Cooperative CLI writers serialize on flock. Non-locking editors can still
+                # race the final check-to-rename interval; POSIX has no conditional rename.
+                atomic_write(self.document, content, before_replace=lambda: self.recheck(raw, stat))
+                check, current, _, _ = self.read_document()
+                require(check == state and current['era'] == era, 'post-write validation mismatch')
+                self.envelope = current
+            if rebuild:
                 atomic_write(self.root / 'dashboard.md', dashboard(state))
-            except OSError as exc:
-                raise RegistryError(f'canonical revision {state["revision"]} retained; dashboard failed: {exc}; run rebuild') from exc
+            if isinstance(result, dict):
+                result.update(self.envelope)
             return result
+        return self.locked(operation)
+
+    def recheck(self, raw, stat):
+        require(not self.document.is_symlink(), 'document replaced before commit; refuse stale operation')
+        try:
+            with self.document.open('rb') as source:
+                current = source.read()
+                identity = fingerprint(os.fstat(source.fileno()))
+            require(raw == current and stat == identity == fingerprint(self.document.stat()),
+                    'document changed/replaced before commit; refuse stale operation')
+        except FileNotFoundError as exc:
+            raise RegistryError('document missing before commit; refuse stale operation') from exc
+
+    def initialize(self):
+        def operation():
+            if self.document.exists() or self.document.is_symlink():
+                # Existing bytes/inode are never rewritten, even if invalid.
+                if self.control() is None:
+                    atomic_write(self.root / 'document-control.json', json.dumps(dict(
+                        kind='initialization', status='completed', document=str(self.document))) + '\n')
+                return dict(initialized=False, note='existing live document preserved')
+            require(self.control() is None, 'document missing after prior initialization/cutover; explicit recovery required')
+            require(not any((self.root / f).exists() for f in ('registry.json', 'dashboard.md')),
+                    'legacy evidence exists; explicit migrate required, no empty initialization')
+            self.document.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            control = dict(kind='initialization', status='pending', document=str(self.document))
+            atomic_write(self.root / 'document-control.json', json.dumps(control) + '\n')
+            exclusive_file(self.document, serialize_document(empty(), TEMPLATE_ERA))
+            control['status'] = 'completed'
+            atomic_write(self.root / 'document-control.json', json.dumps(control) + '\n')
+            return dict(initialized=True, era=TEMPLATE_ERA, revision=0)
+        return self.locked(operation, create=True)
+
+    def recover_initialization(self):
+        def operation():
+            control = self.control()
+            require(control and control.get('kind') == 'initialization' and control.get('status') == 'pending',
+                    'no pending initialization')
+            require(control['document'] == str(self.document), 'initialization document mismatch')
+            content = serialize_document(empty(), TEMPLATE_ERA).encode()
+            if self.document.exists():
+                require(self.document.read_bytes() == content, 'pending initialization diverged; preserve and reconcile explicitly')
+            else:
+                exclusive_file(self.document, content)
+            control['status'] = 'completed'
+            atomic_write(self.root / 'document-control.json', json.dumps(control) + '\n')
+            return dict(initialized=True)
+        return self.locked(operation)
+
+    def migrate(self, resume=False):
+        """Explicit two-phase cutover, never called from query/init/reinstall."""
+        def operation():
+            marker = self.root / 'document-control.json'
+            legacy = self.root / 'registry.json'
+            control = self.control()
+            if control:
+                require(resume and control.get('kind') == 'migration' and control.get('status') == 'pending',
+                        'prior initialization/completed cutover exists; migration forbidden')
+                require(control['document'] == str(self.document), 'cutover document path mismatch')
+                raw = legacy.read_bytes()
+                current = parse_json(raw.decode('utf-8'))
+                fenced = current.get('migration_id') == control['migration_id'] and current.get('format') == FORMAT
+                if not fenced:
+                    # A crash before fence may have allowed old writers to advance. Keep
+                    # old evidence, prepare a fresh locked snapshot rather than replay it.
+                    validate(current)
+                    require(not self.document.exists() and not self.document.is_symlink(), 'unexpected live document; preserve and reconcile explicitly')
+                    control = None
+            else:
+                require(not resume, 'no pending cutover to resume')
+                require(not self.document.exists() and not self.document.is_symlink(),
+                        'live document exists; migration never overwrites it')
+            if control is None:
+                raw = legacy.read_bytes()
+                state = parse_json(raw.decode('utf-8'))
+                validate(state)
+                normalized = copy.deepcopy(state)
+                normalized.setdefault('coordination', {})
+                readiness = {cid: agreement_view(state, a, legacy=True)['agreement_ready']
+                             for cid, a in state.get('coordination', {}).items()}
+                for a in normalized['coordination'].values():
+                    for aid, boundary in a['scopes'].items():
+                        assignment = state['assignments'][aid]
+                        matching = (assignment['status'] == 'active' and assignment['owner'] == boundary['owner'] and
+                                    assignment['updated_at'] == boundary['assignment_updated_at'] and assignment.get('repo') == a['repo'])
+                        boundary['assignment_digest'] = assignment_digest(assignment) if matching else None
+                era = str(uuid.uuid4())
+                staged = serialize_document(normalized, era)
+                parsed, parsed_era = parse_document(staged)
+                require(parsed == normalized and parsed_era == era, 'migration full-state roundtrip mismatch')
+                require(readiness == {cid: agreement_view(parsed, a)['agreement_ready'] for cid, a in parsed['coordination'].items()},
+                        'migration changed agreement readiness')
+                migration_id = str(uuid.uuid4())
+                backup = self.root / ('legacy-' + migration_id + '.json')
+                exclusive_file(backup, raw)
+                self.document.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+                stage = self.document.parent / ('.responsibilities-' + migration_id + '.md')
+                exclusive_file(stage, staged)
+                require(backup.read_bytes() == raw and parse_document(stage.read_text(encoding='utf-8')) == (normalized, era),
+                        'durable migration staging readback failed')
+                control = dict(kind='migration', status='pending', migration_id=migration_id, document=str(self.document),
+                               source_sha256=hashlib.sha256(raw).hexdigest(), backup=str(backup), staged=str(stage),
+                               staged_sha256=hashlib.sha256(staged.encode()).hexdigest(), era=era)
+                atomic_write(marker, json.dumps(control, indent=2) + '\n')
+                self.migration_checkpoint('prepared')
+                require(hashlib.sha256(legacy.read_bytes()).hexdigest() == control['source_sha256'],
+                        'legacy changed outside lock; explicit resume from fresh state')
+                tombstone = dict(format=FORMAT, migration_id=migration_id, backup=str(backup),
+                                 note='Markdown cutover; deliberately invalid legacy state. Never restore as active JSON.')
+                atomic_write(legacy, json.dumps(tombstone) + '\n')
+                self.migration_checkpoint('fenced')
+            backup = Path(control['backup'])
+            require(hashlib.sha256(backup.read_bytes()).hexdigest() == control['source_sha256'], 'migration backup digest mismatch')
+            validate(parse_json(backup.read_text(encoding='utf-8')))
+            stage = Path(control['staged'])
+            staged = stage.read_bytes()
+            require(hashlib.sha256(staged).hexdigest() == control['staged_sha256'], 'migration staged digest mismatch; published document may have diverged; preserve and reconcile explicitly')
+            parse_document(staged.decode('utf-8'))
+            if self.document.exists() or self.document.is_symlink():
+                # Only our hard-link publication is resumable, not a same-content user copy.
+                require(not self.document.is_symlink() and os.path.samefile(stage, self.document) and
+                        self.document.read_bytes() == staged, 'published Markdown diverged/unexpected document; preserve and reconcile explicitly')
+            else:
+                os.link(stage, self.document)  # exclusive publication; never overwrite human edits
+                fsync_directory(self.document.parent)
+            require(self.document.read_bytes() == staged, 'published readback mismatch')
+            self.migration_checkpoint('published')
+            control['status'] = 'completed'
+            atomic_write(marker, json.dumps(control, indent=2) + '\n')
+            stage.unlink()
+            fsync_directory(stage.parent)
+            return dict(migrated=True, era=control['era'], backup=control['backup'],
+                        revision=parse_document(staged.decode('utf-8'))[0]['revision'])
+        return self.locked(operation, create=True)
+
+    def migration_checkpoint(self, phase):
+        """Deterministic crash-injection seam for isolated tests; no runtime switch."""
 
 
 def normalize_scope(value, source=None):
@@ -736,9 +693,10 @@ def query(state, args):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--document', type=Path, help='explicit live Markdown path; mandatory with alternate --root')
     parser.add_argument('--root', type=Path, default=DEFAULT_ROOT, help='private store; override only for explicit alternate store/tests')
     commands = parser.add_subparsers(dest='command', required=True)
-    for name in ['init', 'rebuild']:
+    for name in ['init', 'rebuild', 'migrate', 'resume-migration', 'recover-initialization']:
         commands.add_parser(name)
     q = commands.add_parser('query', help='JSON including hierarchy and dependency relations')
     for name in ['owner', 'project', 'task', 'repo']:
@@ -746,6 +704,7 @@ def main(argv=None):
     q.add_argument('--active', action='store_true')
     for name in ['register', 'update-owner', 'update', 'close', 'handover', 'coord-propose', 'coord-ack', 'coord-release']:
         p = commands.add_parser(name)
+        p.add_argument('--expected-document', required=True, help='opaque token from a deliberate current query')
         p.add_argument('--actor', required=True, help='owner ID or user; authorization attestation, not authentication')
         p.add_argument('--authority', help='known authorization/decision evidence; absent remains unknown')
         p.add_argument('--occurred-at', help='known ISO seconds+timezone, or approximate human description')
@@ -773,14 +732,19 @@ def main(argv=None):
                 payload = parse_json(sys.stdin.read())
             else:
                 payload = parse_json(Path(args.input).read_text(encoding='utf-8'))
-        store = Store(args.root)
-        if args.command in ['init', 'rebuild']:
-            result = store.run(lambda s: dict(revision=s['revision'], owners=len(s['owners']), assignments=len(s['assignments']),
-                                             dashboard=str(store.root / 'dashboard.md')), initialize=args.command == 'init')
+        store = Store(args.root, args.document)
+        if args.command == 'init':
+            result = store.initialize()
+        elif args.command == 'recover-initialization':
+            result = store.recover_initialization()
+        elif args.command in ['migrate', 'resume-migration']:
+            result = store.migrate(resume=args.command == 'resume-migration')
+        elif args.command == 'rebuild':
+            result = store.run(lambda s: dict(dashboard=str(store.root / 'dashboard.md')), rebuild=True)
         elif args.command == 'query':
             result = store.run(lambda s: query(s, args))
         else:
-            result = store.run(lambda s: mutate(s, args, payload))
+            result = store.run(lambda s: mutate(s, args, payload), expected_document=args.expected_document)
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0
     except (RegistryError, OSError, ValueError, TypeError, KeyError) as exc:

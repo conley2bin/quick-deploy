@@ -87,3 +87,15 @@ test('registration ordinal beats names; new roots append to saved order', () => 
   const g = Core.groups(t, Core.bindings(t, rows()), [], ['other', 'ops']);
   assert.deepEqual(g.teams.filter(x => x.root).map(x => x.id), ['other', 'ops', 'new-root']);
 });
+
+test('cached team IDs cannot create ghosts; current zero-session teams keep slots', () => {
+  const snapshot = {schema:'codoxear-owner-groups/v1',ok:true,owners:[
+    {id:'fresh',name:'示例',role:'方向',parent:'user',registration_order:0,pi_session_id:null,
+      identity_source:'unavailable',identity_note:'unknown',state:'no-scope',scopes:[]}
+  ]};
+  const tree = Core.forest(snapshot);
+  const result = Core.groups(tree, Core.bindings(tree, []), [], ['deleted-era-id','fresh']);
+  assert.deepEqual(result.order, ['fresh']);
+  assert.deepEqual(result.teams.map(t => t.id), ['fresh']);
+  assert.deepEqual(result.teams[0].sessions, []);
+});

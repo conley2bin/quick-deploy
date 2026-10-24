@@ -10,6 +10,7 @@ import unittest
 from unittest.mock import patch
 
 SCRIPT = Path(__file__).resolve().parents[1] / 'scripts/registry.py'
+sys.path.insert(0, str(SCRIPT.parent))
 SPEC = importlib.util.spec_from_file_location('registry', SCRIPT)
 registry = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(registry)
@@ -34,13 +35,18 @@ class RegistryTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
+        self.document = self.root / 'RESPONSIBILITIES.md'
         self.cli('init')
 
     def cli(self, *args, payload=None, ok=True):
-        result = subprocess.run([sys.executable, str(SCRIPT), '--root', str(self.root), *args],
+        if args[0] in ['register', 'update-owner', 'update', 'close', 'handover', 'coord-propose', 'coord-ack', 'coord-release']:
+            args = (*args, '--expected-document', self.cli('query')['document_token'])
+        result = subprocess.run([sys.executable, str(SCRIPT), '--root', str(self.root), '--document', str(self.document), *args],
                                 input=json.dumps(payload, ensure_ascii=False) if payload is not None else None,
                                 capture_output=True, text=True, timeout=20)
         self.assertEqual(result.returncode, 0 if ok else 2, result.stderr + result.stdout)
+        if ok and args[0] not in ['query', 'rebuild', 'init']:
+            self.cli('rebuild')  # Explicit optional report, never a source of current rows.
         return json.loads(result.stdout) if ok else result.stderr
 
     def register(self, payload=None, ok=True, actor=None):
@@ -48,14 +54,14 @@ class RegistryTests(unittest.TestCase):
         return self.cli('register', '--actor', actor or p['owner']['id'], payload=p, ok=ok)
 
     def state(self):
-        return json.loads((self.root / 'registry.json').read_text())
+        return registry.parse_document(self.document.read_text())[0]
 
     def test_appointment_hierarchy_lookup_update_handover_close(self):
         p = appointment()
         self.register(p)
-        first = (self.root / 'registry.json').read_bytes()
+        first = self.document.read_bytes()
         self.assertTrue(self.register(p)['unchanged'])
-        self.assertEqual(first, (self.root / 'registry.json').read_bytes())
+        self.assertEqual(first, self.document.read_bytes())
         q = appointment('beta', parent='owner:alpha')
         q.pop('assignment')  # Successor has a genuine appointment, no fake bootstrap task.
         self.register(q)
@@ -99,15 +105,15 @@ class RegistryTests(unittest.TestCase):
 
     def test_conflict_cannot_silently_overwrite_or_create_owner(self):
         self.register()
-        before = (self.root / 'registry.json').read_bytes()
+        before = self.document.read_bytes()
         error = self.register(appointment('beta', 'other'), ok=False)
         self.assertIn('lead conflict', error)
         self.assertIn('handover', error)
-        self.assertEqual(before, (self.root / 'registry.json').read_bytes())
+        self.assertEqual(before, self.document.read_bytes())
         p = appointment()
         p['owner']['name'] = '冒充替换'
         self.assertIn('update-owner', self.register(p, ok=False))
-        self.assertEqual(before, (self.root / 'registry.json').read_bytes())
+        self.assertEqual(before, self.document.read_bytes())
 
     def test_unresolved_parent_then_resolution_and_cycles(self):
         p = appointment(parent='owner:superior')
@@ -118,9 +124,9 @@ class RegistryTests(unittest.TestCase):
         self.assertIn('未登记，待解析', (self.root / 'dashboard.md').read_text())
         q = appointment('superior', parent='owner:alpha')
         q.pop('assignment')
-        before = (self.root / 'registry.json').read_bytes()
+        before = self.document.read_bytes()
         self.assertIn('cycle', self.register(q, ok=False))
-        self.assertEqual(before, (self.root / 'registry.json').read_bytes())
+        self.assertEqual(before, self.document.read_bytes())
         q['owner']['parent'] = 'user'
         self.register(q)
         self.assertTrue(self.cli('query', '--owner', 'alpha')['hierarchy'][0]['parent_resolved'])
@@ -131,7 +137,7 @@ class RegistryTests(unittest.TestCase):
 
     def test_stale_or_unauthorized_changes_rejected(self):
         self.register()
-        before = (self.root / 'registry.json').read_bytes()
+        before = self.document.read_bytes()
         self.assertIn('stale', self.cli('close', '--actor', 'alpha', '--assignment', 'release',
                                        '--expected-revision', '0', '--reason', '过期', ok=False))
         self.assertIn('actor', self.cli('close', '--actor', 'other', '--assignment', 'release',
@@ -140,7 +146,7 @@ class RegistryTests(unittest.TestCase):
                                           '--expected-revision', '1', '--reason', '不猜接任人',
                                           '--to-owner', 'unknown', '--new-assignment', 'next',
                                           '--pending-work', '合成测试：无运行 child', ok=False))
-        self.assertEqual(before, (self.root / 'registry.json').read_bytes())
+        self.assertEqual(before, self.document.read_bytes())
 
     def test_identity_unknown_honest_and_helpers_rejected(self):
         p = appointment()
@@ -189,71 +195,42 @@ class RegistryTests(unittest.TestCase):
 
     def test_corrupt_canonical_preserved_no_silent_reset(self):
         self.register()
-        good = self.state()
-        malformed = ['{bad', '{"version":1,"version":1}', 'null', '{"version":NaN}',
-                     json.dumps({**good, 'owners': []}), json.dumps({**good, 'revision': 9}),
-                     json.dumps({**good, 'version': True})]
+        good = self.document.read_text()
+        malformed = ['{bad', good.replace('Revision: 1', 'Revision: 9'), good.replace('Format: responsibility-registry/v2', 'Format: unknown')]
         old_dashboard = (self.root / 'dashboard.md').read_bytes()
         for broken in malformed:
-            with self.subTest(broken=broken[:40]):
-                (self.root / 'registry.json').write_text(broken)
-                for action in ['init', 'rebuild', 'query']:
-                    self.assertIn('corrupt', self.cli(action, ok=False))
-                    self.assertEqual((self.root / 'registry.json').read_text(), broken)
-                    self.assertEqual((self.root / 'dashboard.md').read_bytes(), old_dashboard)
-        (self.root / 'registry.json').unlink()
-        self.assertIn('restore JSON backup', self.cli('init', ok=False))
+            self.document.write_text(broken)
+            for action in ['rebuild', 'query']:
+                self.assertIn('invalid', self.cli(action, ok=False))
+                self.assertEqual(self.document.read_text(), broken)
+                self.assertEqual((self.root / 'dashboard.md').read_bytes(), old_dashboard)
+        self.document.unlink()
+        self.assertIn('prior initialization', self.cli('init', ok=False))
 
-    def test_projection_repair_and_post_commit_failure_reported(self):
+    def test_query_does_not_repair_optional_report(self):
         self.register()
         (self.root / 'dashboard.md').write_text('stale')
-        self.cli('rebuild')
-        expected = (self.root / 'dashboard.md').read_text()
-        self.assertIn('修订 1', expected)
-        (self.root / 'dashboard.md').unlink()
         self.cli('query')
-        self.assertEqual((self.root / 'dashboard.md').read_text(), expected)
-        store = registry.Store(self.root)
-        real_write = registry.atomic_write
-
-        def failed_dashboard(path, content):
-            if path.name == 'dashboard.md':
-                raise OSError('synthetic interruption after canonical commit')
-            return real_write(path, content)
-
-        # Force projection failure after a valid CLI-equivalent mutation has committed.
-        import argparse
-        args = argparse.Namespace(command='register', actor='beta')
-        with patch.object(registry, 'atomic_write', failed_dashboard):
-            with self.assertRaisesRegex(registry.RegistryError, 'canonical revision 2 retained; dashboard failed'):
-                store.run(lambda state: registry.mutate(state, args, appointment('beta', 'beta-scope', path='/example/beta')))
-        self.assertEqual(self.state()['revision'], 2)
-        self.assertEqual((self.root / 'dashboard.md').read_text(), expected)
+        self.assertEqual((self.root / 'dashboard.md').read_text(), 'stale')
         self.cli('rebuild')
-        self.assertIn('修订 2', (self.root / 'dashboard.md').read_text())
+        self.assertIn('修订 1', (self.root / 'dashboard.md').read_text())
 
-    def test_multiprocess_registration_no_lost_updates(self):
+    def test_multiprocess_registration_serializes_and_rejects_shared_stale_token(self):
+        token = self.cli('query')['document_token']
         children = []
-        for n in range(24):
+        for n in range(8):
             p = appointment(f'owner-{n}', f'scope-{n}', path=f'/example/project-{n}')
             process = subprocess.Popen([sys.executable, str(SCRIPT), '--root', str(self.root),
-                                        'register', '--actor', p['owner']['id']],
-                                       stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-            process.stdin.write(json.dumps(p))
-            process.stdin.close()
-            process.stdin = None
-            children.append(process)
-        for process in children:
-            out, err = process.communicate(timeout=30)
-            self.assertEqual(process.returncode, 0, err + out)
-        state = self.state()
-        self.assertEqual(state['revision'], 24)
-        self.assertEqual(len(state['owners']), 24)
-        self.assertEqual(len(state['assignments']), 24)
-        self.assertEqual(len(state['history']), 24)
-        self.assertIn('修订 24', (self.root / 'dashboard.md').read_text())
-        self.assertEqual((self.root / 'registry.json').stat().st_mode & 0o777, 0o600)
-        registry.validate(state)
+                                        '--document', str(self.document), 'register', '--actor', p['owner']['id'],
+                                        '--expected-document', token], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                       stderr=subprocess.PIPE, text=True)
+            children.append((process, json.dumps(p)))
+        results = [process.communicate(payload, timeout=30) + (process.returncode,) for process, payload in children]
+        self.assertEqual(sum(code == 0 for out, err, code in results), 1)
+        self.assertTrue(all(code == 0 or (code == 2 and 'stale' in err) for out, err, code in results))
+        self.assertEqual(len(self.state()['owners']), 1)
+        self.assertEqual(self.document.stat().st_mode & 0o777, 0o600)
+        registry.validate(self.state())
 
     def test_superior_appointment_records_issuer_without_user_bypass(self):
         self.register()
@@ -349,9 +326,9 @@ class RegistryTests(unittest.TestCase):
                  '--authority', 'manager 本级目标分工决定', '--occurred-at', '2025-05-06T07:08:09+08:00',
                  '--pending-work', 'child-run-example 仍由 alpha 托管，结果直接转 gamma，beta 汇交现有材料',
                  '--coordination-plan', 'gamma 接手重新确认所有共享配置边界，未确认前不派重叠 mutation')
-        before_repeat = (self.root / 'registry.json').read_bytes()
+        before_repeat = self.document.read_bytes()
         self.assertTrue(self.cli(*first)['unchanged'])  # Original revision is stale, original event must not repeat.
-        self.assertEqual(before_repeat, (self.root / 'registry.json').read_bytes())
+        self.assertEqual(before_repeat, self.document.read_bytes())
         self.cli('rebuild')  # Every CLI is a new process: restart/rebuild cannot lose the chain.
         current = self.cli('query', '--task', 'office评测方向', '--active')['current_owners']
         self.assertEqual(list(current), ['office-v3'])
@@ -396,11 +373,11 @@ class RegistryTests(unittest.TestCase):
         event = self.state()['history'][-1]
         self.assertEqual(event['occurred'], {'at': '约2025年5月，具体秒未知', 'precision': 'approximate'})
         self.assertIn('约略，不保证秒', (self.root / 'dashboard.md').read_text())
-        before = (self.root / 'registry.json').read_bytes()
+        before = self.document.read_bytes()
         self.assertIn('timezone', self.cli('close', '--actor', 'beta', '--assignment', 'release-v2',
                                            '--expected-revision', '3', '--reason', '无时区应拒绝',
                                            '--occurred-at', '2025-05-06T07:08:09', ok=False))
-        self.assertEqual(before, (self.root / 'registry.json').read_bytes())
+        self.assertEqual(before, self.document.read_bytes())
 
     def test_legacy_state_read_does_not_invent_repo_goal_or_coordination_facts(self):
         self.register()
@@ -409,14 +386,16 @@ class RegistryTests(unittest.TestCase):
         legacy['owners']['alpha'].pop('appointment_source')
         legacy['assignments']['release'].pop('repo')
         legacy['assignments']['release'].pop('goal_source')
-        content = json.dumps(legacy, ensure_ascii=False)
-        (self.root / 'registry.json').write_text(content)
+        legacy['coordination'] = {}
+        content = registry.serialize_document(legacy, self.cli('query')['era'])
+        self.document.write_text(content)
         result = self.cli('query')
         self.assertEqual(result['coordination'], {})
         self.assertNotIn('repo', result['assignments']['release'])
         self.assertNotIn('goal_source', result['assignments']['release'])
+        self.cli('rebuild')
         self.assertIn('历史未录入，待确认', (self.root / 'dashboard.md').read_text())
-        self.assertEqual((self.root / 'registry.json').read_text(), content)
+        self.assertEqual(self.document.read_text(), content)
 
     def test_project_identity_consistency_and_task_identity_immutable(self):
         p = appointment()

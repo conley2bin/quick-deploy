@@ -47,9 +47,22 @@
     document.getElementById(STYLE)?.remove(); document.getElementById(NOTICE)?.remove();
     const style = el('style', '', css); style.id = STYLE; document.head.append(style);
     let stopped = false, busy = false, pending = false, anchor = null, original = [], layout = [], tree = null, bound = new Map();
-    let message = '', demo = false, order = [];
+    let message = '', demo = false, order = [], era = null;
     const storageKey = 'quick-deploy.owner-groups.order:' + location.pathname;
-    try { const saved = JSON.parse(localStorage.getItem(storageKey)); if (Array.isArray(saved) && saved.every(x => typeof x === 'string') && saved.length <= 1000) order = saved; } catch (_) { /* Storage is optional. Registration order remains deterministic. */ }
+    function resetOrder(nextEra, empty) {
+      if (empty || nextEra === 'template') {
+        order = []; era = nextEra;
+        try { localStorage.removeItem(storageKey); } catch (_) { /* Optional storage. */ }
+      } else if (era !== nextEra) {
+        order = []; era = nextEra;
+        try {
+          const saved = JSON.parse(localStorage.getItem(storageKey));
+          if (saved?.format === 2 && saved.era === era && Array.isArray(saved.order) &&
+              saved.order.length <= 1000 && saved.order.every(x => typeof x === 'string')) order = saved.order;
+          else localStorage.removeItem(storageKey);
+        } catch (_) { /* Registration order remains deterministic. */ }
+      }
+    }
     const headers = new Map();
     const observer = new MutationObserver(() => {
       if (stopped || pending) return;
@@ -102,7 +115,7 @@
       if (new Set(ids).size !== ids.length || original.some(n => !n.matches?.('.session[data-session-id],.sessionGroupHeader,.sidebarEmptyHint'))) throw Error('Unsupported native item wrapper');
       const byId = new Map(rows.map(n => [n.dataset.sessionId, n]));
       const projection = Core.groups(tree, bound, ids, order); order = projection.order;
-      try { localStorage.setItem(storageKey, JSON.stringify(order.slice(-1000))); } catch (_) { /* No required storage writes. */ }
+      try { localStorage.setItem(storageKey, JSON.stringify({format: 2, era, order: order.slice(-1000)})); } catch (_) { /* No required storage writes. */ }
       const leading = original[0]?.matches('.sessionGroupHeader') ? original[0] : null;
       const desired = leading ? [leading] : [], used = new Set();
       cleanDecorations(anchor);
@@ -189,8 +202,9 @@
       busy = true;
       try {
         const payload = await readSnapshot();
+        if (!payload.owners.ok || typeof payload.owners.era !== 'string') throw Error('Unavailable document era');
         const nextTree = Core.forest(payload.owners), nextBound = Core.bindings(nextTree, Core.catalog(payload.sessions));
-        if (!stopped) { tree = nextTree; bound = nextBound; demo = payload.demo === true; message = ''; }
+        if (!stopped) { resetOrder(payload.owners.era, payload.owners.owners.length === 0); tree = nextTree; bound = nextBound; demo = payload.demo === true; message = ''; }
       } catch (_) {
         if (!stopped) { tree = null; bound = new Map(); message = '负责人分组暂不可用，请检查登录或桥接；已恢复原生列表。'; }
       } finally { busy = false; if (!stopped) reconcile(); }

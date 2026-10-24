@@ -8,6 +8,9 @@ import tempfile
 
 HERE = Path(__file__).resolve().parents[1]
 CLI = HERE.parents[1] / 'pi-agent/skills/responsibility-registry/scripts/registry.py'
+CODEC = CLI.parent / 'registry_document.py'
+sys.path.insert(0, str(CLI.parent))
+import registry_document
 spec = importlib.util.spec_from_file_location('projection', HERE / 'registry_projection.py')
 projection = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(projection)
@@ -15,7 +18,9 @@ spec.loader.exec_module(projection)
 
 def build(root):
     def cli(*args, payload=None):
-        result = subprocess.run([sys.executable, str(CLI), '--root', str(root), *args],
+        if args[0] not in ['init', 'query', 'rebuild']:
+            args = (*args, '--expected-document', cli('query')['document_token'])
+        result = subprocess.run([sys.executable, str(CLI), '--root', str(root), '--document', str(root / 'RESPONSIBILITIES.md'), *args],
                                 input=json.dumps(payload, ensure_ascii=False) if payload else None,
                                 text=True, capture_output=True, timeout=10)
         if result.returncode:
@@ -48,7 +53,7 @@ def build(root):
     owner('collision-b', '冲突乙', '冲突演示', pi='pi-synthetic-duplicate')
     owner('other', '另一顶层负责人', '独立项目', parent='user', pi='pi-synthetic-other', task='同库另一方向')
     owner('orphan', '待确认上级方向', '未登记上级演示', parent='owner:not-registered', pi='pi-synthetic-orphan', task='同库独立方向')
-    return json.loads((root / 'registry.json').read_text())
+    return registry_document.parse_document((root / 'RESPONSIBILITIES.md').read_text())[0]
 
 
 def sessions():
@@ -66,7 +71,7 @@ def sessions():
 def demo():
     with tempfile.TemporaryDirectory(prefix='owner-groups-demo-') as temp:
         state = build(Path(temp))
-        return {'owners': projection.project(state), 'sessions': sessions()}
+        return {'owners': dict(projection.project(state), era='00000000-0000-0000-0000-000000000001'), 'sessions': sessions()}
 
 
 if __name__ == '__main__':

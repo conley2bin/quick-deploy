@@ -6,7 +6,7 @@
 
 - 原有侧栏里的**同一批原生会话行**，按登记簿 `parent` 放进白色圆角细框，配轻微中性阴影。原生主题、字体、行高、时间/未读/忙碌标记、选中状态和操作不变；没有新增平行面板、角色看板或「打开会话」按钮。
 - 每个有匹配会话的最高团队一个框，最高 `parent:user` 负责人固定第一行，在自己的原生显示名称**紧后方同行**显示圆润亮黄色 SVG 星星（提示/无障碍名称「最高负责人」），使用原生标题行间距/对齐；标题文字和省略号逻辑不变。星星随标题内容移动，不再绝对定位到卡片角落，也不在 hover 时隐藏。未选中的最高负责人也有独立浅中性色细边卡片，使用原生圆角/主题色，星号归属于该行；选中样式仍由原生主题决定。所有后代负责人平铺对齐，不做嵌套树卡片。同仓库/同项目不决定归组。
-- 框的顺序不跟会话活跃度变化。首次按 canonical registry 的登记插入序号排列；之后新团队追加，现有框顺序保留，并仅在当前浏览器该地址的 localStorage 保存团队 ID 顺序。刷新/重载稳定；同样首次目录的客户端顺序确定。不同客户端若经历不同的重新挂接/新增根过程，历史追加顺序可能不同，不写服务器或登记簿来协调。
+- 框的顺序不跟会话活跃度变化。首次按 canonical registry 的登记插入序号排列；之后新团队追加，现有框顺序保留，并仅在当前浏览器该地址的 localStorage 保存 `{format:2, era, order}`。只在成功快照的同一非 template era 载入，旧数组忽略，era 变化/空模板清除旧序，缓存 ID 不产生团队；同 ID 新任命即便浏览器错过空快照也按新登记序。刷新/重载稳定；同样首次目录的客户端顺序确定。不同客户端若经历不同的重新挂接/新增根过程，历史追加顺序可能不同，不写服务器或登记簿来协调。
 - 下级只按**真实上游最新原生渲染顺序**在自己的框内排序，最高到第二行；原生重建时更新排序依据，不从自己调整后的 DOM 反推活跃度。新增成员出现在所属框内。框的高度随成员增减，固定的是框序而不是屏幕像素坐标。
 - 整个团队没有匹配原生行时不显示空框，但保留其顺序槽位；会话重新出现时回到原位。最高负责人没有匹配原生行、但下级有匹配行时，仅显示「姓名 · 会话不可用」的小字，不制造可点击会话、不给下级加星。未登记上级的可匹配行放在虚线框，标「上级待确认 · 未提升下级」，无星。身份缺失、重复或日志未绑定的会话留在框外；交接历史不推断当前身份。
 - 无关/未绑定会话仍在同一列表框外。原生首段标题（通常为 NOW）保留在最上方，框紧随其后；首段计数包含所有框内会话及该段框外会话，全为 NOW 时等于原生总数，即使 NOW 会话全部入框也保留标题。后续 Waiting/Later 标题只统计各自剩余框外会话，没有剩余行时移除；停用时恢复所有原生标题和原始计数。空登记簿直接显示完整原生列表。不会根据标题、别名、cwd 或路径补造归属。
@@ -40,9 +40,9 @@
 
 ## 身份和数据边界
 
-固定私有来源：`~/.pi/agent/.memory/local/responsibility-registry/registry.json`。先只读打开已存在的 `registry.lock` 并取共享锁，再读取快照；不运行会修复 dashboard 的 registry CLI，不初始化/修复/写入任何文件。
+固定唯一当前来源：`~/.pi/agent/skills/responsibility-registry/RESPONSIBILITIES.md`。受控加载同安装目录的纯 `scripts/registry_document.py`（要求 responsibility-registry/v2），只读打开私有目录已存在的 `registry.lock` 并取共享锁，再严格解析 Markdown；无 Store/CLI 调用、JSON fallback 或路径发现，HTTP 调用者不能指定路径。codec 不存在/不兼容、MD 缺失/损坏只报不可用并恢复原生列表，不显示最后成功图。首次部署须同时部署已安装 codec 与适配器；一次显式迁移和适配器激活后，后续 MD 修改/模板复制无需服务刷新。见 [迁移及不复活旧数据的回退](../../pi-agent/skills/responsibility-registry/references/migration.md)。
 
-只导出当前 owner 的 id/name/role/parent、登记插入序号 registration_order（canonical CLI 保存对象插入顺序，无活动时间/历史）、**source=current-session 已核验 Pi ID**、身份缺失说明、简短 project/task/status。历史、recovery、联系别名、任命证据、目标/验收正文、目录路径、transcript 均不导出。500 owner / 64 层 / 8 MiB 原始快照上限，超限整树拒绝，不截断祖先。重复 Pi 身份不绑定、不挑一个；对应原生行保持在框外。
+只导出当前文档 era/revision 与 owner 的 id/name/role/parent、登记插入序号 registration_order（canonical CLI 保存对象插入顺序，无活动时间/历史）、**source=current-session 已核验 Pi ID**、身份缺失说明、简短 project/task/status。历史、recovery、联系别名、任命证据、目标/验收正文、目录路径、transcript 均不导出。500 owner / 64 层 / 8 MiB 原始快照上限，超限整树拒绝，不截断祖先。重复 Pi 身份不绑定、不挑一个；对应原生行保持在框外。
 
 数据路由为前缀下 **`POST __owner_groups__/snapshot`，空 body、无 query 参数、只读**。GET 返回 405。选择 POST 是必要的兼容措施：当前上游 service worker 会手动缓存 no-store GET、可能用旧 GET 会话记录兜底；它不拦截 POST。适配器用调用浏览器的 cookie 对固定 loopback 上游 **重新 GET `/api/sessions`**，禁止重定向和缓存、要求 200 JSON 及预期结构，再读取目录，返回最小会话关联：
 
