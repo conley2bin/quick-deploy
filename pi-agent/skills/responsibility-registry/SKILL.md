@@ -1,6 +1,6 @@
 ---
 name: responsibility-registry
-description: "全局负责人登记与协作：用户或有授权的直属上级明确说‘任命你为…负责人’‘你负责…’，或变更职责、交接、查谁负责/上下级/项目关系、同仓库协作、向已关闭会话的旧负责人咨询时使用。讨论、示例、否定任命不登记。负责人逐级汇报，由自己的 subagents 实施。"
+description: "全局负责人登记与协作：用户或有授权的直属上级明确说‘任命你为…负责人’‘你负责…’，或取消所有的负责人关系、重建负责人关系、恢复上一次/指定时间关系、变更职责、交接、查谁负责/上下级/项目关系、同仓库协作、向已关闭会话的旧负责人咨询时使用。讨论、示例、否定任命不登记。负责人逐级汇报，由自己的 subagents 实施。"
 ---
 
 # 全局责任登记簿
@@ -14,16 +14,26 @@ description: "全局负责人登记与协作：用户或有授权的直属上级
 ## 接任与登记
 
 1. 把任命转成有边界的项目/任务范围、目标、验收条件，记录 `goal_source` 的 issuer（`user` / `owner:<ID>`）与真实来源证据。目标由直属上级向下分解；只在授权内细化实施步骤，不扩大目标。目标/权限疑问先问直属上级，必要时由上级逐级升级。
-2. **每次行动前重新读取当前 live Markdown / CLI query**。重置后不得从旧任务记忆、历史、旧 JSON 或旧咨询计划重新任命自己；被省略的 owner/职责已经没有当前登记授权。先读同一登记簿：查相关项目/任务、现有 owner、上级与依赖。owner ID 是持续责任身份，不是会话名；首次用 `python3 -c 'import uuid; print(uuid.uuid4())'` 生成，保存到自己的任务记忆。恢复时复用已确认的 ID；找不到证据不要按角色名/cwd 猜是同一人。同一 owner 可承担多个范围，各有稳定责任 ID 和项目内任务 ID。
+2. **每次行动前重新读取当前 live Markdown / CLI query**。重置后不得从旧任务记忆、历史、旧 JSON 或旧咨询计划重新任命自己；被省略的 owner/职责已经没有当前登记授权。先读同一登记簿：查相关项目/任务、现有 owner、上级与依赖。owner ID 是持续责任身份，不是会话名；首次用 `python3 -c 'import uuid; print(uuid.uuid4())'` 生成，将当前 `era` 与 owner ID 一起保存。恢复上下文时先比较 era 并查当前行；只有当前 MD 仍有该行才有登记授权。era 改变且行缺失时，旧任命消息/记忆不能用于重新登记，必须有新任命；找不到证据不要按角色名/cwd 猜是同一人。同一 owner 可承担多个范围，各有稳定责任 ID 和项目内任务 ID。
 3. 核验**自己的**身份：调用 `intercom` 的 `status`，再 `list` 核对 `Current session`；不选同 cwd 第一个会话。Intercom ID 是联系地址，可不同于真实 Pi session ID。真实 Pi ID 仅取已验证的当前会话元数据（Pi `/session`、宿主当前 session 信息或明确对应当前会话的 session 文件 header）。不从最新文件、他人会话、子进程环境猜测；不要为了取 ID 启动一个新的 Pi/CLI bridge。能核验联系 ID 却不能取 Pi ID 时，后者填 null，source 为 `intercom-status`；全部不可用则两者 null/source `unavailable`，写明原因，仍可登记。具体格式见 [CLI](references/cli.md)。同时在 owner 的 `recovery` 保存已核验的 session 文件绝对路径、原 cwd/repo/worktree、交接摘要/关键决策/未决问题及文档指针；不可用项用 null 和缺失原因，不从 ID 拼路径。会话/上下文变化用 update-owner 更新，交接会把前任的实际 Pi ID、联系 ID、recovery 与目标复制成历史快照，不能用其后来新会话覆盖旧记录。工具只验证字段一致性，真实性由调用者依据上述证据保证。
 4. 明确上级：只有用户明确直接任命且没有既有或指定汇报对象，才登记 `parent: user`，作为顶层负责人。用户初始任命不解除已明确的下级汇报链；由上级任命则 parent 为该授权上级。用 `owner:<稳定ID>` 保留未登记上级，并向任命方/已知直属上级澄清关系，不擅自改为 user 或当作顶层；此时不能宣称可直接向用户汇报。下级从 parent 推导；依赖和 peer 协作不改变汇报链。
 5. query 取得当前 `document_token`，核对真实任命与当前 parent 后，所有写命令（包括 register）都必须携带 `--expected-document`；有 expected-revision 的命令仍需 revision。运行 CLI 登记并读取 live Markdown。**同项目可以有多个不同任务/方向的 owner**；仅同一任务已有 lead 才拒绝新 claim，不能改任务拼写绕过。扩大/拆分范围先查语义重叠；修改他人范围、移交或改上级必须有授权。`--actor user` 是已有授权的记录，不是权力开关。任务还记录规范 repo（Git common dir）身份，便于跨项目/worktree 找到同仓库 owner。
    仅作示例，不构成任命或登记：例如同一项目下，可以同时有office场景评测负责人,kitchen场景评测负责人等,又或者同一个Dexathlon_task-proposals仓库,可以同时有发布web管理负责人,也可以同时有office场景采集任务发布负责人,也可以同时有kitchen场景采集任务发布负责人,各自有明确的目标和上级。
 6. 仅顶层负责人向用户汇报；中下层把责任 ID、目标/验收、上下级、联系状态、登记簿路径和下一动作报给直属上级。上级再逐级汇总；不要因用户初始任命就绕过已有链路。登记完成不等于目标完成。
 
-**唯一当前事实源**：`~/.pi/agent/skills/responsibility-registry/RESPONSIBILITIES.md`；同目录 `RESPONSIBILITIES.template.md` 是完全空白模板。可编辑可见表格的姓名/角色/Parent，查询、授权与网页遵循当前行；Details 只含不重复的其余字段，History 仅审计，不恢复当前行。归属变化需可归因时用 CLI。`dashboard.md` 仅是显式 rebuild 的可选报告，不能作为当前授权。私有锁/迁移备份位于 `~/.pi/agent/.memory/local/responsibility-registry/`，不上传远端、不提交运行态。
+**唯一当前事实源**：`~/.pi/agent/skills/responsibility-registry/RESPONSIBILITIES.md`；同目录 `RESPONSIBILITIES.template.md` 是完全空白模板。可编辑可见表格的姓名/角色/Parent，查询、授权与网页遵循当前行；Details 只含不重复的其余字段，History 仅审计，不恢复当前行。归属变化需可归因时用 CLI。旧 `dashboard.md` 只保留无关系的指路 tombstone；即时报告输出到 stdout/显式路径，不能作为当前授权。私有锁/迁移备份位于 `~/.pi/agent/.memory/local/responsibility-registry/`，不上传远端、不提交运行态。
 
-用户重新开始时，只需删除 live MD，再把同目录模板复制为相同 live 文件名；不用删 JSON、跑 reset 命令或重启服务。模板立即表示零当前人员/职责/协议/历史，首次真实新任命自动进入新 era。缺失/损坏文件只报错，不自动导入/修复；网页恢复原生列表。重置不停止正在运行的 agent/child，仍需按真实工作安排处理。手工 rm/cp 时应让登记簿 CLI writer 暂停写入（不用停止业务 agent），避免非协作编辑与最后 rename 的极短竞态。重新安装保留 live MD 字节与 inode；旧 JSON 只能经明确授权的一次迁移，见 [迁移与回退](references/migration.md)。Linux/macOS POSIX + Python 3 标准库；同一本地文件系统上 flock 串行更新，非跨主机服务。精确命令、恢复与临时演练见 [references/cli.md](references/cli.md)。
+## 用户取消、重建与恢复关系
+
+- 用户直接说“取消所有的负责人关系”或“重建负责人关系”：先 query 当前 MD 并核验真实用户授权，调用 `clear --actor user --expected-document TOKEN --reason ... --authority ...`。**不需要后续任命也能保持为空**。仅有 role-bound peer/上级身份不授予清空全局的权限。
+- 同一用户消息另有“我任命你为…”：先完成带备份 clear，再 query 新 era，**只登记该明确新任命**；不从旧记忆推导其他职责。模板仍可手工复制；agent clear 自动使用新的空 UUID era，无需用户提供 ID。
+- 每次 agent clear/restore 在同一锁内先保存当前 MD **原始字节**到同目录私有 `backups/`，以时区秒级时间、序号和 UUID 命名（目录0700/快照0600）；`BACKUPS.md`（0600）列时间、用户依据、根姓名与 parent→child/角色、计数、路径/ID、hash和状态。这个索引与快照是历史证据，不是当前授权源。
+- “恢复上一次/指定时间关系”：`backup-list` 列 completed 候选；先解析并 hash/格式核验目标，歧义列候选向用户问清，不猜。previous 指**本次请求开始时最近 completed 的 pre-switch 快照**，先选目标再备份当前，因此反复 previous 可在前两状态间切换。`restore --target ...` 先备份 CURRENT，再以新 UUID era 恢复目标关系/原样历史，旧 token/plan 不恢复。只允许本技能已登记 `backups/*.md`，不能恢复 legacy JSON/dashboard。恢复不重启 agent/job、不恢复执行态。旧快照缺少协议 terms 证据时明确 not-ready，不自动补确认。
+- 备份/索引写失败时禁止切换。切换后索引失败会非零报 `switched; index incomplete`，先 query 核验当前图，再以用户授权 `recover-switch` 逐 hash 对账；pending/incomplete 不作为 previous，也阻止后续写命令。不得把非零当作未切换而盲重做。
+- **OS 手工 rm 无法拦截**：它会删除该 era 在此文件中的历史（包括迁移后的新事件），不会自动备份未观察到的人工编辑。要完整留存请优先用 agent clear；手工删除前自行做一份私有 dated copy。手工删除后复制同目录模板仍立即表示零当前图，缺失/损坏从不导入旧 JSON/缓存，不需删 JSON或服务重启。
+- 若手工 reset 要与 CLI 串行，可使用 [CLI](references/cli.md) 的同一 `flock` rm+cp 示例。非协作 editor 仍有最后重检到 rename 的竞态；不要宣称绝对无覆盖。重置只改变登记授权，不停止正在运行的 agent/child，所有负责人必须重读当前 MD。
+
+重新安装保留 live MD/index/snapshots，不填补曾初始化后的缺失文件。旧 JSON 只能经明确授权的一次迁移，旧 dashboard 被封存并替换为无关系的指路 tombstone。`rebuild` 仅把标记为非权威的报告输出到 stdout/显式路径，**自然语言“重建负责人关系”使用上述 clear，不是报告命令**。精确 reset/restore/恢复命令见 [CLI](references/cli.md)，迁移与不复活旧数据的回退见 [migration](references/migration.md)。Linux/macOS 本机 POSIX+Python标准库，不是跨主机服务。
 
 ## 负责人运行契约（任命期间持续适用）
 
@@ -32,7 +42,7 @@ description: "全局负责人登记与协作：用户或有授权的直属上级
 - **具体实现、调试、业务文件编辑、测试执行、部署/运维及集成命令必须交给自己的获授权 async subagents**。owner 可以推理、阅读产物、协调决策、操作本登记簿、维护任务笔记、审阅交付并作验收判断；集成所需的代码修改也由实施子代理完成。没有“小/简单/更快/热修复”例外，不能借“集成”自己实施。缺少授权/工具/可用执行者是委派阻塞，向直属上级请求恢复所需能力，绝不自行实施兜底。
 - 先检查实际工具；若有 `subagents_enable` 且允许委派，启用后用 `subagent` 的 `list`（`capabilities: true`）、`get`/`guide` 读取现行能力和治理。使用已存在的 profile，按当前模型路由规则，不编造 provider/agent/API。**只用 async 委派**（显式 `async: true`）；禁止用前台 CLI/其他会话伪装自己的 child，禁止要求未获授权的 child 再递归 fanout。本技能不能突破工具上限或父级禁令。
 - 每个具名 child 任务必须含：输入证据/位置、允许改动的范围与不变量、交付物路径、验收标准、**汇报给此直属 owner**、阻塞升级规则。持续责任 owner 与这些临时 worker 分离；不要把每个 worker 填进全局负责人表。若确需任命持续下级，先有明确授权，登记其真实身份与 parent，而不是把一个 run ID 当成 owner。
-- **派发 mutation worker 之前**，按规范 repo ID 查询已有方向 owner，横向协商文件/模块写入边界、共享文件/接口、分支/worktree 选择、顺序、集成 owner、验收。把受影响方向与条款记入同一登记簿 `coord-propose`；各参与方真实明确同意后分别 `coord-ack`。发送消息/收到送达回执不等于同意，不能替 peer 伪填 ack。query/dashboard 的 `agreement_ready` 只说明所列协议已确认，不是全仓授权或 writer 锁。
+- **派发 mutation worker 之前**，按规范 repo ID 查询已有方向 owner，横向协商文件/模块写入边界、共享文件/接口、分支/worktree 选择、顺序、集成 owner、验收。把受影响方向与条款记入同一登记簿 `coord-propose`；各参与方真实明确同意后分别 `coord-ack`。发送消息/收到送达回执不等于同意，不能替 peer 伪填 ack。当前 query 的 `agreement_ready` 只说明所列协议已确认，不是全仓授权或 writer 锁。
 - 同一 cwd 只有一个活动 writer；隔离 worktree 虽可并行，也必须明确约定重叠文件/接口处理和集成顺序。边界/目标/验收改变须释放旧协议重新协商。未知/不可达 peer 或未确认的重叠，只阻塞相关重叠 mutation；继续规划、只读和能证明不冲突的工作（如已有明确有效边界内的独立任务）。不把全项目停住，也不把未确认工作标 ready。
 - 不覆盖他人工作，不独自 stage/commit 其他 owner 的变更；集成由约定 owner 组织自己的实施 child 完成。普通委派不授予跨范围变更、外部写入、发布或发消息权限。peer 协调是横向合作，不自动改 parent。
 - 常规 helper 问题回其 owning responsible agent；owner 主动识别重大决策或可能实质影响整体目标/方向的问题（如成功定义、关键战略路线、重大范围/优先级取舍或资源承诺），分析影响、备选方案与推荐，提出精确待决定问题。**不以已在范围内或中间上级同意为用户最终认可**：中下层报直属上级，由各级继续上报至顶层与用户讨论，用户决定再逐级下传并更新目标/计划。此前不得承诺或实施有争议方向；可委派有界、不作承诺的证据收集，不能借“探索实验”先实施或暗含重大承诺。判据是对目标/方向的实质影响或重大承诺，不因单纯不确定或普通工具/库选择就升级为重大决策。其他越权或共享仓库边界问题也报直属上级处理；待决期间仅暂停受影响分支，独立工作继续。中下层不得绕过层级直接向用户报告进度或求决。

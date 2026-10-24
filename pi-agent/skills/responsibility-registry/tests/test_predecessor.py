@@ -53,6 +53,8 @@ class PredecessorTests(unittest.TestCase):
     def cli(self, script, *args, payload=None, ok=True, env=None):
         prefix = [sys.executable, str(SCRIPTS / script)]
         if script == 'registry.py':
+            if args[0] == 'rebuild':
+                args = (*args, '--output', str(self.root / 'report.md'))
             prefix += ['--root', str(self.root), '--document', str(self.document)]
             if args[0] not in ['init', 'query', 'rebuild']:
                 args = (*args, '--expected-document', self.cli('registry.py', 'query')['document_token'])

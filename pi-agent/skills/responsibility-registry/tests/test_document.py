@@ -182,6 +182,30 @@ class DocumentTests(DocumentFixture):
         self.assertEqual(state['assignments']['release']['updated_at'], state['coordination']['agreement']['scopes']['release']['assignment_updated_at'])
         self.assertFalse(codec.agreement_view(state, state['coordination']['agreement'])['agreement_ready'])
 
+    def test_manual_agreement_terms_changes_invalidate_acknowledgements(self):
+        self.register()
+        p = appointment('beta', 'frontend')
+        p['assignment']['task'] = 'front'
+        self.register(p)
+        proposal = dict(id='terms', scopes={'release': ['x/**'], 'frontend': ['y/**']}, shared_interfaces='schema v1',
+                        workspace=dict(mode='shared-cwd', plan='one writer'), sequencing='serial',
+                        integration_owner='alpha', acceptance='explicit review')
+        self.store.run(lambda s: registry.mutate(s, args('coord-propose', expected_revision=2, reason='proposal'), proposal), expected_document=self.token())
+        for actor, revision in [('alpha', 3), ('beta', 4)]:
+            self.store.run(lambda s: registry.mutate(s, args('coord-ack', actor=actor, coordination='terms', expected_revision=revision, reason='explicit consent'), None), expected_document=self.token())
+        state, era = codec.parse_document(self.document.read_text())
+        self.assertTrue(codec.agreement_view(state, state['coordination']['terms'])['agreement_ready'])
+        for field in ['integration_owner', 'write_scope', 'shared_interfaces']:
+            changed = copy.deepcopy(state)
+            agreement = changed['coordination']['terms']
+            if field == 'write_scope':
+                agreement['scopes']['release']['write_scope'] = ['EVERYTHING/**']
+            else:
+                agreement[field] = 'beta' if field == 'integration_owner' else 'unacknowledged new interface'
+            self.document.write_text(codec.serialize_document(changed, era))
+            current = self.domain()
+            self.assertIn('terms changed', ' '.join(codec.agreement_view(current, current['coordination']['terms'])['not_ready_reasons']))
+
     def test_manual_parent_changes_direct_superior_authorization(self):
         for oid in ['old-superior', 'new-superior', 'successor']:
             p = appointment(oid)
@@ -335,6 +359,9 @@ class MigrationTests(DocumentFixture):
         for a in expected['coordination'].values():
             aid, b = next(iter(a['scopes'].items()))
             b['assignment_digest'] = None if a['id'] == 'stale' else codec.assignment_digest(state['assignments'][aid])
+        for agreement in expected['coordination'].values():
+            for ack in agreement['acknowledgements'].values():
+                ack['terms_digest'] = codec.terms_digest(agreement)
         result = self.migrate_fixture(state)
         self.assertEqual(self.domain(), expected)  # ALL fields, history IDs/order/snapshots, not counts
         self.assertEqual(len(self.domain()['owners']), 12)
@@ -387,6 +414,25 @@ class MigrationTests(DocumentFixture):
         with self.assertRaisesRegex(registry.RegistryError, 'diverged'):
             self.store.migrate(resume=True)
         self.assertEqual(self.document.read_text(), edited)
+
+    def test_legacy_dashboard_is_backed_up_and_permanently_retired(self):
+        self.register()
+        original = b'# old canonical report\nalpha owns release\n'
+        (self.root / 'dashboard.md').write_bytes(original)
+        migrated = self.migrate_fixture(self.domain())
+        control = self.store.control()
+        self.assertEqual(Path(control['dashboard_backup']).read_bytes(), original)
+        tombstone = (self.root / 'dashboard.md').read_bytes()
+        self.assertNotIn(b'alpha', tombstone)
+        self.assertIn(str(self.document).encode(), tombstone)
+        self.document.unlink()
+        shutil.copyfile(SKILL / 'RESPONSIBILITIES.template.md', self.document)
+        self.assertEqual((self.root / 'dashboard.md').read_bytes(), tombstone)
+        result = subprocess.run([sys.executable, str(SCRIPT), '--root', str(self.root), '--document', str(self.document), 'rebuild'], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('非权威', result.stdout)
+        self.assertIn('template', result.stdout)
+        self.assertEqual((self.root / 'dashboard.md').read_bytes(), tombstone)
 
     def test_crash_before_pending_leaves_legacy_usable_and_no_auto_resume(self):
         self.register()

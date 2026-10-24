@@ -24,3 +24,10 @@ codoxear/.runtime/
 
 # Runtime authority is private; source ships only the blank template.
 /pi-agent/skills/responsibility-registry/RESPONSIBILITIES.md
+
+/pi-agent/skills/responsibility-registry/BACKUPS.md
+/pi-agent/skills/responsibility-registry/backups/
+/pi-agent/skills/responsibility-registry/.responsibilities-*
+/pi-agent/skills/responsibility-registry/.BACKUPS.md-*
+
+/pi-agent/skills/responsibility-registry/.RESPONSIBILITIES.md-*

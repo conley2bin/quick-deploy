@@ -15,7 +15,7 @@ python3 "$RR" query --repo 'repo:/canonical/repo/.git' --active
 python3 "$RR" rebuild
 ```
 
-`init` 只在无任何 legacy/control 证据的新安装创建空模板并记初始化标记；现有 live 文件字节/inode不动，曾初始化后的缺失不自动补齐。旧 JSON 必须明确迁移，见 [migration.md](migration.md)。`rebuild` 仅生成私有 dashboard，不改 live。query 只读，缺失/损坏报错且保留字节，不修复报告。`query` 返回责任、owner、当前归属 current_owners、语义 history、上下级 hierarchy、依赖 relations、写入协调 coordination、当前 revision；项目/repo 过滤为精确 ID 或规范绝对路径，任务过滤为 task/objective 子串；缺省包括已结束记录。完整当前目录读安装根的 `RESPONSIBILITIES.md`；query 同时返回 era、revision、document_token。同项目同 repo 的不同方向可以有不同 owner，不是项目级排他锁。
+`init` 只在无任何 legacy/control 证据的新安装创建空模板并记初始化标记；现有 live 文件字节/inode不动，曾初始化后的缺失不自动补齐。旧 JSON 必须明确迁移，见 [migration.md](migration.md)。`rebuild` 只向 stdout 或显式 `--output FILE` 输出含 era/revision 的非权威即时报告，不写 dashboard.md，不改 live。query 只读，缺失/损坏报错且保留字节，不修复报告。旧 dashboard.md 已由迁移封存并替换为无关系的指路 tombstone。`query` 返回责任、owner、当前归属 current_owners、语义 history、上下级 hierarchy、依赖 relations、写入协调 coordination、当前 revision；项目/repo 过滤为精确 ID 或规范绝对路径，任务过滤为 task/objective 子串；缺省包括已结束记录。完整当前目录读安装根的 `RESPONSIBILITIES.md`；query 同时返回 era、revision、document_token；把 era 与 owner ID 一起保存，只有当前 MD 行可证明当前登记授权。同项目同 repo 的不同方向可以有不同 owner，不是项目级排他锁。
 
 以下仅是用户给出的领域示例，**不构成真实任命，不创建登记记录**：例如同一项目下，可以同时有office场景评测负责人,kitchen场景评测负责人等,又或者同一个Dexathlon_task-proposals仓库,可以同时有发布web管理负责人,也可以同时有office场景采集任务发布负责人,也可以同时有kitchen场景采集任务发布负责人,各自有明确的目标和上级。
 
@@ -60,9 +60,9 @@ python3 "$RR" handover --expected-document "$TOKEN" --actor 'stable-owner-id' --
 
 当前 era 内 CLI 不删除 owner、旧任命、旧责任；用户手工删行或模板重置明确改变当前事实。会话离线不自动交接；有变化时现任 owner/授权直属上级主动更新文档，不等用户提醒。handover 必须给 `--pending-work`：逐个写活动 child 的 run ID、实际托管 owner、结果回报/验收路径；没有则核验后明确写无。运行 child 不会因登记自动更换 supervisor。若上级不同必须给 `--reporting-change` 明确依据；目标、验收、依赖由旧责任继承，不能偷偷改变。
 
-有活动写入协议或继承协调时，`--coordination-plan` 必需。原子交接会把受影响旧协议 released，并把协议 ID、前次/当前 child 安排、再确认计划、汇报安排写进新责任 `handover_obligations`。旧 owner 的 ack 不迁给新 owner，新 owner 在重叠 mutation 前重新协商；原协议/owner/责任和历史仍留存。`query --task ... --active` / `current_owners` 查现任，默认查询和 dashboard 保留历任。
+有活动写入协议或继承协调时，`--coordination-plan` 必需。原子交接会把受影响旧协议 released，并把协议 ID、前次/当前 child 安排、再确认计划、汇报安排写进新责任 `handover_obligations`。旧 owner 的 ack 不迁给新 owner，新 owner 在重叠 mutation 前重新协商；原协议/owner/责任和历史仍留存。`query --task ... --active` / `current_owners` 查现任，当前 era 的默认查询和 live MD 审计历史保留历任。
 
-同一 live Markdown 原子提交同时保存责任变化和追加历史。每个事件有 `event-00000001` 式稳定 ID、revision 顺序、`at`（登记时间，ISO8601 秒+时区）、`occurred`（发生时间及精度）、old/new owner 的 ID/名称/角色快照、项目/任务、操作者、授权/原因和 before/after 快照；同一秒的 A→B→C 按事件顺序区分。历史在**同一 live Markdown** 的 audit-only JSON fence 保存；可选 dashboard 渲染语义事件。历史快照永不重建当前行。姓名/角色是登记该事件时已知的事实，不猜过去未知姓名。
+同一 live Markdown 原子提交同时保存责任变化和追加历史。每个事件有 `event-00000001` 式稳定 ID、revision 顺序、`at`（登记时间，ISO8601 秒+时区）、`occurred`（发生时间及精度）、old/new owner 的 ID/名称/角色快照、项目/任务、操作者、授权/原因和 before/after 快照；同一秒的 A→B→C 按事件顺序区分。历史在**同一 live Markdown** 的 audit-only JSON fence 保存；显式即时报告可渲染语义事件。历史快照永不重建当前行。姓名/角色是登记该事件时已知的事实，不猜过去未知姓名。
 
 所有变更命令支持 `--authority '已知授权证据'`，未提供就保留未知；实时事件缺省记录当前发生秒。**补录过去事件不可用当前秒冒充发生时间**：
 
@@ -94,7 +94,7 @@ python3 "$RR" coord-release --expected-document "$TOKEN" --actor 'owner-a' --coo
   --expected-revision 13 --reason '边界改变，旧协议释放，另建新 ID 重新协商'
 ```
 
-发送/送达不是确认；不能伪填 peer 的 actor/ack。只有真实参与方明确确认才写 ack 证据。状态 proposed → 所有参与 owner ack 后 confirmed；released 不再可用。范围目标/验收/owner/状态改变后旧确认失效，query 的 `agreement_ready` 为 false（即便历史 status 是 confirmed）；须 release 并新建 ID 协商，不复用旧 ack。确认记录在同一 dashboard 可查并有历史。
+发送/送达不是确认；不能伪填 peer 的 actor/ack。只有真实参与方明确确认才写 ack 证据。状态 proposed → 所有参与 owner ack 后 confirmed；released 不再可用。范围目标/验收/owner/状态改变后旧确认失效，query 的 `agreement_ready` 为 false（即便历史 status 是 confirmed）；须 release 并新建 ID 协商，不复用旧 ack。确认记录在同一 live Markdown/query 可查并有历史；人工改协议条款也会使 terms_digest 不匹配而失效。
 
 `agreement_ready` **只覆盖所列协议**，不是全仓调度许可/活动 writer 锁。共享 cwd 一次仅一个 writer；隔离 worktree 可并行但不能忽略重叠文件/接口和集成顺序。未知/不可达 peer 或未确认重叠只阻塞相关 mutation，继续规划、只读和有依据的不冲突工作。禁止越过既有边界、覆盖或单独 stage/commit 他人变更。脚本不做路径 glob 冲突求解，也不替代真实协商。
 
@@ -121,7 +121,11 @@ PY
 }
 trap cleanup EXIT
 rr() { python3 "$RR" --root "$R" --document "$R/RESPONSIBILITIES.md" "$@"; }
-token() { rr query | python3 -c 'import json,sys; print(json.load(sys.stdin)["document_token"])'; }
+inspect_current() {
+  rr query > "$R/current-query.json"
+  cat "$R/current-query.json" # 此块只演示合成数据；真实调用须核对现任/上级/任命再决定。
+  TOKEN=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["document_token"])' "$R/current-query.json")
+}
 rr init
 cat > "$R/appointment.json" <<'JSON'
 {
@@ -141,8 +145,10 @@ cat > "$R/appointment.json" <<'JSON'
   }
 }
 JSON
-rr register --expected-document "$(token)" --actor demo-alpha --input "$R/appointment.json"
-rr register --expected-document "$(token)" --actor demo-alpha --input "$R/appointment.json" # 仍修订 1
+inspect_current
+rr register --expected-document "$TOKEN" --actor demo-alpha --input "$R/appointment.json"
+inspect_current
+rr register --expected-document "$TOKEN" --actor demo-alpha --input "$R/appointment.json" # 仍修订 1
 python3 - "$R" <<'PY'
 import json, pathlib, sys
 r = pathlib.Path(sys.argv[1])
@@ -159,10 +165,12 @@ o = p['owner']
 o['parent'] = 'user'
 (r / 'owner.json').write_text(json.dumps(o, ensure_ascii=False))
 PY
-rr register --expected-document "$(token)" --actor demo-alpha --input "$R/successor.json"
+inspect_current
+rr register --expected-document "$TOKEN" --actor demo-alpha --input "$R/successor.json"
 rr query --owner demo-alpha
 rr query --project demo:alpha --task '发布'
-rr update --expected-document "$(token)" --actor demo-alpha --assignment demo-release-v1 \
+inspect_current
+rr update --expected-document "$TOKEN" --actor demo-alpha --assignment demo-release-v1 \
   --expected-revision 2 --reason '演练：细化验收' --input "$R/scope.json"
 cat > "$R/agreement.json" <<'JSON'
 {
@@ -174,27 +182,33 @@ cat > "$R/agreement.json" <<'JSON'
   "integration_owner": "demo-alpha", "acceptance": "双方确认接口，甲验收集成并向用户报告；乙向甲报告"
 }
 JSON
-rr coord-propose --expected-document "$(token)" --actor demo-alpha --expected-revision 3 \
+inspect_current
+rr coord-propose --expected-document "$TOKEN" --actor demo-alpha --expected-revision 3 \
   --reason '演练：提案发出，不等于同意' --input "$R/agreement.json"
 rr query --repo 'repo:/example/project-alpha/.git' # agreement_ready=false
-rr coord-ack --expected-document "$(token)" --actor demo-alpha --coordination demo-agreement \
+inspect_current
+rr coord-ack --expected-document "$TOKEN" --actor demo-alpha --coordination demo-agreement \
   --expected-revision 4 --reason '演练：甲明确确认全部条款'
-rr coord-ack --expected-document "$(token)" --actor demo-beta --coordination demo-agreement \
+inspect_current
+rr coord-ack --expected-document "$TOKEN" --actor demo-beta --coordination demo-agreement \
   --expected-revision 5 --reason '演练：乙明确确认全部条款，非送达回执'
 rr query --repo 'repo:/example/project-alpha/.git' # agreement_ready=true
-rr handover --expected-document "$(token)" --actor demo-alpha --assignment demo-release-v1 \
+inspect_current
+rr handover --expected-document "$TOKEN" --actor demo-alpha --assignment demo-release-v1 \
   --to-owner demo-beta --new-assignment demo-release-v2 --expected-revision 6 \
   --reason '演练：用户批准交接；甲向乙下达接任目标' \
   --pending-work '演练：已核验无运行 child，甲把现有验收材料交乙' \
   --reporting-change '演练：用户明确乙接任后仍向甲报告' \
   --coordination-plan '演练：释放旧协议，乙接任后与构建方向重新确认共享配置和集成顺序'
 rr query --owner demo-beta --active
-rr close --expected-document "$(token)" --actor demo-beta --assignment demo-release-v2 \
+inspect_current
+rr close --expected-document "$TOKEN" --actor demo-beta --assignment demo-release-v2 \
   --expected-revision 7 --reason '演练：直属上级甲已接受目标'
-rr update-owner --expected-document "$(token)" --actor demo-beta --expected-revision 8 \
+inspect_current
+rr update-owner --expected-document "$TOKEN" --actor demo-beta --expected-revision 8 \
   --reason '演练：用户明确调整为直报' --input "$R/owner.json"
-rr rebuild
-cat "$R/dashboard.md"
+rr rebuild --output "$R/report.md"
+cat "$R/report.md"
 ```
 
 ## Markdown 格式、重置与恢复
@@ -224,9 +238,44 @@ cp -- "$LIVE/RESPONSIBILITIES.template.md" "$LIVE/RESPONSIBILITIES.md"
 # query -> 零当前图；重新核验真实任命后 query/token/register。不要删 JSON，不需服务重启。
 ```
 
-删除/复制间隙及损坏文档只报诊断、保留字节；网页显示原生列表，无最后成功图兜底。模板重置的旧历史不在当前 era 返回；备份不会供给授权。重置不停止 agent/child；不得从旧记忆重建自己职责。query/rebuild/init/reinstall 均不导入旧 JSON。CLI 在同一 `registry.lock` 下校验 token、当前授权、序列化/readback，并在 fsync 临时文件后、atomic replace 前重检原字节/文件身份；不盲重试。非协作 editor 可在最终重检与 rename 之间抢写，标准 POSIX 无比较交换 rename；建议重置时暂停登记写入。不要删除/更换锁 inode。只支持同机本地 POSIX，不承诺 NFS/跨机事务。
+删除/复制间隙及损坏文档只报诊断、保留字节；网页显示原生列表，无最后成功图兜底。手工 rm 会真正删除该文件内该 era 的历史，包括迁移之后新增事件；不会自动归档未观察到的人工编辑。完整备份优先用 agent clear，或在 rm 前自行复制到私有 dated 文件；备份不会供给授权。重置不停止 agent/child；不得从旧记忆重建自己职责。query/rebuild/init/reinstall 均不导入旧 JSON。CLI 在同一 `registry.lock` 下校验 token、当前授权、序列化/readback，并在 fsync 临时文件后、atomic replace 前重检原字节/文件身份；不盲重试。非协作 editor 可在最终重检与 rename 之间抢写，标准 POSIX 无比较交换 rename；建议重置时暂停登记写入。不要删除/更换锁 inode。只支持同机本地 POSIX，不承诺 NFS/跨机事务。
 
 安装/迁移/崩溃恢复和不复活旧数据的代码回退流程见 [migration.md](migration.md)。历史可长期增大，网页上限 8 MiB，超限明确停用分组，不静默截断。
+
+## 用户授权的带备份 clear / restore
+
+自然语言“取消所有的负责人关系”“重建负责人关系”都用 clear；无需后续任命。若用户明确附带新任命，clear 后重新 query，再只登记该任命。全局操作只接受实际用户授权的 `--actor user --reason --authority`，字段是自我声明，不是身份认证边界；peer/角色权限不能清空全局。
+
+```bash
+python3 "$RR" query > /absolute/private/current-query.json
+cat /absolute/private/current-query.json # 核对当前图、用户请求与上级；不是自动重试
+TOKEN=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["document_token"])' /absolute/private/current-query.json)
+python3 "$RR" clear --expected-document "$TOKEN" --actor user \
+  --reason '用户明确取消全部登记关系' --authority '实际用户消息/时间依据'
+python3 "$RR" backup-list
+# 恢复前再次独立 query、核验目标与当前图，重新提取 TOKEN：
+python3 "$RR" restore --target previous --expected-document "$TOKEN" --actor user \
+  --reason '用户明确恢复上一次关系' --authority '实际用户消息依据'
+# 也可 --target 精确ID/文件名/无歧义时区时间前缀；歧义会列候选，需向用户问清。
+# 失败后先 query 看当前图，重新取 TOKEN，并经用户授权：
+python3 "$RR" recover-switch --expected-document "$TOKEN" --actor user \
+  --reason '核对未完成关系切换' --authority '用户授权恢复索引'
+```
+
+`backups/` 中的 exact-byte MD 是不可变 pre-switch 快照；`BACKUPS.md` 显示秒+时区时间、根姓名/parent→child角色、计数、理由/授权、snapshot/hash/status。只有 completed 且匹配 hash/严格 v2 解析的快照可恢复；query/projector 从不读索引/备份作为当前状态，JSON/dashboard永不候选。previous 在创建新备份**之前**解析：A→clear(s1=A)→restore previous(A,s2=empty)→restore previous(empty,s3=A)。目标选定后先备份 CURRENT，再用 fresh UUID era 恢复目标原 revision/history；不复用快照 era，不新增伪历史，不重启任务/进程。旧 terms_digest 缺失的确认保持 not-ready 并报告 readiness_changes，不暗中重签。
+
+快照目录0700，快照/索引0600，时间+序号+UUID且 O_EXCL/fsync 保证同秒不碰撞。快照或 pre-switch 索引失败，live字节/inode不变；pending证据须显式 recover。切换后索引失败会非零报 `switched; index incomplete`；不要认为未切换。`recover-switch` 比较 journal 的 before/after hash与当前真实MD，匹配 before 则aborted，匹配 after 则completed；任何人工分歧只报错保留，不重放旧数据。非completed记录不入 previous，pending会阻止后续mutation。
+
+OS级 rm 无法拦截，故手工路径没有 guaranteed backup。需要保留本era全部历史/未观察人工编辑时，用 clear；如果必须手工，可先做私有 dated copy，并在同一 CLI lock 内执行：
+
+```bash
+PRIV="$HOME/.pi/agent/.memory/local/responsibility-registry"
+L="$HOME/.pi/agent/skills/responsibility-registry/RESPONSIBILITIES.md"
+T="$HOME/.pi/agent/skills/responsibility-registry/RESPONSIBILITIES.template.md"
+flock "$PRIV/registry.lock" sh -c 'rm -- "$1" && cp -- "$2" "$1"' sh "$L" "$T"
+```
+
+这只是可选协作串行方式；用户原始 `rm`+`cp` 仍有效，不需JSON删除/隐藏reset步骤/服务重启。任何reset/restore后重新读era和当前行；缺失行不能凭旧任命/旧记忆重新登记。
 
 ## 维护验证
 

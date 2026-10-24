@@ -254,7 +254,9 @@ def validate_agreement(state, value):
     require(isinstance(value['acknowledgements'], dict), 'invalid acknowledgements')
     require(set(value['acknowledgements']) <= participants, 'acknowledgement from nonparticipant')
     for ack in value['acknowledgements'].values():
-        keys(ack, ['at', 'evidence'])
+        keys(ack, ['at', 'evidence'], ['terms_digest'])
+        digest = ack.get('terms_digest')
+        require(digest is None or (isinstance(digest, str) and re.fullmatch(r'[0-9a-f]{64}', digest)), 'invalid terms digest')
         text(ack['at'], 'ack timestamp')
         text(ack['evidence'], 'explicit acknowledgement evidence, not sent-message receipt')
     require(value['status'] != 'confirmed' or set(value['acknowledgements']) == participants,
@@ -265,6 +267,11 @@ def assignment_digest(value):
     return hashlib.sha256(json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(',', ':'), allow_nan=False).encode('utf-8')).hexdigest()
 
 
+def terms_digest(value):
+    terms = {k: v for k, v in value.items() if k not in ('status', 'acknowledgements', 'created_at', 'updated_at')}
+    return assignment_digest(terms)
+
+
 def agreement_view(state, value, legacy=False):
     reasons = []
     participants = sorted({b['owner'] for b in value['scopes'].values()})
@@ -273,6 +280,8 @@ def agreement_view(state, value, legacy=False):
     missing = sorted(set(participants) - set(value['acknowledgements']))
     if missing:
         reasons.append('explicit acknowledgement missing: ' + ', '.join(missing))
+    if not legacy and any(ack.get('terms_digest') != terms_digest(value) for ack in value['acknowledgements'].values()):
+        reasons.append('terms changed; renegotiate')
     for aid, b in value['scopes'].items():
         a = state['assignments'].get(aid, {})
         if (a.get('status') != 'active' or a.get('owner') != b['owner'] or
@@ -289,6 +298,8 @@ INSTRUCTIONS = (
     'Edit the visible rows. Details are additional fields, never duplicate columns.',
     'To start over: delete this live file, then copy RESPONSIBILITIES.template.md here.',
     'Reset changes registered authority; it does not stop running agents.',
+    'Parent values: user or owner:ID (bare stable ID). Use the CLI to appoint after a template reset.',
+    'Manual deletion loses this file and its history. Prefer agent-managed clear when a complete backup matters.',
 )
 SECTIONS = (
     ('Owners', 'owners', ('ID', 'Name', 'Role', 'Parent'), ('id', 'name', 'role', 'parent')),
@@ -390,8 +401,8 @@ def serialize_document(state, era):
 
 def parse_document(content):
     require(isinstance(content, str), 'UTF-8 document text required')
-    # Only LF separates structural lines; CR is data only via entity encoding.
-    lines = content.split('\n')
+    # Accept editor CRLF structural lines; literal data CR remains entity encoded.
+    lines = content.replace('\r\n', '\n').split('\n')
     pos = 0
     section = 'preamble'
     def take(expected=None):
@@ -404,6 +415,10 @@ def parse_document(content):
         require(expected is None or value == expected,
                 f'{section} line {pos}: expected {expected!r}; got {value!r}')
         return value
+    def table_cells(line):
+        line = line.rstrip(' \t')
+        require(line.startswith('|') and line.endswith('|'), f'{section} line {pos}: required outer delimiters')
+        return [cell.strip(' ') for cell in line[1:-1].split('|')]
     def metadata(label):
         value = take()
         require(value.startswith(label + ': '), f'{section} line {pos}: expected unique {label}')
@@ -423,8 +438,10 @@ def parse_document(content):
     for heading, kind, headers, fields in SECTIONS:
         section = heading
         take('## ' + heading)
-        take('| ' + ' | '.join((*headers, 'Details (JSON)')) + ' |')
-        take('| ' + ' | '.join(['---'] * (len(headers) + 1)) + ' |')
+        require(table_cells(take()) == list((*headers, 'Details (JSON)')), f'{section} line {pos}: wrong column headers')
+        separators = table_cells(take())
+        require(len(separators) == len(headers) + 1 and all(re.fullmatch(r':?-{3,}:?', cell) for cell in separators),
+                f'{section} line {pos}: invalid table separator')
         while pos < len(lines):
             if lines[pos] == '':
                 pos += 1
@@ -432,7 +449,7 @@ def parse_document(content):
             if not lines[pos].startswith('|'):
                 break
             line_no = pos + 1
-            line = lines[pos]
+            line = lines[pos].rstrip(' \t')
             pos += 1
             try:
                 require(line.endswith('|'), 'required outer table delimiters')

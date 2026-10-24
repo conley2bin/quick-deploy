@@ -674,7 +674,7 @@ for i in "${!skill_dirs[@]}"; do
     if [[ "$name" == responsibility-registry ]]; then
       # Never remove/recreate this directory or copy the live authority file,
       # including one accidentally present in a source checkout.
-      tar -C "$skill_dir" --exclude='./RESPONSIBILITIES.md' --exclude='__pycache__' -cf - . |
+      tar -C "$skill_dir" --exclude='./RESPONSIBILITIES.md' --exclude='./BACKUPS.md' --exclude='./backups' --exclude='./.responsibilities-*' --exclude='./.RESPONSIBILITIES.md-*' --exclude='./.BACKUPS.md-*' --exclude='__pycache__' -cf - . |
         tar -C "$dest" -xf -
       registry_root="$(python3 - "$dest" <<'PYROOT'
 from pathlib import Path

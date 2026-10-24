@@ -39,6 +39,8 @@ class RegistryTests(unittest.TestCase):
         self.cli('init')
 
     def cli(self, *args, payload=None, ok=True):
+        if args[0] == 'rebuild' and '--output' not in args:
+            args = (*args, '--output', str(self.root / 'report.md'))
         if args[0] in ['register', 'update-owner', 'update', 'close', 'handover', 'coord-propose', 'coord-ack', 'coord-release']:
             args = (*args, '--expected-document', self.cli('query')['document_token'])
         result = subprocess.run([sys.executable, str(SCRIPT), '--root', str(self.root), '--document', str(self.document), *args],
@@ -121,7 +123,7 @@ class RegistryTests(unittest.TestCase):
         unresolved = self.cli('query')['hierarchy'][0]
         self.assertFalse(unresolved['parent_resolved'])
         self.assertEqual(unresolved['parent'], 'owner:superior')  # Never promote unresolved parent to user.
-        self.assertIn('未登记，待解析', (self.root / 'dashboard.md').read_text())
+        self.assertIn('未登记，待解析', (self.root / 'report.md').read_text())
         q = appointment('superior', parent='owner:alpha')
         q.pop('assignment')
         before = self.document.read_bytes()
@@ -178,7 +180,7 @@ class RegistryTests(unittest.TestCase):
         p['owner']['name'] = '甲“负责人” |\n第二行 <script> & `引号`'
         p['assignment']['objective'] = '范围 | 中文\n下一目标'
         self.register(p)
-        document = (self.root / 'dashboard.md').read_text()
+        document = (self.root / 'report.md').read_text()
         self.assertIn('甲“负责人” &#124;<br>第二行 &lt;script&gt; &amp; &#96;引号&#96;', document)
         self.assertIn('范围 &#124; 中文<br>下一目标', document)
         self.assertNotIn('<script>', document)
@@ -197,23 +199,23 @@ class RegistryTests(unittest.TestCase):
         self.register()
         good = self.document.read_text()
         malformed = ['{bad', good.replace('Revision: 1', 'Revision: 9'), good.replace('Format: responsibility-registry/v2', 'Format: unknown')]
-        old_dashboard = (self.root / 'dashboard.md').read_bytes()
+        old_dashboard = (self.root / 'report.md').read_bytes()
         for broken in malformed:
             self.document.write_text(broken)
             for action in ['rebuild', 'query']:
                 self.assertIn('invalid', self.cli(action, ok=False))
                 self.assertEqual(self.document.read_text(), broken)
-                self.assertEqual((self.root / 'dashboard.md').read_bytes(), old_dashboard)
+                self.assertEqual((self.root / 'report.md').read_bytes(), old_dashboard)
         self.document.unlink()
         self.assertIn('prior initialization', self.cli('init', ok=False))
 
     def test_query_does_not_repair_optional_report(self):
         self.register()
-        (self.root / 'dashboard.md').write_text('stale')
+        (self.root / 'report.md').write_text('stale')
         self.cli('query')
-        self.assertEqual((self.root / 'dashboard.md').read_text(), 'stale')
+        self.assertEqual((self.root / 'report.md').read_text(), 'stale')
         self.cli('rebuild')
-        self.assertIn('修订 1', (self.root / 'dashboard.md').read_text())
+        self.assertIn('修订 1', (self.root / 'report.md').read_text())
 
     def test_multiprocess_registration_serializes_and_rejects_shared_stale_token(self):
         token = self.cli('query')['document_token']
@@ -279,7 +281,7 @@ class RegistryTests(unittest.TestCase):
         self.assertTrue(view['agreement_ready'])
         self.assertEqual(view['status'], 'confirmed')
         self.assertEqual(view['participants'], ['alpha', 'beta'])
-        self.assertIn('shared/schema.py', (self.root / 'dashboard.md').read_text())
+        self.assertIn('shared/schema.py', (self.root / 'report.md').read_text())
         # Goal/boundary basis changes make old acknowledgement unusable; no silent reuse.
         updated = copy.deepcopy(p['assignment'])
         updated['objective'] = '方向范围发生改变，需重新协调'
@@ -349,7 +351,7 @@ class RegistryTests(unittest.TestCase):
             self.assertRegex(e['at'], r'^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{2}:\d{2}$')
             self.assertEqual(e['occurred'], {'at': '2025-05-06T07:08:09+08:00', 'precision': 'exact'})
             self.assertNotEqual(e['at'], e['occurred']['at'])
-        dashboard = (self.root / 'dashboard.md').read_text()
+        dashboard = (self.root / 'report.md').read_text()
         self.assertIn('责任变更历史', dashboard)
         self.assertIn('alpha / 示例alpha / office场景评测负责人', dashboard)
         self.assertIn('beta / 示例beta / 接任方向负责人', dashboard)
@@ -372,7 +374,7 @@ class RegistryTests(unittest.TestCase):
                  '--occurred-at', '约2025年5月，具体秒未知', '--pending-work', '已核验无运行 child')
         event = self.state()['history'][-1]
         self.assertEqual(event['occurred'], {'at': '约2025年5月，具体秒未知', 'precision': 'approximate'})
-        self.assertIn('约略，不保证秒', (self.root / 'dashboard.md').read_text())
+        self.assertIn('约略，不保证秒', (self.root / 'report.md').read_text())
         before = self.document.read_bytes()
         self.assertIn('timezone', self.cli('close', '--actor', 'beta', '--assignment', 'release-v2',
                                            '--expected-revision', '3', '--reason', '无时区应拒绝',
@@ -394,7 +396,7 @@ class RegistryTests(unittest.TestCase):
         self.assertNotIn('repo', result['assignments']['release'])
         self.assertNotIn('goal_source', result['assignments']['release'])
         self.cli('rebuild')
-        self.assertIn('历史未录入，待确认', (self.root / 'dashboard.md').read_text())
+        self.assertIn('历史未录入，待确认', (self.root / 'report.md').read_text())
         self.assertEqual(self.document.read_text(), content)
 
     def test_project_identity_consistency_and_task_identity_immutable(self):

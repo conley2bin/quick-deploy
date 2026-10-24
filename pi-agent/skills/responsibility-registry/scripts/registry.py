@@ -19,7 +19,7 @@ DEFAULT_DOCUMENT = Path.home() / '.pi/agent/skills/responsibility-registry/RESPO
 
 from registry_document import (RegistryError, require, parse_json, text, keys, identity,
     validate_time, goal_source, recovery_context, owner, scope, check_graph, validate,
-    validate_agreement, agreement_view, assignment_digest, parse_document, serialize_document,
+    validate_agreement, agreement_view, assignment_digest, terms_digest, parse_document, serialize_document,
     FORMAT, TEMPLATE_ERA)
 
 
@@ -50,10 +50,10 @@ def coordinate(state, args, payload, stamp):
         require(args.actor in participants, 'only a participating owner can acknowledge/release its agreement')
         require(value['status'] != 'released', 'agreement released; propose a new ID')
         if args.command == 'coord-ack':
-            require(not any('scope changed' in r for r in agreement_view(state, value)['not_ready_reasons']),
+            require(not any(('scope changed' in r or 'terms changed' in r) for r in agreement_view(state, value)['not_ready_reasons']),
                     'scope changed; release and renegotiate before acknowledgement')
             require(args.actor not in value['acknowledgements'], 'owner already acknowledged; query existing evidence')
-            value['acknowledgements'][args.actor] = dict(at=stamp, evidence=args.reason)
+            value['acknowledgements'][args.actor] = dict(at=stamp, evidence=args.reason, terms_digest=terms_digest(value))
             if set(value['acknowledgements']) == participants:
                 value['status'] = 'confirmed'
         else:
@@ -181,12 +181,12 @@ def parent_label(state, parent):
     return f'owner:{oid}' + (f'（{state["owners"][oid]["name"]}）' if oid in state['owners'] else '（未登记，待解析）')
 
 
-def dashboard(state):
+def dashboard(state, era):
     owners, assignments = state['owners'], state['assignments']
-    lines = ['# 全局责任登记簿', '', f'版本 1 · 修订 {state["revision"]}', '',
+    lines = ['# 全局责任登记簿', '', f'Era {era} · 版本 1 · 修订 {state["revision"]}', '',
              '登记表示责任归属，不表示在线；联系前重新核验 intercom status/list。用户是最高授权者。', '',
              '仅 parent:user 的顶层负责人向用户汇报；其他负责人逐级上报，目标/验收逐级下达。未解析上级须澄清，不自动升为顶层。', '',
-             'JSON 为唯一事实源；本页由 rebuild 重建，不要手改。历史快照见 registry.json 的 history。', '', '## 负责人 / 上下级 / 联系', '']
+             '非权威即时报告；任何编辑或重置后即可能过期。当前唯一事实源是 installed RESPONSIBILITIES.md；请重新读取。', '', '## 负责人 / 上下级 / 联系', '']
     rows = []
     for oid, o in sorted(owners.items()):
         i = o['identity']
@@ -327,22 +327,23 @@ class Store:
             return None
         control = parse_json(path.read_text(encoding='utf-8'))
         keys(control, ['kind', 'status', 'document'],
-             ['migration_id', 'source_sha256', 'backup', 'staged', 'staged_sha256', 'era'])
+             ['migration_id', 'source_sha256', 'backup', 'staged', 'staged_sha256', 'era', 'dashboard_backup', 'dashboard_sha256'])
         require(control['kind'] in ['initialization', 'migration'] and control['status'] in ['pending', 'completed'],
                 'invalid document control marker; preserve and reconcile explicitly')
         require(control['document'] == str(self.document), 'document control path mismatch')
         if control['kind'] == 'migration':
-            require(all(k in control for k in ['migration_id', 'source_sha256', 'backup', 'staged', 'staged_sha256', 'era']),
+            require(all(k in control for k in ['migration_id', 'source_sha256', 'backup', 'staged', 'staged_sha256', 'era', 'dashboard_backup', 'dashboard_sha256']),
                     'incomplete migration control marker')
         return control
 
-    def run(self, fn, expected_document=None, rebuild=False):
+    def run(self, fn, expected_document=None):
         def operation():
             state, envelope, raw, stat = self.read_document()
             self.envelope = envelope
             control = self.control()
             envelope['cutover_status'] = control['status'] if control else 'unmanaged'
             if expected_document is not None:
+                require(not self.switch_journal.exists(), 'pending switch; run recover-switch before mutation')
                 require(not control or control.get('status') == 'completed',
                         'pending initialization/cutover; explicit recovery required before mutation')
                 require(expected_document == envelope['document_token'],
@@ -364,8 +365,6 @@ class Store:
                 check, current, _, _ = self.read_document()
                 require(check == state and current['era'] == era, 'post-write validation mismatch')
                 self.envelope = current
-            if rebuild:
-                atomic_write(self.root / 'dashboard.md', dashboard(state))
             if isinstance(result, dict):
                 result.update(self.envelope)
             return result
@@ -455,6 +454,10 @@ class Store:
                         matching = (assignment['status'] == 'active' and assignment['owner'] == boundary['owner'] and
                                     assignment['updated_at'] == boundary['assignment_updated_at'] and assignment.get('repo') == a['repo'])
                         boundary['assignment_digest'] = assignment_digest(assignment) if matching else None
+                for agreement in normalized['coordination'].values():
+                    digest = terms_digest(agreement)
+                    for ack in agreement['acknowledgements'].values():
+                        ack['terms_digest'] = digest
                 era = str(uuid.uuid4())
                 staged = serialize_document(normalized, era)
                 parsed, parsed_era = parse_document(staged)
@@ -471,7 +474,9 @@ class Store:
                         'durable migration staging readback failed')
                 control = dict(kind='migration', status='pending', migration_id=migration_id, document=str(self.document),
                                source_sha256=hashlib.sha256(raw).hexdigest(), backup=str(backup), staged=str(stage),
-                               staged_sha256=hashlib.sha256(staged.encode()).hexdigest(), era=era)
+                               staged_sha256=hashlib.sha256(staged.encode()).hexdigest(), era=era,
+                               dashboard_backup=str(self.root / ('legacy-' + migration_id + '.dashboard.md')),
+                               dashboard_sha256=hashlib.sha256((self.root / 'dashboard.md').read_bytes()).hexdigest() if (self.root / 'dashboard.md').exists() else None)
                 atomic_write(marker, json.dumps(control, indent=2) + '\n')
                 self.migration_checkpoint('prepared')
                 require(hashlib.sha256(legacy.read_bytes()).hexdigest() == control['source_sha256'],
@@ -480,6 +485,9 @@ class Store:
                                  note='Markdown cutover; deliberately invalid legacy state. Never restore as active JSON.')
                 atomic_write(legacy, json.dumps(tombstone) + '\n')
                 self.migration_checkpoint('fenced')
+            self.retire_dashboard(control)
+            if not self.backup_index.exists():
+                self.write_backup_index([])
             backup = Path(control['backup'])
             require(hashlib.sha256(backup.read_bytes()).hexdigest() == control['source_sha256'], 'migration backup digest mismatch')
             validate(parse_json(backup.read_text(encoding='utf-8')))
@@ -504,8 +512,218 @@ class Store:
                         revision=parse_document(staged.decode('utf-8'))[0]['revision'])
         return self.locked(operation, create=True)
 
+    def retire_dashboard(self, control):
+        path = self.root / 'dashboard.md'
+        tombstone = ('# Superseded responsibility report\n\n'
+                     'This path contains no current authority. Reread ' + str(self.document) +
+                     ' for current owners and relations. Never restore roles from old reports or memory.\n')
+        expected = control.get('dashboard_sha256')
+        backup = Path(control.get('dashboard_backup') or self.root / ('legacy-' + control['migration_id'] + '.dashboard.md'))
+        if expected is not None:
+            if not backup.exists():
+                raw = path.read_bytes()
+                require(hashlib.sha256(raw).hexdigest() == expected, 'legacy dashboard diverged; preserve and reconcile')
+                exclusive_file(backup, raw)
+            require(hashlib.sha256(backup.read_bytes()).hexdigest() == expected, 'legacy dashboard backup digest mismatch')
+        if path.exists():
+            raw = path.read_bytes()
+            require(raw == tombstone.encode() or (expected is not None and hashlib.sha256(raw).hexdigest() == expected),
+                    'legacy dashboard diverged; preserve and reconcile')
+        atomic_write(path, tombstone)
+
     def migration_checkpoint(self, phase):
         """Deterministic crash-injection seam for isolated tests; no runtime switch."""
+
+    @property
+    def backup_index(self):
+        return self.document.parent / 'BACKUPS.md'
+
+    @property
+    def switch_journal(self):
+        return self.root / 'switch-pending.json'
+
+    def read_backup_index(self):
+        if not self.backup_index.exists():
+            return []
+        require(not self.backup_index.is_symlink(), 'backup index cannot be a symlink')
+        content = self.backup_index.read_text(encoding='utf-8')
+        marker = '## Switch records (audit JSON)\n```json\n'
+        require(content.count(marker) == 1 and content.endswith('\n```\n'), 'invalid backup index; preserve and reconcile')
+        records = parse_json(content.split(marker, 1)[1][:-5])
+        require(isinstance(records, list), 'backup index records must be an array')
+        seen = set()
+        for record in records:
+            keys(record, ['id', 'sequence', 'time', 'action', 'actor', 'reason', 'authority', 'snapshot', 'sha256',
+                          'status', 'summary', 'before_token', 'after_sha256', 'after_era', 'target_id', 'readiness_changes'])
+            require(record['id'] not in seen and type(record['sequence']) is int and record['sequence'] > 0,
+                    'duplicate/invalid backup ID/sequence')
+            seen.add(record['id'])
+            require(record['status'] in ['pending', 'completed', 'aborted', 'switched-index-incomplete'], 'invalid backup status')
+            require(record['action'] in ['clear', 'restore'] and record['actor'] == 'user', 'invalid switch action/actor')
+            validate_time(dict(at=record['time'], precision='exact'))
+            for field in ['id', 'reason', 'authority', 'snapshot', 'sha256', 'after_sha256', 'after_era']:
+                text(record[field], 'backup.' + field)
+        return records
+
+    def write_backup_index(self, records):
+        lines = ['# Responsibility relationship backups', '',
+                 'Historical switch index, NOT current authority. Read RESPONSIBILITIES.md for current relations.',
+                 'Only completed, hash-verified Markdown snapshots are restore candidates. Restoring does not restart agents/jobs.', '']
+        for record in records:
+            summary = record['summary']
+            lines += ['## ' + record['time'] + ' · ' + record['action'] + ' · ' + record['status'],
+                      '- ID: ' + record['id'] + ' · sequence: ' + str(record['sequence']),
+                      '- Reason: ' + cell(record['reason']) + ' · user authority: ' + cell(record['authority']),
+                      '- Prior era/revision: ' + summary['era'] + ' / ' + str(summary['revision']),
+                      '- Counts: owners=' + str(summary['owners']) + ', assignments=' + str(summary['assignments']) +
+                      ', coordination=' + str(summary['coordination']) + ', history=' + str(summary['history']),
+                      '- Roots: ' + (', '.join(cell(x) for x in summary['roots']) or '(none)'),
+                      '- Relationships (parent → child / role): ' + ('; '.join(cell(x) for x in summary['relations']) or '(none)'),
+                      '- Snapshot: [' + record['id'] + '](' + record['snapshot'] + ')',
+                      '- SHA-256: `' + record['sha256'] + '`', '']
+        lines += ['## Switch records (audit JSON)', '```json', json.dumps(records, ensure_ascii=False, indent=2, allow_nan=False), '```', '']
+        require(not self.backup_index.is_symlink(), 'backup index cannot be a symlink')
+        atomic_write(self.backup_index, '\n'.join(lines))
+
+    def snapshot_bytes(self, record):
+        name = record['snapshot']
+        require(isinstance(name, str) and name.startswith('backups/') and
+                Path(name).name.endswith('.md') and name == 'backups/' + Path(name).name and Path(name).name not in ['.', '..'],
+                'restore target must be a known backups/*.md snapshot, never legacy JSON')
+        directory = self.document.parent / 'backups'
+        path = self.document.parent / name
+        require(not directory.is_symlink() and not path.is_symlink() and path.is_file(), 'snapshot missing or symlink; preserve current')
+        raw = path.read_bytes()
+        require(hashlib.sha256(raw).hexdigest() == record['sha256'], 'snapshot hash mismatch; preserve current')
+        state, era = parse_document(raw.decode('utf-8'))
+        return raw, state, era
+
+    def backup_candidates(self):
+        return [r for r in self.read_backup_index() if r['status'] == 'completed']
+
+    def resolve_backup(self, target):
+        records = self.backup_candidates()
+        if target == 'previous':
+            matches = records[-1:]  # resolved BEFORE the new current backup exists
+        else:
+            matches = [r for r in records if target in [r['id'], r['snapshot'], Path(r['snapshot']).name] or r['time'].startswith(target)]
+        require(matches, 'no completed Markdown snapshot matches; legacy JSON/dashboard are never candidates')
+        require(len(matches) == 1, 'ambiguous restore target; ask user to select: ' +
+                json.dumps([dict(id=r['id'], time=r['time'], snapshot=r['snapshot'], summary=r['summary']) for r in matches], ensure_ascii=False))
+        self.snapshot_bytes(matches[0])
+        return matches[0]
+
+    def switch_authority(self, actor, reason, authority):
+        require(actor == 'user', 'global clear/restore/recovery requires actual direct user authority, not a role-bound peer')
+        text(reason, 'user switch reason')
+        text(authority, 'direct user authorization evidence')
+
+    def switch_document(self, action, expected_document, actor, reason, authority, target=None):
+        """Explicit backed-up clear/restore. No history replay or execution restart."""
+        self.switch_authority(actor, reason, authority)
+        require(action in ['clear', 'restore'], 'invalid switch action')
+        def operation():
+            state, envelope, raw, stat = self.read_document()
+            require(expected_document == envelope['document_token'], 'stale expected document; reread current Markdown before switch')
+            control = self.control()
+            require(not control or control['status'] == 'completed', 'pending cutover; recover explicitly before switch')
+            require(not self.switch_journal.exists(), 'pending switch; run recover-switch before any further mutation')
+            records = self.read_backup_index()
+            require(not any(r['status'] in ['pending', 'switched-index-incomplete'] for r in records), 'pending backup index; recover explicitly')
+            selected = self.resolve_backup(text(target, 'restore target')) if action == 'restore' else None
+            # Resolve and hash/parse the target BEFORE saving current; repeated previous toggles.
+            desired = self.snapshot_bytes(selected)[1] if selected else empty()
+            era = str(uuid.uuid4())
+            content = serialize_document(desired, era)
+            require(parse_document(content) == (desired, era), 'switch serialization mismatch')
+            readiness_changes = {}
+            if selected:
+                for cid, agreement in desired.get('coordination', {}).items():
+                    legacy_ready = agreement_view(desired, agreement, legacy=True)['agreement_ready']
+                    current_ready = agreement_view(desired, agreement)['agreement_ready']
+                    if legacy_ready != current_ready:
+                        readiness_changes[cid] = dict(legacy_ready=legacy_ready, restored_ready=current_ready,
+                                                     reasons=agreement_view(desired, agreement)['not_ready_reasons'])
+            timestamp = datetime.now(timezone.utc).isoformat(timespec='seconds')
+            sequence = max((r['sequence'] for r in records), default=0) + 1
+            identifier = f'{timestamp}-{sequence:06d}-{uuid.uuid4()}'
+            owners = state['owners']
+            def parent_name(parent):
+                return 'user' if parent == 'user' else owners.get(parent[6:], {}).get('name', parent + ' (unresolved)')
+            summary = dict(era=envelope['era'], revision=state['revision'], owners=len(owners),
+                assignments=len(state['assignments']), coordination=len(state.get('coordination', {})), history=len(state['history']),
+                roots=[o['name'] + ' / ' + o['role'] + ' (' + oid + ')' for oid, o in owners.items() if o['parent'] == 'user'],
+                relations=[parent_name(o['parent']) + ' → ' + o['name'] + ' / ' + o['role'] + ' (' + oid + ')' for oid, o in owners.items()])
+            record = dict(id=identifier, sequence=sequence, time=timestamp, action=action, actor=actor, reason=reason,
+                authority=authority, snapshot='backups/' + identifier + '.md', sha256=hashlib.sha256(raw).hexdigest(),
+                status='pending', summary=summary, before_token=envelope['document_token'], after_sha256=hashlib.sha256(content.encode()).hexdigest(),
+                after_era=era, target_id=selected['id'] if selected else None, readiness_changes=readiness_changes)
+            directory = self.document.parent / 'backups'
+            require(not directory.is_symlink(), 'backups directory cannot be symlink')
+            directory.mkdir(mode=0o700, exist_ok=True)
+            directory.chmod(0o700)
+            exclusive_file(self.document.parent / record['snapshot'], raw)  # EXACT bytes bound by final recheck
+            require(self.snapshot_bytes(record)[0] == raw, 'pre-switch snapshot readback mismatch')
+            journal = dict(record=record, phase='pending')
+            atomic_write(self.switch_journal, json.dumps(journal, ensure_ascii=False, indent=2) + '\n')
+            records.append(record)
+            did_switch = False
+            try:
+                self.write_backup_index(records)  # durable pending index before replacing live
+                self.switch_checkpoint('prepared')
+                atomic_write(self.document, content, before_replace=lambda: self.recheck(raw, stat))
+                did_switch = True
+                self.switch_checkpoint('switched')
+                check, current, _, _ = self.read_document()
+                require(check == desired and current['era'] == era, 'switched document readback mismatch')
+                record['status'] = 'completed'
+                self.write_backup_index(records)
+                self.switch_journal.unlink()
+                fsync_directory(self.root)
+                return dict(action=action, backup=record['snapshot'], restored_from=record['target_id'],
+                            readiness_changes=readiness_changes, **current)
+            except (OSError, RegistryError, ValueError) as exc:
+                # The durable journal contains both hashes even if index writes fail.
+                # A conflicting manual replacement is not overwritten or reconstructed.
+                current_raw = self.document.read_bytes() if self.document.exists() else None
+                switched = did_switch or (current_raw is not None and hashlib.sha256(current_raw).hexdigest() == record['after_sha256'])
+                record['status'] = 'switched-index-incomplete' if switched else 'aborted'
+                try:
+                    atomic_write(self.switch_journal, json.dumps(dict(record=record, phase=record['status']), ensure_ascii=False, indent=2) + '\n')
+                except OSError:
+                    pass  # Original pending journal remains explicit recoverable evidence.
+                raise RegistryError(('switched; index incomplete' if switched else 'switch not performed; recovery required') + ': ' + str(exc)) from exc
+        return self.locked(operation)
+
+    def recover_switch(self, expected_document, actor, reason, authority):
+        self.switch_authority(actor, reason, authority)
+        def operation():
+            state, envelope, raw, stat = self.read_document()
+            require(envelope['document_token'] == expected_document, 'stale expected document before recovery')
+            require(self.switch_journal.exists(), 'no pending switch to recover')
+            journal = parse_json(self.switch_journal.read_text(encoding='utf-8'))
+            record = journal['record']
+            self.snapshot_bytes(record)
+            digest = hashlib.sha256(raw).hexdigest()
+            require(digest in [record['sha256'], record['after_sha256']], 'pending switch diverged; preserve current and reconcile explicitly')
+            record['status'] = 'completed' if digest == record['after_sha256'] else 'aborted'
+            records = self.read_backup_index()
+            prior = next((r for r in records if r['id'] == record['id']), None)
+            if prior:
+                require(all(prior[k] == record[k] for k in record if k != 'status'), 'backup index/journal mismatch; preserve evidence')
+                records[records.index(prior)] = record
+            else:
+                records.append(record)
+            self.recheck(raw, stat)
+            self.write_backup_index(records)
+            self.switch_journal.unlink()
+            fsync_directory(self.root)
+            return dict(recovered=record['status'], backup=record['snapshot'], **envelope)
+        return self.locked(operation)
+
+    def switch_checkpoint(self, phase):
+        """Deterministic isolated interruption seam; no production fault knob."""
+
 
 
 def normalize_scope(value, source=None):
@@ -696,8 +914,19 @@ def main(argv=None):
     parser.add_argument('--document', type=Path, help='explicit live Markdown path; mandatory with alternate --root')
     parser.add_argument('--root', type=Path, default=DEFAULT_ROOT, help='private store; override only for explicit alternate store/tests')
     commands = parser.add_subparsers(dest='command', required=True)
-    for name in ['init', 'rebuild', 'migrate', 'resume-migration', 'recover-initialization']:
+    for name in ['init', 'migrate', 'resume-migration', 'recover-initialization']:
         commands.add_parser(name)
+    report = commands.add_parser('rebuild', help='non-authoritative report to stdout or explicit --output, never dashboard.md')
+    report.add_argument('--output', type=Path)
+    commands.add_parser('backup-list', help='historical completed snapshot candidates; never current authority')
+    for command in ['clear', 'restore', 'recover-switch']:
+        p = commands.add_parser(command)
+        p.add_argument('--expected-document', required=True)
+        p.add_argument('--actor', required=True)
+        p.add_argument('--reason', required=True)
+        p.add_argument('--authority', required=True, help='actual direct user authorization evidence')
+        if command == 'restore':
+            p.add_argument('--target', required=True, help='previous, exact backup ID/name, or unambiguous timezone timestamp prefix')
     q = commands.add_parser('query', help='JSON including hierarchy and dependency relations')
     for name in ['owner', 'project', 'task', 'repo']:
         q.add_argument('--' + name)
@@ -739,8 +968,26 @@ def main(argv=None):
             result = store.recover_initialization()
         elif args.command in ['migrate', 'resume-migration']:
             result = store.migrate(resume=args.command == 'resume-migration')
+        elif args.command == 'backup-list':
+            result = store.locked(lambda: dict(backups=store.backup_candidates()))
+        elif args.command in ['clear', 'restore']:
+            result = store.switch_document(args.command, args.expected_document, args.actor, args.reason, args.authority, getattr(args, 'target', None))
+        elif args.command == 'recover-switch':
+            result = store.recover_switch(args.expected_document, args.actor, args.reason, args.authority)
         elif args.command == 'rebuild':
-            result = store.run(lambda s: dict(dashboard=str(store.root / 'dashboard.md')), rebuild=True)
+            result = store.run(lambda s: dict(report=dashboard(s, store.envelope['era'])))
+            if args.output is None:
+                print(result['report'])
+                return 0
+            output = args.output.expanduser().resolve()
+            require(output not in [store.document.resolve(), (store.root / 'dashboard.md').resolve(),
+                                   (store.root / 'registry.json').resolve(), (store.root / 'registry.lock').resolve(),
+                                   (store.root / 'document-control.json').resolve(), (store.root / 'switch-pending.json').resolve(),
+                                   store.document.parent / 'BACKUPS.md'] and
+                    store.document.parent / 'backups' not in output.parents,
+                    'report output cannot replace authority, legacy tombstone or backups')
+            atomic_write(output, result.pop('report'))
+            result['output'] = str(output)
         elif args.command == 'query':
             result = store.run(lambda s: query(s, args))
         else:

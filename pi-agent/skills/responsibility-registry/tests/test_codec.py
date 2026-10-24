@@ -21,6 +21,19 @@ class CodecTests(unittest.TestCase):
             with self.assertRaises(codec.RegistryError):
                 codec.parse_document(bad)
 
+    def test_editor_table_padding_separators_crlf_and_trailing_space(self):
+        state = dict(version=1, revision=0, owners={}, assignments={}, coordination={}, history=[])
+        content = codec.serialize_document(state, 'template')
+        lines = []
+        for line in content.splitlines():
+            if line.startswith('| ---'):
+                line = '|' + '|'.join(':---:' for _ in line[1:-1].split('|')) + '|'
+            elif line.startswith('|'):
+                line = '|' + '|'.join('    ' + c.strip() + '    ' for c in line[1:-1].split('|')) + '|'
+            lines.append(line + '  \t' if line.startswith('|') else line)
+        formatted = '\r\n'.join(lines) + '\r\n'
+        self.assertEqual(codec.parse_document(formatted), (state, 'template'))
+
     def test_one_pass_cells_and_json(self):
         value = '  中文 | &#124; & <br> \\| \\n **[词](路径)** `引号`\r\n下一行\t  '
         self.assertEqual(codec.decode_cell(codec.encode_cell(value)), value)

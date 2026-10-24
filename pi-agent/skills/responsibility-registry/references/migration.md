@@ -6,8 +6,9 @@ This is an **explicit operator action**. Installing source does not authorize mi
 
 1. Identify the live skill COPY and the owned external adapter; do not edit the installed copy as source. Deploy this skill's codec/CLI/template using the selected-skill installer, which excludes `RESPONSIBILITIES.md` categorically. Existing live bytes/inode remain untouched, including invalid documents. Legacy-only destinations are left uninitialized.
 2. Deploy the compatible external projector/browser code together with the installed pure codec. The production projector loads only `~/.pi/agent/skills/responsibility-registry/scripts/registry_document.py`, then reads only the sibling `RESPONSIBILITIES.md`, under the existing private lock. It never invokes Store/CLI or imports legacy JSON. HTTP callers cannot select paths. Preflight isolated fixtures and the authenticated real public session schema before the separately approved adapter activation.
-3. Old processes already holding the lock must finish before migration snapshots JSON. An old CLI loaded before deployment can be queued; a marker alone cannot stop it. The explicit migration replaces legacy JSON with an old-validator-invalid tombstone **after** durable backup and full Markdown roundtrip verification. Do not delete that tombstone or restore the backup over it.
-4. Before MD publication, new readers report missing and new writers refuse. Old code continues using legacy until the fence; after the fence it fails rather than maintaining a second writable authority. Temporary unavailability is expected. Do not use query/init/reinstall to repair it.
+3. Old dashboard bytes are also saved as private `legacy-<migration UUID>.dashboard.md`, then that path is permanently replaced by a relation-free pointer to current MD. `rebuild` emits a non-authoritative era/revision report to stdout or an explicit output path, never the legacy dashboard.
+4. Old processes already holding the lock must finish before migration snapshots JSON. An old CLI loaded before deployment can be queued; a marker alone cannot stop it. The explicit migration replaces legacy JSON with an old-validator-invalid tombstone **after** durable backup and full Markdown roundtrip verification. Do not delete that tombstone or restore the backup over it.
+5. Before MD publication, new readers report missing and new writers refuse. Old code continues using legacy until the fence; after the fence it fails rather than maintaining a second writable authority. Temporary unavailability is expected. Do not use query/init/reinstall to repair it.
 
 ## Cutover command
 
@@ -23,12 +24,12 @@ python3 "$RR" query
 
 - Saves exact raw JSON bytes as a unique mode-0600 private `legacy-<migration UUID>.json`, with SHA256 and fsync.
 - Reconstructs a new UUID era with all IDs, registration order, parent/identity/recovery/source, assignment lifecycle/dependencies/time/handover obligations, coordination and complete semantic history. Optional historical omissions remain omissions. No history event is invented for the envelope.
-- Extends each coordination boundary with a complete-assignment SHA256 **only when** its legacy owner/status/repo/updated-at checks match. Stale boundaries get null digest; original acknowledgements/boundaries stay intact. Ready/stale classifications must match before and after.
+- Extends each coordination boundary with a complete-assignment SHA256 **only when** its legacy owner/status/repo/updated-at checks match. Stale boundaries get null digest; original acknowledgement times/evidence and boundaries stay intact. Existing acknowledgements additionally receive the digest of unchanged current agreement terms; subsequent manual Integration owner/write_scope/interface edits invalidate readiness. Ready/stale classifications must match before and after.
 - Serializes a hidden 0600 staging MD in the live document directory; strict-parses it and compares full reconstructed state and readiness, not counts. Fsyncs staging and directory before fencing JSON.
 - Saves private `document-control.json` as pending, with migration ID, source/backup/stage hashes and document path. Then atomically/fsynced replaces `registry.json` with the invalid legacy tombstone.
 - Publishes by exclusive hard link; an unexpected live filename is never replaced. Reads back published bytes, durably marks completed, removes the staging link. No real graph enters source/fixtures.
 
-Verify full normalized state against the backup (the only permitted delta is the documented coordination digest extension and absent-container normalization). Verify query and sanitized projector, identity binding/public API fields, all rich/history fields and agreement readiness. Record current observed values privately; no earlier counts are a cutover assertion. Adapter activation may require one approved refresh to load new code; subsequent MD edits/template copies need no refresh.
+Verify full normalized state against the backup (the only permitted deltas are the documented assignment/acknowledged-terms digest extensions and absent-container normalization). Verify query and sanitized projector, identity binding/public API fields, all rich/history fields and agreement readiness. Record current observed values privately; no earlier counts are a cutover assertion. Adapter activation may require one approved refresh to load new code; subsequent MD edits/template copies need no refresh.
 
 ## Explicit crash recovery
 
@@ -78,3 +79,11 @@ node --test codoxear/owner-groups/tests/core.test.cjs
 ```
 
 Tests cover literal delete/copy with old JSON/backup intact, manual current rows, strict codec, rich 12-owner migration/readiness, old lockholding and preloaded old writers, crash/resume/divergence, stale/cooperating writers, explicit final rename boundary, predecessor reset, installer byte/inode preservation, and reused-ID browser epochs. No production reset is a test.
+
+## User-managed switches after cutover
+
+Direct user cancel-all/rebuild requests use token-guarded `clear --actor user --reason ... --authority ...`; no new appointment is required. It first stores exact current bytes in mode0600 immutable `backups/<timezone-second>-<sequence>-<UUID>.md` under0700 directory, durably records human-readable parent/child/role evidence plus hash/status in0600 `BACKUPS.md`, then switches to a fresh empty UUID era. Restore resolves a completed target BEFORE backing up current, validates its hash and v2 format, preserves its graph/history under a new UUID era, and never restarts agents/jobs. Repeated previous toggles pre-switch states. Pending/aborted/incomplete records are not candidates. Legacy JSON/dashboard never candidates. See CLI for explicit recovery and ambiguity handling.
+
+A snapshot/pre-index failure leaves live bytes/inode untouched. Post-switch audit failure returns nonzero `switched; index incomplete`; private switch journal retains exact before/after hashes. User-authorized `recover-switch` reconciles hashes and completes/aborts the index without replaying graph data; human divergence is preserved and refused. query/projector never consult backups/index for authority. Installer excludes live/index/snapshots/staging categorically.
+
+Manual OS deletion cannot be intercepted and destroys that file's full era history, including events after migration; it does not guarantee backup of unobserved edits. Prefer agent clear when complete backup matters, otherwise make a private dated copy first. Literal rm+cp remains supported; optional same-lock flock form is documented in CLI.
