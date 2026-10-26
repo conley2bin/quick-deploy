@@ -18,16 +18,16 @@ SPEC.loader.exec_module(registry)
 
 def appointment(oid='alpha', aid='release', parent='user', path='/example/alpha'):
     return {
-        'capacity': 'accountable-owner', 'appointment': '演练：任命你为发布负责人',
-        'goal_source': {'issuer': 'user', 'source': '合成测试：用户给出目标和任命'},
-        'owner': {'id': oid, 'name': '示例' + oid, 'role': '发布负责人', 'parent': parent,
+        'capacity': 'accountable-owner', 'appointment': 'Exercise: you are appointed release owner',
+        'goal_source': {'issuer': 'user', 'source': 'Synthetic test: user supplied goals and appointment'},
+        'owner': {'id': oid, 'name': 'Example ' + oid, 'role': 'Release owner', 'parent': parent,
                   'identity': {'pi_session_id': None, 'intercom_id': None, 'source': 'unavailable',
-                               'unknown_reason': '合成测试，无真实会话'}},
-        'assignment': {'id': aid, 'project': {'name': '示例项目', 'path': path},
+                               'unknown_reason': 'Synthetic test; no real session'}},
+        'assignment': {'id': aid, 'project': {'name': 'Example project', 'path': path},
                        'repo': {'path': path + '/.git'},
-                       'goal_source': {'issuer': 'user', 'source': '合成测试：用户给出目标和任命'}, 'task': '发布',
-                       'objective': '组织目标与验收', 'acceptance': '用户接受所有交付',
-                       'depends_on': [{'kind': 'task', 'project': 'example:upstream', 'task': '构建'}]}}
+                       'goal_source': {'issuer': 'user', 'source': 'Synthetic test: user supplied goals and appointment'}, 'task': 'release',
+                       'objective': 'Organizational goals and acceptance', 'acceptance': 'User accepts all deliverables',
+                       'depends_on': [{'kind': 'task', 'project': 'example:upstream', 'task': 'build'}]}}
 
 
 class RegistryTests(unittest.TestCase):
@@ -70,25 +70,25 @@ class RegistryTests(unittest.TestCase):
         result = self.cli('query', '--owner', 'alpha')
         self.assertEqual(result['hierarchy'][0]['children'], ['beta'])
         self.assertEqual(result['relations'][0]['target']['kind'], 'task')
-        self.assertEqual(self.cli('query', '--project', 'path:/example/alpha', '--task', '发布')['revision'], 2)
+        self.assertEqual(self.cli('query', '--project', 'path:/example/alpha', '--task', 'release')['revision'], 2)
         a = p['assignment']
-        a['acceptance'] = '子代理提供证据，负责人审阅，用户接受'
+        a['acceptance'] = 'Child supplies evidence, owner reviews, user accepts'
         self.cli('update', '--actor', 'alpha', '--assignment', 'release', '--expected-revision', '2',
-                 '--reason', '细化范围内验收', payload=a)
+                 '--reason', 'Refine acceptance within scope', payload=a)
         self.assertTrue(self.cli('update', '--actor', 'alpha', '--assignment', 'release', '--expected-revision', '3',
-                                '--reason', '同样验收', payload=a)['unchanged'])
+                                '--reason', 'Same acceptance criteria', payload=a)['unchanged'])
         self.cli('handover', '--actor', 'alpha', '--assignment', 'release', '--expected-revision', '3',
-                 '--reason', '演练：用户已批准交接', '--to-owner', 'beta', '--new-assignment', 'release-v2',
-                 '--pending-work', '合成测试：已核验无运行 child', '--reporting-change', '用户明确乙接任后仍向甲报告')
+                 '--reason', 'Exercise: user approved handover', '--to-owner', 'beta', '--new-assignment', 'release-v2',
+                 '--pending-work', 'Synthetic test: verified no running children', '--reporting-change', 'User explicitly keeps beta reporting to alpha after succession')
         active = self.cli('query', '--owner', 'beta', '--active')['assignments']
         self.assertEqual(list(active), ['release-v2'])
         self.assertEqual(self.state()['assignments']['release']['status'], 'handed-over')
         self.assertEqual(self.state()['assignments']['release']['owner'], 'alpha')
         self.cli('close', '--actor', 'beta', '--assignment', 'release-v2', '--expected-revision', '4',
-                 '--reason', '目标已获用户接受')
+                 '--reason', 'User accepted the goal')
         o = q['owner']
         o['parent'] = 'user'
-        self.cli('update-owner', '--actor', 'beta', '--expected-revision', '5', '--reason', '用户明确改为直报', payload=o)
+        self.cli('update-owner', '--actor', 'beta', '--expected-revision', '5', '--reason', 'User explicitly changed to direct reporting', payload=o)
         state = self.state()
         self.assertEqual(state['revision'], 6)
         self.assertEqual(state['history'][3]['before']['assignments']['release']['status'], 'active')
@@ -113,7 +113,7 @@ class RegistryTests(unittest.TestCase):
         self.assertIn('handover', error)
         self.assertEqual(before, self.document.read_bytes())
         p = appointment()
-        p['owner']['name'] = '冒充替换'
+        p['owner']['name'] = 'Impersonating replacement'
         self.assertIn('update-owner', self.register(p, ok=False))
         self.assertEqual(before, self.document.read_bytes())
 
@@ -123,7 +123,7 @@ class RegistryTests(unittest.TestCase):
         unresolved = self.cli('query')['hierarchy'][0]
         self.assertFalse(unresolved['parent_resolved'])
         self.assertEqual(unresolved['parent'], 'owner:superior')  # Never promote unresolved parent to user.
-        self.assertIn('未登记，待解析', (self.root / 'report.md').read_text())
+        self.assertIn('not registered; resolution pending', (self.root / 'report.md').read_text())
         q = appointment('superior', parent='owner:alpha')
         q.pop('assignment')
         before = self.document.read_bytes()
@@ -135,19 +135,19 @@ class RegistryTests(unittest.TestCase):
         o = p['owner']
         o['parent'] = 'owner:alpha'
         self.assertIn('cycle', self.cli('update-owner', '--actor', 'alpha', '--expected-revision', '2',
-                                      '--reason', '无效自环', payload=o, ok=False))
+                                      '--reason', 'Invalid self-cycle', payload=o, ok=False))
 
     def test_stale_or_unauthorized_changes_rejected(self):
         self.register()
         before = self.document.read_bytes()
         self.assertIn('stale', self.cli('close', '--actor', 'alpha', '--assignment', 'release',
-                                       '--expected-revision', '0', '--reason', '过期', ok=False))
+                                       '--expected-revision', '0', '--reason', 'Stale revision', ok=False))
         self.assertIn('actor', self.cli('close', '--actor', 'other', '--assignment', 'release',
-                                       '--expected-revision', '1', '--reason', '未经授权', ok=False))
+                                       '--expected-revision', '1', '--reason', 'Unauthorized change', ok=False))
         self.assertIn('register', self.cli('handover', '--actor', 'alpha', '--assignment', 'release',
-                                          '--expected-revision', '1', '--reason', '不猜接任人',
+                                          '--expected-revision', '1', '--reason', 'Do not guess the successor',
                                           '--to-owner', 'unknown', '--new-assignment', 'next',
-                                          '--pending-work', '合成测试：无运行 child', ok=False))
+                                          '--pending-work', 'Synthetic test: no running children', ok=False))
         self.assertEqual(before, self.document.read_bytes())
 
     def test_identity_unknown_honest_and_helpers_rejected(self):
@@ -171,18 +171,19 @@ class RegistryTests(unittest.TestCase):
         # Current-session evidence may prove two different IDs; never conflate them.
         o = helper['owner']
         o['identity'].update(source='current-session', pi_session_id='synthetic-pi-id', intercom_id='synthetic-alias', unknown_reason='')
-        self.cli('update-owner', '--actor', 'helper', '--expected-revision', '2', '--reason', '合成身份核验', payload=o)
+        self.cli('update-owner', '--actor', 'helper', '--expected-revision', '2', '--reason', 'Synthetic identity verification', payload=o)
         self.assertNotEqual(self.state()['owners']['helper']['identity']['pi_session_id'],
                             self.state()['owners']['helper']['identity']['intercom_id'])
 
     def test_chinese_quotes_pipes_newlines_safe_readable_dashboard(self):
         p = appointment()
-        p['owner']['name'] = '甲“负责人” |\n第二行 <script> & `引号`'
-        p['assignment']['objective'] = '范围 | 中文\n下一目标'
+        # Preserve the original Chinese and curly quotes alongside pipe/newline/HTML escaping.
+        p['owner']['name'] = '\u7532\u201c\u8d1f\u8d23\u4eba\u201d |\n\u7b2c\u4e8c\u884c <script> & `\u5f15\u53f7`'
+        p['assignment']['objective'] = '\u8303\u56f4 | \u4e2d\u6587\n\u4e0b\u4e00\u76ee\u6807'
         self.register(p)
         document = (self.root / 'report.md').read_text()
-        self.assertIn('甲“负责人” &#124;<br>第二行 &lt;script&gt; &amp; &#96;引号&#96;', document)
-        self.assertIn('范围 &#124; 中文<br>下一目标', document)
+        self.assertIn('\u7532\u201c\u8d1f\u8d23\u4eba\u201d &#124;<br>\u7b2c\u4e8c\u884c &lt;script&gt; &amp; &#96;\u5f15\u53f7&#96;', document)
+        self.assertIn('\u8303\u56f4 &#124; \u4e2d\u6587<br>\u4e0b\u4e00\u76ee\u6807', document)
         self.assertNotIn('<script>', document)
         self.assertEqual(self.cli('query')['owners']['alpha']['name'], p['owner']['name'])
         # Every row has the same delimiter count as its own table header.
@@ -215,7 +216,7 @@ class RegistryTests(unittest.TestCase):
         self.cli('query')
         self.assertEqual((self.root / 'report.md').read_text(), 'stale')
         self.cli('rebuild')
-        self.assertIn('修订 1', (self.root / 'report.md').read_text())
+        self.assertIn('Revision 1', (self.root / 'report.md').read_text())
 
     def test_multiprocess_registration_serializes_and_rejects_shared_stale_token(self):
         token = self.cli('query')['document_token']
@@ -237,7 +238,7 @@ class RegistryTests(unittest.TestCase):
     def test_superior_appointment_records_issuer_without_user_bypass(self):
         self.register()
         child = appointment('child', 'direction', parent='owner:alpha', path='/example/child')
-        child['goal_source'] = {'issuer': 'owner:alpha', 'source': '合成测试：甲在授权范围内任命下级并下达目标'}
+        child['goal_source'] = {'issuer': 'owner:alpha', 'source': 'Synthetic test: alpha appoints a subordinate and delegates goals within authorized scope'}
         child['assignment']['goal_source'] = child['goal_source']
         self.register(child, actor='alpha')
         state = self.state()
@@ -252,31 +253,31 @@ class RegistryTests(unittest.TestCase):
 
     def test_same_repo_directions_need_explicit_agreement_not_sent_message(self):
         p = appointment()
-        p['assignment']['task'] = '后端方向'
+        p['assignment']['task'] = 'Backend direction'
         self.register(p)
         q = appointment('beta', 'frontend')
-        q['assignment']['task'] = '前端方向'
+        q['assignment']['task'] = 'Frontend direction'
         self.register(q)
         repo = 'repo:/example/alpha/.git'
         self.assertEqual(len(self.cli('query', '--repo', repo)['assignments']), 2)
         agreement = {'id': 'shared-interface-v1',
                      'scopes': {'release': ['backend/**', 'shared/schema.py'],
                                 'frontend': ['frontend/**', 'shared/schema.py']},
-                     'shared_interfaces': '共同确认 schema v1；共享文件修改按顺序集成，不互相覆盖',
-                     'workspace': {'mode': 'isolated-worktrees', 'plan': 'alpha/backend, beta/frontend 分支和 worktree'},
-                     'sequencing': '甲先提交 schema；乙基于已接受接口；甲串行集成',
-                     'integration_owner': 'alpha', 'acceptance': '甲负责集成验收，双方确认接口兼容后向各自上级报告'}
-        self.cli('coord-propose', '--actor', 'alpha', '--expected-revision', '2', '--reason', '已发送提议但尚无同意', payload=agreement)
+                     'shared_interfaces': 'Jointly confirm schema v1; integrate shared-file changes sequentially without overwriting each other',
+                     'workspace': {'mode': 'isolated-worktrees', 'plan': 'alpha/backend, beta/frontend branches and worktrees'},
+                     'sequencing': 'alpha commits schema first; beta uses the accepted interface; alpha integrates serially',
+                     'integration_owner': 'alpha', 'acceptance': 'alpha owns integration acceptance; both parties confirm interface compatibility before reporting to their respective superiors'}
+        self.cli('coord-propose', '--actor', 'alpha', '--expected-revision', '2', '--reason', 'Proposal sent, no consent yet', payload=agreement)
         view = self.cli('query', '--repo', repo)['coordination'][agreement['id']]
         self.assertFalse(view['agreement_ready'])
         self.assertEqual(view['status'], 'proposed')
         self.assertEqual(view['acknowledgements'], {})
         self.assertIn('explicit acknowledgement missing', ' '.join(view['not_ready_reasons']))
         self.cli('coord-ack', '--actor', 'alpha', '--coordination', agreement['id'], '--expected-revision', '3',
-                 '--reason', '甲明确同意完整协议，合成消息 ack-alpha')
+                 '--reason', 'alpha explicitly agrees to the complete agreement; synthetic message ack-alpha')
         self.assertFalse(self.cli('query')['coordination'][agreement['id']]['agreement_ready'])
         self.cli('coord-ack', '--actor', 'beta', '--coordination', agreement['id'], '--expected-revision', '4',
-                 '--reason', '乙明确确认边界、共享接口、隔离与集成顺序，合成消息 ack-beta')
+                 '--reason', 'beta explicitly confirms boundaries, shared interfaces, isolation and integration sequence; synthetic message ack-beta')
         view = self.cli('query', '--owner', 'beta')['coordination'][agreement['id']]
         self.assertTrue(view['agreement_ready'])
         self.assertEqual(view['status'], 'confirmed')
@@ -284,12 +285,12 @@ class RegistryTests(unittest.TestCase):
         self.assertIn('shared/schema.py', (self.root / 'report.md').read_text())
         # Goal/boundary basis changes make old acknowledgement unusable; no silent reuse.
         updated = copy.deepcopy(p['assignment'])
-        updated['objective'] = '方向范围发生改变，需重新协调'
+        updated['objective'] = 'Direction scope changed; coordination must be renewed'
         self.cli('update', '--actor', 'alpha', '--assignment', 'release', '--expected-revision', '5',
-                 '--reason', '直属上级确认目标调整', payload=updated)
+                 '--reason', 'Direct superior confirmed the goal adjustment', payload=updated)
         self.assertFalse(self.cli('query')['coordination'][agreement['id']]['agreement_ready'])
         self.cli('coord-release', '--actor', 'alpha', '--coordination', agreement['id'], '--expected-revision', '6',
-                 '--reason', '边界改变，撤销旧协议并重新协商')
+                 '--reason', 'Boundary changed; release the old agreement and renegotiate')
         self.assertEqual(self.cli('query')['coordination'][agreement['id']]['status'], 'released')
         self.assertEqual(self.state()['history'][4]['after']['coordination'][agreement['id']]['status'], 'confirmed')
 
@@ -298,41 +299,41 @@ class RegistryTests(unittest.TestCase):
         manager.pop('assignment')
         self.register(manager)
         a = appointment(parent='owner:manager')
-        a['owner']['role'] = 'office场景评测负责人'
-        a['assignment']['task'] = 'office评测方向'
+        a['owner']['role'] = 'Office scenario evaluation owner'
+        a['assignment']['task'] = 'Office evaluation direction'
         self.register(a)
         b = appointment('beta', 'kitchen', parent='owner:manager')
-        b['owner']['role'] = '接任方向负责人'
-        b['assignment']['task'] = 'kitchen评测方向'
+        b['owner']['role'] = 'Successor direction owner'
+        b['assignment']['task'] = 'Kitchen evaluation direction'
         self.register(b)
         c = appointment('gamma', parent='owner:manager')
         c.pop('assignment')
         self.register(c)
         agreement = {'id': 'active-shared', 'scopes': {'release': ['office/**', 'shared/config'], 'kitchen': ['kitchen/**', 'shared/config']},
-                     'shared_interfaces': '共享配置按确认版本', 'workspace': {'mode': 'shared-cwd', 'plan': '串行 writer，alpha 先 beta 后'},
-                     'sequencing': 'alpha 后 beta，由 manager 授权 alpha 集成', 'integration_owner': 'alpha', 'acceptance': '直属上级接受接口'}
-        self.cli('coord-propose', '--actor', 'alpha', '--expected-revision', str(self.state()['revision']), '--reason', '明确提案', payload=agreement)
+                     'shared_interfaces': 'Shared configuration uses the confirmed version', 'workspace': {'mode': 'shared-cwd', 'plan': 'Serial writers: alpha before beta'},
+                     'sequencing': 'alpha then beta; manager authorizes alpha to integrate', 'integration_owner': 'alpha', 'acceptance': 'Direct superior accepts the interface'}
+        self.cli('coord-propose', '--actor', 'alpha', '--expected-revision', str(self.state()['revision']), '--reason', 'Explicit proposal', payload=agreement)
         for oid in ['alpha', 'beta']:
             self.cli('coord-ack', '--actor', oid, '--coordination', 'active-shared',
-                     '--expected-revision', str(self.state()['revision']), '--reason', oid + '明确同意所有条款')
+                     '--expected-revision', str(self.state()['revision']), '--reason', oid + ' explicitly agrees to all terms')
         first = ['handover', '--actor', 'alpha', '--assignment', 'release', '--to-owner', 'beta', '--new-assignment', 'office-v2',
-                 '--expected-revision', str(self.state()['revision']), '--reason', '经直属上级授权由甲交给乙',
-                 '--authority', '合成证据：manager 批准交接', '--occurred-at', '2025-05-06T07:08:09+08:00',
-                 '--pending-work', 'child-run-example 仍由 alpha 托管，结果转 beta；不自动换 supervisor',
-                 '--coordination-plan', '旧协议释放，beta 与 kitchen 方向重新确认共享配置和集成顺序']
+                 '--expected-revision', str(self.state()['revision']), '--reason', 'Direct superior authorized alpha to hand over to beta',
+                 '--authority', 'Synthetic evidence: manager approved handover', '--occurred-at', '2025-05-06T07:08:09+08:00',
+                 '--pending-work', 'child-run-example stays under alpha custody; results go to beta; supervisor does not change automatically',
+                 '--coordination-plan', 'Release the old agreement; beta and the kitchen direction reconfirm shared configuration and integration sequence']
         self.cli(*first)
         self.assertEqual(self.state()['coordination']['active-shared']['status'], 'released')
         self.assertFalse(self.cli('query')['coordination']['active-shared']['agreement_ready'])
         self.cli('handover', '--actor', 'manager', '--assignment', 'office-v2', '--to-owner', 'gamma', '--new-assignment', 'office-v3',
-                 '--expected-revision', str(self.state()['revision']), '--reason', '授权直属上级主动记录乙交给丙',
-                 '--authority', 'manager 本级目标分工决定', '--occurred-at', '2025-05-06T07:08:09+08:00',
-                 '--pending-work', 'child-run-example 仍由 alpha 托管，结果直接转 gamma，beta 汇交现有材料',
-                 '--coordination-plan', 'gamma 接手重新确认所有共享配置边界，未确认前不派重叠 mutation')
+                 '--expected-revision', str(self.state()['revision']), '--reason', 'Authorized direct superior records beta handing over to gamma',
+                 '--authority', 'manager decides goal allocation within its own level', '--occurred-at', '2025-05-06T07:08:09+08:00',
+                 '--pending-work', 'child-run-example stays under alpha custody; results go directly to gamma; beta forwards existing materials',
+                 '--coordination-plan', 'gamma reconfirms all shared configuration boundaries; no overlapping mutations before confirmation')
         before_repeat = self.document.read_bytes()
         self.assertTrue(self.cli(*first)['unchanged'])  # Original revision is stale, original event must not repeat.
         self.assertEqual(before_repeat, self.document.read_bytes())
         self.cli('rebuild')  # Every CLI is a new process: restart/rebuild cannot lose the chain.
-        current = self.cli('query', '--task', 'office评测方向', '--active')['current_owners']
+        current = self.cli('query', '--task', 'Office evaluation direction', '--active')['current_owners']
         self.assertEqual(list(current), ['office-v3'])
         self.assertEqual(current['office-v3']['owner']['id'], 'gamma')
         self.assertEqual(current['office-v3']['superior'], 'owner:manager')
@@ -352,10 +353,10 @@ class RegistryTests(unittest.TestCase):
             self.assertEqual(e['occurred'], {'at': '2025-05-06T07:08:09+08:00', 'precision': 'exact'})
             self.assertNotEqual(e['at'], e['occurred']['at'])
         dashboard = (self.root / 'report.md').read_text()
-        self.assertIn('责任变更历史', dashboard)
-        self.assertIn('alpha / 示例alpha / office场景评测负责人', dashboard)
-        self.assertIn('beta / 示例beta / 接任方向负责人', dashboard)
-        self.assertIn('gamma / 示例gamma / 发布负责人', dashboard)
+        self.assertIn('Responsibility change history', dashboard)
+        self.assertIn('alpha / Example alpha / Office scenario evaluation owner', dashboard)
+        self.assertIn('beta / Example beta / Successor direction owner', dashboard)
+        self.assertIn('gamma / Example gamma / Release owner', dashboard)
         self.assertIn(transfers[0]['id'], dashboard)
         self.assertIn(transfers[1]['id'], dashboard)
         self.assertIsNotNone(state['assignments']['release']['end_time'])
@@ -370,14 +371,14 @@ class RegistryTests(unittest.TestCase):
         q.pop('assignment')
         self.register(q)
         self.cli('handover', '--actor', 'alpha', '--assignment', 'release', '--to-owner', 'beta', '--new-assignment', 'release-v2',
-                 '--expected-revision', '2', '--reason', '补录约略过去交接', '--occurrence-precision', 'approximate',
-                 '--occurred-at', '约2025年5月，具体秒未知', '--pending-work', '已核验无运行 child')
+                 '--expected-revision', '2', '--reason', 'Record an approximate past handover', '--occurrence-precision', 'approximate',
+                 '--occurred-at', 'Around May 2025; exact second unknown', '--pending-work', 'Verified no running children')
         event = self.state()['history'][-1]
-        self.assertEqual(event['occurred'], {'at': '约2025年5月，具体秒未知', 'precision': 'approximate'})
-        self.assertIn('约略，不保证秒', (self.root / 'report.md').read_text())
+        self.assertEqual(event['occurred'], {'at': 'Around May 2025; exact second unknown', 'precision': 'approximate'})
+        self.assertIn('approximate; second-level precision not guaranteed', (self.root / 'report.md').read_text())
         before = self.document.read_bytes()
         self.assertIn('timezone', self.cli('close', '--actor', 'beta', '--assignment', 'release-v2',
-                                           '--expected-revision', '3', '--reason', '无时区应拒绝',
+                                           '--expected-revision', '3', '--reason', 'Reject a missing timezone',
                                            '--occurred-at', '2025-05-06T07:08:09', ok=False))
         self.assertEqual(before, self.document.read_bytes())
 
@@ -396,19 +397,19 @@ class RegistryTests(unittest.TestCase):
         self.assertNotIn('repo', result['assignments']['release'])
         self.assertNotIn('goal_source', result['assignments']['release'])
         self.cli('rebuild')
-        self.assertIn('历史未录入，待确认', (self.root / 'report.md').read_text())
+        self.assertIn('not recorded historically; confirmation pending', (self.root / 'report.md').read_text())
         self.assertEqual(self.document.read_text(), content)
 
     def test_project_identity_consistency_and_task_identity_immutable(self):
         p = appointment()
         self.register(p)
         a = copy.deepcopy(p['assignment'])
-        a['task'] = '悄悄换范围'
+        a['task'] = 'Silently replaced scope'
         self.assertIn('identity', self.cli('update', '--actor', 'alpha', '--assignment', 'release',
-                                          '--expected-revision', '1', '--reason', '不应替换', payload=a, ok=False))
+                                          '--expected-revision', '1', '--reason', 'Replacement must be rejected', payload=a, ok=False))
         q = appointment('beta', 'beta-task')
-        q['assignment']['task'] = '构建'
-        q['assignment']['project']['name'] = '同项目的不同名字'
+        q['assignment']['task'] = 'build'
+        q['assignment']['project']['name'] = 'Different name for the same project'
         self.assertIn('project identity mismatch', self.register(q, ok=False))
 
 

@@ -102,21 +102,22 @@ class DocumentTests(DocumentFixture):
         self.assertEqual(len(current['history']), 1)
         self.assertNotEqual(self.store.envelope['era'], old_era)
         token = self.token()
-        text = self.document.read_text().replace('| gamma | 示例gamma | 发布负责人 | user |',
-                                                '| gamma | 手改姓名 | 新角色 | owner:unregistered |')
+        text = self.document.read_text().replace('| gamma | Example gamma | Release owner | user |',
+                                                '| gamma | Manually edited name | New role | owner:unregistered |')
         self.document.write_text(text)
         edited = self.read()
         self.assertEqual(edited['owners']['gamma']['parent'], 'owner:unregistered')
         web_owner = self.project()['owners'][0]
         self.assertEqual((web_owner['name'], web_owner['role'], web_owner['parent']),
-                         ('手改姓名', '新角色', 'owner:unregistered'))
+                         ('Manually edited name', 'New role', 'owner:unregistered'))
         self.assertEqual(edited['revision'], 1)  # no fabricated manual-edit attribution
         with self.assertRaisesRegex(registry.RegistryError, 'stale'):
             self.register(new, token=token)
         self.assertEqual((self.root / 'registry.json').read_bytes(), legacy)
 
     def test_cell_and_complete_document_roundtrip_exact_once(self):
-        value = '  中文 | &#124; &amp; <br> \\| \\n **[词](路径)** `引号`\r\n下一行\t  '
+        # Keep the original Chinese text in the exact Unicode/escaping roundtrip fixture.
+        value = '  \u4e2d\u6587 | &#124; &amp; <br> \\| \\n **[\u8bcd](\u8def\u5f84)** `\u5f15\u53f7`\r\n\u4e0b\u4e00\u884c\t  '
         self.assertEqual(codec.decode_cell(codec.encode_cell(value)), value)
         self.assertIn('&#124;', codec.encode_cell(value))
         self.assertEqual(codec.decode_cell('&amp;#124;'), '&#124;')
@@ -147,7 +148,7 @@ class DocumentTests(DocumentFixture):
                      good.replace('identity&quot;:', 'identity&quot;:null,&quot;identity&quot;:'),
                      good.replace('identity&quot;:', 'unknown&quot;:true,&quot;identity&quot;:'),
                      good.replace('identity&quot;:', 'identity&quot;:NaN,&quot;x&quot;:'),
-                     good.replace('| 示例alpha |', '| 字面\\|错误 |')]
+                     good.replace('| Example alpha |', '| literal\\|error |')]
         original = self.domain()
         with self.assertRaisesRegex(registry.RegistryError, 'duplicate JSON'):
             codec.parse_json('{"same":1,"same":2}')
@@ -177,7 +178,7 @@ class DocumentTests(DocumentFixture):
         self.store.run(lambda s: registry.mutate(s, args('coord-ack', coordination='agreement', expected_revision=2, reason='explicit agreement'), None), expected_document=self.token())
         state = self.domain()
         self.assertTrue(codec.agreement_view(state, state['coordination']['agreement'])['agreement_ready'])
-        self.document.write_text(self.document.read_text().replace('| 组织目标与验收 |', '| 人工扩大范围 |'))
+        self.document.write_text(self.document.read_text().replace('| Organizational goals and acceptance |', '| Manually expanded scope |'))
         state = self.domain()
         self.assertEqual(state['assignments']['release']['updated_at'], state['coordination']['agreement']['scopes']['release']['assignment_updated_at'])
         self.assertFalse(codec.agreement_view(state, state['coordination']['agreement'])['agreement_ready'])
@@ -310,7 +311,7 @@ class MigrationTests(DocumentFixture):
                 p['owner']['identity'].update(pi_session_id='synthetic-actual-pi', intercom_id='synthetic-distinct-alias',
                                             source='current-session', unknown_reason='')
                 p['owner']['recovery'] = dict(session_file='/example/session.jsonl', cwd='/example', repo='/example/.git',
-                    worktree='/example', summary='交接摘要', decisions='接口决定', pending_issues='待验收', context_refs=['doc-ref'],
+                    worktree='/example', summary='Handover summary', decisions='Interface decision', pending_issues='Acceptance pending', context_refs=['doc-ref'],
                     source='synthetic verified fixture', unknown_reason='')
             if n == 1:
                 p['owner']['identity'].update(intercom_id='synthetic-contact-only', source='intercom-status')
@@ -325,7 +326,8 @@ class MigrationTests(DocumentFixture):
         state = self.domain()
         repo = state['assignments']['scope-2']['repo']
         for cid, stale, status in [('ready', False, 'confirmed'), ('stale', True, 'confirmed'), ('proposed', False, 'proposed'), ('released', False, 'released')]:
-            state['coordination'][cid] = dict(id=cid, repo=repo, scopes={'scope-2': dict(owner='fixture-2', write_scope=['共享/**'],
+            # Preserve the original multilingual write-boundary data during migration.
+            state['coordination'][cid] = dict(id=cid, repo=repo, scopes={'scope-2': dict(owner='fixture-2', write_scope=['\u5171\u4eab/**'],
                 assignment_updated_at='old-time' if stale else state['assignments']['scope-2']['updated_at'])},
                 shared_interfaces='schema 1', workspace=dict(mode='isolated-worktrees', plan='branches'), sequencing='serial integration',
                 integration_owner='fixture-2', acceptance='peer review', status=status,
@@ -342,7 +344,8 @@ class MigrationTests(DocumentFixture):
         state['assignments']['scope-11'].pop('goal_source')
         state['owners']['fixture-11'].pop('appointment_source')
         state['history'][0]['occurred'] = {'at': None, 'precision': 'unknown'}
-        state['history'][1]['occurred'] = {'at': '约2025年初', 'precision': 'approximate'}
+        # Keep a free-form Chinese approximate date in full-field preservation coverage.
+        state['history'][1]['occurred'] = {'at': '\u7ea62025\u5e74\u521d', 'precision': 'approximate'}
         codec.validate(state)
         return state
 
@@ -430,7 +433,7 @@ class MigrationTests(DocumentFixture):
         self.assertEqual((self.root / 'dashboard.md').read_bytes(), tombstone)
         result = subprocess.run([sys.executable, str(SCRIPT), '--root', str(self.root), '--document', str(self.document), 'rebuild'], capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn('非权威', result.stdout)
+        self.assertIn('Non-authoritative', result.stdout)
         self.assertIn('template', result.stdout)
         self.assertEqual((self.root / 'dashboard.md').read_bytes(), tombstone)
 

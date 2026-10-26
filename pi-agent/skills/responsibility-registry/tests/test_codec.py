@@ -35,7 +35,8 @@ class CodecTests(unittest.TestCase):
         self.assertEqual(codec.parse_document(formatted), (state, 'template'))
 
     def test_one_pass_cells_and_json(self):
-        value = '  中文 | &#124; & <br> \\| \\n **[词](路径)** `引号`\r\n下一行\t  '
+        # Keep the original Chinese text in the exact Unicode/escaping roundtrip fixture.
+        value = '  \u4e2d\u6587 | &#124; & <br> \\| \\n **[\u8bcd](\u8def\u5f84)** `\u5f15\u53f7`\r\n\u4e0b\u4e00\u884c\t  '
         self.assertEqual(codec.decode_cell(codec.encode_cell(value)), value)
         self.assertEqual(codec.decode_cell('&amp;#124;'), '&#124;')
         self.assertEqual(codec.decode_cell('&lt;br&gt;'), '<br>')

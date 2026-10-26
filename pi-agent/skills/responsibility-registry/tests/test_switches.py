@@ -16,7 +16,7 @@ from test_document import DocumentFixture, SKILL, args, codec, registry, appoint
 
 class SwitchTests(DocumentFixture):
     def switch(self, action='clear', target=None, token=None, actor='user'):
-        return self.store.switch_document(action, token or self.token(), actor, '用户明确取消/恢复关系（合成）',
+        return self.store.switch_document(action, token or self.token(), actor, 'User explicitly cancels/restores relationships (synthetic)',
                                           'synthetic direct user message evidence', target)
 
     def recover(self):
@@ -56,8 +56,8 @@ class SwitchTests(DocumentFixture):
         record = self.store.backup_candidates()[0]
         self.assertEqual((self.document.parent / record['snapshot']).stat().st_mode & 0o777, 0o600)
         index = self.store.backup_index.read_text()
-        self.assertIn('示例alpha', index)
-        self.assertIn('user → 示例alpha', index)
+        self.assertIn('Example alpha', index)
+        self.assertIn('user → Example alpha', index)
         self.assertIn(record['sha256'], index)
         with self.assertRaisesRegex(registry.RegistryError, 'stale'):
             self.register(appointment('beta', 'new', path='/example/beta'), token=old_token)
@@ -464,7 +464,7 @@ class SwitchTests(DocumentFixture):
         output = self.base / 'allowed-report.md'
         with redirect_stdout(io.StringIO()):
             self.assertEqual(registry.main(['--root', str(root), '--document', str(document), 'rebuild', '--output', str(output)]), 0)
-        self.assertIn('非权威', output.read_text())
+        self.assertIn('Non-authoritative', output.read_text())
 
     def test_snapshot_missing_terms_evidence_is_not_silently_reacknowledged(self):
         self.register()

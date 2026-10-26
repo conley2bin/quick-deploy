@@ -129,7 +129,7 @@ def now():
 
 def cell(value):
     if value is None:
-        return '未知'
+        return 'unknown'
     # Escape HTML before adding our own break marker; no raw pipes or newlines in cells.
     return html.escape(str(value), quote=True).replace('|', '&#124;').replace('\r\n', '\n').replace('\r', '\n').replace('\n', '<br>').replace('`', '&#96;')
 
@@ -141,98 +141,98 @@ def table(headers, rows):
 
 def time_label(value):
     if not value:
-        return '历史未记录，发生时间未知'
-    return (value['at'] or '未知') + ('（约略，不保证秒）' if value['precision'] == 'approximate' else
-                                     '（发生时间未知）' if value['precision'] == 'unknown' else '')
+        return 'not recorded historically; occurrence time unknown'
+    return (value['at'] or 'unknown') + (' (approximate; second-level precision not guaranteed)' if value['precision'] == 'approximate' else
+                                     ' (occurrence time unknown)' if value['precision'] == 'unknown' else '')
 
 
 def recovery_label(value):
     if not value:
-        return '恢复定位未登记，不能猜会话路径'
-    return ('session file: ' + (value['session_file'] or '未知') + '; cwd: ' + (value['cwd'] or '未知') +
-            '; repo: ' + (value['repo'] or '未知') + '; worktree: ' + (value['worktree'] or '未知') +
-            '; 摘要: ' + (value['summary'] or '未知') + '; 决策: ' + (value['decisions'] or '未知') +
-            '; 待解决: ' + (value['pending_issues'] or '未知') + '; 指针: ' + ', '.join(value['context_refs']) +
-            '; 依据: ' + value['source'] + '; 缺失: ' + value['unknown_reason'])
+        return 'recovery locator not registered; do not guess a session path'
+    return ('session file: ' + (value['session_file'] or 'unknown') + '; cwd: ' + (value['cwd'] or 'unknown') +
+            '; repo: ' + (value['repo'] or 'unknown') + '; worktree: ' + (value['worktree'] or 'unknown') +
+            '; summary: ' + (value['summary'] or 'unknown') + '; decisions: ' + (value['decisions'] or 'unknown') +
+            '; pending issues: ' + (value['pending_issues'] or 'unknown') + '; references: ' + ', '.join(value['context_refs']) +
+            '; evidence: ' + value['source'] + '; missing: ' + value['unknown_reason'])
 
 
 def obligation_label(value):
     if not value:
         return '—'
-    return ('来自 ' + value['predecessor'] + '；child: ' + value['pending_work'] +
-            ('；前次安排: ' + value['previous_pending_work'] if value['previous_pending_work'] else '') +
-            '；协调: ' + ', '.join(value['coordination_ids']) + '；计划: ' + value['coordination_plan'] +
-            '；汇报: ' + value['reporting_change'] +
-            ('；旧 owner context: ' + recovery_label(value['predecessor_context'].get('recovery'))
-             if value.get('predecessor_context') else '；旧会话定位未登记'))
+    return ('from ' + value['predecessor'] + '; child work: ' + value['pending_work'] +
+            ('; previous arrangement: ' + value['previous_pending_work'] if value['previous_pending_work'] else '') +
+            '; coordination: ' + ', '.join(value['coordination_ids']) + '; plan: ' + value['coordination_plan'] +
+            '; reporting: ' + value['reporting_change'] +
+            ('; predecessor owner context: ' + recovery_label(value['predecessor_context'].get('recovery'))
+             if value.get('predecessor_context') else '; predecessor session locator not registered'))
 
 
 def owner_label(value):
-    return '—' if value is None else f'{value["id"]} / {value.get("name") or "名称未知"} / {value.get("role") or "角色未知"}'
+    return '—' if value is None else f'{value["id"]} / {value.get("name") or "name unknown"} / {value.get("role") or "role unknown"}'
 
 
 def source_label(value):
-    return value['issuer'] + ': ' + value['source'] if value else '历史未录入，待确认'
+    return value['issuer'] + ': ' + value['source'] if value else 'not recorded historically; confirmation pending'
 
 
 def parent_label(state, parent):
     if parent == 'user':
-        return 'user（用户，最高授权）'
+        return 'user (highest authority)'
     oid = parent[6:]
-    return f'owner:{oid}' + (f'（{state["owners"][oid]["name"]}）' if oid in state['owners'] else '（未登记，待解析）')
+    return f'owner:{oid}' + (f' ({state["owners"][oid]["name"]})' if oid in state['owners'] else ' (not registered; resolution pending)')
 
 
 def dashboard(state, era):
     owners, assignments = state['owners'], state['assignments']
-    lines = ['# 全局责任登记簿', '', f'Era {era} · 版本 1 · 修订 {state["revision"]}', '',
-             '登记表示责任归属，不表示在线；联系前重新核验 intercom status/list。用户是最高授权者。', '',
-             '仅 parent:user 的顶层负责人向用户汇报；其他负责人逐级上报，目标/验收逐级下达。未解析上级须澄清，不自动升为顶层。', '',
-             '非权威即时报告；任何编辑或重置后即可能过期。当前唯一事实源是 installed RESPONSIBILITIES.md；请重新读取。', '', '## 负责人 / 上下级 / 联系', '']
+    lines = ['# Global responsibility registry', '', f'Era {era} · Version 1 · Revision {state["revision"]}', '',
+             'Registration records responsibility, not online status; recheck intercom status/list before contact. The user is the highest authority.', '',
+             'Only top-level owners with parent:user report to the user; other owners report through the hierarchy, with goals and acceptance criteria delegated level by level. Clarify unresolved superiors; never promote them automatically to the top level.', '',
+             'Non-authoritative point-in-time report; any edit or reset may make it stale. The installed RESPONSIBILITIES.md is the sole current source of truth; reread it.', '', '## Owners / Hierarchy / Contacts', '']
     rows = []
     for oid, o in sorted(owners.items()):
         i = o['identity']
-        children = ', '.join(k for k, v in sorted(owners.items()) if v['parent'] == 'owner:' + oid) or '无已登记下级'
+        children = ', '.join(k for k, v in sorted(owners.items()) if v['parent'] == 'owner:' + oid) or 'no registered subordinates'
         rows.append([oid, o['name'], o['role'], parent_label(state, o['parent']), children,
-                     i['pi_session_id'], i['intercom_id'], i['source'] + ('；' + i['unknown_reason'] if i['unknown_reason'] else ''),
+                     i['pi_session_id'], i['intercom_id'], i['source'] + ('; ' + i['unknown_reason'] if i['unknown_reason'] else ''),
                      source_label(o.get('appointment_source')), recovery_label(o.get('recovery')), o['updated_at']])
-    lines += [table(['owner ID', '名称', '角色', '上级', '下级（推导）', 'Pi session ID', 'Intercom 联系 ID', '身份依据 / 缺失原因', '任命签发 / 来源', '旧上下文恢复定位 / 交接决策', '更新于'], rows), '', '## 项目 / 任务 / 责任范围', '']
+    lines += [table(['owner ID', 'Name', 'Role', 'Superior', 'Subordinates (derived)', 'Pi session ID', 'Intercom contact ID', 'Identity evidence / Missing reason', 'Appointment issuer / Source', 'Predecessor context locator / Handover decisions', 'Updated at'], rows), '', '## Projects / Tasks / Responsibility scopes', '']
     rows = []
     for aid, a in sorted(assignments.items()):
         p = a['project']
         rows.append([aid, p['id'], p['name'], p['path'], a['task'], a['owner'], a['status'], a['objective'],
-                     a['acceptance'], source_label(a.get('goal_source')), a.get('repo', {}).get('id', '历史未录入，待核验'),
-                     a['appointment'], time_label(a.get('start_time')), time_label(a.get('end_time')) if a['status'] != 'active' else '进行中',
+                     a['acceptance'], source_label(a.get('goal_source')), a.get('repo', {}).get('id', 'not recorded historically; verification pending'),
+                     a['appointment'], time_label(a.get('start_time')), time_label(a.get('end_time')) if a['status'] != 'active' else 'ongoing',
                      a['end_reason'] or '—', a['successor'] or '—',
                      obligation_label(a.get('handover_obligations')), a['created_at'], a['updated_at']])
-    lines += [table(['责任 ID', '项目 ID', '项目名', '项目路径', '任务 ID', 'owner ID', '状态', '目标 / 范围', '验收目标', '目标签发 / 来源', '规范 repo ID', '任命依据', '责任开始（发生）', '责任结束（发生）', '结束原因', '接任责任 ID', '继承的子任务 / 协调 / 汇报安排', '建立记录于', '更新记录于'], rows), '', '## 依赖关系（与汇报关系独立）', '']
+    lines += [table(['Responsibility ID', 'Project ID', 'Project name', 'Project path', 'Task ID', 'owner ID', 'Status', 'Objective / Scope', 'Acceptance criteria', 'Goal issuer / Source', 'Canonical repo ID', 'Appointment evidence', 'Responsibility started (occurred)', 'Responsibility ended (occurred)', 'End reason', 'Successor responsibility ID', 'Inherited child work / Coordination / Reporting arrangements', 'Record created at', 'Record updated at'], rows), '', '## Dependencies (independent of reporting relationships)', '']
     rows = []
     for aid, a in sorted(assignments.items()):
         for d in a['depends_on']:
             resolved = (any(x['project']['id'] == d['project'] and
                             (d['kind'] == 'project' or x['task'] == d['task']) and x['status'] == 'active'
                             for x in assignments.values()))
-            rows.append([aid, a['status'], d['kind'], d['project'], d.get('task', '整项目'), '已登记' if resolved else '未登记 / 无活动责任'])
-    lines += [table(['来源责任 ID', '来源状态', '目标类型', '目标项目 ID', '目标任务 ID', '目标解析'], rows), '',
-              '## 同仓库写入协调（协议可用不代表取得 writer 锁）', '',
-              '发送提议不等于同意；所有受影响方明确确认后才可用。仅覆盖所列范围；共享 cwd 仍仅一个 writer，隔离 worktree 仍按重叠/接口约定集成。', '']
+            rows.append([aid, a['status'], d['kind'], d['project'], d.get('task', 'entire project'), 'registered' if resolved else 'not registered / no active responsibility'])
+    lines += [table(['Source responsibility ID', 'Source status', 'Target type', 'Target project ID', 'Target task ID', 'Target resolution'], rows), '',
+              '## Same-repository write coordination (a ready agreement does not grant a writer lock)', '',
+              'Sending a proposal is not consent; the agreement is ready only after every affected party explicitly acknowledges it. It covers only the listed scopes; a shared cwd still permits only one writer, and isolated worktrees still follow the agreed overlap/interface integration rules.', '']
     rows = []
     for cid, value in sorted(state.get('coordination', {}).items()):
         view = agreement_view(state, value)
         bounds = '; '.join(f'{aid} / {b["owner"]}: {", ".join(b["write_scope"])}' for aid, b in value['scopes'].items())
-        acks = '; '.join(f'{oid}: {a["evidence"]} @ {a["at"]}' for oid, a in value['acknowledgements'].items()) or '无明确确认'
+        acks = '; '.join(f'{oid}: {a["evidence"]} @ {a["at"]}' for oid, a in value['acknowledgements'].items()) or 'no explicit acknowledgement'
         rows.append([cid, value['repo']['id'], value['repo']['path'], bounds, value['status'],
-                     '是（仅已确认范围）' if view['agreement_ready'] else '否：' + '; '.join(view['not_ready_reasons']),
+                     'yes (acknowledged scopes only)' if view['agreement_ready'] else 'no: ' + '; '.join(view['not_ready_reasons']),
                      ', '.join(view['participants']), acks, value['shared_interfaces'],
                      value['workspace']['mode'] + ': ' + value['workspace']['plan'], value['sequencing'],
                      value['integration_owner'], value['acceptance']])
-    lines += [table(['协议 ID', 'repo ID', '规范 repo 路径', '方向责任 / owner / 写入范围', '状态', '写入协议可用', '参与者', '明确确认依据', '共享文件 / 接口', '分支 / worktree', '顺序', '集成 owner', '验收约定'], rows), '',
-              '## 责任变更历史（追加保留，事件顺序区分同秒变更）', '',
-              '所有历史负责人和任命长期保留；会话离线不触发交接。发生时间与登记时间分列；未知或约略时间不补造秒。姓名/角色为事件登记时保存的事实。', '']
+    lines += [table(['Agreement ID', 'repo ID', 'Canonical repo path', 'Direction scope / owner / Write boundary', 'Status', 'Write agreement ready', 'Participants', 'Explicit acknowledgement evidence', 'Shared files / Interfaces', 'Branch / Worktree', 'Sequence', 'Integration owner', 'Acceptance agreement'], rows), '',
+              '## Responsibility change history (append-only; event order distinguishes same-second changes)', '',
+              'All historical owners and appointments are retained indefinitely; an offline session does not trigger handover. Occurrence and recording times are separate; unknown or approximate times never receive fabricated seconds. Names and roles are the facts saved when each event was recorded.', '']
     rows = []
     for event in state['history']:
         details = event.get('changes') or [dict(project=None, task=None, old_owner=None, new_owner=None,
                                                from_parent=None, to_parent=None, from_assignment=None, to_assignment=None,
-                                               summary=event['action'] + '（旧事件无语义字段，见 canonical snapshots）')]
+                                               summary=event['action'] + ' (legacy event has no semantic fields; see canonical snapshots)')]
         for detail in details:
             p = detail.get('project') or {}
             rows.append([event.get('id', f'legacy-{event["revision"]:08d}'), event['revision'],
@@ -240,8 +240,8 @@ def dashboard(state, era):
                          owner_label(detail.get('old_owner')), owner_label(detail.get('new_owner')),
                          (detail.get('from_assignment') or '—') + ' → ' + (detail.get('to_assignment') or '—'),
                          (detail.get('from_parent') or '—') + ' → ' + (detail.get('to_parent') or '—'),
-                         event['actor'], event.get('authority') or '未单列（见原因/任命依据）', event['reason'], detail['summary']])
-    lines += [table(['事件 ID', '顺序', '发生时间 / 精度', '登记时间（含时区）', '动作', '项目 ID', '任务 / 方向', '从谁（ID / 名称 / 角色）', '交给谁（ID / 名称 / 角色）', '责任链', '上级变化', '操作者', '授权依据', '原因', '变更说明'], rows), '']
+                         event['actor'], event.get('authority') or 'not recorded separately (see reason / appointment evidence)', event['reason'], detail['summary']])
+    lines += [table(['Event ID', 'Sequence', 'Occurrence time / Precision', 'Recorded at (with timezone)', 'Action', 'Project ID', 'Task / Direction', 'From (ID / Name / Role)', 'To (ID / Name / Role)', 'Responsibility chain', 'Superior change', 'Actor', 'Authority evidence', 'Reason', 'Change description'], rows), '']
     return '\n'.join(lines)
 
 

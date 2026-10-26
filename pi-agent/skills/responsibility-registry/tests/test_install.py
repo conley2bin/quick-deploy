@@ -41,7 +41,8 @@ class InstallTests(unittest.TestCase):
             protected = {p: (p.read_bytes(), p.stat().st_ino, p.stat().st_mtime_ns, p.stat().st_ctime_ns) for p in [index, snapshot]}
             private = live.parent / '.registry-private'
             self.assertTrue((private / 'document-control.json').exists())
-            real_like = live.read_bytes().replace(b'Revision: 0', b'Revision: 999') + '人工未完成编辑\n'.encode()
+            # Preserve the original multibyte unfinished-edit bytes, not just ASCII.
+            real_like = live.read_bytes().replace(b'Revision: 0', b'Revision: 999') + '\u4eba\u5de5\u672a\u5b8c\u6210\u7f16\u8f91\n'.encode()
             live.write_bytes(real_like)
             before = live.stat()
             install()
