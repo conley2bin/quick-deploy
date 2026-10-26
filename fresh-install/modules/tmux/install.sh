@@ -10,8 +10,8 @@
 #   4. 符号链接 ~/.tmux.conf.local → 模块自带的 tmux.conf.local 基线
 #      （上游规定定制写在 .tmux.conf.local；这里把它链到仓库文件，
 #      定制即仓库改动，别的机器 git pull 本仓库即生效）
-#   5. 链接 pi-suspend-guard（唯一 error 自动恢复 owner）与
-#      pi-tmux-window-status（Pi 生命周期驱动 tmux breathing status）
+#   5. 符号链接 ~/.pi/agent/extensions/pi-tmux-window-status → 本仓库扩展
+#      （Pi 生命周期事件驱动 tmux window breathing status）
 #
 # 幂等语义：重跑 = 确保 apt 包已装、已有克隆用 git pull --ff-only 更新到最新，
 # tmux/Pi 扩展链接指向本仓库；替换任何既有 ~/.tmux.conf / ~/.tmux.conf.local /
@@ -107,12 +107,10 @@ else
     echo -e "${GREEN}✓ ~/.tmux.conf.local → $LOCAL_BASELINE${NC}"
 fi
 
-echo -e "\n${YELLOW}[5/5] 安装 Pi error recovery 与 tmux breathing status extensions...${NC}"
-for extension in pi-suspend-guard pi-tmux-window-status; do
-    PI_EXT_INSTALLER="$SCRIPT_DIR/../../../pi-agent/extensions/$extension/install.sh"
-    [ -f "$PI_EXT_INSTALLER" ] || die "Pi 扩展安装器缺失: $PI_EXT_INSTALLER（仓库不完整？）"
-    "$PI_EXT_INSTALLER"
-done
+echo -e "\n${YELLOW}[5/5] 安装 Pi→tmux breathing status extension...${NC}"
+PI_EXT_INSTALLER="$SCRIPT_DIR/../../../pi-agent/extensions/pi-tmux-window-status/install.sh"
+[ -f "$PI_EXT_INSTALLER" ] || die "Pi 扩展安装器缺失: $PI_EXT_INSTALLER（仓库不完整？）"
+"$PI_EXT_INSTALLER"
 
 echo -e "\n${GREEN}=== 安装完成 ===${NC}"
 echo -e "\n使用要点："

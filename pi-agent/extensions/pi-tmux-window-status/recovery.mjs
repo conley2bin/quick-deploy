@@ -4,7 +4,7 @@ export const AUTO_CONTINUE_MIN_INTERVAL_MS = 60_000;
 export const AUTO_CONTINUE_MAX = 5;
 // Either terminal listener may consume the pane sentinel first. Broadcast the
 // cancellation so both the recovery deadline and tmux's red lease are cleared.
-export const RECOVERY_CANCEL_EVENT = "pi-suspend-guard:cancel";
+export const RECOVERY_CANCEL_EVENT = "pi-tmux-window-status:cancel";
 export const CANCEL_SENTINEL = "\x1b[997;1~";
 const RETRY_EXHAUSTED_ABORT = /^aborted after \d+ retry attempts?$/i;
 
@@ -89,7 +89,7 @@ export function installErrorRecovery(pi) {
       }
     } catch (error) {
       disarm();
-      console.error("pi-suspend-guard: recovery context expired; cancelled pending continue", error);
+      console.error("pi-tmux-window-status: recovery context expired; cancelled pending continue", error);
       return;
     }
     lastSentAt = Date.now();
@@ -98,7 +98,7 @@ export function installErrorRecovery(pi) {
     // a run. Retain one bounded watchdog; agent_start/progress/cancel removes it.
     schedule();
     try { pi.sendUserMessage("continue"); }
-    catch (error) { console.error("pi-suspend-guard: could not send continue", error); }
+    catch (error) { console.error("pi-tmux-window-status: could not send continue", error); }
   };
   const shutdown = () => {
     sessionActive = false;

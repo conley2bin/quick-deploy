@@ -1,23 +1,29 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { execFileSync } from "node:child_process";
+import { cpSync, existsSync, mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { pathToFileURL } from "node:url";
+import extension from "../index.ts";
 import {
   AUTO_CONTINUE_MAX,
   AUTO_CONTINUE_MIN_INTERVAL_MS,
   CANCEL_SENTINEL,
   ERROR_STALL_MS,
   RECOVERY_CANCEL_EVENT,
-  installErrorRecovery,
 } from "../recovery.mjs";
 
 const PERMISSION_ERROR = JSON.stringify({ type: "error", error: { type: "permission_error", message: "You've reached your concurrent request limit. Please wait for your ongoing requests to finish and try again." } });
 const failure = (errorMessage) => ({ role: "assistant", content: [], stopReason: "error", ...(errorMessage === undefined ? {} : { errorMessage }) });
 
-function harness(t, { mode = "tui", depth, send } = {}) {
+function harness(t, { mode = "tui", depth, send, entry = extension } = {}) {
   const previous = { ...process.env };
   for (const key of Object.keys(process.env)) if (key === "TMUX" || key.startsWith("TMUX_") || key === "PI_SUBAGENT_DEPTH") delete process.env[key];
   if (depth !== undefined) process.env.PI_SUBAGENT_DEPTH = String(depth);
   t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 1_000_000 });
-  const handlers = new Map(), channels = new Map(), inputs = new Set(), sent = [], sentAt = [];
+  const handlers = new Map(), channels = new Map(), inputs = new Set(), sent = [], sentAt = [], diagnostics = [];
+  t.mock.method(console, "error", (...args) => diagnostics.push(args));
   let signal, idle = true, pending = false;
   const ctx = {
     mode,
@@ -35,11 +41,11 @@ function harness(t, { mode = "tui", depth, send } = {}) {
     events,
     sendUserMessage(text) { sent.push(text); sentAt.push(Date.now()); send?.(text); },
   };
-  const fire = (name, event = {}) => { for (const fn of handlers.get(name) || []) fn(event, ctx); };
-  installErrorRecovery(pi);
+  const fire = (name, event = {}, context = ctx) => { for (const fn of handlers.get(name) || []) fn(event, context); };
+  entry(pi);
   fire("session_start");
   const h = {
-    ctx, pi, inputs, channels, sent, sentAt, fire,
+    ctx, pi, inputs, channels, sent, sentAt, diagnostics, handlers, fire,
     tick: (ms) => t.mock.timers.tick(ms),
     start() { signal = new AbortController().signal; idle = false; fire("agent_start"); return signal; },
     error(message = failure(PERMISSION_ERROR)) { fire("message_end", { message }); },
@@ -63,6 +69,22 @@ test("user policy is 60 seconds since error, at least 60 seconds per send, at mo
   assert.equal(AUTO_CONTINUE_MAX, 5);
 });
 
+test("standalone module install recovers without any suspend-guard source or installation", async (t) => {
+  const work = mkdtempSync(join(tmpdir(), "pi-status-recovery-install-"));
+  t.after(() => rmSync(work, { recursive: true, force: true }));
+  const source = join(work, "pi-agent", "extensions", "pi-tmux-window-status");
+  const piHome = join(work, "pi-home");
+  cpSync(new URL("..", import.meta.url), source, { recursive: true });
+  execFileSync("bash", [join(source, "install.sh")], { env: { ...process.env, PI_CODING_AGENT_DIR: piHome } });
+  assert.equal(existsSync(join(work, "pi-agent", "extensions", "pi-suspend-guard")), false);
+  assert.equal(existsSync(join(piHome, "extensions", "pi-suspend-guard")), false);
+  const { default: entry } = await import(pathToFileURL(join(piHome, "extensions", "pi-tmux-window-status", "index.ts")).href);
+  const h = harness(t, { entry });
+  h.start(); h.error(); h.settle();
+  h.tick(59_999); assert.deepEqual(h.sent, []);
+  h.tick(1); assert.deepEqual(h.sent, ["continue"]);
+});
+
 for (const [label, errorMessage] of [
   ["exact concurrent permission_error", PERMISSION_ERROR],
   ["arbitrary", "unfamiliar provider failure"],
@@ -73,6 +95,9 @@ for (const [label, errorMessage] of [
   const h = harness(t);
   assert.equal(process.env.TMUX, undefined);
   assert.equal(process.env.TMUX_PANE, undefined);
+  assert.equal(h.handlers.get("message_end").length, 1, "default extension installs exactly one sender without tmux");
+  assert.equal(h.inputs.size, 1, "only the recovery listener is installed without presentation");
+  assert.match(h.diagnostics[0][0], /tmux presentation disabled; error recovery remains enabled/);
   h.start(); h.error(failure(errorMessage)); h.settle();
   h.tick(59_999);
   assert.deepEqual(h.sent, []);
@@ -93,6 +118,15 @@ test("child failures remain owned by the supervisor", (t) => {
   h.start(); h.error(); h.settle(); h.tick(600_000);
   assert.deepEqual(h.sent, []);
   assert.equal(h.inputs.size, 0);
+});
+
+test("loading/reloading ignores historical errors until a new terminal error is observed", (t) => {
+  const h = harness(t);
+  h.ctx.sessionManager = { getBranch: () => [{ type: "message", message: failure(PERMISSION_ERROR) }] };
+  h.fire("session_start"); h.settle(); h.tick(600_000);
+  assert.deepEqual(h.sent, [], "session history never arms a trigger");
+  h.start(); h.error(); h.settle(); h.tick(60_000);
+  assert.deepEqual(h.sent, ["continue"]);
 });
 
 test("agent_end and an expired error deadline cannot interrupt native retries", (t) => {
@@ -198,6 +232,18 @@ for (const abort of ["message", "settlement", "raw-escape", "sentinel"]) test(`i
   assert.deepEqual(h.sent, ["continue"], "a distinct uncancelled run may recover");
 });
 
+test("late errors from a cancelled run cannot arm after a different run has started", (t) => {
+  const h = harness(t);
+  const signal = h.start(), cancelledCtx = { ...h.ctx, signal };
+  h.error(); h.terminal(CANCEL_SENTINEL);
+  h.start();
+  h.fire("message_update", { message: failure() }, cancelledCtx);
+  h.fire("message_end", { message: failure() }, cancelledCtx);
+  h.settle(); h.tick(600_000); assert.deepEqual(h.sent, []);
+  h.error(); h.settle(); h.tick(60_000);
+  assert.deepEqual(h.sent, ["continue"], "only a genuine error from the new run may renew recovery");
+});
+
 test("shared pane cancellation carries the run signal even if another listener consumed sentinel", (t) => {
   const h = harness(t);
   const signal = h.start(); h.error(); h.settle();
@@ -266,9 +312,9 @@ test("a send consumed without a run is retried by one bounded watchdog, not a ti
 });
 
 test("a synchronous send failure is surfaced and remains capped/throttled", (t) => {
-  const errors = [];
-  t.mock.method(console, "error", (...args) => errors.push(args));
   const h = harness(t, { send: () => { throw new Error("delivery rejected"); } });
+  const errors = h.diagnostics;
+  errors.length = 0; // Ignore the expected non-tmux presentation diagnostic.
   h.start(); h.error(); h.settle();
   for (let n = 1; n <= 5; n++) h.tick(60_000);
   h.tick(600_000);
@@ -278,9 +324,9 @@ test("a synchronous send failure is surfaced and remains capped/throttled", (t) 
 });
 
 test("shutdown/restart disposes listeners and deadlines; expired contexts are surfaced", (t) => {
-  const errors = [];
-  t.mock.method(console, "error", (...args) => errors.push(args));
   const h = harness(t);
+  const errors = h.diagnostics;
+  errors.length = 0;
   h.start(); h.error(); h.settle(); h.fire("session_shutdown");
   assert.equal(h.inputs.size, 0);
   assert.equal(h.channels.get(RECOVERY_CANCEL_EVENT).size, 0);

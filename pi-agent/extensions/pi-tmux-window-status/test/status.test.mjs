@@ -7,7 +7,6 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { HEARTBEAT_MS, LEASE_TTL_MS, acquireAnimatorLock, aggregateLogicalState, leasePath, projectAsyncStatus, publishLease, readLease, releaseAnimatorLock, seedAttentionWatermarksFromSnapshot, windowLeaseStates } from "../state.mjs";
 import { CANCEL_SENTINEL, RECOVERY_ARMED_OPTION, animatorSpawnNeeded, childFromStartedPayload, childStillRunning, defaultAsyncRoot, isAssistantError, isManualEscapePress, mergedChildSnapshot, monitorNeeded, nestedProjectionFromChildren, nestedPublisherDisabled, nextAssistantErrorState, readNestedRegistryProjection, recoveryTerminalInput, restoredChildren, sessionIdOf, validateNestedRoute } from "../index.ts";
-import { installErrorRecovery } from "../../pi-suspend-guard/recovery.mjs";
 import { ANIMATOR_URGENT_SIGNAL, ERROR_BG, ERROR_FG, ERROR_MS, FRAME_BLUE, FRAME_COUNT, FRAME_MS, FRAMES, GRAY_RANGE, MAX_CONSECUTIVE_FAILURES, PERIOD_MS, activeWindows, frameAt, isDirectExecution, leaseWindowStates, listClients, listRecoveryArmedPanes, paneRecoveryOptionArgs, requestAnimatorTick, runAnimator, sweepWindows, windowOptionArgs } from "../animator.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -53,14 +52,14 @@ const waitFor = async (read, expected, timeoutMs = 1_500) => {
   assert.equal(read(), expected);
 };
 let harnessSequence = 0;
-async function statusHarness(label, { recovery = true, recoveryFirst = false } = {}) {
+async function statusHarness(label, { presentationFirst = false } = {}) {
   const runtime = temp(), work = temp(), socket = join(work, "server.sock");
   const tmux = (args, options = {}) => isolatedTmux(args, options);
   tmux(["-S", socket, "-f", join(process.env.HOME, ".tmux.conf"), "new-session", "-d", "-s", label]);
   const paneId = tmux(["-S", socket, "display-message", "-p", "#{pane_id}"], { encoding: "utf8" }).trim();
   const handlers = {}, sent = [], sentAt = [], channels = new Map(), terminalInputs = new Set();
   let terminalInputUnsubscribed = 0, currentSignal;
-  const terminalInput = (data) => { for (const fn of terminalInputs) { const result = fn(data); if (result?.consume) return result; } };
+  const terminalInput = (data) => { for (const fn of presentationFirst ? [...terminalInputs].reverse() : terminalInputs) { const result = fn(data); if (result?.consume) return result; } };
   const ctx = {
     mode: "tui",
     ui: { onTerminalInput: (handler) => { terminalInputs.add(handler); return () => { terminalInputs.delete(handler); terminalInputUnsubscribed += 1; }; } },
@@ -83,9 +82,7 @@ async function statusHarness(label, { recovery = true, recoveryFirst = false } =
   Object.assign(process.env, env);
   try {
     const mod = await import(`../index.ts?status-harness-${label}-${++harnessSequence}`);
-    if (recovery && recoveryFirst) installErrorRecovery(pi);
     mod.default(pi);
-    if (recovery && !recoveryFirst) installErrorRecovery(pi);
     fire("session_start", {}, ctx);
   } catch (error) {
     Object.keys(process.env).forEach((key) => { if (!(key in origEnv)) delete process.env[key]; });
@@ -102,7 +99,7 @@ async function statusHarness(label, { recovery = true, recoveryFirst = false } =
     leaseState: () => JSON.parse(readFileSync(leasePath({ socketPath: socket }, `${process.pid}:${paneId}`, env), "utf8")).state,
     async cleanup() {
       fire("session_shutdown", {}, ctx);
-      assert.equal(terminalInputUnsubscribed, recovery ? 2 : 1, "session shutdown releases both raw input listeners");
+      assert.equal(terminalInputUnsubscribed, 2, "session shutdown releases both internal raw input listeners");
       assert.equal(terminalInputs.size, 0);
       Object.keys(process.env).forEach((key) => { if (!(key in origEnv)) delete process.env[key]; });
       Object.assign(process.env, origEnv);
@@ -698,8 +695,8 @@ test("partial tmux batch failure retains attempted window and pane cleanup respo
   }
 });
 
-test("tmux status alone publishes errors but never injects continue", async (t) => {
-  const h = await statusHarness("display-only", { recovery: false });
+test("tmux status alone publishes errors and sends exactly five times for one trigger", async (t) => {
+  const h = await statusHarness("single-owner");
   try {
     h.setSignal(new AbortController().signal);
     h.fire("agent_start", {}, h.ctx);
@@ -707,18 +704,23 @@ test("tmux status alone publishes errors but never injects continue", async (t) 
     await waitFor(h.errorOption, "1");
     await waitFor(h.paneArmed, "1");
     t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: Date.now() });
+    h.fire("message_end", { message: assistantFailure() }, h.ctx);
     h.fire("agent_settled", { aborted: false }, h.ctx);
+    for (let n = 1; n <= 5; n++) {
+      t.mock.timers.tick(59_999); assert.equal(h.sent.length, n - 1);
+      t.mock.timers.tick(1); assert.equal(h.sent.length, n, "only one sender runs per deadline");
+    }
     t.mock.timers.tick(600_000);
-    assert.deepEqual(h.sent, [], "suspend guard is the only sending owner");
-    assert.equal(h.errorOption(), "1");
+    assert.deepEqual(h.sent, Array(5).fill("continue"), "no suspend guard or competing sender is installed");
+    assert.equal(h.leaseState(), "error", "budget exhaustion does not clear the error display");
   } finally {
     t.mock.timers.reset();
     await h.cleanup();
   }
 });
 
-for (const recoveryFirst of [false, true]) test(`one recovery owner; pane cancellation works in either listener order: guard-first=${recoveryFirst}`, async (t) => {
-  const h = await statusHarness(`handoff-${recoveryFirst}`, { recoveryFirst });
+for (const presentationFirst of [false, true]) test(`pane cancellation works in either internal listener order: presentation-first=${presentationFirst}`, async (t) => {
+  const h = await statusHarness(`handoff-${presentationFirst}`, { presentationFirst });
   const first = new AbortController(), second = new AbortController();
   try {
     h.setSignal(first.signal);
@@ -735,14 +737,14 @@ for (const recoveryFirst of [false, true]) test(`one recovery owner; pane cancel
     await waitFor(h.paneArmed, "");
     t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: Date.now() });
     t.mock.timers.tick(600_000);
-    assert.deepEqual(h.sent, [], "consumed sentinel cancels guard and same-run late errors");
+    assert.deepEqual(h.sent, [], "consumed sentinel cancels recovery and same-run late errors");
     h.setSignal(second.signal);
     h.fire("agent_start", {}, h.ctx);
     h.fire("message_end", { message: assistantFailure(ACCOUNT_CONCURRENCY_ERROR) }, h.ctx);
     h.fire("agent_settled", { aborted: false }, h.ctx);
     h.fire("agent_settled", { aborted: false }, h.ctx);
     t.mock.timers.tick(59_999); assert.deepEqual(h.sent, []);
-    t.mock.timers.tick(1); assert.deepEqual(h.sent, ["continue"], "no second tmux sender races the guard");
+    t.mock.timers.tick(1); assert.deepEqual(h.sent, ["continue"], "only the local recovery helper sends");
     assert.equal(h.leaseState(), "error", "sending continue retains the error presentation");
     assert.deepEqual(h.terminalInput("\x1b"), undefined);
     t.mock.timers.tick(600_000); assert.equal(h.sent.length, 1, "raw Esc also cancels the retained watchdog");
@@ -756,7 +758,6 @@ test("native search prompt lifetime cancels only on armed close and preserves un
   const npmRoot = execFileSync("npm", ["root", "-g"], { encoding: "utf8" }).trim();
   const stdinBufferUrl = pathToFileURL(join(npmRoot, "@earendil-works/pi-coding-agent/node_modules/@earendil-works/pi-tui/dist/stdin-buffer.js")).href;
   const extensionUrl = pathToFileURL(join(ROOT, "pi-agent/extensions/pi-tmux-window-status/index.ts")).href;
-  const recoveryUrl = pathToFileURL(join(ROOT, "pi-agent/extensions/pi-suspend-guard/recovery.mjs")).href;
   const cases = [
     { label: "vi-forward", mode: "vi", keyHex: "2f", scenario: "armed-close" },
     { label: "vi-backward", mode: "vi", keyHex: "3f", scenario: "armed-close" },
@@ -773,7 +774,6 @@ test("native search prompt lifetime cancels only on armed close and preserves un
     const runtime = temp(), work = temp(), socket = join(work, "server.sock"), resultPath = join(work, "result.json");
     const fixture = join(work, "extension-fixture.mjs"), injector = join(work, "prompt-inject.py");
     writeFileSync(fixture, `import extension from ${JSON.stringify(extensionUrl)};
-import { installErrorRecovery } from ${JSON.stringify(recoveryUrl)};
 import { StdinBuffer } from ${JSON.stringify(stdinBufferUrl)};
 import { mock } from "node:test";
 import { execFileSync } from "node:child_process";
@@ -788,7 +788,7 @@ const pi = { on(name, fn) { (handlers[name] ||= []).push(fn); }, events: {
   emit(name, event) { for (const fn of channels.get(name) || []) fn(event); }
 }, sendUserMessage(value) { sent.push(value); } };
 const fire = (name, ...args) => { for (const fn of handlers[name] || []) fn(...args); };
-extension(pi); installErrorRecovery(pi); fire("session_start", {}, ctx);
+extension(pi); fire("session_start", {}, ctx);
 let armed = false; const buffer = new StdinBuffer({ escapeTimeout: 1 });
 const report = () => {
   mock.timers.tick(60_000);
@@ -824,7 +824,7 @@ process.stdin.setRawMode(true); process.stdin.resume(); process.stdin.on("data",
         assert.deepEqual(result.sent, ["continue"], `${item.label}: opening alone does not cancel the real timer`);
         assert.equal(result.state, "1|1", `${item.label}: no-close leaves recovery armed`);
       } else {
-        assert.deepEqual(result.sent, [], `${item.label}: first prompt-closing Esc cancels the guard before its virtual 60s deadline`);
+        assert.deepEqual(result.sent, [], `${item.label}: first prompt-closing Esc cancels recovery before its virtual 60s deadline`);
         assert.equal(result.state, "|", `${item.label}: prompt close clears extension error and animator marker`);
       }
       const buffers = spawnSync("tmux", ["-S", socket, "list-buffers", "-F", "#{buffer_name}"], { encoding: "utf8", env: withoutTmuxEnvironment(env) }).stdout || "";
@@ -977,11 +977,6 @@ test("client listing handles zero clients and startup sweep resets stale active/
   assert.ok(args.includes(FRAMES[6]), "active windows breathe through the gray palette");
   assert.equal(args.filter((value) => value === "@quick_deploy_pi_current_bg").length, 1, "only the reset branch unsets the legacy current-bg option");
   assert.ok(args.includes("@quick_deploy_pi_error"));
-});
-
-test("standalone tmux installer includes the single recovery owner", () => {
-  const output = execFileSync("bash", [join(ROOT, "fresh-install/modules/tmux/test/installer.sh")], { encoding: "utf8" });
-  assert.match(output, /PASS: standalone tmux installer/);
 });
 
 test("installer is executable, idempotent, exact-link skip, and preserves foreign new path", () => {

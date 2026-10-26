@@ -7,8 +7,8 @@ import { fileURLToPath } from "node:url";
 import { aggregateLogicalState, HEARTBEAT_MS, publishLease, seedAttentionWatermarksFromSnapshot } from "./state.mjs";
 export { RECOVERY_ARMED_OPTION } from "./state.mjs";
 import { requestAnimatorTick } from "./animator.mjs";
-import { RECOVERY_CANCEL_EVENT, isAssistantError, recoveryTerminalInput, semanticAssistantOutput } from "../pi-suspend-guard/recovery.mjs";
-export { CANCEL_SENTINEL, isAssistantError, isManualEscapePress, recoveryTerminalInput } from "../pi-suspend-guard/recovery.mjs";
+import { RECOVERY_CANCEL_EVENT, installErrorRecovery, isAssistantError, recoveryTerminalInput, semanticAssistantOutput } from "./recovery.mjs";
+export { CANCEL_SENTINEL, isAssistantError, isManualEscapePress, recoveryTerminalInput } from "./recovery.mjs";
 const STARTED = "subagent:async-started", COMPLETE = "subagent:async-complete", CONTROL = "subagent:control-event";
 const HERE = dirname(fileURLToPath(import.meta.url)), ANIMATOR = join(HERE, "animator.mjs");
 type Identity = { socketPath: string; windowId: string; paneId: string };
@@ -50,7 +50,9 @@ export function monitorNeeded(mainActive: boolean, childCount: number, assistant
 
 export default function piTmuxWindowStatus(pi: ExtensionAPI) {
   if (nestedPublisherDisabled()) return;
-  let tmux: Identity; try { tmux = identity(); } catch (error) { console.error(error instanceof Error ? error.message : String(error)); return; }
+  // Recovery belongs to every root session; tmux identity gates presentation only.
+  installErrorRecovery(pi);
+  let tmux: Identity; try { tmux = identity(); } catch (error) { console.error(`${error instanceof Error ? error.message : String(error)}; tmux presentation disabled; error recovery remains enabled`); return; }
   let mainActive = false, assistantErrorLatched = false, rootSessionId: string | undefined, beat: ReturnType<typeof setInterval> | undefined, animator: ReturnType<typeof spawn> | undefined, previousLeaseState: false | "active" | "error" = false;
   let terminalInputUnsubscribe: (() => void) | undefined, activeRunSignal: AbortSignal | undefined;
   const cancelledRunSignals = new WeakSet<AbortSignal>();
