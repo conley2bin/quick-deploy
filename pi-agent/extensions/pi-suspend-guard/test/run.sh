@@ -5,8 +5,8 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 EXTENSION_DIR="$(cd "$HERE/.." && pwd)"
 
-node --test "$HERE/core.test.mjs"
+node --test "$HERE/core.test.mjs" "$HERE/recovery.test.mjs"
 python3 "$HERE/topology.py" "$EXTENSION_DIR/guard.mjs" "$EXTENSION_DIR/index.ts"
 "$HERE/installer.sh"
 
-echo "PASS: pi-suspend-guard core, topology, and installer tests"
+echo "PASS: pi-suspend-guard core, error recovery, topology, and installer tests"

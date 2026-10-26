@@ -11,7 +11,7 @@
 1. `apt install tmux git xclip wl-clipboard` —— 后两者服务的是 gpakosz 配置自带的 `<前缀> y` 绑定（后台任务 `save-buffer - | <探测到的工具>`，在图形会话里才写得进去），在本地图形会话里有意义；**远端复制回本机走的是原生 OSC 52，不需要这两个包**，见下文剪贴板一节。
 2. 克隆 `https://github.com/gpakosz/.tmux` 到 `~/.tmux`（`--single-branch`）。
 3. 链接本仓库的 `tmux.conf.local`（见下表）。
-4. 运行 `pi-agent/extensions/pi-tmux-window-status/install.sh`，把 Pi→tmux breathing status 扩展链接进 `~/.pi/agent/extensions/`。
+4. 运行 `pi-agent/extensions/pi-suspend-guard/install.sh` 与 `pi-agent/extensions/pi-tmux-window-status/install.sh`，把唯一 error 自动恢复 owner 和 Pi→tmux 状态扩展一起链接进 `~/.pi/agent/extensions/`。
 
 ## 脚本创建的链接
 
@@ -19,7 +19,8 @@
 | --- | --- | --- |
 | `~/.tmux.conf` | `~/.tmux/.tmux.conf` | 主配置入口（tmux 固定读取位置）；随重跑时的 `git pull` 自动更新 |
 | `~/.tmux.conf.local` | `fresh-install/modules/tmux/tmux.conf.local`（安装时本仓库的绝对路径） | 定制入口；改动即仓库改动 |
-| `~/.pi/agent/extensions/pi-tmux-window-status` | `pi-agent/extensions/pi-tmux-window-status`（安装时本仓库的绝对路径） | Pi 生命周期到 tmux breathing status 的受管扩展 |
+| `~/.pi/agent/extensions/pi-suspend-guard` | `pi-agent/extensions/pi-suspend-guard`（安装时本仓库的绝对路径） | error 停滞 60 秒自动 continue，每个新错误触发最多 5 次；另保留 suspend 按键防护 |
+| `~/.pi/agent/extensions/pi-tmux-window-status` | `pi-agent/extensions/pi-tmux-window-status`（安装时本仓库的绝对路径） | Pi 生命周期到 tmux breathing status 的受管扩展，仅负责状态显示 |
 
 约束与修复：
 
@@ -216,7 +217,7 @@ Pi 只在启动时扫描 `~/.pi/agent/extensions/` 下的目录，不会扫描�
 - `allow-passthrough all` 允许 pane 把 tmux DCS passthrough 发给外层 Ghostty，因此 pane 内应用的 Kitty graphics 命令不再被 tmux 挡住。刻意选 `all` 而不是 `on`：`on` 在每个 DCS 派发时刻（tmux 3.4 `input.c` 的 `input_dcs_dispatch`）还要过两道瞬态门——某个 client 当前显示的 window 必须就是这个 window（`screen_write_set_client_cb` 的 `curw->window` 比较），且 pane 没有 `PANE_REDRAW`/`PANE_DROP` 待重绘、client 没有 deferred redraw（命中时回调返回 -1，整条 rawstring 写出被跳过）；一次图片事务由多条独立的 tmux DCS 分段拼成一次写入，命中这些事件循环轮询之间的瞬态时，落在瞬态里的分段会被 tmux 静默丢弃，外层终端拿到不完整的多段上传：占位符已经画在屏幕上，图像数据却到不了（表现为 Ghostty 侧的 missing image for virtual placement 与 kitty_gfx 警告，而不是可恢复的重试）。`all` 把这两道门短路为「该 client 的 session 含有这个 window 且 client 就绪（attached 且未 suspended）」，事务不再因瞬态丢分段；隐藏 pane 的主动图像上传仍然由 pi-inline-images 的 viewer monitor 抑制——没有就绪的兼容观看者就不上传，所以 `all` 并不会把常规图像流量引到隐藏 pane。代价必须明确：`all` 会转发隐藏 pane 的任意 DCS，不只是图像命令；它只写给就绪且属于该 session 的 client，不是给 detached 或未来 client 的离线队列；依赖隐藏 pane 做 DCS 隔离的会话不应套用本基线。
 - Pi 的模型或供应商错误把 window 标红并准备自动发送 `continue` 后，animator 会从 live error lease 的 pane ID 派生私有 recovery marker，并在同一个 tmux command batch 中更新 pane marker 与聚合 window 红色；lease 过期、publisher 崩溃、pane 复用及 animator 启动 sweep 都会清除 stale marker。Batch 并非事务，因此 animator 在调用 tmux 前先保留 prior + attempted targets 的清理责任，只有整批成功才缩回 live 集合，尾部 client refresh 失败不会遗留前面已写入的 marker。owning pane 的手动 `Esc` 由 tmux 先投递取消 sentinel、再投递真实 Esc，因此 fullscreen 搜索即使吞掉真实 Esc，也不会漏掉取消意图；扩展立即撤销本 run 的错误与待发送 `continue`，同一 run 的延迟 error 事件不能重新 armed。其他 pane 即使共享红色 window 也没有 marker，不会收到 sentinel。同一 window 若还有其他 Pi root 保持 error lease，聚合标签仍保持红色。
 - `<前缀> e` 打开 `.tmux.conf.local`；保存后按 `<前缀> r`，运行中的 server 才会读取新基线。
-- 状态栏左侧只显示 session 名，与右侧同为浅灰字、深灰底；右侧移除电池与时间、日期，只留 `用户名@主机名`。未选中 window 空闲时为 `#bcbcbc` 灰白块、深色字；bell 保留黄色前景和 `!` 标记；last/activity 不改变背景。选中 window 在色块左右末端各放两个整格实心 `#0077aa` 蓝色竖条（`██`；fg/bg 同设蓝，字体留缝隙也不漏底色），与 error 红底走正交视觉通道，竖条永不呼吸、永不变色。Pi 根回合或其异步子代理运行时，相应 window 背景以约 1s 周期在灰色路径上呼吸；模型/供应商可用性错误时显示稳定红底白字，后续语义输出或成功结束会清除。扩展语义与自动续跑细节见 `pi-agent/extensions/pi-tmux-window-status/README.md`。
+- 状态栏左侧只显示 session 名，与右侧同为浅灰字、深灰底；右侧移除电池与时间、日期，只留 `用户名@主机名`。未选中 window 空闲时为 `#bcbcbc` 灰白块、深色字；bell 保留黄色前景和 `!` 标记；last/activity 不改变背景。选中 window 在色块左右末端各放两个整格实心 `#0077aa` 蓝色竖条（`██`；fg/bg 同设蓝，字体留缝隙也不漏底色），与 error 红底走正交视觉通道，竖条永不呼吸、永不变色。Pi 根回合或其异步子代理运行时，相应 window 背景以约 1s 周期在灰色路径上呼吸；模型/供应商可用性错误时显示稳定红底白字，后续语义输出或成功结束会清除。状态语义见 `pi-agent/extensions/pi-tmux-window-status/README.md`；自动续跑由 `pi-suspend-guard` 独占，任意终态 assistant error 停滞 60 秒且原生 settled/idle/无排队输入才发送，每个新错误触发最多 5 次、至少间隔 60 秒，续跑后再次报错重新计时和重置次数。详情见 `pi-agent/extensions/pi-suspend-guard/README.md`。
 - `<前缀> m` 切换鼠标模式；状态栏 window 标签在鼠标左键释放时切换，因此单击和快速连续点击都会落到释放位置对应的 window。状态栏区域的滚轮不再切换 window；普通 pane 中鼠标滚轮每格滚动 1 行。`<前缀> -` / `<前缀> _` 分屏；`<前缀> h/j/k/l` 在窗格间移动。应用主动开启 mouse reporting 时，滚轮仍交给应用自身处理。鼠标拖选复制后停留在 copy-mode、不跳回 pane 底部；`Esc` 通常只退出 copy-mode，只有当前 pane 同时持有 recovery marker 且 window 聚合状态为红色时，才在退出后投递 sentinel + 真实 Esc；按任意英文字母则退出并把该字母原样输入 pane，大小写保持不变且不会自动回车。Tmux 搜索 prompt 先于这些键表消费按键：vi `/`、`?` 保留原生 submit-on-close 搜索；emacs `C-s`、`C-r` 因 `-i` 在 prompt 打开时就释放 queue，明确改为保留方向、初值和文案的 submit-on-close 搜索，以获得可靠 close edge。Tmux 3.4 无法区分 Esc 取消与 Enter 接受，所以 armed 状态下两种关闭都会取消自动恢复；未 armed 时 pane 零注入。
 - `Ctrl+Alt+←/→` **不需要前缀**，直接切换上一个/下一个 window（底部状态栏的标签）。绑定落在 root 表：`C-M-Left=previous-window`、`C-M-Right=next-window`。Ghostty 模块显式 unbind 这两个键，确保按键进入 pty；gpakosz 检测到 `TERM_PROGRAM=ghostty` 后自动开启 extended-keys，tmux 才能识别组合键。
 - `Ctrl+Alt+=` / `Ctrl+Alt++` **不需要前缀**，提示输入名称后在当前 pane 的目录新建 window；直接回车则让 tmux 按运行程序自动命名。Ghostty 模块为两者显式发送 CSI-u 序列，tmux 分别绑定 `C-M-=` / `C-M-+`，避免符号键修饰信息在终端编码中丢失。

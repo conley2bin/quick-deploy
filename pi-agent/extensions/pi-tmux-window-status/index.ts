@@ -7,6 +7,8 @@ import { fileURLToPath } from "node:url";
 import { aggregateLogicalState, HEARTBEAT_MS, publishLease, seedAttentionWatermarksFromSnapshot } from "./state.mjs";
 export { RECOVERY_ARMED_OPTION } from "./state.mjs";
 import { requestAnimatorTick } from "./animator.mjs";
+import { RECOVERY_CANCEL_EVENT, isAssistantError, recoveryTerminalInput, semanticAssistantOutput } from "../pi-suspend-guard/recovery.mjs";
+export { CANCEL_SENTINEL, isAssistantError, isManualEscapePress, recoveryTerminalInput } from "../pi-suspend-guard/recovery.mjs";
 const STARTED = "subagent:async-started", COMPLETE = "subagent:async-complete", CONTROL = "subagent:control-event";
 const HERE = dirname(fileURLToPath(import.meta.url)), ANIMATOR = join(HERE, "animator.mjs");
 type Identity = { socketPath: string; windowId: string; paneId: string };
@@ -15,39 +17,6 @@ type Child = { id: string; asyncDir?: string; nestedRoute?: NestedRoute; rootTer
 type SessionManager = { getSessionFile?: () => string | null | undefined; getSessionId?: () => string | null | undefined };
 const object = (x: unknown): Record<string, unknown> | undefined => x && typeof x === "object" ? x as Record<string, unknown> : undefined;
 const NESTED_TERMINAL = new Set(["complete", "failed", "paused", "stopped", "rejected"]);
-// Older Pi versions can end native retries with this aborted tail. It preserves
-// an already-armed recovery, unlike a user abort; current Pi may retain the error.
-const RETRY_EXHAUSTED_ABORT = /^aborted after \d+ retry attempts?$/i;
-export const CANCEL_SENTINEL = "\x1b[997;1~";
-
-// Raw TUI listeners see legacy bytes plus Kitty CSI-u press/repeat/release events.
-export function isManualEscapePress(data: string) {
-  if (data === "\x1b") return true;
-  const kitty = data.match(/^\x1b\[27(?::(\d*))?(?::(\d+))?(?:;(\d+))?(?::(\d+))?u$/);
-  if (kitty) {
-    const modifier = (Number.parseInt(kitty[3] || "1", 10) - 1) & ~(64 | 128);
-    return modifier === 0 && Number.parseInt(kitty[4] || "1", 10) !== 3;
-  }
-  const modifyOtherKeys = data.match(/^\x1b\[27;(\d+);27~$/);
-  return modifyOtherKeys?.[1] === "1";
-}
-
-export function recoveryTerminalInput(data: string, cancel: () => void) {
-  if (data === CANCEL_SENTINEL) { cancel(); return { consume: true }; }
-  if (isManualEscapePress(data)) cancel();
-  return undefined;
-}
-
-// Recovery follows Pi's terminal assistant state, never provider wording.
-export function isAssistantError(message: unknown) {
-  const msg = object(message);
-  return msg?.role === "assistant" && msg?.stopReason === "error";
-}
-function partHasSemanticOutput(part: Record<string, unknown> | undefined) { if (!part) return false; if (typeof part.text === "string" && part.text.trim()) return true; if (typeof part.thinking === "string" && (part.thinking as string).trim()) return true; const t = String(part.type || ""); return t === "toolCall" || t === "tool_call" || t === "tool_use"; }
-function assistantHasSemanticOutput(msg: Record<string, unknown> | undefined) { if (!msg || msg.role !== "assistant") return false; if (typeof msg.text === "string" && msg.text.trim()) return true; if (typeof msg.thinking === "string" && msg.thinking.trim()) return true; const content = Array.isArray(msg.content) ? msg.content : []; const delta = object(msg.delta); if (Array.isArray(delta?.content) && delta!.content.some((part) => partHasSemanticOutput(object(part)))) return true; return content.some((part) => partHasSemanticOutput(object(part))); }
-function semanticAssistantOutput(message: unknown) { const p = object(message); if (!p) return false; if (assistantHasSemanticOutput(p)) return true; const inner = object(p.message); if (inner) return assistantHasSemanticOutput(inner); return false; }
-export function isRetryExhaustedAbort(message: unknown) { const msg = object(message); return msg?.role === "assistant" && msg?.stopReason === "aborted" && RETRY_EXHAUSTED_ABORT.test(typeof msg?.errorMessage === "string" ? msg.errorMessage.trim() : ""); }
-export function nextAutoContinueArmed(current: boolean, message: unknown) { return isAssistantError(message) || (isRetryExhaustedAbort(message) && current); }
 export function nextAssistantErrorState(current: boolean, eventType: string, message?: unknown) { if (eventType === "model_select") return false; if (eventType === "message_update") { if (isAssistantError(message)) return true; return current && semanticAssistantOutput(message) ? false : current; } if (eventType === "message_end") { const msg = object(message); if (isAssistantError(message)) return true; if (msg?.role === "assistant" && msg?.stopReason !== "error" && msg?.stopReason !== "aborted") return false; return current; } return current; }
 function eventMessage(args: unknown[]) { for (const arg of args) { const p = object(arg); if (object(p?.message)) return p?.message; if (p?.role === "assistant" || p?.role === "tool") return p; } return undefined; }
 function unwrapAssistantMessage(value: unknown) { const p = object(value); if (object(p?.message)) return p?.message; if (p?.role === "assistant") return p; return undefined; }
@@ -83,9 +52,8 @@ export default function piTmuxWindowStatus(pi: ExtensionAPI) {
   if (nestedPublisherDisabled()) return;
   let tmux: Identity; try { tmux = identity(); } catch (error) { console.error(error instanceof Error ? error.message : String(error)); return; }
   let mainActive = false, assistantErrorLatched = false, rootSessionId: string | undefined, beat: ReturnType<typeof setInterval> | undefined, animator: ReturnType<typeof spawn> | undefined, previousLeaseState: false | "active" | "error" = false;
-  let autoContinueArmed = false, continueTimer: ReturnType<typeof setTimeout> | undefined, lastContinueSentAt = 0, autoContinueCount = 0, terminalInputUnsubscribe: (() => void) | undefined, activeRunSignal: AbortSignal | undefined;
+  let terminalInputUnsubscribe: (() => void) | undefined, activeRunSignal: AbortSignal | undefined;
   const cancelledRunSignals = new WeakSet<AbortSignal>();
-  const AUTO_CONTINUE_MAX = 10, AUTO_CONTINUE_MIN_INTERVAL_MS = 30_000, AUTO_CONTINUE_DEBOUNCE_MS = 250;
   const owner = `${process.pid}:${tmux.paneId}`, children = new Map<string, Child>(), watchers = new Map<string, FSWatcher>(), routeWatchers = new Map<string, FSWatcher>(), attention = new Map<string, number>();
   const snapshots = () => new Map([...children].map(([id, c]) => { const snapshot = mergedChildSnapshot(c, readStatus(c.asyncDir)); seedAttentionWatermarksFromSnapshot(snapshot, attention); return [id, snapshot]; }));
   const logical = () => aggregateLogicalState({ mainActive, roots: new Set(children.keys()), snapshots: snapshots(), attentionWatermarks: attention });
@@ -109,31 +77,25 @@ export default function piTmuxWindowStatus(pi: ExtensionAPI) {
   const captureSession = (ctx: { sessionManager?: SessionManager }) => { rootSessionId ||= sessionIdOf(ctx.sessionManager); if (!rootSessionId) console.error("pi-tmux-window-status: root Pi session identity is unavailable"); };
   const urgentAnimatorTick = () => { requestAnimatorTick(tmux); };
   const updateAssistantError = (eventType: string, message?: unknown) => { const next = nextAssistantErrorState(assistantErrorLatched, eventType, message); if (next !== assistantErrorLatched) { assistantErrorLatched = next; sync(); urgentAnimatorTick(); } };
-  const cancelContinue = () => { if (continueTimer) { clearTimeout(continueTimer); continueTimer = undefined; } };
   const signalFor = (ctx?: { signal?: AbortSignal }) => ctx?.signal || activeRunSignal;
   const eventFromCancelledRun = (ctx?: { signal?: AbortSignal }) => { const signal = signalFor(ctx); return Boolean(signal && cancelledRunSignals.has(signal)); };
-  const cancelErroredAutoContinue = (signal?: AbortSignal) => {
-    if (!assistantErrorLatched && !autoContinueArmed && !continueTimer) return false;
+  const cancelErroredStatus = (signal?: AbortSignal) => {
     if (signal) cancelledRunSignals.add(signal);
-    cancelContinue();
+    if (!assistantErrorLatched) return;
     assistantErrorLatched = false;
-    autoContinueArmed = false;
     sync();
     urgentAnimatorTick();
-    return true;
   };
-  const sendContinue = () => { continueTimer = undefined; lastContinueSentAt = Date.now(); autoContinueCount += 1; pi.sendUserMessage("continue"); };
-  const scheduleContinue = (delay: number) => { cancelContinue(); continueTimer = setTimeout(() => { if (mainActive || !assistantErrorLatched || !autoContinueArmed) { continueTimer = undefined; return; } const idle = lastCtx?.isIdle?.() ?? false; const pending = lastCtx?.hasPendingMessages?.() ?? false; if (!idle || pending) { continueTimer = undefined; return; } const elapsed = Date.now() - lastContinueSentAt; if (elapsed < AUTO_CONTINUE_MIN_INTERVAL_MS) { scheduleContinue(AUTO_CONTINUE_MIN_INTERVAL_MS - elapsed); return; } if (autoContinueCount >= AUTO_CONTINUE_MAX) { continueTimer = undefined; return; } sendContinue(); }, delay); };
-  const maybeAutoContinue = (ctx: { isIdle?: () => boolean; hasPendingMessages?: () => boolean }) => { lastCtx = ctx; if (!assistantErrorLatched || !autoContinueArmed || autoContinueCount >= AUTO_CONTINUE_MAX) return; if (!ctx.isIdle?.() || ctx.hasPendingMessages?.()) return; scheduleContinue(AUTO_CONTINUE_DEBOUNCE_MS); };
-  let lastCtx: { isIdle?: () => boolean; hasPendingMessages?: () => boolean } | undefined;
-  const resetFailureStreak = () => { autoContinueCount = 0; };
-  const unsub = [pi.events.on(STARTED, started), pi.events.on(COMPLETE, complete), pi.events.on(CONTROL, control)];
-  pi.on("session_start", (_event, ctx) => { captureSession(ctx); terminalInputUnsubscribe?.(); terminalInputUnsubscribe = undefined; if (ctx.mode === "tui") terminalInputUnsubscribe = ctx.ui.onTerminalInput((data) => recoveryTerminalInput(data, () => cancelErroredAutoContinue(signalFor(ctx)))); restore(); });
-  pi.on("agent_start", (_event, ctx) => { captureSession(ctx); activeRunSignal = ctx.signal; mainActive = true; cancelContinue(); restore(); sync(); });
-  pi.on("agent_settled", (event, ctx) => { mainActive = false; sync(); if (event.aborted) { cancelContinue(); autoContinueArmed = false; return; } maybeAutoContinue(ctx); });
-  pi.on("input", () => { cancelContinue(); });
+  const manualCancel = () => {
+    cancelErroredStatus(activeRunSignal);
+    pi.events.emit(RECOVERY_CANCEL_EVENT, { signal: activeRunSignal });
+  };
+  const unsub = [pi.events.on(STARTED, started), pi.events.on(COMPLETE, complete), pi.events.on(CONTROL, control), pi.events.on(RECOVERY_CANCEL_EVENT, (event) => cancelErroredStatus(object(event)?.signal as AbortSignal | undefined))];
+  pi.on("session_start", (_event, ctx) => { captureSession(ctx); terminalInputUnsubscribe?.(); terminalInputUnsubscribe = undefined; if (ctx.mode === "tui") terminalInputUnsubscribe = ctx.ui.onTerminalInput((data) => recoveryTerminalInput(data, manualCancel)); restore(); });
+  pi.on("agent_start", (_event, ctx) => { captureSession(ctx); activeRunSignal = ctx.signal; mainActive = true; restore(); sync(); });
+  pi.on("agent_settled", () => { mainActive = false; sync(); });
   pi.on("message_update", (event, ctx) => { if (eventFromCancelledRun(ctx)) return; const msg = unwrapAssistantMessage(eventMessage([event])) || eventMessage([event]); updateAssistantError("message_update", msg); });
-  pi.on("message_end", (event, ctx) => { if (eventFromCancelledRun(ctx)) return; const msg = eventMessage([event]); autoContinueArmed = nextAutoContinueArmed(autoContinueArmed, msg); updateAssistantError("message_end", msg); if (object(msg)?.role === "assistant" && object(msg)?.stopReason !== "error" && object(msg)?.stopReason !== "aborted") resetFailureStreak(); });
-  pi.on("model_select", () => { resetFailureStreak(); updateAssistantError("model_select"); });
-  pi.on("session_shutdown", () => { const hadError = previousLeaseState === "error" || assistantErrorLatched; mainActive = false; assistantErrorLatched = false; autoContinueArmed = false; cancelContinue(); terminalInputUnsubscribe?.(); terminalInputUnsubscribe = undefined; children.clear(); if (beat) clearInterval(beat); for (const watcher of watchers.values()) watcher.close(); watchers.clear(); for (const watcher of routeWatchers.values()) watcher.close(); routeWatchers.clear(); publishLease(tmux, owner, false); if (hadError) { kick(true); urgentAnimatorTick(); } for (const unsubscribe of unsub) if (typeof unsubscribe === "function") unsubscribe(); });
+  pi.on("message_end", (event, ctx) => { if (eventFromCancelledRun(ctx)) return; updateAssistantError("message_end", eventMessage([event])); });
+  pi.on("model_select", () => { updateAssistantError("model_select"); });
+  pi.on("session_shutdown", () => { const hadError = previousLeaseState === "error" || assistantErrorLatched; mainActive = false; assistantErrorLatched = false; terminalInputUnsubscribe?.(); terminalInputUnsubscribe = undefined; children.clear(); if (beat) clearInterval(beat); for (const watcher of watchers.values()) watcher.close(); watchers.clear(); for (const watcher of routeWatchers.values()) watcher.close(); routeWatchers.clear(); publishLease(tmux, owner, false); if (hadError) { kick(true); urgentAnimatorTick(); } for (const unsubscribe of unsub) if (typeof unsubscribe === "function") unsubscribe(); });
 }

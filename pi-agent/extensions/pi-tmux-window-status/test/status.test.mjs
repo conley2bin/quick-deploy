@@ -6,7 +6,8 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { HEARTBEAT_MS, LEASE_TTL_MS, acquireAnimatorLock, aggregateLogicalState, leasePath, projectAsyncStatus, publishLease, readLease, releaseAnimatorLock, seedAttentionWatermarksFromSnapshot, windowLeaseStates } from "../state.mjs";
-import { CANCEL_SENTINEL, RECOVERY_ARMED_OPTION, animatorSpawnNeeded, childFromStartedPayload, childStillRunning, defaultAsyncRoot, isAssistantError, isManualEscapePress, isRetryExhaustedAbort, mergedChildSnapshot, monitorNeeded, nestedProjectionFromChildren, nestedPublisherDisabled, nextAssistantErrorState, nextAutoContinueArmed, readNestedRegistryProjection, recoveryTerminalInput, restoredChildren, sessionIdOf, validateNestedRoute } from "../index.ts";
+import { CANCEL_SENTINEL, RECOVERY_ARMED_OPTION, animatorSpawnNeeded, childFromStartedPayload, childStillRunning, defaultAsyncRoot, isAssistantError, isManualEscapePress, mergedChildSnapshot, monitorNeeded, nestedProjectionFromChildren, nestedPublisherDisabled, nextAssistantErrorState, readNestedRegistryProjection, recoveryTerminalInput, restoredChildren, sessionIdOf, validateNestedRoute } from "../index.ts";
+import { installErrorRecovery } from "../../pi-suspend-guard/recovery.mjs";
 import { ANIMATOR_URGENT_SIGNAL, ERROR_BG, ERROR_FG, ERROR_MS, FRAME_BLUE, FRAME_COUNT, FRAME_MS, FRAMES, GRAY_RANGE, MAX_CONSECUTIVE_FAILURES, PERIOD_MS, activeWindows, frameAt, isDirectExecution, leaseWindowStates, listClients, listRecoveryArmedPanes, paneRecoveryOptionArgs, requestAnimatorTick, runAnimator, sweepWindows, windowOptionArgs } from "../animator.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -52,16 +53,17 @@ const waitFor = async (read, expected, timeoutMs = 1_500) => {
   assert.equal(read(), expected);
 };
 let harnessSequence = 0;
-async function statusHarness(label) {
+async function statusHarness(label, { recovery = true, recoveryFirst = false } = {}) {
   const runtime = temp(), work = temp(), socket = join(work, "server.sock");
   const tmux = (args, options = {}) => isolatedTmux(args, options);
   tmux(["-S", socket, "-f", join(process.env.HOME, ".tmux.conf"), "new-session", "-d", "-s", label]);
   const paneId = tmux(["-S", socket, "display-message", "-p", "#{pane_id}"], { encoding: "utf8" }).trim();
-  const handlers = {}, sent = [], sentAt = [];
-  let terminalInput, terminalInputUnsubscribed = 0, currentSignal;
+  const handlers = {}, sent = [], sentAt = [], channels = new Map(), terminalInputs = new Set();
+  let terminalInputUnsubscribed = 0, currentSignal;
+  const terminalInput = (data) => { for (const fn of terminalInputs) { const result = fn(data); if (result?.consume) return result; } };
   const ctx = {
     mode: "tui",
-    ui: { onTerminalInput: (handler) => { terminalInput = handler; return () => { terminalInputUnsubscribed += 1; }; } },
+    ui: { onTerminalInput: (handler) => { terminalInputs.add(handler); return () => { terminalInputs.delete(handler); terminalInputUnsubscribed += 1; }; } },
     get signal() { return currentSignal; },
     isIdle: () => true,
     hasPendingMessages: () => false,
@@ -69,7 +71,10 @@ async function statusHarness(label) {
   };
   const pi = {
     on: (name, fn) => { (handlers[name] ||= []).push(fn); },
-    events: { on: () => () => {} },
+    events: {
+      on(name, fn) { if (!channels.has(name)) channels.set(name, new Set()); channels.get(name).add(fn); return () => channels.get(name).delete(fn); },
+      emit(name, event) { for (const fn of channels.get(name) || []) fn(event); },
+    },
     sendUserMessage: (content) => { sent.push(content); sentAt.push(Date.now()); },
   };
   const fire = (name, ...args) => (handlers[name] || []).map((fn) => fn(...args));
@@ -78,7 +83,9 @@ async function statusHarness(label) {
   Object.assign(process.env, env);
   try {
     const mod = await import(`../index.ts?status-harness-${label}-${++harnessSequence}`);
+    if (recovery && recoveryFirst) installErrorRecovery(pi);
     mod.default(pi);
+    if (recovery && !recoveryFirst) installErrorRecovery(pi);
     fire("session_start", {}, ctx);
   } catch (error) {
     Object.keys(process.env).forEach((key) => { if (!(key in origEnv)) delete process.env[key]; });
@@ -92,9 +99,11 @@ async function statusHarness(label) {
     setSignal(signal) { currentSignal = signal; },
     errorOption: () => tmux(["-S", socket, "show-options", "-wqv", "@quick_deploy_pi_error"], { encoding: "utf8" }).trim(),
     paneArmed: () => tmux(["-S", socket, "show-options", "-pqv", "-t", paneId, RECOVERY_ARMED_OPTION], { encoding: "utf8" }).trim(),
+    leaseState: () => JSON.parse(readFileSync(leasePath({ socketPath: socket }, `${process.pid}:${paneId}`, env), "utf8")).state,
     async cleanup() {
       fire("session_shutdown", {}, ctx);
-      assert.equal(terminalInputUnsubscribed, 1, "session shutdown releases the raw input listener");
+      assert.equal(terminalInputUnsubscribed, recovery ? 2 : 1, "session shutdown releases both raw input listeners");
+      assert.equal(terminalInputs.size, 0);
       Object.keys(process.env).forEach((key) => { if (!(key in origEnv)) delete process.env[key]; });
       Object.assign(process.env, origEnv);
       try { tmux(["-S", socket, "kill-server"]); } catch {}
@@ -212,7 +221,6 @@ test("assistant error eligibility depends only on role and stopReason, never err
   ]) {
     const message = assistantFailure(errorMessage);
     assert.equal(isAssistantError(message), true, JSON.stringify(message));
-    assert.equal(nextAutoContinueArmed(false, message), true);
     assert.equal(nextAssistantErrorState(false, "message_end", message), true);
   }
   for (const message of [
@@ -251,25 +259,6 @@ test("assistant error state latches every failure and clears only on assistant/m
   assert.equal(nextAssistantErrorState(false, "message_end", assistantFailure("context length exceeded")), true);
   assert.equal(nextAssistantErrorState(true, "message_end", { role: "assistant", stopReason: "aborted", errorMessage: "Operation aborted" }), true, "ordinary abort disarms recovery without clearing the existing red latch");
   assert.equal(nextAssistantErrorState(false, "message_end", { role: "toolResult", isError: true }), false);
-});
-
-test("auto-continue stays armed across legacy retry-exhaustion tails but not user abort or normal output", () => {
-  const failure = assistantFailure();
-  const retryAbort = (n) => ({ role: "assistant", stopReason: "aborted", errorMessage: `Aborted after ${n} retry attempt${n > 1 ? "s" : ""}` });
-  const userAbort = { role: "assistant", stopReason: "aborted", errorMessage: "Operation aborted" };
-  assert.equal(isRetryExhaustedAbort(retryAbort(1)), true);
-  assert.equal(isRetryExhaustedAbort(retryAbort(5)), true);
-  assert.equal(isRetryExhaustedAbort(userAbort), false);
-  assert.equal(isRetryExhaustedAbort(failure), false);
-  assert.equal(isRetryExhaustedAbort({ role: "tool", stopReason: "aborted", errorMessage: "Aborted after 3 retry attempts" }), false);
-  let armed = nextAutoContinueArmed(false, failure);
-  assert.equal(armed, true, "even an error without text arms recovery");
-  armed = nextAutoContinueArmed(armed, retryAbort(1));
-  assert.equal(armed, true, "retry-exhaustion tail preserves an already-armed recovery");
-  assert.equal(nextAutoContinueArmed(false, retryAbort(3)), false, "legacy tail alone does not arm");
-  assert.equal(nextAutoContinueArmed(true, userAbort), false, "user abort clears recovery eligibility");
-  assert.equal(nextAutoContinueArmed(true, { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "ok" }] }), false);
-  assert.equal(nextAutoContinueArmed(true, assistantFailure("context length exceeded")), true);
 });
 
 test("0.56 async-started ownership filters on root Pi session file identity", () => {
@@ -709,329 +698,56 @@ test("partial tmux batch failure retains attempted window and pane cleanup respo
   }
 });
 
-for (const [label, errorMessage] of [
-  ["session-source", SESSION_SOURCE_ERROR],
-  ["account-concurrency", ACCOUNT_CONCURRENCY_ERROR],
-  ["unknown", "unexpected provider failure"],
-  ["empty", ""],
-  ["missing", undefined],
-  ["auth", "401 unauthorized invalid API key"],
-  ["quota", "quota exceeded; billing balance is 0"],
-]) test(`assistant error auto-continue waits for settled and debounce: ${label}`, async (t) => {
-  const h = await statusHarness(`assistant-error-${label}`);
-  const message = assistantFailure(errorMessage);
+test("tmux status alone publishes errors but never injects continue", async (t) => {
+  const h = await statusHarness("display-only", { recovery: false });
   try {
     h.setSignal(new AbortController().signal);
     h.fire("agent_start", {}, h.ctx);
-    h.fire("message_update", { message }, h.ctx);
-    h.fire("message_end", { message }, h.ctx);
-    await waitFor(h.paneArmed, "1");
-    await waitFor(h.errorOption, "1");
-    t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: Date.now() });
-    t.mock.timers.tick(1_000);
-    h.fire("agent_end", {}, h.ctx);
-    t.mock.timers.tick(1_000);
-    assert.deepEqual(h.sent, [], "native retry/compaction still owns the unsettled run");
-    h.fire("agent_settled", { aborted: false }, h.ctx);
-    t.mock.timers.tick(249);
-    assert.deepEqual(h.sent, [], "settlement does not bypass the debounce");
-    t.mock.timers.tick(1);
-    assert.deepEqual(h.sent, ["continue"]);
-    assert.equal(h.errorOption(), "1", "sending continue does not clear the error latch");
-    t.diagnostic(`${label}: error -> red; before settled=0 sends; settled+249ms=0; +250ms=continue`);
-  } finally {
-    t.mock.timers.reset();
-    await h.cleanup();
-  }
-});
-
-test("auto-continue ignores tool failures, ordinary Error text and aborted messages", async (t) => {
-  const h = await statusHarness("non-assistant-errors");
-  try {
-    t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: Date.now() });
-    for (const message of [
-      { role: "toolResult", toolName: "bash", isError: true, content: [{ type: "text", text: `Error: ${SESSION_SOURCE_ERROR}` }] },
-      { role: "tool", stopReason: "error", errorMessage: SESSION_SOURCE_ERROR },
-      { role: "assistant", stopReason: "stop", content: [{ type: "text", text: `Error: ${SESSION_SOURCE_ERROR}` }] },
-      { role: "assistant", stopReason: "aborted", errorMessage: "Operation aborted" },
-    ]) {
-      h.fire("agent_start", {}, h.ctx);
-      h.fire("message_update", { message }, h.ctx);
-      h.fire("message_end", { message }, h.ctx);
-      h.fire("agent_settled", {}, h.ctx);
-      t.mock.timers.tick(30_000);
-      assert.deepEqual(h.sent, [], JSON.stringify(message));
-      assert.equal(h.paneArmed(), "", "non-errors do not publish recovery ownership");
-    }
-    h.fire("agent_start", {}, h.ctx);
-    h.fire("message_end", { message: assistantFailure() }, h.ctx);
-    h.fire("agent_settled", {}, h.ctx);
-    t.mock.timers.tick(250);
-    assert.deepEqual(h.sent, ["continue"], "the same harness can send for an actual assistant error");
-  } finally {
-    t.mock.timers.reset();
-    await h.cleanup();
-  }
-});
-
-test("auto-continue requires idle and no pending messages at settlement and send time", async (t) => {
-  const h = await statusHarness("idle-pending-gates");
-  let idle = false, pending = false;
-  h.ctx.isIdle = () => idle;
-  h.ctx.hasPendingMessages = () => pending;
-  try {
-    h.fire("agent_start", {}, h.ctx);
-    h.fire("message_end", { message: assistantFailure(SESSION_SOURCE_ERROR) }, h.ctx);
-    await waitFor(h.errorOption, "1");
-    t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: Date.now() });
-    h.fire("agent_settled", {}, h.ctx);
-    t.mock.timers.tick(1_000);
-    assert.deepEqual(h.sent, [], "busy settlement schedules nothing");
-    idle = true; pending = true;
-    h.fire("agent_settled", {}, h.ctx);
-    t.mock.timers.tick(1_000);
-    assert.deepEqual(h.sent, [], "queued input at settlement schedules nothing");
-    pending = false;
-    h.fire("agent_settled", {}, h.ctx);
-    pending = true;
-    t.mock.timers.tick(250);
-    assert.deepEqual(h.sent, [], "queued input appearing during debounce blocks the send");
-    pending = false;
-    h.fire("agent_settled", {}, h.ctx);
-    idle = false;
-    t.mock.timers.tick(250);
-    assert.deepEqual(h.sent, [], "becoming busy during debounce blocks the send");
-    idle = true;
-    h.fire("agent_settled", {}, h.ctx);
-    t.mock.timers.tick(250);
-    assert.deepEqual(h.sent, ["continue"]);
-  } finally {
-    t.mock.timers.reset();
-    await h.cleanup();
-  }
-});
-
-test("native retry success settles without an injected continue", async (t) => {
-  const h = await statusHarness("native-retry-success");
-  try {
-    h.fire("agent_start", {}, h.ctx);
-    h.fire("message_end", { message: assistantFailure(SESSION_SOURCE_ERROR) }, h.ctx);
-    await waitFor(h.errorOption, "1");
-    t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: Date.now() });
-    h.fire("agent_end", {}, h.ctx);
-    t.mock.timers.tick(60_000);
-    assert.deepEqual(h.sent, []);
-    h.fire("agent_start", {}, h.ctx);
-    h.fire("message_end", { message: { role: "assistant", stopReason: "toolUse", content: [{ type: "toolCall", name: "bash" }] } }, h.ctx);
-    h.fire("message_end", { message: { role: "toolResult", toolName: "bash", isError: false, content: [{ type: "text", text: "ok" }] } }, h.ctx);
-    h.fire("agent_settled", {}, h.ctx);
-    t.mock.timers.tick(60_000);
-    assert.deepEqual(h.sent, [], "successful native recovery clears eligibility before settlement");
-    t.mock.timers.reset();
-    await waitFor(h.errorOption, "");
-  } finally {
-    t.mock.timers.reset();
-    await h.cleanup();
-  }
-});
-
-test("user abort disarms recovery, including aborted settlement without a new assistant message", async (t) => {
-  const h = await statusHarness("user-abort");
-  const userAbort = { role: "assistant", stopReason: "aborted", errorMessage: "Operation aborted" };
-  try {
-    h.fire("agent_start", {}, h.ctx);
     h.fire("message_end", { message: assistantFailure() }, h.ctx);
     await waitFor(h.errorOption, "1");
+    await waitFor(h.paneArmed, "1");
     t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: Date.now() });
-    h.fire("message_end", { message: userAbort }, h.ctx);
-    h.fire("agent_settled", {}, h.ctx);
-    t.mock.timers.tick(1_000);
-    assert.deepEqual(h.sent, []);
-    assert.equal(h.errorOption(), "1", "ordinary abort preserves the existing red latch");
-    h.fire("agent_start", {}, h.ctx);
-    h.fire("message_end", { message: assistantFailure(SESSION_SOURCE_ERROR) }, h.ctx);
-    h.fire("agent_settled", {}, h.ctx);
-    h.fire("message_end", { message: userAbort }, h.ctx);
-    t.mock.timers.tick(250);
-    assert.deepEqual(h.sent, [], "late user abort invalidates an already-scheduled timer");
-    h.fire("agent_start", {}, h.ctx);
-    h.fire("message_end", { message: assistantFailure(ACCOUNT_CONCURRENCY_ERROR) }, h.ctx);
-    h.fire("agent_settled", { aborted: true }, h.ctx);
-    t.mock.timers.tick(60_000);
-    assert.deepEqual(h.sent, [], "abort during native retry sleep may have no aborted message");
+    h.fire("agent_settled", { aborted: false }, h.ctx);
+    t.mock.timers.tick(600_000);
+    assert.deepEqual(h.sent, [], "suspend guard is the only sending owner");
+    assert.equal(h.errorOption(), "1");
   } finally {
     t.mock.timers.reset();
     await h.cleanup();
   }
 });
 
-test("raw Esc cancels a pending continue for an unfamiliar assistant error", async (t) => {
-  const h = await statusHarness("raw-escape");
+for (const recoveryFirst of [false, true]) test(`one recovery owner; pane cancellation works in either listener order: guard-first=${recoveryFirst}`, async (t) => {
+  const h = await statusHarness(`handoff-${recoveryFirst}`, { recoveryFirst });
+  const first = new AbortController(), second = new AbortController();
   try {
-    h.setSignal(new AbortController().signal);
+    h.setSignal(first.signal);
     h.fire("agent_start", {}, h.ctx);
-    h.fire("message_end", { message: assistantFailure(SESSION_SOURCE_ERROR) }, h.ctx);
-    await waitFor(h.errorOption, "1");
-    t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: Date.now() });
-    h.fire("agent_settled", {}, h.ctx);
-    assert.equal(h.terminalInput("\x1b"), undefined, "raw Esc remains passthrough");
+    h.fire("message_update", { message: assistantFailure() }, h.ctx);
     h.fire("message_end", { message: assistantFailure() }, h.ctx);
-    h.fire("agent_settled", {}, h.ctx);
-    t.mock.timers.tick(60_000);
-    assert.deepEqual(h.sent, [], "Esc suppresses both the timer and same-run late errors");
-    t.mock.timers.reset();
-    await waitFor(h.paneArmed, "");
-    await waitFor(h.errorOption, "");
-  } finally {
-    t.mock.timers.reset();
-    await h.cleanup();
-  }
-});
-
-test("legacy retry-exhausted abort tail preserves only an already-armed recovery", async (t) => {
-  const h = await statusHarness("legacy-retry-tail");
-  const tail = { role: "assistant", stopReason: "aborted", errorMessage: "Aborted after 5 retry attempts" };
-  try {
-    t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: Date.now() });
-    h.fire("agent_start", {}, h.ctx);
-    h.fire("message_end", { message: tail }, h.ctx);
-    h.fire("agent_settled", { aborted: false }, h.ctx);
-    t.mock.timers.tick(1_000);
-    assert.deepEqual(h.sent, [], "legacy tail alone never arms");
-    h.fire("agent_start", {}, h.ctx);
-    h.fire("message_end", { message: assistantFailure("") }, h.ctx);
-    h.fire("message_end", { message: tail }, h.ctx);
-    h.fire("agent_settled", { aborted: false }, h.ctx);
-    t.mock.timers.tick(250);
-    assert.deepEqual(h.sent, ["continue"]);
-  } finally {
-    t.mock.timers.reset();
-    await h.cleanup();
-  }
-});
-
-for (const reset of ["success", "model-select"]) test(`auto-continue preserves 30s throttle and ten-send cap until ${reset}`, async (t) => {
-  const h = await statusHarness(`recovery-cap-${reset}`);
-  const failAndSettle = () => {
-    h.setSignal(new AbortController().signal);
-    h.fire("agent_start", {}, h.ctx);
-    h.fire("message_end", { message: assistantFailure(ACCOUNT_CONCURRENCY_ERROR) }, h.ctx);
-    h.fire("agent_settled", {}, h.ctx);
-  };
-  try {
-    h.fire("agent_start", {}, h.ctx);
-    h.fire("message_end", { message: assistantFailure(SESSION_SOURCE_ERROR) }, h.ctx);
     await waitFor(h.errorOption, "1");
-    t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: Date.now() });
-    h.fire("agent_settled", {}, h.ctx);
-    t.mock.timers.tick(250);
-    assert.equal(h.sent.length, 1);
-    for (let n = 2; n <= 10; n++) {
-      failAndSettle();
-      t.mock.timers.tick(29_999);
-      assert.equal(h.sent.length, n - 1, "a new error cannot bypass the 30s throttle");
-      t.mock.timers.tick(1);
-      assert.equal(h.sent.length, n);
-      assert.equal(h.sentAt[n - 1] - h.sentAt[n - 2], 30_000);
-    }
-    failAndSettle();
-    t.mock.timers.tick(60_000);
-    assert.equal(h.sent.length, 10, "the eleventh failure stays capped");
-    assert.equal(h.errorOption(), "1", "the cap retains the red latch");
-    h.terminalInput(CANCEL_SENTINEL);
-    failAndSettle();
-    t.mock.timers.tick(60_000);
-    assert.equal(h.sent.length, 10, "Esc does not reset the failure cap");
-    if (reset === "success") h.fire("message_end", { message: { role: "assistant", stopReason: "toolUse", content: [{ type: "toolCall", name: "bash" }] } }, h.ctx);
-    else h.fire("model_select", {}, h.ctx);
-    failAndSettle();
-    t.mock.timers.tick(250);
-    assert.equal(h.sent.length, 11, "normal assistant completion or model selection resets the streak");
-    t.diagnostic(`10 sends exactly 30s apart -> capped at 10 -> Esc still capped -> ${reset} permits next send`);
-  } finally {
-    t.mock.timers.reset();
-    await h.cleanup();
-  }
-});
-
-test("sentinel cancellation invalidates delayed events from one run while a distinct run auto-continues", async () => {
-  const h = await statusHarness("delayed-cancel");
-  const firstRun = new AbortController(), secondRun = new AbortController(), thirdRun = new AbortController();
-  const errMsg = assistantFailure(SESSION_SOURCE_ERROR);
-  try {
-    h.setSignal(firstRun.signal);
-    h.fire("agent_start", {}, h.ctx);
-    h.fire("message_update", { message: errMsg }, h.ctx);
     await waitFor(h.paneArmed, "1");
-    await waitFor(h.errorOption, "1");
-
-    let releaseDelayed;
-    const delayedGate = new Promise((resolve) => { releaseDelayed = resolve; });
-    const delayedDispatch = (async () => {
-      await delayedGate;
-      h.handlers.message_update[0]({ message: errMsg }, h.ctx);
-      return h.handlers.message_end[0]({ message: errMsg }, h.ctx);
-    })();
-
-    assert.deepEqual(h.terminalInput(CANCEL_SENTINEL), { consume: true }, "only the private sentinel is consumed");
-    firstRun.abort();
-    await waitFor(h.paneArmed, "");
-    releaseDelayed();
-    await delayedDispatch;
-    h.fire("agent_settled", {}, h.ctx);
-    await new Promise((resolve) => setTimeout(resolve, 350));
-    assert.deepEqual(h.sent, [], "same-signal delayed message_end cannot re-arm or send");
-    assert.equal(h.paneArmed(), "");
-    await waitFor(h.errorOption, "");
-
-    h.setSignal(secondRun.signal);
-    h.fire("agent_start", {}, h.ctx);
-    h.fire("message_end", { message: errMsg }, h.ctx);
-    await waitFor(h.paneArmed, "1");
-    h.fire("agent_settled", {}, h.ctx);
-    await new Promise((resolve) => setTimeout(resolve, 350));
-    assert.deepEqual(h.sent, ["continue"], "distinct uncancelled run follows normal auto-continue");
-    await waitFor(h.errorOption, "1");
-
     assert.deepEqual(h.terminalInput(CANCEL_SENTINEL), { consume: true });
-    h.setSignal(thirdRun.signal);
-    h.fire("agent_start", {}, h.ctx);
-    h.fire("message_end", { message: errMsg }, h.ctx);
-    h.fire("agent_settled", {}, h.ctx);
-    await new Promise((resolve) => setTimeout(resolve, 350));
-    assert.deepEqual(h.sent, ["continue"], "Esc does not reset the existing 30 s send throttle");
-  } finally {
-    await h.cleanup();
-  }
-});
-
-test("input and agent_start cancel pending continue while success clears error ownership", async () => {
-  const h = await statusHarness("existing-cancellations");
-  const run1 = new AbortController(), run2 = new AbortController(), run3 = new AbortController();
-  const errMsg = { role: "assistant", stopReason: "error", errorMessage: "stream_read_error" };
-  try {
-    h.setSignal(run1.signal);
-    h.fire("agent_start", {}, h.ctx);
-    h.fire("message_end", { message: errMsg }, h.ctx);
-    h.fire("agent_settled", {}, h.ctx);
-    h.fire("input", { text: "user typed" }, h.ctx);
-    await new Promise((resolve) => setTimeout(resolve, 350));
-    assert.deepEqual(h.sent, [], "submitted input cancels the debounce before any send");
-    assert.equal(h.paneArmed(), "1", "ordinary input cancellation preserves the existing red latch");
-
-    h.setSignal(run2.signal);
-    h.fire("agent_start", {}, h.ctx);
-    h.fire("message_end", { message: errMsg }, h.ctx);
-    h.fire("agent_settled", {}, h.ctx);
-    h.setSignal(run3.signal);
-    h.fire("agent_start", {}, h.ctx);
-    h.fire("message_end", { message: { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "ok" }] } }, h.ctx);
-    h.fire("agent_settled", {}, h.ctx);
-    await new Promise((resolve) => setTimeout(resolve, 350));
-    assert.deepEqual(h.sent, [], "agent_start cancels the old timer even after the new run succeeds and settles before its deadline");
-    assert.equal(h.paneArmed(), "", "new-run success clears pane recovery ownership");
+    h.fire("message_update", { message: assistantFailure() }, h.ctx);
+    h.fire("message_end", { message: assistantFailure() }, h.ctx);
+    h.fire("agent_settled", { aborted: false }, h.ctx);
     await waitFor(h.errorOption, "");
+    await waitFor(h.paneArmed, "");
+    t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: Date.now() });
+    t.mock.timers.tick(600_000);
+    assert.deepEqual(h.sent, [], "consumed sentinel cancels guard and same-run late errors");
+    h.setSignal(second.signal);
+    h.fire("agent_start", {}, h.ctx);
+    h.fire("message_end", { message: assistantFailure(ACCOUNT_CONCURRENCY_ERROR) }, h.ctx);
+    h.fire("agent_settled", { aborted: false }, h.ctx);
+    h.fire("agent_settled", { aborted: false }, h.ctx);
+    t.mock.timers.tick(59_999); assert.deepEqual(h.sent, []);
+    t.mock.timers.tick(1); assert.deepEqual(h.sent, ["continue"], "no second tmux sender races the guard");
+    assert.equal(h.leaseState(), "error", "sending continue retains the error presentation");
+    assert.deepEqual(h.terminalInput("\x1b"), undefined);
+    t.mock.timers.tick(600_000); assert.equal(h.sent.length, 1, "raw Esc also cancels the retained watchdog");
   } finally {
+    t.mock.timers.reset();
     await h.cleanup();
   }
 });
@@ -1040,6 +756,7 @@ test("native search prompt lifetime cancels only on armed close and preserves un
   const npmRoot = execFileSync("npm", ["root", "-g"], { encoding: "utf8" }).trim();
   const stdinBufferUrl = pathToFileURL(join(npmRoot, "@earendil-works/pi-coding-agent/node_modules/@earendil-works/pi-tui/dist/stdin-buffer.js")).href;
   const extensionUrl = pathToFileURL(join(ROOT, "pi-agent/extensions/pi-tmux-window-status/index.ts")).href;
+  const recoveryUrl = pathToFileURL(join(ROOT, "pi-agent/extensions/pi-suspend-guard/recovery.mjs")).href;
   const cases = [
     { label: "vi-forward", mode: "vi", keyHex: "2f", scenario: "armed-close" },
     { label: "vi-backward", mode: "vi", keyHex: "3f", scenario: "armed-close" },
@@ -1055,7 +772,39 @@ test("native search prompt lifetime cancels only on armed close and preserves un
   for (const item of cases) {
     const runtime = temp(), work = temp(), socket = join(work, "server.sock"), resultPath = join(work, "result.json");
     const fixture = join(work, "extension-fixture.mjs"), injector = join(work, "prompt-inject.py");
-    writeFileSync(fixture, `import extension from ${JSON.stringify(extensionUrl)};\nimport { StdinBuffer } from ${JSON.stringify(stdinBufferUrl)};\nimport { execFileSync } from "node:child_process";\nimport { writeFileSync } from "node:fs";\nconst resultPath = process.argv[2];\nconst handlers = {}, sent = [], unarmedInputs = []; let terminalInput; const run = new AbortController();\nconst ctx = { mode: "tui", ui: { onTerminalInput(fn) { terminalInput = fn; return () => {}; } }, get signal() { return run.signal; }, isIdle: () => true, hasPendingMessages: () => false, sessionManager: { getSessionFile: () => "/tmp/search-prompt-session.jsonl" } };\nconst pi = { on(name, fn) { (handlers[name] ||= []).push(fn); }, events: { on: () => () => {} }, sendUserMessage(value) { sent.push(value); } };\nconst fire = (name, ...args) => { for (const fn of handlers[name] || []) fn(...args); };\nextension(pi); fire("session_start", {}, ctx);\nlet armed = false; const buffer = new StdinBuffer({ escapeTimeout: 1 });\nconst report = () => { const state = execFileSync("tmux", ["display-message", "-p", "-t", process.env.TMUX_PANE, "#{@quick_deploy_pi_recovery_armed}|#{@quick_deploy_pi_error}"], { encoding: "utf8" }).trim(); writeFileSync(resultPath, JSON.stringify({ sent, state, unarmedInputs })); fire("session_shutdown", {}, ctx); setTimeout(() => process.exit(0), 20); };\nbuffer.on("data", (data) => { if (!armed && data === "A") { armed = true; fire("agent_start", {}, ctx); fire("message_end", { message: { role: "assistant", stopReason: "error", errorMessage: "stream_read_error" } }, ctx); fire("agent_settled", {}, ctx); setTimeout(report, 600); return; } if (!armed) { unarmedInputs.push(Buffer.from(data).toString("hex")); return; } terminalInput?.(data); });\nprocess.stdin.setRawMode(true); process.stdin.resume(); process.stdin.on("data", (chunk) => buffer.process(chunk)); process.stdout.write("WAIT\\r\\n");\n`);
+    writeFileSync(fixture, `import extension from ${JSON.stringify(extensionUrl)};
+import { installErrorRecovery } from ${JSON.stringify(recoveryUrl)};
+import { StdinBuffer } from ${JSON.stringify(stdinBufferUrl)};
+import { mock } from "node:test";
+import { execFileSync } from "node:child_process";
+import { writeFileSync } from "node:fs";
+const realSetTimeout = globalThis.setTimeout;
+const resultPath = process.argv[2];
+const handlers = {}, sent = [], unarmedInputs = [], terminalInputs = new Set(), channels = new Map();
+const run = new AbortController();
+const ctx = { mode: "tui", ui: { onTerminalInput(fn) { terminalInputs.add(fn); return () => terminalInputs.delete(fn); } }, get signal() { return run.signal; }, isIdle: () => true, hasPendingMessages: () => false, sessionManager: { getSessionFile: () => "/tmp/search-prompt-session.jsonl" } };
+const pi = { on(name, fn) { (handlers[name] ||= []).push(fn); }, events: {
+  on(name, fn) { if (!channels.has(name)) channels.set(name, new Set()); channels.get(name).add(fn); return () => channels.get(name).delete(fn); },
+  emit(name, event) { for (const fn of channels.get(name) || []) fn(event); }
+}, sendUserMessage(value) { sent.push(value); } };
+const fire = (name, ...args) => { for (const fn of handlers[name] || []) fn(...args); };
+extension(pi); installErrorRecovery(pi); fire("session_start", {}, ctx);
+let armed = false; const buffer = new StdinBuffer({ escapeTimeout: 1 });
+const report = () => {
+  mock.timers.tick(60_000);
+  const state = execFileSync("tmux", ["display-message", "-p", "-t", process.env.TMUX_PANE, "#{@quick_deploy_pi_recovery_armed}|#{@quick_deploy_pi_error}"], { encoding: "utf8" }).trim();
+  writeFileSync(resultPath, JSON.stringify({ sent, state, unarmedInputs })); fire("session_shutdown", {}, ctx); mock.timers.reset(); realSetTimeout(() => process.exit(0), 20);
+};
+buffer.on("data", (data) => {
+  if (!armed && data === "A") {
+    armed = true; mock.timers.enable({ apis: ["setTimeout", "Date"], now: Date.now() });
+    fire("agent_start", {}, ctx); fire("message_end", { message: { role: "assistant", stopReason: "error", errorMessage: "stream_read_error" } }, ctx); fire("agent_settled", {}, ctx); realSetTimeout(report, 600); return;
+  }
+  if (!armed) { unarmedInputs.push(Buffer.from(data).toString("hex")); return; }
+  for (const fn of terminalInputs) if (fn(data)?.consume) break;
+});
+process.stdin.setRawMode(true); process.stdin.resume(); process.stdin.on("data", (chunk) => buffer.process(chunk)); process.stdout.write("WAIT\\r\\n");
+`);
     writeFileSync(injector, `import fcntl, json, os, pty, select, struct, subprocess, sys, termios, time\nsocket, session, pane, mode, key_hex, scenario, result_path = sys.argv[1:]\nenv = os.environ.copy(); env.pop("TMUX", None); env.pop("TMUX_PANE", None)\nbase = ["tmux", "-S", socket]\ndef tx(*args, check=True): return subprocess.run(base + list(args), check=check, capture_output=True, text=True, env=env)\ndef wait_armed():\n    deadline = time.time() + 0.24\n    while time.time() < deadline:\n        state = tx("display-message", "-p", "-t", pane, "#{@quick_deploy_pi_recovery_armed}|#{@quick_deploy_pi_error}").stdout.strip()\n        if state == "1|1": return state\n        time.sleep(0.005)\n    raise AssertionError("recovery did not arm before debounce")\npid, fd = pty.fork()\nif pid == 0:\n    os.environ.clear(); os.environ.update(env); os.environ["TERM"] = "xterm-256color"\n    os.execvp("tmux", base + ["attach-session", "-t", session])\ntry:\n    fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 100, 0, 0))\n    deadline = time.time() + 3\n    while time.time() < deadline and not tx("list-clients", "-t", session, check=False).stdout.strip(): time.sleep(0.02)\n    tx("set-option", "-w", "-t", pane, "mode-keys", mode); tx("select-pane", "-t", pane)\n    unarmed_mode = before_mode = prompt_mode = pane_in_mode = pre_close_state = ""\n    close_key = b"\\r" if scenario == "armed-enter" else b"\\x1b"\n    if scenario in ("armed-close", "armed-enter"):\n        tx("copy-mode", "-t", pane); time.sleep(0.02); os.write(fd, bytes.fromhex(key_hex)); time.sleep(0.05); os.write(fd, close_key); time.sleep(0.05)\n        unarmed_mode = tx("display-message", "-p", "-t", pane, "#{pane_in_mode}").stdout.strip(); tx("send-keys", "-X", "cancel", "-t", pane)\n        tx("send-keys", "-l", "-t", pane, "A"); wait_armed()\n        tx("copy-mode", "-t", pane); time.sleep(0.02); before_mode = tx("display-message", "-p", "-t", pane, "#{pane_in_mode}").stdout.strip()\n        os.write(fd, bytes.fromhex(key_hex)); time.sleep(0.10); prompt_mode = tx("display-message", "-p", "-t", pane, "#{pane_in_mode}").stdout.strip()\n        pre_close_state = tx("display-message", "-p", "-t", pane, "#{@quick_deploy_pi_recovery_armed}|#{@quick_deploy_pi_error}").stdout.strip()\n        os.write(fd, close_key); time.sleep(0.05); pane_in_mode = tx("display-message", "-p", "-t", pane, "#{pane_in_mode}").stdout.strip()\n    elif scenario == "no-close":\n        tx("send-keys", "-l", "-t", pane, "A"); wait_armed()\n        tx("copy-mode", "-t", pane); time.sleep(0.02); before_mode = tx("display-message", "-p", "-t", pane, "#{pane_in_mode}").stdout.strip()\n        os.write(fd, bytes.fromhex(key_hex)); time.sleep(0.10); prompt_mode = tx("display-message", "-p", "-t", pane, "#{pane_in_mode}").stdout.strip()\n        pre_close_state = tx("display-message", "-p", "-t", pane, "#{@quick_deploy_pi_recovery_armed}|#{@quick_deploy_pi_error}").stdout.strip(); pane_in_mode = prompt_mode\n    elif scenario == "arm-while-open":\n        tx("copy-mode", "-t", pane); time.sleep(0.02); before_mode = tx("display-message", "-p", "-t", pane, "#{pane_in_mode}").stdout.strip()\n        os.write(fd, bytes.fromhex(key_hex)); time.sleep(0.05); prompt_mode = tx("display-message", "-p", "-t", pane, "#{pane_in_mode}").stdout.strip()\n        tx("set-buffer", "-b", "__test_arm_trigger", "A"); tx("paste-buffer", "-d", "-b", "__test_arm_trigger", "-t", pane); wait_armed()\n        pre_close_state = tx("display-message", "-p", "-t", pane, "#{@quick_deploy_pi_recovery_armed}|#{@quick_deploy_pi_error}").stdout.strip()\n        os.write(fd, b"\\x1b"); time.sleep(0.05); pane_in_mode = tx("display-message", "-p", "-t", pane, "#{pane_in_mode}").stdout.strip()\n    else: raise AssertionError("unknown scenario")\n    deadline = time.time() + 3\n    while time.time() < deadline and not os.path.exists(result_path): time.sleep(0.02)\n    if not os.path.exists(result_path): raise AssertionError("extension result missing")\n    result = json.load(open(result_path, encoding="utf8")); result.update({"scenario": scenario, "unarmedMode": unarmed_mode, "beforeMode": before_mode, "promptMode": prompt_mode, "preCloseState": pre_close_state, "paneInMode": pane_in_mode}); print(json.dumps(result))\nfinally:\n    tx("detach-client", "-s", session, check=False)\n    try: os.waitpid(pid, 0)\n    except ChildProcessError: pass\n`);
     const tmux = (args, options = {}) => isolatedTmux(args, options);
     const env = { ...process.env, QUICK_DEPLOY_PI_TMUX_WINDOW_STATUS_RUNTIME: runtime };
@@ -1075,7 +824,7 @@ test("native search prompt lifetime cancels only on armed close and preserves un
         assert.deepEqual(result.sent, ["continue"], `${item.label}: opening alone does not cancel the real timer`);
         assert.equal(result.state, "1|1", `${item.label}: no-close leaves recovery armed`);
       } else {
-        assert.deepEqual(result.sent, [], `${item.label}: first prompt-closing Esc cancels the real 250 ms timer`);
+        assert.deepEqual(result.sent, [], `${item.label}: first prompt-closing Esc cancels the guard before its virtual 60s deadline`);
         assert.equal(result.state, "|", `${item.label}: prompt close clears extension error and animator marker`);
       }
       const buffers = spawnSync("tmux", ["-S", socket, "list-buffers", "-F", "#{buffer_name}"], { encoding: "utf8", env: withoutTmuxEnvironment(env) }).stdout || "";
@@ -1228,6 +977,11 @@ test("client listing handles zero clients and startup sweep resets stale active/
   assert.ok(args.includes(FRAMES[6]), "active windows breathe through the gray palette");
   assert.equal(args.filter((value) => value === "@quick_deploy_pi_current_bg").length, 1, "only the reset branch unsets the legacy current-bg option");
   assert.ok(args.includes("@quick_deploy_pi_error"));
+});
+
+test("standalone tmux installer includes the single recovery owner", () => {
+  const output = execFileSync("bash", [join(ROOT, "fresh-install/modules/tmux/test/installer.sh")], { encoding: "utf8" });
+  assert.match(output, /PASS: standalone tmux installer/);
 });
 
 test("installer is executable, idempotent, exact-link skip, and preserves foreign new path", () => {

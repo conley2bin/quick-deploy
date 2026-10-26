@@ -9,6 +9,7 @@ import signal
 import struct
 import sys
 import termios
+import tempfile
 import time
 from pathlib import Path
 
@@ -164,9 +165,13 @@ def main() -> None:
     env = os.environ.copy()
     env["TERM"] = "xterm-256color"
     try:
-        direct = run_direct(pi, str(fixture), env)
-        shell = run_shell(pi, str(fixture), env)
-        assert_guard_end_to_end(pi, index, env)
+        # The real user's keybindings may intentionally disable app.suspend.
+        # Exercise Pi defaults in an isolated agent home, never personal state.
+        with tempfile.TemporaryDirectory(prefix="pi-suspend-guard-home-") as agent_home:
+            env["PI_CODING_AGENT_DIR"] = agent_home
+            direct = run_direct(pi, str(fixture), env)
+            shell = run_shell(pi, str(fixture), env)
+            assert_guard_end_to_end(pi, index, env)
     finally:
         fixture.unlink(missing_ok=True)
     if direct != {"supported": True, "orphaned": True}:
