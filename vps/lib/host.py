@@ -1651,7 +1651,7 @@ def device_owner(request):
 
 
 def transport_request(request):
-    required = ('owner', 'machine_id', 'endpoint', 'config', 'operation_id', 'adapter_sha256', 'ssh_port', 'mode')
+    required = ('owner', 'machine_id', 'endpoint', 'config', 'operation_id', 'adapter_sha256', 'ssh_port', 'mode', 'before_sha256')
     if (request.get('mode') != 'transport-upgrade' or request.get('kind', 'transport-upgrade') != 'transport-upgrade' or request.get('device_action') is not None or
             not re.fullmatch(r'[0-9a-f]{32}', request.get('operation_id', '')) or
             not re.fullmatch(r'[0-9a-f]{64}', request.get('adapter_sha256', '')) or
@@ -1660,12 +1660,12 @@ def transport_request(request):
         raise Error('Invalid transport feature request')
     validate_config(request['config'])
     bound = {key: request[key] for key in required}
-    if 'before_sha256' in request and not re.fullmatch(r'[0-9a-f]{64}', request['before_sha256']):
+    if not isinstance(request['before_sha256'], str) or not re.fullmatch(r'[0-9a-f]{64}', request['before_sha256']):
         raise Error('Invalid pre-change archive digest')
     for key, expected in (('source_transports', ['tcp-reality']), ('target_transports', ['tcp-reality', 'hysteria2'])):
         if key in request and request[key] != expected:
             raise Error('Unsupported transport feature transition')
-    for key in ('before_sha256', 'source_transports', 'target_transports'):
+    for key in ('source_transports', 'target_transports'):
         if key in request:
             bound[key] = request[key]
     return hashlib.sha256(dumps(bound).encode()).hexdigest()
@@ -1721,7 +1721,7 @@ def devices_prepare(upload, transport=False):
         rollback = ROOT / 'device-rollback'
         if rollback.exists():
             raise Error('Retained device recovery intent; run recover first')
-        if transport and 'before_sha256' in request and (not (ROOT / 'export-sha256').is_file() or
+        if transport and (not (ROOT / 'export-sha256').is_file() or
                 (ROOT / 'export-sha256').read_text() != request['before_sha256']):
             raise Error('Transport migration requires its verified pre-change archive receipt')
         reject_symlinks(ROOT / 'active')
@@ -1729,8 +1729,13 @@ def devices_prepare(upload, transport=False):
             raise Error('Symlink recovery adapter')
         adapter = (stage / 'host.py').read_bytes()
         current_sha = hashlib.sha256(adapter).hexdigest()
-        if current_sha != request['adapter_sha256'] or not accepted_adapter_digest(digest(ROOT / 'host.py'), current_sha):
+        stored_sha = digest(ROOT / 'host.py')
+        if current_sha != request['adapter_sha256'] or not accepted_adapter_digest(stored_sha, current_sha):
             raise Error('Unknown stored/uploaded adapter digest; no device writes')
+        # Old reviewed adapters cannot recover a transport journal or a dual
+        # snapshot. The verified pre-change backup must hand off recovery first.
+        if (transport or dual_enabled(manifest)) and stored_sha != current_sha:
+            raise Error('Current recovery adapter required; run verified pre-change backup before this operation')
         check_units()
         binary_health(ROOT / 'active')
         # Publication probes are not an ownership test: restricted feeds may deny.
@@ -1940,6 +1945,8 @@ def devices_commit(request, transport=False):
         raise Error('Owned commit does not match prepared intent')
     if transport and not dual_enabled(manifest):
         raise Error('Transport candidate does not contain owned Hysteria2')
+    if transport and request.get('offnode_sha256') == request['before_sha256']:
+        raise Error('Transport commit requires a new dual-state backup, not the pre-change archive')
     check_lease()
     if (ROOT / 'export-sha256').read_text() != request.get('offnode_sha256'):
         raise Error('Require verified off-node device backup receipt')

@@ -280,8 +280,9 @@ class FeatureTransaction(unittest.TestCase):
         # The fake host tests transaction files, never native protocol behavior.
         self.f.patch(self.h,'enable_hysteria')
         self.f.upload()
-        self.h.atomic(self.h.ROOT/'export-sha256','initial-receipt')
-        self.h.commit(dict(self.f.request,machine_id='a'*32,offnode_sha256='initial-receipt'))
+        self.before_sha256 = 'a'*64
+        self.h.atomic(self.h.ROOT/'export-sha256',self.before_sha256)
+        self.h.commit(dict(self.f.request,machine_id='a'*32,offnode_sha256=self.before_sha256))
         self.manifest=self.h.read_json(self.h.ROOT/'active/manifest.json')
         self.manifest['published']=True
         self.h.atomic(self.h.ROOT/'active/manifest.json',self.h.dumps(self.manifest))
@@ -290,8 +291,10 @@ class FeatureTransaction(unittest.TestCase):
         self.f.patch(self.h,'owned_host_group',return_value=({'id':1},{}))
         self.f.patch(self.h,'service_state',return_value={'running':True,'enabled':True})
         self.f.patch(self.h,'services_active',return_value=True)
+        self.old_adapter = subprocess.check_output(['git','show','ae72036:vps/lib/host.py'])
         self.f.patch(self.h.subprocess,'run',return_value=subprocess.CompletedProcess([],0,b'',b''))
-        self.request=dict(self.f.request,machine_id='a'*32,operation_id='1'*32,ssh_port=22,mode='transport-upgrade')
+        self.request=dict(self.f.request,machine_id='a'*32,operation_id='1'*32,ssh_port=22,
+                          mode='transport-upgrade',before_sha256=self.before_sha256)
         self.original=(self.h.ROOT/'active/manifest.json').read_bytes()
         def enable(folder,manifest,ssh_port):
             manifest['management']={'ssh_port':ssh_port}
@@ -330,8 +333,8 @@ class FeatureTransaction(unittest.TestCase):
 
     def test_transport_commit_receipt_replay_and_lost_ack(self):
         self.h.transport_prepare(self.upload())
-        self.h.atomic(self.h.ROOT/'export-sha256','receipt')
-        request=dict(self.request,offnode_sha256='receipt')
+        self.h.atomic(self.h.ROOT/'export-sha256','b'*64)
+        request=dict(self.request,offnode_sha256='b'*64)
         result=self.h.transport_commit(request)
         self.assertTrue(result['committed']);self.assertEqual(result['transports'],['tcp-reality','hysteria2'])
         self.assertEqual(self.h.transport_commit(request),result)
@@ -344,6 +347,76 @@ class FeatureTransaction(unittest.TestCase):
         with self.assertRaises(self.h.Error):self.h.transport_request(dict(base,target_transports=['tcp-reality']))
         with self.assertRaises(self.h.Error):self.h.transport_request(dict(base,kind='devices'))
         self.assertNotEqual(self.h.receipt_path(base),self.h.ROOT/'device-receipts'/('1'*32+'.json'))
+
+    def test_transport_missing_or_mismatched_before_refuses_without_intent(self):
+        missing = dict(self.request)
+        missing.pop('before_sha256')
+        for request in (missing, dict(self.request,before_sha256='c'*64)):
+            with self.subTest(before=request.get('before_sha256')):
+                with mock.patch.object(self.h,'atomic',wraps=self.h.atomic) as writes, \
+                     mock.patch.object(self.h,'ctl',wraps=self.h.ctl) as control:
+                    with self.assertRaises(self.h.Error):self.h.transport_prepare(self.upload(request))
+                    writes.assert_not_called();control.assert_not_called()
+                self.assertFalse((self.h.ROOT/'device-rollback').exists())
+                self.assertFalse((self.h.ROOT/'pending.json').exists())
+                self.assertFalse(self.h.receipt_path(self.request).exists())
+
+    def test_reviewed_old_transport_adapter_refuses_before_any_rollback_or_service_write(self):
+        self.h.atomic(self.h.ROOT/'host.py',self.old_adapter,0o700)
+        old_sha=hashlib.sha256(self.old_adapter).hexdigest()
+        self.assertTrue(self.h.accepted_adapter_digest(old_sha,self.request['adapter_sha256']))
+        self.assertNotEqual(old_sha,self.request['adapter_sha256'])
+        before_events=list(self.f.events)
+        with mock.patch.object(self.h,'atomic',wraps=self.h.atomic) as writes, \
+             mock.patch.object(self.h,'ctl',wraps=self.h.ctl) as control:
+            with self.assertRaisesRegex(self.h.Error,'Current recovery adapter required'):
+                self.h.transport_prepare(self.upload())
+            writes.assert_not_called();control.assert_not_called()
+        self.assertFalse((self.h.ROOT/'device-rollback').exists())
+        self.assertFalse((self.h.ROOT/'pending.json').exists())
+        self.assertFalse(self.h.receipt_path(self.request).exists())
+        self.assertEqual(self.f.events,before_events)
+        self.assertEqual((self.h.ROOT/'host.py').read_bytes(),self.old_adapter)
+        self.assertEqual((self.h.ROOT/'active/manifest.json').read_bytes(),self.original)
+
+    def test_dual_device_requires_current_adapter_before_any_intent(self):
+        self.h.transport_prepare(self.upload())
+        self.h.atomic(self.h.ROOT/'export-sha256','b'*64)
+        self.h.transport_commit(dict(self.request,offnode_sha256='b'*64))
+        self.h.atomic(self.h.ROOT/'host.py',self.old_adapter,0o700)
+        request=dict(self.f.request,machine_id='a'*32,operation_id='2'*32,ssh_port=22,
+                     device_action='reset',names=['company'])
+        before=(self.h.ROOT/'active/manifest.json').read_bytes()
+        with mock.patch.object(self.h,'atomic',wraps=self.h.atomic) as writes, \
+             mock.patch.object(self.h,'ctl',wraps=self.h.ctl) as control:
+            with self.assertRaisesRegex(self.h.Error,'Current recovery adapter required'):
+                self.h.devices_prepare(self.upload(request))
+            writes.assert_not_called();control.assert_not_called()
+        self.assertFalse((self.h.ROOT/'device-rollback').exists())
+        self.assertFalse((self.h.ROOT/'pending.json').exists())
+        self.assertFalse(self.h.receipt_path(request).exists())
+        self.assertEqual((self.h.ROOT/'active/manifest.json').read_bytes(),before)
+
+    def test_transport_prechange_archive_cannot_publish_dual_candidate(self):
+        self.h.transport_prepare(self.upload())
+        pending=(self.h.ROOT/'pending.json').read_bytes()
+        manifest=(self.h.ROOT/'active/manifest.json').read_bytes()
+        self.assertFalse(json.loads(manifest)['published'])
+        # This digest still equals ROOT/export-sha256. It proves only the old
+        # TCP state: equality alone must not authorize publication of new Auth.
+        self.assertEqual((self.h.ROOT/'export-sha256').read_text(),self.before_sha256)
+        with mock.patch.object(self.h,'front_config',wraps=self.h.front_config) as front, \
+             mock.patch.object(self.h,'atomic',wraps=self.h.atomic) as writes, \
+             mock.patch.object(self.h,'ctl',wraps=self.h.ctl) as control:
+            with self.assertRaisesRegex(self.h.Error,'new dual-state backup'):
+                self.h.transport_commit(dict(self.request,offnode_sha256=self.before_sha256))
+            front.assert_not_called();writes.assert_not_called();control.assert_not_called()
+        self.assertEqual((self.h.ROOT/'pending.json').read_bytes(),pending)
+        self.assertEqual((self.h.ROOT/'active/manifest.json').read_bytes(),manifest)
+        self.assertIsNone(self.h.transaction_receipt(self.request))
+        self.assertTrue((self.h.ROOT/'device-rollback').is_dir())
+        with self.assertRaisesRegex(self.h.Error,'verified off-node'):
+            self.h.transport_commit(dict(self.request,offnode_sha256='c'*64))
 
     def test_bad_identity_lease_and_receipt_fail_without_false_commit(self):
         with self.assertRaises(self.h.Error):self.h.transport_prepare(self.upload(dict(self.request,ssh_port=2222)))

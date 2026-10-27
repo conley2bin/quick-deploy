@@ -416,11 +416,17 @@ VLESS inbound DTO是协议投影，不携带H2 Auth；校验从global原生DB读
 双协议归档恢复时，原生绝对证书路径按新active位置重写；Host完整group地址更新，其他字段保留。
 同目标deploy的功能迁移使用 `transport-prepare` / `transport-commit`，不是二进制升级，也不是device add/replace。
 请求含owner/config/endpoint/machine、operation ID、上传源码摘要、已验证ssh_port及 `mode=transport-upgrade`；
-可附带before备份摘要和源/目标拓扑并纳入请求绑定。独立transport-receipts区分同ID不同请求，已提交重放不生成新Auth。
+`before_sha256`是必需的变更前离机备份摘要，始终纳入请求绑定并核对远端export-sha；源/目标拓扑也可绑定。
+独立transport-receipts区分同ID不同请求，已提交重放不生成新Auth。
+功能迁移写入任何rollback intent/receipt或操作服务之前，ROOT/host.py必须已等于上传的当前适配器摘要。
+正常变更前备份先通过原有受核验机制安装能识别transport journal的新恢复代码，并保留固定旧源码；
+不能把旧TCP-only适配器保存为新功能事务的回滚执行者，否则断电/重启可能将完整active误认成失败新机。
+已经双协议的设备变更也要求当前恢复适配器先接手；旧TCP设备事务仍保留固定已审阅前身的兼容路径。
 
 功能迁移复用设备事务的device-rollback关闭DB快照、manifest/front/adapter、原服务状态、15分钟boot/deadline及
 recovering→restore-queued→后续就绪核验。新H2仅存在于同一原生DB/生成配置中，无额外daemon/unit/账户数据库。
 准备期间旧订阅前端改为404，避免原有SubID在离机receipt之前泄露新增H2能力；commit才恢复相同URL。
+commit要求候选离机备份摘要与远端最新export-sha匹配，且必须不同于before_sha256；旧TCP备份没有新Auth，不能充当双协议发布凭证。
 提交后的传输失败凭durable receipt核对而不重新迁移；管理端取得并验证发布后备份再推进本地权威指针。
 备份/outputs仅在prepared阶段接受该事务；unknown adapter和foreign unit拒绝机制不放宽。
 
