@@ -695,7 +695,7 @@ test("partial tmux batch failure retains attempted window and pane cleanup respo
   }
 });
 
-test("tmux status alone publishes errors and sends exactly five times for one trigger", async (t) => {
+test("tmux status alone caps each distinct error at three sends and renews on a new error", async (t) => {
   const h = await statusHarness("single-owner");
   try {
     h.setSignal(new AbortController().signal);
@@ -704,15 +704,23 @@ test("tmux status alone publishes errors and sends exactly five times for one tr
     await waitFor(h.errorOption, "1");
     await waitFor(h.paneArmed, "1");
     t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: Date.now() });
-    h.fire("message_end", { message: assistantFailure() }, h.ctx);
-    h.fire("agent_settled", { aborted: false }, h.ctx);
-    for (let n = 1; n <= 5; n++) {
-      t.mock.timers.tick(59_999); assert.equal(h.sent.length, n - 1);
-      t.mock.timers.tick(1); assert.equal(h.sent.length, n, "only one sender runs per deadline");
+    for (let trigger = 0; trigger < 2; trigger++) {
+      h.setSignal(new AbortController().signal);
+      h.fire("agent_start", {}, h.ctx);
+      const errorAt = Date.now();
+      h.fire("message_end", { message: assistantFailure() }, h.ctx);
+      h.fire("agent_settled", { aborted: false }, h.ctx);
+      for (let n = 1; n <= 3; n++) {
+        t.mock.timers.tick(59_999); assert.equal(h.sent.length, trigger * 3 + n - 1);
+        t.mock.timers.tick(1); assert.equal(h.sent.length, trigger * 3 + n, "only one sender runs per deadline");
+      }
+      t.mock.timers.tick(60_000);
+      assert.equal(h.sent.length, (trigger + 1) * 3, "no fourth send for this trigger");
+      t.mock.timers.tick(600_000);
+      assert.deepEqual(h.sent, Array((trigger + 1) * 3).fill("continue"), "only a new distinct error renews all three attempts");
+      assert.deepEqual(h.sentAt.slice(trigger * 3), [errorAt + 60_000, errorAt + 120_000, errorAt + 180_000]);
+      assert.equal(h.leaseState(), "error", "budget exhaustion does not clear the error display");
     }
-    t.mock.timers.tick(600_000);
-    assert.deepEqual(h.sent, Array(5).fill("continue"), "no suspend guard or competing sender is installed");
-    assert.equal(h.leaseState(), "error", "budget exhaustion does not clear the error display");
   } finally {
     t.mock.timers.reset();
     await h.cleanup();
