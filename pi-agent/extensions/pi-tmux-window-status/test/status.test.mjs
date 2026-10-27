@@ -712,13 +712,15 @@ test("tmux status alone caps each distinct error at three sends and renews on a 
       h.fire("agent_settled", { aborted: false }, h.ctx);
       for (let n = 1; n <= 3; n++) {
         t.mock.timers.tick(59_999); assert.equal(h.sent.length, trigger * 3 + n - 1);
-        t.mock.timers.tick(1); assert.equal(h.sent.length, trigger * 3 + n, "only one sender runs per deadline");
+        t.mock.timers.tick(1); assert.equal(h.sent.length, trigger * 3 + n - 1, "the former one-minute deadline never sends");
+        t.mock.timers.tick(539_999); assert.equal(h.sent.length, trigger * 3 + n - 1);
+        t.mock.timers.tick(1); assert.equal(h.sent.length, trigger * 3 + n, "only one sender runs per ten-minute deadline");
       }
-      t.mock.timers.tick(60_000);
-      assert.equal(h.sent.length, (trigger + 1) * 3, "no fourth send for this trigger");
       t.mock.timers.tick(600_000);
+      assert.equal(h.sent.length, (trigger + 1) * 3, "no fourth send for this trigger");
+      t.mock.timers.tick(6_000_000);
       assert.deepEqual(h.sent, Array((trigger + 1) * 3).fill("continue"), "only a new distinct error renews all three attempts");
-      assert.deepEqual(h.sentAt.slice(trigger * 3), [errorAt + 60_000, errorAt + 120_000, errorAt + 180_000]);
+      assert.deepEqual(h.sentAt.slice(trigger * 3), [errorAt + 600_000, errorAt + 1_200_000, errorAt + 1_800_000]);
       assert.equal(h.leaseState(), "error", "budget exhaustion does not clear the error display");
     }
   } finally {
@@ -744,18 +746,18 @@ for (const presentationFirst of [false, true]) test(`pane cancellation works in 
     await waitFor(h.errorOption, "");
     await waitFor(h.paneArmed, "");
     t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: Date.now() });
-    t.mock.timers.tick(600_000);
+    t.mock.timers.tick(6_000_000);
     assert.deepEqual(h.sent, [], "consumed sentinel cancels recovery and same-run late errors");
     h.setSignal(second.signal);
     h.fire("agent_start", {}, h.ctx);
     h.fire("message_end", { message: assistantFailure(ACCOUNT_CONCURRENCY_ERROR) }, h.ctx);
     h.fire("agent_settled", { aborted: false }, h.ctx);
     h.fire("agent_settled", { aborted: false }, h.ctx);
-    t.mock.timers.tick(59_999); assert.deepEqual(h.sent, []);
+    t.mock.timers.tick(599_999); assert.deepEqual(h.sent, []);
     t.mock.timers.tick(1); assert.deepEqual(h.sent, ["continue"], "only the local recovery helper sends");
     assert.equal(h.leaseState(), "error", "sending continue retains the error presentation");
     assert.deepEqual(h.terminalInput("\x1b"), undefined);
-    t.mock.timers.tick(600_000); assert.equal(h.sent.length, 1, "raw Esc also cancels the retained watchdog");
+    t.mock.timers.tick(6_000_000); assert.equal(h.sent.length, 1, "raw Esc also cancels the retained watchdog");
   } finally {
     t.mock.timers.reset();
     await h.cleanup();
@@ -799,7 +801,7 @@ const fire = (name, ...args) => { for (const fn of handlers[name] || []) fn(...a
 extension(pi); fire("session_start", {}, ctx);
 let armed = false; const buffer = new StdinBuffer({ escapeTimeout: 1 });
 const report = () => {
-  mock.timers.tick(60_000);
+  mock.timers.tick(600_000);
   const state = execFileSync("tmux", ["display-message", "-p", "-t", process.env.TMUX_PANE, "#{@quick_deploy_pi_recovery_armed}|#{@quick_deploy_pi_error}"], { encoding: "utf8" }).trim();
   writeFileSync(resultPath, JSON.stringify({ sent, state, unarmedInputs })); fire("session_shutdown", {}, ctx); mock.timers.reset(); realSetTimeout(() => process.exit(0), 20);
 };
@@ -832,7 +834,7 @@ process.stdin.setRawMode(true); process.stdin.resume(); process.stdin.on("data",
         assert.deepEqual(result.sent, ["continue"], `${item.label}: opening alone does not cancel the real timer`);
         assert.equal(result.state, "1|1", `${item.label}: no-close leaves recovery armed`);
       } else {
-        assert.deepEqual(result.sent, [], `${item.label}: first prompt-closing Esc cancels recovery before its virtual 60s deadline`);
+        assert.deepEqual(result.sent, [], `${item.label}: first prompt-closing Esc cancels recovery before its virtual ten-minute deadline`);
         assert.equal(result.state, "|", `${item.label}: prompt close clears extension error and animator marker`);
       }
       const buffers = spawnSync("tmux", ["-S", socket, "list-buffers", "-F", "#{buffer_name}"], { encoding: "utf8", env: withoutTmuxEnvironment(env) }).stdout || "";
