@@ -6,12 +6,28 @@
 ./install.sh
 ```
 
+## 新工作：受管 tmux 与受限 job
+
+已有机器可仅更新用户级运行时，不运行 apt 或 Pi 安装器：
+
+```bash
+bash fresh-install/modules/tmux/install.sh --runtime-only
+```
+
+重计算用 `~/.local/bin/job run NAME [选项] -- COMMAND ARGS...`，交互新工作用
+`~/.local/bin/tmux-managed --socket pi-agent -- TMUX_COMMAND ARGS...`。managed
+端点位于 `$XDG_RUNTIME_DIR/tmux-managed/managed-{default,pi-agent}`，现有旧
+`default` / `pi-agent` socket 不迁移。预算、归属校验、旧 mover timer 退役、
+安装冲突与保留活动聚合策略的回滚见 [运行时说明](RUNTIME.md)；作业结果与
+环境合同见 [job 说明](JOBS.md)。它们是显式入口，不覆盖所有 GUI 或直接命令。
+
 ## 安装内容
 
 1. `apt install tmux git xclip wl-clipboard` —— 后两者服务的是 gpakosz 配置自带的 `<前缀> y` 绑定（后台任务 `save-buffer - | <探测到的工具>`，在图形会话里才写得进去），在本地图形会话里有意义；**远端复制回本机走的是原生 OSC 52，不需要这两个包**，见下文剪贴板一节。
 2. 克隆 `https://github.com/gpakosz/.tmux` 到 `~/.tmux`（`--single-branch`）。
 3. 链接本仓库的 `tmux.conf.local`（见下表）。
 4. 运行 `pi-agent/extensions/pi-tmux-window-status/install.sh`，把 Pi→tmux breathing status 扩展链接进 `~/.pi/agent/extensions/`。
+5. 运行窄安装器 `install-runtime.py`，安装 `job`、`tmux-managed`、jobs.slice 与定向 pane OOMPolicy；不启动或重启现有 server。
 
 ## 脚本创建的链接
 
