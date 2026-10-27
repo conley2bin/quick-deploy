@@ -65,6 +65,9 @@ class FakeHost(unittest.TestCase):
         self.patch(self.h, 'native_keys', return_value={'privateKey': 'x' * 43, 'publicKey': 'y' * 43, 'shortIds': ['0123456789abcdef']})
         self.patch(self.h, 'front_config', side_effect=lambda folder, manifest, published: self.h.atomic(folder / 'Caddyfile', self.h.caddyfile(manifest, published)))
         self.patch(self.h, 'configure_native', side_effect=self.configure)
+        # This fake API/certificate fixture retains the legacy DB shape. It
+        # proves transaction control; real dual activation is tested separately.
+        self.patch(self.h, 'enable_hysteria')
         self.patch(self.h, 'backend_health', return_value={})
         self.patch(self.h, 'wait_tls')
         self.patch(self.h, 'tls_probe')
@@ -97,6 +100,8 @@ class FakeHost(unittest.TestCase):
             return subprocess.CompletedProcess(argv, 0, self.ruleset)
         if argv == ['ss', '-H', '-ltnp']:
             return subprocess.CompletedProcess(argv, 0, self.listeners)
+        if argv == ['ss', '-H', '-lunp']:
+            return subprocess.CompletedProcess(argv, 0, b'')
         raise AssertionError('Unmocked host command: ' + str(argv))
 
     def ctl(self, *args):

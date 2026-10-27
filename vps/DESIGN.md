@@ -1,4 +1,4 @@
-# One VPS: native 3x-ui + Xray, an exact-path TLS front
+# One VPS: native TCP/REALITY + UDP/Hysteria2, an exact-path TLS front
 
 Selected architecture, 2026-10-18. This replaces the earlier sing-box/relay and
 independent-static-publisher proposal. Production contact requires a separate
@@ -9,11 +9,13 @@ operator gate; a source implementation is not deployed-client acceptance.
 - **3x-ui** owns SQLite schema, admin authentication, device accounts, Xray
   generation, full Mihomo profiles and base64 URI subscriptions. No public
   converter and no local node-format engine.
-- **Xray** serves VLESS/TCP/REALITY/Vision on TCP443 by default. One validated
-  `config.proxy_port` setting owns inbound, native export, health and backup;
+- **Xray** serves VLESS/TCP/REALITY/Vision and native Hysteria2 on TCP443 and
+  UDP443 by default. One validated `config.proxy_port` setting owns both typed
+  listeners, native exports, health and backup; no separate UDP port knob exists.
   optional `--port` still means SSH only. Fresh installations default to
   company/home/phone; every manifest-owned device has an independent UUID
-  and SubID. Native Clients operations own changes.
+  and SubID, plus the native Hysteria2 `Auth` credential. One global native Client
+  joins exactly the two owned inbounds; Native Clients operations own changes.
 - **Caddy** serves trusted HTTPS on TCP8443, proxying exactly two paths per
   enabled manifest-owned device, without wildcards.
   Panel2053 and subscription2096 bind127.0.0.1. Management is through SSH forwarding.
@@ -72,8 +74,10 @@ an arbitrary allow-list.
    objects plus the native account's HWID limit; no reduced projection is written
    back. Inbound forms cannot overwrite authoritative global clients in v3.10.2.
    The native Hosts table/API owns exported addresses: validate the single owned
-   group/inbound/old-endpoint membership and update its complete group address
-   only. Preserve other Host fields, then verify DB/API and true native feeds.
+   groups/inbounds/old-endpoint membership and update complete group addresses
+   only. Legacy snapshots have exactly one REALITY group/inbound; explicit dual
+   snapshots have that unchanged group and exactly one H2 group/inbound. Preserve
+   other Host fields, then verify DB/API and true native feeds.
    Fresh creation records group identity; a missing source-era archive identity
    is derived only from its verified closed OLD-endpoint snapshot. Extra/hidden/
    disabled duplicates, dangling membership and saved-ID conflicts refuse.
@@ -125,14 +129,14 @@ OpenSSL、systemd/`systemd-analyze`、`ss`、`nft`、可信 CA 包及至少2GiB�
 
 | 入口 | 归属 |
 |---|---|
-| TCP443（默认） | Xray VLESS/TCP/REALITY/Vision |
+| TCP443 / UDP443（默认同一数值） | 同一 Xray 的 VLESS/TCP/REALITY/Vision 与原生 Hysteria2 |
 | TCP8443 | Caddy 可信 HTTPS；每个启用设备仅两条精确订阅路径 |
 | TCP80 | Caddy HTTP01 证书签发/续期；普通 HTTP 请求全部404 |
 | 127.0.0.1:2053 / :2096 / :62789 | 面板 / 原生订阅后端 / Xray API；不公开 |
 | 实际 SSH 端口 | 原样保留，`--port` **只代表 SSH** |
 
-唯一代理端口设置是首次 `--proxy-port`，默认443，保存在私有 config 中；不与上述
-保留入口或实际 SSH 端口冲突。入站、原生导出、进程/端口检查和备份共用此设置。
+唯一代理端口设置是首次 `--proxy-port`，默认443，保存在原有四键私有 config 中；TCP与UDP共用数值，
+不与上述保留入口或实际 SSH 端口冲突。两个入站、原生导出、分开核验的TCP/UDP进程/端口及备份共用此设置。
 以后不会隐式改监听端口；换端口需单独规划迁移。没有证据表明3280更不易被封，
 工具不会自动选它。REALITY 目标站自身的 TLS 端口仍为443，独立于代理监听端口。
 
@@ -247,7 +251,7 @@ Xray26.10.10、Caddy2.11.7二进制和 geodata，**不运行上游安装器**。
 命令配方见 [README](README.md#设备与钥匙管理)。`devices list` 只读当前原生名称/启用状态，
 不输出 UUID、SubID、URL。新装仍默认3个；`devices add device4 device5` 才扩到5个。
 任意合规设备名都可使用，不存在第二套五设备白名单。manifest 的 `accounts` 键拥有成员关系，
-原生 SQLite/API 拥有完整策略与凭据；校验所有 global clients 和唯一入站的全部关联，
+原生 SQLite/API 拥有完整策略与凭据；旧快照校验唯一入站关联，双协议快照校验所有 global clients 到两个受管入站的精确全部关联，
 包含禁用、未挂载账户及悬空关联。未知成员、不同 owner/machine、Host归属冲突、重复名字或
 凭据碰撞会拒绝，不使用直接修改账户表的 SQL。UUID按解析后的字节身份比较，
 不改已有DB/元数据的大小写拼写；新增/轮换要避开整个旧名册（包括目标自己的旧UUID和SubID）及本批新钥匙。旧3、新5、删除后的4以及空名册均可备份/恢复；
@@ -258,7 +262,7 @@ Xray26.10.10、Caddy2.11.7二进制和 geodata，**不运行上游安装器**。
   新旧混合名字、重复名字明确拒绝。已删除账户不会因重跑 deploy 自动复活。
 - `remove <name>` 删除该原生账户并移除其两条前端路径，旧 UUID 不能建立新代理连接，旧 URL404。
   已不存在的名字为幂等无变化。便利JSON不再列它，历史归档不自动删除。
-- `reset <name>` 从新读取的完整 Client DTO及独立LimitHwid只更换该设备 UUID和SubID，
+- `reset <name>` 从新读取的完整 Client DTO及独立LimitHwid更换该设备 UUID、SubID及双协议时的Hysteria2 Auth，
   保留完整策略与禁用状态、其他设备、全局Reality密钥；旧订阅不能取回新钥匙。
   客户端必须重新导入新 URL。它不是幂等的新操作：每次明确发起都会产生新钥匙，失败先 recover。设备动作唯一名称是`reset`，无旧命令别名或转换层。含已移除动作的pending明确拒绝并原样保留供人工核对，不转换/重放。
 - `rename <old> <new>` 使用原生`/clients/update/<old>`，提交完整新读取Client及LimitHwid，只改email。
@@ -278,7 +282,9 @@ Xray26.10.10、Caddy2.11.7二进制和 geodata，**不运行上游安装器**。
 1. 管理端先检查名字/原生Mihomo可用性（命令名按PATH解析为绝对路径并存入pending），以只读status核对存储adapter摘要（未知摘要不触发备份停前端），
    提示所有设备可能短暂重连（不等待确认），再取得变更前离机备份。
 2. 远端核对 owner/machine、单一Host/入站、全局账户/关联、unit及二进制。
-   存储适配器只接受当前上传源码摘要、已审阅18d1b3b摘要 `30430e73…09a000e` 或实际部署918103e摘要 `8777a3d4…ed701f1`；
+   存储适配器只接受当前上传源码摘要及三个固定已审阅公共源码前身：18d1b3b `30430e73…09a000e`、
+   历史918103e `8777a3d4…ed701f1`、reset-only ae72036 `b52adbbf…25f6d7e`（与基线6c02d25的host.py字节相同）。
+   当前生产只读核验的adapter属于最后一种，不能沿用旧记忆假定仍为918103e；
    未知摘要在任何适配器/服务变更前拒绝。不是包/数据库版本升级，也不能用任意scp替代。
 3. 旧manifest/front/adapter及服务启用/运行状态、恢复意图先写入临时私有目录，再原子发布为
    `device-rollback/`。操作ID绑定owner/machine/端点/config/动作/名字的请求摘要；未提交绑定
@@ -330,9 +336,12 @@ replace从完整、新读取的原生Client/账户对象仅更换UUID，并保�
 损坏DB、账户元数据不一致、缺证书/私钥或版本不匹配会拒绝。
 
 所有共享备份入口（包括首次变更前、提交后、recover核对及独立backup）在停止前端前都会：
-核验并安装当前已审阅恢复adapter，仅接受当前摘要及固定的18d1b3b/918103e公共源码摘要；
+核验并安装当前已审阅恢复adapter，仅接受当前摘要及固定的18d1b3b/918103e/ae72036公共源码摘要；
+新增ae72036全摘要为 `b52adbbfb7efc3593c5fa266e8f148ed60deaa2b685d72b926e549b9425f6d7e`，
+由本地Git的ae72036和6c02d25两份相同公共host.py字节独立核验，不以远端自报摘要建立信任。
 旧adapter先存私有摘要命名文件。18d1b3b导出为`previous-host.py`，918103e为`previous-host-918103e.py`，
-两种可选输入都逐一验证，不从远端自报hash扩张信任表。可选旧副本不存在是合法的；已存在时以no-follow/nonblocking文件描述符读取，
+ae72036为`previous-host-ae72036.py`。三个可选输入都逐一验证，不动态扩张信任表。
+可选旧副本不存在是合法的；已存在时以no-follow/nonblocking文件描述符读取，
 仅接受普通文件且字节摘要必须匹配其文件名对应的固定已审阅摘要，链接（含悬空）、FIFO/目录或坏摘要在迁移/停前端前拒绝。
 新副本完整落盘后以不覆盖方式发布并复验，迁移后再复验；归档只用已验证缓存字节，不再按路径读取外部输入。
 安装前中断旧服务未动；安装后中断已有新adapter可恢复，旧adapter不会忽略新停机意图。
@@ -359,7 +368,8 @@ replace从完整、新读取的原生Client/账户对象仅更换UUID，并保�
 commit在锁内、发布前再次检查lease，不依赖timer恰好先触发。URI身份门槛使用显式错误，
 Python优化模式不会删除它。失败私有目录保留供检查，不删除。
 同状态重跑不替换已有工作包；新机失败不会修改旧节点。没有假称“配置回滚也降级了包”。
-**原机版本升级尚未实现**：不同release lock拒绝，不能点面板一键升级或改成latest绕过。
+**原机二进制/数据库版本升级尚未实现**：不同release lock仍拒绝，不能点面板一键升级或改成latest绕过。
+同目标 `deploy` 的TCP→双协议功能迁移使用下述专属事务，不改变三份已固定原生版本。
 磁盘上的历史备份/失败目录不会自动清理，需操作者审阅容量。
 
 旧 `identity.json` / `inventory.json` / `generated/` 和远端 sing-box/旧role目录明确拒绝，
@@ -390,9 +400,65 @@ boot/deadline及恢复中断。额外fork/os._exit测试绕过finally，覆盖�
 当前节点已有的验收不能证明未来续期、重启恢复、持续资源峰值或其他网络路径。
 新的生产接触仍须单独授权，本地快照导出不接触生产。
 
+## 原生双协议与同目标功能迁移
+
+私有 config 仍是原来的四键，global FORMAT仍为1，三份release pin和四个systemd unit不变。
+manifest增加 `management.ssh_port`，值由已认证SSH连接的服务端端口核验，不猜22；
+`hysteria2` 为显式schema1元数据，保存原生H2 inbound ID、Host group ID以及相对deployment的证书/密钥路径。
+缺少该标记只在严格旧TCP单入站、单Host、每账户单join拓扑下合法；双协议要求原SELF-main与新增SELF-h2、
+两个精确Host和每个global client到两入站的精确join，不收编外来或隐藏/禁用的额外行。
+原REALITY inbound/Host、UUID/SubID、完整原生策略和密钥在功能迁移中保持；H2 Auth由原生attach生成。
+VLESS inbound DTO是协议投影，不携带H2 Auth；校验从global原生DB读Auth并跨核对H2及原生feed，
+改名/重置/换机则从global ClientRecord补Auth与独立LimitHwid后提交完整Client DTO，绝不把Record形状直接写回。
+
+新机顺序为私有TCP候选 → Caddy可信HTTP01证书且前端404 → 原生空H2入站及existing client attach →
+双协议核心/端口/feed验证 → 离机完整备份receipt → 发布。恢复旧TCP归档到新目标也走这一步，不改原归档字节。
+双协议归档恢复时，原生绝对证书路径按新active位置重写；Host完整group地址更新，其他字段保留。
+同目标deploy的功能迁移使用 `transport-prepare` / `transport-commit`，不是二进制升级，也不是device add/replace。
+请求含owner/config/endpoint/machine、operation ID、上传源码摘要、已验证ssh_port及 `mode=transport-upgrade`；
+可附带before备份摘要和源/目标拓扑并纳入请求绑定。独立transport-receipts区分同ID不同请求，已提交重放不生成新Auth。
+
+功能迁移复用设备事务的device-rollback关闭DB快照、manifest/front/adapter、原服务状态、15分钟boot/deadline及
+recovering→restore-queued→后续就绪核验。新H2仅存在于同一原生DB/生成配置中，无额外daemon/unit/账户数据库。
+准备期间旧订阅前端改为404，避免原有SubID在离机receipt之前泄露新增H2能力；commit才恢复相同URL。
+提交后的传输失败凭durable receipt核对而不重新迁移；管理端取得并验证发布后备份再推进本地权威指针。
+备份/outputs仅在prepared阶段接受该事务；unknown adapter和foreign unit拒绝机制不放宽。
+
+证书必须是受管Caddy storage内该域名唯一的一对普通文件，拒绝链接、重复对、错误SAN或不匹配私钥。
+不复制另一套key，不增加签发机构/续期daemon。原生TLS设 `oneTimeLoading:false`，Xray以默认3600秒周期重读稳定路径；
+因此续期到消费者加载最多存在一个周期延迟，文件读失败可终止该ticker，需要修复后显式重启核心。
+换证测试应替换真实匹配证书对并重启消费者，验证客户端所见证书变化；它不等于实际ACME续期证明。
+生产仍要求正常公开CA/SNI验证，`allowInsecure:false`，不得skip-cert-verify。
+
+原生订阅每设备仍是原来的两个精确URL，内容各含VLESS与Hysteria2；完整Mihomo仍由3x-ui编码，
+supported inline规则将PROXY初始顺序设为 `[SELF-h2, SELF-main, DIRECT]`，保留手选TCP能力。
+双协议profile另有 `FEED` fallback `[SELF-h2, DIRECT]`；仅TCP8443到订阅域名或本机公网/32的两条AND规则
+位于原domain/IP DIRECT规则之前，其他私网/国内/Bili及MATCH规则tail不变，不截获UDP443或SSH。
+FEED用无SubID的 `https://域名:8443/` 做HEAD健康检查，expected-status字符串`404`，interval300秒、
+timeout5000毫秒、lazy=false。它依据该URL最近健康状态选首个可用成员，不会为同一失败请求同步重试DIRECT；
+需等健康检查收敛并重试。root404只证明TLS前端/路径可达，不代表订阅token或原生feed内容有效。
+旧TCP-only profile字节行为不变。已有客户端可能保留旧selector选择，刷新后需显式选择H2；
+首次导入不能依赖已经不可达的TCP8443。离线local导入不会自动成为remote订阅；随后须显式通过
+Verge的Clash-proxy导入/更新原remote URL，并确认实际生效。其更新顺序可先configured、再Clash/system-proxy，
+不能保证每次请求都进入当前core；全局前置规则也可能遮蔽FEED。因此保留独立H2管理listener及私有curl配置刷新。
+手机URI不携带FEED/Mihomo策略，手机实际代理刷新能力需单独核验；reset更换SubID后旧URL不能发现新秘密，仍须重新导入。
+原生全局删除/禁用作用于两入站，reset同时轮换Auth/UUID/SubID；冷replace轮换Auth/UUID/REALITY并保留SubID，
+rename保留Auth/UUID/SubID及完整策略。panel/core完整停启用于关闭已有TCP与QUIC会话。
+HWID限制原生订阅访问，不是对已导入H2密码的物理设备绑定；quota/expiry仍使用原生全局账户机制，
+当前统计API路由缺陷不因双协议自动修复，不能承诺不可信计数的配额精度。
+
+仅认证SELF-h2入站新增首匹配路由：TCP到本机已验证公网/32的实际SSH端口和8443，送往唯一受核验direct/freedom。
+其他self/private/API阻断保持；不开放127管理端口、不绑定服务端出口eth0、不改sshd/firewall/Tailscale。
+H2管理依赖同一核心，重启/重置操作使用独立管理carrier直至恢复完成，不能把自断开的连接当作事务提交证据。
+TCP与UDP监听分别核验PID/可执行文件/cgroup；TCP8443证书成功不能替代真实H2认证/HTTPS及错误凭据拒绝。
+
+旧fast FakeHost只验证旧DB形状的事务控制，其enable_hysteria为明确mock、UDP inventory独立为空；
+新test_dual_transport验证双拓扑/证书/receipt边界，真实三份固定二进制的双协议行为由test_native_dual单独验证。
+所有这些均不代替真实systemd、公开ACME、公司/Y/手机实际导入和SSH-over-H2的逐路径验收。
+
 ## 已知限制与流量统计
 
 Xray 的现有 `geoip:private` 阻断规则在 `api → api` 例外之前，阻断内部127.0.0.1
 统计 API 路径，所以当前流量计数不可信。不要据此判断是否走代理。
 流量展示需求已取消，此次不修改统计或路由；实际连接以客户端 HTTPS/出口验收为准。
-备份明文、容量手动管理、原机升级未实现及冷换机停机等边界见上文。
+备份明文、容量手动管理、原机二进制升级未实现及冷换机停机等边界见上文。

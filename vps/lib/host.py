@@ -31,7 +31,7 @@ import tarfile
 import tempfile
 import time
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode, urlsplit, parse_qs
+from urllib.parse import urlencode, urlsplit, parse_qs, unquote
 from urllib.request import Request, build_opener, ProxyHandler, HTTPCookieProcessor
 import uuid
 import zipfile
@@ -256,13 +256,55 @@ def new_manifest(owner, config, endpoint):
                              'enable': True, 'flow': 'xtls-rprx-vision'} for d in DEVICES}, 'published': False}
 
 
+def dual_enabled(manifest):
+    if 'hysteria2' not in manifest:
+        return False
+    meta = manifest['hysteria2']
+    if (not isinstance(meta, dict) or set(meta) != {'schema', 'inbound_id', 'host_group_id', 'certificate_file', 'key_file'} or
+            meta['schema'] != 1 or type(meta['inbound_id']) is not int or meta['inbound_id'] <= 0 or
+            not isinstance(meta['host_group_id'], str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,128}', meta['host_group_id'])):
+        raise Error('Invalid owned Hysteria2 capability metadata')
+    for key in ('certificate_file', 'key_file'):
+        path = Path(meta[key]) if isinstance(meta[key], str) else Path('/')
+        if path.is_absolute() or '..' in path.parts or (len(path.parts) < 5 or path.parts[:4] != ('caddy', 'data', 'caddy', 'certificates')):
+            raise Error('Invalid owned Hysteria2 certificate path')
+    if not isinstance(manifest.get('management'), dict) or type(manifest['management'].get('ssh_port')) is not int or not 1 <= manifest['management']['ssh_port'] <= 65535:
+        raise Error('Missing verified management port for Hysteria2')
+    return True
+
+
+def hysteria_certificate_paths(folder, manifest):
+    """Select the unique owned Caddy pair, never a guessed issuer directory."""
+    folder = Path(folder)
+    storage = folder / 'caddy/data/caddy/certificates'
+    reject_symlinks(folder)
+    certs = list(storage.rglob(manifest['config']['domain'] + '.crt')) if storage.is_dir() else []
+    if len(certs) != 1:
+        raise Error('Require exactly one owned Caddy certificate pair')
+    cert = certs[0]
+    key = cert.with_suffix('.key')
+    if not cert.is_file() or not key.is_file() or not cert.stat().st_size or not key.stat().st_size:
+        raise Error('Missing owned Caddy certificate/private key')
+    if dual_enabled(manifest) and (str(cert.relative_to(folder)) != manifest['hysteria2']['certificate_file'] or
+                                 str(key.relative_to(folder)) != manifest['hysteria2']['key_file']):
+        raise Error('Changed owned Hysteria2 certificate identity')
+    checked = run(['openssl', 'x509', '-in', cert, '-noout', '-checkhost', manifest['config']['domain']], timeout=10).stdout
+    if b' does match certificate' not in checked:
+        raise Error('Owned Caddy certificate does not match deployment hostname')
+    public = run(['openssl', 'x509', '-in', cert, '-pubkey', '-noout'], timeout=10).stdout
+    private = run(['openssl', 'pkey', '-in', key, '-pubout'], timeout=10).stdout
+    if public != private:
+        raise Error('Owned Caddy certificate/private key mismatch')
+    return cert.absolute(), key.absolute()
+
+
 def device_names(manifest):
     """The manifest owns membership; native rows can never extend it implicitly."""
     accounts = manifest.get('accounts')
     if not isinstance(accounts, dict) or any(not isinstance(d, str) or
             not re.fullmatch(r'[a-z][a-z0-9-]{0,31}', d) for d in accounts):
         raise Error('Invalid owned device roster; use lowercase names up to32 characters')
-    identities, subscriptions = [], []
+    identities, subscriptions, authorizations = [], [], []
     for name, account in accounts.items():
         if account.get('email') != name or not isinstance(account.get('enable'), bool):
             raise Error('Invalid owned device identity')
@@ -272,9 +314,14 @@ def device_names(manifest):
             raise Error('Invalid owned device UUID') from exc
         if not re.fullmatch(r'[A-Za-z0-9_-]{16,128}', account.get('subId', '')):
             raise Error('Invalid owned subscription identity')
+        if dual_enabled(manifest):
+            auth = account.get('auth')
+            if not isinstance(auth, str) or not re.fullmatch(r'[A-Za-z0-9_-]{16,128}', auth):
+                raise Error('Invalid owned Hysteria2 authorization')
+            authorizations.append(auth)
         identities.append(uuid.UUID(account['id']))
         subscriptions.append(account['subId'])
-    if len(set(identities)) != len(identities) or len(set(subscriptions)) != len(subscriptions):
+    if len(set(identities)) != len(identities) or len(set(subscriptions)) != len(subscriptions) or len(set(authorizations)) != len(authorizations):
         raise Error('Duplicate owned device credential')
     return tuple(accounts)
 
@@ -312,7 +359,18 @@ def clash_rules(manifest):
         'DOMAIN-SUFFIX,hdslb.com,DIRECT', 'GEOSITE,cn,DIRECT', 'GEOIP,CN,DIRECT', 'MATCH,PROXY']
     # JSON is valid YAML and the panel's supported inline template merges these
     # top-level settings. Native dat assets avoid an implicit MMDB dependency.
-    return json.dumps({'geodata-mode': True, 'rules': rules})
+    settings = {'geodata-mode': True, 'rules': rules}
+    if dual_enabled(manifest):
+        domain = manifest['config']['domain']
+        settings['proxy-groups'] = [
+            {'name': 'PROXY', 'type': 'select', 'proxies': ['SELF-h2', 'SELF-main', 'DIRECT']},
+            {'name': 'FEED', 'type': 'fallback', 'proxies': ['SELF-h2', 'DIRECT'],
+             'url': f'https://{domain}:8443/', 'expected-status': '404', 'interval': 300, 'timeout': 5000, 'lazy': False}]
+        settings['rules'] = [
+            f'AND,((NETWORK,TCP),(DOMAIN,{domain}),(DST-PORT,8443)),FEED',
+            f"AND,((NETWORK,TCP),(IP-CIDR,{manifest['endpoint']}/32,no-resolve),(DST-PORT,8443)),FEED",
+            *rules]
+    return json.dumps(settings)
 
 
 def backend_settings(manifest):
@@ -335,11 +393,12 @@ def initialize_db(folder, manifest):
 
 
 def owned_host_group(folder, api, manifest):
-    """Attest the single owned native Host group before any endpoint write."""
+    """Attest every owned native Host row; retain the REALITY return contract."""
     inbounds = api.call('/panel/api/inbounds/list') or []
-    if len(inbounds) != 1 or inbounds[0].get('remark') != 'SELF-main':
+    expected = {'SELF-main': 'vless', 'SELF-h2': 'hysteria'} if dual_enabled(manifest) else {'SELF-main': 'vless'}
+    if len(inbounds) != len(expected) or {i.get('remark'): i.get('protocol') for i in inbounds} != expected:
         raise Error('Unexpected native Host inbound membership')
-    inbound = inbounds[0]
+    inbound = next(i for i in inbounds if i['remark'] == 'SELF-main')
     stream = inbound['streamSettings']
     stream = json.loads(stream) if isinstance(stream, str) else stream
     external = stream.get('externalProxy', [])
@@ -354,14 +413,143 @@ def owned_host_group(folder, api, manifest):
     # API can deduplicate. A changed saved ID is never silently adopted.
     snapshot_host_group(folder / 'db/x-ui.db', dict(manifest, endpoint=old_endpoint))
     groups = api.call('/panel/api/hosts/list') or []
-    if len(groups) != 1 or groups[0].get('groupId') != group_id:
+    expected_groups = {group_id}
+    if dual_enabled(manifest):
+        expected_groups.add(manifest['hysteria2']['host_group_id'])
+    if len(groups) != len(expected_groups) or {g.get('groupId') for g in groups} != expected_groups:
         raise Error('Unexpected native Host group membership')
     group = api.call('/panel/api/hosts/get/' + group_id)
     expected = [old_endpoint + ':' + str(manifest['config']['proxy_port'])]
     if (group.get('groupId') != group_id or group.get('inboundIds') != [inbound['id']] or
             group.get('hosts') != expected or group.get('port') != manifest['config']['proxy_port']):
         raise Error('Unexpected native Host group endpoint/inbound membership')
+    if dual_enabled(manifest):
+        h2 = next(i for i in inbounds if i['remark'] == 'SELF-h2')
+        h2stream = h2['streamSettings']
+        h2stream = json.loads(h2stream) if isinstance(h2stream, str) else h2stream
+        if (h2['id'] != manifest['hysteria2']['inbound_id'] or h2.get('tag') != 'SELF-h2' or
+                h2stream.get('externalProxy') != [{'forceTls': 'same', 'dest': old_endpoint, 'port': manifest['config']['proxy_port'], 'remark': ''}]):
+            raise Error('Changed owned Hysteria2 inbound identity')
+        h2_group = api.call('/panel/api/hosts/get/' + manifest['hysteria2']['host_group_id'])
+        if (h2_group.get('inboundIds') != [h2['id']] or h2_group.get('hosts') != expected or
+                h2_group.get('port') != manifest['config']['proxy_port']):
+            raise Error('Unexpected native Hysteria2 Host group')
     return inbound, group
+
+
+def hysteria_inbound(manifest, cert, key):
+    return {'remark': 'SELF-h2', 'tag': 'SELF-h2', 'enable': True, 'listen': '0.0.0.0', 'port': manifest['config']['proxy_port'],
+            'protocol': 'hysteria', 'settings': json.dumps({'version': 2, 'clients': []}),
+            'streamSettings': json.dumps({'network': 'hysteria', 'security': 'tls',
+                'hysteriaSettings': {'version': 2}, 'tlsSettings': {'serverName': manifest['config']['domain'],
+                    'alpn': ['h3'], 'certificates': [{'certificateFile': str(cert), 'keyFile': str(key), 'oneTimeLoading': False}],
+                    'settings': {'allowInsecure': False}},
+                'externalProxy': [{'forceTls': 'same', 'dest': manifest['endpoint'], 'port': manifest['config']['proxy_port'], 'remark': ''}]}),
+            'sniffing': json.dumps({'enabled': True, 'destOverride': ['http', 'tls', 'quic'], 'routeOnly': True})}
+
+
+def management_rule(template, manifest, inbound_tag):
+    direct = [o for o in template.get('outbounds', []) if o.get('tag') == 'direct' and o.get('protocol') == 'freedom']
+    if len(direct) != 1:
+        raise Error('Missing unique native freedom management outbound')
+    return {'type': 'field', 'inboundTag': [inbound_tag], 'network': 'tcp',
+            'ip': [manifest['endpoint'] + '/32'], 'port': ','.join(map(str, sorted({manifest['management']['ssh_port'], 8443}))),
+            'outboundTag': direct[0]['tag']}
+
+
+def hysteria_health(folder, manifest, api, check_paths=True):
+    if not dual_enabled(manifest):
+        return
+    inbound = next(i for i in api.call('/panel/api/inbounds/list') if i['id'] == manifest['hysteria2']['inbound_id'])
+    stream = inbound['streamSettings']
+    stream = json.loads(stream) if isinstance(stream, str) else stream
+    settings = inbound['settings']
+    settings = json.loads(settings) if isinstance(settings, str) else settings
+    clients = settings.get('clients', [])
+    if (len(clients) != len(device_names(manifest)) or {c.get('email') for c in clients} != set(device_names(manifest)) or
+            any(c.get('auth') != manifest['accounts'][c['email']]['auth'] for c in clients)):
+        raise Error('Unexpected native Hysteria2 account authorization')
+    tls = stream.get('tlsSettings', {})
+    cert = Path(folder) / manifest['hysteria2']['certificate_file']
+    key = Path(folder) / manifest['hysteria2']['key_file']
+    if (inbound.get('protocol') != 'hysteria' or inbound.get('enable') is not True or inbound.get('port') != manifest['config']['proxy_port'] or
+            stream.get('network') != 'hysteria' or stream.get('security') != 'tls' or
+            stream.get('hysteriaSettings', {}).get('version') != 2 or settings.get('version') != 2 or
+            tls.get('serverName') != manifest['config']['domain'] or tls.get('alpn') != ['h3'] or
+            tls.get('settings', {}).get('allowInsecure') is not False or
+            (check_paths and tls.get('certificates') != [{'certificateFile': str(cert.absolute()), 'keyFile': str(key.absolute()), 'oneTimeLoading': False}])):
+        raise Error('Unexpected native Hysteria2 transport/TLS configuration')
+    if not check_paths:
+        certificates = tls.get('certificates', [])
+        if (len(certificates) != 1 or certificates[0].get('oneTimeLoading') is not False or
+                any(not isinstance(certificates[0].get(field), str) or not Path(certificates[0][field]).is_absolute() or
+                    not certificates[0][field].endswith('/' + manifest['hysteria2'][meta])
+                    for field, meta in (('certificateFile', 'certificate_file'), ('keyFile', 'key_file')))):
+            raise Error('Invalid archived Hysteria2 certificate paths')
+    hysteria_certificate_paths(folder, manifest)
+    with contextlib.closing(sqlite3.connect('file:' + str(Path(folder) / 'db/x-ui.db') + '?mode=ro', uri=True)) as db:
+        row = db.execute("select value from settings where key='xrayTemplateConfig'").fetchone()
+    template = json.loads(row[0]) if row else {}
+    if inbound.get('tag') != 'SELF-h2':
+        raise Error('Changed owned Hysteria2 inbound tag')
+    rule = management_rule(template, manifest, inbound['tag'])
+    rules = template.get('routing', {}).get('rules', [])
+    if not rules or rules[0] != rule or sum(r.get('inboundTag') == [inbound['tag']] for r in rules) != 1:
+        raise Error('Missing or changed exact Hysteria2 management route')
+
+
+def enable_hysteria(folder, manifest, ssh_port):
+    """Native-only mutation. Caller owns the complete DB rollback transaction."""
+    if type(ssh_port) is not int or not 1 <= ssh_port <= 65535 or ssh_port in required_ports(manifest['config']):
+        raise Error('Invalid verified management SSH port')
+    if 'management' in manifest and manifest['management'] != {'ssh_port': ssh_port}:
+        raise Error('Changed verified management SSH port')
+    api = wait_api(manifest)
+    owned_host_group(folder, api, manifest)
+    manifest['accounts'] = snapshot_accounts(Path(folder) / 'db/x-ui.db', manifest)
+    cert, key = hysteria_certificate_paths(folder, manifest)
+    was_dual = dual_enabled(manifest)
+    manifest['management'] = {'ssh_port': ssh_port}
+    if not was_dual:
+        old_groups = {g['groupId'] for g in api.call('/panel/api/hosts/list')}
+        api.call('/panel/api/inbounds/add', hysteria_inbound(manifest, cert, key))
+        inbounds = api.call('/panel/api/inbounds/list')
+        found = [i for i in inbounds if i.get('remark') == 'SELF-h2' and i.get('protocol') == 'hysteria']
+        groups = [g for g in api.call('/panel/api/hosts/list') if g['groupId'] not in old_groups]
+        if len(found) != 1 or len(groups) != 1:
+            raise Error('Unexpected native Hysteria2 creation membership')
+        inbound = found[0]
+        # Attach native global identities; native code generates missing Auth.
+        for name in device_names(manifest):
+            api.call('/panel/api/clients/' + name + '/attach', {'inboundIds': [inbound['id']]})
+        manifest['hysteria2'] = {'schema': 1, 'inbound_id': inbound['id'], 'host_group_id': groups[0]['groupId'],
+            'certificate_file': str(cert.relative_to(Path(folder).absolute())), 'key_file': str(key.relative_to(Path(folder).absolute()))}
+        # Metadata is not yet populated with Auth: derive it directly from DB.
+        manifest['accounts'] = snapshot_accounts(Path(folder) / 'db/x-ui.db', manifest, validate_metadata=False)
+    else:
+        inbound = next(i for i in api.call('/panel/api/inbounds/list') if i['id'] == manifest['hysteria2']['inbound_id'])
+        stream = inbound['streamSettings']
+        stream = json.loads(stream) if isinstance(stream, str) else stream
+        stream['tlsSettings']['certificates'] = [{'certificateFile': str(cert), 'keyFile': str(key), 'oneTimeLoading': False}]
+        inbound['streamSettings'] = json.dumps(stream)
+        api.call('/panel/api/inbounds/update/' + str(inbound['id']), inbound)
+    with contextlib.closing(sqlite3.connect(Path(folder) / 'db/x-ui.db')) as db:
+        template = json.loads(db.execute("select value from settings where key='xrayTemplateConfig'").fetchone()[0])
+    rules = template.setdefault('routing', {}).setdefault('rules', [])
+    if inbound.get('tag') != 'SELF-h2':
+        raise Error('Unexpected native Hysteria2 inbound tag')
+    expected = management_rule(template, manifest, inbound['tag'])
+    # Replace only our exact previous management rule, never another exception.
+    rules[:] = [r for r in rules if not (r.get('inboundTag') == expected['inboundTag'] and r.get('outboundTag') == 'direct' and
+        r.get('ip') == [manifest['endpoint'] + '/32'] and r.get('network') == 'tcp' and r.get('port') == expected['port'])]
+    rules.insert(0, expected)
+    ctl('stop', PANEL)
+    settings_write(Path(folder) / 'db/x-ui.db', dict(backend_settings(manifest), xrayTemplateConfig=json.dumps(template)))
+    ctl('start', PANEL)
+    api = wait_api(manifest)
+    owned_host_group(folder, api, manifest)
+    hysteria_health(folder, manifest, api)
+    core_check(folder)
 
 
 def configure_native(folder, manifest, fresh, rotate=False):
@@ -373,8 +561,12 @@ def configure_native(folder, manifest, fresh, rotate=False):
         api.call('/panel/api/setting/updateUser', {'oldUsername': 'admin', 'oldPassword': 'admin',
                  'newUsername': manifest['admin_user'], 'newPassword': manifest['admin_password']})
     api = wait_api(manifest)
+    previous_endpoint = manifest['endpoint']
     if not fresh:
-        owned_host_group(folder, api, manifest)  # before settings, inbound or client writes
+        old_inbound, _ = owned_host_group(folder, api, manifest)  # before any write
+        old_stream = old_inbound['streamSettings']
+        old_stream = json.loads(old_stream) if isinstance(old_stream, str) else old_stream
+        previous_endpoint = old_stream['externalProxy'][0]['dest']
     if fresh:
         template = api.call('/panel/api/setting/getDefaultJsonConfig')
         template = json.loads(template) if isinstance(template, str) else template
@@ -388,6 +580,14 @@ def configure_native(folder, manifest, fresh, rotate=False):
     routing = template.setdefault('routing', {})
     routing['domainStrategy'] = 'IPIfNonMatch'
     routing.setdefault('rules', []).insert(0, {'type': 'field', 'ip': ['geoip:private', manifest['endpoint'] + '/32'], 'outboundTag': 'blocked'})
+    if dual_enabled(manifest):
+        # A restored target may have a different verified SSH port. The closed
+        # archive already attested the old rule; remove only its exact shape.
+        old_rules = [r for r in routing['rules'] if r.get('inboundTag') == ['SELF-h2']]
+        if len(old_rules) != 1 or old_rules[0].get('ip') != [previous_endpoint + '/32'] or old_rules[0].get('network') != 'tcp' or old_rules[0].get('outboundTag') != 'direct':
+            raise Error('Unexpected restored Hysteria2 management rule')
+        routing['rules'] = [r for r in routing['rules'] if r != old_rules[0]]
+        routing['rules'].insert(0, management_rule(template, manifest, 'SELF-h2'))
     if not any(o.get('tag') == 'blocked' and o.get('protocol') == 'blackhole' for o in template.get('outbounds', [])):
         raise Error('Unexpected native template: missing blocked outbound')
     # Stop before changing persistent template/settings; cached panel state is
@@ -428,20 +628,39 @@ def configure_native(folder, manifest, fresh, rotate=False):
             # the complete object and change the address only, never its policy.
             api.call('/panel/api/hosts/update/' + group['groupId'], desired_group)
         api.call('/panel/api/inbounds/update/' + str(inbound['id']), inbound)
-        if owned_host_group(folder, api, manifest)[1] != desired_group:
+        if api.call('/panel/api/hosts/get/' + group['groupId']) != desired_group:
             raise Error('Native Host update changed unexpected fields')
+        if dual_enabled(manifest):
+            h2 = next(i for i in api.call('/panel/api/inbounds/list') if i['id'] == manifest['hysteria2']['inbound_id'])
+            h2group = api.call('/panel/api/hosts/get/' + manifest['hysteria2']['host_group_id'])
+            desired_h2 = copy.deepcopy(h2group)
+            desired_h2['hosts'] = [manifest['endpoint'] + ':' + str(manifest['config']['proxy_port'])]
+            if desired_h2 != h2group:
+                api.call('/panel/api/hosts/update/' + h2group['groupId'], desired_h2)
+            h2stream = h2['streamSettings']
+            h2stream = json.loads(h2stream) if isinstance(h2stream, str) else h2stream
+            h2stream['externalProxy'][0]['dest'] = manifest['endpoint']
+            cert, key = hysteria_certificate_paths(folder, manifest)
+            h2stream['tlsSettings']['certificates'] = [{'certificateFile': str(cert), 'keyFile': str(key), 'oneTimeLoading': False}]
+            h2['streamSettings'] = json.dumps(h2stream)
+            api.call('/panel/api/inbounds/update/' + str(h2['id']), h2)
+        owned_host_group(folder, api, manifest)
         if rotate:
             # Each complete fresh native object carries quota/expiry/reset and
             # disabled state. Change only UUID, never reconstruct a Client DTO.
             for device in device_names(manifest):
-                current = api.call('/panel/api/inbounds/list')[0]['settings']
+                current = next(i for i in api.call('/panel/api/inbounds/list') if i['remark'] == 'SELF-main')['settings']
                 current = json.loads(current) if isinstance(current, str) else current
                 account = next(c for c in current['clients'] if c['email'] == device)
                 # The native update endpoint has one policy outside Client DTO:
                 # LimitHwid. Preserve it from its own complete native record.
                 detail = api.call('/panel/api/clients/get/' + device)['client']
                 account['limitHwid'] = detail['limitHwid']
+                if dual_enabled(manifest):
+                    account['auth'] = detail['auth']
                 account['id'] = str(uuid.uuid4())
+                if dual_enabled(manifest):
+                    account['auth'] = secrets.token_hex(24)
                 api.call('/panel/api/clients/update/' + device, account)
     api.call('/panel/api/server/restartXrayService', {})
     for _ in range(60):
@@ -539,14 +758,19 @@ def get_feed(manifest, device, fmt):
 
 def validate_feed_scope(manifest, device, data, fmt):
     current = manifest['accounts'][device]
-    others = [manifest['accounts'][d]['id'] for d in device_names(manifest) if d != device]
+    others = [manifest['accounts'][d][key] for d in device_names(manifest) if d != device
+              for key in (('id', 'auth') if dual_enabled(manifest) else ('id',))]
     if fmt == 'sub':
         try:
             text = base64.b64decode(data, validate=True).decode()
             links = text.strip().splitlines()
-            if len(links) != 1:
+            if len(links) != (2 if dual_enabled(manifest) else 1):
                 raise ValueError()
-            parsed = urlsplit(links[0])
+            parsed_links = [urlsplit(link) for link in links]
+            vless = [link for link in parsed_links if link.scheme == 'vless']
+            if len(vless) != 1:
+                raise ValueError()
+            parsed = vless[0]
             query = parse_qs(parsed.query)
             valid = (parsed.scheme == 'vless' and uuid.UUID(parsed.username) == uuid.UUID(current['id']) and
                      parsed.hostname == manifest['endpoint'] and parsed.port == manifest['config']['proxy_port'] and
@@ -554,6 +778,16 @@ def validate_feed_scope(manifest, device, data, fmt):
                      query.get('pbk') == [manifest['reality']['publicKey']] and
                      query.get('sid') == [manifest['reality']['shortIds'][0]] and
                      query.get('sni') == [manifest['config']['reality_target']])
+            if dual_enabled(manifest):
+                h2 = [link for link in parsed_links if link.scheme == 'hysteria2']
+                if len(h2) != 1:
+                    raise ValueError('Missing Hysteria2 URI')
+                link = h2[0]
+                params = parse_qs(link.query)
+                valid = valid and (unquote(link.username or '') == current['auth'] and link.password is None and
+                    link.hostname == manifest['endpoint'] and link.port == manifest['config']['proxy_port'] and
+                    params.get('sni') == [manifest['config']['domain']] and params.get('alpn') == ['h3'] and
+                    params.get('security') == ['tls'] and not any(params.get(k, ['0']) != ['0'] for k in ('insecure', 'allowInsecure', 'skip-cert-verify')))
             if not valid:
                 raise ValueError('URI identity mismatch')
         except (ValueError, KeyError, UnicodeError) as exc:
@@ -562,6 +796,35 @@ def validate_feed_scope(manifest, device, data, fmt):
         text = data.decode()
         if not all(s in text for s in ('proxies:', 'proxy-groups:', 'rules:', current['id'], manifest['endpoint'], 'MATCH,PROXY', 'bilibili.com,DIRECT')):
             raise Error('Native Mihomo output is not the expected full routed profile')
+        if dual_enabled(manifest):
+            section = re.search(r'(?ms)^proxies:\s*\n(.*?)(?=^[A-Za-z][\w-]*:|\Z)', text)
+            if not section:
+                raise Error('Missing native dual Mihomo proxies')
+            lines = section[1].splitlines()
+            starts = [(n, len(line) - len(line.lstrip())) for n, line in enumerate(lines) if re.match(r'^\s*-\s+[\w-]+:', line)]
+            indent = min((i for _, i in starts), default=-1)
+            indices = [n for n, i in starts if i == indent] + [len(lines)]
+            nodes = []
+            for start, end in zip(indices, indices[1:]):
+                fields = {}
+                for line in lines[start:end]:
+                    match = re.match(r'^\s*(?:-\s+)?([\w-]+):\s*(.*?)\s*$', line)
+                    if match and match[2]:
+                        value = match[2]
+                        try:
+                            value = json.loads(value)
+                        except ValueError:
+                            value = value.strip("\"'")
+                        fields[match[1]] = value
+                nodes.append(fields)
+            if (len(nodes) != 2 or {n.get('type') for n in nodes} != {'vless', 'hysteria2'} or
+                    any(n.get('server') != manifest['endpoint'] or n.get('port') != manifest['config']['proxy_port'] for n in nodes)):
+                raise Error('Unexpected native dual Mihomo endpoints/types')
+            reality = next(n for n in nodes if n['type'] == 'vless')
+            h2 = next(n for n in nodes if n['type'] == 'hysteria2')
+            if (reality.get('uuid') != current['id'] or h2.get('password') != current['auth'] or
+                    h2.get('sni') != manifest['config']['domain'] or h2.get('skip-cert-verify') not in (None, False)):
+                raise Error('Unexpected native dual Mihomo authentication/TLS')
     if any(other in text for other in others):
         raise Error('Cross-device credentials present in native subscription')
 
@@ -588,17 +851,19 @@ def backend_health(folder, manifest):
     clients = (json.loads(settings) if isinstance(settings, str) else settings)['clients']
     if len(clients) != len(device_names(manifest)) or {c['email'] for c in clients} != set(device_names(manifest)):
         raise Error('Unexpected native account membership; manual ownership review required')
-    # SQLite/API is the source of truth. Supported native per-device credential,
-    # SubID and enabled changes must survive backup/replacement, not be undone by
-    # an old wrapper copy. Only explicit manifest membership is wrapper-owned.
+    # Inbound DTOs are protocol projections: VLESS does not carry native Auth.
+    # Read credential authority from global records and cross-check the VLESS
+    # projection, then H2's projection and both genuine native feeds below.
+    authoritative = snapshot_accounts(folder / 'db/x-ui.db', manifest)
     for client in clients:
         uuid.UUID(client['id'])
         if not re.fullmatch(r'[A-Za-z0-9_-]{16,128}', client['subId']) or not isinstance(client['enable'], bool):
             raise Error('Invalid native account identity')
-        manifest['accounts'][client['email']] = {k: client[k] for k in ('id', 'subId', 'email', 'enable', 'flow')}
-    # Count global accounts AND joins, including unattached/foreign native rows.
-    snapshot_accounts(folder / 'db/x-ui.db', manifest)
+        if any(client[k] != authoritative[client['email']][k] for k in ('id', 'subId', 'email', 'enable', 'flow')):
+            raise Error('Native VLESS projection disagrees with global account authority')
+    manifest['accounts'] = authoritative
     device_names(manifest)
+    hysteria_health(folder, manifest, api)
     core_check(folder)
     outputs = {}
     for device in device_names(manifest):
@@ -696,7 +961,8 @@ def check_units(require_all=True):
 def process_health():
     """Attest loaded executables, unit ownership and the actual socket boundary."""
     active = ROOT / 'active'
-    config = read_json(active / 'manifest.json')['config']
+    manifest = read_json(active / 'manifest.json')
+    config = manifest['config']
     ports = required_ports(config)
     check_units()
     for service in (PANEL, FRONT):
@@ -723,6 +989,26 @@ def process_health():
                 raise Error('Foreign/stale loaded executable on owned listener')
     if found != set(ports):
         raise Error('One or more declared listeners are missing')
+    if dual_enabled(manifest):
+        found_udp = False
+        for line in run(['ss', '-H', '-lunp'], timeout=10).stdout.decode().splitlines():
+            fields = line.split()
+            if len(fields) < 4:
+                raise Error('Cannot parse runtime UDP listeners')
+            if fields[3].rsplit(':', 1)[-1] != str(config['proxy_port']):
+                continue
+            pids = re.findall(r'pid=(\d+)', line)
+            if not pids:
+                raise Error('Cannot attest Hysteria2 UDP listener ownership')
+            if fields[3] not in ('0.0.0.0:' + str(config['proxy_port']), '*:' + str(config['proxy_port']), '[::]:' + str(config['proxy_port'])):
+                raise Error('Hysteria2 UDP listener is not publicly bound')
+            for pid in pids:
+                proc = Path('/proc') / pid
+                if PANEL not in (proc / 'cgroup').read_text() or os.readlink(proc / 'exe') != str(active / 'bin/xray-linux-amd64'):
+                    raise Error('Foreign/stale executable on Hysteria2 UDP listener')
+            found_udp = True
+        if not found_udp:
+            raise Error('Declared Hysteria2 UDP listener is missing')
 
 
 def boot_id():
@@ -767,7 +1053,10 @@ def preflight(request):
     connection = os.environ.get('QD_SSH_CONNECTION', os.environ.get('SSH_CONNECTION', '')).split()
     if len(connection) != 4 or connection[2] != expected:
         raise Error('SSH server address differs from expected endpoint; wrong host/NAT is not supported')
-    if config['proxy_port'] == int(connection[3]):
+    ssh_port = int(connection[3])
+    if ('ssh_port' in request and type(request['ssh_port']) is not int) or request.get('ssh_port', ssh_port) != ssh_port or not 1 <= ssh_port <= 65535:
+        raise Error('SSH management port differs from authenticated connection')
+    if config['proxy_port'] == ssh_port:
         raise Error('Proxy listener conflicts with the actual SSH port')
     mid = machine_id()
     if not re.fullmatch(r'[0-9a-f]{32}', mid) or request.get('machine_id', mid) != mid:
@@ -813,12 +1102,24 @@ def preflight(request):
                 raise Error('Foreign process on an owned listener port')
         if port in (str(ADMIN_PORT), str(SUB_PORT), str(API_PORT)) and not columns[3].startswith('127.0.0.1:'):
             raise Error('Management/backend listener escaped loopback')
+    # UDP ownership is independent of the identically numbered TCP listener.
+    for line in run(['ss', '-H', '-lunp'], timeout=10).stdout.decode().splitlines():
+        columns = line.split()
+        if len(columns) < 4:
+            raise Error('Cannot parse UDP listener inventory')
+        if columns[3].rsplit(':', 1)[-1] != str(config['proxy_port']):
+            continue
+        pids = re.findall(r'pid=(\d+)', line)
+        if not owned or not pids or not (ROOT / 'active/manifest.json').is_file() or not dual_enabled(read_json(ROOT / 'active/manifest.json')):
+            raise Error('Required UDP listener port is already in use; no port stealing')
+        if any(PANEL not in (Path('/proc') / pid / 'cgroup').read_text() for pid in pids):
+            raise Error('Foreign process on owned Hysteria2 UDP port')
     if shutil.disk_usage(ROOT if ROOT.exists() else ROOT.parent).free < 2 * 1024**3:
         raise Error('Require at least2GiB free for verified artifacts, staging and complete off-node export')
     if (ROOT / 'pending.json').exists():
         raise Error('Persistent transaction pending; run recover, never overwrite it')
     return {'machine_id': mid, 'owned': owned, 'endpoint': expected,
-            'platform': 'ubuntu-24.04-amd64', 'firewall': 'empty; unchanged', 'ports': list(ports)}
+            'platform': 'ubuntu-24.04-amd64', 'firewall': 'empty; unchanged', 'ports': list(ports), 'ssh_port': ssh_port}
 
 
 def check_target(config):
@@ -885,21 +1186,29 @@ def db_snapshot(source, target):
                 'schema_sha256': hashlib.sha256(schema.encode()).hexdigest(), 'schema': schema}
 
 
-def snapshot_accounts(database, manifest=None):
-    """Read only publication metadata from the same authoritative closed DB."""
+def snapshot_accounts(database, manifest=None, validate_metadata=True):
+    """Read publication metadata from native authority; legacy archives stay five-field."""
+    dual = manifest is not None and dual_enabled(manifest)
     with contextlib.closing(sqlite3.connect('file:' + str(database) + '?mode=ro', uri=True)) as db:
-        rows = db.execute('select email,uuid,sub_id,enable,flow from clients order by email').fetchall()
-    expected = set(DEVICES if manifest is None else device_names(manifest))
+        rows = db.execute('select email,uuid,sub_id,enable,flow' + (',auth' if dual else '') + ' from clients order by email').fetchall()
+    source = manifest if validate_metadata else {k: v for k, v in manifest.items() if k != 'hysteria2'}
+    expected = set(DEVICES if manifest is None else device_names(source))
     if len(rows) != len(expected) or {row[0] for row in rows} != expected:
         raise Error('Unexpected snapshot account membership')
     if manifest is not None:
         with contextlib.closing(sqlite3.connect('file:' + str(database) + '?mode=ro', uri=True)) as db:
             inbounds = db.execute('select id from inbounds').fetchall()
             joins = db.execute('select c.email,ci.inbound_id from client_inbounds ci left join clients c on c.id=ci.client_id').fetchall()
-        if len(inbounds) != 1 or len(joins) != len(expected) or set(joins) != {(name, inbounds[0][0]) for name in expected}:
+        ids = {row[0] for row in inbounds}
+        wanted = {(name, identity) for name in expected for identity in ids}
+        if (len(inbounds) != (2 if dual else 1) or len(joins) != len(wanted) or set(joins) != wanted or
+                (dual and manifest['hysteria2']['inbound_id'] not in ids)):
             raise Error('Unexpected snapshot account inbound membership')
-    return {email: {'email': email, 'id': identity, 'subId': sub_id, 'enable': bool(enabled), 'flow': flow}
-            for email, identity, sub_id, enabled, flow in rows}
+    result = {r[0]: dict(zip(('email', 'id', 'subId', 'enable', 'flow') + (('auth',) if dual else ()),
+                           (r[0], r[1], r[2], bool(r[3]), r[4]) + ((r[5],) if dual else ()))) for r in rows}
+    if manifest is not None:
+        device_names(dict(manifest, accounts=result))
+    return result
 
 
 def snapshot_host_group(database, manifest):
@@ -909,18 +1218,29 @@ def snapshot_host_group(database, manifest):
         admins = db.execute('select id from users where username=?', (manifest['admin_user'],)).fetchall()
         # No enabled/hidden filter: foreign inactive rows and duplicates count.
         hosts = db.execute('select group_id,inbound_id,address,port from hosts').fetchall()
-    if (len(inbounds) != 1 or len(admins) != 1 or
-            inbounds[0][1:] != (admins[0][0], 'SELF-main', 'vless', manifest['config']['proxy_port'])):
+    dual = dual_enabled(manifest)
+    wanted = {'SELF-main': 'vless', 'SELF-h2': 'hysteria'} if dual else {'SELF-main': 'vless'}
+    if (len(inbounds) != len(wanted) or len(admins) != 1 or
+            {r[2]: r[3] for r in inbounds} != wanted or any(r[1] != admins[0][0] or r[4] != manifest['config']['proxy_port'] for r in inbounds)):
         raise Error('Unexpected native Host owned-inbound identity')
-    if len(hosts) != 1:
+    if len(hosts) != len(wanted):
         raise Error('Unexpected native Host snapshot membership')
-    group_id, inbound_id, address, port = hosts[0]
-    if (not isinstance(group_id, str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,128}', group_id) or
-            inbound_id != inbounds[0][0] or address != manifest['endpoint'] or port != manifest['config']['proxy_port']):
-        raise Error('Unexpected native Host snapshot endpoint/membership')
-    if 'host_group_id' in manifest and manifest['host_group_id'] != group_id:
+    identities = {}
+    for identity, _, remark, _, _ in inbounds:
+        matching = [row for row in hosts if row[1] == identity]
+        if len(matching) != 1:
+            raise Error('Unexpected native Host snapshot membership')
+        group_id, inbound_id, address, port = matching[0]
+        if (not isinstance(group_id, str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,128}', group_id) or
+                address != manifest['endpoint'] or port != manifest['config']['proxy_port']):
+            raise Error('Unexpected native Host snapshot endpoint/membership')
+        identities[remark] = group_id
+    if len(set(identities.values())) != len(wanted) or ('host_group_id' in manifest and manifest['host_group_id'] != identities['SELF-main']):
         raise Error('Changed persisted native Host group identity')
-    return group_id
+    if dual and (identities['SELF-h2'] != manifest['hysteria2']['host_group_id'] or
+                 next(r[0] for r in inbounds if r[2] == 'SELF-h2') != manifest['hysteria2']['inbound_id']):
+        raise Error('Changed persisted Hysteria2 Host/inbound identity')
+    return identities['SELF-main']
 
 
 def reject_symlinks(root):
@@ -1067,8 +1387,8 @@ def recover_backup():
 def export_backup(request=None):
     if (ROOT / 'pending.json').exists():
         pending = read_json(ROOT / 'pending.json')
-        if pending.get('kind') == 'devices' and pending.get('phase') != 'prepared':
-            raise Error('Device transaction not ready for backup')
+        if pending.get('kind') in ('devices', 'transport-upgrade') and pending.get('phase') != 'prepared':
+            raise Error('Owned transaction not ready for backup')
     if ROOT.is_symlink():
         raise Error('Symlink owned root cannot be exported')
     active = ROOT / 'active'
@@ -1134,6 +1454,8 @@ def verify_backup(folder, lock):
     manifest = read_json(active / 'manifest.json')
     if manifest.get('format') != FORMAT:
         raise Error('Backup missing account mapping')
+    validate_config(manifest['config'])
+    public_ip(manifest['endpoint'])
     certs = list((active / 'caddy/data/caddy/certificates').rglob(manifest['config']['domain'] + '.crt'))
     if not certs or any(not cert.with_suffix('.key').is_file() or not cert.with_suffix('.key').stat().st_size for cert in certs):
         raise Error('Backup missing external TLS certificate/private key and renewal storage')
@@ -1147,6 +1469,15 @@ def verify_backup(folder, lock):
     # This is the only source-era metadata migration: derive from the verified
     # closed OLD-endpoint snapshot; never alter the archive or adopt a conflict.
     manifest['host_group_id'] = snapshot_host_group(active / 'db/x-ui.db', manifest)
+    if dual_enabled(manifest):
+        class SnapshotAPI:
+            def call(self, path):
+                if path != '/panel/api/inbounds/list':
+                    raise Error('Unsupported closed snapshot query')
+                with contextlib.closing(sqlite3.connect('file:' + str(active / 'db/x-ui.db') + '?mode=ro', uri=True)) as db:
+                    db.row_factory = sqlite3.Row
+                    return [dict(row, streamSettings=row['stream_settings'], enable=bool(row['enable'])) for row in db.execute('select * from inbounds')]
+        hysteria_health(active, manifest, SnapshotAPI(), check_paths=False)
     return manifest
 
 
@@ -1187,7 +1518,7 @@ def prepare(upload):
                 ctl('restart', FRONT)
                 tls_probe(old)
             atomic(ROOT / 'active/manifest.json', dumps(old))
-            return {'unchanged': True, **info}
+            return {'unchanged': True, 'needs_transport_upgrade': not dual_enabled(old), **info}
         check_target(config)
         adapter = (stage / 'host.py').read_bytes()
         if hashlib.sha256(adapter).hexdigest() != request['adapter_sha256']:
@@ -1226,14 +1557,17 @@ def prepare(upload):
                 manifest['reality'] = native_keys(active)
                 initialize_db(active, manifest)
                 fresh = True
+            manifest['management'] = {'ssh_port': info['ssh_port']}
             atomic(active / 'manifest.json', dumps(manifest))
             front_config(active, manifest, False)
             ctl('start', PANEL)
             configure_native(active, manifest, fresh, rotate=(request['mode'] == 'replace'))
-            backend_health(active, manifest)
-            atomic(active / 'manifest.json', dumps(manifest))
+            # H2 TLS paths may only reference an already-issued owned pair.
             ctl('start', FRONT)
             wait_tls(manifest)
+            enable_hysteria(active, manifest, info['ssh_port'])
+            backend_health(active, manifest)
+            atomic(active / 'manifest.json', dumps(manifest))
             process_health()
             return {'unchanged': False, **info}
         except BaseException:
@@ -1245,8 +1579,11 @@ def prepare(upload):
 # Explicit reviewed public-source predecessors; never infer trust from a remote hash.
 LEGACY_ADAPTER_SHA256 = '30430e73199f175099d509f056b31c38b17f3eb6ec7ff07972a75003409a000e'
 DEPLOYED_ADAPTER_SHA256 = '8777a3d47b07b91bc85de2ce88016efb6de9c3b0568f5688f5bd8d929ed701f1'
+# Reviewed reset-only ae72036; identical public host.py at baseline6c02d25.
+BASELINE_ADAPTER_SHA256 = 'b52adbbfb7efc3593c5fa266e8f148ed60deaa2b685d72b926e549b9425f6d7e'
 ADAPTER_PREDECESSORS = {LEGACY_ADAPTER_SHA256: 'previous-host.py',
-                        DEPLOYED_ADAPTER_SHA256: 'previous-host-918103e.py'}
+                        DEPLOYED_ADAPTER_SHA256: 'previous-host-918103e.py',
+                        BASELINE_ADAPTER_SHA256: 'previous-host-ae72036.py'}
 
 
 def accepted_adapter_digest(stored, current):
@@ -1308,18 +1645,69 @@ def device_owner(request):
     manifest = read_json(ROOT / 'active/manifest.json')
     if manifest['owner'] != request['owner'] or manifest['config'] != request['config'] or manifest['endpoint'] != request['endpoint']:
         raise Error('Device operation differs from owned deployment')
+    if 'ssh_port' in request and 'management' in manifest and manifest['management'] != {'ssh_port': request['ssh_port']}:
+        raise Error('Management SSH port differs from owned deployment')
     return manifest
 
 
-def devices_prepare(upload):
+def transport_request(request):
+    required = ('owner', 'machine_id', 'endpoint', 'config', 'operation_id', 'adapter_sha256', 'ssh_port', 'mode')
+    if (request.get('mode') != 'transport-upgrade' or request.get('kind', 'transport-upgrade') != 'transport-upgrade' or request.get('device_action') is not None or
+            not re.fullmatch(r'[0-9a-f]{32}', request.get('operation_id', '')) or
+            not re.fullmatch(r'[0-9a-f]{64}', request.get('adapter_sha256', '')) or
+            type(request.get('ssh_port')) is not int or not 1 <= request['ssh_port'] <= 65535 or
+            any(key not in request for key in required)):
+        raise Error('Invalid transport feature request')
+    validate_config(request['config'])
+    bound = {key: request[key] for key in required}
+    if 'before_sha256' in request and not re.fullmatch(r'[0-9a-f]{64}', request['before_sha256']):
+        raise Error('Invalid pre-change archive digest')
+    for key, expected in (('source_transports', ['tcp-reality']), ('target_transports', ['tcp-reality', 'hysteria2'])):
+        if key in request and request[key] != expected:
+            raise Error('Unsupported transport feature transition')
+    for key in ('before_sha256', 'source_transports', 'target_transports'):
+        if key in request:
+            bound[key] = request[key]
+    return hashlib.sha256(dumps(bound).encode()).hexdigest()
+
+
+def transaction_request(request):
+    return transport_request(request) if request.get('mode') == 'transport-upgrade' else device_request(request)
+
+
+def receipt_path(value):
+    transport = value.get('kind') == 'transport-upgrade' or value.get('mode') == 'transport-upgrade'
+    return ROOT / ('transport-receipts' if transport else 'device-receipts') / (value['operation_id'] + '.json')
+
+
+def transaction_receipt(request):
+    if request.get('mode') != 'transport-upgrade':
+        return device_receipt(request)
+    fingerprint = transport_request(request)
+    path = receipt_path(request)
+    if path.exists():
+        receipt = read_json(path)
+        if receipt['request_sha256'] != fingerprint:
+            raise Error('Operation ID already bound to a different transport request')
+        return receipt if receipt.get('committed') else None
+    return None
+
+
+def transport_prepare(upload):
+    return devices_prepare(upload, transport=True)
+
+
+def devices_prepare(upload, transport=False):
     with tempfile.TemporaryDirectory(prefix='qd-device-upload-') as tmp:
         stage = Path(tmp)
         safe_unpack(upload, stage)
         request = read_json(stage / 'request.json')
         check_request_identity(request)
         manifest = device_owner(request)
-        fingerprint = device_request(request)
-        receipt = device_receipt(request)
+        if transport != (request.get('mode') == 'transport-upgrade'):
+            raise Error('Wrong transaction preparation action')
+        fingerprint = transaction_request(request)
+        receipt = transaction_receipt(request)
         if receipt:
             return receipt
         if (ROOT / 'pending.json').exists():
@@ -1333,6 +1721,9 @@ def devices_prepare(upload):
         rollback = ROOT / 'device-rollback'
         if rollback.exists():
             raise Error('Retained device recovery intent; run recover first')
+        if transport and 'before_sha256' in request and (not (ROOT / 'export-sha256').is_file() or
+                (ROOT / 'export-sha256').read_text() != request['before_sha256']):
+            raise Error('Transport migration requires its verified pre-change archive receipt')
         reject_symlinks(ROOT / 'active')
         if (ROOT / 'host.py').is_symlink():
             raise Error('Symlink recovery adapter')
@@ -1346,12 +1737,14 @@ def devices_prepare(upload):
         api = API(manifest)
         inbound, _ = owned_host_group(ROOT / 'active', api, manifest)
         snapshot_accounts(ROOT / 'active/db/x-ui.db', manifest)
-        names, action = request['names'], request['device_action']
+        names, action = ([], 'transport-upgrade') if transport else (request['names'], request['device_action'])
         existing = set(device_names(manifest))
-        if (action == 'add' and set(names) <= existing) or (action == 'remove' and names[0] not in existing):
+        if (transport and dual_enabled(manifest)) or (action == 'add' and set(names) <= existing) or (action == 'remove' and names[0] not in existing):
             result = {'unchanged': True, 'committed': True, 'request_sha256': fingerprint,
                       'machine_id': request['machine_id'], 'node_id': manifest['node_id']}
-            atomic(ROOT / 'device-receipts' / (request['operation_id'] + '.json'), dumps(result))
+            if transport:
+                result['transports'] = ['tcp-reality', 'hysteria2']
+            atomic(receipt_path(request), dumps(result))
             return result
         if action == 'add' and set(names) & existing:
             raise Error('Mixed existing/new names; no partial add')
@@ -1373,7 +1766,7 @@ def devices_prepare(upload):
             services[unit] = {key: subprocess.run(['systemctl', command, '--quiet', unit], capture_output=True).returncode == 0
                               for key, command in [('running', 'is-active'), ('enabled', 'is-enabled')]}
         intent = {'boot_id': boot_id(), 'deadline': time.time() + 900, 'had_active': True,
-                  'kind': 'devices', 'phase': 'snapshot', 'operation_id': request['operation_id'],
+                  'kind': 'transport-upgrade' if transport else 'devices', 'phase': 'snapshot', 'operation_id': request['operation_id'],
                   'request_sha256': fingerprint, 'services': services}
         atomic(preparation / 'intent.json', dumps(intent))
         os.replace(preparation, rollback)
@@ -1384,8 +1777,7 @@ def devices_prepare(upload):
             os.close(directory)
         # Crash before replacement leaves the old adapter and services unchanged;
         # crash after replacement is recognized by recover's staged-intent branch.
-        atomic(ROOT / 'device-receipts' / (request['operation_id'] + '.json'),
-               dumps({'request_sha256': fingerprint, 'committed': False}))
+        atomic(receipt_path(request), dumps({'request_sha256': fingerprint, 'committed': False}))
         atomic(ROOT / 'host.py', adapter, 0o700)
         atomic(ROOT / 'pending.json', dumps(intent))
         active = ROOT / 'active'
@@ -1398,7 +1790,9 @@ def devices_prepare(upload):
             atomic(ROOT / 'pending.json', dumps(intent))
             ctl('start', PANEL)
             api = wait_api(manifest)
-            if action == 'add':
+            if transport:
+                enable_hysteria(active, manifest, request['ssh_port'])
+            elif action == 'add':
                 for name in names:
                     check_lease()
                     account = {'id': str(uuid.uuid4()), 'subId': secrets.token_hex(24), 'email': name,
@@ -1407,7 +1801,13 @@ def devices_prepare(upload):
                     if any(uuid.UUID(account['id']) == uuid.UUID(c['id']) or account['subId'] == c['subId']
                            for c in manifest['accounts'].values()):
                         raise Error('Generated credential collision; recover and retry')
-                    api.call('/panel/api/clients/add', {'client': account, 'inboundIds': [inbound['id']]})
+                    inbound_ids = [inbound['id']]
+                    if dual_enabled(manifest):
+                        account['auth'] = secrets.token_hex(24)
+                        if any(account['auth'] == c['auth'] for c in manifest['accounts'].values()):
+                            raise Error('Generated Hysteria2 credential collision')
+                        inbound_ids.append(manifest['hysteria2']['inbound_id'])
+                    api.call('/panel/api/clients/add', {'client': account, 'inboundIds': inbound_ids})
                     manifest['accounts'][name] = account
             elif action == 'remove':
                 check_lease()
@@ -1415,16 +1815,23 @@ def devices_prepare(upload):
                 del manifest['accounts'][names[0]]
             else:
                 name = names[0]
-                settings = api.call('/panel/api/inbounds/list')[0]['settings']
+                settings = next(i for i in api.call('/panel/api/inbounds/list') if i['remark'] == 'SELF-main')['settings']
                 settings = json.loads(settings) if isinstance(settings, str) else settings
                 account = next(c for c in settings['clients'] if c['email'] == name)
-                account['limitHwid'] = api.call('/panel/api/clients/get/' + name)['client']['limitHwid']
+                detail = api.call('/panel/api/clients/get/' + name)['client']
+                account['limitHwid'] = detail['limitHwid']
+                if dual_enabled(manifest):
+                    account['auth'] = detail['auth']
                 if action == 'rename':
                     if rename_target_has_history(active / 'db/x-ui.db', names[1]):
                         raise Error('Rename target has retained native history; recover before retry')
                     account['email'] = names[1]
                 else:
                     account.update(id=str(uuid.uuid4()), subId=secrets.token_hex(24))
+                    if dual_enabled(manifest):
+                        account['auth'] = secrets.token_hex(24)
+                        if any(account['auth'] == c['auth'] for c in manifest['accounts'].values()):
+                            raise Error('Generated Hysteria2 credential collision')
                     if any(uuid.UUID(account['id']) == uuid.UUID(c['id']) or account['subId'] == c['subId']
                            for c in manifest['accounts'].values()):
                         raise Error('Generated credential collision; recover and retry')
@@ -1446,6 +1853,8 @@ def devices_prepare(upload):
             atomic(active / 'manifest.json', dumps(manifest))
             # Keep the OLD exact front paths until backup receipt/commit. New
             # capabilities are never exposed before off-node verification.
+            if transport:
+                front_config(active, manifest, False)
             ctl('start', FRONT)
             wait_tls(manifest, pending=True)
             process_health()
@@ -1460,7 +1869,7 @@ def devices_prepare(upload):
 
 def recover_devices(pending):
     rollback = ROOT / 'device-rollback'
-    receipt = ROOT / 'device-receipts' / (pending['operation_id'] + '.json')
+    receipt = receipt_path(pending)
     if receipt.exists() and read_json(receipt)['request_sha256'] != pending['request_sha256']:
         raise Error('Recovery receipt request mismatch')
     if receipt.exists() and read_json(receipt).get('committed'):
@@ -1514,15 +1923,23 @@ def recover_devices(pending):
     return {'pending': False, 'restored': 'original device database/front/adapter and service state'}
 
 
-def devices_commit(request):
+def transport_commit(request):
+    return devices_commit(request, transport=True)
+
+
+def devices_commit(request, transport=False):
     manifest = device_owner(request)
-    fingerprint = device_request(request)
-    receipt = device_receipt(request)
+    if transport != (request.get('mode') == 'transport-upgrade'):
+        raise Error('Wrong transaction commit action')
+    fingerprint = transaction_request(request)
+    receipt = transaction_receipt(request)
     if receipt:
         return receipt
     pending = read_json(ROOT / 'pending.json')
-    if pending.get('kind') != 'devices' or pending.get('phase') != 'prepared' or pending['request_sha256'] != fingerprint:
-        raise Error('Device commit does not match prepared intent')
+    if pending.get('kind') != ('transport-upgrade' if transport else 'devices') or pending.get('phase') != 'prepared' or pending['request_sha256'] != fingerprint:
+        raise Error('Owned commit does not match prepared intent')
+    if transport and not dual_enabled(manifest):
+        raise Error('Transport candidate does not contain owned Hysteria2')
     check_lease()
     if (ROOT / 'export-sha256').read_text() != request.get('offnode_sha256'):
         raise Error('Require verified off-node device backup receipt')
@@ -1537,7 +1954,9 @@ def devices_commit(request):
     atomic(ROOT / 'active/manifest.json', dumps(manifest))
     result = {'committed': True, 'published': True, 'request_sha256': fingerprint,
               'machine_id': request['machine_id'], 'node_id': manifest['node_id']}
-    atomic(ROOT / 'device-receipts' / (request['operation_id'] + '.json'), dumps(result))
+    if transport:
+        result['transports'] = ['tcp-reality', 'hysteria2']
+    atomic(receipt_path(request), dumps(result))
     (ROOT / 'pending.json').unlink()
     os.replace(ROOT / 'device-rollback', ROOT / ('completed-' + request['operation_id']))
     return result
@@ -1548,7 +1967,7 @@ def recover_transaction(force=False):
     if not pending_path.exists() and (ROOT / 'device-rollback/intent.json').exists():
         staged = read_json(ROOT / 'device-rollback/intent.json')
         # A completed journal was disarmed before old-adapter restoration.
-        if (ROOT / 'device-receipts' / (staged['operation_id'] + '.json')).exists():
+        if receipt_path(staged).exists():
             return recover_devices(staged)
         atomic(pending_path, dumps(staged))
     if not pending_path.exists():
@@ -1556,7 +1975,7 @@ def recover_transaction(force=False):
     pending = read_json(pending_path)
     if not force and pending.get('phase') not in ('recovering', 'restore-queued') and pending['boot_id'] == boot_id() and time.time() < pending['deadline']:
         return {'pending': True, 'waiting': True}
-    if pending.get('kind') == 'devices':
+    if pending.get('kind') in ('devices', 'transport-upgrade'):
         return recover_devices(pending)
     check_units(require_all=False)
     for service in (FRONT, PANEL):
@@ -1579,7 +1998,7 @@ def recover(force=False):
     pending_path = ROOT / 'pending.json'
     if pending_path.exists():
         pending = read_json(pending_path)
-        receipt = ROOT / 'device-receipts' / (pending.get('operation_id', 'none') + '.json')
+        receipt = receipt_path(dict(pending, operation_id=pending.get('operation_id', 'none')))
         committed = receipt.exists() and read_json(receipt).get('committed')
         due = (force or pending['boot_id'] != boot_id() or time.time() >= pending['deadline'] or
                pending.get('phase') in ('recovering', 'restore-queued'))
@@ -1601,12 +2020,16 @@ def status(request):
         raise Error('Pending transaction: recover before normal operations')
     active = ROOT / 'active'
     manifest = read_json(active / 'manifest.json')
+    if 'ssh_port' in request and 'management' in manifest and manifest['management'] != {'ssh_port': request['ssh_port']}:
+        raise Error('Management SSH port differs from owned deployment')
     backend_health(active, manifest)
     tls_probe(manifest)
     process_health()
     if (ROOT / 'host.py').is_symlink():
         raise Error('Symlink recovery adapter')
     result = {'healthy': True, 'published': manifest['published'], 'node_id': manifest['node_id'],
+            'transports': ['tcp-reality', 'hysteria2'] if dual_enabled(manifest) else ['tcp-reality'],
+            'needs_transport_upgrade': not dual_enabled(manifest),
             'adapter_sha256': digest(ROOT / 'host.py'), 'devices': list(device_names(manifest)),
             'machine_id': marker['machine_id'], 'versions': {k: read_json(active / 'release-lock.json')[k]['version'] for k in ('panel', 'core', 'front')}}
     if 'rename_target' in request:
@@ -1648,6 +2071,8 @@ def check_request_identity(request):
         raise Error('Wrong SSH endpoint for private operation')
     if request.get('machine_id') != machine_id():
         raise Error('Wrong machine identity for private operation')
+    if 'ssh_port' in request and (type(request['ssh_port']) is not int or request['ssh_port'] != int(connection[3])):
+        raise Error('Wrong verified SSH management port')
 
 
 def abort(request):
@@ -1657,9 +2082,9 @@ def abort(request):
     marker = read_json(ROOT / 'owner.json')
     if marker['owner'] != request['owner'] or marker['machine_id'] != request['machine_id']:
         raise Error('Wrong host/owner for recovery')
-    if request.get('device_action'):
-        fingerprint = device_request(request)
-        receipt = device_receipt(request)
+    if request.get('device_action') or request.get('mode') == 'transport-upgrade':
+        fingerprint = transaction_request(request)
+        receipt = transaction_receipt(request)
         if (ROOT / 'pending.json').exists() and read_json(ROOT / 'pending.json').get('request_sha256') != fingerprint:
             raise Error('Recovery request differs from pending device operation')
         if (ROOT / 'device-rollback/intent.json').exists() and read_json(ROOT / 'device-rollback/intent.json')['request_sha256'] != fingerprint:
@@ -1697,7 +2122,9 @@ def main():
                 # service start is itself ordered after this recovery oneshot.
                 print(dumps({'pending': True, 'busy': True}), end='')
                 return
-            if action == 'devices-prepare':
+            if action == 'transport-prepare':
+                result = transport_prepare(sys.stdin.buffer)
+            elif action == 'devices-prepare':
                 result = devices_prepare(sys.stdin.buffer)
             elif action == 'prepare':
                 result = prepare(sys.stdin.buffer)
@@ -1712,12 +2139,15 @@ def main():
                     result = status(request)
                 elif action == 'devices-commit':
                     result = devices_commit(request)
+                elif action == 'transport-commit':
+                    result = transport_commit(request)
                 elif action == 'devices-list':
                     manifest = device_owner(request)
                     if (ROOT / 'pending.json').exists():
                         raise Error('Pending transaction; recover first')
-                    snapshot_accounts(ROOT / 'active/db/x-ui.db', manifest)
-                    result = {name: {'enabled': account['enable']} for name, account in snapshot_accounts(ROOT / 'active/db/x-ui.db', manifest).items()}
+                    accounts = snapshot_accounts(ROOT / 'active/db/x-ui.db', manifest)
+                    snapshot_host_group(ROOT / 'active/db/x-ui.db', manifest)
+                    result = {name: {'enabled': account['enable']} for name, account in accounts.items()}
                 elif action == 'commit':
                     result = commit(request)
                 elif action == 'abort':
@@ -1733,8 +2163,8 @@ def main():
                         return
                     if (ROOT / 'pending.json').exists():
                         pending = read_json(ROOT / 'pending.json')
-                        if pending.get('kind') == 'devices' and pending.get('phase') != 'prepared':
-                            raise Error('Device transaction not ready for output export')
+                        if pending.get('kind') in ('devices', 'transport-upgrade') and pending.get('phase') != 'prepared':
+                            raise Error('Owned transaction not ready for output export')
                     active = ROOT / 'active'
                     result = {name: base64.b64encode(data).decode() for name, data in backend_health(active, read_json(active / 'manifest.json')).items()}
                 else:
