@@ -219,6 +219,7 @@ class Recovery(unittest.TestCase):
                     host.atomic(self.state/'reconciled.tar', 'closed reconciled archive fixture')
                     return self.state/'reconciled.tar'
                 with mock.patch.object(vps,'remote',side_effect=recover_remote),mock.patch.object(vps,'backup_remote',side_effect=backup), \
+                        mock.patch.object(vps,'checked_backup',return_value=manifest), \
                         mock.patch.object(vps,'validate_outputs'),mock.patch.object(vps,'export_after_commit',side_effect=lambda state:exports.append(True)):
                     vps.recover_local(self.state,self.document)
                     self.assertTrue((self.state/'pending.json').exists(),'queued response must retain local intent')
@@ -397,6 +398,7 @@ class Recovery(unittest.TestCase):
         host.atomic(self.state/'inactive.tar', 'closed inactive archive fixture')
         with mock.patch.object(vps,'remote',side_effect=remote), \
                 mock.patch.object(vps,'backup_remote',return_value=self.state/'inactive.tar'), \
+                mock.patch.object(vps,'checked_backup',return_value=h.read_json(h.ROOT/'active/manifest.json')), \
                 mock.patch.object(vps,'validate_outputs'), mock.patch.object(vps,'export_after_commit'):
             vps.recover_local(self.state,self.document)
         self.assertFalse((self.state/'pending.json').exists())

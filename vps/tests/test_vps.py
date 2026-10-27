@@ -80,7 +80,8 @@ class Local(unittest.TestCase):
                      mock.patch.object(vps.subprocess, 'run', side_effect=AssertionError('No external process')), \
                      mock.patch.object(vps, 'target_record', return_value=dict(self.record)), \
                      mock.patch.object(vps, 'remote', side_effect=remote), \
-                     mock.patch.object(vps, 'inspect_backup', return_value={'owner': document['owner'], 'config': self.config}), \
+                     mock.patch.object(vps, 'inspect_backup', return_value=host.new_manifest(document['owner'], self.config,
+                         document['current']['endpoint'] if document['current'] else self.record['endpoint'])), \
                      mock.patch.object(vps, 'artifacts', return_value=state), \
                      mock.patch.object(vps, 'upload_bundle', return_value=io.BytesIO()), \
                      mock.patch.object(vps, 'resolve_mihomo', return_value='/fixture/mihomo'), \
@@ -249,6 +250,8 @@ class Local(unittest.TestCase):
         self.assertNotEqual(host.device_request(request),host.device_request(dict(request,names=['tablet','home'])))
 
     def test_committed_rename_cleanup_is_exact_and_recoverable(self):
+        sync = mock.patch.object(vps, 'sync_outputs')  # This test isolates the exact legacy rename cleanup hook.
+        sync.start(); self.addCleanup(sync.stop)
         self.doc['current']=self.record
         output=vps.private_dir(self.state/'outputs')
         outside=self.state/'outside';host.atomic(outside,'outside-unchanged')

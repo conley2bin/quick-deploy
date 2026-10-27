@@ -279,7 +279,7 @@ class Transport(unittest.TestCase):
         if action == 'devices-list':
             response = {'home': {'enabled': True}}
         elif action in ('prepare', 'devices-prepare'):
-            response = {'unchanged': False}
+            response = {'unchanged': action == 'prepare'}
         elif action == 'abort':
             response = {'committed': False}
         else:
@@ -381,6 +381,7 @@ class Transport(unittest.TestCase):
                         vps.remote(record, 'feed', {'private': 'PAYLOAD-SENTINEL'})
                     with mock.patch.object(vps.subprocess, 'run', side_effect=self.process), \
                          mock.patch.object(vps, 'backup_remote', side_effect=backup), \
+                         mock.patch.object(vps, 'checked_backup', return_value={'node_id': 'fixture-node', 'published': True}), \
                          mock.patch.object(vps, 'validate_outputs', side_effect=validate), \
                          mock.patch.object(vps, 'resolve_mihomo', return_value='/fixture/mihomo'), \
                          mock.patch.object(vps, 'artifacts', return_value=self.state), \

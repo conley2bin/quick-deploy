@@ -616,10 +616,6 @@ def validate_outputs(state, document, record, binary=None, backup=None):
     if host.digest(backup) != digest:
         raise host.Error('Verified backup changed during native validation')
     store_generation(state, manifest, digest, files)
-    output = private_dir(state / 'outputs')
-    for name, data in files.items():
-        host.atomic(output / name, data)
-    host.atomic(output / 'subscription-urls.json', host.dumps(subscription_urls(manifest)))
     return digest
 
 
@@ -711,17 +707,28 @@ def export_bootstrap(state, args):
     management = getattr(args, 'management_interface', None)
     port = 10808 if args.management_port is None else args.management_port
     binary = None
+    management_name = device + '.management.yaml'
+    destination = args.bootstrap_dir.expanduser().absolute()
+    # An old runtime may authenticate with revoked keys. Never silently keep it
+    # or guess that a legacy unbound file is ours to delete.
+    if destination.exists():
+        with directory_fd(destination) as directory:
+            names = set(os.listdir(directory))
+            legacy_unknown = ('management.yaml' in names and
+                (device != 'management' or read_at(directory, 'management.yaml') != files[device + '.yaml']))
+            if legacy_unknown or (management is None and any(name.endswith('.management.yaml') for name in names)):
+                raise host.Error('Existing management runtime requires explicit refresh or manual cleanup; no files changed')
     if management is not None:
         try:
-            selected['management.yaml'] = bootstrap.render_management(files[device + '.yaml'], endpoint=manifest['endpoint'],
+            selected[management_name] = bootstrap.render_management(files[device + '.yaml'], endpoint=manifest['endpoint'],
                 proxy_port=manifest['config']['proxy_port'], ssh_port=manifest['management']['ssh_port'],
                 domain=manifest['config']['domain'], interface=management, listen_port=port)
         except bootstrap.BootstrapError as exc:
             raise host.Error(str(exc)) from exc
-        binary = resolve_mihomo()
+        binary = resolve_mihomo(args.mihomo)
         with tempfile.TemporaryDirectory(prefix='qd-management-check-') as tmp:
-            path = Path(tmp) / 'management.yaml'
-            host.atomic(path, selected['management.yaml'])
+            path = Path(tmp) / management_name
+            host.atomic(path, selected[management_name])
             host.run([binary, '-t', '-d', tmp, '-f', path], timeout=60)
     destination = args.bootstrap_dir.expanduser().absolute()
     # Private profile bytes must not land in this or another Git worktree.
@@ -741,7 +748,7 @@ def export_bootstrap(state, args):
     for name in selected:
         print(str(destination / name))
     if management is not None:
-        print(shlex.join([binary, '-d', str(destination), '-f', str(destination / 'management.yaml')]))
+        print(shlex.join([binary, '-d', str(destination), '-f', str(destination / management_name)]))
         print(shlex.join(['bash', str(MODULE / 'setup.sh'), '--state-dir', str(state), 'status', '--ssh-proxy', f'socks5://127.0.0.1:{port}']))
     return destination
 
@@ -775,20 +782,56 @@ def retire_renamed_outputs(state, request):
         os.close(directory)
 
 
-def remember_commit(state, document, record, backup, result):
+def sync_outputs(state, document, files=None, manifest=None):
+    """Only committed bytes enter outputs; prune only the old verified roster."""
+    output = state / 'outputs'
+    if files is None and not output.exists() and not output.is_symlink():
+        return
+    old_names = set()
+    if document.get('backup') and document.get('current'):
+        previous = checked_backup(document, document['current'], document['backup'])
+        old_names = {name + ext for name in host.device_names(previous) for ext in ('.yaml', '.txt')} | {'subscription-urls.json'}
+    selected = {} if files is None else dict(files, **{'subscription-urls.json': host.dumps(subscription_urls(manifest)).encode()})
+    with directory_fd(output, create=files is not None) as directory:
+        for name in old_names | set(selected):
+            try:
+                info = os.stat(name, dir_fd=directory, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o600:
+                raise host.Error('Commit accepted; refusing unknown convenience output. Preserve it and retry recover')
+        for name, data in selected.items():
+            write_at(directory, name, data)
+        for name in old_names - set(selected):
+            try:
+                os.unlink(name, dir_fd=directory)
+            except FileNotFoundError:
+                pass
+        os.fsync(directory)
+
+
+def remember_commit(state, document, record, backup, result, use_generation=True):
     previous = document['current']
     if previous and previous['endpoint'] != record['endpoint'] and previous not in document['previous']:
         document['previous'].append(previous)
     record = dict(record, machine_id=result['machine_id'])
     digest = host.digest(backup)
-    if (state / 'generations' / digest).exists() or (state / 'generations' / digest).is_symlink():
+    files = manifest = None
+    if use_generation and ((state / 'generations' / digest).exists() or (state / 'generations' / digest).is_symlink()):
         manifest = checked_backup(document, record, backup)
         if result.get('node_id', manifest['node_id']) != manifest['node_id'] or not manifest.get('published'):
             raise host.Error('Commit result does not match published native snapshot')
-        read_generation(state, manifest, digest)
+        files = read_generation(state, manifest, digest)
+    try:
+        sync_outputs(state, document, files, manifest)
+    except (host.Error, OSError, ValueError, tarfile.TarError):
+        if use_generation:
+            raise
+        # Backup-only failure is reported by the caller. Preserve unknown files,
+        # but never keep their offline authority or strand the verified backup.
+    if files is not None:
         document['native_generation'] = digest
     else:
-        # Legacy URL-only state/uncaptured backups never inherit stale profiles.
         document.pop('native_generation', None)
     document.update(current=record, backup=str(backup.absolute()))
     host.atomic(state / 'state.json', host.dumps(document))
@@ -796,6 +839,25 @@ def remember_commit(state, document, record, backup, result):
         pending = load(state / 'pending.json')
         retire_renamed_outputs(state, pending.get('request', {}))
         (state / 'pending.json').unlink()
+
+
+def backup_committed(state, document, record, backup, mihomo=None):
+    # A feed/core failure may invalidate an offline snapshot, never a verified
+    # published backup. Bind it to the CURRENT node, not an uncommitted candidate.
+    current = document.get('current')
+    if not current or any(current.get(key) != record.get(key) for key in ('endpoint', 'machine_id', 'port')):
+        raise host.Error('Backup does not match committed current identity')
+    old = checked_backup(document, current, document['backup'])
+    manifest = checked_backup(document, record, backup)
+    if not manifest.get('published') or manifest['node_id'] != old['node_id']:
+        raise host.Error('Backup is not the published committed current node')
+    result = {'machine_id': record['machine_id'], 'node_id': manifest['node_id']}
+    try:
+        validate_outputs(state, document, record, mihomo, backup)
+        remember_commit(state, document, record, backup, result)
+    except (host.Error, OSError, ValueError, tarfile.TarError):
+        remember_commit(state, document, record, backup, result, use_generation=False)
+        raise host.Error('Backup committed; offline snapshot not captured. Latest offline outputs invalidated; retry capture through a working carrier/core') from None
 
 
 def deploy_existing(state, document, record, args):
@@ -809,12 +871,20 @@ def deploy_existing(state, document, record, args):
     if type(upgrading) is not bool or checked.get('transports') != expected:
         raise host.Error('Unrecognized owned transport topology; no implicit migration')
     binary = resolve_mihomo(args.mihomo)
-    if getattr(args, 'artifacts_dir', None) is not None:
+    if upgrading and getattr(args, 'artifacts_dir', None) is not None:
         artifacts(state, release_lock(), args.artifacts_dir)
     if not upgrading:
-        # No prepare/Auth generation/core restart on an already dual node.
+        # Retain prepare's native projection/Caddy allowlist reconciliation.
+        # Its unchanged branch never creates Auth or restarts the native core.
+        request.update(lock=release_lock(), mode='deploy', adapter_sha256=adapter)
+        folder = artifacts(state, request['lock'], getattr(args, 'artifacts_dir', None))
+        with upload_bundle(request, folder=folder) as stream:
+            prepared = remote(record, 'prepare', stdin=stream)
+        if not prepared.get('unchanged') or prepared.get('needs_transport_upgrade'):
+            raise host.Error('Expected unchanged owned dual node; use recover before retry')
         backup = backup_remote(state, document, record)
         validate_outputs(state, document, record, binary, backup)
+        checked = remote(record, 'status', request_for(document, record))
         remember_commit(state, document, record, backup, checked)
         export_after_commit(state)
         print('Owned dual transport unchanged; committed native snapshot refreshed.')
@@ -907,7 +977,7 @@ def deploy(state, document, args):
     except BaseException:
         print('Transaction incomplete. Local pending intent is retained; run recover. No SSH, firewall, DNS or PC network policy was changed.', file=sys.stderr)
         raise
-    print('Deployment committed. Private native profiles and subscription URLs: ' + str(state / 'outputs'))
+    print('Deployment committed. Export an enabled device with export --device NAME --bootstrap-dir PRIVATE_DIR.')
     print('Off-node backup is UNENCRYPTED (0700/0600): ' + str(offnode))
     if replacing:
         print('Operator must update grey DNS to the new endpoint and REFRESH clients. Old node was not contacted or revoked; cold replacement has downtime.')
@@ -974,7 +1044,7 @@ def recover_local(state, document, mihomo=None):
     if not (state / 'pending.json').exists():
         if not document.get('current'):
             raise host.Error('No saved current node or pending transaction')
-        host.atomic(state / 'pending.json', host.dumps({'record': document['current'], 'mode': 'backup'}))
+        host.atomic(state / 'pending.json', host.dumps({'record': document['current'], 'mode': 'backup', 'mihomo': mihomo}))
     pending = load(state / 'pending.json')
     record = pending['record']
     mode = pending.get('mode')
@@ -991,7 +1061,15 @@ def recover_local(state, document, mihomo=None):
         # A standalone backup preserves an intentionally inactive front; its
         # verified DB/artifact snapshot does not require publishing feeds. The
         # timer may already have completed and removed the remote stop intent.
-        status = {'machine_id': record['machine_id']} if pending.get('mode') == 'backup' else remote(record, 'status', request_for(document, record))
+        backup_only = mode == 'backup' or (mode not in ('devices', 'transport-upgrade') and not pending.get('request')
+            and document.get('current') is not None and record == document['current'])
+        if backup_only:
+            backup = backup_remote(state, document, record)
+            backup_committed(state, document, record, backup, mihomo or pending.get('mihomo'))
+            print('Verified committed backup reconciled; offline snapshot captured.')
+            export_after_commit(state)
+            return
+        status = remote(record, 'status', request_for(document, record))
         backup = backup_remote(state, document, record)
         binary = resolve_mihomo(mihomo or pending.get('mihomo'))
         pending['mihomo'] = binary
@@ -1039,7 +1117,7 @@ def parser():
         if name in ('deploy', 'replace', 'restore'):
             a.add_argument('--backup', type=Path, help='existing private unencrypted recovery archive')
             a.add_argument('--mihomo', help='native core executable for profile validation')
-        if name in ('recover', 'backup'):
+        if name in ('recover', 'backup', 'export'):
             a.add_argument('--mihomo', help='native core path for committed profile validation')
         if name == 'deploy':
             a.add_argument('--artifacts-dir', type=Path, help='explicit directory containing all three original SHA-pinned release files')
@@ -1111,9 +1189,9 @@ def main(argv=None):
                 else:
                     if (state / 'pending.json').exists():
                         raise host.Error('Local transaction pending; use recover before backup')
+                    host.atomic(state / 'pending.json', host.dumps({'record': record, 'mode': 'backup', 'mihomo': args.mihomo}))
                     path = backup_remote(state, document, record)
-                    validate_outputs(state, document, record, args.mihomo, path)
-                    remember_commit(state, document, record, path, {'machine_id': record['machine_id']})
+                    backup_committed(state, document, record, path, args.mihomo)
                     print('Complete UNENCRYPTED off-node backup and native snapshot (0700/0600): ' + str(path))
         return 0
     except (host.Error, OSError, ValueError, EOFError, tarfile.TarError) as exc:

@@ -50,7 +50,7 @@ bash vps/setup.sh deploy --ssh "$VPS_SSH" \
 保留原私有状态，通过一个**独立、已工作的管理中转**运行相同的 `deploy`。
 工具先只读核验旧节点及已审阅 adapter，再做完整升级前备份；独立 transport-upgrade 事务增加原生 H2，
 保留原 REALITY 密钥、UUID、SubID、URL、账户策略与历史。不会用“添加设备”冒充升级。
-已有双协议节点重复 deploy 不再生成 Auth 或重启核心；会刷新离机备份和提交绑定的原生快照。
+已有双协议节点重复 deploy 不再生成 Auth 或重启核心；仍核对原生投影并同步 Caddy公开路径（例如面板中更改启用状态后），再刷新离机备份和提交绑定的原生快照。
 备份过程可能短暂停止订阅前端。
 
 SSH 默认直连。任一远程命令末尾可显式追加
@@ -72,6 +72,19 @@ bash vps/setup.sh replace --ssh root@203.0.113.20
 replace 面向**新虚拟机**，会轮换代理认证身份，保留订阅地址；操作员更新灰云 DNS 后，各客户端刷新或重新离线导入。
 有停机，工具不访问或撤销旧机。受控 `restore --backup ... --ssh ...` 保留归档身份，具体约束见 [DESIGN](DESIGN.md#备份冷替换与恢复边界)。
 同一旧节点的功能升级用 deploy；同一 guest 直接换公网IP不属于受支持的 replace 路径，不能借此绕过机器/端点身份校验。
+
+## 保留当前节点，另建一台
+
+另建独立节点使用新的状态目录和新域名，不用 replace；`--state-dir` 放在子命令之前：
+
+```bash
+bash vps/setup.sh --state-dir "$HOME/.local/state/quick-deploy-private/vps-second" deploy \
+  --ssh root@203.0.113.30 --domain second-sub.example.org --reality-target target.example.org \
+  --artifacts-dir /path/to/verified-releases
+```
+
+每个状态目录各自保存权威账户、备份和提交快照。仓库固定的 `vps/subscription-urls.json` 只是**最近一次成功导出**的副本，
+不是多节点聚合；对具体节点使用对应 `--state-dir` 导出。只有替换原节点时才用 replace。
 
 ## 离线首次导入：不依赖已经阻断的旧订阅
 
@@ -103,13 +116,15 @@ bash vps/setup.sh export --device company --bootstrap-dir "$VPS_STATE/bootstrap/
   --management-interface eno1 --management-port 10808
 ```
 
-此操作需要 PyYAML 和本地 Mihomo格式检查；从已提交原生 YAML 完整复制 H2 映射，只替换运行时外壳。
+此操作需要 PyYAML 和本地 Mihomo格式检查；可用 `export --mihomo /path/to/mihomo` 显式选择本地核心。
+原生 `<设备>.yaml` 与 `<设备>.management.yaml` 分开保存，从已提交原生 YAML 完整复制 H2 映射，只替换运行时外壳。
+已有管理运行时的目录若不带管理参数重导出，会明确拒绝，避免留下旧 Auth；无来源绑定的旧 `management.yaml` 需人工清理，不猜测删除。
 管理进程仅监听127.0.0.1，仅允许该 VPS 公网IP的实际 SSH 端口及8443经 H2，其余拒绝。
 外层 QUIC 使用数值公网IP和指定物理接口，TLS SNI 仍为证书域名；不依赖代理 DNS 自举，不开控制器/LAN/TUN。
 按命令输出的 core 启动命令运行独立进程，例如：
 
 ```sh
-mihomo -d "$VPS_STATE/bootstrap/management" -f "$VPS_STATE/bootstrap/management/management.yaml"
+mihomo -d "$VPS_STATE/bootstrap/management" -f "$VPS_STATE/bootstrap/management/company.management.yaml"
 bash vps/setup.sh status --ssh-proxy socks5://127.0.0.1:10808
 ```
 
@@ -169,6 +184,10 @@ bash vps/setup.sh export
 权威状态和完整备份位于 `~/.local/state/quick-deploy-private/vps`，不搬入仓库。
 成功提交/核对后自动更新忽略的0600 **[`vps/subscription-urls.json`](subscription-urls.json)**；普通 export 只读已提交本地备份、不联系 VPS。
 备份为**明文 TAR**，另存加密离机副本；用最新撤销后备份，恢复旧档可能复活旧账户。
+`backup --mihomo /path/to/mihomo` 会保留所选路径供 recover 覆盖。完整归档不依赖 live feed 或本地核心：
+若离线配置捕获因 HWID/到期/缺核心等失败，仍保存已验证的当前节点备份、清除备份 pending，并非零返回
+“Backup committed; offline snapshot not captured”。最新便捷离线文件及 generation 指针失效，不能把旧文件当作新配置；历史备份/generation保留。
+设备/传输升级的提交前配置校验仍是强制门槛；普通 URL export 不需要本地核心。
 Caddy 继续负责 HTTP01签发/续期；原生 Xray 在稳定受控证书路径上按小时重读，非即时续期钩子。
 需要保留证书重叠时间并监控续期；这不是已经完成真实 ACME 续期/重启验收的声明。
 

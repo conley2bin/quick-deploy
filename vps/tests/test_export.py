@@ -33,6 +33,7 @@ class Export(unittest.TestCase):
         self.record = {'target': 'fixture', 'endpoint': '93.184.216.34', 'machine_id': 'a' * 32, 'port': 22}
         config = {'domain': 'sub.example.org', 'reality_target': 'target.example.org', 'acme_email': '', 'proxy_port': 443}
         self.manifest = host.new_manifest('fixture-owner', config, self.record['endpoint'])
+        self.manifest['published'] = True
         self.doc = {'format': host.FORMAT, 'owner': self.manifest['owner'], 'config': config,
                     'current': self.record, 'previous': [], 'backup': str(self.state / 'backup.tar')}
         host.atomic(self.state / 'state.json', host.dumps(self.doc))
@@ -226,7 +227,7 @@ class Export(unittest.TestCase):
                 host.atomic(self.state / 'pending.json', host.dumps({'record': self.record}))
             def remote(record, action, *args, **kwargs):
                 if action == 'prepare':
-                    return {'unchanged': False}
+                    return {'unchanged': True}
                 return {'machine_id': self.record['machine_id'], 'committed': True,
                         'adapter_sha256': host.digest(self.module / 'lib/host.py'),
                         'needs_transport_upgrade': False, 'transports': ['tcp-reality', 'hysteria2']}
@@ -276,7 +277,7 @@ class Export(unittest.TestCase):
              mock.patch.object(vps, 'validate_outputs'), \
              mock.patch('sys.stdout', new_callable=io.StringIO):
             vps.recover_local(self.state, self.doc)
-        self.assertEqual([c.args[1] for c in rem.call_args_list], ['abort', 'status'])
+        self.assertEqual([c.args[1] for c in rem.call_args_list], ['abort'])
         self.assertFalse((self.state / 'pending.json').exists())
         self.assertEqual(json.loads(self.destination.read_bytes()), vps.subscription_urls(before))
         self.assertEqual(self.manifest, before)

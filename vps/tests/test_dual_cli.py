@@ -184,6 +184,8 @@ rules:
             return {'machine_id': self.record['machine_id'], 'node_id': self.legacy['node_id'],
                     'adapter_sha256': host.digest(Path(host.__file__)), 'needs_transport_upgrade': not self.upgraded,
                     'transports': ['tcp-reality', 'hysteria2'] if self.upgraded else ['tcp-reality']}
+        if action == 'prepare':
+            return {'unchanged': True, 'needs_transport_upgrade': False}
         if action == 'transport-prepare':
             with tarfile.open(fileobj=stdin) as archive:
                 self.assertEqual(set(archive.getnames()), {'request.json', 'host.py'})
@@ -278,6 +280,14 @@ rules:
         vps.remember_commit(self.state, self.doc, self.record, archive, {'machine_id': self.record['machine_id']})
         with self.assertRaisesRegex(host.Error, 'disabled'):
             vps.export_bootstrap(self.state, args)
+        # Clean legacy convenience bytes even if the old verified roster had
+        # already disabled the account (the old publisher did not prune it).
+        host.atomic(self.state / 'outputs/company.yaml', data)
+        del disabled['accounts']['company']
+        removed = self.archive(disabled, 'removed-disabled')
+        self.current_outputs = self.feeds(disabled); self.capture(removed)
+        vps.remember_commit(self.state, self.doc, self.record, removed, {'machine_id': self.record['machine_id']})
+        self.assertFalse((self.state / 'outputs/company.yaml').exists())
 
     @unittest.skipUnless(importlib.util.find_spec('yaml'), 'Optional PyYAML is needed only for management rendering')
     def test_management_is_optional_copies_native_node_and_prints_only_commands_paths(self):
@@ -286,7 +296,7 @@ rules:
         with mock.patch('sys.stdout', new_callable=io.StringIO) as out:
             folder = vps.export_bootstrap(self.state, args)
         import yaml
-        runtime = yaml.safe_load((folder / 'management.yaml').read_bytes())
+        runtime = yaml.safe_load((folder / 'company.management.yaml').read_bytes())
         self.assertEqual(runtime['proxies'][0]['password'], self.dual['accounts']['company']['auth'])
         self.assertEqual(runtime['mixed-port'], 10809)
         self.assertIn('DST-PORT,2222', runtime['rules'][0])
@@ -365,7 +375,7 @@ rules:
                      mock.patch.object(vps, 'export_after_commit'), mock.patch('sys.stdout', new_callable=io.StringIO):
                     vps.recover_local(self.state, document)
                 self.assertEqual([x for x in self.events if x != 'mihomo-t'],
-                                 ['abort', 'outputs'] if mode == 'backup' else ['abort', 'status', 'outputs'])
+                                 ['abort', 'status', 'outputs'] if mode in ('devices', 'transport-upgrade') else ['abort', 'outputs'])
                 self.assertEqual(vps.load(self.state / 'state.json')['native_generation'], host.digest(self.after))
                 self.assertFalse((self.state / 'pending.json').exists())
 
@@ -408,6 +418,8 @@ rules:
             self.events.clear()
             document = copy.deepcopy(self.doc)
             document['current'] = None if command == 'deploy' else dict(self.record, endpoint='93.184.216.35')
+            if command != 'deploy':
+                document['backup'] = str(self.archive(dict(self.dual, endpoint='93.184.216.35'), 'old-' + command))
             host.atomic(self.state / 'state.json', host.dumps(document))
             def remote(record, action, request=None, stdin=None, **kwargs):
                 if action in ('preflight', 'prepare', 'commit'):
@@ -435,7 +447,7 @@ rules:
         with mock.patch.object(vps, 'remote', side_effect=self.remote), mock.patch.object(vps, 'backup_remote', return_value=self.after), \
              mock.patch.object(vps, 'export_after_commit'), mock.patch('sys.stdout', new_callable=io.StringIO):
             vps.deploy(self.state, document, vps.parser().parse_args(['deploy']))
-        self.assertEqual([x for x in self.events if x != 'mihomo-t'], ['status', 'outputs'])
+        self.assertEqual([x for x in self.events if x != 'mihomo-t'], ['status', 'prepare', 'outputs', 'status'])
 
     def test_reset_rename_remove_generation_binding_and_missing_generation_clear(self):
         self.publish()
@@ -454,6 +466,8 @@ rules:
             vps.remember_commit(self.state, self.doc, self.record, archive, {'machine_id': self.record['machine_id']})
             self.assertNotEqual(self.doc['native_generation'], initial)
             if operation != 'reset':
+                self.assertFalse((self.state / 'outputs/company.yaml').exists())
+                self.assertFalse((self.state / 'outputs/company.txt').exists())
                 with self.assertRaisesRegex(host.Error, 'removed'):
                     vps.export_bootstrap(self.state, self.export_args())
             else:
@@ -472,6 +486,132 @@ rules:
             path = vps.export_urls(self.state)
         self.assertEqual(json.loads(path.read_bytes()), vps.subscription_urls(self.legacy))
         self.assertNotIn('native_generation', vps.load(self.state / 'state.json'))
+
+    def test_backup_capture_failure_advances_archive_clears_pending_and_invalidates_outputs(self):
+        self.publish()
+        host.atomic(self.state / 'outputs/unrelated.txt', 'user-owned untouched')
+        archive = self.archive(dict(self.dual, note='next verified snapshot'), 'backup-next')
+        for pending in (None, {'record': self.record, 'mode': 'backup'}, {'record': self.record}):
+            with self.subTest(pending=pending):
+                host.atomic(self.state / 'state.json', host.dumps(self.doc))
+                if pending is not None:
+                    host.atomic(self.state / 'pending.json', host.dumps(pending))
+                actions = []
+                def remote(record, action, *args, **kwargs):
+                    actions.append(action)
+                    if action == 'abort': return {'committed': True}
+                    if action == 'outputs': raise host.Error('PRIVATE-CREDENTIAL-MUST-NOT-PRINT')
+                    raise AssertionError('Feed-independent path called ' + action)
+                def backup(*args):
+                    self.assertEqual(vps.load(self.state / 'pending.json').get('mihomo'), '/chosen/core') if pending is None else None
+                    return archive
+                command = ['backup', '--mihomo', '/chosen/core'] if pending is None else ['recover']
+                with mock.patch.object(vps, 'remote', side_effect=remote), mock.patch.object(vps, 'backup_remote', side_effect=backup), \
+                     mock.patch('sys.stderr', new_callable=io.StringIO) as err:
+                    self.assertEqual(vps.main(['--state-dir', str(self.state), *command]), 1)
+                saved = vps.load(self.state / 'state.json')
+                self.assertEqual(saved['backup'], str(archive))
+                self.assertEqual(saved['current'], self.record)
+                self.assertNotIn('native_generation', saved)
+                self.assertFalse((self.state / 'pending.json').exists())
+                self.assertIn('Backup committed; offline snapshot not captured', err.getvalue())
+                self.assertNotIn('PRIVATE-CREDENTIAL', err.getvalue())
+                self.assertNotIn('status', actions)
+                self.assertFalse((self.state / 'outputs/company.yaml').exists())
+                self.assertEqual((self.state / 'outputs/unrelated.txt').read_text(), 'user-owned untouched')
+                with self.assertRaisesRegex(host.Error, 'No committed native generation'):
+                    vps.export_bootstrap(self.state, self.export_args())
+        with mock.patch.object(vps, 'validate_outputs') as capture:
+            with self.assertRaisesRegex(host.Error, 'published committed'):
+                vps.backup_committed(self.state, self.doc, self.record, self.candidate)
+            capture.assert_not_called()
+
+    def test_backup_missing_core_is_after_archive_and_never_strands_pending(self):
+        self.publish()
+        calls = []
+        def backup(*args): calls.append('archive'); return self.after
+        def missing(*args): calls.append('core'); raise host.Error('PRIVATE-CORE-ERROR')
+        with mock.patch.object(vps, 'backup_remote', side_effect=backup), mock.patch.object(vps, 'resolve_mihomo', side_effect=missing), \
+             mock.patch('sys.stderr', new_callable=io.StringIO) as err:
+            self.assertEqual(vps.main(['--state-dir', str(self.state), 'backup', '--mihomo', '/absent/core']), 1)
+        self.assertEqual(calls, ['archive', 'core'])
+        self.assertFalse((self.state / 'pending.json').exists())
+        self.assertNotIn('native_generation', vps.load(self.state / 'state.json'))
+        self.assertNotIn('PRIVATE-CORE-ERROR', err.getvalue())
+
+    def test_failed_device_commit_then_rollback_preserves_committed_convenience_bytes(self):
+        self.publish()
+        original = {p.name: p.read_bytes() for p in (self.state / 'outputs').iterdir()}
+        reset = copy.deepcopy(self.dual)
+        reset['accounts']['home'].update(id='11111111-1111-4111-8111-111111111111', auth='reset-auth-' + 'c' * 32, subId='d' * 32)
+        candidate = self.archive(dict(reset, published=False), 'reset-candidate')
+        self.current_outputs = self.feeds(reset); self.upgraded = True
+        def remote(record, action, request=None, **kwargs):
+            if action == 'devices-prepare': return {'prepared': True}
+            if action == 'devices-commit': raise host.Error('lost commit reply')
+            if action == 'abort': return {'committed': False}
+            return self.remote(record, action, request, **kwargs)
+        with mock.patch.object(vps, 'remote', side_effect=remote), \
+             mock.patch.object(vps, 'backup_remote', side_effect=[self.after, candidate]), mock.patch('sys.stderr', new_callable=io.StringIO):
+            with self.assertRaisesRegex(host.Error, 'lost commit reply'):
+                vps.devices(self.state, self.doc, vps.parser().parse_args(['devices', 'reset', 'home']))
+        self.assertEqual({p.name: p.read_bytes() for p in (self.state / 'outputs').iterdir()}, original)
+        with mock.patch.object(vps, 'remote', side_effect=remote), mock.patch('sys.stdout', new_callable=io.StringIO):
+            vps.recover_local(self.state, self.doc)
+        self.assertEqual({p.name: p.read_bytes() for p in (self.state / 'outputs').iterdir()}, original)
+        self.assertFalse((self.state / 'pending.json').exists())
+
+    @unittest.skipUnless(importlib.util.find_spec('yaml'), 'Optional PyYAML management renderer')
+    def test_management_device_name_custom_core_and_stale_runtime_refusal(self):
+        manifest = copy.deepcopy(self.dual)
+        manifest['accounts'] = {'management': dict(manifest['accounts']['company'], email='management')}
+        archive = self.archive(manifest, 'management-device')
+        self.current_outputs = self.feeds(manifest)
+        self.capture(archive)
+        vps.remember_commit(self.state, self.doc, self.record, archive, {'machine_id': self.record['machine_id']})
+        args = self.export_args('--management-interface', 'eno1', '--mihomo', '/chosen/core'); args.device = 'management'
+        with mock.patch('sys.stdout', new_callable=io.StringIO):
+            folder = vps.export_bootstrap(self.state, args)
+        self.assertEqual((folder / 'management.yaml').read_bytes(), self.current_outputs['management.yaml'])
+        self.assertTrue((folder / 'management.management.yaml').is_file())
+        vps.resolve_mihomo.assert_called_with('/chosen/core')
+        args.management_interface = None
+        with self.assertRaisesRegex(host.Error, 'manual cleanup'):
+            vps.export_bootstrap(self.state, args)
+        (folder / 'management.management.yaml').unlink()
+        host.atomic(folder / 'old-device.management.yaml', b'unknown runtime: preserve')
+        with self.assertRaisesRegex(host.Error, 'manual cleanup'):
+            vps.export_bootstrap(self.state, args)
+        self.assertEqual((folder / 'old-device.management.yaml').read_bytes(), b'unknown runtime: preserve')
+        (folder / 'old-device.management.yaml').unlink()
+        host.atomic(folder / 'management.yaml', b'legacy unbound secret runtime')
+        args.management_interface = 'eno1'
+        with self.assertRaisesRegex(host.Error, 'manual cleanup'):
+            vps.export_bootstrap(self.state, args)
+
+    def test_already_dual_prepare_reconciles_enabled_projection_before_archive(self):
+        self.publish(); self.upgraded = True
+        changed = copy.deepcopy(self.dual); changed['accounts']['home']['enable'] = False
+        archive = self.archive(changed, 'panel-disabled')
+        self.current_outputs = self.feeds(changed)
+        vps.artifacts(self.state, self.lock, self.public)
+        events = []; reconciled = False
+        def remote(record, action, *args, **kwargs):
+            nonlocal reconciled
+            events.append(action)
+            if action == 'prepare':
+                reconciled = True  # host.prepare unchanged branch reconciles Caddy.
+                return {'unchanged': True, 'needs_transport_upgrade': False}
+            return self.remote(record, action, *args, **kwargs)
+        def backup(*args):
+            self.assertTrue(reconciled, 'archive preceded Caddy allowlist reconciliation')
+            events.append('archive'); return archive
+        with mock.patch.object(vps, 'remote', side_effect=remote), mock.patch.object(vps, 'backup_remote', side_effect=backup), \
+             mock.patch.object(vps, 'export_after_commit'), mock.patch('sys.stdout', new_callable=io.StringIO):
+            vps.deploy(self.state, self.doc, vps.parser().parse_args(['deploy']))
+        self.assertEqual(events, ['status', 'prepare', 'archive', 'outputs', 'status'])
+        self.assertFalse((self.state / 'outputs/home.yaml').exists())
+        self.assertFalse((self.state / 'outputs/home.txt').exists())
 
     def test_unknown_topology_or_adapter_refuses_before_backup_and_pair_flags(self):
         self.upgraded = False
