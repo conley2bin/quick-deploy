@@ -192,7 +192,12 @@ def submit(args, root):
         reservation_spec = {"unit": unit, "memoryMax": args.mem, "submission": "pending", "directory": str(directory)}
         atomic(reservation, reservation_spec)
         (directory / "output.log").touch(mode=0o600)
-        finish = ":" + " ".join(systemd_word(s) for s in (PYTHON, SCRIPT, "_finish", str(directory)))
+        # A source update/entrypoint rollback must not change an in-flight
+        # finalizer. This self-contained helper snapshot belongs to the run.
+        runner = directory / "runner.py"
+        shutil.copyfile(SCRIPT, runner)
+        runner.chmod(0o600)
+        finish = ":" + " ".join(systemd_word(s) for s in (PYTHON, str(runner), "_finish", str(directory)))
         cmd = ["systemd-run", "--user", "--no-ask-password", "--quiet", "--collect", "--service-type=exec",
                "--expand-environment=no", "--unit=" + unit, "--slice=jobs.slice",
                "--property=Restart=no", "--property=OOMPolicy=kill", "--property=KillMode=control-group",
@@ -201,7 +206,7 @@ def submit(args, root):
                "--property=MemorySwapMax=" + str(args.swap),
                "--property=StandardOutput=append:" + str(directory / "output.log"),
                "--property=StandardError=inherit", "--property=ExecStopPost=" + finish,
-               "--", PYTHON, SCRIPT, "_exec", str(directory)]
+               "--", PYTHON, str(runner), "_exec", str(directory)]
         try:
             # The lock fd survives a killed submitter until systemd-run exits.
             proc = subprocess.run(cmd, text=True, capture_output=True, timeout=40, pass_fds=(lock.fileno(),))

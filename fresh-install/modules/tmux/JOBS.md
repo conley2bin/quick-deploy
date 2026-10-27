@@ -46,6 +46,8 @@ victim; it does not promise to kill the newest submission.
 - `output.log`: combined stdout/stderr, independent of journal retention.
 - `result.json`: final manager reason, exit/signal status, invocation identity,
   memory peak/events when available; survives transient-unit collection.
+- `runner.py`: private snapshot of the manager helper, keeping an in-flight
+  run's launch/finalizer code stable across source updates and entrypoint removal.
 
 The entire caller environment is transferred through a mode600 ephemeral file
 under `/run/user/UID/workstation-jobs`, removed before command exec. It is never

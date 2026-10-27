@@ -11,6 +11,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 
 JOB = Path(__file__).resolve().parents[1] / "runtime/job.py"
@@ -77,6 +78,7 @@ class LiveJobTests(unittest.TestCase):
         self.assertFalse(Path(record["environmentFile"]).exists())
         self.assertEqual(directory.stat().st_mode & 0o777, 0o700)
         self.assertEqual((directory / "result.json").stat().st_mode & 0o777, 0o600)
+        self.assertEqual((directory / "runner.py").read_bytes(), JOB.read_bytes())
         self.assertFalse((cwd / "SHOULD_NOT_EXIST").exists())
 
     def test_02_fast_failure_signal_and_exec_failure(self):
@@ -131,6 +133,39 @@ class LiveJobTests(unittest.TestCase):
         self.assertEqual(info["state"], "running", info)
         self.cli("cancel", sentinel)
         print("OOM_CONTAINMENT: 64MiB job killed; independent64MiB service alive", flush=True)
+
+    def test_06_interrupted_submission_retains_lock_and_reconciles(self):
+        bindir = self.home / "delayed-rejection"
+        bindir.mkdir()
+        marker = self.home / "launch-entered"
+        fake = bindir / "systemd-run"
+        fake.write_text("#!/bin/sh\nprintf ready > '" + str(marker) + "'\nsleep .6\nexit 23\n")
+        fake.chmod(0o700)
+        env = dict(self.env, PATH=str(bindir) + ":" + os.environ["PATH"])
+        proc = subprocess.Popen([PYTHON, str(JOB), "run", "interrupted", "--mem", "64M", "--swap", "0", "--", "/bin/true"],
+                                env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        end = time.monotonic() + 5
+        while not marker.exists() and time.monotonic() < end:
+            time.sleep(.01)
+        self.assertTrue(marker.exists())
+        records = list((Path(self.env["XDG_STATE_HOME"]) / "workstation-jobs").glob("interrupted-*/run.json"))
+        self.assertEqual(len(records), 1)
+        ident = json.loads(records[0].read_text())["id"]
+        self.ids.append(ident)
+        proc.kill()
+        proc.wait(timeout=2)
+        before = time.monotonic()
+        following = self.submit("after-interruption", ["/bin/true"], ("--mem", "64M", "--swap", "0"))
+        self.assertGreater(time.monotonic() - before, .3, "submitting parent's death released the child's admission lock")
+        self.completed(following, 0)
+        value = json.loads(self.cli("status", ident).stdout)
+        self.assertEqual(value["state"], "unknown")
+        ledger = Path(f"/run/user/{os.getuid()}/workstation-jobs/{ident}.reservation.json")
+        self.assertTrue(ledger.exists(), "uncertain submission must fail closed")
+        self.cli("cancel", ident)
+        self.assertFalse(ledger.exists())
+        self.completed(ident, 125)
+        print("INTERRUPTION: child retained admission lock; unknown result held reservation until explicit cancel", flush=True)
 
 
 if __name__ == "__main__":
