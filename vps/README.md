@@ -41,6 +41,14 @@ bash vps/setup.sh deploy --ssh "$VPS_SSH" \
 `--port 2222 --identity "$HOME/.ssh/vps_ed25519"`（`--port` 只指 SSH）。
 同状态重跑不轮换账户、不重启 Xray；真实客户端连接仍需自行验收。
 
+SSH 默认直连。需要中转时，在任一远程命令末尾显式追加
+`--ssh-proxy socks5://127.0.0.1:10808` 或 `--ssh-proxy http://127.0.0.1:10808`（本地 HTTP CONNECT）；
+支持 deploy/preflight/replace/restore、status/backup/recover 及所有 devices 子命令，export 仅本地、不接受此参数。
+使用随仓库附带的 Python 标准库助手，无需 nc；仅接受字面量127.0.0.1和端口1..65535，不接受密码、其他 URL 部分或任意命令。
+参数只对本次调用有效，不保存中转端口、不采用环境变量/GUI/SSH配置中的代理，失败不会退回直连；原 VPS 地址、SSH端口、密钥和严格主机密钥校验保持不变。
+已有 current/pending 状态可不带 --ssh；`recover --ssh-proxy http://127.0.0.1:10809` 可换中转，不改原事务身份。
+中转监听需事先独立启动；会重启/撤销自身代理账户的变更应使用独立管理中转，保留服务商控制台入口。
+
 ## 3. 旧 VPS 坏了，换新机
 
 管理电脑必须保留原私有状态和完整备份，旧机无需在线。新机需满足相同前提：

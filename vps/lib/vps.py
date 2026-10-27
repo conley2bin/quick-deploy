@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import base64
 import contextlib
+from contextvars import ContextVar
 import fcntl
 import io
 import json
@@ -22,8 +23,15 @@ import tempfile
 import time
 from urllib.request import build_opener, ProxyHandler
 import uuid
+import zlib
 
 import host
+import ssh_proxy
+
+# Carrier selection never enters saved target records or operation fingerprints.
+SSH_PROXY = ContextVar('ssh_proxy', default=None)
+SSH_OPTIONS = ['-o', 'StrictHostKeyChecking=yes', '-o', 'BatchMode=yes', '-o', 'ControlMaster=no', '-o', 'ControlPath=none',
+               '-o', 'ClearAllForwardings=yes', '-o', 'ProxyCommand=none', '-o', 'ProxyJump=none', '-o', 'ConnectTimeout=15']
 
 MODULE = Path(__file__).resolve().parents[1]
 DEFAULT_STATE = Path.home() / '.local/state/quick-deploy-private/vps'
@@ -118,23 +126,85 @@ def state_document(state, args, create=False):
             'previous': [], 'backup': None}
 
 
+def saved_ssh_options(record):
+    """Read only the bounded legacy option vocabulary; never run saved commands."""
+    options = record.get('options')
+    if not isinstance(options, list) or len(options) > 24 or len(options) % 2:
+        raise host.Error('Invalid saved SSH options')
+    retained, seen = [], set()
+    for flag, value in zip(options[::2], options[1::2]):
+        if not isinstance(value, str) or not value or any(ord(c) < 32 or ord(c) == 127 for c in value):
+            raise host.Error('Invalid saved SSH option value')
+        if flag == '-o' and value in SSH_OPTIONS[1::2]:
+            key = value.split('=')[0]
+        elif flag == '-o' and value == 'IdentitiesOnly=yes':
+            key = 'IdentitiesOnly'
+            retained += [flag, value]
+        elif flag == '-i':
+            key = flag
+            retained += [flag, value]
+        elif flag == '-p' and re.fullmatch(r'[0-9]{1,5}', value) and int(value) == record['port']:
+            key = flag
+            retained += [flag, value]
+        else:
+            raise host.Error('Unsupported saved SSH option; arbitrary proxy commands are never adopted')
+        if key in seen:
+            raise host.Error('Duplicate saved SSH option')
+        seen.add(key)
+    return retained
+
+
+def host_key_alias(value):
+    if value is None:
+        return None
+    if not isinstance(value, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.:@\[\]-]{0,252}', value):
+        raise host.Error('Unsupported SSH HostKeyAlias')
+    return value
+
+
+def ssh_effective(argv):
+    result = host.run(['ssh', '-G', *argv], timeout=15)
+    effective = {}
+    for line in result.stdout.decode().splitlines():
+        key, _, value = line.partition(' ')
+        effective.setdefault(key, value)
+    return effective
+
+
+def transport_options(record):
+    retained = saved_ssh_options(record)
+    options = list(SSH_OPTIONS)
+    proxy = SSH_PROXY.get()
+    if proxy is not None:
+        try:
+            generated = ssh_proxy.proxy_command(proxy, record['endpoint'], record['port'])
+        except ssh_proxy.Error as exc:
+            raise host.Error(str(exc)) from exc
+        # OpenSSH uses the FIRST value. Filter only our exact legacy none;
+        # persisted arbitrary commands were rejected above, not silently removed.
+        options = ['-o', 'ProxyCommand=' + generated] + [
+            token for pair in zip(options[::2], options[1::2]) if pair != ('-o', 'ProxyCommand=none') for token in pair]
+    return options + retained
+
+
 def target_record(args, current=None):
     target = getattr(args, 'ssh', None)
     if not target:
         if not current:
             raise host.Error('Supply --ssh for this target')
-        return current
+        if getattr(args, 'port', None) is None and getattr(args, 'identity', None) is None:
+            return current
+        target = current['target']
     if not re.fullmatch(r'(?:[A-Za-z_][A-Za-z0-9_-]*@)?[A-Za-z0-9][A-Za-z0-9_.-]*', target):
         raise host.Error('--ssh is user@host or a verified alias, never a shell command')
-    options = ['-o', 'StrictHostKeyChecking=yes', '-o', 'BatchMode=yes', '-o', 'ControlMaster=no', '-o', 'ControlPath=none',
-               '-o', 'ClearAllForwardings=yes', '-o', 'ProxyCommand=none', '-o', 'ProxyJump=none', '-o', 'ConnectTimeout=15']
+    options = list(SSH_OPTIONS)
     same_target = current is not None and target == current['target']
     port_override = getattr(args, 'port', None)
     identity = getattr(args, 'identity', None)
     if same_target:
         if port_override is None:
             port_override = current['port']
-        saved = current['options']
+        saved = saved_ssh_options(current)
         if identity is None and '-i' in saved:
             identity = Path(saved[saved.index('-i') + 1])
     if port_override is not None:
@@ -144,40 +214,59 @@ def target_record(args, current=None):
     if identity is not None:
         options += ['-i', str(identity.expanduser().absolute()), '-o', 'IdentitiesOnly=yes']
     # Resolve aliases through OpenSSH, never parse/read private SSH config here.
-    result = host.run(['ssh', '-G', *options, target], timeout=15)
-    effective = {}
-    for line in result.stdout.decode().splitlines():
-        key, _, value = line.partition(' ')
-        effective.setdefault(key, value)
+    effective = ssh_effective([*options, target])
     endpoint = host.public_ip(effective.get('hostname', ''))
     user, port = effective.get('user', ''), int(effective.get('port', '0'))
     if not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_-]*', user) or not 1 <= port <= 65535:
         raise host.Error('Cannot resolve SSH user/port')
-    record = {'target': target, 'options': options, 'endpoint': endpoint, 'user': user, 'port': port}
+    alias = host_key_alias(effective.get('hostkeyalias'))
+    record = {'target': target, 'options': options, 'endpoint': endpoint, 'user': user, 'port': port, 'host_key_alias': alias}
     if current and endpoint == current['endpoint']:
+        if alias != host_key_alias(current.get('host_key_alias')):
+            raise host.Error('SSH HostKeyAlias changed or was absent from legacy state; explicit trust review required')
         if user != current['user'] or port != current['port']:
             raise host.Error('SSH identity/port change requires explicit review, not implicit reassignment')
         record.update({key: current[key] for key in ('machine_id',) if key in current})
     return record
 
 
-def remote(record, action, request=None, stdin=None, stdout=None):
-    # Source is public code in argv; payloads/credentials travel ONLY over stdin.
-    source = (MODULE / 'lib/host.py').read_text()
+def remote_command(record, action):
+    # Pack PUBLIC adapter bytes only. Linux limits each argv string to roughly
+    # 128KiB even when total ARG_MAX is larger. Private payloads stay on stdin.
+    source = (MODULE / 'lib/host.py').read_bytes()
+    packed = base64.b64encode(zlib.compress(source, 9)).decode('ascii')
+    bootstrap = 'import base64,zlib;exec(compile(zlib.decompress(base64.b64decode(' + repr(packed) + ')),"<string>","exec"))'
     prefix = '' if record['user'] == 'root' else 'sudo -n '
-    command = prefix + 'env QD_SSH_CONNECTION="$SSH_CONNECTION" python3 -c ' + shlex.quote(source) + ' ' + shlex.quote(action)
+    command = prefix + 'env QD_SSH_CONNECTION="$SSH_CONNECTION" python3 -c ' + shlex.quote(bootstrap) + ' ' + shlex.quote(action)
+    if len(command.encode()) >= 120 * 1024:
+        raise host.Error('Compressed public adapter exceeds SSH single-argument limit; no private input sent')
+    return command
+
+
+def remote(record, action, request=None, stdin=None, stdout=None):
+    command = remote_command(record, action)
     endpoint = host.public_ip(record['endpoint'])
-    if not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_-]*', record['user']) or not 1 <= int(record['port']) <= 65535:
+    if (not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_-]*', record['user']) or type(record['port']) is not int
+            or not 1 <= record['port'] <= 65535 or not re.fullmatch(r'(?:[A-Za-z_][A-Za-z0-9_-]*@)?[A-Za-z0-9][A-Za-z0-9_.-]*', record['target'])):
         raise host.Error('Invalid saved SSH transport identity')
     # Resolve once, then bind the transport itself BEFORE any private stdin is
     # released. Alias matching/normal host-key checking remain in OpenSSH.
     pinned = ['-o', 'HostName=' + endpoint, '-o', 'User=' + record['user'], '-o', 'Port=' + str(record['port'])]
-    argv = ['ssh', '-T', *pinned, *record['options'], record['target'], command]
+    alias = host_key_alias(record.get('host_key_alias'))
+    if alias is not None:
+        pinned += ['-o', 'HostKeyAlias=' + alias]
+    # Missing legacy metadata means normal endpoint/port lookup, not permission
+    # to adopt a new alias from mutable SSH config. -G never connects or sends stdin.
+    checked = ssh_effective([*pinned, *SSH_OPTIONS, *saved_ssh_options(record), record['target']])
+    if host_key_alias(checked.get('hostkeyalias')) != alias:
+        raise host.Error('SSH HostKeyAlias changed; no private input sent')
+    argv = ['ssh', '-T', *pinned, *transport_options(record), record['target'], command]
     kwargs = {'check': False, 'stderr': subprocess.PIPE}
     if stdin is not None:
         kwargs['stdin'] = stdin
     else:
         kwargs['input'] = host.dumps(request or {}).encode()
+    kwargs['shell'] = False
     kwargs['stdout'] = stdout or subprocess.PIPE
     result = subprocess.run(argv, **kwargs)
     if result.returncode:
@@ -584,14 +673,26 @@ def recover_local(state, document, mihomo=None):
             print('Candidate stopped/disabled; private failed state retained on the target. Current/old host unchanged.')
 
 
+def proxy_argument(value):
+    try:
+        return ssh_proxy.parse_proxy(value)
+    except ssh_proxy.Error as exc:
+        # argparse's generic ValueError formatting would echo a rejected URI,
+        # including any credentials the caller mistakenly supplied.
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+
+
 def parser():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--state-dir', type=Path, default=DEFAULT_STATE)
     sub = p.add_subparsers(dest='command', required=True)
     for name in ('deploy', 'replace', 'restore', 'preflight', 'status', 'backup', 'recover', 'export'):
         a = sub.add_parser(name)
+        if name != 'export':
+            a.add_argument('--ssh-proxy', type=proxy_argument,
+                           help='invocation-only socks5://127.0.0.1:PORT or http://127.0.0.1:PORT; default direct')
         if name in ('deploy', 'replace', 'restore', 'preflight'):
-            a.add_argument('--ssh', required=True, help='trusted SSH alias or user@public-IPv4; host key must already be verified')
+            a.add_argument('--ssh', required=name in ('replace', 'restore'), help='trusted SSH alias or user@public-IPv4; first setup requires it, otherwise use saved current')
             a.add_argument('--port', type=int, help='SSH port ONLY; otherwise use verified SSH config')
             a.add_argument('--proxy-port', type=int, help='first setup REALITY listener; default443, saved once')
             a.add_argument('--identity', type=Path)
@@ -607,7 +708,8 @@ def parser():
             a.set_defaults(backup_required=True)
     a = sub.add_parser('devices', help='manage manifest-owned device credentials')
     operations = a.add_subparsers(dest='device_action', required=True)
-    operations.add_parser('list', help='names/enabled status only, no credentials')
+    listing = operations.add_parser('list', help='names/enabled status only, no credentials')
+    listing.add_argument('--ssh-proxy', type=proxy_argument, help='explicit loopback SSH carrier; default direct')
     for action in ('add', 'remove', 'rename', 'reset'):
         operation = operations.add_parser(action,
             help=('reset UUID and subscription key' if action == 'reset' else
@@ -615,11 +717,13 @@ def parser():
         operation.add_argument('names', nargs='+' if action == 'add' else (2 if action == 'rename' else 1),
             metavar='NAME')
         operation.add_argument('--mihomo', help='native core executable for format validation')
+        operation.add_argument('--ssh-proxy', type=proxy_argument, help='explicit loopback SSH carrier; default direct')
     return p
 
 
 def main(argv=None):
     args = parser().parse_args(argv)
+    carrier = SSH_PROXY.set(getattr(args, 'ssh_proxy', None))
     os.umask(0o077)
     state = args.state_dir.expanduser().absolute()
     try:
@@ -662,6 +766,8 @@ def main(argv=None):
     except KeyboardInterrupt:
         print('vps: interrupted; inspect pending state with recover', file=sys.stderr)
         return 130
+    finally:
+        SSH_PROXY.reset(carrier)
 
 
 if __name__ == '__main__':
