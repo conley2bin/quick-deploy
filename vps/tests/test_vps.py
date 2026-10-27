@@ -95,8 +95,9 @@ class Local(unittest.TestCase):
                                 'backup', 'validate', 'status', 'export']
                     self.assertIn('ALL devices may briefly reconnect', out.getvalue())
                 else:
-                    expected = ['preflight', 'prepare', 'backup', 'validate',
-                                'status' if case == ('deploy', 'unchanged') else 'commit', 'export']
+                    expected = (['preflight', 'prepare', 'backup', 'validate', 'status', 'export']
+                                if case == ('deploy', 'unchanged') else
+                                ['preflight', 'prepare', 'backup', 'validate', 'commit', 'backup', 'validate', 'status', 'export'])
                 self.assertEqual(events, expected)
                 self.assertEqual(vps.load(state / 'state.json')['current'], self.record)
                 self.assertFalse((state / 'pending.json').exists())
@@ -198,6 +199,7 @@ class Local(unittest.TestCase):
         self.assertEqual(vps.parser().parse_args(['recover','--mihomo',str(executable)]).mihomo,str(executable))
         self.doc['current'] = self.record
         request=dict(vps.request_for(self.doc,self.record),device_action='reset',names=['home'],operation_id='c'*32)
+        host.atomic(self.state/'fixture.tar', 'postcommit archive fixture')
         for saved, override in ((str(executable), None), ('/vanished/core',str(executable)), (None,str(executable))):
             pending = {'record':self.record,'mode':'devices','request':request,'mihomo':saved}
             host.atomic(self.state/'pending.json',host.dumps(pending))
@@ -256,6 +258,7 @@ class Local(unittest.TestCase):
         host.atomic(output/'home.txt','managed-old');host.atomic(output/'tablet.yaml','new-current')
         host.atomic(output/'unrelated.txt','unrelated')
         backup=self.state/'postcommit.tar'
+        host.atomic(backup, 'postcommit archive fixture')
         with self.assertRaisesRegex(host.Error,'already committed'):
             vps.remember_commit(self.state,self.doc,self.record,backup,{'machine_id':'a'*32})
         self.assertTrue((self.state/'pending.json').exists())
@@ -374,7 +377,7 @@ class Local(unittest.TestCase):
             vps.deploy(self.state, self.doc, self.args('replace'))
         export.assert_called_once_with(self.state)
         self.assertTrue(all(target != 'old-fixture' for target, _ in calls))
-        self.assertEqual([action for _, action in calls], ['preflight', 'prepare', 'commit'])
+        self.assertEqual([action for _, action in calls], ['preflight', 'prepare', 'commit', 'status'])
         saved = vps.load(self.state / 'state.json')
         self.assertEqual(saved['current']['endpoint'], self.record['endpoint'])
         self.assertEqual(saved['previous'][0]['target'], 'old-fixture')
@@ -402,7 +405,7 @@ class Local(unittest.TestCase):
         def remote(record, action, *args):
             return {'committed': True} if action == 'abort' else {'machine_id': self.record['machine_id'], 'healthy': True}
         with mock.patch.object(vps, 'remote', side_effect=remote) as rem, mock.patch.object(vps, 'backup_remote', return_value=offnode), \
-             mock.patch.object(vps, 'export_after_commit') as export:
+             mock.patch.object(vps, 'validate_outputs'), mock.patch.object(vps, 'export_after_commit') as export:
             vps.recover_local(self.state, self.doc)
         export.assert_called_once_with(self.state)
         self.assertEqual([c.args[1] for c in rem.call_args_list], ['abort', 'status'])

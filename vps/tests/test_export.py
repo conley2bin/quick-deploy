@@ -30,7 +30,7 @@ class Export(unittest.TestCase):
         (self.module / 'lib').mkdir()
         (self.module / 'lib/host.py').write_bytes((source / 'vps/lib/host.py').read_bytes())
         self.state = vps.private_dir(self.root / 'authority')
-        self.record = {'target': 'fixture', 'endpoint': '93.184.216.34', 'machine_id': 'a' * 32}
+        self.record = {'target': 'fixture', 'endpoint': '93.184.216.34', 'machine_id': 'a' * 32, 'port': 22}
         config = {'domain': 'sub.example.org', 'reality_target': 'target.example.org', 'acme_email': '', 'proxy_port': 443}
         self.manifest = host.new_manifest('fixture-owner', config, self.record['endpoint'])
         self.doc = {'format': host.FORMAT, 'owner': self.manifest['owner'], 'config': config,
@@ -190,12 +190,15 @@ class Export(unittest.TestCase):
                 document = copy.deepcopy(self.doc)
                 if command in ('replace', 'restore'):
                     document['current']['endpoint'] = '93.184.216.35'
+                elif not unchanged:
+                    document['current'] = None  # Fresh deploy; repeated dual uses status only.
                 before = copy.deepcopy(self.manifest)
                 args = vps.parser().parse_args([command, '--ssh', 'fixture'])
                 def remote(record, action, *args, **kwargs):
                     if action == 'prepare':
                         return {'unchanged': unchanged}
-                    return {'machine_id': self.record['machine_id']}
+                    return {'machine_id': self.record['machine_id'], 'adapter_sha256': host.digest(self.module / 'lib/host.py'),
+                            'needs_transport_upgrade': False, 'transports': ['tcp-reality', 'hysteria2']}
                 def check_at_export(state):
                     self.assertFalse((state / 'pending.json').exists())
                     self.assertEqual(vps.load(state / 'state.json')['current'], self.record)
@@ -213,7 +216,8 @@ class Export(unittest.TestCase):
                 export.assert_called_once_with(self.state)
                 self.assertEqual(self.manifest, before)
                 self.assertEqual(json.loads(self.destination.read_bytes()), vps.subscription_urls(before))
-                self.assertEqual([c.args[1] for c in rem.call_args_list][-1], 'status' if unchanged else 'commit')
+                self.assertEqual([c.args[1] for c in rem.call_args_list][-1], 'status')
+                self.assertEqual([c.args[1] for c in rem.call_args_list].count('commit'), 0 if unchanged else 1)
 
     def test_postcommit_export_failure_preserves_commit_not_false_pending(self):
         for recovering in (False, True):
@@ -223,7 +227,9 @@ class Export(unittest.TestCase):
             def remote(record, action, *args, **kwargs):
                 if action == 'prepare':
                     return {'unchanged': False}
-                return {'machine_id': self.record['machine_id'], 'committed': True}
+                return {'machine_id': self.record['machine_id'], 'committed': True,
+                        'adapter_sha256': host.digest(self.module / 'lib/host.py'),
+                        'needs_transport_upgrade': False, 'transports': ['tcp-reality', 'hysteria2']}
             with mock.patch.object(vps, 'target_record', return_value=self.record), \
                  mock.patch.object(vps, 'remote', side_effect=remote), mock.patch('builtins.input', side_effect=AssertionError('Unexpected input')), \
                  mock.patch.object(vps, 'artifacts'), mock.patch.object(vps, 'upload_bundle', return_value=io.BytesIO()), \
@@ -245,7 +251,9 @@ class Export(unittest.TestCase):
         vps.export_urls(self.state)
         original = self.destination.read_bytes()
         with mock.patch.object(vps, 'target_record', return_value=self.record), \
-             mock.patch.object(vps, 'remote', return_value={'machine_id': self.record['machine_id'], 'unchanged': False}) as rem, \
+             mock.patch.object(vps, 'remote', return_value={'machine_id': self.record['machine_id'], 'unchanged': False,
+                 'adapter_sha256': host.digest(self.module / 'lib/host.py'), 'node_id': self.manifest['node_id'],
+                 'needs_transport_upgrade': True, 'transports': ['tcp-reality']}) as rem, \
              mock.patch('builtins.input', side_effect=AssertionError('Unexpected input')), mock.patch.object(vps, 'artifacts'), \
              mock.patch.object(vps, 'upload_bundle', return_value=io.BytesIO()), \
              mock.patch.object(vps, 'backup_remote', return_value=Path(self.doc['backup'])), \
@@ -255,6 +263,7 @@ class Export(unittest.TestCase):
                 vps.deploy(self.state, self.doc, vps.parser().parse_args(['deploy', '--ssh', 'fixture']))
         export.assert_not_called()
         self.assertNotIn('commit', [c.args[1] for c in rem.call_args_list])
+        self.assertNotIn('transport-commit', [c.args[1] for c in rem.call_args_list])
         self.assertTrue((self.state / 'pending.json').exists())
         self.assertEqual(self.destination.read_bytes(), original)
 
@@ -264,6 +273,7 @@ class Export(unittest.TestCase):
         before = copy.deepcopy(self.manifest)
         with mock.patch.object(vps, 'remote', return_value={'committed': True, 'machine_id': self.record['machine_id']}) as rem, \
              mock.patch.object(vps, 'backup_remote', return_value=Path(self.doc['backup'])), \
+             mock.patch.object(vps, 'validate_outputs'), \
              mock.patch('sys.stdout', new_callable=io.StringIO):
             vps.recover_local(self.state, self.doc)
         self.assertEqual([c.args[1] for c in rem.call_args_list], ['abort', 'status'])

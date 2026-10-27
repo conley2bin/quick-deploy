@@ -284,6 +284,7 @@ class Transport(unittest.TestCase):
             response = {'committed': False}
         else:
             response = {'machine_id': 'a' * 32, 'adapter_sha256': host.digest(vps.MODULE / 'lib/host.py'),
+                        'transports': ['tcp-reality', 'hysteria2'], 'needs_transport_upgrade': False,
                         'devices': ['home'], 'rename_target_has_history': False}
         return subprocess.CompletedProcess(argv, 0, host.dumps(response).encode(), b'')
 

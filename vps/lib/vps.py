@@ -7,6 +7,7 @@ import base64
 import contextlib
 from contextvars import ContextVar
 import fcntl
+import hashlib
 import io
 import json
 import os
@@ -21,10 +22,12 @@ import sys
 import tarfile
 import tempfile
 import time
+from urllib.error import HTTPError
 from urllib.request import build_opener, ProxyHandler
 import uuid
 import zlib
 
+import bootstrap
 import host
 import ssh_proxy
 
@@ -49,12 +52,78 @@ def private_dir(path):
 
 
 def read_private(path):
-    if path.is_symlink() or not path.is_file():
-        raise host.Error('Missing regular private file')
-    st = path.stat()
-    if st.st_uid != os.getuid() or st.st_mode & 0o077:
-        raise host.Error('Private file requires current owner and mode0600')
-    return path.read_bytes()
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError as exc:
+        raise host.Error('Missing regular private file; refusing links') from exc
+    with os.fdopen(fd, 'rb') as source:
+        info = os.fstat(source.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o600:
+            raise host.Error('Private file requires regular current-owner mode0600')
+        return source.read()
+
+
+@contextlib.contextmanager
+def directory_fd(path, create=False, private=True):
+    """Pin every directory component without following links."""
+    path = Path(path).expanduser().absolute()
+    if '..' in path.parts:
+        raise host.Error('Parent traversal is not a private output path')
+    fd = os.open(path.anchor, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for part in path.parts[1:]:
+            if create:
+                try:
+                    os.mkdir(part, 0o700, dir_fd=fd)
+                    os.fsync(fd)
+                except FileExistsError:
+                    pass
+            next_fd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            os.close(fd)
+            fd = next_fd
+        info = os.fstat(fd)
+        if private and (info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o700):
+            raise host.Error('Private directory requires current owner and mode0700')
+        yield fd
+    finally:
+        os.close(fd)
+
+
+def read_at(directory, name, limit=bootstrap.MAX_PROFILE_BYTES):
+    fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
+    with os.fdopen(fd, 'rb') as source:
+        info = os.fstat(source.fileno())
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or
+                stat.S_IMODE(info.st_mode) != 0o600 or info.st_size > limit):
+            raise host.Error('Profile generation requires bounded regular current-owner mode0600 files')
+        data = source.read(limit + 1)
+        if len(data) > limit:
+            raise host.Error('Profile file grew beyond the bounded size')
+        return data
+
+
+def write_at(directory, name, data):
+    try:
+        info = os.stat(name, dir_fd=directory, follow_symlinks=False)
+    except FileNotFoundError:
+        pass
+    else:
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o600:
+            raise host.Error('Refusing unknown or nonprivate bootstrap output')
+    temporary = '.profile-' + secrets.token_hex(12)
+    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=directory)
+    try:
+        with os.fdopen(fd, 'wb') as out:
+            out.write(data)
+            out.flush()
+            os.fsync(out.fileno())
+        os.replace(temporary, name, src_dir_fd=directory, dst_dir_fd=directory)
+        os.fsync(directory)
+    finally:
+        try:
+            os.unlink(temporary, dir_fd=directory)
+        except FileNotFoundError:
+            pass
 
 
 def load(path):
@@ -285,6 +354,7 @@ def remote(record, action, request=None, stdin=None, stdout=None):
 def request_for(document, record):
     result = {key: document[key] for key in ('owner', 'config')}
     result['endpoint'] = record['endpoint']
+    result['ssh_port'] = record['port']
     if record.get('machine_id'):
         result['machine_id'] = record['machine_id']
     return result
@@ -294,15 +364,72 @@ def release_lock():
     return json.loads((MODULE / 'release-lock.json').read_text())
 
 
-def artifacts(state, lock):
+def import_artifacts(folder, source, lock):
+    # Hold only the exact three public files open. Validate the complete set
+    # before copying anything into the durable cache; never import a directory.
+    with directory_fd(source, private=False) as directory, contextlib.ExitStack() as stack:
+        sources = []
+        for component in ('panel', 'core', 'front'):
+            pin = lock[component]
+            if Path(pin['file']).name != pin['file']:
+                raise host.Error('Invalid pinned artifact filename')
+            fd = os.open(pin['file'], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
+            stream = stack.enter_context(os.fdopen(fd, 'rb'))
+            info = os.fstat(stream.fileno())
+            if not stat.S_ISREG(info.st_mode) or not 0 < info.st_size <= host.MAX_ARCHIVE:
+                raise host.Error('Artifact source requires a bounded ordinary file, never a symlink')
+            checksum = hashlib.sha256()
+            total = 0
+            while chunk := stream.read(1024 * 1024):
+                total += len(chunk)
+                if total > host.MAX_ARCHIVE:
+                    raise host.Error('Oversized artifact source; cache unchanged')
+                checksum.update(chunk)
+            if checksum.hexdigest() != pin['sha256']:
+                raise host.Error('Verified artifact directory SHA256 mismatch; cache unchanged')
+            stream.seek(0)
+            sources.append((pin, stream))
+        with tempfile.TemporaryDirectory(prefix='.verified-', dir=folder) as tmp:
+            stage = Path(tmp)
+            for pin, stream in sources:
+                path = stage / pin['file']
+                with path.open('xb') as out:
+                    os.chmod(path, 0o600)
+                    total, checksum = 0, hashlib.sha256()
+                    while chunk := stream.read(1024 * 1024):
+                        total += len(chunk)
+                        if total > host.MAX_ARCHIVE:
+                            raise host.Error('Artifact source changed size; cache unchanged')
+                        checksum.update(chunk)
+                        out.write(chunk)
+                    out.flush()
+                    os.fsync(out.fileno())
+                if checksum.hexdigest() != pin['sha256']:
+                    raise host.Error('Artifact source changed after validation; cache unchanged')
+            for pin, _ in sources:
+                destination = folder / pin['file']
+                if destination.exists() or destination.is_symlink():
+                    read_private(destination)
+            for pin, _ in sources:
+                os.replace(stage / pin['file'], folder / pin['file'])
+            directory = os.open(folder, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
+
+
+def artifacts(state, lock, source=None):
     folder = private_dir(state / 'artifacts')
+    if source is not None:
+        import_artifacts(folder, source, lock)
     # A dead proxy selected in the management PC must not be required to fetch
     # new-node releases. This changes no environment/client settings.
     opener = build_opener(ProxyHandler({}))
     for component in ('panel', 'core', 'front'):
         pin = lock[component]
         path = folder / pin['file']
-        if path.exists():
+        if path.exists() or path.is_symlink():
             read_private(path)
         else:
             if not pin['url'].startswith('https://github.com/'):
@@ -321,6 +448,8 @@ def artifacts(state, lock):
                 if host.digest(Path(tmp)) != pin['sha256']:
                     raise host.Error('Official release artifact digest mismatch')
                 os.replace(tmp, path)
+            except HTTPError as exc:
+                raise host.Error(f'Pinned {component} artifact unavailable (HTTP{exc.code}); use deploy --artifacts-dir with a verified original release set. No version or mirror fallback') from exc
             finally:
                 if os.path.exists(tmp):
                     os.unlink(tmp)
@@ -338,7 +467,7 @@ def upload_bundle(request, folder=None, backup=None):
         archive.add(MODULE / 'lib/host.py', arcname='host.py', recursive=False)
         if backup:
             archive.add(backup, arcname='restore.tar', recursive=False)
-        elif 'device_action' not in request:
+        elif 'device_action' not in request and request.get('mode') != 'transport-upgrade':
             for component in ('panel', 'core', 'front'):
                 path = folder / request['lock'][component]['file']
                 archive.add(path, arcname='artifacts/' + path.name, recursive=False)
@@ -390,34 +519,108 @@ def resolve_mihomo(binary=None):
     return str(Path(resolved).absolute())
 
 
+def checked_backup(document, record, backup):
+    manifest = inspect_backup(Path(backup), release_lock())
+    if (manifest['owner'] != document['owner'] or manifest['config'] != document['config']
+            or manifest['endpoint'] != record['endpoint']):
+        raise host.Error('Saved backup does not match committed owner/config/endpoint')
+    return manifest
+
+
+def profile_names(manifest):
+    return {name + ext for name in host.device_names(manifest) if manifest['accounts'][name]['enable']
+            for ext in ('.yaml', '.txt')}
+
+
+def generation_binding(manifest, digest):
+    return {'format': 1, 'backup_sha256': digest, 'owner': manifest['owner'], 'node_id': manifest['node_id'],
+            'endpoint': manifest['endpoint'], 'config': manifest['config'],
+            'roster': {name: manifest['accounts'][name]['enable'] for name in host.device_names(manifest)},
+            'accounts_sha256': hashlib.sha256(json.dumps(manifest['accounts'], sort_keys=True).encode()).hexdigest()}
+
+
+def read_generation(state, manifest, digest):
+    if not isinstance(digest, str) or not re.fullmatch(r'[0-9a-f]{64}', digest):
+        raise host.Error('Invalid committed native generation identity')
+    with directory_fd(state / 'generations' / digest) as directory:
+        metadata = json.loads(read_at(directory, 'metadata.json'))
+        if not isinstance(metadata, dict) or not isinstance(metadata.get('files'), dict):
+            raise host.Error('Invalid native generation metadata')
+        binding = generation_binding(manifest, digest)
+        if {key: value for key, value in metadata.items() if key != 'files'} != binding:
+            raise host.Error('Native generation does not match verified committed backup')
+        expected = profile_names(manifest)
+        if set(metadata.get('files', {})) != expected or set(os.listdir(directory)) != expected | {'metadata.json'}:
+            raise host.Error('Native generation roster/files changed')
+        files = {}
+        for name in expected:
+            data = read_at(directory, name)
+            if hashlib.sha256(data).hexdigest() != metadata['files'][name]:
+                raise host.Error('Native generation file hash changed')
+            host.validate_feed_scope(manifest, name.rsplit('.', 1)[0], data, 'sub' if name.endswith('.txt') else 'mihomo')
+            files[name] = data
+        return files
+
+
+def store_generation(state, manifest, digest, files):
+    if not isinstance(digest, str) or not re.fullmatch(r'[0-9a-f]{64}', digest) or set(files) != profile_names(manifest):
+        raise host.Error('Invalid native generation identity or roster')
+    parent = state / 'generations'
+    with directory_fd(parent, create=True) as directory:
+        try:
+            os.mkdir(digest, 0o700, dir_fd=directory)
+            os.fsync(directory)
+        except FileExistsError:
+            if read_generation(state, manifest, digest) != files:
+                raise host.Error('Immutable native generation already exists with different bytes')
+            return
+    # A partial generation is preserved and refused, never overwritten on retry.
+    with directory_fd(parent / digest) as directory:
+        for name, data in files.items():
+            fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=directory)
+            with os.fdopen(fd, 'wb') as out:
+                out.write(data)
+                out.flush()
+                os.fsync(out.fileno())
+        metadata = dict(generation_binding(manifest, digest), files={name: hashlib.sha256(data).hexdigest() for name, data in files.items()})
+        write_at(directory, 'metadata.json', host.dumps(metadata).encode())
+        os.fsync(directory)
+
+
 def validate_outputs(state, document, record, binary=None, backup=None):
     binary = resolve_mihomo(binary)
-    manifest = inspect_backup(backup, release_lock())
+    manifest = checked_backup(document, record, backup)
+    digest = host.digest(backup)
     outputs = remote(record, 'outputs', request_for(document, record))
-    expected = {d + ext for d in host.device_names(manifest) if manifest['accounts'][d]['enable'] for ext in ('.yaml', '.txt')}
-    if set(outputs) != expected:
+    if not isinstance(outputs, dict) or set(outputs) != profile_names(manifest):
         raise host.Error('Native outputs disagree with verified backup roster')
-    output = private_dir(state / 'outputs')
+    files = {}
     with tempfile.TemporaryDirectory(prefix='qd-native-check-') as tmp:
         root = Path(tmp)
-        # Both are genuine V2Ray geodata shipped with the pinned Xray release;
-        # -t needs these to validate GEOIP/GEOSITE rules without downloading.
         with tarfile.open(backup) as archive:
             for name in ('geoip.dat', 'geosite.dat'):
                 data = archive.extractfile('deployment/bin/' + name).read()
                 host.atomic(root / name, data)
         for name, encoded in outputs.items():
-            if name not in expected:
-                raise host.Error('Unexpected native output filename')
+            if not isinstance(encoded, str) or len(encoded) > 2 * bootstrap.MAX_PROFILE_BYTES:
+                raise host.Error('Oversized native output')
             data = base64.b64decode(encoded, validate=True)
+            if len(data) > bootstrap.MAX_PROFILE_BYTES:
+                raise host.Error('Oversized native output')
             host.validate_feed_scope(manifest, name.rsplit('.', 1)[0], data, 'sub' if name.endswith('.txt') else 'mihomo')
-            host.atomic(output / name, data)
             if name.endswith('.yaml'):
                 config = root / name
                 host.atomic(config, data)
                 host.run([binary, '-t', '-d', root, '-f', config], timeout=60)
-    manifest = inspect_backup(backup, release_lock())
+            files[name] = data
+    if host.digest(backup) != digest:
+        raise host.Error('Verified backup changed during native validation')
+    store_generation(state, manifest, digest, files)
+    output = private_dir(state / 'outputs')
+    for name, data in files.items():
+        host.atomic(output / name, data)
     host.atomic(output / 'subscription-urls.json', host.dumps(subscription_urls(manifest)))
+    return digest
 
 
 def subscription_urls(manifest):
@@ -486,6 +689,63 @@ def export_urls(state):
     return destination
 
 
+def export_bootstrap(state, args):
+    if (state / 'pending.json').exists() or (state / 'pending.json').is_symlink():
+        raise host.Error('Pending transaction is ambiguous; use recover before bootstrap export')
+    document = load(state / 'state.json')
+    if document.get('format') != host.FORMAT or not document.get('current') or not document.get('backup'):
+        raise host.Error('Bootstrap requires saved committed state')
+    manifest = checked_backup(document, document['current'], document['backup'])
+    digest = host.digest(document['backup'])
+    if document.get('native_generation') != digest or not manifest.get('published'):
+        raise host.Error('No committed native generation; capture with deploy or backup through a working SSH carrier first')
+    if not host.dual_enabled(manifest):
+        raise host.Error('Offline dual bootstrap requires a committed dual-transport snapshot')
+    if args.device not in host.device_names(manifest) or not manifest['accounts'][args.device]['enable']:
+        raise host.Error('Bootstrap device is removed, disabled or unknown')
+    files = read_generation(state, manifest, digest)
+    device = args.device
+    selected = {device + ext: files[device + ext] for ext in ('.yaml', '.txt')}
+    selected[device + '.uris.txt'] = base64.b64decode(files[device + '.txt'], validate=True)
+    selected[device + '.urls.json'] = host.dumps(subscription_urls(manifest)[device]).encode()
+    management = getattr(args, 'management_interface', None)
+    port = 10808 if args.management_port is None else args.management_port
+    binary = None
+    if management is not None:
+        try:
+            selected['management.yaml'] = bootstrap.render_management(files[device + '.yaml'], endpoint=manifest['endpoint'],
+                proxy_port=manifest['config']['proxy_port'], ssh_port=manifest['management']['ssh_port'],
+                domain=manifest['config']['domain'], interface=management, listen_port=port)
+        except bootstrap.BootstrapError as exc:
+            raise host.Error(str(exc)) from exc
+        binary = resolve_mihomo()
+        with tempfile.TemporaryDirectory(prefix='qd-management-check-') as tmp:
+            path = Path(tmp) / 'management.yaml'
+            host.atomic(path, selected['management.yaml'])
+            host.run([binary, '-t', '-d', tmp, '-f', path], timeout=60)
+    destination = args.bootstrap_dir.expanduser().absolute()
+    # Private profile bytes must not land in this or another Git worktree.
+    if any((parent / '.git').exists() for parent in (destination, *destination.parents)):
+        raise host.Error('Bootstrap output must be outside Git worktrees')
+    with directory_fd(destination, create=True) as directory:
+        # Precheck the entire destination set before replacing any old output.
+        for name in selected:
+            try:
+                info = os.stat(name, dir_fd=directory, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o600:
+                raise host.Error('Refusing unknown or nonprivate bootstrap output')
+        for name, data in selected.items():
+            write_at(directory, name, data)
+    for name in selected:
+        print(str(destination / name))
+    if management is not None:
+        print(shlex.join([binary, '-d', str(destination), '-f', str(destination / 'management.yaml')]))
+        print(shlex.join(['bash', str(MODULE / 'setup.sh'), '--state-dir', str(state), 'status', '--ssh-proxy', f'socks5://127.0.0.1:{port}']))
+    return destination
+
+
 def export_after_commit(state):
     try:
         path = export_urls(state)
@@ -520,12 +780,77 @@ def remember_commit(state, document, record, backup, result):
     if previous and previous['endpoint'] != record['endpoint'] and previous not in document['previous']:
         document['previous'].append(previous)
     record = dict(record, machine_id=result['machine_id'])
+    digest = host.digest(backup)
+    if (state / 'generations' / digest).exists() or (state / 'generations' / digest).is_symlink():
+        manifest = checked_backup(document, record, backup)
+        if result.get('node_id', manifest['node_id']) != manifest['node_id'] or not manifest.get('published'):
+            raise host.Error('Commit result does not match published native snapshot')
+        read_generation(state, manifest, digest)
+        document['native_generation'] = digest
+    else:
+        # Legacy URL-only state/uncaptured backups never inherit stale profiles.
+        document.pop('native_generation', None)
     document.update(current=record, backup=str(backup.absolute()))
     host.atomic(state / 'state.json', host.dumps(document))
     if (state / 'pending.json').exists():
         pending = load(state / 'pending.json')
         retire_renamed_outputs(state, pending.get('request', {}))
         (state / 'pending.json').unlink()
+
+
+def deploy_existing(state, document, record, args):
+    request = request_for(document, record)
+    checked = remote(record, 'status', request)
+    adapter = host.digest(MODULE / 'lib/host.py')
+    if not host.accepted_adapter_digest(checked.get('adapter_sha256'), adapter):
+        raise host.Error('Unknown stored adapter digest; no transport backup/service mutation')
+    upgrading = checked.get('needs_transport_upgrade')
+    expected = ['tcp-reality'] if upgrading is True else ['tcp-reality', 'hysteria2']
+    if type(upgrading) is not bool or checked.get('transports') != expected:
+        raise host.Error('Unrecognized owned transport topology; no implicit migration')
+    binary = resolve_mihomo(args.mihomo)
+    if getattr(args, 'artifacts_dir', None) is not None:
+        artifacts(state, release_lock(), args.artifacts_dir)
+    if not upgrading:
+        # No prepare/Auth generation/core restart on an already dual node.
+        backup = backup_remote(state, document, record)
+        validate_outputs(state, document, record, binary, backup)
+        remember_commit(state, document, record, backup, checked)
+        export_after_commit(state)
+        print('Owned dual transport unchanged; committed native snapshot refreshed.')
+        return
+    before = backup_remote(state, document, record)
+    manifest = checked_backup(document, record, before)
+    if host.dual_enabled(manifest) or manifest['node_id'] != checked.get('node_id'):
+        raise host.Error('Verified pre-change archive differs from legacy status')
+    request.update(mode='transport-upgrade', operation_id=secrets.token_hex(16), adapter_sha256=adapter,
+                   before_sha256=host.digest(before), source_transports=['tcp-reality'],
+                   target_transports=['tcp-reality', 'hysteria2'])
+    host.transport_request(request)
+    pending = {'record': record, 'mode': 'transport-upgrade', 'request': request, 'before': str(before.absolute()),
+               'backup': None, 'mihomo': binary}
+    host.atomic(state / 'pending.json', host.dumps(pending))
+    try:
+        with upload_bundle(request) as stream:
+            prepared = remote(record, 'transport-prepare', stdin=stream)
+        if prepared.get('pending') or prepared.get('queued'):
+            print('Transport preparation waiting; pending retained. Use recover with the same target.')
+            return
+        if not prepared.get('committed') and not prepared.get('unchanged'):
+            candidate = backup_remote(state, document, record)
+            pending['backup'] = str(candidate.absolute())
+            host.atomic(state / 'pending.json', host.dumps(pending))
+            validate_outputs(state, document, record, binary, candidate)
+            remote(record, 'transport-commit', dict(request, offnode_sha256=host.digest(candidate)))
+        after = backup_remote(state, document, record)
+        validate_outputs(state, document, record, binary, after)
+        result = remote(record, 'status', request_for(document, record))
+        remember_commit(state, document, record, after, result)
+    except BaseException:
+        print('Transport upgrade incomplete or already committed; pending intent retained. Use recover, never replay credentials.', file=sys.stderr)
+        raise
+    export_after_commit(state)
+    print('Native TCP/REALITY + UDP/Hysteria2 upgrade committed; original account identities retained.')
 
 
 def deploy(state, document, args):
@@ -536,6 +861,8 @@ def deploy(state, document, args):
     replacing = args.command in ('replace', 'restore')
     if args.command == 'deploy' and document['current'] and record['endpoint'] != document['current']['endpoint']:
         raise host.Error('Different host: use replace; never silently take over')
+    if args.command == 'deploy' and document['current']:
+        return deploy_existing(state, document, record, args)
     backup = args.backup if replacing and args.backup else (Path(document['backup']) if replacing and document['backup'] else None)
     if replacing:
         if not backup:
@@ -550,9 +877,9 @@ def deploy(state, document, args):
     record['machine_id'] = info['machine_id']
     request = dict(request_for(document, record), lock=lock, mode=args.command,
                    adapter_sha256=host.digest(MODULE / 'lib/host.py'))
-    print(f"Preflight passed for the explicit SSH target. This dedicated node will run REALITY{document['config']['proxy_port']}, TLS subscriptions8443 and HTTP01 only on80. SSH/firewall/Tailscale stay unchanged.")
-    folder = None if backup else artifacts(state, lock)
-    pending = {'record': record, 'mode': args.command, 'backup': None}
+    print(f"Preflight passed. This dedicated node will run TCP/REALITY + UDP/Hysteria2 on{document['config']['proxy_port']}, TLS subscriptions8443 and HTTP01 on80. SSH/firewall/Tailscale stay unchanged.")
+    folder = None if backup else artifacts(state, lock, getattr(args, 'artifacts_dir', None))
+    pending = {'record': record, 'mode': args.command, 'backup': None, 'mihomo': resolve_mihomo(args.mihomo)}
     host.atomic(state / 'pending.json', host.dumps(pending))
     # The first setup config/ownership is durable before remote activation.
     host.atomic(state / 'state.json', host.dumps(document))
@@ -570,6 +897,12 @@ def deploy(state, document, args):
         else:
             print('Native core/full Mihomo profiles and scoped URI feeds validated; trusted TLS and a complete unencrypted OFF-NODE backup exist. Publishing validated device feed paths. Real phone/desktop connectivity remains a separate user test.')
             result = remote(record, 'commit', dict(request_for(document, record), offnode_sha256=host.digest(offnode)))
+        if not prepared['unchanged']:
+            offnode = backup_remote(state, document, record)
+            pending['backup'] = str(offnode.absolute())
+            host.atomic(state / 'pending.json', host.dumps(pending))
+            validate_outputs(state, document, record, pending['mihomo'], offnode)
+            result = remote(record, 'status', request_for(document, record))
         remember_commit(state, document, record, offnode, result)
     except BaseException:
         print('Transaction incomplete. Local pending intent is retained; run recover. No SSH, firewall, DNS or PC network policy was changed.', file=sys.stderr)
@@ -644,11 +977,14 @@ def recover_local(state, document, mihomo=None):
         host.atomic(state / 'pending.json', host.dumps({'record': document['current'], 'mode': 'backup'}))
     pending = load(state / 'pending.json')
     record = pending['record']
-    request = pending['request'] if pending.get('mode') == 'devices' else request_for(document, record)
-    if pending.get('mode') == 'devices':
+    mode = pending.get('mode')
+    request = pending['request'] if mode in ('devices', 'transport-upgrade') else request_for(document, record)
+    if mode == 'devices':
         host.device_request(request)  # Unknown/removed actions are preserved, never translated or replayed.
+    elif mode == 'transport-upgrade':
+        host.transport_request(request)
     result = remote(record, 'abort', request)
-    if result.get('pending'):
+    if result.get('pending') or result.get('queued'):
         print('Recovery queued/waiting; local pending retained. Retry recover after the owned recovery unit exits.')
         return
     if result.get('committed'):
@@ -657,11 +993,10 @@ def recover_local(state, document, mihomo=None):
         # timer may already have completed and removed the remote stop intent.
         status = {'machine_id': record['machine_id']} if pending.get('mode') == 'backup' else remote(record, 'status', request_for(document, record))
         backup = backup_remote(state, document, record)
-        if pending.get('mode') == 'devices':
-            binary = resolve_mihomo(mihomo or pending.get('mihomo'))
-            pending['mihomo'] = binary
-            host.atomic(state / 'pending.json', host.dumps(pending))
-            validate_outputs(state, document, record, binary=binary, backup=backup)
+        binary = resolve_mihomo(mihomo or pending.get('mihomo'))
+        pending['mihomo'] = binary
+        host.atomic(state / 'pending.json', host.dumps(pending))
+        validate_outputs(state, document, record, binary=binary, backup=backup)
         remember_commit(state, document, record, backup, status)
         print('Remote commit had succeeded; reconciled ownership and made a new off-node backup.')
         export_after_commit(state)
@@ -669,6 +1004,8 @@ def recover_local(state, document, mihomo=None):
         (state / 'pending.json').unlink()
         if pending.get('mode') == 'devices':
             print('Device operation did not commit; original device state restored or unchanged. Private rollback evidence retained.')
+        elif pending.get('mode') == 'transport-upgrade':
+            print('Transport upgrade did not commit; original native transport state restored or unchanged. Private rollback evidence retained.')
         else:
             print('Candidate stopped/disabled; private failed state retained on the target. Current/old host unchanged.')
 
@@ -702,8 +1039,15 @@ def parser():
         if name in ('deploy', 'replace', 'restore'):
             a.add_argument('--backup', type=Path, help='existing private unencrypted recovery archive')
             a.add_argument('--mihomo', help='native core executable for profile validation')
-        if name == 'recover':
-            a.add_argument('--mihomo', help='override retained native core path for committed recovery')
+        if name in ('recover', 'backup'):
+            a.add_argument('--mihomo', help='native core path for committed profile validation')
+        if name == 'deploy':
+            a.add_argument('--artifacts-dir', type=Path, help='explicit directory containing all three original SHA-pinned release files')
+        if name == 'export':
+            a.add_argument('--device', help='enabled committed device name for private offline bootstrap')
+            a.add_argument('--bootstrap-dir', type=Path, help='private output directory outside Git; pair with --device')
+            a.add_argument('--management-interface', help='explicit physical Linux interface; render isolated H2 management profile')
+            a.add_argument('--management-port', type=int, help='loopback management listener port; default10808 with --management-interface')
         if name == 'restore':
             a.set_defaults(backup_required=True)
     a = sub.add_parser('devices', help='manage manifest-owned device credentials')
@@ -728,6 +1072,13 @@ def main(argv=None):
     state = args.state_dir.expanduser().absolute()
     try:
         with locked(state):
+            if args.command == 'export':
+                if bool(args.device) != bool(args.bootstrap_dir):
+                    raise host.Error('--device and --bootstrap-dir must be supplied together')
+                if (args.management_interface is not None or args.management_port is not None) and not args.device:
+                    raise host.Error('Management options require --device and --bootstrap-dir')
+                if args.management_port is not None and (not args.management_interface or not 1 <= args.management_port <= 65535):
+                    raise host.Error('--management-port requires --management-interface and port1..65535')
             if args.command == 'restore' and not args.backup:
                 raise host.Error('Controlled restore requires an explicit --backup and --ssh')
             if args.command == 'restore' and not (state / 'state.json').exists():
@@ -747,7 +1098,10 @@ def main(argv=None):
             elif args.command == 'recover':
                 recover_local(state, document, args.mihomo)
             elif args.command == 'export':
-                print('Private saved-snapshot subscription URLs: ' + str(export_urls(state)))
+                if args.device:
+                    export_bootstrap(state, args)
+                else:
+                    print('Private saved-snapshot subscription URLs: ' + str(export_urls(state)))
             else:
                 record = document['current']
                 if not record:
@@ -755,12 +1109,14 @@ def main(argv=None):
                 if args.command == 'status':
                     print(host.dumps(remote(record, 'status', request_for(document, record))), end='')
                 else:
+                    if (state / 'pending.json').exists():
+                        raise host.Error('Local transaction pending; use recover before backup')
                     path = backup_remote(state, document, record)
-                    document['backup'] = str(path.absolute())
-                    host.atomic(state / 'state.json', host.dumps(document))
-                    print('Complete UNENCRYPTED off-node backup (0700/0600): ' + str(path))
+                    validate_outputs(state, document, record, args.mihomo, path)
+                    remember_commit(state, document, record, path, {'machine_id': record['machine_id']})
+                    print('Complete UNENCRYPTED off-node backup and native snapshot (0700/0600): ' + str(path))
         return 0
-    except (host.Error, OSError, ValueError, EOFError) as exc:
+    except (host.Error, OSError, ValueError, EOFError, tarfile.TarError) as exc:
         print('vps: ' + str(exc), file=sys.stderr)
         return 1
     except KeyboardInterrupt:

@@ -87,7 +87,7 @@ class Recovery(unittest.TestCase):
         f.h.commit(dict(f.request, machine_id='a'*32, offnode_sha256='fixture-receipt'))
         self.graph = OrderedServices(f)
         self.state = vps.private_dir(f.root/'operator')
-        self.record = {'endpoint':f.request['endpoint'],'machine_id':'a'*32}
+        self.record = {'endpoint':f.request['endpoint'],'machine_id':'a'*32,'port':22}
         self.document = {'format':host.FORMAT,'owner':f.request['owner'],'config':f.config,
                          'current':self.record,'previous':[],'backup':None}
         host.atomic(self.state/'state.json',host.dumps(self.document))
@@ -216,6 +216,7 @@ class Recovery(unittest.TestCase):
                 def backup(state,document,record):
                     self.assertTrue(self.graph.state(host.FRONT)['running'])
                     self.assertEqual(h.read_json(h.ROOT/'active/manifest.json')['accounts'],expected)
+                    host.atomic(self.state/'reconciled.tar', 'closed reconciled archive fixture')
                     return self.state/'reconciled.tar'
                 with mock.patch.object(vps,'remote',side_effect=recover_remote),mock.patch.object(vps,'backup_remote',side_effect=backup), \
                         mock.patch.object(vps,'validate_outputs'),mock.patch.object(vps,'export_after_commit',side_effect=lambda state:exports.append(True)):
@@ -393,9 +394,10 @@ class Recovery(unittest.TestCase):
         def remote(record,action,request=None,**kwargs):
             self.assertEqual(action,'abort')
             return adapter.abort(request)
+        host.atomic(self.state/'inactive.tar', 'closed inactive archive fixture')
         with mock.patch.object(vps,'remote',side_effect=remote), \
                 mock.patch.object(vps,'backup_remote',return_value=self.state/'inactive.tar'), \
-                mock.patch.object(vps,'export_after_commit'):
+                mock.patch.object(vps,'validate_outputs'), mock.patch.object(vps,'export_after_commit'):
             vps.recover_local(self.state,self.document)
         self.assertFalse((self.state/'pending.json').exists())
         self.assertFalse(self.graph.state(host.FRONT)['running'])
