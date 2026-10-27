@@ -1,7 +1,7 @@
 // One recovery owner for root Pi sessions, independent of tmux and UI mode.
 export const ERROR_STALL_MS = 600_000;
 export const AUTO_CONTINUE_MIN_INTERVAL_MS = 600_000;
-export const AUTO_CONTINUE_MAX = 3;
+export const AUTO_CONTINUE_MAX = 5;
 // Either terminal listener may consume the pane sentinel first. Broadcast the
 // cancellation so both the recovery deadline and tmux's red lease are cleared.
 export const RECOVERY_CANCEL_EVENT = "pi-tmux-window-status:cancel";

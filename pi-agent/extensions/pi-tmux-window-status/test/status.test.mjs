@@ -695,7 +695,7 @@ test("partial tmux batch failure retains attempted window and pane cleanup respo
   }
 });
 
-test("tmux status alone caps each distinct error at three sends and renews on a new error", async (t) => {
+test("tmux status alone caps each distinct error at five sends and renews on a new error", async (t) => {
   const h = await statusHarness("single-owner");
   try {
     h.setSignal(new AbortController().signal);
@@ -710,17 +710,17 @@ test("tmux status alone caps each distinct error at three sends and renews on a 
       const errorAt = Date.now();
       h.fire("message_end", { message: assistantFailure() }, h.ctx);
       h.fire("agent_settled", { aborted: false }, h.ctx);
-      for (let n = 1; n <= 3; n++) {
-        t.mock.timers.tick(59_999); assert.equal(h.sent.length, trigger * 3 + n - 1);
-        t.mock.timers.tick(1); assert.equal(h.sent.length, trigger * 3 + n - 1, "the former one-minute deadline never sends");
-        t.mock.timers.tick(539_999); assert.equal(h.sent.length, trigger * 3 + n - 1);
-        t.mock.timers.tick(1); assert.equal(h.sent.length, trigger * 3 + n, "only one sender runs per ten-minute deadline");
+      for (let n = 1; n <= 5; n++) {
+        t.mock.timers.tick(59_999); assert.equal(h.sent.length, trigger * 5 + n - 1);
+        t.mock.timers.tick(1); assert.equal(h.sent.length, trigger * 5 + n - 1, "the former one-minute deadline never sends");
+        t.mock.timers.tick(539_999); assert.equal(h.sent.length, trigger * 5 + n - 1);
+        t.mock.timers.tick(1); assert.equal(h.sent.length, trigger * 5 + n, "only one sender runs per ten-minute deadline");
       }
       t.mock.timers.tick(600_000);
-      assert.equal(h.sent.length, (trigger + 1) * 3, "no fourth send for this trigger");
+      assert.equal(h.sent.length, (trigger + 1) * 5, "no sixth send at sixty minutes for this trigger");
       t.mock.timers.tick(6_000_000);
-      assert.deepEqual(h.sent, Array((trigger + 1) * 3).fill("continue"), "only a new distinct error renews all three attempts");
-      assert.deepEqual(h.sentAt.slice(trigger * 3), [errorAt + 600_000, errorAt + 1_200_000, errorAt + 1_800_000]);
+      assert.deepEqual(h.sent, Array((trigger + 1) * 5).fill("continue"), "only a new distinct error renews all five attempts; no sixth later");
+      assert.deepEqual(h.sentAt.slice(trigger * 5), [errorAt + 600_000, errorAt + 1_200_000, errorAt + 1_800_000, errorAt + 2_400_000, errorAt + 3_000_000]);
       assert.equal(h.leaseState(), "error", "budget exhaustion does not clear the error display");
     }
   } finally {

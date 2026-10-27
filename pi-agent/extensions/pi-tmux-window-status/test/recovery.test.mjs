@@ -63,10 +63,10 @@ function harness(t, { mode = "tui", depth, send, entry = extension } = {}) {
   return h;
 }
 
-test("user policy is ten minutes since error, at least ten minutes per send, at most three", () => {
+test("user policy is ten minutes since error, at least ten minutes per send, at most five", () => {
   assert.equal(ERROR_STALL_MS, 600_000);
   assert.equal(AUTO_CONTINUE_MIN_INTERVAL_MS, 600_000);
-  assert.equal(AUTO_CONTINUE_MAX, 3);
+  assert.equal(AUTO_CONTINUE_MAX, 5);
 });
 
 test("standalone module install recovers without any suspend-guard source or installation", async (t) => {
@@ -276,37 +276,60 @@ test("legacy retry-exhausted aborted tails preserve an existing error, never arm
   assert.equal(h.sent.length, 1, "explicit aborted settlement still wins");
 });
 
-test("every new terminal error renews three attempts, including after an automatic continue", (t) => {
+test("every new terminal error renews five attempts, including after an automatic continue", (t) => {
   const h = harness(t);
   for (let n = 1; n <= 7; n++) {
+    if (n > 1) h.tick(300_000);
     h.start(); h.error(); h.settle();
     h.tick(599_999); assert.equal(h.sent.length, n - 1);
-    h.tick(1); assert.equal(h.sent.length, n, "new errors intentionally allow more than three sends in total");
-    if (n > 1) assert.equal(h.sentAt[n - 1] - h.sentAt[n - 2], 600_000);
+    h.tick(1); assert.equal(h.sent.length, n, "new errors intentionally allow more than five sends in total");
+    if (n > 1) assert.equal(h.sentAt[n - 1] - h.sentAt[n - 2], 900_000, "a new error gets a fresh ten-minute wait, even after a send");
   }
-  // No new error: only the remaining two attempts belong to this trigger.
-  for (let n = 0; n < 2; n++) h.tick(600_000);
-  assert.equal(h.sent.length, 9);
-  h.tick(6_000_000); assert.equal(h.sent.length, 9, "the latest trigger still has a three-send cap");
+  // No new error: only the remaining four attempts belong to this trigger.
+  for (let n = 0; n < 4; n++) h.tick(600_000);
+  assert.equal(h.sent.length, 11);
+  h.tick(600_000); assert.equal(h.sent.length, 11, "no sixth send for the latest trigger");
+  h.tick(6_000_000); assert.equal(h.sent.length, 11, "the latest trigger still has a five-send cap");
   h.terminal(CANCEL_SENTINEL);
   h.start(); h.error(); h.settle(); h.tick(600_000);
-  assert.equal(h.sent.length, 10, "a genuinely new error starts a new trigger after cancellation too");
+  assert.equal(h.sent.length, 12, "a genuinely new error starts a new trigger after cancellation too");
+});
+
+test("message_update and duplicate message_end never move the original deadline or renew its budget", (t) => {
+  const h = harness(t);
+  const message = failure();
+  h.start(); h.error(message); h.settle();
+  h.tick(300_000);
+  h.fire("message_update", { message });
+  h.fire("message_update", { message: failure("different update") });
+  h.error(message); h.settle();
+  h.tick(299_999); assert.deepEqual(h.sent, []);
+  h.tick(1); assert.deepEqual(h.sentAt, [1_600_000], "duplicates and updates leave the first ten-minute deadline intact");
+  for (let n = 1; n < 5; n++) h.tick(600_000);
+  h.tick(600_000); assert.equal(h.sent.length, 5, "no sixth send at sixty minutes");
+  h.tick(6_000_000); assert.equal(h.sent.length, 5, "duplicates and updates never add attempts");
 });
 
 test("message_update and duplicate message_end cannot renew an exhausted trigger", (t) => {
   const h = harness(t);
   const message = failure();
   h.start(); h.error(message); h.settle();
-  for (let n = 0; n < 3; n++) h.tick(600_000);
-  assert.equal(h.sent.length, 3);
-  h.fire("message_update", { message }); h.error(message); h.settle();
-  h.tick(6_000_000); assert.equal(h.sent.length, 3);
+  for (let n = 0; n < 5; n++) h.tick(600_000);
+  assert.equal(h.sent.length, 5);
+  h.fire("message_update", { message });
+  h.fire("message_update", { message: failure() });
+  h.error(message); h.settle();
+  h.tick(600_000); assert.equal(h.sent.length, 5, "duplicates cannot restore a sixth attempt");
+  h.tick(6_000_000); assert.equal(h.sent.length, 5);
+  const renewedAt = Date.now();
   h.error(failure()); h.settle();
-  for (let n = 1; n <= 3; n++) {
-    h.tick(599_999); assert.equal(h.sent.length, 3 + n - 1);
-    h.tick(1); assert.equal(h.sent.length, 3 + n, "a new terminal message, even with identical text, renews all three attempts");
+  for (let n = 1; n <= 5; n++) {
+    h.tick(599_999); assert.equal(h.sent.length, 5 + n - 1);
+    h.tick(1); assert.equal(h.sent.length, 5 + n, "a new terminal message, even with identical text, renews all five attempts");
   }
-  h.tick(6_000_000); assert.equal(h.sent.length, 6, "the renewed trigger also stops before a fourth send");
+  assert.deepEqual(h.sentAt.slice(5), [600_000, 1_200_000, 1_800_000, 2_400_000, 3_000_000].map((delay) => renewedAt + delay));
+  h.tick(600_000); assert.equal(h.sent.length, 10, "the renewed trigger also stops before a sixth send");
+  h.tick(6_000_000); assert.equal(h.sent.length, 10);
 });
 
 for (const invalidation of ["normal completion", "model selection"]) test(`${invalidation} never bypasses the ten-minute send throttle`, (t) => {
@@ -325,10 +348,10 @@ test("a send consumed without a run is retried by one bounded watchdog, not a ti
   let h;
   h = harness(t, { send: () => h.fire("input", { text: "continue", source: "extension" }) });
   h.start(); h.error(); h.settle();
-  for (let n = 1; n <= 3; n++) { h.tick(599_999); assert.equal(h.sent.length, n - 1); h.tick(1); assert.equal(h.sent.length, n); }
-  h.tick(600_000); assert.equal(h.sent.length, 3, "no fourth send at the next deadline");
-  h.tick(6_000_000); assert.equal(h.sent.length, 3);
-  assert.deepEqual(h.sentAt, [1_600_000, 2_200_000, 2_800_000]);
+  for (let n = 1; n <= 5; n++) { h.tick(599_999); assert.equal(h.sent.length, n - 1); h.tick(1); assert.equal(h.sent.length, n); }
+  h.tick(600_000); assert.equal(h.sent.length, 5, "no sixth send at sixty minutes");
+  h.tick(6_000_000); assert.equal(h.sent.length, 5, "no sixth send later");
+  assert.deepEqual(h.sentAt, [1_600_000, 2_200_000, 2_800_000, 3_400_000, 4_000_000]);
 });
 
 test("a synchronous send failure is surfaced and remains capped/throttled", (t) => {
@@ -336,10 +359,11 @@ test("a synchronous send failure is surfaced and remains capped/throttled", (t) 
   const errors = h.diagnostics;
   errors.length = 0; // Ignore the expected non-tmux presentation diagnostic.
   h.start(); h.error(); h.settle();
-  for (let n = 1; n <= 3; n++) h.tick(600_000);
+  for (let n = 1; n <= 5; n++) h.tick(600_000);
+  h.tick(600_000); assert.equal(h.sent.length, 5, "send failures cannot create a sixth attempt");
   h.tick(6_000_000);
-  assert.equal(h.sent.length, 3);
-  assert.equal(errors.length, 3);
+  assert.equal(h.sent.length, 5);
+  assert.equal(errors.length, 5);
   assert.match(errors[0][0], /could not send continue/);
 });
 
