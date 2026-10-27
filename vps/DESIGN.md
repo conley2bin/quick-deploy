@@ -464,6 +464,17 @@ TCP与UDP监听分别核验PID/可执行文件/cgroup；TCP8443证书成功不�
 
 ## 已知限制与流量统计
 
+固定3x-ui 3.10.2（源码提交 `608ef4e4010bf83e2e78328e08f77efc051ad4d7`）的原生
+[UpdateInbound](https://github.com/MHSanaei/3x-ui/blob/608ef4e4010bf83e2e78328e08f77efc051ad4d7/internal/web/service/inbound.go#L1972-L1974)
+保留入站已存客户端投影；[SyncInbound / applyClientRecordMerge](https://github.com/MHSanaei/3x-ui/blob/608ef4e4010bf83e2e78328e08f77efc051ad4d7/internal/web/service/client_link.go#L81-L82)
+选择更早的创建时间；[ClientUpdate 入站同步](https://github.com/MHSanaei/3x-ui/blob/608ef4e4010bf83e2e78328e08f77efc051ad4d7/internal/web/service/client_inbound_apply.go#L808-L822)
+也会覆盖提交的 `created_at`。因此冷 restore/replace、reset/rename 可能把全局 `createdAt` 的毫秒尾数
+归一到较早的整秒入站元数据；已验证样本整秒不变，变化小于1000ms。这不改变网络、认证身份或到期/配额等策略语义，
+原始TAR中的关闭DB仍保留精确原始元数据。当前上线功能迁移保留了基线记录，但未来这些操作不能承诺
+`createdAt` 位级一致。`test_native_dual_recovery.py` 分开核验功能及该已知原生精度限制，
+保留精确相等的 `KNOWN_NATIVE_LIMIT` expected-failure；上游修正后应出现 unexpected-success 并审阅重锁版本，
+不能把它报告为完整记录精度通过，也不能据此容许任意创建日期丢失。
+
 Xray 的现有 `geoip:private` 阻断规则在 `api → api` 例外之前，阻断内部127.0.0.1
 统计 API 路径，所以当前流量计数不可信。不要据此判断是否走代理。
 流量展示需求已取消，此次不修改统计或路由；实际连接以客户端 HTTPS/出口验收为准。
