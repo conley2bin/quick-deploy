@@ -167,6 +167,16 @@ class LiveJobTests(unittest.TestCase):
         self.completed(ident, 125)
         print("INTERRUPTION: child retained admission lock; unknown result held reservation until explicit cancel", flush=True)
 
+    def test_07_minimum_job_has_no_inherited_tmux_identity(self):
+        environment = dict(self.env, TMUX="foreign-endpoint,999,0", TMUX_PANE="%999", KEEP_TEST_VALUE="required")
+        code = "import json,os; print(json.dumps(['TMUX' in os.environ,'TMUX_PANE' in os.environ,os.environ['KEEP_TEST_VALUE']]))"
+        ident = self.submit("minimum-detached", [PYTHON, "-c", code], ("--mem", "32M", "--swap", "0"), environment)
+        self.completed(ident, 0)
+        self.assertEqual(json.loads(self.cli("log", ident).stdout), [False, False, "required"])
+        directory = Path(json.loads(self.cli("status", ident).stdout)["directory"])
+        self.assertEqual(json.loads((directory / "run.json").read_text())["memoryHigh"], 24 * 1024**2)
+        print("MINIMUM:32MiB helper/finalizer completed; TMUX/TMUX_PANE absent, required environment retained", flush=True)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

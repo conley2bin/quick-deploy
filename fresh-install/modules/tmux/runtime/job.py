@@ -17,7 +17,7 @@ import uuid
 
 CAPACITY = 20 * 1024**3
 DEFAULT_MAX = 8 * 1024**3
-DEFAULT_HIGH = 6 * 1024**3
+MIN_MAX = 32 * 1024**2
 DEFAULT_SWAP = 1024**3
 SCRIPT = str(Path(__file__).resolve())
 PYTHON = str(Path(sys.executable).resolve())
@@ -153,9 +153,9 @@ def local_result(directory, result, code, **extra):
 def submit(args, root):
     if not args.name or len(args.name) > 128 or "\x00" in args.name:
         raise RuntimeError("name must contain 1..128 characters")
-    high = args.high if args.high is not None else min(DEFAULT_HIGH, args.mem * 3 // 4)
-    if not 0 < high <= args.mem <= CAPACITY or args.swap < 0:
-        raise RuntimeError("require 0 < high <= mem <=20G and swap >=0")
+    high = args.high if args.high is not None else args.mem * 3 // 4
+    if not MIN_MAX <= args.mem <= CAPACITY or not 0 < high <= args.mem or args.swap < 0:
+        raise RuntimeError("require 32M <= mem <=20G, 0 < high <= mem and swap >=0")
     argv = args.command
     if argv[:1] == ["--"]:
         argv = argv[1:]
@@ -180,7 +180,7 @@ def submit(args, root):
         # Whole caller environment is needed by venvs, credentials, toolchains.
         # It is private, ephemeral, and removed before executing the command.
         environment = dict(os.environ)
-        for key in ("INVOCATION_ID", "JOURNAL_STREAM", "SYSTEMD_EXEC_PID", "SERVICE_RESULT", "EXIT_CODE", "EXIT_STATUS"):
+        for key in ("TMUX", "TMUX_PANE", "INVOCATION_ID", "JOURNAL_STREAM", "SYSTEMD_EXEC_PID", "SERVICE_RESULT", "EXIT_CODE", "EXIT_STATUS"):
             environment.pop(key, None)
         atomic(envfile, environment)
         unit = "workstation-job-" + ident + ".service"
@@ -201,7 +201,7 @@ def submit(args, root):
         cmd = ["systemd-run", "--user", "--no-ask-password", "--quiet", "--collect", "--service-type=exec",
                "--expand-environment=no", "--unit=" + unit, "--slice=jobs.slice",
                "--property=Restart=no", "--property=OOMPolicy=kill", "--property=KillMode=control-group",
-               "--property=TimeoutStopSec=10s", "--property=StandardInput=null",
+               "--property=TimeoutStopSec=30s", "--property=StandardInput=null",
                "--property=MemoryHigh=" + str(high), "--property=MemoryMax=" + str(args.mem),
                "--property=MemorySwapMax=" + str(args.swap),
                "--property=StandardOutput=append:" + str(directory / "output.log"),
@@ -216,17 +216,28 @@ def submit(args, root):
             atomic(directory / "run.json", spec)
             print(f"{ident}\nsubmission uncertain; inspect status/cancel explicitly", file=sys.stderr)
             return 70
-        spec["submission"] = "accepted" if proc.returncode == 0 else "rejected"
-        atomic(directory / "run.json", spec)
-        reservation_spec["submission"] = spec["submission"]
-        atomic(reservation, reservation_spec)
         if proc.returncode:
             info = unit_info(unit)
-            if not is_live(info) and not (directory / "result.json").exists():
-                local_result(directory, "start-failed", 125, error=proc.stderr.strip())
-                envfile.unlink(missing_ok=True)
+            if info["LoadState"] != "not-found" or (directory / "result.json").exists():
+                # A failed acknowledgement cannot prove rejection of an
+                # enqueued, running, or already completed command. Do not
+                # invite a duplicate run; pending admission fails closed.
+                spec["submissionError"] = proc.stderr.strip() or f"systemd-run exited {proc.returncode}"
+                atomic(directory / "run.json", spec)
+                print(f"{ident}\nsubmission uncertain; inspect status/cancel explicitly: {spec['submissionError']}", file=sys.stderr)
+                return 70
+            spec["submission"] = "rejected"
+            atomic(directory / "run.json", spec)
+            reservation_spec["submission"] = "rejected"
+            atomic(reservation, reservation_spec)
+            local_result(directory, "start-failed", 125, error=proc.stderr.strip())
+            envfile.unlink(missing_ok=True)
             print(f"{ident}\nservice start failed: {proc.stderr.strip()}", file=sys.stderr)
             return 125
+        spec["submission"] = "accepted"
+        atomic(directory / "run.json", spec)
+        reservation_spec["submission"] = "accepted"
+        atomic(reservation, reservation_spec)
     print(ident, flush=True)
     return 0
 
