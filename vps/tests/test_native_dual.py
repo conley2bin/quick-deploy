@@ -8,6 +8,7 @@ Readiness/rollback uses the existing fixture's scheduler fake, not an OS reboot.
 import base64
 import copy
 from contextlib import closing
+import hashlib
 import http.server
 import io
 import json
@@ -19,6 +20,7 @@ import sqlite3
 import ssl
 import subprocess
 import tarfile
+import tempfile
 import threading
 import time
 import unittest
@@ -62,6 +64,57 @@ class NativeDual(unittest.TestCase):
                 data = dict(data, listen='127.0.0.1')
             return real_call(api, path, data)
         self.enterContext(mock.patch.object(host.API, 'call', new=loopback_add))
+        self.addCleanup(self.preserve_failure_evidence)
+
+    def preserve_failure_evidence(self):
+        result = self._outcome.result
+        if not any(test is self for test, _ in result.failures + result.errors):
+            return
+        # Collect while the owned panel/core and fixture files still exist.
+        # Keep raw native logs private; stdout receives only an artifact path.
+        destination = Path(tempfile.mkdtemp(prefix='qd-native-dual-failure-'))
+        os.chmod(destination, 0o700)
+        summary = {'test': self.id(), 'expected_core_version': self.fx.lock['core']['version']}
+        def retain(name, data):
+            path = destination / name
+            path.write_bytes(data if isinstance(data, bytes) else data.encode())
+            path.chmod(0o600)
+        try:
+            status = host.API(self.manifest).call('/panel/api/server/status') or {}
+            xray = status.get('xray', {})
+            summary['xray'] = {key: xray.get(key) for key in ('state', 'version', 'error')}
+        except Exception as error:
+            summary['status_error_type'] = type(error).__name__
+        try:
+            processes = subprocess.run(['ps', '-o', 'pid,ppid,etimes,comm', '--ppid', str(self.fx.proc.pid)],
+                                       capture_output=True, timeout=5)
+            retain('owned-processes.txt', processes.stdout)
+            listeners = subprocess.run(['ss', '-H', '-lntup'], capture_output=True, timeout=5)
+            ports = {self.manifest['config']['proxy_port'], host.ADMIN_PORT, host.SUB_PORT, host.API_PORT}
+            lines = [line for line in listeners.stdout.decode().splitlines()
+                     if any(':' + str(port) in line for port in ports)]
+            retain('fixture-listeners.txt', '\n'.join(lines))
+        except Exception as error:
+            summary['process_evidence_error_type'] = type(error).__name__
+        try:
+            check = subprocess.run([str(self.folder / 'bin/xray-linux-amd64'), 'run', '-test',
+                                    '-config', str(self.folder / 'bin/config.json')],
+                                   env=dict(os.environ, XRAY_LOCATION_ASSET=str(self.folder / 'bin')),
+                                   capture_output=True, timeout=15)
+            summary['config_check_returncode'] = check.returncode
+            retain('config-check.txt', check.stdout + check.stderr)
+        except Exception as error:
+            summary['config_check_error_type'] = type(error).__name__
+        self.fx.log.flush()
+        logs = [self.folder / 'native.log'] + list((self.folder / 'logs').rglob('*'))
+        for index, log in enumerate(logs):
+            if log.is_file() and not log.is_symlink():
+                retain(str(index) + '-' + log.name, log.read_bytes()[-256 * 1024:])
+        for port, log in getattr(self, '_client_log_paths', {}).items():
+            if log.is_file(): retain('client-' + str(port) + '.log', log.read_bytes()[-128 * 1024:])
+        summary['last_https'] = getattr(self, 'last_https_diagnostic', None)
+        retain('summary.json', json.dumps(summary, indent=2))
+        print('Private native failure evidence: ' + str(destination))
 
     @property
     def folder(self):
@@ -169,8 +222,8 @@ class NativeDual(unittest.TestCase):
         self.assertTrue(result.returncode == 0, 'Full native dual profile must parse in pinned local Mihomo')
         return profile
 
-    def archive(self):
-        path = host.export_backup()
+    def archive(self, request=None):
+        path = host.export_backup(request)
         stage = self.fx.root / ('dual-archive-' + str(time.monotonic_ns()))
         stage.mkdir()
         with path.open('rb') as source:
@@ -183,11 +236,24 @@ class NativeDual(unittest.TestCase):
         self.assertTrue(callable(getattr(host, 'transport_commit', None)), 'Missing frozen transport_commit action')
         request = self.fx.device_request('reset', 'company')
         request.pop('device_action'); request.pop('names')
-        return dict(request, mode='transport-upgrade', kind='transport-upgrade', ssh_port=22, lock=self.fx.lock)
+        source = (vps.MODULE / 'lib/host.py').read_bytes()
+        # This is the controller's real pre-change backup sequence: hand off
+        # capable recovery code before any feature intent, then verify the
+        # closed TCP archive and bind its digest once for this operation.
+        backup_request = dict(request, adapter_b64=base64.b64encode(source).decode())
+        before, _, verified = self.archive(backup_request)
+        self.assertFalse(host.dual_enabled(verified), 'Feature backup must describe the original TCP state')
+        self.assertTrue(host.digest(host.ROOT / 'host.py') == request['adapter_sha256'],
+                        'Verified pre-change backup did not install the current recovery adapter')
+        return dict(request, mode='transport-upgrade', kind='transport-upgrade', ssh_port=22, lock=self.fx.lock,
+                    before_sha256=host.digest(before), source_transports=['tcp-reality'],
+                    target_transports=['tcp-reality', 'hysteria2'])
 
     def prepare(self, request):
         # Transport upgrade changes no release assets. Only source + bound request
         # are uploaded, as for the existing module's native device transaction.
+        self.assertTrue(host.digest(host.ROOT / 'host.py') == request['adapter_sha256'],
+                        'Feature preparation must already have the uploaded capable recovery adapter')
         data = io.BytesIO()
         with tarfile.open(fileobj=data, mode='w') as tar:
             for name, value in (('request.json', host.dumps(request).encode()),
@@ -198,7 +264,14 @@ class NativeDual(unittest.TestCase):
         return host.transport_prepare(data)
 
     def finish(self, request):
+        # At this point export-sha256 still names the genuine pre-change archive.
+        # Accepting it would publish new H2 Auth without an off-node dual backup.
+        with self.assertRaisesRegex(host.Error, 'new dual-state backup'):
+            host.transport_commit(dict(request, offnode_sha256=request['before_sha256']))
+        self.assertTrue(host.read_json(host.ROOT / 'pending.json')['phase'] == 'prepared',
+                        'Rejected old-archive commit changed the prepared intent')
         path, _, verified = self.archive()
+        self.assertTrue(host.digest(path) != request['before_sha256'], 'Candidate archive reused the pre-change digest')
         result = host.transport_commit(dict(request, offnode_sha256=host.digest(path)))
         self.fx.manifest = host.read_json(self.folder / 'manifest.json')
         self.assertTrue(result.get('committed') and host.dual_enabled(verified))
@@ -218,17 +291,29 @@ class NativeDual(unittest.TestCase):
                 body = b'native-dual-https-egress\n'
                 self.send_response(200); self.send_header('Content-Length', str(len(body))); self.end_headers(); self.wfile.write(body)
             def log_message(self, *_): pass
-        server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Origin)
-        server.daemon_threads = True; server.peers = []
+        class OriginServer(http.server.ThreadingHTTPServer):
+            def get_request(self):
+                try:
+                    return super().get_request()
+                except ssl.SSLError as error:
+                    self.tls_errors.append(error.reason)
+                    raise
+        server = OriginServer(('127.0.0.1', 0), Origin)
+        server.daemon_threads = True; server.peers = []; server.tls_errors = []; server.snis = []
         server.trust_file = self.folder / ('origin-trust-' + str(server.server_port) + '.pem')
         server.trust_file.write_bytes(cert.read_bytes())
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER); context.load_cert_chain(cert, key)
+        context.set_servername_callback(lambda connection, name, original: server.snis.append(name))
         server.socket = context.wrap_socket(server.socket, server_side=True)
         threading.Thread(target=server.serve_forever, daemon=True).start()
         self.addCleanup(server.server_close); self.addCleanup(server.shutdown)
         self.fx.stop()
         with closing(sqlite3.connect(self.folder / 'db/x-ui.db')) as db:
             template = json.loads(db.execute("select value from settings where key='xrayTemplateConfig'").fetchone()[0])
+        # Keep native dispatcher/egress evidence if an authenticated stream fails
+        # before the origin TLS callback; all raw logs stay in the private fixture.
+        template['log'] = {'access': str(self.folder / 'logs/dual-access.log'),
+                           'error': str(self.folder / 'logs/dual-error.log'), 'loglevel': 'debug'}
         # Both exceptions are needed: pinned freedom blocks loopback even when
         # the routing rule chooses direct. Allow ONLY the owned origin port.
         for outbound in template['outbounds']:
@@ -262,10 +347,13 @@ class NativeDual(unittest.TestCase):
             env=dict(os.environ, SSL_CERT_FILE=str(trust_file)), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             text=True, start_new_session=True)
         ready = threading.Event()
+        if not hasattr(self, '_client_log_paths'):
+            self._client_log_paths = {}
+        self._client_log_paths[port] = directory / 'private.log'
         def capture():
             with (directory / 'private.log').open('w') as log:
                 for line in proc.stdout:
-                    log.write(line)
+                    log.write(line); log.flush()
                     if 'proxy listening at:' in line: ready.set()
         threading.Thread(target=capture, daemon=True).start()
         def stop():
@@ -279,10 +367,27 @@ class NativeDual(unittest.TestCase):
         return port
 
     def https(self, port, origin):
+        def core_children():
+            tasks = Path('/proc') / str(self.fx.proc.pid) / 'task'
+            found = set()
+            for children in tasks.glob('*/children'):
+                try: found.update(children.read_text().split())
+                except FileNotFoundError: pass
+            return ' '.join(sorted(found))
+        before_children = core_children()
         result = subprocess.run(['curl', '--silent', '--show-error', '--max-time', '4', '--noproxy', '',
             '--proxy', 'http://127.0.0.1:' + str(port), '--cacert', str(origin.trust_file),
-            'https://127.0.0.1:' + str(origin.server_port) + '/'], capture_output=True, timeout=6)
-        return result.returncode == 0 and result.stdout == b'native-dual-https-egress\n'
+            '--connect-to', 'sub.example.org:' + str(origin.server_port) + ':127.0.0.1:' + str(origin.server_port),
+            'https://sub.example.org:' + str(origin.server_port) + '/'], capture_output=True, timeout=6)
+        body_matches = result.stdout == b'native-dual-https-egress\n'
+        after_children = core_children()
+        log_path = getattr(self, '_client_log_paths', {}).get(port)
+        log = log_path.read_text().lower() if log_path and log_path.exists() else ''
+        stages = [name for name in ('certificate', 'authentication', 'timeout', 'connection refused', 'closed') if name in log]
+        # Diagnostic categories and curl's local-fixture stderr only; never emit
+        # native profiles, UUIDs, Auth values or full client logs on failure.
+        self.last_https_diagnostic = 'curl_exit=' + str(result.returncode) + ', exact_body=' + str(body_matches) + ', stages=' + ','.join(stages) + ', origin_tls=' + ','.join(origin.tls_errors[-3:]) + ', core_children=' + before_children + '->' + after_children + ', stderr=' + result.stderr.decode(errors='replace').strip()
+        return result.returncode == 0 and body_matches
 
     def test_enable_preserves_full_native_policy_and_exports(self):
         self.seed_policy()
@@ -314,6 +419,7 @@ class NativeDual(unittest.TestCase):
         old_profile = self.assert_native_exports(); old = self.client(old_profile)
         self.assertTrue(self.https(old, origin), 'Native module H2 did not carry verified HTTPS')
         self.assertTrue(origin.peers and set(origin.peers) == {'127.0.0.1'}, 'Owned fixture origin did not observe tunnel egress')
+        self.assertTrue(origin.snis and set(origin.snis) == {'sub.example.org'}, 'HTTPS origin did not receive the verified fixture SNI')
         reset_before = self.records()
         reset = self.device('reset', 'company')
         reset_records = self.records()
@@ -373,7 +479,14 @@ class NativeDual(unittest.TestCase):
         with self.assertRaises(host.Error): host.verify_backup(stage, self.fx.lock)
 
     def test_transport_failure_rolls_back_queued_and_receipt_replay_is_once(self):
+        # Exercise a real recognized TCP-era recovery handoff, rather than
+        # starting with capable source already installed in the fixture root.
+        predecessor = subprocess.check_output(['git', 'show', '6c02d25:vps/lib/host.py'])
+        self.assertTrue(hashlib.sha256(predecessor).hexdigest() == host.BASELINE_ADAPTER_SHA256,
+                        'Fixture predecessor does not match the reviewed TCP-only adapter')
+        host.atomic(host.ROOT / 'host.py', predecessor, 0o700)
         request = self.request(); before = self.records(); joins = self.rows('client_inbounds')
+        bound = host.transport_request(request)
         real_enable = host.enable_hysteria
         def partial(*args):
             real_enable(*args)
@@ -388,8 +501,13 @@ class NativeDual(unittest.TestCase):
         self.fx.manifest = host.read_json(self.folder / 'manifest.json')
         self.assertFalse(host.dual_enabled(self.manifest))
         self.assertTrue(self.records() == before and self.rows('client_inbounds') == joins, 'Pre-receipt failure did not restore original native state')
+        with self.assertRaises(host.Error): self.prepare(dict(request, before_sha256='0' * 64))
         self.prepare(request)
-        path, _, _ = self.archive(); receipt = dict(request, offnode_sha256=host.digest(path))
+        self.assertTrue(host.read_json(host.ROOT / 'pending.json')['request_sha256'] == bound,
+                        'Rollback retry lost the original pre-change archive binding')
+        path, _, _ = self.archive()
+        self.assertTrue(host.digest(path) != request['before_sha256'], 'Retry candidate archive must differ from the original TCP backup')
+        receipt = dict(request, offnode_sha256=host.digest(path))
         real_atomic = host.atomic
         def lose_ack(path, data, mode=0o600):
             real_atomic(path, data, mode)
@@ -434,14 +552,14 @@ class NativeDual(unittest.TestCase):
         cert.write_bytes(saved[0]); key.write_bytes(saved[1])
         origin = self.origin(); self.enable()
         profile = self.assert_native_exports(); old_root = self.folder / 'old-trust.pem'; old_root.write_bytes(cert.read_bytes())
-        self.assertTrue(self.https(self.client(profile), origin))
+        self.assertTrue(self.https(self.client(profile), origin), self.last_https_diagnostic)
         before = self.records(); self.make_certificate(); self.enable()
         self.assertTrue({n: {k: v for k, v in c.items() if k != 'updatedAt'} for n, c in self.records().items()} ==
                         {n: {k: v for k, v in c.items() if k != 'updatedAt'} for n, c in before.items()},
                         'Certificate refresh regenerated account Auth or policy')
         # Explicit module consumer reload, NOT a claim that the hourly builtin
         # ticker or a real Caddy ACME renewal was exercised.
-        self.assertTrue(self.https(self.client(profile), origin), 'New consumer did not trust replacement H2 pair')
+        self.assertTrue(self.https(self.client(profile), origin), 'New consumer did not trust replacement H2 pair: ' + self.last_https_diagnostic)
         self.assertFalse(self.https(self.client(profile, trust=old_root), origin), 'Old trust root accepted replacement H2 certificate')
 
 

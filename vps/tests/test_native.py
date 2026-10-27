@@ -401,7 +401,7 @@ class Native(unittest.TestCase):
         history=traffic();self.assertEqual(history,[('home',123456,654321),('tablet',777777,888888)])
         self.assertNotIn('tablet',before)
         state=self.root/'history-operator';state.mkdir(mode=0o700)
-        record={'endpoint':self.manifest['endpoint'],'machine_id':host.machine_id()}
+        record={'endpoint':self.manifest['endpoint'],'machine_id':host.machine_id(),'port':22}
         doc={'owner':self.manifest['owner'],'config':self.manifest['config'],'current':record}
         def remote(record,action,request=None,**kwargs):
             self.assertEqual(action,'status');self.assertEqual(request['rename_target'],'tablet')
@@ -790,7 +790,7 @@ class Native(unittest.TestCase):
         import argparse
         self.device_fixture()
         state = self.root / 'operator-state'; state.mkdir(mode=0o700)
-        record = {'endpoint':self.manifest['endpoint'], 'machine_id':host.machine_id()}
+        record = {'endpoint':self.manifest['endpoint'], 'machine_id':host.machine_id(), 'port':22}
         document = {'format':host.FORMAT,'owner':self.manifest['owner'],'config':self.manifest['config'],
                     'current':record,'previous':[],'backup':None}
         custom_core = state/'custom-core'
