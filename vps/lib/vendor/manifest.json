@@ -1,0 +1,11 @@
+{
+  "name": "qrcodegen",
+  "version": "1.8.0",
+  "license": "MIT",
+  "source_url": "https://raw.githubusercontent.com/nayuki/QR-Code-generator/v1.8.0/python/qrcodegen.py",
+  "source_sha256": "b089855caf16185c61421ea4927c1b213cf9468940d71fa8ab11ef83662dcc84",
+  "pypi_metadata_url": "https://pypi.org/pypi/qrcodegen/1.8.0/json",
+  "sdist_url": "https://files.pythonhosted.org/packages/86/f8/d961d4e7035f8f67ca623e3e53ca7c610951b01b76667dee43f55d2e32f5/qrcodegen-1.8.0.zip",
+  "sdist_sha256": "82db61f5065b6ba6d7606115b9413abdafdf3fe9c2810047100d08eced186e9e",
+  "verification": "Official PyPI sdist SHA256 verified against version metadata; qrcodegen.py bytes equal official GitHub v1.8.0 tag source. No runtime downloads."
+}

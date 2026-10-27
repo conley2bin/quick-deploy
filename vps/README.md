@@ -101,11 +101,33 @@ bash vps/setup.sh export --device phone --bootstrap-dir "$VPS_STATE/bootstrap/ph
 ```
 
 得到该设备的原生 `.yaml` 完整 profile、原生 base64 `.txt` 订阅、解码后的 `.uris.txt` 和私有 `.urls.json`；
-原生字节不经过节点转换。电脑以本地文件导入完整 YAML，手机私下传送**自己的** URI 文件导入。
+原生字节不经过节点转换。另有该设备的离线 `index.html`、每节点及两个订阅 URL 的 SVG 二维码；直接用浏览器打开 `index.html`。
+电脑以本地文件导入完整 YAML，手机私下传送**自己的** URI 文件导入。
 H2 是新订阅的默认首选，TCP/REALITY 仍可选；GUI 可能缓存旧选择，导入后要明确选中 `SELF-h2` 并核验实际连接。
 手机保留已验证的 **Chrome140 / X25519MLKEM768** TCP 指纹；URI 本身不提供手机分流策略，国内/Bili直连需单独核验。
 有 pending、备份/快照 hash 不匹配、文件篡改、禁用/删除设备或跨设备凭据时，离线导出拒绝，不会改用候选文件。
 文件含凭据，不贴工单、不放 Git；旧导出和旧备份可能保留已经撤销的钥匙。
+
+## 本地连接资料网页与二维码
+
+```bash
+bash vps/setup.sh dashboard
+# 可选：只导出一个启用设备，或指定 Git 之外的私有目录
+bash vps/setup.sh dashboard --device phone --output-dir "$HOME/.local/state/quick-deploy-private/vps/dashboard-phone"
+```
+
+默认打开 `~/.local/state/quick-deploy-private/vps/dashboard/index.html`；自选 `--state-dir` 时位于该状态的 `dashboard/`。
+这是**已提交 generation 的离线连接资料**：按设备搜索、复制、查看/下载二维码及原生配置，不启动 HTTP 服务，不联网，不增删服务器账户。
+每个启用设备包含原生订阅中的全部节点 URI，以及 Mihomo / Shadowrocket 两个订阅 URL；订阅二维码导入的是 URL，不是单节点。
+页面中的“启用”只表示备份内账户状态，**不代表在线或已测连通**。当前优先使用 H2，保留 TCP 选项不意味着当前 TCP 路径可用。
+
+二维码使用仓库内固定的 Nayuki `qrcodegen 1.8.0` 纯 Python 编码器，直接编码原生 URI 的 UTF-8 字节，不转码密码/URL，不调用在线制码。
+其版本、官方来源及 SHA256 见 `lib/vendor/manifest.json`；这是本地工具依赖，服务器的三个 release-lock pin 不变。过长链接明确失败，不截断。
+
+整个输出目录包含凭据，目录0700、文件0600，必须位于 Git 之外；不要上传、公开托管或共享完整目录。
+仅更新/清理 `.qd-dashboard.json` 精确记录的本模块文件，用户旁置文件保留。
+网页不是实时面板：reset/remove/禁用后，先通过正常模块流程同步备份及原生 generation，再重新运行 dashboard 或对应 bootstrap export。
+浏览器刷新不读取服务器；旧二维码、已复制链接、另存网页和历史备份不会被自动擦除。以最新撤销后备份为准。
 
 ## 独立 H2 管理监听
 

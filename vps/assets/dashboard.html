@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <title>连接资料 · VPS 离线快照</title>
+  <link rel="stylesheet" href="dashboard.css">
+  <script src="dashboard.js" defer></script>
+</head>
+<body>
+  <a class="skip-link" href="#connection-content">跳至连接资料</a>
+  <div class="app-shell" id="app-shell">
+    <header class="topbar">
+      <div class="brand"><span class="brand-mark" aria-hidden="true">↗</span><div><strong>连接资料</strong><span class="brand-caption">VPS / 本地导入工作台</span></div></div>
+      <span class="snapshot-badge">已提交离线快照</span>
+    </header>
+    <div class="workspace">
+      <aside class="sidebar" aria-label="选择设备">
+        <div class="sidebar-heading"><h2>我的设备</h2><span id="device-count" class="count">0</span></div>
+        <label class="search-label" for="device-search">搜索设备</label>
+        <input id="device-search" type="search" placeholder="输入设备名称…" autocomplete="off" spellcheck="false">
+        <nav id="device-list" class="device-list" aria-label="设备列表"></nav>
+        <p id="search-empty" class="muted" hidden>没有匹配的设备，请换个名称。</p>
+        <div class="sidebar-note"><span class="eyebrow">仅保存在本地</span><p>按设备取用连接资料。二维码和配置均从此文件夹读取。</p><p>此目录包含连接凭据，请妥善保管，勿公开分享。</p></div>
+      </aside>
+      <main id="connection-content" tabindex="-1">
+        <section class="notice" aria-label="快照使用提示"><span class="notice-icon" aria-hidden="true">i</span><p>这不是在线连通性测试；账户重置/删除后请重新生成此页。</p></section>
+        <section id="load-error" class="error-panel" role="alert" hidden></section>
+        <div id="device-content" hidden>
+          <header class="device-heading"><div><p class="eyebrow">当前设备 / CONNECTIONS</p><h1 id="device-name"></h1><p class="muted">选择单个节点导入，或使用客户端订阅。</p></div><span id="device-state" class="state-badge"></span></header>
+          <p id="disabled-notice" class="notice disabled-notice" hidden>此设备在快照中已停用，不提供导入链接或配置。</p>
+          <section class="connection-section" aria-labelledby="nodes-heading"><div class="section-heading"><h2 id="nodes-heading">原生节点</h2><span class="muted">单节点 · 扫码或复制导入</span></div><div id="node-links" class="card-grid"></div></section>
+          <section class="connection-section" aria-labelledby="subscriptions-heading"><div class="section-heading"><h2 id="subscriptions-heading">客户端订阅</h2><span class="muted">在对应客户端内添加订阅</span></div><div id="subscription-links" class="card-grid"></div></section>
+          <section class="downloads-section" aria-labelledby="downloads-heading"><div><h2 id="downloads-heading">下载配置</h2><p class="muted">保留原生文件格式，供离线导入。</p></div><div id="config-downloads" class="download-list"></div></section>
+        </div>
+        <footer class="snapshot-footer"><div class="snapshot-details"><span>快照生成 <time id="generated-at">—</time></span><span>备份 SHA256 <code id="backup-digest">—</code></span><span>端点 <span id="endpoint">—</span></span></div><details class="generation-help"><summary>如何更新连接资料？</summary><p>先通过 VPS 模块正常完成 backup / export，再运行 dashboard 重新生成。重新打开此文件只会读取本地快照，不会刷新服务端。</p></details></footer>
+      </main>
+    </div>
+    <p id="status-message" class="status-message" role="status" aria-live="polite" aria-atomic="true"></p>
+  </div>
+  <dialog id="qr-dialog" aria-labelledby="qr-title" aria-describedby="qr-description">
+    <div class="dialog-heading"><div><p id="qr-device" class="eyebrow"></p><h2 id="qr-title">连接二维码</h2></div><button type="button" id="qr-close" class="icon-button" aria-label="关闭二维码">×</button></div>
+    <p id="qr-description" class="muted">在对应客户端中扫码导入。二维码包含此设备的连接凭据。</p>
+    <div class="qr-frame"><img id="qr-image" alt="" width="360" height="360"></div>
+    <p id="qr-error" role="alert" hidden>二维码文件无法读取，请重新生成完整目录。</p>
+    <div class="dialog-actions"><button type="button" id="qr-copy" class="button primary">复制链接</button><a id="qr-download" class="button secondary" download>下载二维码</a></div>
+    <p class="dialog-footnote">只读取本地 SVG · 不向在线制码服务发送资料</p>
+  </dialog>
+  <dialog id="copy-dialog" aria-labelledby="copy-title" aria-describedby="copy-description">
+    <div class="dialog-heading"><h2 id="copy-title">手动复制链接</h2><button type="button" id="copy-close" class="icon-button" aria-label="关闭手动复制">×</button></div>
+    <p id="copy-description">浏览器未允许自动复制。请在下方选中链接，使用系统的复制操作。</p>
+    <label for="manual-copy" id="manual-copy-label">当前连接链接</label><textarea id="manual-copy" rows="5" readonly spellcheck="false"></textarea><button type="button" id="select-copy" class="button secondary">全选链接</button>
+  </dialog>
+  <noscript><p class="error-panel">请启用 JavaScript 以选择设备和查看本地连接资料。</p></noscript>
+  <script type="application/json" id="dashboard-data">__QD_DATA__</script>
+</body>
+</html>

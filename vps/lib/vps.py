@@ -29,6 +29,7 @@ import zlib
 
 import bootstrap
 import host
+import link_dashboard
 import ssh_proxy
 
 # Carrier selection never enters saved target records or operation fingerprints.
@@ -685,9 +686,9 @@ def export_urls(state):
     return destination
 
 
-def export_bootstrap(state, args):
+def committed_dashboard_source(state):
     if (state / 'pending.json').exists() or (state / 'pending.json').is_symlink():
-        raise host.Error('Pending transaction is ambiguous; use recover before bootstrap export')
+        raise host.Error('Pending transaction is ambiguous; use recover before dashboard/bootstrap export')
     document = load(state / 'state.json')
     if document.get('format') != host.FORMAT or not document.get('current') or not document.get('backup'):
         raise host.Error('Bootstrap requires saved committed state')
@@ -697,13 +698,86 @@ def export_bootstrap(state, args):
         raise host.Error('No committed native generation; capture with deploy or backup through a working SSH carrier first')
     if not host.dual_enabled(manifest):
         raise host.Error('Offline dual bootstrap requires a committed dual-transport snapshot')
+    return manifest, digest, read_generation(state, manifest, digest)
+
+
+def dashboard_render(manifest, digest, files, device=None, extra_downloads=None):
+    assets = {name: (MODULE / 'assets' / name).read_bytes()
+              for name in ('dashboard.html', 'dashboard.css', 'dashboard.js')}
+    return link_dashboard.render(manifest, files, subscription_urls(manifest), digest, assets,
+                                 device, extra_downloads)
+
+
+def publish_dashboard(destination, index, assets, selected=None):
+    """Immutable downloads + index-last publication; prune only a bound inventory."""
+    destination = destination.expanduser().absolute()
+    if any((parent / '.git').exists() or (parent / '.git').is_symlink()
+           for parent in (destination, *destination.parents)):
+        raise host.Error('Dashboard/bootstrap output must be outside Git worktrees')
+    selected = selected or {}
+    current = {name: hashlib.sha256(data).hexdigest() for name, data in dict(assets, **selected).items()}
+    # Validate our own intended names with the same closed vocabulary used on disk.
+    link_dashboard.inventory(link_dashboard.inventory_bytes(current))
+    with directory_fd(destination, create=True) as directory:
+        try:
+            fcntl.flock(directory, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise host.Error('Another export owns this dashboard directory') from None
+        names = set(os.listdir(directory))
+        if any(name.endswith('.management.yaml') and name not in selected for name in names):
+            raise host.Error('Existing management runtime requires explicit refresh or manual cleanup; no files changed')
+        previous = (link_dashboard.inventory(read_at(directory, link_dashboard.INVENTORY,
+                    link_dashboard.MAX_INVENTORY_BYTES)) if link_dashboard.INVENTORY in names else {})
+        if 'index.html' in names and link_dashboard.INVENTORY not in names:
+            raise host.Error('Refusing an unowned dashboard index; no files changed')
+        # Every touched old/new path is checked before the first credential write.
+        for name in set(previous) | set(current) | set(selected) | {'index.html'}:
+            if name not in names:
+                continue
+            info = os.stat(name, dir_fd=directory, follow_symlinks=False)
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o600:
+                raise host.Error('Refusing unknown or nonprivate dashboard/bootstrap output')
+            if name in previous:
+                # Legacy bootstrap paths are intentionally mutable; an interrupted
+                # update may leave either generation there. The page never uses them.
+                if (link_dashboard.ASSET_NAME.fullmatch(name) and
+                        hashlib.sha256(read_at(directory, name)).hexdigest() != previous[name]):
+                    raise host.Error('Managed dashboard asset changed; no files changed')
+            elif name in assets:
+                raise host.Error('Refusing an unowned dashboard asset; no files changed')
+        # A durable union also owns partial assets after an interrupted publication.
+        write_at(directory, link_dashboard.INVENTORY,
+                 link_dashboard.inventory_bytes(dict(previous, **current)))
+        for name, data in assets.items():
+            if name not in names:
+                write_at(directory, name, data)
+        for name, data in selected.items():
+            write_at(directory, name, data)
+        write_at(directory, 'index.html', index)
+        for name in set(previous) - set(current):
+            try:
+                os.unlink(name, dir_fd=directory)
+            except FileNotFoundError:
+                pass
+        os.fsync(directory)
+        write_at(directory, link_dashboard.INVENTORY, link_dashboard.inventory_bytes(current))
+    return destination
+
+
+def export_dashboard(state, args):
+    manifest, digest, files = committed_dashboard_source(state)
+    _, index, assets = dashboard_render(manifest, digest, files, args.device)
+    destination = publish_dashboard(args.output_dir or state / 'dashboard', index, assets)
+    print('Private offline dashboard snapshot: ' + str(destination / 'index.html'))
+    return destination
+
+
+def export_bootstrap(state, args):
+    manifest, digest, files = committed_dashboard_source(state)
     if args.device not in host.device_names(manifest) or not manifest['accounts'][args.device]['enable']:
         raise host.Error('Bootstrap device is removed, disabled or unknown')
-    files = read_generation(state, manifest, digest)
     device = args.device
-    selected = {device + ext: files[device + ext] for ext in ('.yaml', '.txt')}
-    selected[device + '.uris.txt'] = base64.b64decode(files[device + '.txt'], validate=True)
-    selected[device + '.urls.json'] = host.dumps(subscription_urls(manifest)[device]).encode()
+    selected = link_dashboard.native_material(device, files, subscription_urls(manifest))
     management = getattr(args, 'management_interface', None)
     port = 10808 if args.management_port is None else args.management_port
     binary = None
@@ -730,22 +804,9 @@ def export_bootstrap(state, args):
             path = Path(tmp) / management_name
             host.atomic(path, selected[management_name])
             host.run([binary, '-t', '-d', tmp, '-f', path], timeout=60)
-    destination = args.bootstrap_dir.expanduser().absolute()
-    # Private profile bytes must not land in this or another Git worktree.
-    if any((parent / '.git').exists() for parent in (destination, *destination.parents)):
-        raise host.Error('Bootstrap output must be outside Git worktrees')
-    with directory_fd(destination, create=True) as directory:
-        # Precheck the entire destination set before replacing any old output.
-        for name in selected:
-            try:
-                info = os.stat(name, dir_fd=directory, follow_symlinks=False)
-            except FileNotFoundError:
-                continue
-            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o600:
-                raise host.Error('Refusing unknown or nonprivate bootstrap output')
-        for name, data in selected.items():
-            write_at(directory, name, data)
-    for name in selected:
+    _, index, assets = dashboard_render(manifest, digest, files, device, {device: selected})
+    destination = publish_dashboard(destination, index, assets, selected)
+    for name in (*selected, 'index.html'):
         print(str(destination / name))
     if management is not None:
         print(shlex.join([binary, '-d', str(destination), '-f', str(destination / management_name)]))
@@ -1101,9 +1162,9 @@ def parser():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--state-dir', type=Path, default=DEFAULT_STATE)
     sub = p.add_subparsers(dest='command', required=True)
-    for name in ('deploy', 'replace', 'restore', 'preflight', 'status', 'backup', 'recover', 'export'):
+    for name in ('deploy', 'replace', 'restore', 'preflight', 'status', 'backup', 'recover', 'export', 'dashboard'):
         a = sub.add_parser(name)
-        if name != 'export':
+        if name not in ('export', 'dashboard'):
             a.add_argument('--ssh-proxy', type=proxy_argument,
                            help='invocation-only socks5://127.0.0.1:PORT or http://127.0.0.1:PORT; default direct')
         if name in ('deploy', 'replace', 'restore', 'preflight'):
@@ -1126,6 +1187,9 @@ def parser():
             a.add_argument('--bootstrap-dir', type=Path, help='private output directory outside Git; pair with --device')
             a.add_argument('--management-interface', help='explicit physical Linux interface; render isolated H2 management profile')
             a.add_argument('--management-port', type=int, help='loopback management listener port; default10808 with --management-interface')
+        if name == 'dashboard':
+            a.add_argument('--output-dir', type=Path, help='private static output outside Git; default STATE/dashboard')
+            a.add_argument('--device', help='show only this enabled committed device')
         if name == 'restore':
             a.set_defaults(backup_required=True)
     a = sub.add_parser('devices', help='manage manifest-owned device credentials')
@@ -1175,6 +1239,8 @@ def main(argv=None):
                 print(host.dumps(remote(record, 'preflight', request_for(document, record))), end='')
             elif args.command == 'recover':
                 recover_local(state, document, args.mihomo)
+            elif args.command == 'dashboard':
+                export_dashboard(state, args)
             elif args.command == 'export':
                 if args.device:
                     export_bootstrap(state, args)

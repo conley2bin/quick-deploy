@@ -377,6 +377,35 @@ Python优化模式不会删除它。失败私有目录保留供检查，不删�
 接口已删除；历史实现保留在Git，不复制归档。其他模块的可选旧JSON读取器未改，新的profile
 不会写入它们的旧输入路径。
 
+## 本地静态连接资料
+
+`dashboard [--output-dir DIR] [--device NAME]` 与设备 bootstrap export 共用现有 pending 拒绝、
+`checked_backup` 和 `read_generation`：完整已提交备份 SHA/owner/config/端点/名册/原生文件 hash
+全部匹配后才绘制。当前与 bootstrap 一样要求显式双协议 generation；旧 TCP 快照不会被静默忽略或补造 H2。
+节点 URI 仅从原生 base64 feed 解码，排除记录换行后保留 UTF-8 字节及百分号转义；fragment 只作界面标签。
+订阅 URL 复用 `subscription_urls`，不另做入站/节点编码器，不读取/写入生产数据库，不建立网络连接。
+禁用设备可显示状态但无凭据条目；“启用”不是在线连通性或 TCP 可用性判断。
+
+固定本地编码器是官方 Nayuki qrcodegen1.8.0 单文件 MIT 实现，`lib/vendor/manifest.json` 记录
+官方 PyPI sdist SHA256、GitHub v1.8.0 源码 URL 及文件 SHA256；两官方来源的代码字节相同。
+编码使用 UTF-8 ECI/byte segment、中等纠错、确定性黑白 SVG、四模块 quiet zone，容量不足明确失败且不回显秘密。
+这是本地工具 pin，不是服务器第四组件；原 `release-lock.json` 不变，无 pip/系统依赖安装或运行时下载。
+
+渲染先在内存生成全部字节。输出复用 no-follow 目录描述符与当前 owner0700/普通文件0600检查，拒绝 Git 内目录。
+页面只引用 SHA256 命名的不可变本地 CSS/JS/QR/配置；现有四个 bootstrap 文件名及独立管理配置语义保留。
+`.qd-dashboard.json` schema1 精确绑定内容 hash 文件名及完整设备 bootstrap 文件组，不接受任意路径。
+发布前检查全部旧受管及新目标文件，先持久记录新旧 inventory 并集，再写新文件，最后原子替换 `index.html`；
+随后仅清理旧 inventory 中不再引用的文件并压缩 inventory。发布中断不会令旧 index 引用新的 QR 或配置，重试可清理已登记残留。
+用户旁置文件不参与清理；已有未知 index、篡改的受管资产或不安全路径明确拒绝。
+已有管理运行时仍要求显式管理参数并重新执行本地 Mihomo 格式校验，不因网页缓存跳过。
+
+HTML 的单一 `__QD_DATA__` 替换使用 JSON，转义 `<>&` 和 Unicode 行分隔符，阻断 script-end 注入；
+界面标签通过 DOM textContent 显示。schema1 的附加 `files` 映射只内嵌页面明确列出的 QR/配置下载的原始字节（base64），
+用于 file:// 下 Blob 下载，避免浏览器忽略本地 `<a download>` 或拒绝本地 fetch；不枚举私有目录，不内嵌备份/状态或其他文件。
+所有二维码、URI、HTML 和下载都是私有能力资料，隐藏链接不等于加密。
+生成时间指本次渲染时间，备份 hash 绑定原生来源；页面没有健康探测、远端刷新或账户 CRUD。
+重置/撤销后需要先同步权威快照再重新生成，历史导出、已分发二维码及旧备份不会自动擦除。
+
 ## 隔离测试与生产门槛
 
 ```bash
