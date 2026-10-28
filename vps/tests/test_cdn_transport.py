@@ -1009,6 +1009,12 @@ class SourceNativeCDN(unittest.TestCase):
         cls.addClassCleanup(native_dual.NativeDual.doClassCleanups)
 
     def test_transport_handler_native_updates_exports_archive_and_abort(self):
+        self.native_case(commit=False)
+
+    def test_transport_handler_native_auth_final_archive_and_commit(self):
+        self.native_case(commit=True)
+
+    def native_case(self, commit):
         native = self.native_dual.native
         fx = self.native_dual.NativeDual('test_enable_preserves_full_native_policy_and_exports')
         fx._outcome = self._outcome
@@ -1030,6 +1036,21 @@ class SourceNativeCDN(unittest.TestCase):
                         if path.is_file(): host.atomic(destination / 'retained-witness.log', path.read_bytes())
             self.addCleanup(retain_private)
         fx.seed_policy(); fx.enable()
+        import test_native_cdn as native_cdn
+        import test_native_cdn_triple as triple
+        wire = native_cdn.NativeCDN('runTest')
+        wire.fx = fx
+        wire.evidence = Path(os.environ.get('QD_NATIVE_AUTH_EVIDENCE', str(fx.folder.parent / 'auth-evidence'))) / ('commit' if commit else 'abort')
+        wire.evidence.mkdir(mode=0o700, parents=True, exist_ok=True)
+        self.addCleanup(wire.doCleanups)
+        target_port, moved_port = native.free_port(), native.free_port()
+        triple.NativeCDNTriple.front(wire, target_port)
+        api = fx.api()
+        main = next(i for i in api.call('/panel/api/inbounds/list') if i['remark'] == 'SELF-main')
+        main_stream = json.loads(main['streamSettings'])
+        main_stream['realitySettings']['dest'] = '127.0.0.1:' + str(target_port)
+        main['streamSettings'] = json.dumps(main_stream)
+        api.call('/panel/api/inbounds/update/' + str(main['id']), main)
         # Reuse the existing HTTPS origin's narrow local routing exceptions, but
         # remove its debug instrumentation BEFORE capturing the original state.
         origin = fx.origin()
@@ -1051,7 +1072,7 @@ class SourceNativeCDN(unittest.TestCase):
         request.pop('device_action'); request.pop('names')
         request.update(mode='transport-upgrade', feature='tcp-cdn', ssh_port=22, before_sha256=before_hash,
             source_transports=['tcp-reality', 'hysteria2'], target_transports=['tcp-reality', 'tcp-xhttp-cdn', 'hysteria2'],
-            tcp_cdn={'schema': 1, 'domain': 'cdn.example.org', 'reality_port': 9443})
+            tcp_cdn={'schema': 1, 'domain': 'cdn.example.org', 'reality_port': moved_port})
         def issue(folder, manifest, domain):
             # HTTP01 issuance is an external boundary. Issue a matching private
             # fixture pair; all native mutation/health/archive code stays real.
@@ -1075,6 +1096,12 @@ class SourceNativeCDN(unittest.TestCase):
             self.assertEqual(int(fields[1]), fx.fx.proc.pid)
             return {'boot_id': host.boot_id(), 'pid': int(pid), 'start_ticks': int(fields[19])}
         source_health = host.reality_source_health
+        def fixture_source_health(inbound, manifest):
+            self.assertEqual(inbound['listen'], '127.0.0.1')
+            stream = json.loads(inbound['streamSettings']) if isinstance(inbound['streamSettings'], str) else copy.deepcopy(inbound['streamSettings'])
+            self.assertEqual(stream['realitySettings']['dest'], '127.0.0.1:' + str(target_port))
+            stream['realitySettings']['dest'] = manifest['config']['reality_target'] + ':443'
+            return source_health(dict(inbound, listen='0.0.0.0', streamSettings=stream), manifest)
         # Existing native fixture confines listeners to loopback/high ports.
         # Only these socket coordinates and the ACME/DNS boundary are adapted.
         with mock.patch.object(host, 'CDN_PORT', original['config']['proxy_port']), \
@@ -1082,8 +1109,7 @@ class SourceNativeCDN(unittest.TestCase):
                 mock.patch.object(host, 'bootstrap_cdn_certificate', side_effect=issue), \
                 mock.patch.object(host, 'check_cdn_dns'), \
                 mock.patch.object(host, 'auth_core_epoch', side_effect=fixture_epoch), \
-                mock.patch.object(host, 'reality_source_health', side_effect=lambda inbound, manifest:
-                    source_health(dict(inbound, listen='0.0.0.0'), manifest)):
+                mock.patch.object(host, 'reality_source_health', side_effect=fixture_source_health):
             import vps
             with vps.upload_bundle(request) as stream:
                 prepared = host.transport_prepare(stream)
@@ -1091,33 +1117,42 @@ class SourceNativeCDN(unittest.TestCase):
             current = host.read_json(fx.folder / 'manifest.json')
             self.assertEqual(host.transports(current), request['target_transports'])
             self.assertEqual(current['hysteria2'], original['hysteria2'])
-            expected_joins = [dict(row, flow_override='') if row['inbound_id'] == current['tcp_cdn']['inbound_id'] else row
-                              for row in joins]
-            self.assertEqual(fx.rows('client_inbounds'), expected_joins)
+            after_joins = fx.rows('client_inbounds')
+            self.assertEqual([r for r in after_joins if r['inbound_id'] != current['tcp_cdn']['inbound_id']], joins)
+            self.assertEqual(len(after_joins), 3 * len(records))
+            self.assertEqual({(r['client_id'], r['inbound_id']) for r in after_joins},
+                {(c['id'], i['id']) for c in fx.rows('clients') for i in fx.rows('inbounds')})
+            self.assertEqual(len(fx.rows('inbounds')), 3)
+            self.assertEqual(len(fx.rows('hosts')), 3)
+            main_after = next(i for i in fx.api().call('/panel/api/inbounds/list') if i['remark'] == 'SELF-main')
+            self.assertEqual((main_after['id'], main_after['tag'], main_after['port']),
+                (main['id'], main['tag'], moved_port))
+            self.assertEqual(current['tcp_cdn']['reality_tag'], main['tag'])
+            self.assertEqual(current['host_group_id'], original['host_group_id'])
+            self.assertEqual(json.loads(main_after['streamSettings'])['realitySettings'], main_stream['realitySettings'])
+            self.assertEqual(current['config'], original['config'])
+            self.assertEqual(current['reality'], original['reality'])
             self.assertEqual([r for r in fx.rows('hosts') if r['inbound_id'] == original['hysteria2']['inbound_id']], h2_rows)
             for name, record in records.items():
                 after = fx.records()[name]
-                self.assertEqual({k: v for k, v in after.items() if k not in ('flow', 'createdAt', 'updatedAt')},
-                    {k: v for k, v in record.items() if k not in ('flow', 'createdAt', 'updatedAt')})
-                self.assertEqual(after['flow'], '')
+                self.assertEqual({k: v for k, v in after.items() if k not in ('createdAt', 'updatedAt')},
+                    {k: v for k, v in record.items() if k not in ('createdAt', 'updatedAt')})
+                self.assertEqual(after['flow'], record['flow'])
             host.backend_health(fx.folder, current)
             candidate, _, verified = fx.archive()
             candidate_a = host.digest(candidate)
             self.assertNotEqual(candidate_a, before_hash)
             self.assertEqual(verified['tcp_cdn'], current['tcp_cdn'])
-            import test_native_cdn as native_cdn
-            wire = native_cdn.NativeCDN('runTest')
-            wire.fx = fx
-            wire.evidence = Path(os.environ.get('QD_NATIVE_AUTH_EVIDENCE', str(fx.folder.parent / 'auth-evidence')))
-            wire.evidence.mkdir(mode=0o700, parents=True, exist_ok=True)
-            self.addCleanup(wire.doCleanups)
             front_port, cert, _ = wire.caddy(host.XHTTP_PORT)
             profile = fx.profile()
             node = next(p for p in profile['proxies'] if p.get('network') == 'xhttp')
             original_template = host.auth_template(fx.folder)[0]
             generated = host.read_json(fx.folder / 'bin/config.json')
             self.assertEqual(generated['log'], {'access': 'none', 'error': 'none', 'loglevel': 'none'})
+            reality_node = next(p for p in profile['proxies'] if p['name'] == 'SELF-main')
+            self.assertTrue(wire.https(wire.client(reality_node, moved_port, cert), origin))
             begun = host.transport_auth_begin(request)
+            self.assertEqual((begun['inbound_id'], begun['inbound_tag']), (current['tcp_cdn']['inbound_id'], 'SELF-cdn'))
             self.assertEqual(host.transport_auth_begin(request), begun)
             self.assertTrue(wire.https(wire.client(node, front_port, cert), origin))
             wrong = copy.deepcopy(node); wrong['uuid'] = begun['nonce']
@@ -1133,6 +1168,7 @@ class SourceNativeCDN(unittest.TestCase):
             with mock.patch.object(host, 'auth_read_verdict', side_effect=retain_closed_witness):
                 finished = host.transport_auth_finish(dict(request, cdn_auth_nonce=begun['nonce']))
             self.assertTrue(finished['rejected'])
+            self.assertEqual((finished['inbound_id'], finished['inbound_tag']), (current['tcp_cdn']['inbound_id'], 'SELF-cdn'))
             self.assertEqual(finished['native_identity_sha256'], begun['native_identity_sha256'])
             self.assertEqual(host.auth_template(fx.folder)[0], original_template)
             self.assertEqual(host.read_json(fx.folder / 'bin/config.json'), generated)
@@ -1153,11 +1189,33 @@ class SourceNativeCDN(unittest.TestCase):
                 'nonlog_generated_unchanged': True, 'valid_again': True, 'reconnect': True, 'h2_preserved': True,
                 'candidate_a_sha256': candidate_a, 'candidate_b_sha256': host.digest(final),
                 'locked_artifacts': {key: fx.fx.lock[key]['sha256'] for key in ('panel', 'core', 'front')}}))
-            self.assertTrue(host.abort(request)['queued'])
-            self.assertFalse(host.abort(request)['pending'])
-            restored = host.read_json(fx.folder / 'manifest.json')
-            self.assertEqual(restored, original)
-            host.backend_health(fx.folder, restored)
+            if commit:
+                fingerprint = host.transport_request(request)
+                proof = {'schema': 1, 'operation_id': request['operation_id'], 'request_fingerprint': fingerprint,
+                    'candidate_sha256': host.digest(final), 'domain': current['tcp_cdn']['domain'],
+                    'device_identity_sha256': 'e' * 64, 'observed_at': datetime.now(timezone.utc).isoformat(),
+                    'interface': 'fixture0', 'edge_ips': ['104.16.1.1'],
+                    'checks': {k: True for k in ('edge_tls', 'edge_cloudflare', 'xhttp_https', 'vps_egress',
+                        'wrong_uuid_rejected', 'valid_again', 'reconnect', 'hysteria2_preserved')}}
+                # Controller's public-CF attestation is a boundary here; native
+                # role/auth/template/archive and durable receipt handlers are real.
+                bound = dict(request, offnode_sha256=host.digest(final), cdn_proof=proof,
+                             cdn_proof_sha256=host.cdn_proof_digest(proof))
+                committed = host.transport_commit(bound)
+                self.assertTrue(committed['committed'])
+                self.assertEqual(committed['cdn_auth_verdict'], finished)
+                self.assertEqual(host.transport_commit(bound), committed)
+                self.assertEqual(host.abort(request), committed)
+                self.assertFalse((host.ROOT / 'pending.json').exists())
+                host.backend_health(fx.folder, host.read_json(fx.folder / 'manifest.json'))
+            else:
+                self.assertTrue(host.abort(request)['queued'])
+                self.assertFalse(host.abort(request)['pending'])
+                restored = host.read_json(fx.folder / 'manifest.json')
+                self.assertEqual(restored, original)
+                host.backend_health(fx.folder, restored)
+            host.atomic(wire.evidence / 'final-manifest.json', host.dumps(host.read_json(fx.folder / 'manifest.json')))
+            host.atomic(wire.evidence / 'final-database.sqlite', (fx.folder / 'db/x-ui.db').read_bytes())
         self.assertEqual(host.digest(before_archive), before_hash)
 
 
