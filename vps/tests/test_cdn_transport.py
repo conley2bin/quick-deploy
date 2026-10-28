@@ -205,6 +205,7 @@ class CdnHost(unittest.TestCase):
                 generated()
             return result
         generated()
+        self.real_auth_core_epoch = self.h.auth_core_epoch
         self.f.patch(self.h, 'auth_core_epoch', side_effect=lambda folder: dict(epoch))
         self.f.patch(self.h, 'auth_live_users', side_effect=lambda folder, tag:
             {c['email']: c['id'] for c in json.loads(self.model.inbounds[1]['settings'])['clients']})
@@ -370,6 +371,17 @@ class CdnHost(unittest.TestCase):
         self.assertEqual(self.h.abort(self.request), committed)
         self.assertEqual(len(self.model.calls), calls, 'Lost ACK must not replay native mutation or rotate Auth')
         with self.assertRaises(self.h.Error): self.h.transport_commit(invalid)
+
+    def test_already_cdn_new_operation_is_refused_but_receipt_retry_is_idempotent(self):
+        self.publish()
+        committed = self.h.transport_prepare(self.base.upload(self.request))
+        self.assertTrue(committed['committed'])
+        request = dict(self.request, operation_id='9' * 32, before_sha256='d' * 64)
+        events = len(self.f.events)
+        with self.assertRaisesRegex(self.h.Error, 'fresh CDN verification transaction is unsupported'):
+            self.h.transport_prepare(self.base.upload(request))
+        self.assertEqual(len(self.f.events), events)
+        self.assertFalse((self.h.ROOT / 'pending.json').exists())
 
     def test_new_feature_dual_source_is_not_false_noop(self):
         result = self.prepare()
@@ -769,6 +781,45 @@ class AuthWitness(unittest.TestCase):
         self.assertFalse(directory.exists()); self.assertEqual((unrelated / 'keep').read_bytes(), b'keep')
         self.assertEqual(self.h.read_json(self.h.ROOT / 'pending.json')['phase'], 'restore-queued')
         self.assertEqual((self.active / 'db/x-ui.db').read_bytes(), (self.h.ROOT / 'device-rollback/x-ui.db').read_bytes())
+
+    def test_actual_core_epoch_pins_boot_pid_start_ticks_executable_and_unit(self):
+        proc = self.f.root / 'proc/55'; proc.mkdir()
+        (proc / 'exe').symlink_to(self.active / 'bin/xray-linux-amd64')
+        (proc / 'cgroup').write_text('0::/system.slice/' + self.h.PANEL)
+        fields = ['S', '1'] + ['0'] * 18; fields[19] = '12345'
+        (proc / 'stat').write_text('55 (xray core worker) ' + ' '.join(fields))
+        lines = ('LISTEN 0 8 127.0.0.1:' + str(self.h.API_PORT) + ' 0.0.0.0:* users:(("xray",pid=55,fd=1))\n').encode()
+        epoch = self.owner.real_auth_core_epoch
+        with mock.patch.object(self.h, 'run', return_value=subprocess.CompletedProcess([], 0, lines)):
+            self.assertEqual(epoch(self.active), {'boot_id': self.h.boot_id(), 'pid': 55, 'start_ticks': 12345})
+            fields[19] = '12346'; (proc / 'stat').write_text('55 (xray core worker) ' + ' '.join(fields))
+            self.assertEqual(epoch(self.active)['start_ticks'], 12346)
+            (proc / 'cgroup').write_text('0::/system.slice/foreign.service')
+            with self.assertRaisesRegex(self.h.Error, 'Foreign native core epoch'): epoch(self.active)
+        with mock.patch.object(self.h, 'run', return_value=subprocess.CompletedProcess([], 0, lines.replace(b'127.0.0.1:', b'0.0.0.0:'))):
+            with self.assertRaisesRegex(self.h.Error, 'unique native core epoch'): epoch(self.active)
+
+    def test_expired_finish_restores_original_database_instead_of_returning_cached_verdict(self):
+        self.begin(); self.append(); self.finish()
+        pending = self.h.read_json(self.h.ROOT / 'pending.json'); pending['deadline'] = 0
+        self.h.atomic(self.h.ROOT / 'pending.json', self.h.dumps(pending))
+        with self.assertRaisesRegex(self.h.Error, 'lease expired'): self.finish()
+        self.assertEqual(self.h.read_json(self.h.ROOT / 'pending.json')['phase'], 'restore-queued')
+        self.assertEqual((self.active / 'db/x-ui.db').read_bytes(), (self.h.ROOT / 'device-rollback/x-ui.db').read_bytes())
+
+    def test_file_replacement_rollback_restores_database_before_preserving_foreign_inode(self):
+        self.begin(); self.append()
+        self.path.rename(self.path.with_suffix('.owned'))
+        self.path.write_bytes(b'foreign'); self.path.chmod(0o600)
+        with self.assertRaisesRegex(self.h.Error, 'identity changed'): self.h.abort(self.request)
+        self.assertEqual((self.active / 'db/x-ui.db').read_bytes(), (self.h.ROOT / 'device-rollback/x-ui.db').read_bytes())
+        self.assertEqual(self.path.read_bytes(), b'foreign')
+        self.assertNotIn(self.h.PANEL, self.f.services); self.assertNotIn(self.h.FRONT, self.f.services)
+
+    def test_archive_refusal_does_not_stop_any_consumer(self):
+        self.begin(); calls = self.h.ctl.call_count
+        with self.assertRaisesRegex(self.h.Error, 'cannot enter an archive'): self.h.export_backup()
+        self.assertEqual(self.h.ctl.call_count, calls)
 
     def test_wrong_binding_refused_without_touching_active_diagnostic(self):
         self.begin(); calls = self.h.ctl.call_count
