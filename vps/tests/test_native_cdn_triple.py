@@ -164,6 +164,9 @@ class NativeCDNTriple(unittest.TestCase):
         self.save('reality-update-payload.json', main)
         api.call('/panel/api/inbounds/update/' + str(main_id), main)
         group = api.call('/panel/api/hosts/get/' + fx.manifest['host_group_id'])
+        # GET hosts includes an explicit address:old-port, which overrides the
+        # separate port field in native parseHostAndPort. Retain its address.
+        group['hosts'] = [h['address'] for h in old_rows['hosts'] if h['inbound_id'] == main_id]
         group['port'] = reality_port
         # Native group update replaces physical Host row ID; logical group ID
         # and bound inbound remain. Parent explicitly approved this boundary.
