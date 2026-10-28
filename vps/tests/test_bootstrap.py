@@ -95,6 +95,37 @@ class Bootstrap(unittest.TestCase):
                          before['proxies'][1]['native-uncommon-options'])
         self.assertEqual(result, render(source))
 
+    def test_three_native_roles_keep_only_full_unchanged_h2_mapping(self):
+        source = native_profile()
+        shared_uuid = '00000000-0000-4000-8000-000000000001'
+        reality = {'name': 'SELF-main', 'type': 'vless', 'server': ENDPOINT,
+                   'port': 9443, 'uuid': shared_uuid, 'network': 'tcp', 'tls': True,
+                   'flow': 'xtls-rprx-vision', 'reality-opts': {'public-key': 'y' * 43}}
+        cdn = {'name': 'SELF-cdn', 'type': 'vless', 'server': 'cdn.example.com',
+               'port': 443, 'uuid': shared_uuid, 'network': 'xhttp', 'tls': True,
+               'servername': 'cdn.example.com', 'alpn': ['h2'],
+               'xhttp-opts': {'host': 'cdn.example.com', 'path': '/qd-xhttp/', 'mode': 'packet-up'}}
+        h2 = dict(native_node(), name='SELF-h2')
+        source['proxy-groups'] = [{'name': 'PROXY', 'type': 'select',
+                                   'proxies': ['SELF-h2', 'SELF-cdn', 'SELF-main', 'DIRECT']}]
+        # Selection must depend on the sole native H2 type, not list position or
+        # the UUID shared by both VLESS transports. All H2 options survive.
+        for nodes in ([reality, cdn, h2], [h2, reality, cdn], [cdn, h2, reality]):
+            with self.subTest(order=[node['name'] for node in nodes]):
+                source['proxies'] = nodes
+                before = copy.deepcopy(source)
+                runtime = yaml.safe_load(render(source))
+                self.assertEqual(runtime['proxies'], [h2])
+                self.assertEqual(runtime['proxies'][0]['port'], 443)
+                self.assertEqual(runtime['tun'], {'enable': False})
+                self.assertEqual(runtime['interface-name'], 'eno1')
+                self.assertNotIn('proxy-groups', runtime)
+                self.assertTrue(all(rule.endswith(',SELF-h2') for rule in runtime['rules'][:-1]))
+                self.assertEqual(runtime['rules'][-1], 'MATCH,REJECT')
+                self.assertEqual(source, before)
+        source['proxies'] = [reality, cdn]
+        self.assert_invalid(source)  # No REALITY/CDN management fallback.
+
     def test_original_envelope_is_not_inherited(self):
         runtime = yaml.safe_load(render())
         self.assertEqual(runtime['bind-address'], '127.0.0.1')

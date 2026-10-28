@@ -94,21 +94,28 @@ check('malicious native fragment remains a literal heading', () => {
   assert.equal(heading.textContent, fixture.maliciousLabel);
   assert.equal(heading.children.length, 0);
 });
-for (let index = 0; index < cards.length; index++) {
-  const actions = cards[index].children[3].children;
-  await actions[1].emit('click');
-  assert.equal(clipboard.at(-1), links[index].uri, 'copy must retain exact native UTF-8 string');
-  await actions[0].emit('click');
-  assert.equal(get('qr-title').textContent, links[index].label);
-  assert.equal(get('qr-image').src, links[index].qr);
-  await get('qr-copy').emit('click');
-  assert.equal(clipboard.at(-1), links[index].uri);
-  await get('qr-download').emit('click');
-  assert.equal(downloads.at(-1).name, links[index].qr);
-  assert.deepEqual(Buffer.from(await downloads.at(-1).blob.arrayBuffer()), Buffer.from(fixture.model.files[links[index].qr], 'base64'));
-  get('qr-dialog').close();
+assert.equal(get('subscription-links').children.length, 2);
+for (const [kind, container] of [['node', 'node-links'], ['subscription', 'subscription-links']]) {
+  const scopedLinks = fixture.model.devices[0].links.filter(link => link.kind === kind);
+  const scopedCards = get(container).children;
+  assert.equal(scopedCards.length, scopedLinks.length);
+  for (let index = 0; index < scopedCards.length; index++) {
+    const link = scopedLinks[index];
+    const actions = scopedCards[index].children[3].children;
+    await actions[1].emit('click');
+    assert.equal(clipboard.at(-1), link.uri, 'copy must retain exact native UTF-8 string');
+    await actions[0].emit('click');
+    assert.equal(get('qr-title').textContent, link.label);
+    assert.equal(get('qr-image').src, link.qr);
+    await get('qr-copy').emit('click');
+    assert.equal(clipboard.at(-1), link.uri);
+    await get('qr-download').emit('click');
+    assert.equal(downloads.at(-1).name, link.qr);
+    assert.deepEqual(Buffer.from(await downloads.at(-1).blob.arrayBuffer()), Buffer.from(fixture.model.files[link.qr], 'base64'));
+    get('qr-dialog').close();
+  }
 }
-checks.push('every card and QR dialog copies exact original URI and downloads unchanged QR bytes');
+checks.push('every node/subscription card and QR dialog copies exact URI and downloads unchanged QR bytes');
 navigator.clipboard.writeText = async () => { throw new Error('fake denied permission'); };
 let fallback;
 document.execCommand = command => { assert.equal(command, 'copy'); fallback = document.activeElement.value; return true; };
@@ -140,5 +147,12 @@ check('device change closes old QR and scopes payloads', () => {
   assert.equal(get('device-name').textContent, fixture.model.devices[1].name);
   assert.equal(get('node-links').children.length, 1);
   assert.equal(get('node-links').children[0].children[0].children[1].textContent, 'Hysteria2 · hysteria2://');
+});
+const beta = fixture.model.devices[1].links.find(link => link.kind === 'node');
+navigator.clipboard.writeText = async value => { clipboard.push(value); };
+await get('node-links').children[0].children[3].children[1].emit('click');
+check('copy after device switch cannot reuse another device credential', () => {
+  assert.equal(clipboard.at(-1), beta.uri);
+  assert.ok(!links.some(link => link.uri === clipboard.at(-1)));
 });
 console.log(JSON.stringify({status: 'passed', checks}));

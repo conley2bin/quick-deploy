@@ -1,6 +1,7 @@
 """Offline fake credentials only: exact payloads, committed authority and private publication."""
 import base64
 import contextlib
+import copy
 import hashlib
 import io
 import json
@@ -293,6 +294,59 @@ class CommittedAuthority(unittest.TestCase):
         host.atomic(f.state / 'pending.json', '{}')
         with self.assertRaisesRegex(host.Error, 'Pending'):
             vps.export_dashboard(f.state, args)
+
+    def test_generation_binding_carries_full_three_entry_metadata(self):
+        f = self.fixture
+        manifest = copy.deepcopy(f.dual)
+        manifest['tcp_cdn'] = {'schema': 1, 'domain': 'cdn.example.org', 'inbound_id': 3,
+            'host_group_id': 'cdn-group', 'reality_port': 9443, 'reality_tag': 'in-443-tcp',
+            'path': '/qd-xhttp/', 'mode': 'packet-up',
+            'certificate_file': 'caddy/data/caddy/certificates/fixture/cdn.example.org.crt',
+            'key_file': 'caddy/data/caddy/certificates/fixture/cdn.example.org.key'}
+        digest = 'a' * 64
+        legacy_binding = vps.generation_binding(f.dual, digest)
+        # Pure metadata projection only. The parallel Host implementation owns
+        # attesting this roster/topology; this is not a verified triple archive.
+        with mock.patch.object(host, 'device_names', return_value=tuple(manifest['accounts'])) as roster:
+            binding = vps.generation_binding(manifest, digest)
+        roster.assert_called_once_with(manifest)
+        self.assertEqual(binding, dict(legacy_binding, tcp_cdn=manifest['tcp_cdn']))
+        self.assertNotIn('tcp_cdn', legacy_binding)
+
+    def test_wrong_device_generation_refuses_before_any_dashboard_or_bootstrap_write(self):
+        f = self.fixture
+        f.publish()
+        generation = f.state / 'generations' / f.doc['native_generation']
+        metadata_path = generation / 'metadata.json'
+        original_metadata = metadata_path.read_bytes()
+        # Use the real existing archive/hash/scope pipeline. Updating a file's
+        # recorded hash must never turn another device's credentials into authority.
+        for filename in ('company.yaml', 'company.txt'):
+            with self.subTest(filename=filename):
+                original = (generation / filename).read_bytes()
+                if filename.endswith('.txt'):
+                    raw = base64.b64decode(original, validate=True)
+                    wrong = base64.b64encode(raw.replace(f.dual['accounts']['company']['id'].encode(),
+                                                         f.dual['accounts']['home']['id'].encode()))
+                else:
+                    wrong = original + b'\n# ' + f.dual['accounts']['home']['auth'].encode() + b'\n'
+                metadata = json.loads(original_metadata)
+                metadata['files'][filename] = hashlib.sha256(wrong).hexdigest()
+                host.atomic(generation / filename, wrong)
+                host.atomic(metadata_path, host.dumps(metadata))
+                with mock.patch.object(vps, 'remote', side_effect=AssertionError('offline only')), \
+                     mock.patch.object(vps, 'dashboard_render', side_effect=AssertionError('unverified bytes reached UI')):
+                    for command in ('dashboard', 'bootstrap'):
+                        with self.subTest(command=command), self.assertRaisesRegex(host.Error, 'Cross-device|Native URI') as raised:
+                            if command == 'dashboard':
+                                vps.export_dashboard(f.state, vps.parser().parse_args(['dashboard']))
+                            else:
+                                vps.export_bootstrap(f.state, f.export_args())
+                        self.assertNotIn(f.dual['accounts']['home']['auth'], str(raised.exception))
+                self.assertFalse((f.state / 'dashboard').exists())
+                self.assertFalse((f.root / 'bootstrap').exists())
+                host.atomic(generation / filename, original)
+                host.atomic(metadata_path, original_metadata)
 
     def test_bootstrap_preserves_four_files_and_management_recheck_every_time(self):
         f = self.fixture
