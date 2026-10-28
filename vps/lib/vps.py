@@ -1200,7 +1200,8 @@ def _cdn(state, document, args):
             cdn_probe.select_edge(domain, answers, record['endpoint'], args.interface, budget, preflight_observations,
                                   edge_ip=args.edge_ip)
     except (cdn_probe.Error, OSError, ValueError) as exc:
-        raise host.Error('Physical authoritative DNS/Cloudflare TLS preflight failed; no remote mutation') from exc
+        detail = type(exc).__name__ + (': ' + str(exc) if isinstance(exc, cdn_probe.Error) else '')
+        raise host.Error('Physical authoritative DNS/Cloudflare TLS preflight failed; no remote mutation: ' + detail) from exc
     print('Use an independent SSH carrier/console for this core-changing transaction; '
           'shared Xray may briefly reconnect H2. No desktop selection or system DNS will be changed.')
     # This complete backup hands the guard to the current capable adapter BEFORE

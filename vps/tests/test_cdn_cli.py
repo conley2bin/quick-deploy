@@ -490,6 +490,23 @@ class CDNCLI(unittest.TestCase):
         self.assertFalse((self.state / 'pending.json').exists())
         self.assertFalse((self.state / 'cdn-proofs').exists())
 
+    def test_ordinary_cli_preflight_failure_reports_sanitized_attempt_evidence(self):
+        with mock.patch.object(cdn_probe, 'resolve_a', return_value=['104.16.1.2', '172.67.1.2']), \
+                mock.patch.object(cdn_probe, 'edge_tls', side_effect=TimeoutError('raw private exception text')):
+            result = vps.main(['--state-dir', str(self.state), 'cdn', '--domain', 'cdn.example.org',
+                               '--interface', 'eno1', '--dns-server', '1.1.1.1'])
+        self.assertEqual(result, 1)
+        message = sys.stderr.getvalue()
+        for expected in ('104.16.1.2', '172.67.1.2', 'TimeoutError', 'seconds', 'edge_tls'):
+            self.assertIn(expected, message)
+        self.assertNotIn('raw private exception text', message)
+        self.assertEqual(self.events, ['status'])
+
+    def test_preflight_external_errors_surface_type_without_raw_details(self):
+        with mock.patch.object(cdn_probe, 'resolve_a', side_effect=OSError('raw private exception text')):
+            with self.assertRaisesRegex(host.Error, 'OSError') as error: self.run_cdn()
+        self.assertNotIn('raw private exception text', str(error.exception))
+
     def test_postprepare_all_edges_fail_recovers_without_auth_or_fresh_proof(self):
         def probe(**kwargs):
             return REAL_CDN_PROBE(**kwargs)

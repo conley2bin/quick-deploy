@@ -323,8 +323,9 @@ def operation_deadline(budget):
     except BaseException as exc:
         # Deadline-induced EOF/reset is inconclusive, never an auth rejection.
         # Explicit integrity errors and cancellation retain their own verdict.
-        if expired.is_set() and (isinstance(exc, (ssl.SSLEOFError, Rejected)) or
-                                not isinstance(exc, (ValueError, ssl.SSLError, http.client.HTTPException, Cancelled))):
+        if expired.is_set() and isinstance(exc, Exception) and (
+                isinstance(exc, (ssl.SSLEOFError, Rejected)) or
+                not isinstance(exc, (ValueError, ssl.SSLError, http.client.HTTPException))):
             raise DeadlineExceeded('HTTPS operation timed out; authentication rejection is unproven') from None
         raise
     finally:

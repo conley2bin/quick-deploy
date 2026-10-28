@@ -550,6 +550,17 @@ class EdgeSelection(unittest.TestCase):
             with self.assertRaises(probe.Cancelled): self.choose([EDGE, self.SECOND])
             self.assertEqual(tls.call_count, 1)
 
+    def test_expired_keyboard_interrupt_or_system_exit_cancels_without_second_edge(self):
+        for cancellation in (KeyboardInterrupt(), SystemExit(143)):
+            def cancel(domain, address, interface, budget):
+                with probe.operation_deadline(budget.bounded(.001)):
+                    threading.Event().wait(.01)
+                    raise cancellation
+            with self.subTest(cancellation=type(cancellation).__name__), \
+                    mock.patch.object(probe, 'edge_tls', side_effect=cancel) as tls:
+                with self.assertRaises(type(cancellation)): self.choose([EDGE, self.SECOND])
+                self.assertEqual(tls.call_count, 1)
+
     def test_real_wall_clock_deadline_caps_trickle_and_preserves_security_and_cancel(self):
         budget = probe.Budget(time.time() + 15).bounded(.03)
         start = time.monotonic()
