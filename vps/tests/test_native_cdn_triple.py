@@ -193,6 +193,8 @@ class NativeCDNTriple(unittest.TestCase):
         self.assertEqual(len(rows['hosts']), 3)
         ids = {i['id'] for i in inbounds}
         self.assertEqual(ids, {i['id'] for i in old_inbounds} | {cdn_id})
+        self.assertEqual({h['inbound_id'] for h in rows['hosts']}, ids)
+        self.assertTrue(all(not h['is_disabled'] and not h['is_hidden'] for h in rows['hosts']))
         self.assertEqual({c['email']: c['id'] for c in rows['clients']}, {c['email']: c['id'] for c in old_rows['clients']})
         self.assertEqual(len(rows['client_inbounds']), 3 * len(before))
         self.assertEqual({(j['client_id'], j['inbound_id']) for j in rows['client_inbounds']},
@@ -213,8 +215,12 @@ class NativeCDNTriple(unittest.TestCase):
         self.assertEqual([h for h in rows['hosts'] if h['inbound_id'] == h2_id], [h for h in old_rows['hosts'] if h['inbound_id'] == h2_id])
         old_host = next(h for h in old_rows['hosts'] if h['inbound_id'] == main_id)
         new_host = next(h for h in rows['hosts'] if h['inbound_id'] == main_id)
-        self.assertEqual({k: v for k, v in old_host.items() if k not in ('id', 'port')},
-                         {k: v for k, v in new_host.items() if k not in ('id', 'port')})
+        replaced_metadata = {'id', 'port', 'created_at', 'updated_at'}
+        self.assertEqual({k: v for k, v in old_host.items() if k not in replaced_metadata},
+                         {k: v for k, v in new_host.items() if k not in replaced_metadata})
+        self.assertGreaterEqual(new_host['created_at'], old_host['created_at'])
+        self.assertEqual(new_host['created_at'], new_host['updated_at'])
+        self.summary['reality_host_physical_row_recreated'] = True
         self.assertNotEqual(old_host['id'], new_host['id'])
         self.assertEqual(new_host['port'], reality_port)
         self.summary['reality_host_row_ids'] = [old_host['id'], new_host['id']]
