@@ -1,0 +1,443 @@
+diff --git a/codoxear/static/app_application_composition.js b/codoxear/static/app_application_composition.js
+index 62224321..1bb198ec 100644
+--- a/codoxear/static/app_application_composition.js
++++ b/codoxear/static/app_application_composition.js
+@@ -1,5 +1,5 @@
+ import * as CodoxearChatInteraction from "./app_chat_interaction.js";
+-import * as CodoxearClipboard from "./app_file_ops.js";
++import * as CodoxearClipboard from "./app_clipboard.js";
+ import * as CodoxearConversationCopy from "./app_conversation_copy.js";
+ import * as CodoxearCodeCopy from "./app_code_copy.js";
+ import * as CodoxearDiagnostics from "./app_diagnostics.js";
+diff --git a/codoxear/static/app_clipboard.js b/codoxear/static/app_clipboard.js
+new file mode 100644
+index 00000000..42cac3e9
+--- /dev/null
++++ b/codoxear/static/app_clipboard.js
+@@ -0,0 +1,115 @@
++  /* Clipboard delivery owns one ladder: the async Clipboard API on a secure
++   * origin, the legacy execCommand textarea handoff where that API does not
++   * exist, and a manual-copy error when the browser refuses both.
++   *
++   * Codoxear is routinely opened over plain http:// on a LAN or tailnet address
++   * (http://100.x.y.z:8743). Those origins are not secure contexts, so
++   * navigator.clipboard does not exist there at all — gating copy on it made
++   * every copy button fail on a phone while the text sat on screen.
++   * execCommand("copy") is gated on a user gesture, not on a secure origin, so
++   * it carries the insecure case. It dies once transient activation expires
++   * (measured in Chrome 152: true inside the first seconds after the tap, false
++   * at 8 s), which is why the final error names the manual path instead of
++   * claiming a missing capability.
++   */
++
++  const CLIPBOARD_MANUAL_MESSAGE = "this browser blocked clipboard access — long-press the text and choose Copy";
++
++  function clipboardNavigator(windowTarget, navigatorTarget) {
++    if (navigatorTarget) return navigatorTarget;
++    if (typeof navigator !== "undefined" && navigator) return navigator;
++    return windowTarget && windowTarget.navigator ? windowTarget.navigator : null;
++  }
++
++  function clipboardSecureOrigin(windowTarget) {
++    return Boolean(windowTarget && windowTarget.isSecureContext === true);
++  }
++
++  function asyncClipboard(windowTarget, navigatorTarget) {
++    if (!clipboardSecureOrigin(windowTarget)) return null;
++    const nav = clipboardNavigator(windowTarget, navigatorTarget);
++    const clipboard = nav && nav.clipboard;
++    if (!clipboard || typeof clipboard.writeText !== "function") return null;
++    return clipboard;
++  }
++
++  // The scratch textarea must stay laid out: WebKit refuses to copy a selection
++  // it has not rendered, so it is parked offscreen and made transparent instead
++  // of display:none. readonly keeps the mobile keyboard down, aria-hidden and
++  // tabindex -1 keep it out of the accessibility tree and tab order.
++  function legacyCopyTextarea(documentTarget, text) {
++    const body = documentTarget && documentTarget.body;
++    if (!body || typeof documentTarget.createElement !== "function" || typeof documentTarget.execCommand !== "function") return false;
++    const value = String(text == null ? "" : text);
++    const previousFocus = documentTarget.activeElement || null;
++    const holder = documentTarget.createElement("textarea");
++    holder.value = value;
++    holder.setAttribute("readonly", "");
++    holder.setAttribute("aria-hidden", "true");
++    holder.setAttribute("tabindex", "-1");
++    const style = holder.style;
++    style.position = "fixed";
++    style.top = "0";
++    style.left = "0";
++    style.width = "1px";
++    style.height = "1px";
++    style.padding = "0";
++    style.border = "none";
++    style.outline = "none";
++    style.boxShadow = "none";
++    style.background = "transparent";
++    style.color = "transparent";
++    style.fontSize = "12pt";
++    style.opacity = "0";
++    let copied = false;
++    try {
++      body.appendChild(holder);
++      holder.focus({ preventScroll: true });
++      holder.select();
++      // iOS ignores select() on a programmatically focused textarea unless the
++      // range is also set explicitly.
++      holder.setSelectionRange(0, value.length);
++      copied = documentTarget.execCommand("copy") === true;
++    } catch (err) {
++      copied = false;
++    } finally {
++      if (typeof holder.remove === "function") holder.remove();
++      else if (typeof body.removeChild === "function") body.removeChild(holder);
++      if (previousFocus && previousFocus !== holder && typeof previousFocus.focus === "function") {
++        try {
++          previousFocus.focus({ preventScroll: true });
++        } catch (err) {}
++      }
++    }
++    return copied;
++  }
++
++  function manualCopyError() {
++    const error = new Error(CLIPBOARD_MANUAL_MESSAGE);
++    error.name = "ClipboardError";
++    error.code = "clipboard_manual_copy_required";
++    return error;
++  }
++
++  // Resolves with the path that delivered the text ("clipboard" or
++  // "execCommand"), and rejects only when the browser refused both — the caller
++  // then reports the manual instruction instead of a capability fact.
++  async function copyToClipboard(text, options = {}) {
++    const value = String(text == null ? "" : text);
++    const windowTarget = options.windowTarget || (typeof window !== "undefined" ? window : null);
++    const documentTarget = options.documentTarget || (typeof document !== "undefined" ? document : null);
++    const clipboard = asyncClipboard(windowTarget, options.navigatorTarget);
++    if (clipboard) {
++      try {
++        await clipboard.writeText(value);
++        return "clipboard";
++      } catch (err) {
++        // A refused permission still leaves the gesture-scoped path open, so
++        // this is a fall-through, not a terminal failure.
++      }
++    }
++    if (legacyCopyTextarea(documentTarget, value)) return "execCommand";
++    throw manualCopyError();
++  }
++
++export { CLIPBOARD_MANUAL_MESSAGE, copyToClipboard, legacyCopyTextarea };
+diff --git a/codoxear/static/app_file_ops.js b/codoxear/static/app_file_ops.js
+index 1fc1c324..82ce592d 100644
+--- a/codoxear/static/app_file_ops.js
++++ b/codoxear/static/app_file_ops.js
+@@ -1,3 +1,4 @@
++import * as CodoxearClipboard from "./app_clipboard.js";
+ import * as CodoxearFileEditorOps from "./app_file_editor_ops.js";
+ import * as CodoxearFileVim from "./app_file_vim.js";
+ import * as CodoxearFilePickerOps from "./app_file_picker_ops.js";
+@@ -17,12 +18,8 @@ import * as CodoxearSessionEdit from "./app_session_edit.js";
+     return value;
+   }
+ 
+-  async function copyToClipboard(text) {
+-    const nav = typeof navigator !== "undefined" ? navigator : window.navigator;
+-    if (!window.isSecureContext || !nav || !nav.clipboard || typeof nav.clipboard.writeText !== "function") {
+-      throw new Error("Clipboard API unavailable; requires a secure context (HTTPS)");
+-    }
+-    await nav.clipboard.writeText(String(text ?? ""));
++  function copyToClipboard(text, options) {
++    return CodoxearClipboard.copyToClipboard(text, options);
+   }
+ 
+   function createFileEditModeController(options = {}) {
+@@ -1271,4 +1268,4 @@ syncFileButtonState();
+     });
+   }
+ 
+-export { copyToClipboard, createFileEditModeController, createFileTouchController, createFileOpsController };
++export { createFileEditModeController, createFileTouchController, createFileOpsController };
+diff --git a/tests/frontend_module_loader.py b/tests/frontend_module_loader.py
+index fd7131dc..c45d0e93 100644
+--- a/tests/frontend_module_loader.py
++++ b/tests/frontend_module_loader.py
+@@ -25,6 +25,7 @@ MODULE_NAMESPACES = {
+     "app_chat_interaction.js": ["CodoxearChatInteraction"],
+     "app_chat_navigation.js": ["CodoxearChatNavigation"],
+     "app_chat_search.js": ["CodoxearChatSearch"],
++    "app_clipboard.js": ["CodoxearClipboard"],
+     "app_code_copy.js": ["CodoxearCodeCopy"],
+     "app_composer.js": ["CodoxearComposer"],
+     "app_composer_history.js": ["CodoxearComposerHistory"],
+@@ -40,7 +41,7 @@ MODULE_NAMESPACES = {
+     "app_file_editor_ops.js": ["CodoxearFileEditorOps"],
+     "app_file_helpers.js": ["CodoxearFileHelpers"],
+     "app_file_mode.js": ["CodoxearFileMode"],
+-    "app_file_ops.js": ["CodoxearClipboard", "CodoxearFileEditMode", "CodoxearFileOps", "CodoxearFileTouch"],
++    "app_file_ops.js": ["CodoxearFileEditMode", "CodoxearFileOps", "CodoxearFileTouch"],
+     "app_file_paste_dialog.js": ["CodoxearFilePasteDialog"],
+     "app_file_pdf.js": ["CodoxearFilePdf"],
+     "app_file_picker.js": ["CodoxearFilePicker"],
+@@ -182,6 +183,7 @@ def module_path(module_name: str) -> Path:
+     # Load their actual implementations for existing standalone VM fixtures
+     # whose controller modules now import them, just as ESM does in the app.
+     for dependency, namespace in (
++        ("app_clipboard.js", "CodoxearClipboard"),
+         ("app_network.js", "CodoxearNetwork"),
+         ("app_sw.js", "CodoxearSW"),
+         ("app_path_completion.js", "CodoxearPathCompletion"),
+diff --git a/tests/test_frontend_clipboard_module_source.py b/tests/test_frontend_clipboard_module_source.py
+index 6ec4f4ea..b0c37675 100644
+--- a/tests/test_frontend_clipboard_module_source.py
++++ b/tests/test_frontend_clipboard_module_source.py
+@@ -3,69 +3,87 @@ import json
+ import subprocess
+ import textwrap
+ import unittest
+-from pathlib import Path
+ 
+ 
+-ROOT = Path(__file__).resolve().parents[1]
+-APP_JS = ROOT / "codoxear" / "static" / "app.js"
+-APP_CLIPBOARD_JS = module_path("app_file_ops.js")
+-INDEX_HTML = ROOT / "codoxear" / "static" / "index.html"
++APP_CLIPBOARD_JS = module_path("app_clipboard.js")
+ 
+-
+-def eval_clipboard_helpers() -> dict:
+-    source = APP_CLIPBOARD_JS.read_text(encoding="utf-8")
+-    js = textwrap.dedent(
+-        f"""
++HARNESS_PRELUDE = """
+         const vm = require("vm");
+         const events = [];
+-        class FakeHTMLElement {{
+-          focus(opts) {{ events.push(["active-focus", Boolean(opts && opts.preventScroll)]); }}
+-        }}
++        let execResult = true;
++        class FakeHTMLElement {
++          focus(opts) { events.push(["active-focus", Boolean(opts && opts.preventScroll)]); }
++        }
+         const active = new FakeHTMLElement();
+         const textareas = [];
+-        const document = {{
++        const document = {
+           activeElement: active,
+-          body: {{ appendChild(node) {{ events.push(["append", node.tagName]); }} }},
+-          createElement(tag) {{
+-            const node = {{
++          body: { appendChild(node) { events.push(["append", node.tagName]); }, removeChild(node) { events.push(["body-remove", node.tagName]); } },
++          createElement(tag) {
++            const node = {
+               tagName: tag,
+               value: "",
+-              attrs: {{}},
+-              style: {{}},
+-              setAttribute(name, value) {{ this.attrs[name] = String(value); }},
+-              focus(opts) {{ events.push(["textarea-focus", Boolean(opts && opts.preventScroll)]); }},
+-              select() {{ events.push(["select"]); }},
+-              setSelectionRange(start, end) {{ events.push(["range", start, end]); }},
+-              remove() {{ events.push(["remove"]); }},
+-            }};
++              attrs: {},
++              style: {},
++              setAttribute(name, value) { this.attrs[name] = String(value); },
++              focus(opts) { events.push(["textarea-focus", Boolean(opts && opts.preventScroll)]); },
++              select() { events.push(["select"]); },
++              setSelectionRange(start, end) { events.push(["range", start, end]); },
++              remove() { events.push(["remove"]); },
++            };
+             textareas.push(node);
+             return node;
+-          }},
+-          execCommand(command) {{ events.push(["exec", command]); return true; }},
+-        }};
++          },
++          execCommand(command) { events.push(["exec", command]); return execResult; },
++        };
++"""
++
++
++def eval_clipboard(scenario: str) -> dict:
++    """Run one clipboard-delivery scenario over the module's real source.
++
++    secure  — origin is a secure context and the async Clipboard API accepts.
++    insecure — plain http origin: navigator.clipboard is absent in real browsers,
++               and a secure-context gate must not block the copy.
++    denied  — a secure origin where the async write is refused by permissions.
++    refused — no usable async path and execCommand returns false.
++    """
++    source = APP_CLIPBOARD_JS.read_text(encoding="utf-8")
++    secure = scenario in ("secure", "denied")
++    async_denied = scenario == "denied"
++    js = textwrap.dedent(
++        f"""
++        {HARNESS_PRELUDE}
++        execResult = {json.dumps(scenario != "refused")};
++        const secure = {json.dumps(secure)};
++        const asyncDenied = {json.dumps(async_denied)};
+         const writes = [];
+         const ctx = {{
+           HTMLElement: FakeHTMLElement,
+           document,
+-          navigator: {{ clipboard: {{ writeText(value) {{ writes.push(value); return Promise.resolve(); }} }} }},
+-          window: {{ isSecureContext: true, navigator: null }},
++          navigator: {{
++            clipboard: {{
++              writeText(value) {{
++                writes.push(value);
++                if (asyncDenied) return Promise.reject(new Error("permission denied"));
++                return Promise.resolve();
++              }},
++            }},
++          }},
++          window: {{ isSecureContext: secure, navigator: null }},
+         }};
+         vm.createContext(ctx);
+         vm.runInContext({json.dumps(source)}, ctx);
+         const helpers = ctx.window.CodoxearClipboard;
+-        let insecureError = null;
++        let outcome = null;
+         (async () => {{
+-          await helpers.copyToClipboard("secure text");
+-          ctx.window.isSecureContext = false;
+-          try {{
+-            await helpers.copyToClipboard("fallback text");
+-          }} catch (e) {{
+-            insecureError = e.message || String(e);
+-          }}
++          await helpers.copyToClipboard("clipboard text")
++            .then((method) => {{ outcome = {{ resolved: method }}; }})
++            .catch((err) => {{ outcome = {{ rejected: err.message || String(err), code: err.code || "" }}; }});
+           process.stdout.write(JSON.stringify({{
+             writes,
+             events,
+-            insecureError,
++            outcome,
+             frozen: Object.isFrozen(helpers),
+           }}));
+         }})().catch((err) => {{ console.error(err && err.stack || err); process.exit(1); }});
+@@ -75,16 +93,46 @@ def eval_clipboard_helpers() -> dict:
+     return json.loads(proc.stdout)
+ 
+ 
+-class TestFrontendClipboardModuleSource(unittest.TestCase):
++def legacy_events(text: str) -> list:
++    return [
++        ["append", "textarea"],
++        ["textarea-focus", True],
++        ["select"],
++        ["range", 0, len(text)],
++        ["exec", "copy"],
++        ["remove"],
++        ["active-focus", True],
++    ]
+ 
+ 
+-    def test_clipboard_module_uses_secure_clipboard_only(self) -> None:
+-        result = eval_clipboard_helpers()
+-        self.assertEqual(result["writes"], ["secure text"])
++class TestFrontendClipboardModuleBehavior(unittest.TestCase):
++
++    def test_secure_origin_uses_async_clipboard_without_touching_the_document(self) -> None:
++        result = eval_clipboard("secure")
++        self.assertEqual(result["writes"], ["clipboard text"])
+         self.assertEqual(result["events"], [])
+-        self.assertContains("Clipboard API unavailable", result.get("insecureError", ""))
++        self.assertEqual(result["outcome"], {"resolved": "clipboard"})
+         self.assertTrue(result["frozen"])
+ 
++    def test_insecure_origin_uses_the_legacy_textarea_handoff(self) -> None:
++        result = eval_clipboard("insecure")
++        self.assertEqual(result["writes"], [])
++        self.assertEqual(result["outcome"], {"resolved": "execCommand"})
++        self.assertEqual(result["events"], legacy_events("clipboard text"))
++
++    def test_denied_async_clipboard_falls_through_to_the_gesture_path(self) -> None:
++        result = eval_clipboard("denied")
++        self.assertEqual(result["writes"], ["clipboard text"])
++        self.assertEqual(result["outcome"], {"resolved": "execCommand"})
++        self.assertEqual(result["events"], legacy_events("clipboard text"))
++
++    def test_refused_paths_report_the_manual_instruction(self) -> None:
++        result = eval_clipboard("refused")
++        self.assertEqual(result["outcome"]["code"], "clipboard_manual_copy_required")
++        self.assertRegex(result["outcome"]["rejected"], r"long-press")
++        self.assertNotIn("secure context", result["outcome"]["rejected"])
++        self.assertEqual(result["events"], legacy_events("clipboard text"))
++
+ 
+ if __name__ == "__main__":
+     unittest.main()
+diff --git a/tests/test_frontend_conversation_copy_source.py b/tests/test_frontend_conversation_copy_source.py
+index 625476f2..e3435610 100644
+--- a/tests/test_frontend_conversation_copy_source.py
++++ b/tests/test_frontend_conversation_copy_source.py
+@@ -8,7 +8,7 @@ from pathlib import Path
+ 
+ 
+ ROOT = Path(__file__).resolve().parents[1]
+-APP_FILE_OPS_JS = module_path("app_file_ops.js")
++APP_CLIPBOARD_JS = module_path("app_clipboard.js")
+ APP_CONVERSATION_COPY_JS = module_path("app_conversation_copy.js")
+ 
+ 
+@@ -97,20 +97,37 @@ def eval_conversation_copy_controller(scenario: str) -> dict:
+ 
+ 
+ def eval_app_clipboard_fallback() -> dict:
+-    source = APP_FILE_OPS_JS.read_text(encoding="utf-8")
++    source = APP_CLIPBOARD_JS.read_text(encoding="utf-8")
+     js = textwrap.dedent(
+         f"""
+         const vm = require("vm");
+         let primaryCalls = 0;
++        let legacyCalls = 0;
++        const document = {{
++          activeElement: null,
++          body: {{ appendChild() {{}}, removeChild() {{}} }},
++          createElement() {{
++            return {{
++              style: {{}},
++              setAttribute() {{}},
++              focus() {{}},
++              select() {{}},
++              setSelectionRange() {{}},
++              remove() {{}},
++            }};
++          }},
++          execCommand(command) {{ legacyCalls += 1; return command === "copy"; }},
++        }};
+         const ctx = {{
++          document,
+           navigator: {{ clipboard: {{ writeText() {{ primaryCalls += 1; throw new Error("permission denied"); }} }} }},
+           window: {{ isSecureContext: true, navigator: null }},
+         }};
+         vm.createContext(ctx);
+         vm.runInContext({json.dumps(source)}, ctx);
+         ctx.window.CodoxearClipboard.copyToClipboard("conversation text")
+-          .then(() => process.stdout.write(JSON.stringify({{ primaryCalls, threw: false }})))
+-          .catch((err) => process.stdout.write(JSON.stringify({{ primaryCalls, threw: true, message: err.message || String(err) }})));
++          .then((method) => process.stdout.write(JSON.stringify({{ primaryCalls, legacyCalls, method, threw: false }})))
++          .catch((err) => process.stdout.write(JSON.stringify({{ primaryCalls, legacyCalls, threw: true, message: err.message || String(err) }})));
+         """
+     )
+     proc = subprocess.run(["node", "-e", js], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+@@ -166,10 +183,12 @@ class TestFrontendConversationCopyBehavior(unittest.TestCase):
+         self.assertEqual(result["missingLimit"], "")
+         self.assertEqual(result["network"], "")
+ 
+-    def test_app_copy_uses_secure_clipboard_only(self) -> None:
++    def test_app_copy_falls_back_to_the_gesture_path_when_the_async_write_is_denied(self) -> None:
+         result = eval_app_clipboard_fallback()
+         self.assertEqual(result["primaryCalls"], 1)
+-        self.assertTrue(result.get("threw"))
++        self.assertEqual(result["legacyCalls"], 1)
++        self.assertEqual(result["method"], "execCommand")
++        self.assertFalse(result.get("threw"))
+ 
+     def test_format_conversation_for_copy_preserves_existing_contract(self) -> None:
+         result = eval_conversation_copy(
