@@ -511,6 +511,17 @@ class CdnHost(unittest.TestCase):
         self.prepare(); self.complete_auth(); self.h.atomic(self.h.ROOT / 'export-sha256', 'd' * 64)
         self.h.transport_commit(self.proof_request())
 
+    def test_correct_cdn_flow_does_not_rewrite_unaffected_native_clients(self):
+        self.publish()
+        current = self.h.read_json(self.active / 'manifest.json')
+        self.model.calls.clear()
+        self.h.reapply_role_flows(self.model, current)
+        self.assertFalse(any(path.startswith('/panel/api/inbounds/update/') for path, _ in self.model.calls))
+        self.model.inbounds[3]['disableFlow'] = False
+        self.h.reapply_role_flows(self.model, current)
+        self.assertTrue(self.model.inbounds[3]['disableFlow'])
+        self.assertEqual(sum(path == '/panel/api/inbounds/update/3' for path, _ in self.model.calls), 1)
+
     def test_add_rename_reset_remove_single_authority_and_three_joins(self):
         self.publish()
         original = copy.deepcopy(self.model.records['company'])
@@ -531,6 +542,11 @@ class CdnHost(unittest.TestCase):
             self.assertFalse(candidate['published'])
             self.assertEqual((stage / 'deployment/Caddyfile').read_text(), self.h.caddyfile(candidate, False))
             self.assertEqual((self.active / 'Caddyfile').read_bytes(), live_front)
+            self.h.atomic(self.active / 'Caddyfile', live_front + b'\n# foreign front drift\n')
+            with self.assertRaisesRegex(self.h.Error, 'exact prepared device snapshot'):
+                self.h.export_backup()
+            self.h.atomic(self.active / 'Caddyfile', live_front)
+            self.assertFalse((self.h.ROOT / 'backup-stop.json').exists())
             with sqlite3.connect(self.model.database) as db:
                 joins = db.execute('select client_id,inbound_id from client_inbounds').fetchall()
                 self.assertEqual(len(joins), 3 * len(current['accounts']))

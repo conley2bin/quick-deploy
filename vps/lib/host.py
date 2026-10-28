@@ -683,6 +683,9 @@ def enable_cdn(folder, manifest, domain, port):
 def reapply_role_flows(api, manifest):
     if cdn_enabled(manifest):
         inbound = next(i for i in api.call('/panel/api/inbounds/list') if i['id'] == manifest['tcp_cdn']['inbound_id'])
+        clients = native_object(inbound['settings']).get('clients', [])
+        if inbound.get('disableFlow') is True and all(not c.get('flow', '') for c in clients):
+            return  # A full native UPDATE would rewrite every Client.updatedAt.
         inbound['disableFlow'] = True
         api.call('/panel/api/inbounds/update/' + str(inbound['id']), inbound)
 
@@ -2010,7 +2013,18 @@ def export_backup(request=None):
                 # The unpublished candidate archive must instead restore its
                 # own private front, without publishing new capabilities or
                 # changing the active/rollback front configuration.
-                atomic(stage / 'deployment/Caddyfile', caddyfile(manifest, False))
+                private_front = caddyfile(manifest, False)
+                archived_front = stage / 'deployment/Caddyfile'
+                if archived_front.read_text() != private_front:
+                    pending = read_json(ROOT / 'pending.json')
+                    rollback = ROOT / 'device-rollback'
+                    before_manifest = read_json(rollback / 'manifest.json')
+                    before_front = (rollback / 'Caddyfile').read_text()
+                    if (pending.get('kind') != 'devices' or pending.get('phase') != 'prepared' or
+                            before_front != caddyfile(before_manifest, before_manifest['published']) or
+                            archived_front.read_text() != before_front):
+                        raise Error('Candidate front differs from its exact prepared device snapshot')
+                atomic(archived_front, private_front)
             metadata.update(format=FORMAT, encryption='none', panel_version=read_json(active / 'release-lock.json')['panel']['version'])
             atomic(stage / 'database-schema.sql', metadata.pop('schema'))
             atomic(stage / 'backup.json', dumps(metadata))
