@@ -916,6 +916,7 @@ class CdnFeeds(unittest.TestCase):
       reality-opts:
         public-key: {'x'*43}
         short-id: '1234567890abcdef'
+        support-x25519mlkem768: true
     - alpn:
         - h2
       name: SELF-cdn
