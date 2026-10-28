@@ -120,7 +120,10 @@ class NativeModel:
             self.groups[path.rsplit('/', 1)[1]] = copy.deepcopy(data)
         elif path.startswith('/panel/api/inbounds/update/'):
             identity = int(path.rsplit('/', 1)[1])
+            old = self.inbounds[identity]
             self.inbounds[identity] = copy.deepcopy(data)
+            if old['tag'] == 'in-' + str(old['port']) + '-tcp' and data.get('tag') == old['tag']:
+                self.inbounds[identity]['tag'] = 'in-' + str(data['port']) + '-tcp'
             if data.get('disableFlow'):
                 settings = json.loads(self.inbounds[identity]['settings'])
                 for client in settings['clients']: client['flow'] = ''
@@ -302,6 +305,8 @@ class CdnHost(unittest.TestCase):
         payload = next(data for path, data in updates if path == '/panel/api/inbounds/update/1')
         self.assertIs(payload['disableFlow'], False)
         self.assertEqual((payload['port'], payload['tag']), (9443, 'in-443-tcp'))
+        self.assertEqual(sum(path == '/panel/api/inbounds/update/1' for path, _ in updates), 2)
+        self.assertEqual(self.model.inbounds[1]['tag'], 'in-443-tcp')
         self.assertEqual(payload['policySentinel'], 'preserved')
         self.assertEqual(json.loads(payload['settings'])['fallbacks'], [])
         for name, record in records.items():

@@ -601,6 +601,25 @@ def enable_cdn(folder, manifest, domain, port):
     desired.update(hosts=[manifest['endpoint'] + ':' + str(port)], port=port)
     check_lease()
     api.call('/panel/api/inbounds/update/' + str(original['id']), moved)
+    current = next(i for i in api.call('/panel/api/inbounds/list') if i['id'] == original['id'])
+    # Pinned UpdateInbound treats an unchanged automatic tag as a request to
+    # regenerate it for the new port, even when the full DTO explicitly posts
+    # that tag. Reapply the saved tag on the fresh full DTO before acceptance.
+    if current.get('tag') != original['tag']:
+        if current.get('tag') != 'in-' + str(port) + '-tcp':
+            raise Error('Unexpected native REALITY tag normalization during port move')
+        if (current.get('id') != original['id'] or current.get('port') != port or
+                native_object(current['streamSettings']) != native_object(moved['streamSettings']) or
+                native_object(current['settings']) != native_object(original['settings']) or
+                current.get('remark') != original['remark'] or current.get('protocol') != original['protocol']):
+            raise Error('Native REALITY port move changed its retained configuration')
+        current['tag'] = original['tag']
+        api.call('/panel/api/inbounds/update/' + str(original['id']), current)
+    retained = next(i for i in api.call('/panel/api/inbounds/list') if i['id'] == original['id'])
+    if (retained.get('tag') != original['tag'] or retained.get('port') != port or
+            native_object(retained['streamSettings']) != native_object(moved['streamSettings']) or
+            native_object(retained['settings']) != native_object(original['settings'])):
+        raise Error('Native REALITY port move did not restore its saved tag/configuration')
     api.call('/panel/api/hosts/update/' + group['groupId'], desired)
     payload = {'remark': 'SELF-cdn', 'tag': 'SELF-cdn', 'enable': True, 'listen': '127.0.0.1',
         'port': XHTTP_PORT, 'protocol': 'vless', 'disableFlow': True, 'settings': original['settings'],
