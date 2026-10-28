@@ -368,7 +368,7 @@ class ThreeFixture:
             self.front.wait(timeout=8)
         self.front = None
 
-    def start_front(self):
+    def start_front(self, production=None):
         if self.front is not None:
             self.assertIsNone(self.front.poll(), 'Owned Caddy unexpectedly stopped')
             return
@@ -377,13 +377,22 @@ class ThreeFixture:
         folder.mkdir(mode=0o700)
         config, access = folder / 'Caddyfile', folder / 'access.jsonl'
         self.access_logs.append(access)
-        # Match the service scheduler's finite stop: held XHTTP requests must
-        # not make this disposable Caddy drain indefinitely before PANEL stops.
-        config.write_text('{\n admin off\n auto_https off\n grace_period 1s\n servers {\n  protocols h1 h2\n }\n}\n' +
-            'https://cdn.example.org:%d {\n bind 127.0.0.1\n tls %s %s\n log {\n  output file %s\n  format json\n }\n' %
-            (host.CDN_PORT, cert, key, access) +
-            ' @xhttp path %s %s*\n handle @xhttp {\n  reverse_proxy 127.0.0.1:%d {\n   flush_interval -1\n  }\n }\n respond 404\n}\n' %
-            (host.XHTTP_PATH, host.XHTTP_PATH, host.XHTTP_PORT))
+        # Retain the actual production globals and CDN route. Only local socket,
+        # CA and access-log coordinates differ; no fixture-only drain override.
+        production = host.caddyfile(host.read_json(self.fx.folder / 'manifest.json'), True) if production is None else production
+        config.write_text(production)
+        command = [str(self.fx.folder / 'bin/caddy'), 'adapt', '--config', str(config), '--adapter', 'caddyfile']
+        adapted = json.loads(host.run(command).stdout)
+        self.save('production-front-' + str(time.monotonic_ns()) + '.json', adapted)
+        # Retain diagnostics for this owned process's readiness marker.
+        global_options = production.split('https://', 1)[0].replace('output discard', 'output stderr')
+        cdn_site = production[production.index('https://cdn.example.org:'):].split('http://cdn.example.org:', 1)[0]
+        cdn_site = re.sub(r'    tls \{\n        issuer acme \{.*?\n    \}', '    tls %s %s' % (cert, key), cdn_site, flags=re.S)
+        cdn_site = cdn_site.replace(' {\n', ' {\n    bind 127.0.0.1\n    log {\n        output file %s\n        format json\n    }\n' % access, 1)
+        config.write_text(global_options + cdn_site)
+        local = json.loads(host.run(command).stdout)
+        self.assertEqual(local['apps']['http'].get('grace_period'), adapted['apps']['http'].get('grace_period'))
+        self.front_grace_ns = adapted['apps']['http'].get('grace_period')
         self.front = self.spawn([str(self.fx.folder / 'bin/caddy'), 'run', '--config', str(config), '--adapter', 'caddyfile'],
             folder, dict(os.environ), 'serving initial configuration', folder / 'private.log')
         context = ssl.create_default_context(cafile=str(cert))
@@ -725,6 +734,59 @@ class NativeThreeDevices(ThreeFixture, unittest.TestCase):
         control, _ = self.exports('company')
         self.all_three(control, origin)
         self.http2_evidence()
+
+
+@unittest.skipUnless(os.environ.get('QD_VPS_ARTIFACTS') and os.environ.get('QD_NATIVE_CDN_EVIDENCE'), REQUIRED)
+class NativeThreeDrain(ThreeFixture, unittest.TestCase):
+    def test_production_grace_bounds_held_xhttp_before_panel_stop_and_backup(self):
+        profile, _ = self.exports()
+        origin = self.origin()
+        origin.RequestHandlerClass.protocol_version = 'HTTP/1.1'
+        panel = self.fx.fx.proc
+        production = host.caddyfile(self.fx.manifest, True)
+        self.assertEqual(self.front_grace_ns, 5_000_000_000)
+        stream = self.held_stream(profile, 'cdn', origin)
+        self.assert_stream_alive(stream)
+        self.assertIsNone(panel.poll())
+        started = time.monotonic()
+        self.stop_front()  # SIGTERM, exactly the production FRONT stop signal
+        elapsed = time.monotonic() - started
+        self.assertLess(elapsed, 8)
+        self.assertIsNone(panel.poll(), 'FRONT drained only because PANEL stopped')
+        self.save('bounded-drain.json', {'graceNanoseconds': self.front_grace_ns,
+            'elapsedSeconds': elapsed, 'panelAliveAfterFrontExit': True, 'signal': 'SIGTERM'})
+        stream.close()
+        self.start_front()
+        stream = self.held_stream(profile, 'cdn', origin)
+        self.assert_stream_alive(stream)
+        before = {table: self.fx.rows(table) for table in ('clients', 'client_inbounds', 'hosts', 'inbounds')}
+        self.fx.archive()  # actual backup stops FRONT while this XHTTP is held
+        self.assertIsNone(panel.poll(), 'Backup unexpectedly stopped PANEL')
+        self.assertEqual(before, {table: self.fx.rows(table) for table in before})
+        self.topology()
+        stream.close()
+        self.fresh(profile, 'cdn', origin, True)
+        self.stop_front()
+        # Counterfactual is the same production render with only the fix absent.
+        unbounded = production.replace('    grace_period 5s\n', '')
+        self.assertNotEqual(production, unbounded)
+        self.start_front(unbounded)
+        self.assertIsNone(self.front_grace_ns)
+        stream = self.held_stream(profile, 'cdn', origin)
+        self.assert_stream_alive(stream)
+        self.assertIsNone(panel.poll())
+        started = time.monotonic()
+        os.killpg(self.front.pid, signal.SIGTERM)
+        with self.assertRaises(subprocess.TimeoutExpired):
+            self.front.wait(timeout=7)
+        self.assertIsNone(panel.poll())
+        self.save('unbounded-drain-negative.json', {'observedSeconds': time.monotonic() - started,
+            'frontStillAlive': self.front.poll() is None, 'panelStillAlive': panel.poll() is None,
+            'graceNanoseconds': self.front_grace_ns, 'signal': 'SIGTERM'})
+        self.fx.fx.stop()  # owned PANEL cleanup, never wait for the 60s caller
+        self.front.wait(timeout=8)
+        self.front = None
+        stream.close()
 
 
 @unittest.skipUnless(os.environ.get('QD_VPS_ARTIFACTS') and os.environ.get('QD_NATIVE_CDN_EVIDENCE'), REQUIRED)

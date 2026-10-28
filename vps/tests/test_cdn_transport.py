@@ -14,6 +14,8 @@ from pathlib import Path
 import socket
 import sqlite3
 import subprocess
+import tarfile
+import tempfile
 import types
 import unittest
 from unittest import mock
@@ -918,6 +920,35 @@ class CdnFeeds(unittest.TestCase):
             'mode': host.XHTTP_MODE, 'certificate_file': 'caddy/data/caddy/certificates/issuer/cdn.example.org.crt',
             'key_file': 'caddy/data/caddy/certificates/issuer/cdn.example.org.key'}
         self.account = self.manifest['accounts']['company']
+
+    @unittest.skipUnless(os.environ.get('QD_VPS_ARTIFACTS'), 'Pinned Caddy artifact required for real adaptation')
+    def test_production_caddy_grace_is_bounded_only_for_cdn(self):
+        pin = test_remote.vps.release_lock()['front']
+        archive = Path(os.environ['QD_VPS_ARTIFACTS']) / pin['file']
+        self.assertEqual(host.digest(archive), pin['sha256'])
+        with tempfile.TemporaryDirectory(prefix='qd-cdn-grace-') as directory:
+            root = Path(directory)
+            binary = root / 'caddy'
+            with tarfile.open(archive) as source:
+                host.atomic(binary, source.extractfile('caddy').read(), 0o700)
+            for mode in ('legacy', 'dual', 'cdn'):
+                manifest = copy.deepcopy(self.manifest)
+                if mode != 'cdn':
+                    manifest.pop('tcp_cdn')
+                if mode == 'legacy':
+                    manifest.pop('hysteria2')
+                with self.subTest(mode=mode):
+                    rendered = host.caddyfile(manifest, True)
+                    path = root / 'Caddyfile'
+                    host.atomic(path, rendered)
+                    adapted = json.loads(host.run([binary, 'adapt', '--config', path, '--adapter', 'caddyfile']).stdout)
+                    http = adapted['apps']['http']
+                    if mode == 'cdn':
+                        self.assertEqual(http['grace_period'], 5_000_000_000)
+                        self.assertLess(http['grace_period'], 60_000_000_000)
+                    else:
+                        self.assertNotIn('grace_period', http)
+                        self.assertNotIn('grace_period', rendered)
 
     def uri(self):
         vless = 'vless://' + self.account['id'] + '@cdn.example.org:443?' + urlencode({'type': 'xhttp', 'security': 'tls',

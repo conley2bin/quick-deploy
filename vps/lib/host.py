@@ -961,6 +961,9 @@ def caddyfile(manifest, published, bootstrap_domain=None):
 ''' if published and paths else ''
     contact = manifest['config']['acme_email']
     email_option = '    email ' + json.dumps(contact) + '\n' if contact else ''
+    # Held XHTTP downloads must drain before ctl's 60s caller deadline while
+    # PANEL is still alive. Keep legacy/dual front bytes unchanged.
+    grace_option = '    grace_period 5s\n' if cdn_enabled(manifest) else ''
     extra = ''
     if cdn_enabled(manifest) or bootstrap_domain is not None:
         cdn = manifest['tcp_cdn']['domain'] if cdn_enabled(manifest) else hostname(bootstrap_domain)
@@ -990,7 +993,7 @@ http://{cdn}:80 {{
     auto_https disable_redirects
     http_port 80
     https_port 8443
-{email_option}    log default {{
+{email_option}{grace_option}    log default {{
         output discard
     }}
     servers {{

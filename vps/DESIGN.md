@@ -518,6 +518,7 @@ UUID/Auth/SubID/启用/到期/额度/HWID 等策略不变。
 - H2：UDP443、Auth、原订阅域名证书绑定、Host 与管理路由完全不变。
 - Caddy 最终监听 CDN 域名:443，仅把精确 XHTTP 路径及子孙反代到 127.0.0.1:2080（不去前缀），其余路径404；
   全局 `protocols h1 h2` 保持不变——不引入 h3，UDP443 始终属于 H2。原 sub:8443 订阅与 HTTP01:80 保留。
+  仅 CDN 模式设置全局 `grace_period 5s`，使持有的 XHTTP 下载在 FRONT 先于 PANEL 停止时有界关闭，早于控制调用的60秒期限；旧单/双入口渲染及 unit 不变。
   新证书是该域名在受管 Caddy storage 内唯一匹配的一对普通文件；H2 证书选择器按原订阅域名过滤，第二对证书不造成歧义。
 - Cloudflare443 → 源站443，同主机名/SNI，无长期443→8443 Origin Rule。端口归属按活动模式：
   CDN 模式 FRONT 拥有 TCP443/8443/80，PANEL 拥有回环2080、REALITY 选定 TCP 端口与 UDP443；
