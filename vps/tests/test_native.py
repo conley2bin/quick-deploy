@@ -690,6 +690,7 @@ class Native(unittest.TestCase):
             self.stop()
             self.work, self.manifest = original_work, original_manifest
             self.start()
+            host.wait_api(self.manifest)
 
     def test_devices_real_reality_auth_stream_revocation_and_tls_capabilities(self):
         import socketserver
@@ -1247,6 +1248,7 @@ class Native(unittest.TestCase):
         self.manifest = recovered
         expected_accounts = copy.deepcopy(recovered['accounts'])
         self.start()
+        host.wait_api(self.manifest)
         restored_outputs = host.backend_health(self.work, self.manifest)
         self.assertEqual(len(restored_outputs), 6)
         self.assertEqual(self.manifest['accounts'], expected_accounts)

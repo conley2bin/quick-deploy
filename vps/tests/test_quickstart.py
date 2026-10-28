@@ -43,7 +43,12 @@ class Quickstart(unittest.TestCase):
                     self.assertEqual(record['port'], 2222)
                     self.assertIn('/fixture-home/.ssh/vps_ed25519', record['options'])
         commands = [args.command for args in parsed]
-        self.assertEqual(commands[:3], ['preflight', 'deploy', 'replace'])
+        self.assertEqual(commands[:4], ['preflight', 'deploy', 'cdn', 'replace'])
+        cdn = next(args for args in parsed if args.command == 'cdn')
+        self.assertEqual(cdn.cdn_domain, 'cdn.example.org')
+        self.assertFalse(hasattr(cdn, 'domain'))
+        self.assertEqual((cdn.interface, cdn.dns_server, cdn.mihomo),
+                         ('eno1', '203.0.113.2', '/path/to/mihomo'))
         for required in ('status', 'backup', 'recover', 'restore'):
             self.assertIn(required, commands)
         devices = [args for args in parsed if args.command == 'devices']
