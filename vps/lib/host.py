@@ -1852,6 +1852,8 @@ def export_backup(request=None):
         pending = read_json(ROOT / 'pending.json')
         if pending.get('kind') in ('devices', 'transport-upgrade') and pending.get('phase') != 'prepared':
             raise Error('Owned transaction not ready for backup')
+        if pending.get('cdn_auth', {}).get('phase') not in (None, 'restored'):
+            raise Error('Active auth diagnostic cannot enter an archive')
     if ROOT.is_symlink():
         raise Error('Symlink owned root cannot be exported')
     active = ROOT / 'active'
@@ -2465,6 +2467,7 @@ def recover_devices(pending):
             atomic(active / name, (rollback / name).read_bytes())
         if pending.get('caddy_snapshot'):
             restore_caddy(active, rollback)
+        auth_cleanup(pending)
         # Snapshot-phase crashes never ran candidate FRONT, so an incomplete
         # initial subtree is deliberately ignored rather than restored.
         # Persist restored-state authorization BEFORE queueing dependent jobs.
@@ -2498,6 +2501,341 @@ def recover_devices(pending):
     return {'pending': False, 'restored': 'original device database/front/adapter and service state'}
 
 
+def auth_template(folder):
+    with contextlib.closing(sqlite3.connect('file:' + str(Path(folder) / 'db/x-ui.db') + '?mode=ro', uri=True)) as db:
+        rows = db.execute("select value from settings where key='xrayTemplateConfig'").fetchall()
+    if len(rows) != 1 or not isinstance(rows[0][0], str):
+        raise Error('Missing or ambiguous native Xray template')
+    raw = rows[0][0]
+    try:
+        template = json.loads(raw)
+    except ValueError as exc:
+        raise Error('Invalid native Xray template') from exc
+    if not isinstance(template, dict) or 'xraySetting' in template or not isinstance(template.get('log'), dict):
+        raise Error('Unexpected native Xray template shape')
+    return raw, template
+
+
+def auth_core_epoch(folder):
+    """Bind evidence to the attested native API listener, not a PID alone."""
+    pids = set()
+    for line in run(['ss', '-H', '-ltnp'], timeout=10).stdout.decode().splitlines():
+        fields = line.split()
+        if len(fields) >= 4 and fields[3] == '127.0.0.1:' + str(API_PORT):
+            pids.update(re.findall(r'pid=(\d+)', line))
+    if len(pids) != 1:
+        raise Error('Cannot pin unique native core epoch')
+    pid = pids.pop()
+    proc = Path('/proc') / pid
+    if (os.readlink(proc / 'exe') != str(Path(folder) / 'bin/xray-linux-amd64') or
+            PANEL not in (proc / 'cgroup').read_text()):
+        raise Error('Foreign native core epoch')
+    fields = (proc / 'stat').read_text().rsplit(')', 1)[1].split()
+    return {'boot_id': boot_id(), 'pid': int(pid), 'start_ticks': int(fields[19])}
+
+
+def auth_live_users(folder, tag):
+    """Pinned Xray HandlerService read; never the panel's cached projection."""
+    result = run([Path(folder) / 'bin/xray-linux-amd64', 'api', 'inbounduser',
+                  '--server=127.0.0.1:' + str(API_PORT), '-tag=' + tag, '-timeout=3'], timeout=5)
+    try:
+        users = json.loads(result.stdout)['users']
+        if not isinstance(users, list):
+            raise ValueError()
+        for user in users:
+            if (not isinstance(user.get('email'), str) or
+                    user['account'].get('_TypedMessage_') != 'xray.proxy.vless.Account'):
+                raise ValueError()
+            uuid.UUID(user['account']['id'])
+        return {user['email']: user['account']['id'] for user in users} if len({u['email'] for u in users}) == len(users) else None
+    except (ValueError, KeyError, TypeError, AttributeError) as exc:
+        raise Error('Cannot attest native VLESS live registry') from exc
+
+
+def auth_uuid_key(value):
+    raw = bytearray(uuid.UUID(value).bytes)
+    raw[6:8] = b'\0\0'  # Pinned Xray ProcessUUID lookup semantics.
+    return bytes(raw)
+
+
+def auth_native_state(folder, manifest):
+    check_lease()
+    process_health()
+    api = wait_api(manifest)
+    owned_host_group(folder, api, manifest)
+    hysteria_health(folder, manifest, api)
+    accounts = snapshot_accounts(Path(folder) / 'db/x-ui.db', manifest)
+    if accounts != manifest['accounts']:
+        raise Error('Native credentials changed during auth diagnostic')
+    config = read_json(Path(folder) / 'bin/config.json')
+    config.pop('log', None)
+    vless = [i for i in config.get('inbounds', []) if i.get('protocol') == 'vless']
+    if len(vless) != 1 or vless[0].get('tag') != 'SELF-cdn':
+        raise Error('Auth diagnostic requires the single owned native VLESS ingress')
+    generated = {c['email']: c['id'] for c in vless[0]['settings']['clients']}
+    live = auth_live_users(folder, vless[0]['tag'])
+    if not generated or live != generated:
+        raise Error('Native VLESS registry disagrees with generated configuration')
+    authority = {c['email']: c['id'] for c in accounts.values()}
+    if any(authority.get(name) != identity for name, identity in live.items()):
+        raise Error('Native VLESS registry differs from owned identities')
+    records = {name: api.call('/panel/api/clients/get/' + name)['client'] for name in device_names(manifest)}
+    # ClientRecord contains identity and policy, not mutable traffic counters.
+    # Routing rules/outbounds and all other generated lists retain their order.
+    state = {'config': config, 'clients': records,
+             'hosts': {g['groupId']: g for g in api.call('/panel/api/hosts/list')}}
+    check_lease()
+    return state, list(authority.values())
+
+
+def auth_bound(request):
+    fingerprint = transport_request(request)
+    manifest = device_owner(request)
+    pending = read_json(ROOT / 'pending.json')
+    if (request.get('feature') != 'tcp-cdn' or not cdn_enabled(manifest) or
+            pending.get('kind') != 'transport-upgrade' or pending.get('phase') != 'prepared' or
+            pending.get('feature') != 'tcp-cdn' or pending.get('operation_id') != request['operation_id'] or
+            pending.get('request_sha256') != fingerprint or manifest['tcp_cdn']['domain'] != request['tcp_cdn']['domain']):
+        raise Error('Auth diagnostic requires its owned prepared CDN operation')
+    return manifest, pending, fingerprint
+
+
+def auth_directory(pending):
+    # No caller-selected path and no arbitrary recursive cleanup.
+    return ROOT / ('auth-witness-' + pending['operation_id'])
+
+
+def auth_file(pending, record):
+    directory = auth_directory(pending)
+    ds = directory.lstat()
+    if (not stat.S_ISDIR(ds.st_mode) or ds.st_uid != os.getuid() or stat.S_IMODE(ds.st_mode) != 0o700 or
+            [ds.st_dev, ds.st_ino] != record['directory_identity']):
+        raise Error('Auth witness directory identity changed')
+    fd = os.open(directory / 'error.log', os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        info = os.fstat(fd)
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o600 or
+                info.st_nlink != 1 or [info.st_dev, info.st_ino] != record['file_identity']):
+            raise Error('Auth witness file identity changed')
+        return os.fdopen(fd, 'rb')
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def auth_cleanup(pending):
+    record = pending.get('cdn_auth')
+    if not record:
+        return
+    directory = auth_directory(pending)
+    if not directory.exists() and not directory.is_symlink():
+        return
+    ds = directory.lstat()
+    if (not stat.S_ISDIR(ds.st_mode) or ds.st_uid != os.getuid() or stat.S_IMODE(ds.st_mode) != 0o700 or
+            ('directory_identity' in record and [ds.st_dev, ds.st_ino] != record['directory_identity'])):
+        raise Error('Refusing foreign auth diagnostic directory cleanup')
+    path = directory / 'error.log'
+    if path.exists() or path.is_symlink():
+        if 'file_identity' in record:
+            with auth_file(pending, record):
+                pass
+        else:
+            info = path.lstat()  # Crash between exclusive creation and journal pin.
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or
+                    stat.S_IMODE(info.st_mode) != 0o600 or info.st_nlink != 1):
+                raise Error('Refusing foreign unpinned auth witness cleanup')
+        path.unlink()
+    directory.rmdir()  # Refuse unexpected entries; never delete a foreign file.
+
+
+def auth_begin_result(request, fingerprint, record):
+    return {'schema': 1, 'operation_id': request['operation_id'], 'request_fingerprint': fingerprint,
+            'nonce': record['nonce'], 'native_identity_sha256': record['native_identity_sha256']}
+
+
+def transport_auth_begin(request):
+    manifest, pending, fingerprint = auth_bound(request)
+    active = ROOT / 'active'
+    try:
+        check_lease()
+        record = pending.get('cdn_auth')
+        if record:
+            if record.get('phase') != 'active':
+                raise Error('Auth diagnostic already finished or interrupted; recover operation')
+            state, _ = auth_native_state(active, manifest)
+            raw, _ = auth_template(active)
+            with auth_file(pending, record) as stream:
+                if os.fstat(stream.fileno()).st_size < record['offset']:
+                    raise Error('Auth witness truncated')
+            if (auth_core_epoch(active) != record['epoch'] or state != record['native_state'] or
+                    raw != record['temporary_template']):
+                raise Error('Active auth diagnostic changed; recovery required')
+            check_lease()
+            return auth_begin_result(request, fingerprint, record)
+        state, registered = auth_native_state(active, manifest)
+        raw, template = auth_template(active)
+        if template['log'] != {'access': 'none', 'error': 'none', 'loglevel': 'none'}:
+            raise Error('Auth diagnostic requires original disabled native logging')
+        excluded = {auth_uuid_key(value) for value in registered}
+        for _ in range(32):
+            nonce = str(uuid.uuid4())
+            if auth_uuid_key(nonce) not in excluded:
+                break
+        else:
+            raise Error('Cannot generate excluded native auth nonce')
+        record = {'phase': 'arming', 'original_template': raw, 'native_state': state, 'nonce': nonce,
+                  'original_epoch': auth_core_epoch(active), 'native_identity_sha256': cdn_proof_digest(state)}
+        pending['cdn_auth'] = record
+        atomic(ROOT / 'pending.json', dumps(pending))  # Save exact original BEFORE any mutation.
+        directory = auth_directory(pending)
+        directory.mkdir(mode=0o700)
+        ds = directory.lstat()
+        record['directory_identity'] = [ds.st_dev, ds.st_ino]
+        atomic(ROOT / 'pending.json', dumps(pending))
+        fd = os.open(directory / 'error.log', os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, 'wb') as stream:
+            stream.flush(); os.fsync(stream.fileno())
+            info = os.fstat(stream.fileno())
+        record['file_identity'] = [info.st_dev, info.st_ino]
+        record['offset'] = info.st_size
+        template['log'] = {'access': 'none', 'error': str(directory / 'error.log'), 'loglevel': 'info'}
+        record['temporary_template'] = json.dumps(template)
+        record['started_at'] = time.time()
+        atomic(ROOT / 'pending.json', dumps(pending))
+        check_lease()
+        ctl('stop', PANEL)
+        check_lease()
+        settings_write(active / 'db/x-ui.db', {'xrayTemplateConfig': record['temporary_template']})
+        ctl('start', PANEL)
+        wait_api(manifest)
+        current, _ = auth_native_state(active, manifest)
+        if current != state or auth_template(active)[0] != record['temporary_template']:
+            raise Error('Temporary logging changed native identity/configuration')
+        with auth_file(pending, record) as stream:
+            record['offset'] = os.fstat(stream.fileno()).st_size
+        epoch = auth_core_epoch(active)
+        if epoch == record['original_epoch']:
+            raise Error('Native logger did not enter a fresh core epoch')
+        record.update(phase='active', epoch=epoch)
+        check_lease()
+        atomic(ROOT / 'pending.json', dumps(pending))
+        return auth_begin_result(request, fingerprint, record)
+    except BaseException:
+        recover(force=True)
+        raise
+
+
+def auth_read_verdict(pending, record):
+    with auth_file(pending, record) as stream:
+        size = os.fstat(stream.fileno()).st_size
+        if size < record['offset'] or size - record['offset'] > 4 * 1024 * 1024:
+            raise Error('Auth witness truncated or exceeds bounded read')
+        stream.seek(record['offset'])
+        data = stream.read(4 * 1024 * 1024 + 1)
+    nonce = re.escape(record['nonce'])
+    pattern = (rb'^(\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2}\.\d{6}) \[Info\] \[\d+\] '
+               rb'app/proxyman/inbound: connection ends > proxy/vless/inbound: invalid request from '
+               rb'[^\r\n]+ > proxy/vless/encoding: invalid request user id: ' + nonce.encode() + rb'$')
+    for line in data.splitlines(keepends=True):
+        if not line.endswith(b'\n'):
+            continue
+        match = re.fullmatch(pattern, line.rstrip(b'\r\n'))
+        if match:
+            observed = datetime.strptime(match[1].decode(), '%Y/%m/%d %H:%M:%S.%f').timestamp()
+            if record['started_at'] <= observed <= time.time():
+                return True
+    raise Error('No fresh exact native invalid-user nonce verdict')
+
+
+def transport_auth_finish(request):
+    manifest, pending, fingerprint = auth_bound(request)
+    record = pending.get('cdn_auth')
+    if not record:
+        raise Error('No owned native auth diagnostic to finish')
+    try:
+        check_lease()
+    except Error:
+        recover(force=True)
+        raise
+    supplied = request.get('cdn_auth_nonce')
+    nonce_matches = (isinstance(supplied, str) and hashlib.sha256(supplied.encode()).hexdigest() ==
+                     (record.get('nonce_sha256') or hashlib.sha256(record['nonce'].encode()).hexdigest()))
+    if record.get('phase') == 'restored':
+        if not nonce_matches or not record.get('verdict'):
+            raise Error('No matching restored native auth verdict')
+        auth_commit_verdict(request, pending, fingerprint)
+        return record['verdict']
+    active = ROOT / 'active'
+    failure = None
+    try:
+        if record.get('phase') != 'active' or not nonce_matches:
+            raise Error('Auth nonce or diagnostic phase mismatch')
+        if auth_core_epoch(active) != record['epoch']:
+            raise Error('Native auth witness process epoch changed')
+    except Exception as exc:
+        failure = exc
+    # Close writer before reading; restoration runs even on absent/invalid evidence.
+    ctl('stop', PANEL)
+    try:
+        if failure is None:
+            auth_read_verdict(pending, record)
+    except Exception as exc:
+        failure = exc
+    record['phase'] = 'restoring'
+    atomic(ROOT / 'pending.json', dumps(pending))
+    settings_write(active / 'db/x-ui.db', {'xrayTemplateConfig': record['original_template']})
+    cleanup_failed = False
+    try:
+        auth_cleanup(pending)
+    except Exception as exc:
+        failure, cleanup_failed = exc, True
+    check_lease()
+    ctl('start', PANEL)
+    wait_api(manifest)
+    current, _ = auth_native_state(active, manifest)
+    if (current != record['native_state'] or auth_template(active)[0] != record['original_template'] or
+            read_json(active / 'bin/config.json').get('log') != json.loads(record['original_template'])['log']):
+        raise Error('Auth diagnostic restoration changed native identity/configuration/logging')
+    check_lease()
+    identity = record['native_identity_sha256']
+    verdict = {'schema': 1, 'operation_id': request['operation_id'], 'request_fingerprint': fingerprint,
+               'nonce_sha256': hashlib.sha256(record['nonce'].encode()).hexdigest(), 'rejected': True,
+               'native_identity_sha256': identity}
+    # Only sanitized bound result persists after restoration; no template/log/nonce archive.
+    if not cleanup_failed:
+        pending['cdn_auth'] = {'phase': 'restored', 'nonce_sha256': verdict['nonce_sha256'],
+                               'restored_template_sha256': hashlib.sha256(record['original_template'].encode()).hexdigest(),
+                               'native_identity_sha256': identity, 'verdict': verdict if failure is None else None}
+    (ROOT / 'export-sha256').unlink(missing_ok=True)  # Candidate A is never final B.
+    atomic(ROOT / 'pending.json', dumps(pending))
+    if failure is not None:
+        raise Error('Native auth verdict unavailable; original logging restored') from failure
+    return verdict
+
+
+def auth_commit_verdict(request, pending, fingerprint):
+    record = pending.get('cdn_auth', {})
+    verdict = record.get('verdict', {})
+    if (record.get('phase') != 'restored' or not isinstance(verdict, dict) or
+            set(verdict) != {'schema', 'operation_id', 'request_fingerprint', 'nonce_sha256', 'rejected', 'native_identity_sha256'} or
+            type(verdict.get('schema')) is not int or verdict.get('schema') != 1 or verdict.get('rejected') is not True or
+            verdict.get('operation_id') != request['operation_id'] or verdict.get('request_fingerprint') != fingerprint or
+            verdict.get('nonce_sha256') != record.get('nonce_sha256') or
+            not re.fullmatch(r'[0-9a-f]{64}', verdict.get('nonce_sha256', '')) or
+            auth_directory(pending).exists() or auth_directory(pending).is_symlink()):
+        raise Error('CDN commit requires its bound restored native auth verdict and no active diagnostic')
+    active = ROOT / 'active'
+    raw, template = auth_template(active)
+    if (hashlib.sha256(raw.encode()).hexdigest() != record.get('restored_template_sha256') or
+            template['log'] != {'access': 'none', 'error': 'none', 'loglevel': 'none'} or
+            read_json(active / 'bin/config.json').get('log') != template['log']):
+        raise Error('Native logging/template changed after auth restoration')
+    state, _ = auth_native_state(active, device_owner(request))
+    if cdn_proof_digest(state) != verdict['native_identity_sha256']:
+        raise Error('Native identity/configuration changed after auth restoration')
+    return verdict
+
+
 def transport_commit(request):
     return devices_commit(request, transport=True)
 
@@ -2524,6 +2862,7 @@ def devices_commit(request, transport=False):
         raise Error('Require verified off-node device backup receipt')
     if cdn:
         validate_cdn_proof(request, fingerprint)
+        auth_commit_verdict(request, pending, fingerprint)
     backend_health(ROOT / 'active', manifest)
     check_lease()
     front_config(ROOT / 'active', manifest, True)
@@ -2538,7 +2877,8 @@ def devices_commit(request, transport=False):
     if transport:
         result['transports'] = transports(manifest)
         if cdn:
-            result.update(offnode_sha256=request['offnode_sha256'], cdn_proof=request['cdn_proof'], cdn_proof_sha256=request['cdn_proof_sha256'])
+            result.update(offnode_sha256=request['offnode_sha256'], cdn_proof=request['cdn_proof'], cdn_proof_sha256=request['cdn_proof_sha256'],
+                          cdn_auth_verdict=pending['cdn_auth']['verdict'])
     atomic(receipt_path(request), dumps(result))
     (ROOT / 'pending.json').unlink()
     os.replace(ROOT / 'device-rollback', ROOT / ('completed-' + request['operation_id']))
@@ -2726,6 +3066,10 @@ def main():
                     result = devices_commit(request)
                 elif action == 'transport-commit':
                     result = transport_commit(request)
+                elif action == 'transport-auth-begin':
+                    result = transport_auth_begin(request)
+                elif action == 'transport-auth-finish':
+                    result = transport_auth_finish(request)
                 elif action == 'devices-list':
                     manifest = device_owner(request)
                     if (ROOT / 'pending.json').exists():
@@ -2750,6 +3094,8 @@ def main():
                         pending = read_json(ROOT / 'pending.json')
                         if pending.get('kind') in ('devices', 'transport-upgrade') and pending.get('phase') != 'prepared':
                             raise Error('Owned transaction not ready for output export')
+                        if pending.get('cdn_auth', {}).get('phase') not in (None, 'restored'):
+                            raise Error('Active auth diagnostic cannot enter output export')
                     active = ROOT / 'active'
                     result = {name: base64.b64encode(data).decode() for name, data in backend_health(active, read_json(active / 'manifest.json')).items()}
                 else:

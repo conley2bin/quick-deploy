@@ -60,7 +60,8 @@ class NativeModel:
                 db.execute('alter table hosts add column ' + definition)
             db.execute('create table client_traffics(email text)')
             db.execute('create table inbound_client_ips(client_email text)')
-        template = {'outbounds': [{'tag': 'direct', 'protocol': 'freedom'}, {'tag': 'blocked', 'protocol': 'blackhole'}]}
+        template = {'log': {'access': 'none', 'error': 'none', 'loglevel': 'none'},
+                    'outbounds': [{'tag': 'direct', 'protocol': 'freedom'}, {'tag': 'blocked', 'protocol': 'blackhole'}]}
         template['routing'] = {'rules': [host.management_rule(template, manifest, 'SELF-h2')]}
         self.h.settings_write(self.database, {'xrayTemplateConfig': json.dumps(template)})
         self.sync()
@@ -182,6 +183,41 @@ class CdnHost(unittest.TestCase):
 
     def prepare(self):
         return self.h.transport_prepare(self.base.upload(self.request))
+
+    def install_auth_runtime(self):
+        epoch = {'boot_id': self.h.boot_id(), 'pid': 55, 'start_ticks': 10}
+        original_ctl = self.h.ctl.side_effect
+        def generated():
+            _, template = self.h.auth_template(self.active)
+            config = copy.deepcopy(template)
+            config['inbounds'] = [{'tag': i['tag'], 'protocol': i['protocol'], 'listen': i['listen'], 'port': i['port'],
+                'settings': json.loads(i['settings']), 'streamSettings': json.loads(i['streamSettings'])}
+                for i in self.model.inbounds.values()]
+            self.h.atomic(self.active / 'bin/config.json', self.h.dumps(config))
+            path = template['log']['error']
+            if path != 'none':
+                with Path(path).open('a') as out: out.write('native startup marker\n')
+        def control(*args):
+            result = original_ctl(*args)
+            if args == ('start', self.h.PANEL):
+                epoch['start_ticks'] += 1
+                generated()
+            return result
+        generated()
+        self.f.patch(self.h, 'auth_core_epoch', side_effect=lambda folder: dict(epoch))
+        self.f.patch(self.h, 'auth_live_users', side_effect=lambda folder, tag:
+            {c['email']: c['id'] for c in json.loads(self.model.inbounds[1]['settings'])['clients']})
+        self.h.ctl.side_effect = control
+        return epoch
+
+    def complete_auth(self):
+        self.install_auth_runtime()
+        begun = self.h.transport_auth_begin(self.request)
+        pending = self.h.read_json(self.h.ROOT / 'pending.json')
+        path = self.h.auth_directory(pending) / 'error.log'
+        line = datetime.now().strftime('%Y/%m/%d %H:%M:%S.%f') + ' [Info] [123] app/proxyman/inbound: connection ends > proxy/vless/inbound: invalid request from 127.0.0.1:4567 > proxy/vless/encoding: invalid request user id: ' + begun['nonce'] + '\n'
+        with path.open('a') as stream: stream.write(line)
+        return self.h.transport_auth_finish(dict(self.request, cdn_auth_nonce=begun['nonce']))
 
     def proof_request(self, candidate='d' * 64):
         proof = {'schema': 1, 'operation_id': self.request['operation_id'], 'request_fingerprint': self.h.transport_request(self.request),
@@ -322,6 +358,7 @@ class CdnHost(unittest.TestCase):
         before = self.proof_request('c' * 64)
         self.h.atomic(self.h.ROOT / 'export-sha256', 'c' * 64)
         with self.assertRaisesRegex(self.h.Error, 'new dual-state backup'): self.h.transport_commit(before)
+        self.complete_auth()
         self.h.atomic(self.h.ROOT / 'export-sha256', 'd' * 64)
         committed = self.h.transport_commit(request)
         self.assertTrue(committed['committed']); self.assertEqual(committed['transports'], self.request['target_transports'])
@@ -420,7 +457,7 @@ class CdnHost(unittest.TestCase):
         self.h.hysteria_health.assert_called()
 
     def publish(self):
-        self.prepare(); self.h.atomic(self.h.ROOT / 'export-sha256', 'd' * 64)
+        self.prepare(); self.complete_auth(); self.h.atomic(self.h.ROOT / 'export-sha256', 'd' * 64)
         self.h.transport_commit(self.proof_request())
 
     def test_add_rename_reset_remove_single_authority_and_two_joins(self):
@@ -540,6 +577,157 @@ class CdnHost(unittest.TestCase):
         self.assertTrue(self.h.preflight(self.request)['owned'])
         source = copy.deepcopy(self.manifest); self.h.atomic(self.active / 'manifest.json', self.h.dumps(source))
         with self.assertRaisesRegex(self.h.Error, 'Foreign process|2080'): self.h.preflight(self.request)
+
+
+class AuthWitness(unittest.TestCase):
+    def setUp(self):
+        self.owner = CdnHost('runTest'); self.owner.setUp(); self.addCleanup(self.owner.doCleanups)
+        self.h, self.f, self.active = self.owner.h, self.owner.f, self.owner.active
+        self.request = self.owner.request
+        self.owner.prepare()
+        self.epoch = self.owner.install_auth_runtime()
+        self.original_raw = self.h.auth_template(self.active)[0]
+        self.original_config = self.h.read_json(self.active / 'bin/config.json')
+        self.original_records = copy.deepcopy(self.owner.model.records)
+
+    def begin(self):
+        self.begun = self.h.transport_auth_begin(self.request)
+        self.pending = self.h.read_json(self.h.ROOT / 'pending.json')
+        self.path = self.h.auth_directory(self.pending) / 'error.log'
+        return self.begun
+
+    def append(self, nonce=None, when=None):
+        nonce = nonce or self.begun['nonce']
+        stamp = (when or datetime.now()).strftime('%Y/%m/%d %H:%M:%S.%f')
+        with self.path.open('a') as out:
+            out.write(stamp + ' [Info] [12345] app/proxyman/inbound: connection ends > proxy/vless/inbound: invalid request from 127.0.0.1:1234 > proxy/vless/encoding: invalid request user id: ' + nonce + '\n')
+
+    def finish(self, nonce=None):
+        return self.h.transport_auth_finish(dict(self.request, cdn_auth_nonce=nonce or self.begun['nonce']))
+
+    def assert_restored(self):
+        self.assertEqual(self.h.auth_template(self.active)[0], self.original_raw)
+        self.assertEqual(self.h.read_json(self.active / 'bin/config.json'), self.original_config)
+        self.assertEqual(self.owner.model.records, self.original_records)
+        self.assertFalse(self.path.exists())
+
+    def test_bound_fresh_verdict_restores_exact_raw_and_finish_lost_ack(self):
+        raw, template = self.h.auth_template(self.active)
+        # Raw spacing is part of the restore contract, not just parsed equality.
+        self.original_raw = '  ' + json.dumps(template, indent=3) + '\n'
+        self.h.settings_write(self.active / 'db/x-ui.db', {'xrayTemplateConfig': self.original_raw})
+        with mock.patch.object(self.h, 'settings_write', wraps=self.h.settings_write) as writes:
+            result = self.begin()
+            self.assertEqual(set(result), {'schema', 'operation_id', 'request_fingerprint', 'nonce', 'native_identity_sha256'})
+            self.assertEqual(self.path.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(self.path.parent.stat().st_mode & 0o777, 0o700)
+            self.assertNotIn(self.active, self.path.parents)
+            self.assertEqual(self.begin(), result, 'Begin lost ACK must reuse the nonce and logger')
+            self.append()
+            finished = self.finish()
+            self.assertEqual(set(finished), {'schema', 'operation_id', 'request_fingerprint', 'nonce_sha256', 'rejected', 'native_identity_sha256'})
+            self.assertTrue(finished['rejected'])
+            self.assertEqual(finished['native_identity_sha256'], result['native_identity_sha256'])
+            calls = self.h.ctl.call_count
+            self.assertEqual(self.finish(), finished)
+            self.assertEqual(self.h.ctl.call_count, calls)
+            self.assertEqual(len(writes.call_args_list), 2)
+            self.assertTrue(all(set(call.args[1]) == {'xrayTemplateConfig'} for call in writes.call_args_list))
+        self.assert_restored()
+        saved = self.h.read_json(self.h.ROOT / 'pending.json')['cdn_auth']
+        self.assertNotIn('nonce', saved); self.assertNotIn('original_template', saved); self.assertNotIn('native_state', saved)
+        self.assertFalse((self.h.ROOT / 'export-sha256').exists(), 'A digest must be invalidated before final B')
+
+    def test_other_missing_stale_or_extended_nonce_never_sets_verdict(self):
+        from datetime import timedelta
+        for kind in ('missing', 'other', 'stale', 'extended'):
+            with self.subTest(kind=kind):
+                # Each scenario uses a genuinely independent transaction.
+                other = AuthWitness('runTest'); other.setUp()
+                try:
+                    other.begin()
+                    if kind == 'other': other.append('00000000-0000-4000-8000-000000000001')
+                    if kind == 'stale': other.append(when=datetime.now() - timedelta(days=1))
+                    if kind == 'extended': other.append(other.begun['nonce'] + 'ffff')
+                    with other.assertRaisesRegex(other.h.Error, 'verdict unavailable'): other.finish()
+                    other.assert_restored()
+                    self.assertIsNone(other.h.read_json(other.h.ROOT / 'pending.json')['cdn_auth']['verdict'])
+                    with other.assertRaises(other.h.Error): other.finish()
+                finally:
+                    other.doCleanups()
+
+    def test_processuuid_registered_collision_regenerates_boundedly(self):
+        import uuid
+        registered = next(iter(self.owner.model.records.values()))['uuid']
+        raw = bytearray(uuid.UUID(registered).bytes); raw[6] ^= 0x0f; raw[7] ^= 0xff
+        equivalent = uuid.UUID(bytes=bytes(raw))
+        self.assertNotEqual(str(equivalent), registered)
+        self.assertEqual(self.h.auth_uuid_key(str(equivalent)), self.h.auth_uuid_key(registered))
+        real_uuid4 = uuid.uuid4
+        fresh = real_uuid4()
+        with mock.patch.object(self.h.uuid, 'uuid4', side_effect=[equivalent, fresh]) as generate:
+            self.assertEqual(self.begin()['nonce'], str(fresh)); self.assertEqual(generate.call_count, 2)
+        self.append(); self.finish()
+
+    def test_truncation_or_changed_epoch_restore_without_verdict(self):
+        self.begin(); self.append()
+        self.path.write_bytes(b'')
+        with self.assertRaisesRegex(self.h.Error, 'verdict unavailable'): self.finish()
+        self.assert_restored()
+
+    def test_wrong_inode_never_consumed_and_foreign_file_never_deleted(self):
+        self.begin(); self.append()
+        original = self.path.with_name('held-original')
+        self.path.rename(original)
+        self.path.write_bytes(original.read_bytes()); self.path.chmod(0o600)
+        with self.assertRaisesRegex(self.h.Error, 'verdict unavailable'): self.finish()
+        self.assertEqual(self.h.auth_template(self.active)[0], self.original_raw)
+        self.assertEqual(self.h.read_json(self.active / 'bin/config.json'), self.original_config)
+        self.assertTrue(self.path.exists()); self.assertTrue(original.exists())
+        self.assertTrue((self.h.ROOT / 'pending.json').exists())
+
+    def test_epoch_change_and_wrong_nonce_fail_after_restoration(self):
+        self.begin(); self.append(); self.epoch['start_ticks'] += 1
+        with self.assertRaisesRegex(self.h.Error, 'verdict unavailable'): self.finish('00000000-0000-4000-8000-000000000001')
+        self.assert_restored()
+
+    def test_restore_failure_leaves_guard_armed_and_commit_denied(self):
+        self.begin(); self.append()
+        with mock.patch.object(self.h, 'settings_write', side_effect=self.h.Error('restore failed')):
+            with self.assertRaisesRegex(self.h.Error, 'restore failed'): self.finish()
+        pending = self.h.read_json(self.h.ROOT / 'pending.json')
+        self.assertEqual(pending['cdn_auth']['phase'], 'restoring')
+        with self.assertRaisesRegex(self.h.Error, 'bound restored'):
+            self.h.auth_commit_verdict(self.request, pending, self.h.transport_request(self.request))
+        self.assertTrue(self.h.abort(self.request)['queued'])
+        self.assertFalse(self.path.exists())
+
+    def test_active_diagnostic_archive_and_commit_gates(self):
+        self.begin()
+        with self.assertRaisesRegex(self.h.Error, 'cannot enter an archive'): self.h.export_backup()
+        request = self.owner.proof_request()
+        self.h.atomic(self.h.ROOT / 'export-sha256', request['offnode_sha256'])
+        with self.assertRaisesRegex(self.h.Error, 'bound restored'): self.h.transport_commit(request)
+        self.append(); self.finish()
+        with self.assertRaises((self.h.Error, FileNotFoundError)): self.h.transport_commit(request)
+        self.h.atomic(self.h.ROOT / 'export-sha256', request['offnode_sha256'])
+        self.assertTrue(self.h.transport_commit(request)['committed'])
+        self.assertEqual(self.h.transport_commit(request)['cdn_auth_verdict']['rejected'], True)
+
+    def test_deadline_and_crash_recovery_remove_only_owned_logger(self):
+        self.begin(); directory = self.path.parent
+        unrelated = self.h.ROOT / 'auth-witness-foreign'; unrelated.mkdir(); (unrelated / 'keep').write_bytes(b'keep')
+        pending = self.h.read_json(self.h.ROOT / 'pending.json'); pending['deadline'] = 0
+        self.h.atomic(self.h.ROOT / 'pending.json', self.h.dumps(pending))
+        self.assertTrue(self.h.recover()['queued'])
+        self.assertFalse(directory.exists()); self.assertEqual((unrelated / 'keep').read_bytes(), b'keep')
+        self.assertEqual(self.h.read_json(self.h.ROOT / 'pending.json')['phase'], 'restore-queued')
+        self.assertEqual((self.active / 'db/x-ui.db').read_bytes(), (self.h.ROOT / 'device-rollback/x-ui.db').read_bytes())
+
+    def test_wrong_binding_refused_without_touching_active_diagnostic(self):
+        self.begin(); calls = self.h.ctl.call_count
+        with self.assertRaises(self.h.Error): self.h.transport_auth_finish(dict(self.request, operation_id='f' * 32))
+        self.assertEqual(self.h.ctl.call_count, calls); self.assertTrue(self.path.exists())
 
 
 class LegacyRestoreMode(unittest.TestCase):
