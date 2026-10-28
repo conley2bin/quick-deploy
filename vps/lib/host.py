@@ -150,14 +150,13 @@ def validate_config(config):
 
 def required_ports(config, manifest=None):
     ports = (80, config['proxy_port'], 8443, ADMIN_PORT, SUB_PORT, API_PORT)
-    return (*ports, XHTTP_PORT) if manifest is not None and cdn_enabled(manifest) else ports
-
+    return (*ports, reality_port(manifest), XHTTP_PORT) if manifest is not None and cdn_enabled(manifest) else ports
 
 def tcp_owner(manifest, port):
     """Ownership follows attested active state, never a proposed transition."""
     if port in (80, 8443) or (cdn_enabled(manifest) and port == CDN_PORT):
         return FRONT, 'caddy'
-    return PANEL, 'xray-linux-amd64' if port in (manifest['config']['proxy_port'], API_PORT, XHTTP_PORT) else 'x-ui'
+    return PANEL, 'xray-linux-amd64' if port in (reality_port(manifest), API_PORT, XHTTP_PORT) else 'x-ui'
 
 
 def verify_artifacts(folder, lock):
@@ -276,16 +275,29 @@ def certificate_metadata(meta, label):
         raise Error('Invalid owned ' + label + ' certificate pair')
 
 
+def validate_reality_port(port, ssh_port):
+    if (type(port) is not int or not 1 <= port <= 65535 or
+            port in (ssh_port, 80, CDN_PORT, 8443, XHTTP_PORT, ADMIN_PORT, SUB_PORT, API_PORT)):
+        raise Error('Invalid retained REALITY port or conflict with management/front/backend listener')
+    return port
+
+
 def cdn_metadata(manifest):
     meta = manifest['tcp_cdn']
-    if (not isinstance(meta, dict) or set(meta) != {'schema', 'domain', 'inbound_id', 'path', 'mode', 'certificate_file', 'key_file'} or
+    if (not isinstance(meta, dict) or set(meta) != {'schema', 'domain', 'inbound_id', 'host_group_id', 'reality_port', 'reality_tag',
+            'path', 'mode', 'certificate_file', 'key_file'} or
             type(meta['schema']) is not int or meta['schema'] != 1 or type(meta['inbound_id']) is not int or meta['inbound_id'] <= 0 or
+            not isinstance(meta['host_group_id'], str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,128}', meta['host_group_id']) or
+            not isinstance(meta['reality_tag'], str) or not meta['reality_tag'] or len(meta['reality_tag']) > 128 or
+            any(c.isspace() or ord(c) < 32 for c in meta['reality_tag']) or meta['reality_tag'] in ('SELF-cdn', 'SELF-h2') or
             hostname(meta['domain']) != meta['domain'] or meta['domain'] in (manifest['config']['domain'], manifest['config']['reality_target']) or
             manifest['config']['proxy_port'] != CDN_PORT or meta['path'] != XHTTP_PATH or meta['mode'] != XHTTP_MODE or
-            meta['inbound_id'] == manifest['hysteria2']['inbound_id']):
+            meta['inbound_id'] == manifest['hysteria2']['inbound_id'] or
+            len({manifest.get('host_group_id'), meta['host_group_id'], manifest['hysteria2']['host_group_id']}) != 3 or
+            not manifest.get('host_group_id')):
         raise Error('Invalid owned TCP CDN capability metadata')
+    validate_reality_port(meta['reality_port'], manifest['management']['ssh_port'])
     certificate_metadata(meta, 'CDN')
-
 
 def cdn_enabled(manifest):
     if 'tcp_cdn' not in manifest:
@@ -295,12 +307,18 @@ def cdn_enabled(manifest):
 
 
 def main_tag(manifest):
-    return 'SELF-cdn' if cdn_enabled(manifest) else 'SELF-main'
+    return 'SELF-main'
 
+
+def reality_port(manifest):
+    return manifest['tcp_cdn']['reality_port'] if cdn_enabled(manifest) else manifest['config']['proxy_port']
+
+
+def reality_tag(manifest):
+    return manifest['tcp_cdn']['reality_tag'] if cdn_enabled(manifest) else 'in-' + str(manifest['config']['proxy_port']) + '-tcp'
 
 def transports(manifest):
-    return ['tcp-xhttp-cdn', 'hysteria2'] if cdn_enabled(manifest) else (['tcp-reality', 'hysteria2'] if dual_enabled(manifest) else ['tcp-reality'])
-
+    return ['tcp-reality', 'tcp-xhttp-cdn', 'hysteria2'] if cdn_enabled(manifest) else (['tcp-reality', 'hysteria2'] if dual_enabled(manifest) else ['tcp-reality'])
 
 def dual_enabled(manifest):
     if 'hysteria2' not in manifest:
@@ -399,13 +417,14 @@ def native_keys(folder):
 
 def inbound_for(manifest):
     keys = manifest['reality']
-    return {'remark': 'SELF-main', 'enable': True, 'listen': '0.0.0.0', 'port': manifest['config']['proxy_port'],
+    return {'remark': 'SELF-main', 'enable': True, 'listen': '0.0.0.0', 'port': reality_port(manifest),
+            **({'tag': reality_tag(manifest)} if cdn_enabled(manifest) else {}),
             'protocol': 'vless', 'settings': json.dumps({'clients': list(manifest['accounts'].values()), 'decryption': 'none'}),
             'streamSettings': json.dumps({'network': 'tcp', 'security': 'reality', 'tcpSettings': {'header': {'type': 'none'}},
                 'realitySettings': {'show': False, 'dest': manifest['config']['reality_target'] + ':443',
                     'xver': 0, 'serverNames': [manifest['config']['reality_target']], **keys,
                     'settings': {'publicKey': keys['publicKey'], 'fingerprint': 'chrome', 'spiderX': '/'}},
-                'externalProxy': [{'forceTls': 'same', 'dest': manifest['endpoint'], 'port': manifest['config']['proxy_port'], 'remark': ''}]}),
+                'externalProxy': [{'forceTls': 'same', 'dest': manifest['endpoint'], 'port': reality_port(manifest), 'remark': ''}]}),
             'sniffing': json.dumps({'enabled': True, 'destOverride': ['http', 'tls', 'quic'], 'routeOnly': True})}
 
 
@@ -427,7 +446,7 @@ def clash_rules(manifest):
     if dual_enabled(manifest):
         domain = manifest['config']['domain']
         settings['proxy-groups'] = [
-            {'name': 'PROXY', 'type': 'select', 'proxies': ['SELF-h2', main_tag(manifest), 'DIRECT']},
+            {'name': 'PROXY', 'type': 'select', 'proxies': (['SELF-h2', 'SELF-cdn', 'SELF-main', 'DIRECT'] if cdn_enabled(manifest) else ['SELF-h2', 'SELF-main', 'DIRECT'])},
             {'name': 'FEED', 'type': 'fallback', 'proxies': ['SELF-h2', 'DIRECT'],
              'url': f'https://{domain}:8443/', 'expected-status': '404', 'interval': 300, 'timeout': 5000, 'lazy': False}]
         settings['rules'] = [
@@ -457,57 +476,53 @@ def initialize_db(folder, manifest):
 
 
 def owned_host_group(folder, api, manifest):
-    """Attest every native row and the exact advertised/main-listener split."""
+    """Attest every role; return the retained REALITY inbound/logical Host."""
     inbounds = api.call('/panel/api/inbounds/list') or []
-    tag = main_tag(manifest)
-    expected = {tag: 'vless', 'SELF-h2': 'hysteria'} if dual_enabled(manifest) else {tag: 'vless'}
+    expected = {'SELF-main': 'vless'}
+    if dual_enabled(manifest):
+        expected['SELF-h2'] = 'hysteria'
+    if cdn_enabled(manifest):
+        expected['SELF-cdn'] = 'vless'
     if len(inbounds) != len(expected) or {i.get('remark'): i.get('protocol') for i in inbounds} != expected:
         raise Error('Unexpected native Host inbound membership')
-    inbound = next(i for i in inbounds if i['remark'] == tag)
-    stream = native_object(inbound['streamSettings'])
-    if cdn_enabled(manifest):
-        cdn_inbound_health(inbound, manifest)
-        h2 = next(i for i in inbounds if i['remark'] == 'SELF-h2')
-        external = native_object(h2['streamSettings']).get('externalProxy', [])
-    else:
-        external = stream.get('externalProxy', [])
-    if (len(external) != 1 or (not cdn_enabled(manifest) and inbound['port'] != manifest['config']['proxy_port']) or
-            external[0].get('port') != manifest['config']['proxy_port']):
+    inbound = next(i for i in inbounds if i['remark'] == 'SELF-main')
+    external = native_object(inbound['streamSettings']).get('externalProxy', [])
+    if (len(external) != 1 or inbound['port'] != reality_port(manifest) or
+            external[0].get('port') != reality_port(manifest)):
         raise Error('Unexpected native Host endpoint membership')
     old_endpoint = public_ip(external[0]['dest'])
     group_id = manifest.get('host_group_id')
     if not group_id:
         raise Error('Missing native Host ownership identity; verify the closed backup first')
-    # Count all DB rows, including hidden/disabled duplicates that the grouped
-    # API can deduplicate. A changed saved ID is never silently adopted.
-    snapshot_host_group(folder / 'db/x-ui.db', dict(manifest, endpoint=old_endpoint))
+    snapshot_host_group(Path(folder) / 'db/x-ui.db', dict(manifest, endpoint=old_endpoint))
     groups = api.call('/panel/api/hosts/list') or []
     expected_groups = {group_id}
     if dual_enabled(manifest):
         expected_groups.add(manifest['hysteria2']['host_group_id'])
+    if cdn_enabled(manifest):
+        expected_groups.add(manifest['tcp_cdn']['host_group_id'])
     if len(groups) != len(expected_groups) or {g.get('groupId') for g in groups} != expected_groups:
         raise Error('Unexpected native Host group membership')
     group = api.call('/panel/api/hosts/get/' + group_id)
-    expected = [old_endpoint + ':' + str(manifest['config']['proxy_port'])]
-    advertised = [manifest['tcp_cdn']['domain'] + ':' + str(CDN_PORT)] if cdn_enabled(manifest) else expected
     if (group.get('groupId') != group_id or group.get('inboundIds') != [inbound['id']] or
-            group.get('hosts') != advertised or group.get('port') != manifest['config']['proxy_port']):
+            group.get('hosts') != [old_endpoint + ':' + str(reality_port(manifest))] or group.get('port') != reality_port(manifest)):
         raise Error('Unexpected native Host group endpoint/inbound membership')
     if cdn_enabled(manifest):
-        cdn_host_health(group, manifest)
+        reality_source_health(inbound, manifest)
+        cdn = next(i for i in inbounds if i['remark'] == 'SELF-cdn')
+        cdn_inbound_health(cdn, manifest)
+        cdn_host_health(api.call('/panel/api/hosts/get/' + manifest['tcp_cdn']['host_group_id']), manifest)
     if dual_enabled(manifest):
         h2 = next(i for i in inbounds if i['remark'] == 'SELF-h2')
-        h2stream = h2['streamSettings']
-        h2stream = json.loads(h2stream) if isinstance(h2stream, str) else h2stream
         if (h2['id'] != manifest['hysteria2']['inbound_id'] or h2.get('tag') != 'SELF-h2' or
-                h2stream.get('externalProxy') != [{'forceTls': 'same', 'dest': old_endpoint, 'port': manifest['config']['proxy_port'], 'remark': ''}]):
+                native_object(h2['streamSettings']).get('externalProxy') !=
+                [{'forceTls': 'same', 'dest': old_endpoint, 'port': manifest['config']['proxy_port'], 'remark': ''}]):
             raise Error('Changed owned Hysteria2 inbound identity')
         h2_group = api.call('/panel/api/hosts/get/' + manifest['hysteria2']['host_group_id'])
-        if (h2_group.get('inboundIds') != [h2['id']] or h2_group.get('hosts') != expected or
+        if (h2_group.get('inboundIds') != [h2['id']] or h2_group.get('hosts') != [old_endpoint + ':' + str(manifest['config']['proxy_port'])] or
                 h2_group.get('port') != manifest['config']['proxy_port']):
             raise Error('Unexpected native Hysteria2 Host group')
     return inbound, group
-
 
 def native_object(value):
     return json.loads(value) if isinstance(value, str) else value
@@ -528,7 +543,7 @@ def cdn_inbound_health(inbound, manifest):
 
 def cdn_host_health(group, manifest):
     meta = manifest['tcp_cdn']
-    expected = {'groupId': manifest['host_group_id'], 'inboundIds': [meta['inbound_id']], 'hosts': [meta['domain'] + ':' + str(CDN_PORT)],
+    expected = {'groupId': meta['host_group_id'], 'inboundIds': [meta['inbound_id']], 'hosts': [meta['domain'] + ':' + str(CDN_PORT)],
                 'port': CDN_PORT, 'security': 'tls', 'sni': meta['domain'], 'hostHeader': meta['domain'],
                 'path': meta['path'], 'alpn': ['h2'], 'allowInsecure': False}
     forbidden = ('pinnedPeerCertSha256', 'verifyPeerCertByName', 'echConfigList', 'muxParams', 'sockoptParams', 'finalMask',
@@ -543,8 +558,8 @@ def reality_source_health(inbound, manifest):
     reality = stream.get('realitySettings', {})
     # The existing native API generates this tag because inbound_for supplies
     # a remark but no tag. SELF-main is the exported role, not the native tag.
-    if (inbound.get('tag') != 'in-' + str(CDN_PORT) + '-tcp' or inbound.get('remark') != 'SELF-main' or inbound.get('enable') is not True or
-            inbound.get('listen') != '0.0.0.0' or inbound.get('port') != CDN_PORT or inbound.get('protocol') != 'vless' or
+    if (inbound.get('tag') != reality_tag(manifest) or inbound.get('remark') != 'SELF-main' or inbound.get('enable') is not True or
+            inbound.get('listen') != '0.0.0.0' or inbound.get('port') != reality_port(manifest) or inbound.get('protocol') != 'vless' or
             stream.get('network') != 'tcp' or stream.get('security') != 'reality' or settings.get('decryption') != 'none' or
             reality.get('dest') != manifest['config']['reality_target'] + ':443' or
             reality.get('serverNames') != [manifest['config']['reality_target']] or
@@ -552,67 +567,94 @@ def reality_source_health(inbound, manifest):
         raise Error('CDN source is not the exact owned REALITY listener')
 
 
-def enable_cdn(folder, manifest, domain):
-    """Convert the existing VLESS/Host via full native objects; never reattach clients."""
+def enable_cdn(folder, manifest, domain, port):
+    """Move retained REALITY, then add one native flow-clamped CDN role."""
     if cdn_enabled(manifest) or not dual_enabled(manifest) or manifest['config']['proxy_port'] != CDN_PORT:
         raise Error('CDN migration requires the exact REALITY+Hysteria2 source')
+    validate_reality_port(port, manifest['management']['ssh_port'])
     domain = hostname(domain)
     api = wait_api(manifest)
     original, group = owned_host_group(folder, api, manifest)
+    reality_source_health(original, manifest)
     before = snapshot_accounts(Path(folder) / 'db/x-ui.db', manifest)
-    h2_group = api.call('/panel/api/hosts/get/' + manifest['hysteria2']['host_group_id'])
     records = {n: api.call('/panel/api/clients/get/' + n)['client'] for n in device_names(manifest)}
     earliest = {n: r.get('createdAt') for n, r in records.items()}
+    old_groups = {g['groupId'] for g in api.call('/panel/api/hosts/list')}
     for item in api.call('/panel/api/inbounds/list'):
         for client in native_object(item['settings']).get('clients', []):
             value = client.get('created_at', 0)
             if client['email'] in earliest and type(value) is int and value > 0 and type(earliest[client['email']]) is int:
                 earliest[client['email']] = min(earliest[client['email']], value)
+    # API clientStats uses a shared row whose inboundId moves to the new role;
+    # persisted H2 transport, Host and original joins are the invariants.
+    with contextlib.closing(sqlite3.connect(Path(folder) / 'db/x-ui.db')) as db:
+        h2_id = manifest['hysteria2']['inbound_id']
+        h2_before = (db.execute('select * from inbounds where id=?', (h2_id,)).fetchall(),
+                     db.execute('select * from hosts where inbound_id=?', (h2_id,)).fetchall(),
+                     db.execute('select * from client_inbounds order by client_id,inbound_id').fetchall())
     cert, key = certificate_paths(folder, domain)
-    meta = {'schema': 1, 'domain': domain, 'inbound_id': original['id'], 'path': XHTTP_PATH, 'mode': XHTTP_MODE,
-            'certificate_file': str(cert.relative_to(Path(folder).absolute())), 'key_file': str(key.relative_to(Path(folder).absolute()))}
-    candidate = dict(manifest, tcp_cdn=meta)
-    cdn_enabled(candidate)
-    inbound = copy.deepcopy(original)
-    settings = native_object(inbound['settings'])
-    inbound.update(remark='SELF-cdn', tag='SELF-cdn', listen='127.0.0.1', port=XHTTP_PORT, disableFlow=True, settings=json.dumps(settings),
-        streamSettings=json.dumps({'network': 'xhttp', 'security': 'none',
-            'xhttpSettings': {'host': domain, 'path': XHTTP_PATH, 'mode': XHTTP_MODE}, 'externalProxy': []}))
+    moved = copy.deepcopy(original)
+    stream = native_object(moved['streamSettings'])
+    stream['externalProxy'][0]['port'] = port
+    moved.update(port=port, tag=original['tag'], streamSettings=json.dumps(stream))
     desired = copy.deepcopy(group)
-    desired.update(hosts=[domain + ':' + str(CDN_PORT)], port=CDN_PORT, security='tls', sni=domain,
-                   hostHeader=domain, path=XHTTP_PATH, alpn=['h2'], allowInsecure=False)
+    desired.update(hosts=[manifest['endpoint'] + ':' + str(port)], port=port)
     check_lease()
-    api.call('/panel/api/inbounds/update/' + str(inbound['id']), inbound)
+    api.call('/panel/api/inbounds/update/' + str(original['id']), moved)
     api.call('/panel/api/hosts/update/' + group['groupId'], desired)
+    payload = {'remark': 'SELF-cdn', 'tag': 'SELF-cdn', 'enable': True, 'listen': '127.0.0.1',
+        'port': XHTTP_PORT, 'protocol': 'vless', 'disableFlow': True, 'settings': original['settings'],
+        'streamSettings': json.dumps({'network': 'xhttp', 'security': 'none',
+            'xhttpSettings': {'host': domain, 'path': XHTTP_PATH, 'mode': XHTTP_MODE}}), 'sniffing': original['sniffing']}
+    api.call('/panel/api/inbounds/add', payload)
+    found = [i for i in api.call('/panel/api/inbounds/list') if i.get('remark') == 'SELF-cdn']
+    if len(found) != 1 or found[0]['id'] in (original['id'], h2_id):
+        raise Error('Unexpected additive native CDN inbound identity')
+    cdn_id = found[0]['id']
+    api.call('/panel/api/hosts/add', {'inboundIds': [cdn_id], 'hosts': [domain], 'remark': 'SELF-cdn',
+        'port': CDN_PORT, 'security': 'tls', 'sni': domain, 'hostHeader': domain, 'path': XHTTP_PATH,
+        'alpn': ['h2'], 'allowInsecure': False})
+    new_groups = [g for g in api.call('/panel/api/hosts/list') if g['groupId'] not in old_groups]
+    if len(new_groups) != 1:
+        raise Error('Unexpected additive native CDN Host identity')
+    meta = {'schema': 1, 'domain': domain, 'inbound_id': cdn_id, 'host_group_id': new_groups[0]['groupId'],
+        'reality_port': port, 'reality_tag': original['tag'], 'path': XHTTP_PATH, 'mode': XHTTP_MODE,
+        'certificate_file': str(cert.relative_to(Path(folder).absolute())), 'key_file': str(key.relative_to(Path(folder).absolute()))}
     manifest['tcp_cdn'] = meta
     after = snapshot_accounts(Path(folder) / 'db/x-ui.db', manifest)
-    if any({k: v for k, v in after[n].items() if k != 'flow'} != {k: v for k, v in c.items() if k != 'flow'} or after[n]['flow'] != ''
-           for n, c in before.items()):
-        raise Error('Native CDN conversion changed credential authority')
+    if after != before:
+        raise Error('Native CDN addition changed global credential/flow authority')
     manifest['accounts'] = after
     for name, record in records.items():
         current = api.call('/panel/api/clients/get/' + name)['client']
-        if ({k: v for k, v in current.items() if k not in ('flow', 'createdAt', 'updatedAt')} !=
-                {k: v for k, v in record.items() if k not in ('flow', 'createdAt', 'updatedAt')} or current.get('flow') != ''):
-            raise Error('Native CDN conversion changed full client identity/policy')
-        if current.get('createdAt') != record.get('createdAt'):
-            value, original_time = current.get('createdAt'), record.get('createdAt')
-            if (type(value) is not int or type(original_time) is not int or value != earliest[name] or
-                    value // 1000 != original_time // 1000 or not 0 <= original_time - value < 1000):
-                raise Error('Native CDN conversion changed creation metadata beyond known normalization')
-        # Only the known earliest stored millisecond normalization is allowed.
-    if (api.call('/panel/api/hosts/get/' + group['groupId']) != desired or
-            api.call('/panel/api/hosts/get/' + manifest['hysteria2']['host_group_id']) != h2_group):
-        raise Error('Native CDN Host update changed unrelated policy')
+        if ({k: v for k, v in current.items() if k not in ('createdAt', 'updatedAt')} !=
+                {k: v for k, v in record.items() if k not in ('createdAt', 'updatedAt')}):
+            raise Error('Native CDN addition changed full client identity/policy')
+        value, original_time = current.get('createdAt'), record.get('createdAt')
+        if value != original_time and (type(value) is not int or type(original_time) is not int or value != earliest[name] or
+                value // 1000 != original_time // 1000 or not 0 <= original_time - value < 1000):
+            raise Error('Native CDN addition changed creation metadata beyond known normalization')
+    with contextlib.closing(sqlite3.connect(Path(folder) / 'db/x-ui.db')) as db:
+        h2_after = (db.execute('select * from inbounds where id=?', (h2_id,)).fetchall(),
+                    db.execute('select * from hosts where inbound_id=?', (h2_id,)).fetchall(),
+                    db.execute('select * from client_inbounds where inbound_id!=? order by client_id,inbound_id', (cdn_id,)).fetchall())
+    if h2_after != h2_before or api.call('/panel/api/hosts/get/' + group['groupId']) != desired:
+        raise Error('Native CDN addition changed retained H2 or REALITY Host policy')
     owned_host_group(folder, api, manifest)
-    # The full non-flow native policies stay in the preserved inbound/DB; do not
-    # reconstruct global Client DTOs from the reduced manifest projection.
     ctl('stop', PANEL)
     settings_write(Path(folder) / 'db/x-ui.db', backend_settings(manifest))
     ctl('start', PANEL)
     wait_api(manifest)
+    owned_host_group(folder, api, manifest)
     core_check(folder)
+    check_listener_free(CDN_PORT)
 
+
+def reapply_role_flows(api, manifest):
+    if cdn_enabled(manifest):
+        inbound = next(i for i in api.call('/panel/api/inbounds/list') if i['id'] == manifest['tcp_cdn']['inbound_id'])
+        inbound['disableFlow'] = True
+        api.call('/panel/api/inbounds/update/' + str(inbound['id']), inbound)
 
 def hysteria_inbound(manifest, cert, key):
     return {'remark': 'SELF-h2', 'tag': 'SELF-h2', 'enable': True, 'listen': '0.0.0.0', 'port': manifest['config']['proxy_port'],
@@ -743,11 +785,7 @@ def configure_native(folder, manifest, fresh, rotate=False):
         old_inbound, _ = owned_host_group(folder, api, manifest)  # before any write
         old_stream = old_inbound['streamSettings']
         old_stream = json.loads(old_stream) if isinstance(old_stream, str) else old_stream
-        if cdn_enabled(manifest):
-            h2 = next(i for i in api.call('/panel/api/inbounds/list') if i['id'] == manifest['hysteria2']['inbound_id'])
-            previous_endpoint = native_object(h2['streamSettings'])['externalProxy'][0]['dest']
-        else:
-            previous_endpoint = old_stream['externalProxy'][0]['dest']
+        previous_endpoint = old_stream['externalProxy'][0]['dest']
     if fresh:
         template = api.call('/panel/api/setting/getDefaultJsonConfig')
         template = json.loads(template) if isinstance(template, str) else template
@@ -794,18 +832,20 @@ def configure_native(folder, manifest, fresh, rotate=False):
         stream = inbound['streamSettings']
         stream = json.loads(stream) if isinstance(stream, str) else stream
         external = stream.get('externalProxy', [])
-        if not cdn_enabled(manifest) and (len(external) != 1 or inbound['port'] != manifest['config']['proxy_port']):
+        if len(external) != 1 or inbound['port'] != reality_port(manifest):
             raise Error('Unexpected restored native endpoint configuration')
-        if not cdn_enabled(manifest):
-            external[0]['dest'] = manifest['endpoint']
-        if rotate and not cdn_enabled(manifest):
+        external[0]['dest'] = manifest['endpoint']
+        if cdn_enabled(manifest):
+            inbound['tag'] = reality_tag(manifest)
+        if rotate:
+            if cdn_enabled(manifest):
+                manifest['reality'] = native_keys(folder)
             reality = stream['realitySettings']
             reality.update(manifest['reality'])
             reality.setdefault('settings', {})['publicKey'] = manifest['reality']['publicKey']
         inbound['streamSettings'] = json.dumps(stream)
         desired_group = copy.deepcopy(group)
-        if not cdn_enabled(manifest):
-            desired_group['hosts'] = [manifest['endpoint'] + ':' + str(manifest['config']['proxy_port'])]
+        desired_group['hosts'] = [manifest['endpoint'] + ':' + str(reality_port(manifest))]
         if desired_group['hosts'] != group['hosts']:
             # Hosts, not externalProxy, is authoritative for native feeds. Send
             # the complete object and change the address only, never its policy.
@@ -845,6 +885,7 @@ def configure_native(folder, manifest, fresh, rotate=False):
                 if dual_enabled(manifest):
                     account['auth'] = secrets.token_hex(24)
                 api.call('/panel/api/clients/update/' + device, account)
+    reapply_role_flows(api, manifest)
     api.call('/panel/api/server/restartXrayService', {})
     for _ in range(60):
         config = folder / 'bin/config.json'
@@ -971,24 +1012,29 @@ def validate_feed_scope(manifest, device, data, fmt):
         try:
             text = base64.b64decode(data, validate=True).decode()
             links = text.strip().splitlines()
-            if len(links) != (2 if dual_enabled(manifest) else 1):
+            if len(links) != (3 if cdn_enabled(manifest) else 2 if dual_enabled(manifest) else 1):
                 raise ValueError()
             parsed_links = [urlsplit(link) for link in links]
-            vless = [link for link in parsed_links if link.scheme == 'vless']
+            vless = [link for link in parsed_links if link.scheme == 'vless' and parse_qs(link.query).get('security') == ['reality']]
             if len(vless) != 1:
                 raise ValueError()
             parsed = vless[0]
             query = parse_qs(parsed.query, keep_blank_values=True)
             valid = (parsed.scheme == 'vless' and uuid.UUID(parsed.username) == uuid.UUID(current['id']) and
-                     parsed.hostname == manifest['endpoint'] and parsed.port == manifest['config']['proxy_port'] and
+                     parsed.hostname == manifest['endpoint'] and parsed.port == reality_port(manifest) and
                      query.get('security') == ['reality'] and query.get('flow') == ['xtls-rprx-vision'] and
                      query.get('pbk') == [manifest['reality']['publicKey']] and
                      query.get('sid') == [manifest['reality']['shortIds'][0]] and
                      query.get('sni') == [manifest['config']['reality_target']])
             if cdn_enabled(manifest):
+                cdn_links = [link for link in parsed_links if link.scheme == 'vless' and unquote(link.fragment) == 'SELF-cdn']
+                if len(cdn_links) != 1 or unquote(parsed.fragment) != 'SELF-main':
+                    raise ValueError('Missing precise VLESS role membership')
+                parsed = cdn_links[0]
+                query = parse_qs(parsed.query, keep_blank_values=True)
                 meta = manifest['tcp_cdn']
                 allowed = {'security', 'type', 'encryption', 'sni', 'host', 'path', 'mode', 'alpn', 'fp', 'flow', 'extra'}
-                valid = (uuid.UUID(parsed.username) == uuid.UUID(current['id']) and parsed.password is None and
+                valid = valid and (uuid.UUID(parsed.username) == uuid.UUID(current['id']) and parsed.password is None and
                     parsed.hostname == meta['domain'] and parsed.port == CDN_PORT and unquote(parsed.fragment) == 'SELF-cdn' and
                     set(query) <= allowed and all(len(v) == 1 for v in query.values()) and
                     all(query.get(k) == [v] for k, v in {'security': 'tls', 'type': 'xhttp', 'sni': meta['domain'],
@@ -1114,8 +1160,16 @@ def native_yaml_nodes(text):
 
 def validate_cdn_yaml(manifest, current, text):
     nodes = native_yaml_nodes(text)
-    if len(nodes) != 2 or {n.get('name') for n in nodes} != {'SELF-cdn', 'SELF-h2'}:
+    if len(nodes) != 3 or {n.get('name') for n in nodes} != {'SELF-main', 'SELF-cdn', 'SELF-h2'}:
         raise Error('Unexpected native CDN Mihomo role membership')
+    reality = next(n for n in nodes if n['name'] == 'SELF-main')
+    expected_reality = {'type': 'vless', 'server': manifest['endpoint'], 'port': reality_port(manifest),
+        'uuid': current['id'], 'network': 'tcp', 'tls': True, 'servername': manifest['config']['reality_target'],
+        'flow': current['flow'], 'reality-opts': {'public-key': manifest['reality']['publicKey'], 'short-id': manifest['reality']['shortIds'][0]}}
+    if (any(reality.get(k) != v for k, v in expected_reality.items()) or reality.get('tls') is not True or
+            reality.get('skip-cert-verify', False) is not False or not set(reality) <=
+            set(expected_reality) | {'name', 'udp', 'client-fingerprint', 'skip-cert-verify', 'packet-encoding'}):
+        raise Error('Unexpected retained REALITY Mihomo authentication/transport/TLS')
     cdn = next(n for n in nodes if n['name'] == 'SELF-cdn')
     h2 = next(n for n in nodes if n['name'] == 'SELF-h2')
     meta = manifest['tcp_cdn']
@@ -1171,6 +1225,12 @@ def backend_health(folder, manifest):
     hysteria_health(folder, manifest, api)
     if cdn_enabled(manifest):
         cdn_certificate_paths(folder, manifest)
+        cdn = next(i for i in api.call('/panel/api/inbounds/list') if i['id'] == manifest['tcp_cdn']['inbound_id'])
+        projected = native_object(cdn['settings'])['clients']
+        if (len(projected) != len(authoritative) or {c['email'] for c in projected} != set(authoritative) or
+                any(any(c.get(k, '' if k == 'flow' else None) != ('' if k == 'flow' else authoritative[c['email']][k])
+                        for k in ('id', 'email', 'subId', 'enable', 'flow')) for c in projected)):
+            raise Error('Native CDN projection disagrees with role-specific account authority')
     core_check(folder)
     outputs = {}
     for device in device_names(manifest):
@@ -1412,6 +1472,10 @@ def preflight(request):
         raise Error('Foreign unit name conflict')
     current = read_json(ROOT / 'active/manifest.json') if (ROOT / 'active/manifest.json').is_file() else None
     ports = required_ports(config, current)
+    if request.get('feature') == 'tcp-cdn':
+        proposal = request.get('tcp_cdn', {})
+        validate_reality_port(proposal.get('reality_port'), ssh_port)
+        ports = (*ports, proposal['reality_port'])
     if request.get('feature') == 'tcp-cdn' and XHTTP_PORT not in ports:
         ports = (*ports, XHTTP_PORT)
     check_units(require_all=current is not None)
@@ -1429,6 +1493,9 @@ def preflight(request):
         if port not in {str(p) for p in ports}:
             continue
         pids = re.findall(r'pid=(\d+)', line)
+        if (request.get('feature') == 'tcp-cdn' and int(port) == request['tcp_cdn']['reality_port'] and
+                (current is None or not cdn_enabled(current))):
+            raise Error('Retained REALITY TCP port is already in use; no port stealing')
         if (int(port) == XHTTP_PORT and request.get('feature') == 'tcp-cdn' and (current is None or not cdn_enabled(current))):
             raise Error('XHTTP loopback2080 is already in use; no port stealing')
         if not owned or not pids:
@@ -1461,14 +1528,17 @@ def preflight(request):
             'platform': 'ubuntu-24.04-amd64', 'firewall': 'empty; unchanged', 'ports': list(ports), 'ssh_port': ssh_port}
 
 
-def check_xhttp_port():
+def check_listener_free(port):
     for line in run(['ss', '-H', '-ltnp'], timeout=10).stdout.decode().splitlines():
         fields = line.split()
         if len(fields) < 4:
             raise Error('Cannot parse listener inventory')
-        if fields[3].rsplit(':', 1)[-1] == str(XHTTP_PORT):
-            raise Error('XHTTP loopback2080 is already in use; no port stealing')
+        if fields[3].rsplit(':', 1)[-1] == str(port):
+            raise Error('Required TCP listener ' + str(port) + ' is already in use; no port stealing')
 
+
+def check_xhttp_port():
+    check_listener_free(XHTTP_PORT)
 
 def check_cdn_dns(domain, endpoint):
     addresses = socket.getaddrinfo(domain, CDN_PORT, type=socket.SOCK_STREAM)
@@ -1555,7 +1625,7 @@ def snapshot_accounts(database, manifest=None, validate_metadata=True):
             joins = db.execute('select c.email,ci.inbound_id from client_inbounds ci left join clients c on c.id=ci.client_id').fetchall()
         ids = {row[0] for row in inbounds}
         wanted = {(name, identity) for name in expected for identity in ids}
-        if (len(inbounds) != (2 if dual else 1) or len(joins) != len(wanted) or set(joins) != wanted or
+        if (len(inbounds) != (3 if manifest is not None and cdn_enabled(manifest) else 2 if dual else 1) or len(joins) != len(wanted) or set(joins) != wanted or
                 (dual and manifest['hysteria2']['inbound_id'] not in ids)):
             raise Error('Unexpected snapshot account inbound membership')
     if manifest is not None and cdn_enabled(manifest):
@@ -1564,8 +1634,6 @@ def snapshot_accounts(database, manifest=None, validate_metadata=True):
                            (r[0], r[1], r[2], bool(r[3]), r[4]) + ((r[5],) if dual else ()))) for r in rows}
     if manifest is not None:
         device_names(dict(manifest, accounts=result))
-        if cdn_enabled(manifest) and any(c['flow'] != '' for c in result.values()):
-            raise Error('Unexpected Vision flow in CDN global authority')
     return result
 
 
@@ -1576,12 +1644,19 @@ def snapshot_host_group(database, manifest):
         admins = db.execute('select id from users where username=?', (manifest['admin_user'],)).fetchall()
         # No enabled/hidden filter: foreign inactive rows and duplicates count.
         hosts = db.execute('select group_id,inbound_id,address,port from hosts').fetchall()
-    dual = dual_enabled(manifest)
-    tag = main_tag(manifest)
-    wanted = {tag: 'vless', 'SELF-h2': 'hysteria'} if dual else {tag: 'vless'}
-    if (len(inbounds) != len(wanted) or len(admins) != 1 or
-            {r[2]: r[3] for r in inbounds} != wanted or any(r[1] != admins[0][0] or
-                r[4] != (XHTTP_PORT if cdn_enabled(manifest) and r[2] == tag else manifest['config']['proxy_port']) for r in inbounds)):
+    dual, cdn = dual_enabled(manifest), cdn_enabled(manifest)
+    tag = 'SELF-main'
+    wanted = {tag: 'vless'}
+    if dual:
+        wanted['SELF-h2'] = 'hysteria'
+    if cdn:
+        wanted['SELF-cdn'] = 'vless'
+    def listener(remark):
+        return XHTTP_PORT if remark == 'SELF-cdn' else reality_port(manifest) if remark == tag else manifest['config']['proxy_port']
+    def advertised(remark):
+        return CDN_PORT if remark == 'SELF-cdn' else listener(remark)
+    if (len(inbounds) != len(wanted) or len(admins) != 1 or {r[2]: r[3] for r in inbounds} != wanted or
+            any(r[1] != admins[0][0] or r[4] != listener(r[2]) for r in inbounds)):
         raise Error('Unexpected native Host owned-inbound identity')
     if len(hosts) != len(wanted):
         raise Error('Unexpected native Host snapshot membership')
@@ -1592,7 +1667,7 @@ def snapshot_host_group(database, manifest):
             raise Error('Unexpected native Host snapshot membership')
         group_id, inbound_id, address, port = matching[0]
         if (not isinstance(group_id, str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,128}', group_id) or
-                address != (manifest['tcp_cdn']['domain'] if cdn_enabled(manifest) and remark == tag else manifest['endpoint']) or port != manifest['config']['proxy_port']):
+                address != (manifest['tcp_cdn']['domain'] if remark == 'SELF-cdn' else manifest['endpoint']) or port != advertised(remark)):
             raise Error('Unexpected native Host snapshot endpoint/membership')
         identities[remark] = group_id
     if len(set(identities.values())) != len(wanted) or ('host_group_id' in manifest and manifest['host_group_id'] != identities[tag]):
@@ -1601,20 +1676,30 @@ def snapshot_host_group(database, manifest):
                  next(r[0] for r in inbounds if r[2] == 'SELF-h2') != manifest['hysteria2']['inbound_id']):
         raise Error('Changed persisted Hysteria2 Host/inbound identity')
     if cdn_enabled(manifest):
-        if next(r[0] for r in inbounds if r[2] == tag) != manifest['tcp_cdn']['inbound_id']:
+        if (next(r[0] for r in inbounds if r[2] == 'SELF-cdn') != manifest['tcp_cdn']['inbound_id'] or
+                identities['SELF-cdn'] != manifest['tcp_cdn']['host_group_id']):
             raise Error('Changed persisted CDN inbound identity')
         # CDN archives require positive transport/Host field evidence, not just
         # two familiar row names. Old DB schemas retain their original reader.
         with contextlib.closing(sqlite3.connect('file:' + str(database) + '?mode=ro', uri=True)) as db:
             db.row_factory = sqlite3.Row
             row = dict(db.execute('select * from inbounds where id=?', (manifest['tcp_cdn']['inbound_id'],)).fetchone())
-            host = dict(db.execute('select * from hosts where group_id=?', (manifest['host_group_id'],)).fetchone())
+            host = dict(db.execute('select * from hosts where group_id=?', (manifest['tcp_cdn']['host_group_id'],)).fetchone())
             clients = {c['email']: {'email': c['email'], 'id': c['uuid'], 'subId': c['sub_id'], 'enable': bool(c['enable']), 'flow': c['flow']}
                        for c in db.execute('select email,uuid,sub_id,enable,flow from clients')}
+            main = dict(db.execute("select * from inbounds where remark='SELF-main'").fetchone())
+            joins = db.execute('select c.email,ci.flow_override from client_inbounds ci join clients c on c.id=ci.client_id where ci.inbound_id=?',
+                               (manifest['tcp_cdn']['inbound_id'],)).fetchall()
         try:
+            reality_source_health(dict(main, streamSettings=main['stream_settings'], enable=bool(main['enable'])), manifest)
+            main_clients = native_object(main['settings']).get('clients', [])
+            if (len(main_clients) != len(clients) or {c['email'] for c in main_clients} != set(clients) or
+                    any(any(c.get(k, '' if k == 'flow' else None) != v for k, v in clients[c['email']].items()) for c in main_clients) or
+                    len(joins) != len(clients) or {r[0] for r in joins} != set(clients) or any(r[1] != '' for r in joins)):
+                raise Error('REALITY/CDN effective flow projection disagrees with native authority')
             projected = native_object(row['settings']).get('clients', [])
             if (len(projected) != len(clients) or {c['email'] for c in projected} != set(clients) or
-                    any(any(c.get(k, '' if k == 'flow' else None) != v for k, v in clients[c['email']].items()) for c in projected)):
+                    any(any(c.get(k, '' if k == 'flow' else None) != ('' if k == 'flow' else v) for k, v in clients[c['email']].items()) for c in projected)):
                 raise Error('CDN snapshot projection disagrees with global account authority')
             cdn_inbound_health(dict(row, streamSettings=row['stream_settings'], enable=bool(row['enable']), disableFlow=bool(row['disable_flow'])), manifest)
             cdn_host_health({'groupId': host['group_id'], 'inboundIds': [host['inbound_id']],
@@ -1989,7 +2074,10 @@ def prepare(upload):
             atomic(ROOT / 'active/manifest.json', dumps(old))
             return {'unchanged': True, 'needs_transport_upgrade': not dual_enabled(old), **info}
         if restored is not None and cdn_enabled(old):
+            validate_reality_port(reality_port(old), info['ssh_port'])
+            check_listener_free(reality_port(old))
             check_xhttp_port()
+            check_target(config)
         else:
             check_target(config)
         adapter = (stage / 'host.py').read_bytes()
@@ -2017,7 +2105,7 @@ def prepare(upload):
                 # The upstream schema is retained; only a new node lease rotates
                 # keys and proxy UUIDs. SubIDs/admin credentials stay stable.
                 manifest.update(endpoint=request['endpoint'], node_id=str(uuid.uuid4()), published=False)
-                if request['mode'] == 'replace':
+                if request['mode'] == 'replace' and not cdn_enabled(manifest):
                     manifest['reality'] = native_keys(active)
                 settings_write(active / 'db/x-ui.db', backend_settings(manifest))
                 fresh = False
@@ -2140,12 +2228,13 @@ def transport_request(request):
         raise Error('Invalid pre-change archive digest')
     if 'feature' in request:
         proposal = request.get('tcp_cdn')
-        if (request['feature'] != 'tcp-cdn' or not isinstance(proposal, dict) or set(proposal) != {'schema', 'domain'} or
+        if (request['feature'] != 'tcp-cdn' or not isinstance(proposal, dict) or set(proposal) != {'schema', 'domain', 'reality_port'} or
                 type(proposal['schema']) is not int or proposal['schema'] != 1 or hostname(proposal['domain']) != proposal['domain'] or
                 proposal['domain'] in (request['config']['domain'], request['config']['reality_target']) or request['config']['proxy_port'] != CDN_PORT or
                 request.get('source_transports') != ['tcp-reality', 'hysteria2'] or
-                request.get('target_transports') != ['tcp-xhttp-cdn', 'hysteria2']):
+                request.get('target_transports') != ['tcp-reality', 'tcp-xhttp-cdn', 'hysteria2']):
             raise Error('Unsupported TCP CDN feature proposal/transition')
+        validate_reality_port(proposal['reality_port'], request['ssh_port'])
         bound.update({key: request[key] for key in ('feature', 'tcp_cdn', 'source_transports', 'target_transports')})
     else:
         # Historical featureless fingerprints are immutable, including the
@@ -2291,12 +2380,14 @@ def devices_prepare(upload, transport=False):
             if manifest.get('published') is not True:
                 raise Error('CDN migration requires a committed source; active files alone are not acceptance')
             if cdn_enabled(manifest):
-                if manifest['tcp_cdn']['domain'] != request['tcp_cdn']['domain']:
+                if (manifest['tcp_cdn']['domain'], manifest['tcp_cdn']['reality_port']) != (request['tcp_cdn']['domain'], request['tcp_cdn']['reality_port']):
                     raise Error('CDN domain differs from the owned target')
                 raise Error('Owned CDN is already committed; a fresh CDN verification transaction is unsupported')
             elif not dual_enabled(manifest):
                 raise Error('CDN migration requires the exact REALITY+Hysteria2 source')
             else:
+                validate_reality_port(request['tcp_cdn']['reality_port'], request['ssh_port'])
+                check_listener_free(request['tcp_cdn']['reality_port'])
                 check_xhttp_port()
                 check_cdn_dns(request['tcp_cdn']['domain'], manifest['endpoint'])
                 reality_source_health(inbound, manifest)
@@ -2358,14 +2449,14 @@ def devices_prepare(upload, transport=False):
             api = wait_api(manifest)
             if cdn:
                 bootstrap_cdn_certificate(active, manifest, request['tcp_cdn']['domain'])
-                enable_cdn(active, manifest, request['tcp_cdn']['domain'])
+                enable_cdn(active, manifest, request['tcp_cdn']['domain'], request['tcp_cdn']['reality_port'])
             elif transport:
                 enable_hysteria(active, manifest, request['ssh_port'])
             elif action == 'add':
                 for name in names:
                     check_lease()
                     account = {'id': str(uuid.uuid4()), 'subId': secrets.token_hex(24), 'email': name,
-                               'enable': True, 'flow': '' if cdn_enabled(manifest) else 'xtls-rprx-vision'}
+                               'enable': True, 'flow': 'xtls-rprx-vision'}
                     # Collision checking covers ALL global native accounts above.
                     if any(uuid.UUID(account['id']) == uuid.UUID(c['id']) or account['subId'] == c['subId']
                            for c in manifest['accounts'].values()):
@@ -2376,6 +2467,8 @@ def devices_prepare(upload, transport=False):
                         if any(account['auth'] == c['auth'] for c in manifest['accounts'].values()):
                             raise Error('Generated Hysteria2 credential collision')
                         inbound_ids.append(manifest['hysteria2']['inbound_id'])
+                    if cdn_enabled(manifest):
+                        inbound_ids.append(manifest['tcp_cdn']['inbound_id'])
                     api.call('/panel/api/clients/add', {'client': account, 'inboundIds': inbound_ids})
                     manifest['accounts'][name] = account
             elif action == 'remove':
@@ -2412,6 +2505,7 @@ def devices_prepare(upload, transport=False):
                     manifest['accounts'] = {names[1] if key == name else key:
                         dict(value, email=names[1]) if key == name else value
                         for key, value in manifest['accounts'].items()}
+            reapply_role_flows(wait_api(manifest), manifest)
             # Restart the owned panel/core process, not only Xray's live user API:
             # this closes existing streams as well as rejecting new old UUIDs.
             ctl('stop', PANEL)
@@ -2481,6 +2575,8 @@ def recover_devices(pending):
     try:
         if services[PANEL]['running']:
             api = wait_api(restored)
+            if cdn_enabled(restored):
+                owned_host_group(ROOT / 'active', api, restored)
             if dual_enabled(restored):
                 hysteria_health(ROOT / 'active', restored, api)
         if services[FRONT]['running']:
@@ -2545,7 +2641,7 @@ def auth_live_users(folder, tag):
                     user['account'].get('_TypedMessage_') != 'xray.proxy.vless.Account'):
                 raise ValueError()
             uuid.UUID(user['account']['id'])
-        return {user['email']: user['account']['id'] for user in users} if len({u['email'] for u in users}) == len(users) else None
+        return {user['email']: {'id': user['account']['id'], 'flow': user['account'].get('flow', '')} for user in users} if len({u['email'] for u in users}) == len(users) else None
     except (ValueError, KeyError, TypeError, AttributeError) as exc:
         raise Error('Cannot attest native VLESS live registry') from exc
 
@@ -2560,7 +2656,7 @@ def auth_native_state(folder, manifest):
     check_lease()
     binary_health(Path(folder))
     api = wait_api(manifest)
-    live = auth_live_users(folder, 'SELF-cdn')  # Blocking native gRPC readiness after restart.
+    live = {tag: auth_live_users(folder, tag) for tag in (reality_tag(manifest), 'SELF-cdn')}
     process_health()
     owned_host_group(folder, api, manifest)
     hysteria_health(folder, manifest, api)
@@ -2570,21 +2666,27 @@ def auth_native_state(folder, manifest):
     config = read_json(Path(folder) / 'bin/config.json')
     config.pop('log', None)
     vless = [i for i in config.get('inbounds', []) if i.get('protocol') == 'vless']
-    if len(vless) != 1 or vless[0].get('tag') != 'SELF-cdn':
-        raise Error('Auth diagnostic requires the single owned native VLESS ingress')
-    generated = {c['email']: c['id'] for c in vless[0]['settings']['clients']}
-    if not generated or live != generated:
-        raise Error('Native VLESS registry disagrees with generated configuration')
-    authority = {c['email']: c['id'] for c in accounts.values()}
-    if any(authority.get(name) != identity for name, identity in live.items()):
-        raise Error('Native VLESS registry differs from owned identities')
+    if len(vless) != 2 or {i.get('tag') for i in vless} != set(live):
+        raise Error('Auth diagnostic requires exact retained REALITY and CDN VLESS registries')
+    authority = {c['email']: c for c in accounts.values()}
+    excluded = [c['id'] for c in accounts.values()]
+    for inbound in vless:
+        tag = inbound['tag']
+        clients = inbound['settings']['clients']
+        generated = {c['email']: {'id': c['id'], 'flow': c.get('flow', '')} for c in clients}
+        if len(generated) != len(clients) or live[tag] != generated:
+            raise Error('Native VLESS registry disagrees with generated configuration')
+        for name, client in generated.items():
+            if (name not in authority or client['id'] != authority[name]['id'] or
+                    client['flow'] != ('' if tag == 'SELF-cdn' else authority[name]['flow'])):
+                raise Error('Native VLESS registry differs from owned per-role identities/flow')
+            excluded.append(client['id'])
+        excluded.extend(c['id'] for c in live[tag].values())
     records = {name: api.call('/panel/api/clients/get/' + name)['client'] for name in device_names(manifest)}
-    # ClientRecord contains identity and policy, not mutable traffic counters.
-    # Routing rules/outbounds and all other generated lists retain their order.
-    state = {'config': config, 'clients': records,
+    state = {'config': config, 'clients': records, 'tcp_cdn': manifest['tcp_cdn'], 'live_vless': live,
              'hosts': {g['groupId']: g for g in api.call('/panel/api/hosts/list')}}
     check_lease()
-    return state, list(authority.values())
+    return state, excluded
 
 
 def auth_bound(request):
@@ -2594,7 +2696,7 @@ def auth_bound(request):
     if (request.get('feature') != 'tcp-cdn' or not cdn_enabled(manifest) or
             pending.get('kind') != 'transport-upgrade' or pending.get('phase') != 'prepared' or
             pending.get('feature') != 'tcp-cdn' or pending.get('operation_id') != request['operation_id'] or
-            pending.get('request_sha256') != fingerprint or manifest['tcp_cdn']['domain'] != request['tcp_cdn']['domain']):
+            pending.get('request_sha256') != fingerprint or (manifest['tcp_cdn']['domain'], manifest['tcp_cdn']['reality_port']) != (request['tcp_cdn']['domain'], request['tcp_cdn']['reality_port'])):
         raise Error('Auth diagnostic requires its owned prepared CDN operation')
     return manifest, pending, fingerprint
 
@@ -2657,7 +2759,8 @@ def auth_cleanup(pending):
 
 def auth_begin_result(request, fingerprint, record):
     return {'schema': 1, 'operation_id': request['operation_id'], 'request_fingerprint': fingerprint,
-            'nonce': record['nonce'], 'native_identity_sha256': record['native_identity_sha256']}
+            'nonce': record['nonce'], 'native_identity_sha256': record['native_identity_sha256'],
+            'inbound_id': record['inbound_id'], 'inbound_tag': record['inbound_tag']}
 
 
 def transport_auth_begin(request):
@@ -2691,7 +2794,7 @@ def transport_auth_begin(request):
                 break
         else:
             raise Error('Cannot generate excluded native auth nonce')
-        record = {'phase': 'arming', 'original_template': raw, 'native_state': state, 'nonce': nonce,
+        record = {'phase': 'arming', 'inbound_id': manifest['tcp_cdn']['inbound_id'], 'inbound_tag': 'SELF-cdn', 'original_template': raw, 'native_state': state, 'nonce': nonce,
                   'original_epoch': auth_core_epoch(active), 'native_identity_sha256': cdn_proof_digest(state)}
         pending['cdn_auth'] = record
         atomic(ROOT / 'pending.json', dumps(pending))  # Save exact original BEFORE any mutation.
@@ -2818,12 +2921,13 @@ def transport_auth_finish(request):
     identity = record['native_identity_sha256']
     verdict = {'schema': 1, 'operation_id': request['operation_id'], 'request_fingerprint': fingerprint,
                'nonce_sha256': hashlib.sha256(record['nonce'].encode()).hexdigest(), 'rejected': True,
-               'native_identity_sha256': identity}
+               'native_identity_sha256': identity, 'inbound_id': record['inbound_id'], 'inbound_tag': record['inbound_tag']}
     # Only sanitized bound result persists after restoration; no template/log/nonce archive.
     if not cleanup_failed:
         pending['cdn_auth'] = {'phase': 'restored', 'nonce_sha256': verdict['nonce_sha256'],
                                'restored_template_sha256': hashlib.sha256(record['original_template'].encode()).hexdigest(),
-                               'native_identity_sha256': identity, 'verdict': verdict if failure is None else None}
+                               'native_identity_sha256': identity, 'inbound_id': record['inbound_id'], 'inbound_tag': record['inbound_tag'],
+                               'verdict': verdict if failure is None else None}
     (ROOT / 'export-sha256').unlink(missing_ok=True)  # Candidate A is never final B.
     atomic(ROOT / 'pending.json', dumps(pending))
     if failure is not None:
@@ -2835,9 +2939,11 @@ def auth_commit_verdict(request, pending, fingerprint):
     record = pending.get('cdn_auth', {})
     verdict = record.get('verdict', {})
     if (record.get('phase') != 'restored' or not isinstance(verdict, dict) or
-            set(verdict) != {'schema', 'operation_id', 'request_fingerprint', 'nonce_sha256', 'rejected', 'native_identity_sha256'} or
+            set(verdict) != {'schema', 'operation_id', 'request_fingerprint', 'nonce_sha256', 'rejected', 'native_identity_sha256', 'inbound_id', 'inbound_tag'} or
             type(verdict.get('schema')) is not int or verdict.get('schema') != 1 or verdict.get('rejected') is not True or
             verdict.get('operation_id') != request['operation_id'] or verdict.get('request_fingerprint') != fingerprint or
+            verdict.get('inbound_id') != device_owner(request)['tcp_cdn']['inbound_id'] or verdict.get('inbound_tag') != 'SELF-cdn' or
+            record.get('inbound_id') != verdict.get('inbound_id') or record.get('inbound_tag') != 'SELF-cdn' or
             verdict.get('nonce_sha256') != record.get('nonce_sha256') or
             not re.fullmatch(r'[0-9a-f]{64}', verdict.get('nonce_sha256', '')) or
             auth_directory(pending).exists() or auth_directory(pending).is_symlink() or
@@ -2872,7 +2978,7 @@ def devices_commit(request, transport=False):
         raise Error('Owned commit does not match prepared intent')
     cdn = transport and request.get('feature') == 'tcp-cdn'
     if transport and (transports(manifest) != (request['target_transports'] if cdn else ['tcp-reality', 'hysteria2']) or
-            (cdn and manifest['tcp_cdn']['domain'] != request['tcp_cdn']['domain'])):
+            (cdn and (manifest['tcp_cdn']['domain'], manifest['tcp_cdn']['reality_port']) != (request['tcp_cdn']['domain'], request['tcp_cdn']['reality_port']))):
         raise Error('Transport candidate does not contain the exact requested target mode')
     if transport and request.get('offnode_sha256') == request['before_sha256']:
         raise Error('Transport commit requires a new dual-state backup, not the pre-change archive')

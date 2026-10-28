@@ -58,6 +58,7 @@ class NativeModel:
             for definition in ('security text', 'sni text', 'host_header text', 'path text', 'alpn text', 'allow_insecure integer',
                                'pinned_peer_cert_sha256 text', 'verify_peer_cert_by_name text', 'exclude_from_sub_types text'):
                 db.execute('alter table hosts add column ' + definition)
+            db.execute("alter table client_inbounds add column flow_override text default ''")
             db.execute('create table client_traffics(email text)')
             db.execute('create table inbound_client_ips(client_email text)')
         template = {'log': {'access': 'none', 'error': 'none', 'loglevel': 'none'},
@@ -66,23 +67,28 @@ class NativeModel:
         self.h.settings_write(self.database, {'xrayTemplateConfig': json.dumps(template)})
         self.sync()
 
-    def clients(self, h2=False):
+    def clients(self, h2=False, cdn=False):
         result = []
         for name, record in self.records.items():
             item = {k: v for k, v in record.items() if k not in ('id', 'uuid', 'auth', 'createdAt', 'updatedAt')}
             item.update(id=record['uuid'], created_at=1800000000000)
             if h2: item['auth'] = record['auth']
+            if h2 or cdn: item['flow'] = ''
             result.append(item)
         return result
 
     def sync(self):
         with sqlite3.connect(self.database) as db:
             for identity, inbound in self.inbounds.items():
+                if not db.execute('select 1 from inbounds where id=?', (identity,)).fetchone():
+                    db.execute('insert into inbounds(id,user_id) values(?,1)', (identity,))
                 db.execute('update inbounds set remark=?,protocol=?,port=?,enable=?,listen=?,tag=?,settings=?,stream_settings=?,disable_flow=? where id=?',
                     (inbound['remark'], inbound['protocol'], inbound['port'], inbound['enable'], inbound['listen'], inbound['tag'],
                      inbound['settings'], inbound['streamSettings'], inbound.get('disableFlow', False), identity))
             for group in self.groups.values():
                 address, port = group['hosts'][0].rsplit(':', 1)
+                if not db.execute('select 1 from hosts where group_id=?', (group['groupId'],)).fetchone():
+                    db.execute('insert into hosts(group_id,inbound_id) values(?,?)', (group['groupId'], group['inboundIds'][0]))
                 db.execute('update hosts set address=?,port=?,security=?,sni=?,host_header=?,path=?,alpn=?,allow_insecure=?,pinned_peer_cert_sha256=?,exclude_from_sub_types=? where group_id=?',
                     (address, int(port), group['security'], group['sni'], group['hostHeader'], group['path'], json.dumps(group['alpn']),
                      group['allowInsecure'], json.dumps(group.get('pinnedPeerCertSha256', [])), 'null', group['groupId']))
@@ -96,7 +102,21 @@ class NativeModel:
         if path == '/panel/api/hosts/list': return copy.deepcopy(list(self.groups.values()))
         if path.startswith('/panel/api/hosts/get/'): return copy.deepcopy(self.groups[path.rsplit('/', 1)[1]])
         if path.startswith('/panel/api/clients/get/'): return {'client': copy.deepcopy(self.records[path.rsplit('/', 1)[1]])}
-        if path.startswith('/panel/api/hosts/update/'):
+        if path == '/panel/api/inbounds/add':
+            identity = max(self.inbounds) + 1
+            self.inbounds[identity] = dict(copy.deepcopy(data), id=identity)
+            settings = json.loads(self.inbounds[identity]['settings'])
+            for client in settings['clients']: client['flow'] = ''
+            self.inbounds[identity]['settings'] = json.dumps(settings)
+            with sqlite3.connect(self.database) as db:
+                db.executemany('insert into client_inbounds(client_id,inbound_id,flow_override) values(?,?,?)',
+                    [(r['id'], identity, '') for r in self.records.values()])
+            for record in self.records.values(): record['createdAt'] = 1800000000000
+        elif path == '/panel/api/hosts/add':
+            identity = 'cdn-group'
+            self.groups[identity] = dict(copy.deepcopy(data), groupId=identity,
+                hosts=[h + ':' + str(data['port']) for h in data['hosts']])
+        elif path.startswith('/panel/api/hosts/update/'):
             self.groups[path.rsplit('/', 1)[1]] = copy.deepcopy(data)
         elif path.startswith('/panel/api/inbounds/update/'):
             identity = int(path.rsplit('/', 1)[1])
@@ -105,14 +125,14 @@ class NativeModel:
                 settings = json.loads(self.inbounds[identity]['settings'])
                 for client in settings['clients']: client['flow'] = ''
                 self.inbounds[identity]['settings'] = json.dumps(settings)
-                for record in self.records.values(): record['flow'] = ''; record['createdAt'] = 1800000000000
+                for record in self.records.values(): record['createdAt'] = 1800000000000
         elif path == '/panel/api/clients/add':
             account = data['client']; name = account['email']; identity = max(r['id'] for r in self.records.values()) + 1
             self.records[name] = dict(account, id=identity, uuid=account['id'], limitHwid=0, createdAt=1800000000000, updatedAt=1800000000000)
             with sqlite3.connect(self.database) as db:
                 db.execute('insert into clients(email,uuid,sub_id,enable,flow,id,auth) values(?,?,?,?,?,?,?)',
                     (name, account['id'], account['subId'], account['enable'], account['flow'], identity, account['auth']))
-                db.executemany('insert into client_inbounds values(?,?)', [(identity, i) for i in data['inboundIds']])
+                db.executemany('insert into client_inbounds(client_id,inbound_id) values(?,?)', [(identity, i) for i in data['inboundIds']])
             self.refresh_clients()
         elif path.startswith('/panel/api/clients/update/'):
             name = path.rsplit('/', 1)[1]; record = self.records.pop(name)
@@ -137,7 +157,7 @@ class NativeModel:
     def refresh_clients(self):
         for identity, inbound in self.inbounds.items():
             settings = json.loads(inbound['settings'])
-            settings['clients'] = self.clients(identity == 2)
+            settings['clients'] = self.clients(identity == 2, inbound.get('disableFlow', False))
             inbound['settings'] = json.dumps(settings)
 
 
@@ -165,6 +185,7 @@ class CdnHost(unittest.TestCase):
         def emitted(manifest, device, fmt):
             view = types.SimpleNamespace(account=manifest['accounts'][device])
             text = (CdnFeeds.uri(view) if fmt == 'sub' else CdnFeeds.yaml(view)).replace('93.184.216.34', manifest['endpoint'])
+            text = text.replace('x'*43, manifest['reality']['publicKey']).replace('1234567890abcdef', manifest['reality']['shortIds'][0])
             return base64.b64encode(text.encode()) if fmt == 'sub' else text.encode()
         self.f.patch(self.h, 'get_feed', side_effect=emitted)
         self.h.front_config.side_effect = lambda folder, manifest, published, bootstrap_domain=None: self.h.atomic(
@@ -177,8 +198,8 @@ class CdnHost(unittest.TestCase):
         self.before = {str(p.relative_to(self.store)): p.read_bytes() for p in self.store.rglob('*') if p.is_file()}
         self.h.atomic(self.h.ROOT / 'export-sha256', 'c' * 64)
         self.request = dict(self.base.request, operation_id='2' * 32, before_sha256='c' * 64,
-            feature='tcp-cdn', source_transports=['tcp-reality', 'hysteria2'], target_transports=['tcp-xhttp-cdn', 'hysteria2'],
-            tcp_cdn={'schema': 1, 'domain': 'cdn.example.org'})
+            feature='tcp-cdn', source_transports=['tcp-reality', 'hysteria2'], target_transports=['tcp-reality', 'tcp-xhttp-cdn', 'hysteria2'],
+            tcp_cdn={'schema': 1, 'domain': 'cdn.example.org', 'reality_port': 9443})
         self.original = (self.active / 'manifest.json').read_bytes()
 
     def prepare(self):
@@ -208,7 +229,8 @@ class CdnHost(unittest.TestCase):
         self.real_auth_core_epoch = self.h.auth_core_epoch
         self.f.patch(self.h, 'auth_core_epoch', side_effect=lambda folder: dict(epoch))
         self.f.patch(self.h, 'auth_live_users', side_effect=lambda folder, tag:
-            {c['email']: c['id'] for c in json.loads(self.model.inbounds[1]['settings'])['clients']})
+            {c['email']: {'id': c['id'], 'flow': c.get('flow', '')} for i in self.model.inbounds.values() if i['tag'] == tag
+             for c in json.loads(i['settings'])['clients']})
         self.h.ctl.side_effect = control
         return epoch
 
@@ -233,8 +255,10 @@ class CdnHost(unittest.TestCase):
         self.assertFalse(host.cdn_enabled(self.manifest)); self.assertTrue(host.dual_enabled(self.manifest))
         self.prepare(); current = self.h.read_json(self.active / 'manifest.json')
         self.assertTrue(host.cdn_enabled(current)); self.assertTrue(host.dual_enabled(current))
-        self.assertEqual(host.main_tag(current), 'SELF-cdn')
-        self.assertEqual(host.transports(current), ['tcp-xhttp-cdn', 'hysteria2'])
+        self.assertEqual(host.main_tag(current), 'SELF-main')
+        self.assertEqual(host.reality_tag(current), 'in-443-tcp')
+        self.assertEqual(host.reality_port(current), 9443)
+        self.assertEqual(host.transports(current), ['tcp-reality', 'tcp-xhttp-cdn', 'hysteria2'])
         for mutate in (lambda m: m.pop('hysteria2'), lambda m: m['tcp_cdn'].update(extra=True),
                        lambda m: m['tcp_cdn'].update(mode='auto'), lambda m: m['tcp_cdn'].update(path='/other'),
                        lambda m: m['tcp_cdn'].update(schema=True), lambda m: m['tcp_cdn'].update(inbound_id=2),
@@ -244,39 +268,46 @@ class CdnHost(unittest.TestCase):
         self.assertEqual(host.snapshot_accounts(self.model.database, current), current['accounts'])
         self.assertEqual(host.snapshot_host_group(self.model.database, current), self.manifest['host_group_id'])
         for statement in ("insert into hosts(group_id,inbound_id,address,port,is_hidden) values('hidden',1,'cdn.example.org',443,1)",
-                          'insert into client_inbounds values(1,1)', "update inbounds set listen='0.0.0.0' where id=1",
-                          "update hosts set sni='foreign.example.org' where inbound_id=1",
-                          "update hosts set pinned_peer_cert_sha256='[\"custom\"]' where inbound_id=1"):
+                          'insert into client_inbounds(client_id,inbound_id) values(1,1)', "update inbounds set listen='0.0.0.0' where id=3",
+                          "update hosts set sni='foreign.example.org' where inbound_id=3",
+                          "update hosts set pinned_peer_cert_sha256='[\"custom\"]' where inbound_id=3"):
             saved = self.model.database.read_bytes()
             with sqlite3.connect(self.model.database) as db: db.execute(statement)
             with self.assertRaises(host.Error): host.snapshot_accounts(self.model.database, current)
             self.model.database.write_bytes(saved)
 
-    def test_in_place_payload_full_policies_hosts_h2_and_two_joins(self):
+    def test_additive_payload_full_policies_hosts_h2_and_three_joins(self):
         h2 = copy.deepcopy(self.model.inbounds[2]); h2group = copy.deepcopy(self.model.groups[self.manifest['hysteria2']['host_group_id']])
         records = copy.deepcopy(self.model.records)
         with sqlite3.connect(self.model.database) as db: joins = db.execute('select * from client_inbounds').fetchall()
         result = self.prepare()
         self.assertTrue(result['prepared']); self.assertGreater(result['deadline'], 0)
         current = self.h.read_json(self.active / 'manifest.json')
-        self.assertEqual(current['tcp_cdn']['inbound_id'], 1)
+        self.assertEqual(current['tcp_cdn']['inbound_id'], 3)
+        self.assertEqual(current['tcp_cdn']['host_group_id'], 'cdn-group')
         self.assertEqual(current['host_group_id'], self.manifest['host_group_id'])
         self.assertEqual(self.model.inbounds[2], h2); self.assertEqual(self.model.groups[h2group['groupId']], h2group)
         self.assertEqual(current['hysteria2'], self.manifest['hysteria2'])
         with sqlite3.connect(self.model.database) as db:
-            self.assertEqual(db.execute('select * from client_inbounds').fetchall(), joins)
-            self.assertEqual(db.execute('select count(*) from inbounds').fetchone()[0], 2)
-            self.assertEqual(db.execute('select count(*) from hosts').fetchone()[0], 2)
+            self.assertEqual(db.execute('select * from client_inbounds where inbound_id!=3').fetchall(), joins)
+            self.assertEqual(db.execute('select count(*) from client_inbounds').fetchone()[0], 9)
+            self.assertEqual(db.execute('select count(*) from inbounds').fetchone()[0], 3)
+            self.assertEqual(db.execute('select count(*) from hosts').fetchone()[0], 3)
         updates = [(path, data) for path, data in self.model.calls if data is not None]
-        self.assertFalse(any('/attach' in path or path.endswith('/add') for path, _ in updates))
+        self.assertFalse(any('/attach' in path for path, _ in updates))
+        self.assertEqual(sum(path == '/panel/api/inbounds/add' for path, _ in updates), 1)
+        added = next(data for path, data in updates if path == '/panel/api/inbounds/add')
+        self.assertIs(added['disableFlow'], True)
+        self.assertNotIn('externalProxy', json.loads(added['streamSettings']))
         payload = next(data for path, data in updates if path == '/panel/api/inbounds/update/1')
-        self.assertIs(payload['disableFlow'], True)
+        self.assertIs(payload['disableFlow'], False)
+        self.assertEqual((payload['port'], payload['tag']), (9443, 'in-443-tcp'))
         self.assertEqual(payload['policySentinel'], 'preserved')
         self.assertEqual(json.loads(payload['settings'])['fallbacks'], [])
         for name, record in records.items():
-            self.assertEqual({k: v for k, v in self.model.records[name].items() if k not in ('flow', 'createdAt')},
-                             {k: v for k, v in record.items() if k not in ('flow', 'createdAt')})
-        host.cdn_host_health(self.model.groups[current['host_group_id']], current)
+            self.assertEqual({k: v for k, v in self.model.records[name].items() if k not in ('createdAt',)},
+                             {k: v for k, v in record.items() if k not in ('createdAt',)})
+        host.cdn_host_health(self.model.groups[current['tcp_cdn']['host_group_id']], current)
         self.assertFalse(current['published'])
         self.assertNotIn('@feed', (self.active / 'Caddyfile').read_text())
 
@@ -313,7 +344,7 @@ class CdnHost(unittest.TestCase):
         self.assertNotIn(2080, host.required_ports(self.manifest['config']))
         self.assertIn(2080, host.required_ports(current['config'], current))
         inline = json.loads(host.clash_rules(current))
-        self.assertEqual(inline['proxy-groups'][0]['proxies'], ['SELF-h2', 'SELF-cdn', 'DIRECT'])
+        self.assertEqual(inline['proxy-groups'][0]['proxies'], ['SELF-h2', 'SELF-cdn', 'SELF-main', 'DIRECT'])
         self.assertEqual(inline['proxy-groups'][1]['proxies'], ['SELF-h2', 'DIRECT'])
         self.assertEqual(inline['rules'][:2], json.loads(host.clash_rules(self.manifest))['rules'][:2])
         self.assertEqual(inline['rules'][2], 'DOMAIN,cdn.example.org,DIRECT')
@@ -386,7 +417,7 @@ class CdnHost(unittest.TestCase):
     def test_new_feature_dual_source_is_not_false_noop(self):
         result = self.prepare()
         self.assertNotIn('unchanged', result)
-        self.assertEqual(result['transports'], ['tcp-xhttp-cdn', 'hysteria2'])
+        self.assertEqual(result['transports'], ['tcp-reality', 'tcp-xhttp-cdn', 'hysteria2'])
         self.assertEqual(result, self.prepare())
 
     def test_candidate_archive_contains_target_and_closed_store_not_before_topology(self):
@@ -395,7 +426,7 @@ class CdnHost(unittest.TestCase):
         stage = self.f.root / 'verified-cdn-archive'; stage.mkdir()
         with archive.open('rb') as stream: self.h.safe_unpack(stream, stage)
         manifest = self.h.verify_backup(stage, self.f.request['lock'])
-        self.assertEqual(host.transports(manifest), ['tcp-xhttp-cdn', 'hysteria2'])
+        self.assertEqual(host.transports(manifest), ['tcp-reality', 'tcp-xhttp-cdn', 'hysteria2'])
         self.assertEqual(manifest['tcp_cdn']['domain'], 'cdn.example.org')
         for relative, content in self.before.items():
             self.assertEqual((stage / 'deployment/caddy' / relative).read_bytes(), content)
@@ -430,7 +461,9 @@ class CdnHost(unittest.TestCase):
                 self.assertEqual(restored['tcp_cdn'], original['tcp_cdn'])
                 self.assertEqual(restored['hysteria2'], original['hysteria2'])
                 self.assertEqual(restored['endpoint'], endpoint)
-                self.assertEqual(self.model.groups[restored['host_group_id']]['hosts'], ['cdn.example.org:443'])
+                self.assertEqual(self.model.groups[restored['host_group_id']]['hosts'], [endpoint + ':9443'])
+                self.assertEqual(self.model.groups[restored['tcp_cdn']['host_group_id']]['hosts'], ['cdn.example.org:443'])
+                self.assertEqual(self.model.inbounds[1]['tag'], original['tcp_cdn']['reality_tag'])
                 self.assertEqual(self.model.groups[restored['hysteria2']['host_group_id']]['hosts'], [endpoint + ':443'])
                 for name, account in original['accounts'].items():
                     after = restored['accounts'][name]
@@ -440,7 +473,7 @@ class CdnHost(unittest.TestCase):
                 self.assertEqual(len([p for p, _ in self.model.calls if '/panel/api/clients/update/' in p]),
                                  len(original['accounts']) if mode == 'replace' else 0)
         self.assertEqual(host.digest(archive), source_sha)
-        self.h.check_target.assert_not_called()
+        self.assertEqual(self.h.check_target.call_count, 2)
 
     def test_closed_store_snapshot_before_bootstrap_and_exact_rollback(self):
         original_bootstrap = self.h.bootstrap_cdn_certificate
@@ -473,7 +506,7 @@ class CdnHost(unittest.TestCase):
         self.prepare(); self.complete_auth(); self.h.atomic(self.h.ROOT / 'export-sha256', 'd' * 64)
         self.h.transport_commit(self.proof_request())
 
-    def test_add_rename_reset_remove_single_authority_and_two_joins(self):
+    def test_add_rename_reset_remove_single_authority_and_three_joins(self):
         self.publish()
         original = copy.deepcopy(self.model.records['company'])
         for index, (action, names) in enumerate((('add', ['tablet']), ('rename', ['company', 'work']),
@@ -484,10 +517,10 @@ class CdnHost(unittest.TestCase):
             current = self.h.read_json(self.active / 'manifest.json')
             with sqlite3.connect(self.model.database) as db:
                 joins = db.execute('select client_id,inbound_id from client_inbounds').fetchall()
-                self.assertEqual(len(joins), 2 * len(current['accounts']))
-                self.assertEqual({i for _, i in joins}, {1, 2})
+                self.assertEqual(len(joins), 3 * len(current['accounts']))
+                self.assertEqual({i for _, i in joins}, {1, 2, 3})
             if action == 'add':
-                self.assertEqual(current['accounts']['tablet']['flow'], '')
+                self.assertEqual(current['accounts']['tablet']['flow'], 'xtls-rprx-vision')
                 self.assertTrue(current['accounts']['tablet']['auth'])
             elif action == 'rename':
                 renamed = self.model.records['work']
@@ -503,17 +536,21 @@ class CdnHost(unittest.TestCase):
                 self.assertNotIn('tablet', self.model.records); self.assertNotIn('tablet', current['accounts'])
             self.h.atomic(self.h.ROOT / 'export-sha256', str(index) * 64)
             self.h.devices_commit(dict(request, offnode_sha256=str(index) * 64))
-        self.assertEqual(self.h.read_json(self.active / 'manifest.json')['tcp_cdn']['inbound_id'], 1)
+        self.assertEqual(self.h.read_json(self.active / 'manifest.json')['tcp_cdn']['inbound_id'], 3)
 
     def test_cold_configure_preserves_cdn_host_mode_and_rotates_once_only_on_replace(self):
         self.prepare(); source = self.h.read_json(self.active / 'manifest.json')
         (self.active / 'bin/config.json').write_text('{}')
         main_group = copy.deepcopy(self.model.groups[source['host_group_id']])
+        main_group['hosts'] = ['93.184.216.35:9443']
+        cdn_group = copy.deepcopy(self.model.groups[source['tcp_cdn']['host_group_id']])
         before = copy.deepcopy(self.model.records)
         target = copy.deepcopy(source); target['endpoint'] = '93.184.216.35'
         real_function(self.h, 'configure_native')(self.active, target, fresh=False, rotate=False)
         self.assertEqual(self.model.groups[target['host_group_id']], main_group)
         self.assertEqual(self.model.records, before)
+        self.assertEqual(self.model.groups[target['tcp_cdn']['host_group_id']], cdn_group)
+        self.assertEqual(self.model.inbounds[1]['tag'], 'in-443-tcp')
         self.assertEqual(self.model.groups[target['hysteria2']['host_group_id']]['hosts'], ['93.184.216.35:443'])
         self.assertEqual(json.loads(self.model.inbounds[2]['streamSettings'])['externalProxy'][0]['dest'], '93.184.216.35')
         self.assertEqual(json.loads(self.model.inbounds[2]['streamSettings'])['tlsSettings']['certificates'],
@@ -631,14 +668,16 @@ class AuthWitness(unittest.TestCase):
         self.h.settings_write(self.active / 'db/x-ui.db', {'xrayTemplateConfig': self.original_raw})
         with mock.patch.object(self.h, 'settings_write', wraps=self.h.settings_write) as writes:
             result = self.begin()
-            self.assertEqual(set(result), {'schema', 'operation_id', 'request_fingerprint', 'nonce', 'native_identity_sha256'})
+            self.assertEqual(set(result), {'schema', 'operation_id', 'request_fingerprint', 'nonce', 'native_identity_sha256', 'inbound_id', 'inbound_tag'})
+            self.assertEqual((result['inbound_id'], result['inbound_tag']), (3, 'SELF-cdn'))
             self.assertEqual(self.path.stat().st_mode & 0o777, 0o600)
             self.assertEqual(self.path.parent.stat().st_mode & 0o777, 0o700)
             self.assertEqual(self.path.parent, self.active / 'logs')
             self.assertEqual(self.begin(), result, 'Begin lost ACK must reuse the nonce and logger')
             self.append()
             finished = self.finish()
-            self.assertEqual(set(finished), {'schema', 'operation_id', 'request_fingerprint', 'nonce_sha256', 'rejected', 'native_identity_sha256'})
+            self.assertEqual(set(finished), {'schema', 'operation_id', 'request_fingerprint', 'nonce_sha256', 'rejected', 'native_identity_sha256', 'inbound_id', 'inbound_tag'})
+            self.assertEqual((finished['inbound_id'], finished['inbound_tag']), (3, 'SELF-cdn'))
             self.assertTrue(finished['rejected'])
             self.assertEqual(finished['native_identity_sha256'], result['native_identity_sha256'])
             calls = self.h.ctl.call_count
@@ -842,10 +881,10 @@ class CdnFeeds(unittest.TestCase):
     def setUp(self):
         self.fx = test_dual_transport.DualSnapshot('runTest'); self.fx.setUp(); self.addCleanup(self.fx.doCleanups)
         self.fx.dualize(); self.manifest = copy.deepcopy(self.fx.manifest)
-        self.manifest['tcp_cdn'] = {'schema': 1, 'domain': 'cdn.example.org', 'inbound_id': 1, 'path': host.XHTTP_PATH,
+        self.manifest['tcp_cdn'] = {'schema': 1, 'domain': 'cdn.example.org', 'inbound_id': 3, 'host_group_id': 'cdn-group',
+            'reality_port': 9443, 'reality_tag': 'in-443-tcp', 'path': host.XHTTP_PATH,
             'mode': host.XHTTP_MODE, 'certificate_file': 'caddy/data/caddy/certificates/issuer/cdn.example.org.crt',
             'key_file': 'caddy/data/caddy/certificates/issuer/cdn.example.org.key'}
-        for account in self.manifest['accounts'].values(): account['flow'] = ''
         self.account = self.manifest['accounts']['company']
 
     def uri(self):
@@ -853,10 +892,25 @@ class CdnFeeds(unittest.TestCase):
             'encryption': 'none', 'sni': 'cdn.example.org', 'host': 'cdn.example.org', 'alpn': 'h2', 'path': host.XHTTP_PATH,
             'mode': host.XHTTP_MODE, 'extra': json.dumps({'mode': host.XHTTP_MODE}, separators=(',', ':'))}) + '#SELF-cdn'
         h2 = 'hysteria2://' + self.account['auth'] + '@93.184.216.34:443?' + urlencode({'security': 'tls', 'sni': 'sub.example.org', 'alpn': 'h3'}) + '#SELF-h2'
-        return vless + '\n' + h2 + '\n'
+        reality = 'vless://' + self.account['id'] + '@93.184.216.34:9443?' + urlencode({
+            'security': 'reality', 'flow': 'xtls-rprx-vision', 'pbk': 'x'*43, 'sid': '1234567890abcdef',
+            'sni': 'target.example.org'}) + '#SELF-main'
+        return reality + '\n' + vless + '\n' + h2 + '\n'
 
     def yaml(self):
         return f'''proxies:
+    - name: SELF-main
+      type: vless
+      uuid: {self.account['id']}
+      server: 93.184.216.34
+      port: 9443
+      network: tcp
+      tls: true
+      servername: target.example.org
+      flow: xtls-rprx-vision
+      reality-opts:
+        public-key: {'x'*43}
+        short-id: '1234567890abcdef'
     - alpn:
         - h2
       name: SELF-cdn
@@ -880,7 +934,7 @@ class CdnFeeds(unittest.TestCase):
       alpn: [h3]
 proxy-groups:
     - name: PROXY
-      proxies: [SELF-h2, SELF-cdn, DIRECT]
+      proxies: [SELF-h2, SELF-cdn, SELF-main, DIRECT]
 rules:
     - DOMAIN-SUFFIX,bilibili.com,DIRECT
     - MATCH,PROXY
@@ -996,8 +1050,8 @@ class SourceNativeCDN(unittest.TestCase):
         request = fx.fx.device_request('reset', 'company')
         request.pop('device_action'); request.pop('names')
         request.update(mode='transport-upgrade', feature='tcp-cdn', ssh_port=22, before_sha256=before_hash,
-            source_transports=['tcp-reality', 'hysteria2'], target_transports=['tcp-xhttp-cdn', 'hysteria2'],
-            tcp_cdn={'schema': 1, 'domain': 'cdn.example.org'})
+            source_transports=['tcp-reality', 'hysteria2'], target_transports=['tcp-reality', 'tcp-xhttp-cdn', 'hysteria2'],
+            tcp_cdn={'schema': 1, 'domain': 'cdn.example.org', 'reality_port': 9443})
         def issue(folder, manifest, domain):
             # HTTP01 issuance is an external boundary. Issue a matching private
             # fixture pair; all native mutation/health/archive code stays real.
