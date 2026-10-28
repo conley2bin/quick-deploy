@@ -1188,13 +1188,15 @@ def _cdn(state, document, args):
     if already:
         raise host.Error('Source is already CDN; a new auth acceptance proof requires a prepared transition. '
                          'No fresh proof produced; use status to inspect the committed deployment')
-    if not already:
-        try:
-            answers = cdn_probe.resolve_a(domain, args.interface, args.dns_server, cdn_probe.Budget(time.time() + 15))
-        except (cdn_probe.Error, OSError) as exc:
-            raise host.Error('Direct public DNS preflight failed; no remote mutation') from None
-        if answers != [record['endpoint']]:
-            raise host.Error('Before preparation, only the new CDN A record must be gray/DNS-only at the owned origin IPv4')
+    try:
+        budget = cdn_probe.Budget(time.time() + 15)
+        answers = cdn_probe.resolve_a(domain, args.interface, args.dns_server, budget)
+        already_proxied = answers != [record['endpoint']]
+        if already_proxied:
+            edges = cdn_probe.edge_addresses(answers, record['endpoint'])
+            cdn_probe.edge_tls(domain, edges[0], args.interface, budget)
+    except (cdn_probe.Error, OSError, ValueError) as exc:
+        raise host.Error('Physical authoritative DNS/Cloudflare TLS preflight failed; no remote mutation') from exc
     print('Use an independent SSH carrier/console for this core-changing transaction; '
           'shared Xray may briefly reconnect H2. No desktop selection or system DNS will be changed.')
     # This complete backup hands the guard to the current capable adapter BEFORE
@@ -1222,7 +1224,8 @@ def _cdn(state, document, args):
         target = checked_backup(document, record, candidate)
         if (prepared.get('transports') != request['target_transports'] or prepared.get('tcp_cdn') != target.get('tcp_cdn')):
             raise host.Error('CDN prepare differs from the bound three-entry candidate topology')
-        acknowledge_orange(domain, deadline)
+        if not already_proxied:
+            acknowledge_orange(domain, deadline)
         proof, proof_sha256, candidate = cdn_evidence(state, document, record, request, fingerprint, candidate, before,
                                          args, deadline, binary)
         if deadline - time.time() < cdn_probe.COMMIT_MARGIN:
@@ -1247,7 +1250,7 @@ def _cdn(state, document, args):
                 recover_local(state, document, binary)
             except BaseException:
                 print('CDN reconciliation pending; use recover with the same independent SSH carrier. No migration replay.', file=sys.stderr)
-            print('CDN attempt ended. If rollback occurred, return ONLY the CDN DNS record to gray before retry; '
+            print('CDN attempt ended. Complete reconciliation before retry; the CDN record may remain proxied. '
                   'sub/H2 credentials and desktop selection are unchanged.', file=sys.stderr)
             if commit_attempted and not (state / 'pending.json').exists() and document.get('tcp_cdn', {}).get('domain') == domain:
                 print('CDN commit receipt reconciled; no credential replay.')

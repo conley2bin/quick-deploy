@@ -23,7 +23,7 @@ operator gate; a source implementation is not deployed-client acceptance.
 - **TCP80** belongs exclusively to HTTP01 validation. All normal HTTP requests
   return404. Automatic redirects and TLS-ALPN challenges are disabled; Caddy
   must not claim443. Unavailable/invalid certificates cannot become HTTP feeds.
-- **Operator** owns grey DNS and the registered hostname. No DNS API credential
+- **Operator** owns DNS routing/proxy state and the registered hostname. No DNS API credential
   is needed or installed. DNS propagation, client refresh and cold-replacement
   downtime are real operational steps, not automatic failover.
 - **Management PC** holds a private0700/0600 off-node recovery set. The default
@@ -531,6 +531,14 @@ UUID/Auth/SubID/启用/到期/额度/HWID 等策略不变。
   PROXY 顺序 `[SELF-h2, SELF-cdn, SELF-main, DIRECT]`，FEED 仍为 `[SELF-h2, DIRECT]`；
   H2 保持默认，无 GUI 自动选择；原生 H2 管理导出字节语义不变。
 
+事务有两个入口：控制器在任何备份前经物理接口查询权威 A；精确单一源站 IP 保留灰云流程，
+否则必须全部为 CF IPv4 边缘并通过正常 CA/SNI TLS、精确 peer 与匹配 CF trace，才选择已橙云流程。
+混合/错误/私有 DNS 或无效 TLS/trace 在备份前拒绝。已橙云不读 stdin、不等聊天、不要求切回灰云。
+Host 不以 ambient DNS 的 A/AAAA 作为源站所有权：绑定的 SSH/owner/machine/endpoint/config、原生 API、
+正常源站证书、精确 native nonce 与实际 VPS 出口继续独立核验；CF IP 不是源站归属证明。
+HTTP01 始终走 HTTP80；橙云 Full 下 HTTP 请求仍可明文回源，实际挑战路径须原样到达 Caddy80，
+不导入候选证书、不改变现有 bootstrap 顺序或900秒租约。
+
 事务顺序：只读核验旧双协议状态与选定 REALITY TCP 端口可用性、变更前离机备份（先安装当前 guard）→
 持久化绑定请求/回滚意图 → FRONT/PANEL 停止期间取**关闭的 Caddy storage 子树**与 DB/manifest/front 快照
 （phase=ready 前完成，半成品不用于恢复）→ 旧 REALITY 仍占443期间，临时8443纯证书 vhost 取得新域名公开可信证书
@@ -538,14 +546,14 @@ UUID/Auth/SubID/启用/到期/额度/HWID 等策略不变。
 （保留 tag/密钥/设置/Clients）、新增顶层 disableFlow 的 CDN 入站（完整 Client DTO，不以 manifest 投影代替）
 并显式只加一个 CDN Host → 核验 REALITY 在新端口、XHTTP 仅回环2080、H2 UDP443、精确三角色与有效 flow，
 **确认 TCP443 已释放后才启动最终 Caddy443** → prepared 返回绝对 deadline，订阅不发布，H2 保持默认 →
-操作员在期限内仅把 cdn 记录转橙云并确认 → 控制器基于实际原生输出，在专用 noTUN/loopback 临时客户端中强制
+仅灰云入口由操作员在有限窗口把 cdn 转橙云并输入 ORANGE；已橙云入口直接继续 → 控制器重新查询权威 DNS/TLS，基于实际原生输出，在专用 noTUN/loopback 临时客户端中强制
 唯一 SELF-cdn 路由探针（绑定物理接口与新鲜 CF 边缘；私有127控制器 PUT 相同配置待204为就绪屏障；
 核验真实 CF 边缘 TLS、内层 HTTPS+VPS 出口、错误 UUID 拒绝后正确恢复、重连/短空闲、原 H2 新鲜认证）→
 全部通过后持久化私有 proof，随候选归档摘要一并 commit（proof 绑定 operation/请求指纹/候选 SHA/域名，
 是控制器证明而非密码学远端观测，不设永久在线健康标志）。超时/失败走既有 abort/recover：**先停候选 FRONT 释放443，
 再恢复旧 REALITY443**；恢复关闭的原 DB/manifest/sub:8443-only Caddyfile 与关闭的证书存储，移除新增 CDN 入站/Host
 并还原 REALITY 端口/Host/tag，保留原 H2；recovering → restore-queued → 后续实际就绪（含原 H2 证书对/绑定/Auth）后才解除；
-CF 侧手动改动不在 guest 回滚范围内，操作员把 cdn 转回灰云。丢 ACK 凭 durable receipt 对账，不重放迁移或轮换。
+CF 侧手动改动不在 guest 回滚范围内，cdn 可保持橙云；重试前必须完成对账。丢 ACK 凭 durable receipt 对账，不重放迁移或轮换。
 
 错误 UUID witness 复用既有有界机制：仅捕获原模板、停止 PANEL 后只写 xrayTemplateConfig、临时 info/error 日志
 （access:none）、钉住实际日志路径/inode/offset/核心 epoch、新鲜 nonce 的精确原生拒绝判定、**最终归档B之前

@@ -200,7 +200,7 @@ class BaselineAdapterRetention(unittest.TestCase):
         self.pin = self.h.BASELINE_ADAPTER_SHA256
         self.previous = self.h.ROOT / ('adapter-before-' + self.pin + '.py')
 
-    def test_exact_reviewed_baseline_migration_exports_all_four_pinned_sources(self):
+    def test_exact_reviewed_baseline_migration_exports_all_five_pinned_sources(self):
         self.assertEqual(self.baseline, subprocess.check_output(['git', 'show', '6c02d25:vps/lib/host.py']))
         self.assertEqual(hashlib.sha256(self.baseline).hexdigest(), self.pin)
         self.assertEqual(self.pin, 'b52adbbfb7efc3593c5fa266e8f148ed60deaa2b685d72b926e549b9425f6d7e')
@@ -208,12 +208,14 @@ class BaselineAdapterRetention(unittest.TestCase):
             self.h.LEGACY_ADAPTER_SHA256: 'previous-host.py',
             self.h.DEPLOYED_ADAPTER_SHA256: 'previous-host-918103e.py',
             self.pin: 'previous-host-ae72036.py',
-            self.h.DUAL_ADAPTER_SHA256: 'previous-host-51f71ce.py'})
+            self.h.DUAL_ADAPTER_SHA256: 'previous-host-51f71ce.py',
+            self.h.DRAIN_ADAPTER_SHA256: 'previous-host-7849ef1.py'})
         originals = {
             self.h.LEGACY_ADAPTER_SHA256: subprocess.check_output(['git', 'show', '18d1b3b:vps/lib/host.py']),
             self.h.DEPLOYED_ADAPTER_SHA256: subprocess.check_output(['git', 'show', '918103e:vps/lib/host.py']),
             self.pin: self.baseline,
-            self.h.DUAL_ADAPTER_SHA256: subprocess.check_output(['git', 'show', '51f71ce:vps/lib/host.py'])}
+            self.h.DUAL_ADAPTER_SHA256: subprocess.check_output(['git', 'show', '51f71ce:vps/lib/host.py']),
+            self.h.DRAIN_ADAPTER_SHA256: subprocess.check_output(['git', 'show', '7849ef1:vps/lib/host.py'])}
         self.assertEqual(originals[self.h.DUAL_ADAPTER_SHA256], subprocess.check_output(['git', 'show', 'e754605:vps/lib/host.py']))
         self.assertEqual(hashlib.sha256(originals[self.h.DUAL_ADAPTER_SHA256]).hexdigest(), self.h.DUAL_ADAPTER_SHA256)
         inodes = {}
@@ -249,6 +251,57 @@ class BaselineAdapterRetention(unittest.TestCase):
             if inode is not None: self.assertEqual(retained.stat().st_ino, inode)
             inode = retained.stat().st_ino
             self.assertEqual((self.h.ROOT / 'host.py').read_bytes(), Path(host.__file__).read_bytes())
+
+    def test_current_3948_guard_handoff_retains_exact_bytes_and_cached_archive(self):
+        source = subprocess.check_output(['git', 'show', '7849ef1654f68bc92347d1f3417706acdbe19cdf:vps/lib/host.py'])
+        pin = self.h.DRAIN_ADAPTER_SHA256
+        self.assertEqual(pin, '3948c13793f7e50d1600d88036c8ffd3c174fd74fe16481d1d75000b6b4d425a')
+        self.assertEqual(hashlib.sha256(source).hexdigest(), pin)
+        self.h.atomic(self.h.ROOT / 'host.py', source, 0o700)
+        retained = self.h.ROOT / ('adapter-before-' + pin + '.py')
+        inode = None
+        for attempt in range(2):
+            with tarfile.open(self.h.export_backup()) as archive:
+                self.assertEqual(archive.extractfile('previous-host-7849ef1.py').read(), source)
+            self.assertEqual(retained.read_bytes(), source)
+            if inode is not None: self.assertEqual(retained.stat().st_ino, inode)
+            inode = retained.stat().st_ino
+            self.assertEqual((self.h.ROOT / 'host.py').read_bytes(), Path(host.__file__).read_bytes())
+        sentinel = self.f.root / 'foreign-3948'; sentinel.write_bytes(b'foreign')
+        control = self.h.ctl.side_effect
+        def race(*args):
+            if args == ('stop', self.h.FRONT):
+                retained.unlink(); retained.symlink_to(sentinel)
+            return control(*args)
+        self.h.ctl.side_effect = race
+        with tarfile.open(self.h.export_backup()) as archive:
+            self.assertEqual(archive.extractfile('previous-host-7849ef1.py').read(), source)
+        self.assertTrue(retained.is_symlink())
+        self.assertEqual(sentinel.read_bytes(), b'foreign')
+
+    def test_current_3948_retained_slot_rejects_unsafe_or_wrong_source_before_stop(self):
+        source = subprocess.check_output(['git', 'show', '7849ef1:vps/lib/host.py'])
+        pin = self.h.DRAIN_ADAPTER_SHA256
+        retained = self.h.ROOT / ('adapter-before-' + pin + '.py')
+        outside = self.f.root / 'reviewed-3948'; outside.write_bytes(source)
+        for kind in ('link', 'fifo', 'directory', 'wrong-digest'):
+            self.h.atomic(self.h.ROOT / 'host.py', source, 0o700)
+            if kind == 'link': retained.symlink_to(outside)
+            elif kind == 'fifo': os.mkfifo(retained)
+            elif kind == 'directory': retained.mkdir()
+            else: retained.write_bytes(source + b'\n')
+            try:
+                with mock.patch.object(self.h, 'atomic', wraps=self.h.atomic) as writes, \
+                        mock.patch.object(self.h, 'ctl', wraps=self.h.ctl) as control:
+                    with self.assertRaises(self.h.Error): self.h.export_backup()
+                    writes.assert_not_called(); control.assert_not_called()
+                self.assertEqual((self.h.ROOT / 'host.py').read_bytes(), source)
+                self.assertFalse((self.h.ROOT / 'backup-stop.json').exists())
+            finally:
+                if kind == 'directory': retained.rmdir()
+                else: retained.unlink()
+        with self.assertRaisesRegex(self.h.Error, 'Unverified'):
+            self.h.retain_previous_adapter(source + b'\n', pin)
 
     def test_stored_adapter_link_fifo_and_unknown_source_refuse_without_stop(self):
         import signal

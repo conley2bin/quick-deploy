@@ -181,7 +181,6 @@ class CdnHost(unittest.TestCase):
         self.h.owned_host_group.side_effect = real_function(self.h, 'owned_host_group')
         self.f.patch(self.h, 'core_check')
         self.f.patch(self.h, 'hysteria_health', side_effect=real_function(self.h, 'hysteria_health'))
-        self.f.patch(self.h, 'check_cdn_dns')
         self.f.patch(self.h, 'tls_hostname_probe')
         self.f.patch(self.h, 'certificate_paths', side_effect=lambda folder, domain, metadata=None:
             ((Path(folder) / 'caddy/data/caddy/certificates/fixture' / (domain + '.crt')).absolute(),
@@ -333,6 +332,20 @@ class CdnHost(unittest.TestCase):
                 writes.assert_not_called()
             self.assertFalse((self.h.ROOT / 'pending.json').exists())
         self.model.inbounds = original; self.model.sync()
+
+    def test_prepare_ignores_ambient_dns_but_retains_bound_source_ownership(self):
+        original = copy.deepcopy(self.request)
+        for change in ({'endpoint': '104.16.1.2'}, {'owner': 'foreign'}, {'machine_id': 'f' * 32},
+                       {'config': dict(self.request['config'], domain='foreign.example.org')}, {'ssh_port': 2222}):
+            self.request = dict(original, **change)
+            with mock.patch.object(self.h, 'atomic', wraps=self.h.atomic) as writes, \
+                    mock.patch.object(self.h, 'ctl', wraps=self.h.ctl) as control:
+                with self.assertRaises(self.h.Error): self.prepare()
+                writes.assert_not_called(); control.assert_not_called()
+            self.assertFalse((self.h.ROOT / 'pending.json').exists())
+        self.request = original
+        with mock.patch.object(self.h.socket, 'getaddrinfo', side_effect=AssertionError('Ambient DNS is not ownership')):
+            self.assertTrue(self.prepare()['prepared'])
 
     def test_front_bootstrap_final_path_and_caddy_never_udp443(self):
         staging = host.caddyfile(self.manifest, False, bootstrap_domain='cdn.example.org')
@@ -1036,15 +1049,6 @@ rules:
                     text.replace(self.account['auth'], self.manifest['accounts']['home']['auth'])):
             with self.assertRaises(host.Error): host.validate_feed_scope(self.manifest, 'company', bad.encode(), 'mihomo')
 
-    def test_bootstrap_dns_rejects_edge_wrong_origin_and_aaaa(self):
-        origin = '93.184.216.34'
-        answer = [(socket.AF_INET, socket.SOCK_STREAM, 6, '', (origin, 443))]
-        with mock.patch.object(host.socket, 'getaddrinfo', return_value=answer): host.check_cdn_dns('cdn.example.org', origin)
-        for bad in ([], [(socket.AF_INET, socket.SOCK_STREAM, 6, '', ('104.16.1.1', 443))],
-                    answer + [(socket.AF_INET6, socket.SOCK_STREAM, 6, '', ('2606:4700::1', 443, 0, 0))]):
-            with mock.patch.object(host.socket, 'getaddrinfo', return_value=bad), self.assertRaises(host.Error):
-                host.check_cdn_dns('cdn.example.org', origin)
-
     def test_certificate_selection_is_per_hostname_and_preserves_h2_binding(self):
         folder = self.fx.folder
         storage = folder / 'caddy/data/caddy/certificates/issuer'; storage.mkdir(parents=True)
@@ -1171,7 +1175,6 @@ class SourceNativeCDN(unittest.TestCase):
         with mock.patch.object(host, 'CDN_PORT', original['config']['proxy_port']), \
                 mock.patch.object(host, 'XHTTP_PORT', native.free_port()), \
                 mock.patch.object(host, 'bootstrap_cdn_certificate', side_effect=issue), \
-                mock.patch.object(host, 'check_cdn_dns'), \
                 mock.patch.object(host, 'auth_core_epoch', side_effect=fixture_epoch), \
                 mock.patch.object(host, 'reality_source_health', side_effect=fixture_source_health):
             import vps

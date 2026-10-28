@@ -16,6 +16,7 @@ import select
 import signal
 import shutil
 import sqlite3
+import ssl
 import subprocess
 import sys
 import tempfile
@@ -408,11 +409,48 @@ class CDNCLI(unittest.TestCase):
         self.assertNotIn('transport-prepare', self.events)
         self.assertFalse((self.state / 'pending.json').exists())
 
-    def test_preflight_gray_origin_and_prerequisite_failures_do_not_mutate(self):
-        with mock.patch.object(cdn_probe, 'resolve_a', return_value=['104.16.1.2']):
-            with self.assertRaisesRegex(host.Error, 'gray/DNS-only'): self.run_cdn()
+    def test_already_proxied_strict_preflight_skips_ack_with_closed_stdin(self):
+        def edge(domain, ip, interface, budget):
+            self.assertEqual((domain, ip, interface), ('cdn.example.org', '104.16.1.2', 'eno1'))
+            self.assertEqual(self.events, ['status'])
+            self.assertLessEqual(budget.left(), 15)
+            self.assertFalse((self.state / 'pending.json').exists())
+            return {'peer': ip, 'port': 443}
+        with mock.patch.object(cdn_probe, 'resolve_a', return_value=['104.16.1.2']), \
+                mock.patch.object(cdn_probe, 'edge_tls', side_effect=edge) as tls, \
+                mock.patch.object(vps, 'acknowledge_orange') as ack, \
+                open(os.devnull) as closed, mock.patch.object(sys, 'stdin', closed):
+            self.run_cdn()
+        tls.assert_called_once(); ack.assert_not_called()
+        self.assertIn('transport-auth-begin', self.events)
+        self.assertIn('transport-auth-finish', self.events)
+        self.assertIn('transport-commit', self.events)
+        self.assertEqual(self.receipt['offnode_sha256'], host.digest(self.final_path))
+        self.assertFalse((self.state / 'pending.json').exists())
+
+    def test_preflight_wrong_dns_edge_certificate_or_trace_refuses_before_backup(self):
+        for answers in ([], ['1.1.1.1'], ['10.0.0.1'], ['198.18.0.1'],
+                        ['104.16.1.2', self.record['endpoint']], ['104.16.1.2', '1.1.1.1']):
+            with self.subTest(answers=answers), \
+                    mock.patch.object(cdn_probe, 'resolve_a', return_value=answers), \
+                    mock.patch.object(cdn_probe, 'edge_tls') as tls:
+                with self.assertRaisesRegex(host.Error, 'preflight failed'): self.run_cdn()
+                tls.assert_not_called()
+                self.assertEqual(self.events, ['status']); self.events.clear()
+                self.assertFalse((self.state / 'pending.json').exists())
+        for error in (cdn_probe.Error('wrong trace/peer'), ssl.SSLCertVerificationError('wrong certificate/SNI'),
+                      OSError('DNS failed')):
+            with self.subTest(error=error), \
+                    mock.patch.object(cdn_probe, 'resolve_a', return_value=['104.16.1.2']), \
+                    mock.patch.object(cdn_probe, 'edge_tls', side_effect=error):
+                with self.assertRaisesRegex(host.Error, 'preflight failed'): self.run_cdn()
+                self.assertEqual(self.events, ['status']); self.events.clear()
+                self.assertFalse((self.state / 'pending.json').exists())
+        with mock.patch.object(cdn_probe, 'resolve_a', side_effect=cdn_probe.Error('non-authoritative DNS')):
+            with self.assertRaisesRegex(host.Error, 'preflight failed'): self.run_cdn()
         self.assertEqual(self.events, ['status'])
-        self.events.clear()
+
+    def test_preflight_prerequisite_failures_do_not_mutate(self):
         with mock.patch.object(cdn_probe, 'environment', side_effect=cdn_probe.Error('prerequisite absent')):
             with self.assertRaisesRegex(host.Error, 'prerequisite absent'): self.run_cdn()
         self.assertEqual(self.events, [])
@@ -434,7 +472,7 @@ class CDNCLI(unittest.TestCase):
             result = self.remote(*args, **kwargs)
             return None if args[1] == 'transport-auth-finish' else result
         with mock.patch.object(cdn_probe, 'validate_cdn_candidate', side_effect=probe), \
-                mock.patch.object(cdn_probe, 'resolve_a', side_effect=[[self.record['endpoint']], ['104.16.1.2']]), \
+                mock.patch.object(cdn_probe, 'resolve_a', side_effect=[['104.16.1.2'], ['104.16.1.2']]), \
                 mock.patch.object(cdn_probe, 'edge_tls', return_value={'peer': '104.16.1.2', 'port': 443}), \
                 mock.patch.object(cdn_probe, 'socket_peers', return_value={('104.16.1.2', 443)}), \
                 mock.patch.object(cdn_probe.select, 'select', wraps=probe_fixtures.select_without_idle), \
@@ -450,6 +488,44 @@ class CDNCLI(unittest.TestCase):
         self.assertFalse((self.state / 'cdn-proofs').exists())
         self.assertFalse((self.state / 'pending.json').exists())
 
+    def test_already_proxied_edge_cannot_replace_inner_origin_egress_or_certificate(self):
+        for failure in ('egress', 'certificate'):
+            with self.subTest(failure=failure):
+                fixture = probe_fixtures.Probe('runTest')
+                fixture.setUp()
+                try:
+                    self.events.clear(); self.backups = [self.before_path, self.candidate_path]
+                    def probe(**kwargs):
+                        kwargs['binary'] = str(fixture.binary)
+                        return REAL_CDN_PROBE(**kwargs)
+                    with contextlib.ExitStack() as stack:
+                        stack.enter_context(mock.patch.object(cdn_probe, 'validate_cdn_candidate', side_effect=probe))
+                        stack.enter_context(mock.patch.object(cdn_probe, 'resolve_a', return_value=['104.16.1.2']))
+                        stack.enter_context(mock.patch.object(cdn_probe, 'edge_tls', return_value={'peer': '104.16.1.2', 'port': 443}))
+                        stack.enter_context(mock.patch.object(cdn_probe, 'socket_peers', return_value={('104.16.1.2', 443)}))
+                        stack.enter_context(mock.patch.object(cdn_probe.select, 'select', wraps=probe_fixtures.select_without_idle))
+                        ack = stack.enter_context(mock.patch.object(vps, 'acknowledge_orange'))
+                        if failure == 'egress':
+                            def wrong_origin(handler):
+                                body = b'1.1.1.1' if handler.headers.get('Host') == 'api.ipify.org' else b'public-https-fixture'
+                                handler.send_response(200)
+                                handler.send_header('Content-Length', str(len(body)))
+                                handler.end_headers(); handler.wfile.write(body)
+                            stack.enter_context(mock.patch.object(fixture.origin.RequestHandlerClass, 'do_GET', wrong_origin))
+                        else:
+                            stack.enter_context(mock.patch.object(cdn_probe, 'strict_context', return_value=ssl.create_default_context()))
+                        expected = 'egress differs' if failure == 'egress' else 'Inner public HTTPS CA/hostname verification failed'
+                        with self.assertRaisesRegex(host.Error, expected): self.run_cdn()
+                        ack.assert_not_called()
+                    self.assertIn('transport-auth-begin', self.events)
+                    fixture.assert_processes_clean()
+                    self.assertNotIn('transport-commit', self.events)
+                    self.assertIn('abort', self.events)
+                    self.assertFalse(self.diagnostic_active)
+                    self.assertFalse((self.state / 'pending.json').exists())
+                finally:
+                    fixture.doCleanups()
+
     def test_matching_restored_witness_real_probe_checks_bind_final_b(self):
         fixture = probe_fixtures.Probe('test_five_fresh_clients_negative_valid_reconnect_and_h2_proof')
         fixture.setUp(); self.addCleanup(fixture.doCleanups)
@@ -457,11 +533,16 @@ class CDNCLI(unittest.TestCase):
             kwargs['binary'] = str(fixture.binary)
             return REAL_CDN_PROBE(**kwargs)
         with mock.patch.object(cdn_probe, 'validate_cdn_candidate', side_effect=probe), \
-                mock.patch.object(cdn_probe, 'resolve_a', side_effect=[[self.record['endpoint']], ['104.16.1.2']]), \
-                mock.patch.object(cdn_probe, 'edge_tls', return_value={'peer': '104.16.1.2', 'port': 443}), \
+                mock.patch.object(cdn_probe, 'resolve_a', side_effect=[['104.16.1.2'], ['104.16.1.2']]) as dns, \
+                mock.patch.object(cdn_probe, 'edge_tls', return_value={'peer': '104.16.1.2', 'port': 443}) as tls, \
+                mock.patch.object(vps, 'acknowledge_orange') as ack, \
                 mock.patch.object(cdn_probe, 'socket_peers', return_value={('104.16.1.2', 443)}), \
-                mock.patch.object(cdn_probe.select, 'select', wraps=probe_fixtures.select_without_idle):
+                mock.patch.object(cdn_probe.select, 'select', wraps=probe_fixtures.select_without_idle), \
+                open(os.devnull) as closed, mock.patch.object(sys, 'stdin', closed):
             self.run_cdn()
+        ack.assert_not_called()
+        self.assertEqual(dns.call_count, 2)
+        self.assertEqual(tls.call_count, 2)
         fixture.assert_processes_clean()
         self.assertEqual(len([e for e in fixture.events() if 'pid' in e]), 5)
         self.assertEqual(sum(e.get('uuid_sha256') == hashlib.sha256(self.auth_nonce.encode()).hexdigest()

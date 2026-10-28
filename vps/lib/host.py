@@ -1578,12 +1578,6 @@ def check_listener_free(port):
 def check_xhttp_port():
     check_listener_free(XHTTP_PORT)
 
-def check_cdn_dns(domain, endpoint):
-    addresses = socket.getaddrinfo(domain, CDN_PORT, type=socket.SOCK_STREAM)
-    if not addresses or any(item[0] != socket.AF_INET or item[4][0] != endpoint for item in addresses):
-        raise Error('CDN bootstrap requires grey DNS A pointing only to this origin, with no AAAA')
-
-
 def check_target(config):
     target = hostname(config['reality_target'])
     addresses = {item[4][0] for item in socket.getaddrinfo(target, 443, type=socket.SOCK_STREAM)}
@@ -2201,10 +2195,13 @@ DEPLOYED_ADAPTER_SHA256 = '8777a3d47b07b91bc85de2ce88016efb6de9c3b0568f5688f5bd8
 BASELINE_ADAPTER_SHA256 = 'b52adbbfb7efc3593c5fa266e8f148ed60deaa2b685d72b926e549b9425f6d7e'
 # Independently verified git-show51f71ce AND e754605 public host.py bytes.
 DUAL_ADAPTER_SHA256 = 'ecdb5af7d782bb41b9aa2e8794b5659724bfd468a2c7d82c67da330df81e8df7'
+# Independently byte-verified git-show7849ef1; authorized before-backup guard.
+DRAIN_ADAPTER_SHA256 = '3948c13793f7e50d1600d88036c8ffd3c174fd74fe16481d1d75000b6b4d425a'
 ADAPTER_PREDECESSORS = {LEGACY_ADAPTER_SHA256: 'previous-host.py',
                         DEPLOYED_ADAPTER_SHA256: 'previous-host-918103e.py',
                         BASELINE_ADAPTER_SHA256: 'previous-host-ae72036.py',
-                        DUAL_ADAPTER_SHA256: 'previous-host-51f71ce.py'}
+                        DUAL_ADAPTER_SHA256: 'previous-host-51f71ce.py',
+                        DRAIN_ADAPTER_SHA256: 'previous-host-7849ef1.py'}
 
 
 def accepted_adapter_digest(stored, current):
@@ -2450,7 +2447,6 @@ def devices_prepare(upload, transport=False):
                 validate_reality_port(request['tcp_cdn']['reality_port'], request['ssh_port'])
                 check_listener_free(request['tcp_cdn']['reality_port'])
                 check_xhttp_port()
-                check_cdn_dns(request['tcp_cdn']['domain'], manifest['endpoint'])
                 reality_source_health(inbound, manifest)
                 hysteria_health(ROOT / 'active', dict(manifest, accounts=snapshot_accounts(ROOT / 'active/db/x-ui.db', manifest)), api)
         if (transport and ((cdn and cdn_enabled(manifest)) or (not cdn and dual_enabled(manifest)))) or (action == 'add' and set(names) <= existing) or (action == 'remove' and names[0] not in existing):
