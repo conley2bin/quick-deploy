@@ -1039,7 +1039,8 @@ def cdn_candidate_identity(candidate, manifest, files, interface):
     return {'manifest': manifest, 'mappings': mappings, 'native': rows}
 
 
-def cdn_evidence(state, document, record, request, fingerprint, candidate, before, args, deadline, binary):
+def cdn_evidence(state, document, record, request, fingerprint, candidate, before, args, deadline, binary,
+                 preflight_observations=()):
     manifest = checked_backup(document, record, candidate)
     if (not host.cdn_enabled(manifest) or
             {key: manifest['tcp_cdn'][key] for key in ('schema', 'domain', 'reality_port')} != request['tcp_cdn']):
@@ -1054,7 +1055,7 @@ def cdn_evidence(state, document, record, request, fingerprint, candidate, befor
     device = enabled[0]
     identity_a = cdn_candidate_identity(candidate, manifest, files, args.interface)
     initial_candidate, initial_digest = candidate, digest
-    observations, final, witness = [], {}, {}
+    observations, final, witness = list(preflight_observations), {}, {}
     def auth_begin():
         answer = cdn_probe.auth_binding(remote(record, 'transport-auth-begin', request), request, fingerprint, manifest)
         witness['begin'] = answer
@@ -1188,12 +1189,13 @@ def _cdn(state, document, args):
     if already:
         raise host.Error('Source is already CDN; a new auth acceptance proof requires a prepared transition. '
                          'No fresh proof produced; use status to inspect the committed deployment')
+    preflight_observations = []
     try:
         budget = cdn_probe.Budget(time.time() + 15)
         answers = cdn_probe.resolve_a(domain, args.interface, args.dns_server, budget)
         already_proxied = answers != [record['endpoint']]
         if already_proxied:
-            cdn_probe.select_edge(domain, answers, record['endpoint'], args.interface, budget)
+            cdn_probe.select_edge(domain, answers, record['endpoint'], args.interface, budget, preflight_observations)
     except (cdn_probe.Error, OSError, ValueError) as exc:
         raise host.Error('Physical authoritative DNS/Cloudflare TLS preflight failed; no remote mutation') from exc
     print('Use an independent SSH carrier/console for this core-changing transaction; '
@@ -1226,7 +1228,7 @@ def _cdn(state, document, args):
         if not already_proxied:
             acknowledge_orange(domain, deadline)
         proof, proof_sha256, candidate = cdn_evidence(state, document, record, request, fingerprint, candidate, before,
-                                         args, deadline, binary)
+                                         args, deadline, binary, preflight_observations)
         if deadline - time.time() < cdn_probe.COMMIT_MARGIN:
             raise host.Error('CDN proof exhausted commit margin; restoring original transport')
         pending.update(backup=str(candidate.absolute()), cdn_proof_sha256=proof_sha256)

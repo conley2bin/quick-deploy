@@ -428,13 +428,17 @@ class CDNCLI(unittest.TestCase):
         self.assertEqual(self.receipt['offnode_sha256'], host.digest(self.final_path))
         self.assertFalse((self.state / 'pending.json').exists())
 
-    def test_preflight_transport_failover_is_bounded_and_all_failure_never_backs_up(self):
+    def test_preflight_transport_failover_is_bounded_and_preserves_failure_samples(self):
         addresses = ['104.16.1.2', '172.67.1.2']
         with mock.patch.object(cdn_probe, 'resolve_a', return_value=addresses), \
                 mock.patch.object(cdn_probe, 'edge_tls', side_effect=[TimeoutError(), {'peer': addresses[1], 'port': 443}]) as tls:
             self.run_cdn()
         self.assertEqual([call.args[1] for call in tls.call_args_list], addresses)
         self.assertIn('transport-commit', self.events)
+        samples = vps.load(self.state / 'cdn-proofs' / (self.request['operation_id'] + '.samples.json'))
+        self.assertEqual(samples[0]['address'], addresses[0])
+        self.assertEqual(samples[0]['type'], 'TimeoutError')
+        self.assertEqual(samples[1]['peer'], addresses[1])
 
     def test_preflight_all_addresses_fail_no_backup_prepare_or_proof(self):
         with mock.patch.object(cdn_probe, 'resolve_a', return_value=['104.16.1.2', '172.67.1.2']), \
