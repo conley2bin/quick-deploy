@@ -613,14 +613,19 @@ class ThreeFixture:
             body += chunk
         self.assertEqual(body, b'native-dual-https-egress\n')
 
-    def assert_stream_closed(self, stream):
+    def assert_stream_revoked(self, stream, origin):
+        hits = len(origin.peers)  # The origin records EVERY HTTP request.
         try:
-            stream.sendall(b'GET / HTTP/1.1\r\nHost: sub.example.org\r\n\r\n')
+            stream.sendall(b'GET /revoked-stream HTTP/1.1\r\nHost: sub.example.org\r\n\r\n')
             self.assertEqual(stream.recv(4096), b'', 'Revoked established stream still usable')
-        except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, ssl.SSLEOFError, ssl.SSLZeroReturnError):
+        except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, ssl.SSLEOFError, ssl.SSLZeroReturnError, TimeoutError):
+            # Mihomo may retain its local SOCKS socket after the server tunnel
+            # is gone. No response AND no authenticated origin request is the
+            # revocation boundary; local EOF timing is not server authority.
             pass
         finally:
             stream.close()
+        self.assertEqual(len(origin.peers), hits, 'Revoked held stream reached authenticated origin')
 
     def http2_evidence(self):
         entries = [json.loads(line) for path in self.access_logs if path.exists()
@@ -704,9 +709,12 @@ class NativeThreeDevices(ThreeFixture, unittest.TestCase):
         held.update({role: self.held_stream(fresh, role, origin) for role in ('cdn', 'h2')})
         for stream in held.values():
             self.assert_stream_alive(stream)
+        previous_panel = fx.fx.proc
         fx.device('remove', 'reader')
+        self.assertIsNotNone(previous_panel.poll(), 'Old native panel/core process group still running')
+        self.assertNotEqual(fx.fx.proc.pid, previous_panel.pid)
         for stream in held.values():
-            self.assert_stream_closed(stream)
+            self.assert_stream_revoked(stream, origin)
         self.assertNotIn('reader', fx.records())
         self.assertTrue(all(c['id'] != stable['reader']['id'] for c in fx.rows('clients')))
         self.assertTrue(all(j['client_id'] != stable['reader']['id'] for j in fx.rows('client_inbounds')))
