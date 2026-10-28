@@ -973,7 +973,14 @@ class SourceNativeCDN(unittest.TestCase):
             hits = len(origin.peers)
             self.assertFalse(wire.https(wire.client(wrong, front_port, cert), origin))
             self.assertEqual(len(origin.peers), hits)
-            finished = host.transport_auth_finish(dict(request, cdn_auth_nonce=begun['nonce']))
+            verdict_reader = host.auth_read_verdict
+            def retain_closed_witness(pending, record):
+                with host.auth_file(pending, record) as stream:
+                    host.atomic(wire.evidence / 'closed-witness.log', stream.read())
+                host.atomic(wire.evidence / 'witness-read-record.json', host.dumps(record))
+                return verdict_reader(pending, record)
+            with mock.patch.object(host, 'auth_read_verdict', side_effect=retain_closed_witness):
+                finished = host.transport_auth_finish(dict(request, cdn_auth_nonce=begun['nonce']))
             self.assertTrue(finished['rejected'])
             self.assertEqual(finished['native_identity_sha256'], begun['native_identity_sha256'])
             self.assertEqual(host.auth_template(fx.folder)[0], original_template)
