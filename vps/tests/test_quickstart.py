@@ -47,6 +47,11 @@ class Quickstart(unittest.TestCase):
         cdn = next(args for args in parsed if args.command == 'cdn')
         self.assertEqual(cdn.cdn_domain, 'cdn.example.org')
         self.assertFalse(hasattr(cdn, 'domain'))
+        self.assertEqual(cdn.reality_port, 9443)
+        explicit = vps.parser().parse_args(['cdn', '--domain', 'cdn.example.org', '--reality-port', '10443',
+                                           '--interface', 'eno1', '--dns-server', '203.0.113.2'])
+        self.assertEqual(explicit.reality_port, 10443)
+        self.assertIs(type(explicit.reality_port), int)
         self.assertEqual((cdn.interface, cdn.dns_server, cdn.mihomo),
                          ('eno1', '203.0.113.2', '/path/to/mihomo'))
         for required in ('status', 'backup', 'recover', 'restore'):

@@ -68,7 +68,7 @@ mode=(root/'mode').read_text(); running=False
 node=cfg['proxies'][0]
 def record(item):
  with (root/'events').open('a') as f:f.write(json.dumps(item)+'\n')
-record({'pid':os.getpid(),'config':str(path),'argv':sys.argv})
+record({'pid':os.getpid(),'config':str(path),'argv':sys.argv,'role':node['name']})
 class Control(http.server.BaseHTTPRequestHandler):
  def log_message(self,*a):pass
  def do_PUT(self):
@@ -85,7 +85,9 @@ class Control(http.server.BaseHTTPRequestHandler):
   if self.headers.get('Authorization')!='Bearer '+cfg['secret']:
    self.send_response(401);self.end_headers();return
   record({'event':'selected','running':running})
-  data=json.dumps({'now':node['name'],'all':[node['name']]}).encode()
+  group={'now':node['name'],'all':[node['name']]}
+  if mode=='fallback-selector':group['all']+=['SELF-main','SELF-h2','DIRECT']
+  data=json.dumps(group).encode()
   self.send_response(200);self.send_header('Content-Length',str(len(data)));self.end_headers();self.wfile.write(data)
 class Socks(socketserver.BaseRequestHandler):
  def handle(self):
@@ -248,6 +250,13 @@ class Probe(unittest.TestCase):
         self.assert_processes_clean()
         self.assertFalse(any(e.get('event') == 'socks' for e in self.events()))
 
+    def test_apply204_with_any_fallback_selector_is_refused_before_traffic(self):
+        (self.root / 'mode').write_text('fallback-selector')
+        with self.assertRaisesRegex(probe.Error, 'selected/all'):
+            with self.client(): self.fail('fallback route must never be used')
+        self.assert_processes_clean()
+        self.assertFalse(any(e.get('event') == 'socks' for e in self.events()))
+
     def test_real_tls_wrong_hostname_is_not_authentication_rejection(self):
         with self.client() as client:
             with self.assertRaisesRegex(probe.Error, 'CA/hostname') as error:
@@ -366,13 +375,16 @@ class Probe(unittest.TestCase):
         runtime = probe.runtime(cdn, 'cdn.example.org', EDGE, 'eno1', '1.1.1.1', 12345, 12346, 'secret')
         self.assertEqual(runtime['proxies'], [original[0]])
         self.assertEqual(runtime['proxy-groups'][0]['proxies'], ['SELF-cdn'])
+        self.run_proof(profile_bytes=probe.canonical({'proxies': reordered}))
+        self.assertEqual([e['role'] for e in self.events() if 'pid' in e], ['SELF-cdn'] * 4 + ['SELF-h2'])
+        self.assert_processes_clean()
         for bad in ([original[2], original[1]], [original[2], original[1], original[2]]):
             with self.assertRaises(probe.Error):
                 probe.native_nodes(probe.canonical({'proxies': bad}), self.m, 'company', 'eno1')
 
     def test_each_native_role_wrong_port_flow_or_credential_is_rejected(self):
         cases = [(0, 'port', 9443), (0, 'flow', 'xtls-rprx-vision'), (0, 'uuid', str(uuid.uuid4())),
-                 (1, 'port', 9443), (1, 'password', 'wrong-auth'), (1, 'sni', 'cdn.example.org'),
+                 (1, 'port', 9443), (1, 'password', 'wrong-auth'), (1, 'sni', 'cdn.example.org'), (1, 'flow', 'xtls-rprx-vision'),
                  (2, 'port', 443), (2, 'flow', ''), (2, 'uuid', str(uuid.uuid4())),
                  (2, 'network', 'xhttp'), (2, 'reality-opts', {'public-key': 'wrong', 'short-id': 'bad'})]
         for index, key, value in cases:

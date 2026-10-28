@@ -212,10 +212,53 @@ class CDNCLI(unittest.TestCase):
         self.assertEqual(vps.configuration(self.args, self.config), self.config)
         with self.assertRaises(SystemExit):
             vps.parser().parse_args(['cdn', '--domain', 'cdn.example.org', '--interface', 'eno1'])
+        with mock.patch.object(sys, 'stderr', new=io.StringIO()):
+            for command in ('deploy', 'preflight', 'status', 'backup', 'recover', 'export', 'dashboard'):
+                with self.subTest(command=command), self.assertRaises(SystemExit):
+                    vps.parser().parse_args([command, '--reality-port', '10443'])
         for flag in ('--ssh', '--proxy-port', '--reality-target'):
             with self.assertRaises(SystemExit):
                 vps.parser().parse_args(['cdn', '--domain', 'cdn.example.org', '--interface', 'eno1',
                                         '--dns-server', '1.1.1.1', flag, 'anything'])
+
+    def test_explicit_port_proposal_fingerprint_and_reserved_ports(self):
+        self.assertEqual(self.args.reality_port, 9443)
+        for port in (9443, 10443):
+            request, fingerprint = vps.cdn_request(self.doc, self.record, 'cdn.example.org', self.before_path, 'a' * 64, port)
+            self.assertEqual(request['tcp_cdn'], {'schema': 1, 'domain': 'cdn.example.org', 'reality_port': port})
+            self.assertEqual(request['config']['proxy_port'], 443)
+            changed = dict(request, tcp_cdn=dict(request['tcp_cdn'], reality_port=8444))
+            self.assertNotEqual(fingerprint, host.transport_request(changed))
+        for value in (None, True, '9443', 0, 65536, 22, 80, 443, 8443, 2080,
+                      host.ADMIN_PORT, host.SUB_PORT, host.API_PORT):
+            with self.subTest(port=value), self.assertRaisesRegex(host.Error, 'non-reserved'):
+                vps.cdn_request(self.doc, self.record, 'cdn.example.org', self.before_path, 'a' * 64, value)
+        with self.assertRaises(host.Error):
+            vps.cdn_reality_port(9443, 9443)
+        self.assertEqual(vps.cdn_reality_port(65535, 2222), 65535)
+        self.assertEqual(self.events, [])
+
+    def test_port_or_obsolete_topology_prepare_tamper_aborts(self):
+        for change in ({'transports': ['tcp-xhttp-cdn', 'hysteria2']},
+                       {'tcp_cdn': dict(self.candidate['tcp_cdn'], reality_port=10443)},
+                       {'tcp_cdn': dict(self.candidate['tcp_cdn'], reality_tag='in-9443-tcp')}):
+            self.events.clear(); self.backups = [self.before_path, self.candidate_path]
+            self.prepare_change = lambda result: result.update(change)
+            with self.subTest(change=change), self.assertRaisesRegex(host.Error, 'prepare differs'):
+                self.run_cdn()
+            self.assertNotIn('probe', self.events)
+            self.assertNotIn('transport-commit', self.events)
+            self.assertIn('abort', self.events)
+
+    def test_reserved_port_and_target_hostname_refuse_before_remote_mutation(self):
+        for value in (80, 443, 8443, 2080, 22, 0, 65536):
+            self.args.reality_port = value
+            with self.subTest(port=value), self.assertRaises(host.Error): self.run_cdn()
+        self.args.reality_port = 9443
+        for domain in ('sub.example.org', 'target.example.org'):
+            self.args.cdn_domain = domain
+            with self.assertRaisesRegex(host.Error, 'separate hostname'): self.run_cdn()
+        self.assertEqual(self.events, [])
 
     def test_candidate_proof_before_commit_published_archive_only_projection(self):
         self.run_cdn()
@@ -287,6 +330,26 @@ class CDNCLI(unittest.TestCase):
         self.assertTrue((self.state / 'pending.json').exists())
         self.assertNotIn('tcp_cdn', vps.load(self.state / 'state.json'))
 
+    def test_lost_ack_receipt_wrong_role_nonce_or_verdict_type_retains_pending(self):
+        self.lost_ack = True
+        self.run_cdn()
+        pending = {'request': self.request, 'backup': str(self.final_path),
+                   'cdn_proof_sha256': self.receipt['cdn_proof_sha256']}
+        good = copy.deepcopy(self.receipt)
+        for change in ({'inbound_id': 1}, {'inbound_tag': 'in-443-tcp'}, {'inbound_tag': 'SELF-main'},
+                       {'nonce_sha256': 'f' * 64}, {'schema': True}, {'inbound_id': 3.0},
+                       {'native_identity_sha256': 'f' * 64}, {'unexpected': 'extra'}):
+            receipt = dict(good, cdn_auth_verdict=dict(good['cdn_auth_verdict'], **change))
+            with self.subTest(change=change), self.assertRaisesRegex(host.Error, 'receipt'):
+                vps.check_cdn_receipt(self.state, pending, receipt)
+        with self.assertRaises(host.Error):
+            vps.check_cdn_receipt(self.state, pending, dict(good, cdn_auth_verdict=None))
+        tampered = dict(pending, request=dict(self.request, tcp_cdn=dict(self.request['tcp_cdn'], reality_port=10443)))
+        with self.assertRaisesRegex(host.Error, 'receipt'):
+            vps.check_cdn_receipt(self.state, tampered, good)
+        vps.check_cdn_receipt(self.state, pending, good)
+        self.assertEqual(self.events.count('transport-prepare'), 1)
+
     def test_non443_pending_legacy_foreign_domain_refuse_without_mutation(self):
         self.doc['config']['proxy_port'] = 8443
         with self.assertRaisesRegex(host.Error, 'port443'): self.run_cdn()
@@ -310,6 +373,9 @@ class CDNCLI(unittest.TestCase):
         self.assertEqual(self.events, ['status'])
         self.assertEqual((self.state / 'state.json').read_bytes(), original)
         self.assertFalse((self.state / 'pending.json').exists())
+        self.args.reality_port = 10443; self.events.clear()
+        with self.assertRaisesRegex(host.Error, 'different CDN domain or REALITY port'): self.run_cdn()
+        self.args.reality_port = 9443
         self.args.cdn_domain = 'different.example.org'; self.events.clear()
         with self.assertRaisesRegex(host.Error, 'different CDN domain or REALITY port'): self.run_cdn()
         self.assertNotIn('backup', self.events)
@@ -322,6 +388,25 @@ class CDNCLI(unittest.TestCase):
         self.assertEqual(saved['tcp_cdn'], {'schema': 1, 'domain': 'cdn.example.org', 'reality_port': 9443})
         self.assertEqual(saved['backup'], str(self.after_path))
         self.assertNotIn('native_generation', saved)
+
+    def test_ordinary_deploy_retains_archive_port_without_new_acceptance(self):
+        self.committed = True
+        self.doc.update(backup=str(self.after_path), tcp_cdn={'schema': 1, 'domain': 'stale.example.org', 'reality_port': 10443})
+        self.backups = [self.after_path]
+        remote = self.remote
+        def unchanged(record, action, *args, **kwargs):
+            if action == 'prepare':
+                self.events.append(action)
+                return {'unchanged': True, 'needs_transport_upgrade': False}
+            return remote(record, action, *args, **kwargs)
+        with mock.patch.object(vps, 'remote', side_effect=unchanged), mock.patch.object(vps, 'artifacts'), \
+                mock.patch.object(vps, 'upload_bundle', return_value=contextlib.nullcontext(io.BytesIO())):
+            vps.deploy_existing(self.state, self.doc, self.record, vps.parser().parse_args(['deploy']))
+        self.assertEqual(self.events, ['status', 'prepare', 'backup', 'outputs', 'status', 'export'])
+        self.assertEqual(self.doc['tcp_cdn'], {'schema': 1, 'domain': 'cdn.example.org', 'reality_port': 9443})
+        self.assertNotIn('probe', self.events)
+        self.assertNotIn('transport-prepare', self.events)
+        self.assertFalse((self.state / 'pending.json').exists())
 
     def test_preflight_gray_origin_and_prerequisite_failures_do_not_mutate(self):
         with mock.patch.object(cdn_probe, 'resolve_a', return_value=['104.16.1.2']):
@@ -392,7 +477,11 @@ class CDNCLI(unittest.TestCase):
                    lambda m: m['accounts']['company'].update(auth='changed-private-auth'),
                    lambda m: m['accounts']['company'].update(subId='changed-private-subid'),
                    lambda m: m['accounts']['company'].update(totalGB=9),
-                   lambda m: m['hysteria2'].update(inbound_id=3)]
+                   lambda m: m['hysteria2'].update(inbound_id=3),
+                   lambda m: m['tcp_cdn'].update(reality_port=10443),
+                   lambda m: m['tcp_cdn'].update(reality_tag='in-9443-tcp'),
+                   lambda m: m['tcp_cdn'].update(host_group_id='foreign-group'),
+                   lambda m: m['tcp_cdn'].update(inbound_id=4)]
         for index, change in enumerate(changes):
             with self.subTest(change=change):
                 self.events.clear()
@@ -426,7 +515,11 @@ class CDNCLI(unittest.TestCase):
                    ('transport-auth-begin', {'native_identity_sha256': None}),
                    ('transport-auth-finish', {'nonce_sha256': 'f' * 64}),
                    ('transport-auth-finish', {'native_identity_sha256': 'f' * 64}),
-                   ('transport-auth-finish', {'rejected': False})]
+                   ('transport-auth-finish', {'rejected': False}),
+                   ('transport-auth-begin', {'inbound_id': 1}),
+                   ('transport-auth-begin', {'inbound_tag': 'SELF-main'}),
+                   ('transport-auth-finish', {'inbound_id': 1}),
+                   ('transport-auth-finish', {'inbound_tag': 'in-443-tcp'})]
         for action, change in changes:
             with self.subTest(action=action, change=change):
                 self.events.clear(); self.backups = [self.before_path, self.candidate_path]
@@ -682,6 +775,22 @@ class SIGTERMSubprocess(unittest.TestCase):
                 shutil.rmtree(client['folder'], ignore_errors=True)
 
 
+class LegacyControllerCompatibility(unittest.TestCase):
+    def test_featureless_fingerprint_vectors_remain_exact(self):
+        request = {'owner': 'fixture-owner', 'machine_id': 'b' * 32, 'endpoint': '93.184.216.34',
+                   'config': {'domain': 'sub.example.org', 'reality_target': 'target.example.org',
+                              'acme_email': '', 'proxy_port': 443},
+                   'operation_id': 'a' * 32, 'adapter_sha256': 'c' * 64, 'ssh_port': 22,
+                   'mode': 'transport-upgrade', 'before_sha256': 'd' * 64}
+        self.assertEqual(host.transport_request(request), '473ced2f7344584b39998e28c6af041b063d6ee1c71b486c9742fec6a3b261d2')
+        request.update(source_transports=['tcp-reality'], target_transports=['tcp-reality', 'hysteria2'])
+        self.assertEqual(host.transport_request(request), '1fa65ad2db8be94772857db42c1d2b5d3713ea53a5c6f9309bb644c726177d78')
+        # Featureless generation projection is byte-semantically unchanged too.
+        old = node_manifest(); old.pop('tcp_cdn'); old.pop('hysteria2')
+        old.update(owner='fixture-owner', node_id='fixture-node')
+        self.assertNotIn('tcp_cdn', vps.generation_binding(old, 'd' * 64))
+
+
 class CombinedHostContract(unittest.TestCase):
     """Real integration gate, deliberately NOT stubbed to hide old BASE Host.
 
@@ -697,6 +806,9 @@ class CombinedHostContract(unittest.TestCase):
             record = {'machine_id': 'b' * 32, 'endpoint': '93.184.216.34', 'port': 22}
             request, fingerprint = vps.cdn_request(document, record, 'cdn.example.org', before, 'a' * 64, 9443)
             self.assertEqual(fingerprint, host.transport_request(request))
+            self.assertEqual(fingerprint, transport_contract(request))
+            self.assertNotEqual(fingerprint, host.transport_request(dict(request,
+                tcp_cdn=dict(request['tcp_cdn'], reality_port=10443))))
             self.assertEqual(request['tcp_cdn'], {'schema': 1, 'domain': 'cdn.example.org', 'reality_port': 9443})
             target = host.new_manifest(document['owner'], document['config'], record['endpoint'])
             target.update(host_group_id='main-group', management={'ssh_port': 22}, hysteria2={
@@ -758,6 +870,11 @@ class NativeCandidateContinuity(unittest.TestCase):
                     insert into client_inbounds values(1,1,'xtls-rprx-vision'),(1,2,''),(1,3,'');
                     insert into settings values(1,'xrayTemplateConfig','{"log":{"loglevel":"none"}}');
                 ''')
+                db.executescript('''alter table inbounds add column port integer;
+                    alter table inbounds add column tag text;
+                    update inbounds set port=9443,tag='in-443-tcp' where id=1;
+                    update inbounds set port=443,tag='SELF-h2' where id=2;
+                    update inbounds set port=2080,tag='SELF-cdn' where id=3;''')
                 account = manifest['accounts']['company']
                 db.execute('insert into clients values(1,?,?,?,1,12345,1893456000000,3,?)',
                            (account['id'], account['auth'], account['subId'], 'xtls-rprx-vision'))
@@ -792,9 +909,24 @@ class NativeCandidateContinuity(unittest.TestCase):
             self.assertNotEqual(identity(), original)
             with sqlite3.connect(db_path) as db:
                 db.execute("insert into client_inbounds values(1,2,'')")
-            changed_nodes = nodes(); changed_nodes[0]['client-fingerprint'] = 'firefox'
-            files['company.yaml'] = cdn_probe.canonical({'proxies': changed_nodes})
-            self.assertNotEqual(identity(), original)
+            for inbound_id in (1, 2, 3):
+                for column, value in (('port', 10443), ('tag', 'changed-native-tag')):
+                    with self.subTest(inbound=inbound_id, column=column), sqlite3.connect(db_path) as db:
+                        old = db.execute('select ' + column + ' from inbounds where id=?', (inbound_id,)).fetchone()[0]
+                        db.execute('update inbounds set ' + column + '=? where id=?', (value, inbound_id)); db.commit()
+                        self.assertNotEqual(identity(), original)
+                        db.execute('update inbounds set ' + column + '=? where id=?', (old, inbound_id))
+                with sqlite3.connect(db_path) as db:
+                    old = db.execute('select flow_override from client_inbounds where inbound_id=?', (inbound_id,)).fetchone()[0]
+                    db.execute('update client_inbounds set flow_override=? where inbound_id=?', ('wrong-flow', inbound_id)); db.commit()
+                    self.assertNotEqual(identity(), original)
+                    db.execute('update client_inbounds set flow_override=? where inbound_id=?', (old, inbound_id))
+            for index in range(3):
+                changed_nodes = nodes(); changed_nodes[index]['client-fingerprint'] = 'firefox'
+                files['company.yaml'] = cdn_probe.canonical({'proxies': changed_nodes})
+                self.assertNotEqual(identity(), original)
+            files['company.yaml'] = cdn_probe.canonical({'proxies': nodes()})
+            self.assertEqual(identity(), original)
 
 
 ORIGINAL_ACK = vps.acknowledge_orange

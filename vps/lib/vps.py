@@ -1132,7 +1132,8 @@ def check_cdn_receipt(state, pending, receipt):
     proof = load(state / 'cdn-proofs' / (request['operation_id'] + '.json'))
     proof_sha = host.cdn_proof_digest(proof)
     verdict = load(state / 'cdn-proofs' / (request['operation_id'] + '.auth.json'))
-    if (type(receipt.get('cdn_auth_verdict')) is not dict or receipt['cdn_auth_verdict'] != verdict or
+    if (type(receipt.get('cdn_auth_verdict')) is not dict or
+            cdn_probe.canonical(receipt['cdn_auth_verdict']) != cdn_probe.canonical(verdict) or
             receipt.get('committed') is not True or receipt.get('request_sha256') != host.transport_request(request) or
             not pending.get('backup') or receipt.get('offnode_sha256') != host.digest(Path(pending['backup'])) or
             receipt.get('cdn_proof_sha256') != proof_sha or pending.get('cdn_proof_sha256') != proof_sha or

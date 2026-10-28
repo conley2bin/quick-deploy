@@ -381,6 +381,7 @@ def native_nodes(profile_bytes, manifest, device, interface):
                 raise Error('Native REALITY has an unsupported trust/outer-dial override')
         if (type(target.get('schema')) is not int or target['schema'] != 1 or
                 target.get('path') != '/qd-xhttp/' or target.get('mode') != 'packet-up' or h2.get('alpn') != ['h3'] or
+                h2.get('flow') not in (None, '') or
                 not account['enable'] or cdn.get('type') != 'vless' or h2['name'] != 'SELF-h2' or
                 cdn.get('uuid') != account['id'] or h2['password'] != account['auth'] or
                 cdn.get('server') != target['domain'] or type(cdn.get('port')) is not int or cdn.get('port') != 443 or cdn.get('tls') is not True or
