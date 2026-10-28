@@ -291,6 +291,7 @@ class NativeCDNTriple(unittest.TestCase):
         self.assertEqual({entry['request']['tls']['proto'] for entry in logs}, {'h2'})
         self.assertTrue({'POST', 'GET'} <= {entry['request']['method'] for entry in logs})
         self.summary['caddy_http2_requests'] = len(logs)
+        self.assertEqual(host.digest(archive), archive_sha, 'Original native closed archive changed')
         self.assertEqual(host.digest(self.evidence / 'original-closed-dual.tar'), archive_sha)
         self.summary.update(global_accounts=len(before), inbounds=3, hosts=3, joins=len(rows['client_inbounds']),
             original_closed_archive_unchanged=True, native_scoped_three_node_feeds=len(profiles),
