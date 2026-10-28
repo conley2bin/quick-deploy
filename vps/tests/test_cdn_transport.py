@@ -1,7 +1,8 @@
 """Host-only CDN invariants. Real files/SQLite/journals, mocked system/native API.
 
-No fixture binds API62789 or starts a server. Native runtime/CF acceptance is a
-separate serial lane; these assertions inspect payloads, ownership and recovery.
+Fast fixtures inspect payloads, ownership and recovery without API62789. The
+explicit-artifact SourceNativeCDN class uses the sole serial native fixture lease;
+it exercises actual module handlers, not public Cloudflare or production TLS.
 """
 import base64
 import copy
@@ -39,7 +40,7 @@ class NativeModel:
         for index, (name, account) in enumerate(manifest['accounts'].items(), 1):
             self.records[name] = dict(account, id=index, uuid=account['id'], limitHwid=3, totalGB=123456,
                                       expiryTime=1893456000000, limitIp=2, reset=4, createdAt=1800000000123, updatedAt=1800000000123)
-        main = dict(host.inbound_for(manifest), id=1, tag='SELF-main', disableFlow=False, policySentinel='preserved')
+        main = dict(host.inbound_for(manifest), id=1, tag='in-443-tcp', disableFlow=False, policySentinel='preserved')
         active = self.h.ROOT / 'active'
         h2 = dict(host.hysteria_inbound(manifest, active / manifest['hysteria2']['certificate_file'],
                                       active / manifest['hysteria2']['key_file']), id=2)
@@ -243,7 +244,8 @@ class CdnHost(unittest.TestCase):
 
     def test_source_transport_and_original_h2_negative_fields_refuse_before_intent(self):
         original = copy.deepcopy(self.model.inbounds)
-        for mutate in (lambda: self.model.inbounds[1].update(listen='127.0.0.1'),
+        for mutate in (lambda: self.model.inbounds[1].update(tag='SELF-main'),
+                       lambda: self.model.inbounds[1].update(listen='127.0.0.1'),
                        lambda: self.model.inbounds[1].update(streamSettings=json.dumps({'network': 'xhttp', 'security': 'none',
                            'externalProxy': [{'forceTls': 'same', 'dest': self.manifest['endpoint'], 'port': 443, 'remark': ''}]})),
                        lambda: self.model.inbounds[2].update(settings=json.dumps({'version': 2, 'clients': []})),
@@ -563,7 +565,8 @@ class CdnFeeds(unittest.TestCase):
 
     def uri(self):
         vless = 'vless://' + self.account['id'] + '@cdn.example.org:443?' + urlencode({'type': 'xhttp', 'security': 'tls',
-            'encryption': 'none', 'sni': 'cdn.example.org', 'host': 'cdn.example.org', 'alpn': 'h2', 'path': host.XHTTP_PATH, 'mode': host.XHTTP_MODE}) + '#SELF-cdn'
+            'encryption': 'none', 'sni': 'cdn.example.org', 'host': 'cdn.example.org', 'alpn': 'h2', 'path': host.XHTTP_PATH,
+            'mode': host.XHTTP_MODE, 'extra': json.dumps({'mode': host.XHTTP_MODE}, separators=(',', ':'))}) + '#SELF-cdn'
         h2 = 'hysteria2://' + self.account['auth'] + '@93.184.216.34:443?' + urlencode({'security': 'tls', 'sni': 'sub.example.org', 'alpn': 'h3'}) + '#SELF-h2'
         return vless + '\n' + h2 + '\n'
 
@@ -607,12 +610,19 @@ rules:
                     uri.replace('host=cdn.', 'host=foreign.'), uri.replace('path=%2Fqd-xhttp%2F', 'path=%2Fother'),
                     uri.replace(self.account['id'], self.manifest['accounts']['home']['id']),
                     uri.replace(self.account['auth'], self.manifest['accounts']['home']['auth']),
-                    uri.replace('type=xhttp', 'type=xhttp&pbk=stale'), uri.replace('mode=packet-up', 'mode=auto'), uri + uri):
+                    uri.replace('type=xhttp', 'type=xhttp&pbk=stale'), uri.replace('mode=packet-up', 'mode=auto'),
+                    uri.replace('%7B%22mode%22%3A%22packet-up%22%7D', '%7B%22mode%22%3A%22auto%22%7D'),
+                    uri.replace('%7B%22mode%22%3A%22packet-up%22%7D', '%7B%22mode%22%3A%22packet-up%22%2C%22extra%22%3Atrue%7D'), uri + uri):
             with self.subTest(bad=bad[:20]), self.assertRaises(host.Error): check(bad)
 
     def test_native_yaml_nested_role_fields_not_flat_text_matches(self):
         text = self.yaml()
         host.validate_feed_scope(self.manifest, 'company', text.encode(), 'mihomo')
+        # The pinned Go emitter aligns list items with their mapping key.
+        # Keep both valid YAML spellings, but validate the actual emitted one.
+        emitted = text.replace('        - h2', '      - h2')
+        host.validate_feed_scope(self.manifest, 'company', emitted.encode(), 'mihomo')
+        self.assertEqual(host.native_yaml_nodes(emitted), host.native_yaml_nodes(text))
         for bad in (text.replace('tls: true', 'tls: false'), text.replace('network: xhttp', 'network: tcp'),
                     text.replace('path: /qd-xhttp/', 'path: /other'), text.replace('mode: packet-up', 'mode: auto'),
                     text.replace('tls: true', 'tls: true\n      flow: xtls-rprx-vision'),
@@ -648,6 +658,79 @@ rules:
         with self.assertRaises(host.Error): host.cdn_certificate_paths(folder, wrong)
         (storage / 'cdn.example.org.key').unlink(); (storage / 'cdn.example.org.key').symlink_to(old[1])
         with self.assertRaisesRegex(host.Error, 'Symlink'): host.cdn_certificate_paths(folder, self.manifest)
+
+
+@unittest.skipUnless(os.environ.get('QD_VPS_ARTIFACTS'), 'Explicit locked artifacts and serial API62789 lease required')
+class SourceNativeCDN(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        import test_native_dual as native_dual
+        cls.native_dual = native_dual
+        native_dual.NativeDual.setUpClass()
+        cls.addClassCleanup(native_dual.NativeDual.doClassCleanups)
+
+    def test_transport_handler_native_updates_exports_archive_and_abort(self):
+        native = self.native_dual.native
+        fx = self.native_dual.NativeDual('test_enable_preserves_full_native_policy_and_exports')
+        fx._outcome = self._outcome
+        self.addCleanup(fx.doCleanups)
+        fx.setUp()
+        fx.seed_policy(); fx.enable()
+        original = copy.deepcopy(fx.manifest)
+        records, joins = fx.records(), fx.rows('client_inbounds')
+        h2_rows = [r for r in fx.rows('hosts') if r['inbound_id'] == original['hysteria2']['inbound_id']]
+        exported, _, _ = fx.archive()
+        before_archive = fx.folder.parent / 'closed-before-cdn.tar'
+        before_archive.write_bytes(exported.read_bytes())
+        before_hash = host.digest(before_archive)
+        request = fx.fx.device_request('reset', 'company')
+        request.pop('device_action'); request.pop('names')
+        request.update(mode='transport-upgrade', feature='tcp-cdn', ssh_port=22, before_sha256=before_hash,
+            source_transports=['tcp-reality', 'hysteria2'], target_transports=['tcp-xhttp-cdn', 'hysteria2'],
+            tcp_cdn={'schema': 1, 'domain': 'cdn.example.org'})
+        def issue(folder, manifest, domain):
+            # HTTP01 issuance is an external boundary. Issue a matching private
+            # fixture pair; all native mutation/health/archive code stays real.
+            cert = Path(folder) / 'caddy/data/caddy/certificates/fixture' / (domain + '.crt')
+            subprocess.run(['openssl', 'req', '-x509', '-newkey', 'ec', '-pkeyopt', 'ec_paramgen_curve:P-256',
+                '-nodes', '-days', '1', '-subj', '/CN=' + domain, '-addext', 'subjectAltName=DNS:' + domain,
+                '-keyout', str(cert.with_suffix('.key')), '-out', str(cert)],
+                check=True, capture_output=True, timeout=10)
+        source_health = host.reality_source_health
+        # Existing native fixture confines listeners to loopback/high ports.
+        # Only these socket coordinates and the ACME/DNS boundary are adapted.
+        with mock.patch.object(host, 'CDN_PORT', original['config']['proxy_port']), \
+                mock.patch.object(host, 'XHTTP_PORT', native.free_port()), \
+                mock.patch.object(host, 'bootstrap_cdn_certificate', side_effect=issue), \
+                mock.patch.object(host, 'check_cdn_dns'), \
+                mock.patch.object(host, 'reality_source_health', side_effect=lambda inbound, manifest:
+                    source_health(dict(inbound, listen='0.0.0.0'), manifest)):
+            import vps
+            with vps.upload_bundle(request) as stream:
+                prepared = host.transport_prepare(stream)
+            self.assertTrue(prepared['prepared'])
+            current = host.read_json(fx.folder / 'manifest.json')
+            self.assertEqual(host.transports(current), request['target_transports'])
+            self.assertEqual(current['hysteria2'], original['hysteria2'])
+            expected_joins = [dict(row, flow_override='') if row['inbound_id'] == current['tcp_cdn']['inbound_id'] else row
+                              for row in joins]
+            self.assertEqual(fx.rows('client_inbounds'), expected_joins)
+            self.assertEqual([r for r in fx.rows('hosts') if r['inbound_id'] == original['hysteria2']['inbound_id']], h2_rows)
+            for name, record in records.items():
+                after = fx.records()[name]
+                self.assertEqual({k: v for k, v in after.items() if k not in ('flow', 'createdAt', 'updatedAt')},
+                    {k: v for k, v in record.items() if k not in ('flow', 'createdAt', 'updatedAt')})
+                self.assertEqual(after['flow'], '')
+            host.backend_health(fx.folder, current)
+            candidate, _, verified = fx.archive()
+            self.assertNotEqual(host.digest(candidate), before_hash)
+            self.assertEqual(verified['tcp_cdn'], current['tcp_cdn'])
+            self.assertTrue(host.abort(request)['queued'])
+            self.assertFalse(host.abort(request)['pending'])
+            restored = host.read_json(fx.folder / 'manifest.json')
+            self.assertEqual(restored, original)
+            host.backend_health(fx.folder, restored)
+        self.assertEqual(host.digest(before_archive), before_hash)
 
 
 if __name__ == '__main__': unittest.main()

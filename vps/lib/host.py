@@ -489,7 +489,7 @@ def owned_host_group(folder, api, manifest):
         raise Error('Unexpected native Host group membership')
     group = api.call('/panel/api/hosts/get/' + group_id)
     expected = [old_endpoint + ':' + str(manifest['config']['proxy_port'])]
-    advertised = [manifest['tcp_cdn']['domain'] + ':443'] if cdn_enabled(manifest) else expected
+    advertised = [manifest['tcp_cdn']['domain'] + ':' + str(CDN_PORT)] if cdn_enabled(manifest) else expected
     if (group.get('groupId') != group_id or group.get('inboundIds') != [inbound['id']] or
             group.get('hosts') != advertised or group.get('port') != manifest['config']['proxy_port']):
         raise Error('Unexpected native Host group endpoint/inbound membership')
@@ -528,7 +528,7 @@ def cdn_inbound_health(inbound, manifest):
 
 def cdn_host_health(group, manifest):
     meta = manifest['tcp_cdn']
-    expected = {'groupId': manifest['host_group_id'], 'inboundIds': [meta['inbound_id']], 'hosts': [meta['domain'] + ':443'],
+    expected = {'groupId': manifest['host_group_id'], 'inboundIds': [meta['inbound_id']], 'hosts': [meta['domain'] + ':' + str(CDN_PORT)],
                 'port': CDN_PORT, 'security': 'tls', 'sni': meta['domain'], 'hostHeader': meta['domain'],
                 'path': meta['path'], 'alpn': ['h2'], 'allowInsecure': False}
     forbidden = ('pinnedPeerCertSha256', 'verifyPeerCertByName', 'echConfigList', 'muxParams', 'sockoptParams', 'finalMask',
@@ -541,7 +541,9 @@ def cdn_host_health(group, manifest):
 def reality_source_health(inbound, manifest):
     stream, settings = native_object(inbound['streamSettings']), native_object(inbound['settings'])
     reality = stream.get('realitySettings', {})
-    if (inbound.get('tag') != 'SELF-main' or inbound.get('remark') != 'SELF-main' or inbound.get('enable') is not True or
+    # The existing native API generates this tag because inbound_for supplies
+    # a remark but no tag. SELF-main is the exported role, not the native tag.
+    if (inbound.get('tag') != 'in-' + str(CDN_PORT) + '-tcp' or inbound.get('remark') != 'SELF-main' or inbound.get('enable') is not True or
             inbound.get('listen') != '0.0.0.0' or inbound.get('port') != CDN_PORT or inbound.get('protocol') != 'vless' or
             stream.get('network') != 'tcp' or stream.get('security') != 'reality' or settings.get('decryption') != 'none' or
             reality.get('dest') != manifest['config']['reality_target'] + ':443' or
@@ -577,7 +579,7 @@ def enable_cdn(folder, manifest, domain):
         streamSettings=json.dumps({'network': 'xhttp', 'security': 'none',
             'xhttpSettings': {'host': domain, 'path': XHTTP_PATH, 'mode': XHTTP_MODE}, 'externalProxy': []}))
     desired = copy.deepcopy(group)
-    desired.update(hosts=[domain + ':443'], port=CDN_PORT, security='tls', sni=domain,
+    desired.update(hosts=[domain + ':' + str(CDN_PORT)], port=CDN_PORT, security='tls', sni=domain,
                    hostHeader=domain, path=XHTTP_PATH, alpn=['h2'], allowInsecure=False)
     check_lease()
     api.call('/panel/api/inbounds/update/' + str(inbound['id']), inbound)
@@ -985,12 +987,13 @@ def validate_feed_scope(manifest, device, data, fmt):
                      query.get('sni') == [manifest['config']['reality_target']])
             if cdn_enabled(manifest):
                 meta = manifest['tcp_cdn']
-                allowed = {'security', 'type', 'encryption', 'sni', 'host', 'path', 'mode', 'alpn', 'fp', 'flow'}
+                allowed = {'security', 'type', 'encryption', 'sni', 'host', 'path', 'mode', 'alpn', 'fp', 'flow', 'extra'}
                 valid = (uuid.UUID(parsed.username) == uuid.UUID(current['id']) and parsed.password is None and
                     parsed.hostname == meta['domain'] and parsed.port == CDN_PORT and unquote(parsed.fragment) == 'SELF-cdn' and
                     set(query) <= allowed and all(len(v) == 1 for v in query.values()) and
                     all(query.get(k) == [v] for k, v in {'security': 'tls', 'type': 'xhttp', 'sni': meta['domain'],
                         'host': meta['domain'], 'path': meta['path'], 'mode': meta['mode'], 'alpn': 'h2'}.items()) and
+                    query.get('extra') == [json.dumps({'mode': meta['mode']}, separators=(',', ':'))] and
                     query.get('flow', ['']) == [''] and query.get('encryption', ['none']) == ['none'])
             if dual_enabled(manifest):
                 h2 = [link for link in parsed_links if link.scheme == 'hysteria2']
@@ -1081,7 +1084,10 @@ def native_yaml_nodes(text):
             for index, line in enumerate(lines[start:end]):
                 field_indent = len(line) - len(line.lstrip()) + (2 if index == 0 else 0)
                 raw = line.strip()[2:] if index == 0 else line.strip()
-                while stack and field_indent <= stack[-1][0]:
+                # Pinned native YAML uses indentless block sequences: the
+                # '- h2' item aligns with its 'alpn:' key, not one level deeper.
+                while stack and (field_indent < stack[-1][0] or
+                        (field_indent == stack[-1][0] and not (raw.startswith('- ') and isinstance(stack[-1][1], list)))):
                     stack.pop()
                 parent = stack[-1][1] if stack else node
                 if raw.startswith('- '):
