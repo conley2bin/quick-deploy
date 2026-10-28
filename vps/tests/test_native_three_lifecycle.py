@@ -377,7 +377,9 @@ class ThreeFixture:
         folder.mkdir(mode=0o700)
         config, access = folder / 'Caddyfile', folder / 'access.jsonl'
         self.access_logs.append(access)
-        config.write_text('{\n admin off\n auto_https off\n servers {\n  protocols h1 h2\n }\n}\n' +
+        # Match the service scheduler's finite stop: held XHTTP requests must
+        # not make this disposable Caddy drain indefinitely before PANEL stops.
+        config.write_text('{\n admin off\n auto_https off\n grace_period 1s\n servers {\n  protocols h1 h2\n }\n}\n' +
             'https://cdn.example.org:%d {\n bind 127.0.0.1\n tls %s %s\n log {\n  output file %s\n  format json\n }\n' %
             (host.CDN_PORT, cert, key, access) +
             ' @xhttp path %s %s*\n handle @xhttp {\n  reverse_proxy 127.0.0.1:%d {\n   flush_interval -1\n  }\n }\n respond 404\n}\n' %
