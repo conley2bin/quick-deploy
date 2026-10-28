@@ -589,6 +589,9 @@ def enable_cdn(folder, manifest, domain, port):
     # persisted H2 transport, Host and original joins are the invariants.
     with contextlib.closing(sqlite3.connect(Path(folder) / 'db/x-ui.db')) as db:
         h2_id = manifest['hysteria2']['inbound_id']
+        db.row_factory = sqlite3.Row
+        main_host_before = dict(db.execute('select * from hosts where group_id=?', (group['groupId'],)).fetchone())
+        db.row_factory = None
         h2_before = (db.execute('select * from inbounds where id=?', (h2_id,)).fetchall(),
                      db.execute('select * from hosts where inbound_id=?', (h2_id,)).fetchall(),
                      db.execute('select * from client_inbounds order by client_id,inbound_id').fetchall())
@@ -657,7 +660,15 @@ def enable_cdn(folder, manifest, domain, port):
         h2_after = (db.execute('select * from inbounds where id=?', (h2_id,)).fetchall(),
                     db.execute('select * from hosts where inbound_id=?', (h2_id,)).fetchall(),
                     db.execute('select * from client_inbounds where inbound_id!=? order by client_id,inbound_id', (cdn_id,)).fetchall())
-    if h2_after != h2_before or api.call('/panel/api/hosts/get/' + group['groupId']) != desired:
+        db.row_factory = sqlite3.Row
+        main_host_after = dict(db.execute('select * from hosts where group_id=?', (group['groupId'],)).fetchone())
+    # Native HostGroup UPDATE recreates only this physical row and its automatic
+    # timestamps. Its logical group/inbound and every other policy stay exact.
+    allowed_host_changes = {'id', 'created_at', 'updated_at', 'port'}
+    if (h2_after != h2_before or main_host_after['port'] != port or
+            {k: v for k, v in main_host_after.items() if k not in allowed_host_changes} !=
+            {k: v for k, v in main_host_before.items() if k not in allowed_host_changes} or
+            api.call('/panel/api/hosts/get/' + group['groupId']) != desired):
         raise Error('Native CDN addition changed retained H2 or REALITY Host policy')
     owned_host_group(folder, api, manifest)
     ctl('stop', PANEL)
@@ -785,6 +796,7 @@ def enable_hysteria(folder, manifest, ssh_port):
     settings_write(Path(folder) / 'db/x-ui.db', dict(backend_settings(manifest), xrayTemplateConfig=json.dumps(template)))
     ctl('start', PANEL)
     api = wait_api(manifest)
+    reapply_role_flows(api, manifest)
     owned_host_group(folder, api, manifest)
     hysteria_health(folder, manifest, api)
     core_check(folder)
@@ -1708,6 +1720,8 @@ def snapshot_host_group(database, manifest):
             clients = {c['email']: {'email': c['email'], 'id': c['uuid'], 'subId': c['sub_id'], 'enable': bool(c['enable']), 'flow': c['flow']}
                        for c in db.execute('select email,uuid,sub_id,enable,flow from clients')}
             main = dict(db.execute("select * from inbounds where remark='SELF-main'").fetchone())
+            if any(r['is_hidden'] or r['is_disabled'] for r in db.execute('select is_hidden,is_disabled from hosts')):
+                raise Error('Hidden or disabled Host in owned three-role snapshot')
             joins = db.execute('select c.email,ci.flow_override from client_inbounds ci join clients c on c.id=ci.client_id where ci.inbound_id=?',
                                (manifest['tcp_cdn']['inbound_id'],)).fetchall()
         try:
