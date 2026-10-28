@@ -15,9 +15,11 @@ from pathlib import Path
 import select
 import signal
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
+import tarfile
 import time
 import unittest
 import uuid
@@ -27,7 +29,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'lib'))
 import cdn_probe
 import host
 import vps
+import test_cdn_probe as probe_fixtures
 from test_cdn_probe import FAKE_CLIENT, manifest as node_manifest, nodes
+
+REAL_CDN_PROBE = cdn_probe.validate_cdn_candidate
 
 
 def transport_contract(request):
@@ -70,6 +75,7 @@ class CDNCLI(unittest.TestCase):
         self.events, self.backups = [], [self.before_path, self.candidate_path, self.final_path, self.after_path]
         self.auth_change = None
         self.auth_nonce = str(uuid.uuid4())
+        self.diagnostic_active = self.witness_ready = False
         self.committed = False
         self.proof_change = None
         self.prepare_change = None
@@ -135,6 +141,7 @@ class CDNCLI(unittest.TestCase):
             return result
         if action == 'transport-auth-begin':
             self.assertEqual(request, self.request)
+            self.diagnostic_active = True
             result = {'schema': 1, 'operation_id': request['operation_id'],
                       'request_fingerprint': host.transport_request(request), 'nonce': self.auth_nonce,
                       'native_identity_sha256': 'e' * 64}
@@ -142,6 +149,9 @@ class CDNCLI(unittest.TestCase):
             return result
         if action == 'transport-auth-finish':
             self.assertEqual(request, dict(self.request, cdn_auth_nonce=self.auth_nonce))
+            self.assertTrue(self.diagnostic_active)
+            self.diagnostic_active = False
+            self.witness_ready = True
             result = {'schema': 1, 'operation_id': request['operation_id'],
                       'request_fingerprint': host.transport_request(request),
                       'nonce_sha256': hashlib.sha256(self.auth_nonce.encode()).hexdigest(),
@@ -149,7 +159,11 @@ class CDNCLI(unittest.TestCase):
             if self.auth_change: self.auth_change(action, result)
             return result
         if action == 'transport-commit':
+            self.assertFalse(self.diagnostic_active)
+            self.assertTrue(self.witness_ready)
             self.assertEqual(request['offnode_sha256'], host.digest(self.final_path))
+            pending = vps.load(self.state / 'pending.json')
+            self.assertEqual(pending['backup'], str(self.final_path))
             self.assertNotEqual(request['offnode_sha256'], self.request['before_sha256'])
             proof_path = self.state / 'cdn-proofs' / (self.request['operation_id'] + '.json')
             self.assertEqual(proof_path.stat().st_mode & 0o777, 0o600)
@@ -163,6 +177,7 @@ class CDNCLI(unittest.TestCase):
         if action == 'abort':
             self.assertEqual(request, self.request)
             if self.queued: return {'queued': True}
+            self.diagnostic_active = False
             return self.receipt if self.committed else {'committed': False}
         raise AssertionError('Unmocked remote action: ' + action)
 
@@ -319,6 +334,131 @@ class CDNCLI(unittest.TestCase):
         self.assertNotIn('transport-commit', self.events); self.assertIn('abort', self.events)
         self.assertNotIn('tcp_cdn', vps.load(self.state / 'state.json'))
 
+    def test_accept_all_injected_reset_missing_native_verdict_aborts_controller(self):
+        fixture = probe_fixtures.Probe('test_accept_all_one_wrong_attempt_reset_without_witness_fails')
+        fixture.setUp(); self.addCleanup(fixture.doCleanups)
+        (fixture.root / 'mode').write_text('accept-reset')
+        def probe(**kwargs):
+            kwargs['binary'] = str(fixture.binary)
+            return REAL_CDN_PROBE(**kwargs)
+        def remote(*args, **kwargs):
+            result = self.remote(*args, **kwargs)
+            return None if args[1] == 'transport-auth-finish' else result
+        with mock.patch.object(cdn_probe, 'validate_cdn_candidate', side_effect=probe), \
+                mock.patch.object(cdn_probe, 'resolve_a', side_effect=[[self.record['endpoint']], ['104.16.1.2']]), \
+                mock.patch.object(cdn_probe, 'edge_tls', return_value={'peer': '104.16.1.2', 'port': 443}), \
+                mock.patch.object(cdn_probe, 'socket_peers', return_value={('104.16.1.2', 443)}), \
+                mock.patch.object(cdn_probe.select, 'select', wraps=probe_fixtures.select_without_idle), \
+                mock.patch.object(vps, 'remote', side_effect=remote):
+            with self.assertRaisesRegex(host.Error, 'witness'):
+                self.run_cdn()
+        self.assertEqual(sum(e.get('event') == 'injected-reset' for e in fixture.events()), 1)
+        fixture.assert_processes_clean()
+        self.assertNotIn('transport-commit', self.events)
+        self.assertIn('transport-auth-finish', self.events)
+        self.assertIn('abort', self.events)
+        self.assertFalse(self.diagnostic_active)
+        self.assertFalse((self.state / 'cdn-proofs').exists())
+        self.assertFalse((self.state / 'pending.json').exists())
+
+    def test_matching_restored_witness_real_probe_checks_bind_final_b(self):
+        fixture = probe_fixtures.Probe('test_five_fresh_clients_negative_valid_reconnect_and_h2_proof')
+        fixture.setUp(); self.addCleanup(fixture.doCleanups)
+        def probe(**kwargs):
+            kwargs['binary'] = str(fixture.binary)
+            return REAL_CDN_PROBE(**kwargs)
+        with mock.patch.object(cdn_probe, 'validate_cdn_candidate', side_effect=probe), \
+                mock.patch.object(cdn_probe, 'resolve_a', side_effect=[[self.record['endpoint']], ['104.16.1.2']]), \
+                mock.patch.object(cdn_probe, 'edge_tls', return_value={'peer': '104.16.1.2', 'port': 443}), \
+                mock.patch.object(cdn_probe, 'socket_peers', return_value={('104.16.1.2', 443)}), \
+                mock.patch.object(cdn_probe.select, 'select', wraps=probe_fixtures.select_without_idle):
+            self.run_cdn()
+        fixture.assert_processes_clean()
+        self.assertEqual(len([e for e in fixture.events() if 'pid' in e]), 5)
+        self.assertEqual(sum(e.get('uuid_sha256') == hashlib.sha256(self.auth_nonce.encode()).hexdigest()
+                             for e in fixture.events()), 1)
+        self.assertIn('transport-commit', self.events)
+        self.assertFalse(self.diagnostic_active)
+        proof = vps.load(self.state / 'cdn-proofs' / (self.request['operation_id'] + '.json'))
+        self.assertEqual(proof['candidate_sha256'], host.digest(self.final_path))
+        self.assertNotEqual(proof['candidate_sha256'], host.digest(self.candidate_path))
+
+    def test_final_b_identity_policy_or_topology_change_aborts_without_proof(self):
+        changes = [lambda m: m['accounts']['company'].update(id=str(uuid.uuid4())),
+                   lambda m: m['accounts']['company'].update(auth='changed-private-auth'),
+                   lambda m: m['accounts']['company'].update(subId='changed-private-subid'),
+                   lambda m: m['accounts']['company'].update(totalGB=9),
+                   lambda m: m['hysteria2'].update(inbound_id=3)]
+        for index, change in enumerate(changes):
+            with self.subTest(change=change):
+                self.events.clear()
+                host.atomic(self.final_path, ('final-native-variant-' + str(index)).encode())
+                self.backups = [self.before_path, self.candidate_path, self.final_path]
+                self.final.clear(); self.final.update(copy.deepcopy(self.candidate))
+                change(self.final)
+                with self.assertRaisesRegex(host.Error, 'changed native'):
+                    self.run_cdn()
+                self.assertNotIn('transport-commit', self.events)
+                self.assertIn('abort', self.events)
+                self.assertFalse(self.diagnostic_active)
+                self.assertFalse((self.state / 'cdn-proofs').exists())
+
+    def test_proof_for_pre_diagnostic_a_and_mutated_final_b_never_commit(self):
+        self.proof_change = lambda proof: proof.update(candidate_sha256=host.digest(self.candidate_path))
+        with self.assertRaisesRegex(host.Error, 'mismatched proof'):
+            self.run_cdn()
+        self.assertNotIn('transport-commit', self.events)
+        self.backups = [self.before_path, self.candidate_path, self.final_path]
+        self.events.clear()
+        self.proof_change = lambda proof: host.atomic(self.final_path, b'changed-final-after-validation')
+        with self.assertRaisesRegex(host.Error, 'archive changed'):
+            self.run_cdn()
+        self.assertNotIn('transport-commit', self.events)
+        self.assertFalse((self.state / 'cdn-proofs').exists())
+
+    def test_native_callback_mismatch_restoration_failure_or_early_cancel_abort(self):
+        changes = [('transport-auth-begin', {'operation_id': 'f' * 32}),
+                   ('transport-auth-begin', {'request_fingerprint': 'f' * 64}),
+                   ('transport-auth-begin', {'native_identity_sha256': None}),
+                   ('transport-auth-finish', {'nonce_sha256': 'f' * 64}),
+                   ('transport-auth-finish', {'native_identity_sha256': 'f' * 64}),
+                   ('transport-auth-finish', {'rejected': False})]
+        for action, change in changes:
+            with self.subTest(action=action, change=change):
+                self.events.clear(); self.backups = [self.before_path, self.candidate_path]
+                self.auth_change = lambda current, result: result.update(change) if current == action else None
+                with self.assertRaises(host.Error): self.run_cdn()
+                self.assertNotIn('transport-commit', self.events)
+                self.assertIn('abort', self.events)
+                self.assertFalse(self.diagnostic_active)
+        self.auth_change = None
+        for cancel in (False, True):
+            self.events.clear(); self.backups = [self.before_path, self.candidate_path]
+            def early(**kwargs):
+                kwargs['auth_begin']()
+                self.assertTrue(self.diagnostic_active)
+                if cancel: os.kill(os.getpid(), signal.SIGTERM)
+                raise host.Error('restoration failed')
+            with mock.patch.object(cdn_probe, 'validate_cdn_candidate', side_effect=early):
+                with self.assertRaises(cdn_probe.Cancelled if cancel else host.Error): self.run_cdn()
+            self.assertNotIn('transport-auth-finish', self.events)
+            self.assertIn('abort', self.events)
+            self.assertFalse(self.diagnostic_active)
+            self.assertNotIn('transport-commit', self.events)
+            self.assertFalse((self.state / 'cdn-proofs').exists())
+
+    def test_lost_ack_receipt_for_a_instead_of_final_b_retains_pending(self):
+        self.lost_ack = True
+        remote = self.remote
+        def stale(*args, **kwargs):
+            if args[1] == 'abort': self.receipt['offnode_sha256'] = host.digest(self.candidate_path)
+            return remote(*args, **kwargs)
+        with mock.patch.object(vps, 'remote', side_effect=stale), self.assertRaises(host.Error):
+            self.run_cdn()
+        pending = vps.load(self.state / 'pending.json')
+        self.assertEqual(pending['backup'], str(self.final_path))
+        self.assertNotIn('tcp_cdn', vps.load(self.state / 'state.json'))
+
     def test_generation_binding_legacy_shape_unchanged_cdn_adds_metadata_only(self):
         before = vps.generation_binding(self.before, 'd' * 64)
         cdn = vps.generation_binding(self.after, 'd' * 64)
@@ -434,6 +574,7 @@ def remote(*args,**kwargs):
  if args[1]=='abort' and outcome=='failed':raise host.Error('fixture reconciliation unavailable')
  return original_remote(*args,**kwargs)
 def probe(**kwargs):
+ kwargs['auth_begin']()
  with contextlib.ExitStack() as stack:
   for node in (nodes() if phase=='nested' else nodes()[:1]):
    client=cdn_probe.Client(str(binary),node,'cdn.example.org','104.16.1.2','eno1','1.1.1.1',cdn_probe.Budget(time.time()+30))
@@ -449,7 +590,8 @@ with mock.patch.object(cdn_probe,'validate_cdn_candidate',side_effect=probe), \
  code=vps.main(['--state-dir',str(test.state),'cdn','--domain','cdn.example.org','--interface','eno1','--dns-server','1.1.1.1'])
 report={'stage':'result','code':code,'events':test.events,'pending':(test.state/'pending.json').exists(),
         'saved_cdn':'tcp_cdn' in vps.load(test.state/'state.json'),'proof':(test.state/'cdn-proofs').exists(),
-        'stderr':sys.stderr.getvalue(),'restored':signal.getsignal(signal.SIGTERM)==previous}
+        'stderr':sys.stderr.getvalue(),'restored':signal.getsignal(signal.SIGTERM)==previous,
+        'diagnostic_active':test.diagnostic_active}
 if report['pending']:report['pending_mode']=vps.load(test.state/'pending.json')['mode']
 os.write(events,(json.dumps(report)+'\n').encode())
 test.doCleanups()
@@ -511,6 +653,7 @@ class SIGTERMSubprocess(unittest.TestCase):
             self.assertNotIn('transport-commit', result['events'])
             self.assertFalse(result['saved_cdn']); self.assertFalse(result['proof'])
             self.assertEqual(result['pending'], outcome != 'restored')
+            self.assertEqual(result['diagnostic_active'], result['pending'])
             if result['pending']:
                 self.assertEqual(result['pending_mode'], 'transport-upgrade')
                 self.assertIn('pending', result['stderr'])
@@ -569,6 +712,75 @@ class CombinedHostContract(unittest.TestCase):
             # never smuggle candidate paths or assume they already exist.
             with self.assertRaises(host.Error):
                 host.transport_request(dict(request, tcp_cdn=target['tcp_cdn']))
+
+
+class NativeCandidateContinuity(unittest.TestCase):
+    """Closed SQLite/fake native mappings only; no native panel/process/API."""
+    def test_full_policy_rows_mappings_topology_and_raw_template_vs_traffic(self):
+        with tempfile.TemporaryDirectory(prefix='qd-cdn-continuity-') as folder:
+            root = Path(folder)
+            db_path = root / 'native.db'
+            manifest = node_manifest()
+            manifest['config'].update(proxy_port=443, reality_target='target.example.org')
+            manifest['management'] = {'ssh_port': 22}
+            manifest['hysteria2'].update(host_group_id='h2-group',
+                certificate_file='caddy/data/caddy/certificates/issuer/sub.example.org.crt',
+                key_file='caddy/data/caddy/certificates/issuer/sub.example.org.key')
+            manifest['tcp_cdn'].update(inbound_id=1,
+                certificate_file='caddy/data/caddy/certificates/issuer/cdn.example.org.crt',
+                key_file='caddy/data/caddy/certificates/issuer/cdn.example.org.key')
+            files = {'company.yaml': cdn_probe.canonical({'proxies': nodes()})}
+            with sqlite3.connect(db_path) as db:
+                db.executescript('''
+                    create table clients(id integer primary key,uuid text,auth text,sub_id text,
+                        enable integer,total_gb integer,expiry_time integer,limit_hwid integer,flow text);
+                    create table inbounds(id integer primary key,settings text,stream_settings text,
+                        sniffing text,up integer,down integer,total integer,last_traffic_reset_time integer);
+                    create table hosts(id integer primary key,inbound_id integer,address text,alpn text);
+                    create table client_inbounds(client_id integer,inbound_id integer);
+                    create table settings(id integer primary key,key text,value text);
+                    insert into inbounds values(1,'{"clients":[],"decryption":"none"}',
+                        '{"network":"xhttp","routing":{"rules":["first","second"]}}','{}',1,2,1000,0);
+                    insert into inbounds values(2,'{"version":2}','{"network":"hysteria"}','{}',3,4,1000,0);
+                    insert into hosts values(1,1,'cdn.example.org','["h2"]');
+                    insert into hosts values(2,2,'93.184.216.34','["h3"]');
+                    insert into client_inbounds values(1,1),(1,2);
+                    insert into settings values(1,'xrayTemplateConfig','{"log":{"loglevel":"none"}}');
+                ''')
+                account = manifest['accounts']['company']
+                db.execute('insert into clients values(1,?,?,?,1,12345,1893456000000,3,?)',
+                           (account['id'], account['auth'], account['subId'], ''))
+            archive = root / 'candidate.tar'
+            def identity():
+                with tarfile.open(archive, 'w') as out:
+                    out.add(db_path, arcname='deployment/db/x-ui.db')
+                return vps.cdn_candidate_identity(archive, manifest, files, 'eno1')
+            original = identity()
+            with sqlite3.connect(db_path) as db:
+                db.execute('update inbounds set up=up+10,down=down+20,last_traffic_reset_time=50')
+                db.execute('update inbounds set settings=? where id=1', ('{ "decryption":"none", "clients":[] }',))
+            self.assertEqual(identity(), original)
+            mutations = [('clients', 'uuid', str(uuid.uuid4())), ('clients', 'auth', 'changed'),
+                         ('clients', 'sub_id', 'changed'), ('clients', 'enable', 0),
+                         ('clients', 'total_gb', 9), ('clients', 'expiry_time', 0),
+                         ('clients', 'limit_hwid', 0), ('clients', 'flow', 'changed'),
+                         ('inbounds', 'total', 9), ('hosts', 'address', 'changed'),
+                         ('inbounds', 'stream_settings', '{"network":"xhttp","routing":{"rules":["second","first"]}}'),
+                         ('settings', 'value', '{ "log":{"loglevel":"none"}}')]
+            for table, column, value in mutations:
+                with self.subTest(table=table, column=column), sqlite3.connect(db_path) as db:
+                    old = db.execute('select ' + column + ' from ' + table + ' where id=1').fetchone()[0]
+                    db.execute('update ' + table + ' set ' + column + '=? where id=1', (value,)); db.commit()
+                    self.assertNotEqual(identity(), original)
+                    db.execute('update ' + table + ' set ' + column + '=? where id=1', (old,))
+            with sqlite3.connect(db_path) as db:
+                db.execute('delete from client_inbounds where inbound_id=2')
+            self.assertNotEqual(identity(), original)
+            with sqlite3.connect(db_path) as db:
+                db.execute('insert into client_inbounds values(1,2)')
+            changed_nodes = nodes(); changed_nodes[0]['client-fingerprint'] = 'firefox'
+            files['company.yaml'] = cdn_probe.canonical({'proxies': changed_nodes})
+            self.assertNotEqual(identity(), original)
 
 
 ORIGINAL_ACK = vps.acknowledge_orange

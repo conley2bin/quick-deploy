@@ -53,7 +53,7 @@ def nodes():
 # The listener deliberately ACKs SOCKS while Running=False and the selector is
 # already populated. Only an authenticated identical-config PUT enables ingress.
 FAKE_CLIENT = r'''#!/usr/bin/env python3
-import http.server,json,os,pathlib,select,socket,socketserver,struct,sys,threading
+import hashlib,http.server,json,os,pathlib,select,socket,socketserver,struct,sys,threading
 if '-v' in sys.argv:
  print('Mihomo Meta v1.19.32');sys.exit(0)
 path=pathlib.Path(sys.argv[sys.argv.index('-f')+1]);cfg=json.loads(path.read_text())
@@ -96,7 +96,8 @@ class Socks(socketserver.BaseRequestHandler):
    s.sendall(b'\x05\x00');hdr=exact(4)
    size=exact(1)[0] if hdr[3]==3 else 4
    exact(size+2);s.sendall(b'\x05\x00\x00\x01\x7f\x00\x00\x01\x01\xbb')
-   record({'event':'socks','running':running,'type':node['type']})
+   record({'event':'socks','running':running,'type':node['type'],
+           'uuid_sha256':hashlib.sha256(node.get('uuid','').encode()).hexdigest()})
    wrong=(node['type']=='vless' and node['uuid']!='11111111-1111-4111-8111-111111111111')
    if wrong and mode=='accept-reset':
     record({'event':'injected-reset'});return
@@ -259,6 +260,8 @@ class Probe(unittest.TestCase):
         self.assertEqual([e['type'] for e in self.events() if e.get('event') == 'socks'],
                          ['vless', 'vless', 'vless', 'vless', 'vless', 'vless', 'hysteria2', 'hysteria2'])
         self.assertEqual(len(samples), 8)
+        self.assertEqual(sum(e.get('uuid_sha256') == hashlib.sha256(self.nonce.encode()).hexdigest()
+                             for e in self.events()), 1)
         self.assert_processes_clean()
 
     def test_wrong_uuid_acceptance_fails_instead_of_falling_back(self):
@@ -297,6 +300,17 @@ class Probe(unittest.TestCase):
             self.run_proof(auth_finish=mock.Mock(side_effect=probe.Error('restoration failed')))
         self.assertEqual(len([e for e in self.events() if 'pid' in e]), 2)
         self.assert_processes_clean()
+
+    def test_begin_requires_exact_operation_fingerprint_identity_nonce_and_schema(self):
+        original = self.auth_begin
+        changes = [dict(operation_id='f' * 32), dict(request_fingerprint='f' * 64),
+                   dict(native_identity_sha256=None), dict(nonce='malformed-private-nonce'),
+                   dict(schema=True), dict(raw_log='untrusted-extra-metadata')]
+        for change in changes:
+            self.auth_events.clear()
+            with self.subTest(change=change), self.assertRaises(probe.Error):
+                self.run_proof(auth_begin=lambda: dict(original(), **change))
+            self.assertFalse((self.root / 'events').exists())
 
     def test_nonce_excludes_normalized_registered_users_before_any_client(self):
         # The full wire UUID differs while pinned ProcessUUID is identical.
