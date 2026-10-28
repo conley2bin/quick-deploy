@@ -122,7 +122,22 @@ class ThreeFixture:
     # Compose shared process/digest/readiness helpers, not any capability tests.
     setUpClass = classmethod(capability.NativeCDNTriple.setUpClass.__func__)
     spawn = capability.NativeCDNTriple.spawn
-    await_core_started = capability.NativeCDNTriple.await_core_started
+    def await_core_started(self):
+        # Native updates can reopen the logger without restarting Xray; that
+        # logger epoch has no new process-start banner. Attest the actual gRPC
+        # service and BOTH live role registries instead of a banner substring.
+        result = subprocess.run([str(self.fx.folder / 'bin/xray-linux-amd64'),
+            'api', 'statssys', '--server=127.0.0.1:62789', '--timeout=6'],
+            capture_output=True, timeout=8)
+        self.assertEqual(result.returncode, 0, 'Owned Xray API readiness failed')
+        status = self.fx.api().call('/panel/api/server/status')['xray']
+        self.assertEqual((status['state'], status['version']), ('running', self.fx.fx.lock['core']['version']))
+        expected = {r['email']: {'id': r['uuid'], 'flow': VISION}
+                    for r in self.fx.records().values() if r['enable']}
+        for tag, flow in ((self.original_tag, VISION), ('SELF-cdn', '')):
+            users = host.auth_live_users(self.fx.folder, tag)
+            self.assertTrue(users == {name: dict(value, flow=flow) for name, value in expected.items()},
+                            'Actual live role registry differs from native authority (values withheld)')
     earliest = recovery.RecoveryFixture.earliest
     record_contract = recovery.RecoveryFixture.record_contract
     unchanged = recovery.RecoveryFixture.unchanged
