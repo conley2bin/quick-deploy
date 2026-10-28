@@ -1144,6 +1144,26 @@ class SourceNativeCDN(unittest.TestCase):
                 mock.patch.object(host, 'auth_core_epoch', side_effect=fixture_epoch), \
                 mock.patch.object(host, 'reality_source_health', side_effect=fixture_source_health):
             import vps
+            import cdn_probe
+            import yaml
+            def controller_identity(archive, manifest):
+                # Native API uses disposable high ports. Attest each actual
+                # coordinate, then alter ONLY CDN/H2 ports for the production
+                # controller's public443 role validator; full maps stay native.
+                advertised = copy.deepcopy(manifest)
+                advertised['config']['proxy_port'] = 443
+                files = {}
+                for name in host.device_names(manifest):
+                    if not manifest['accounts'][name]['enable']:
+                        continue
+                    profile = yaml.safe_load(host.get_feed(manifest, name, 'mihomo'))
+                    for node in profile['proxies']:
+                        if node['name'] in ('SELF-cdn', 'SELF-h2'):
+                            self.assertEqual(node['port'], host.CDN_PORT)
+                            node['port'] = 443
+                    files[name + '.yaml'] = yaml.safe_dump(profile).encode()
+                with mock.patch.object(host, 'CDN_PORT', 443):
+                    return vps.cdn_candidate_identity(archive, advertised, files, 'fixture0')
             with vps.upload_bundle(request) as stream:
                 prepared = host.transport_prepare(stream)
             self.assertTrue(prepared['prepared'])
@@ -1174,6 +1194,7 @@ class SourceNativeCDN(unittest.TestCase):
             host.backend_health(fx.folder, current)
             candidate, _, verified = fx.archive()
             candidate_a = host.digest(candidate)
+            controller_a = controller_identity(candidate, verified)
             self.assertNotEqual(candidate_a, before_hash)
             self.assertEqual(verified['tcp_cdn'], current['tcp_cdn'])
             front_port, cert, _ = wire.caddy(host.XHTTP_PORT)
@@ -1186,6 +1207,7 @@ class SourceNativeCDN(unittest.TestCase):
             self.assertTrue(wire.https(wire.client(reality_node, moved_port, cert), origin))
             begun = host.transport_auth_begin(request)
             self.assertEqual((begun['inbound_id'], begun['inbound_tag']), (current['tcp_cdn']['inbound_id'], 'SELF-cdn'))
+            cdn_probe.auth_binding(begun, request, host.transport_request(request), current)
             self.assertEqual(host.transport_auth_begin(request), begun)
             self.assertTrue(wire.https(wire.client(node, front_port, cert), origin))
             wrong = copy.deepcopy(node); wrong['uuid'] = begun['nonce']
@@ -1201,6 +1223,7 @@ class SourceNativeCDN(unittest.TestCase):
             with mock.patch.object(host, 'auth_read_verdict', side_effect=retain_closed_witness):
                 finished = host.transport_auth_finish(dict(request, cdn_auth_nonce=begun['nonce']))
             self.assertTrue(finished['rejected'])
+            cdn_probe.auth_binding(finished, request, host.transport_request(request), current, begin=begun)
             self.assertEqual((finished['inbound_id'], finished['inbound_tag']), (current['tcp_cdn']['inbound_id'], 'SELF-cdn'))
             self.assertEqual(finished['native_identity_sha256'], begun['native_identity_sha256'])
             self.assertEqual(host.auth_template(fx.folder)[0], original_template)
@@ -1217,6 +1240,7 @@ class SourceNativeCDN(unittest.TestCase):
             self.assertEqual(final_manifest['accounts'], verified['accounts'])
             self.assertEqual(final_manifest['tcp_cdn'], verified['tcp_cdn'])
             self.assertEqual(final_manifest['hysteria2'], verified['hysteria2'])
+            self.assertEqual(controller_identity(final, final_manifest), controller_a)
             host.atomic(wire.evidence / 'auth-summary.json', host.dumps({'schema': 1, 'native_verdict': finished,
                 'original_logging_none': True, 'temporary_info_only': True, 'exact_raw_restored': True,
                 'nonlog_generated_unchanged': True, 'valid_again': True, 'reconnect': True, 'h2_preserved': True,
@@ -1237,6 +1261,11 @@ class SourceNativeCDN(unittest.TestCase):
                 committed = host.transport_commit(bound)
                 self.assertTrue(committed['committed'])
                 self.assertEqual(committed['cdn_auth_verdict'], finished)
+                state = wire.evidence / 'controller-receipt'
+                host.atomic(state / ('cdn-proofs/' + request['operation_id'] + '.json'), host.dumps(proof))
+                host.atomic(state / ('cdn-proofs/' + request['operation_id'] + '.auth.json'), host.dumps(finished))
+                vps.check_cdn_receipt(state, {'request': request, 'backup': str(final),
+                    'cdn_proof_sha256': bound['cdn_proof_sha256']}, committed)
                 self.assertEqual(host.transport_commit(bound), committed)
                 self.assertEqual(host.abort(request), committed)
                 self.assertFalse((host.ROOT / 'pending.json').exists())

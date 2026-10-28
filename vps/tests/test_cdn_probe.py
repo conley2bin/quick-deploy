@@ -52,7 +52,7 @@ def nodes():
              'password': 'fixture-h2-auth-original', 'sni': 'sub.example.org', 'alpn': ['h3'], 'skip-cert-verify': False},
             {'name': 'SELF-main', 'type': 'vless', 'server': ORIGIN, 'port': 9443, 'uuid': UUID,
              'tls': True, 'servername': 'target.example.org', 'network': 'tcp', 'flow': 'xtls-rprx-vision',
-             'reality-opts': {'public-key': 'R' * 43, 'short-id': '0123456789abcdef'},
+             'reality-opts': {'public-key': 'R' * 43, 'short-id': '0123456789abcdef', 'support-x25519mlkem768': True},
              'client-fingerprint': 'chrome', 'udp': True}]
 
 

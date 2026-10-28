@@ -371,7 +371,8 @@ def native_nodes(profile_bytes, manifest, device, interface):
                 reality.get('uuid') != account['id'] or reality.get('flow') != 'xtls-rprx-vision' or
                 reality.get('servername') != manifest['config']['reality_target'] or
                 reality.get('reality-opts') != {'public-key': manifest['reality']['publicKey'],
-                                               'short-id': manifest['reality']['shortIds'][0]}):
+                                               'short-id': manifest['reality']['shortIds'][0],
+                                               'support-x25519mlkem768': True}):
             raise Error('Native REALITY role has wrong port, identity, keys, transport or Vision flow')
         for key in ('skip-cert-verify', 'insecure', 'disable-sni'):
             if key in reality and reality[key] is not False:
