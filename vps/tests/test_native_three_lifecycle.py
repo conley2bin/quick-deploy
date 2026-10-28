@@ -2,8 +2,8 @@
 
 Setup uses complete real native API objects and exact approved metadata/readbacks;
 it does not run or attest module transport-prepare/commit, Cloudflare or ACME.
-Only OS scheduling/preflight, local CA issuance and disposable high-port socket
-coordinates are fixture boundaries. Module ownership, account CRUD, archive,
+Only OS scheduling/preflight, external target DNS/CA preflight, local CA issuance
+and disposable high-port socket coordinates are fixture boundaries. Module ownership, account CRUD, archive,
 restore/replace, native DB/serializers and all three authenticators remain real.
 
 Run native classes serially ONLY after the parent grants API127.0.0.1:62789.
@@ -710,10 +710,13 @@ class NativeThreeCold(ThreeFixture, unittest.TestCase):
             lock=fx.fx.lock, machine_id=host.machine_id(), ssh_port=22,
             adapter_sha256=host.digest(vps.MODULE / 'lib/host.py'))
         info = dict(machine_id=host.machine_id(), owned=False, endpoint=endpoint, ssh_port=22)
-        # Only dedicated-guest/OS scheduler boundary; actual prepare,
-        # configure_native, ownership, native API, archive and commit run.
+        # Dedicated-guest/OS scheduling and external public target preflight are
+        # boundaries. Strict local-CA REALITY target traffic is exercised above
+        # and below; prepare/configure/ownership/API/archive/commit stay real.
         with mock.patch.object(host, 'ROOT', target), mock.patch.object(host, 'UNITS', units), \
-                mock.patch.object(host, 'preflight', return_value=info):
+                mock.patch.object(host, 'preflight', return_value=info), \
+                mock.patch.object(host, 'check_target', side_effect=lambda config: self.assertEqual(
+                    config['reality_target'], 'target.example.org')):
             fx.fx.work = target / 'active'
             with vps.upload_bundle(request, backup=archive) as stream:
                 prepared = host.prepare(stream)
