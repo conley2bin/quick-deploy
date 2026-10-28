@@ -3,8 +3,8 @@
 Codoxear 是本机 Codex/Pi 会话的浏览器接力工具，不是 MCP server。对外只提供两个脚本：
 
 ```bash
-./setup.sh       # 首次配置
-./run_server.sh  # 拉取远程 main 最新版本并启动 Web server
+./setup.sh       # 首次配置，包含默认负责人分组适配器的独立依赖
+./run_server.sh  # 拉取远程 main 最新版本并启动带负责人分组的 Web server
 ```
 
 `setup.sh` 会向 `.bashrc` 或 `.zshrc` 写入 `codox`/`piox` 函数，用于启动可被 Web 接力的终端会话。原始 `codex` 和 `pi` 命令不会被替换。
@@ -19,7 +19,7 @@ run_server.sh
 .internal/       # 两个入口调用的内部实现，不直接运行
 .runtime/        # upstream checkout、独立 venv、安装状态；Git 忽略
 .env             # 本机配置；Git 忽略
-owner-groups/    # 可选、独立维护的负责人分组服务端适配器（不修改上游）
+owner-groups/    # 默认启用、独立维护的负责人分组服务端适配器（不修改上游）
 ```
 
 `.internal/` 包含远程 main 同步、安装、dotenv 加载、server/broker 启动和 shell rc 更新逻辑。它不是第三组用户命令。
@@ -35,7 +35,10 @@ cd /path/to/quick-deploy/codoxear
 
 1. clone/fetch `https://github.com/yiwenlu66/codoxear` 的远程 `main`。
 2. 从当前远程 main 的 `.env.example` 创建本地 `.env`。
-3. 创建 `.runtime/venv`、安装当前远程 main，并写入 `codox`/`piox` shell 函数。
+3. 创建 `.runtime/venv`、安装当前远程 main。
+4. 自动调用 `owner-groups/setup.sh`，在 `owner-groups/.venv` 安装默认适配器的既有锁定依赖，再写入 `codox`/`piox` shell 函数。无需额外 setup 步骤或启用参数；依赖安装失败会明确中止。
+
+setup 不启动、停止或重启任何服务。已有在线进程仍保留原行为，需安排 Web 重启才切换到新默认。
 
 setup 不要求设置 Web 密码；未设置密码时，terminal-owned 的 `codox`/`piox` 仍可使用。准备启动 Web server 时再编辑：
 
@@ -74,11 +77,11 @@ CODEX_WEB_PASSWORD=your-password
 3. 将 runtime checkout 切换到该 commit。
 4. commit 变化时重新安装。
 5. 在终端打印本次 revision、浏览器地址、监听范围、codox/piox、网页新建会话、tmux、Delete、停止方式和 HTTP/HTTPS 边界。
-6. 启动同一环境中的 `codoxear-server`。
+6. 默认启动负责人分组适配器，由它在私有 loopback 启动同一环境中的 `codoxear-server`；前端仍使用原 host/port/prefix/登录。显式 `--no-owner-groups` 则直接启动原生 server。
 
 启动说明基于当前 `.env` 的实际 host、port、URL prefix、默认后端和 secure-cookie 配置生成，不显示密码值。
 
-如果远程不可达、远程 main 无法解析，或 runtime checkout 有本地修改，启动会直接失败，不使用无法证明为最新的旧版本。
+如果远程不可达、远程 main 无法解析，或 runtime checkout 有本地修改，启动会直接失败，不使用无法证明为最新的旧版本。默认适配器依赖会在更新上游前检查；缺失时提示运行 `./setup.sh` 并中止，不产生 updater 副作用。适配器启动失败也会明确报错，不悄悄切换到原生服务。
 
 默认访问地址由上游决定，当前为：
 
@@ -138,15 +141,17 @@ tailscale serve --bg --yes --https=8443 http://127.0.0.1:8743
 CODEX_WEB_COOKIE_SECURE=1
 ```
 
-## 可选：跨电脑/手机的负责人侧栏分组
+## 默认：跨电脑/手机的负责人侧栏分组
 
-[owner-groups/README.md](owner-groups/README.md) 维护独立源码、依赖、测试、兼容边界和回退步骤。先运行 `./owner-groups/setup.sh` 安装其独立 `.venv`，不改变正在运行的服务。获准维护窗口切换后，可用：
+[owner-groups/README.md](owner-groups/README.md) 维护独立源码、依赖、测试、兼容边界和回退步骤。普通 `./setup.sh` 已安装其独立 `.venv`；无参数 `./run_server.sh` 默认启用，旧命令 `./run_server.sh --owner-groups` 保持兼容。
+
+前端仍使用现有 host/port/prefix/登录，上游不变并运行在私有 loopback 后端；每次启动仍执行既有远程 main 更新流程。显式原生回退（无需适配器依赖）：
 
 ```bash
-./run_server.sh --owner-groups
+./run_server.sh --no-owner-groups
 ```
 
-前端仍使用现有 host/port/prefix/登录，上游不变并运行在私有 loopback 后端；每次启动仍执行既有远程 main 更新流程。普通 `./run_server.sh` 不加载该增强。停止可选入口后改用普通启动即可回退。**安装源码/依赖不等于当前服务已启用**，不要在原端口仍被现有进程占用时重启或杀未知服务。
+**安装源码/依赖不等于当前服务已启用**；已有在线进程不会自动切换，需确认原 Web 服务的启动者和停止方式，在获准维护窗口停止旧入口后再用新命令启动。不要在原端口仍被现有进程占用时重启或杀未知服务；不要停止 broker/agent 来切换 Web 入口。
 
 分组按真实登记的上级关系（不是项目/目录）；最高负责人左上角有 ★，缺失上级不冒充顶层。保留原生全部会话和操作；真实登记为空时显示空状态，演示仅使用隔离合成数据。
 

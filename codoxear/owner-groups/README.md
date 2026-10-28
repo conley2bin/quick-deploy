@@ -1,6 +1,6 @@
-# 负责人分组（独立、可选的服务端适配器）
+# 负责人分组（默认启用的独立服务端适配器）
 
-给**电脑和手机使用同一 Codoxear 地址**增加原生会话分组。源码和依赖归 quick-deploy；不修改、复制覆盖或固定上游 checkout / site-packages。默认 `../run_server.sh` 行为保持不变，只有显式 `--owner-groups` 才启用。
+给**电脑和手机使用同一 Codoxear 地址**增加原生会话分组。源码和依赖归 quick-deploy；不修改、复制覆盖或固定上游 checkout / site-packages。无参数 `../run_server.sh` 默认启用，旧 `--owner-groups` 命令保持兼容；`--no-owner-groups` 显式回退原生入口。
 
 ## 看见什么
 
@@ -17,18 +17,19 @@
 从 `quick-deploy/codoxear/`：
 
 ```bash
-./owner-groups/setup.sh
+./setup.sh
 ```
 
-只在 `owner-groups/.venv/` 安装锁定的 aiohttp 依赖，优先使用 uv，没有 uv 则使用 Python venv/pip；需要 Python 3.10+（无 uv 时系统需提供 venv/pip）。**不启动、更新或重启任何服务**，不写浏览器配置、全局 prompts/settings 或登记簿。
+普通 setup 在既有远程 main 同步/安装后自动调用 `owner-groups/setup.sh`，无需额外选择 flag 或独立 setup 步骤。该子脚本只在 `owner-groups/.venv/` 安装锁定的 aiohttp 依赖，优先使用 uv，没有 uv 则使用 Python venv/pip；需要 Python 3.10+（无 uv 时系统需提供 venv/pip）。如仅修复适配器依赖，也可单独运行 `./owner-groups/setup.sh`，不更新上游。两种 setup 都**不启动或重启任何服务**；独立子脚本也不写 shell rc、浏览器配置、全局 prompts/settings 或登记簿。
 
-完成独立测试并获准切换后，在计划维护窗口停止原 Web server，再运行：
+完成独立测试并获准切换后，确认实际启动者/停止方式，在计划维护窗口停止原 Web server，再运行：
 
 ```bash
-./run_server.sh --owner-groups
+./run_server.sh
+# 旧 ./run_server.sh --owner-groups 与此相同
 ```
 
-此命令仍先执行既有远程 main 同步/安装流程，然后：
+此命令先检查适配器依赖，缺失/不可导入时明确失败并提示重新运行 `./setup.sh`，不执行 updater。之后仍执行既有远程 main 同步/安装流程，然后：
 
 1. 从原 `.env` / shell 环境读取**原前端 host、port、URL prefix、cookie 配置**。
 2. 适配器占用原前端地址；上游同一可执行文件在临时私有 `127.0.0.1` 端口启动，HOME/状态/认证 secret/前缀不变。公网反代仍指向原地址；不新增 TLS、密码或公开端口。IPv6 wildcard 继续采用上游的 dual-stack socket 行为。
@@ -36,7 +37,7 @@
 
 **本功能不会替你切换当前运行服务。** 需要记录实际启动者/停止方式再安排切换，不要对未知进程执行 kill。既有反代若只放行固定路径，需一并允许前缀下 `__owner_groups__/`；应由反代负责人确认，不在此自动修改。
 
-回退：停止该可选入口，再按原方式运行 `./run_server.sh`。原生入口不依赖适配器。停用后可删除**本功能自己的** `owner-groups/.venv/`；保留 quick-deploy 源码以便维护。没有浏览器插件、native host 或系统服务需要卸载。上游 service worker 可能在离线时显示旧的缓存 HTML；联网重新加载原生入口恢复，适配器不可用时自动恢复原生列表。不自动清除用户浏览器缓存。
+回退：停止该入口，再运行 `./run_server.sh --no-owner-groups`。原生入口不依赖适配器，仍执行既有 env 校验、远程 main 同步/安装和启动说明。默认入口的依赖或启动失败会明确报错，**不会自动启动原生服务兜底**。停用后可删除**本功能自己的** `owner-groups/.venv/`；保留 quick-deploy 源码以便维护。没有浏览器插件、native host 或系统服务需要卸载。上游 service worker 可能在离线时显示旧的缓存 HTML；联网重新加载原生入口恢复。已加载的增强页面在快照失败时恢复原生列表，不等于服务端自动切换入口。不自动清除用户浏览器缓存。
 
 ## 身份和数据边界
 
@@ -70,7 +71,15 @@ has_bound_log (仅对可信上游返回的非空绝对 log_path 做只读 regula
 
 ## 独立演示和验证
 
-以下测试不使用真实 owner、会话、消息或密码。先安装本功能依赖；从 `codoxear/`：
+以下测试不使用真实 owner、会话、消息或密码。从 `codoxear/` 运行入口流程测试（只需系统 Python 和 bash）：
+
+```bash
+python3 -m unittest discover -s tests -p 'test_entrypoints.py' -v
+```
+
+测试只运行临时副本，使用临时 HOME/.env、受限 PATH 和 updater/installer/启动器 stub，验证默认入口、显式回退、失败顺序和普通 setup，不更新真实上游、安装依赖或启动服务。
+
+适配器测试需先安装本功能依赖：
 
 ```bash
 CODOXEAR_TEST_PYTHON="$PWD/.runtime/venv/bin/python" \

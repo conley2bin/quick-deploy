@@ -6,32 +6,38 @@ source "${SCRIPT_DIR}/.internal/common.sh"
 
 usage() {
   cat <<'EOF'
-usage: ./run_server.sh [--owner-groups]
+usage: ./run_server.sh [--owner-groups | --no-owner-groups]
 
-每次运行都 fetch 远程 origin/main，切换到最新提交，必要时重新安装，
-然后启动 codoxear-server。无法确认远程最新版本时直接失败。
---owner-groups: 可选独立负责人分组适配器，保留现有前端地址，
-               上游改为私有 loopback 后端。先运行 owner-groups/setup.sh。
+默认启用独立负责人分组适配器，保留现有前端地址，上游运行在私有 loopback。
+每次启动前都 fetch 远程 origin/main，切换到最新提交，必要时重新安装。
+无法确认远程最新版本、适配器依赖缺失或启动失败时直接报错，不自动回退。
+先运行 ./setup.sh 安装全部依赖；已有在线服务需安排重启才切换。
+--owner-groups:    兼容旧命令，与无参数默认行为相同。
+--no-owner-groups: 显式回退到原生 codoxear-server，不依赖适配器。
 EOF
 }
 
 main() {
-  local owner_groups=0
+  local owner_groups=1 owner_python="${SCRIPT_DIR}/owner-groups/.venv/bin/python"
   if (($#)); then
+    if (($# > 1)); then
+      echo "error: 多余参数: $2" >&2; usage >&2; return 2
+    fi
     case "$1" in
       -h|--help) usage; return 0 ;;
-      --owner-groups) owner_groups=1; shift ;;
+      --owner-groups) ;;
+      --no-owner-groups) owner_groups=0 ;;
       *) echo "error: 未知参数: $1" >&2; usage >&2; return 2 ;;
     esac
-    if (($#)); then
-      echo "error: 多余参数: $1" >&2; return 2
-    fi
   fi
   if ((owner_groups)); then
-    [[ -x "${SCRIPT_DIR}/owner-groups/.venv/bin/python" ]] || {
-      echo "error: 请先运行 ${SCRIPT_DIR}/owner-groups/setup.sh" >&2; return 1
+    [[ -x "${owner_python}" ]] || {
+      echo "error: 负责人分组依赖未安装，请先运行 ${SCRIPT_DIR}/setup.sh" >&2; return 1
     }
-    "${SCRIPT_DIR}/owner-groups/.venv/bin/python" -c 'import aiohttp' || return 1
+    if ! "${owner_python}" -c 'import aiohttp'; then
+      echo "error: 负责人分组依赖不可用，请重新运行 ${SCRIPT_DIR}/setup.sh" >&2
+      return 1
+    fi
   fi
 
   [[ -f "${ENV_FILE}" ]] || {
@@ -46,7 +52,7 @@ main() {
   python="$(python_launcher)"
   "${python}" "${SCRIPT_DIR}/.internal/launch.py" describe "${revision}"
   if ((owner_groups)); then
-    exec "${SCRIPT_DIR}/owner-groups/.venv/bin/python" "${SCRIPT_DIR}/owner-groups/proxy.py" --managed-upstream
+    exec "${owner_python}" "${SCRIPT_DIR}/owner-groups/proxy.py" --managed-upstream
   fi
   exec "${python}" "${SCRIPT_DIR}/.internal/launch.py" server
 }
