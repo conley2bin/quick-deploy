@@ -15,7 +15,8 @@ operator gate; a source implementation is not deployed-client acceptance.
   optional `--port` still means SSH only. Fresh installations default to
   company/home/phone; every manifest-owned device has an independent UUID
   and SubID, plus the native Hysteria2 `Auth` credential. One global native Client
-  joins exactly the two owned inbounds; Native Clients operations own changes.
+  joins exactly the two owned inbounds (three after the optional CDN three-entry
+  migration; see CDN 入口模式); Native Clients operations own changes.
 - **Caddy** serves trusted HTTPS on TCP8443, proxying exactly two paths per
   enabled manifest-owned device, without wildcards.
   Panel2053 and subscription2096 bind127.0.0.1. Management is through SSH forwarding.
@@ -135,11 +136,13 @@ OpenSSL、systemd/`systemd-analyze`、`ss`、`nft`、可信 CA 包及至少2GiB�
 | 127.0.0.1:2053 / :2096 / :62789 | 面板 / 原生订阅后端 / Xray API；不公开 |
 | 实际 SSH 端口 | 原样保留，`--port` **只代表 SSH** |
 
-cdn 切换后 TCP443 归 Caddy（CDN TLS 终止 → 回环 XHTTP2080），UDP443 仍属 Xray H2，见下文「CDN 入口模式」。
+cdn 三入口迁移后 TCP443 归 Caddy（CDN TLS 终止 → 回环 XHTTP2080），REALITY 迁移到选定的独立
+TCP 端口（默认9443），UDP443 仍属 Xray H2，见下文「CDN 入口模式」。
 
 唯一代理端口设置是首次 `--proxy-port`，默认443，保存在原有四键私有 config 中；TCP与UDP共用数值，
 不与上述保留入口或实际 SSH 端口冲突。两个入站、原生导出、分开核验的TCP/UDP进程/端口及备份共用此设置。
-以后不会隐式改监听端口；换端口需单独规划迁移。没有证据表明3280更不易被封，
+以后不会隐式改监听端口；换端口需单独规划迁移——cdn 三入口迁移即是该规划迁移：REALITY 监听/广告端口
+改为 tcp_cdn.reality_port，config.proxy_port 与 H2 UDP 端口不变。没有证据表明3280更不易被封，
 工具不会自动选它。REALITY 目标站自身的 TLS 端口仍为443，独立于代理监听端口。
 
 域名由用户控制并设置 **DNS-only/灰云** A 记录；不需要 Cloudflare API key。
@@ -254,6 +257,7 @@ Xray26.10.10、Caddy2.11.7二进制和 geodata，**不运行上游安装器**。
 不输出 UUID、SubID、URL。新装仍默认3个；`devices add device4 device5` 才扩到5个。
 任意合规设备名都可使用，不存在第二套五设备白名单。manifest 的 `accounts` 键拥有成员关系，
 原生 SQLite/API 拥有完整策略与凭据；旧快照校验唯一入站关联，双协议快照校验所有 global clients 到两个受管入站的精确全部关联，
+三入口快照校验到三个受管入站的精确全部关联，
 包含禁用、未挂载账户及悬空关联。未知成员、不同 owner/machine、Host归属冲突、重复名字或
 凭据碰撞会拒绝，不使用直接修改账户表的 SQL。UUID按解析后的字节身份比较，
 不改已有DB/元数据的大小写拼写；新增/轮换要避开整个旧名册（包括目标自己的旧UUID和SubID）及本批新钥匙。旧3、新5、删除后的4以及空名册均可备份/恢复；
@@ -383,7 +387,8 @@ Python优化模式不会删除它。失败私有目录保留供检查，不删�
 
 `dashboard [--output-dir DIR] [--device NAME]` 与设备 bootstrap export 共用现有 pending 拒绝、
 `checked_backup` 和 `read_generation`：完整已提交备份 SHA/owner/config/端点/名册/原生文件 hash
-全部匹配后才绘制。当前与 bootstrap 一样要求显式双协议 generation；旧 TCP 快照不会被静默忽略或补造 H2。
+全部匹配后才绘制。当前与 bootstrap 一样要求与归档模式精确匹配的 generation（旧单 TCP、双协议或三入口）；
+旧模式快照不会被静默忽略或补造节点。
 节点 URI 仅从原生 base64 feed 解码，排除记录换行后保留 UTF-8 字节及百分号转义；fragment 只作界面标签。
 订阅 URL 复用 `subscription_urls`，不另做入站/节点编码器，不读取/写入生产数据库，不建立网络连接。
 禁用设备可显示状态但无凭据条目；“启用”不是在线连通性或 TCP 可用性判断。
@@ -438,6 +443,7 @@ manifest增加 `management.ssh_port`，值由已认证SSH连接的服务端端�
 `hysteria2` 为显式schema1元数据，保存原生H2 inbound ID、Host group ID以及相对deployment的证书/密钥路径。
 缺少该标记只在严格旧TCP单入站、单Host、每账户单join拓扑下合法；双协议要求原SELF-main与新增SELF-h2、
 两个精确Host和每个global client到两入站的精确join，不收编外来或隐藏/禁用的额外行。
+三入口模式额外要求 tcp_cdn 元数据及三个入站/三个单入站 Host/每 client 三个精确 join（见 CDN 入口模式）。
 原REALITY inbound/Host、UUID/SubID、完整原生策略和密钥在功能迁移中保持；H2 Auth由原生attach生成。
 VLESS inbound DTO是协议投影，不携带H2 Auth；校验从global原生DB读Auth并跨核对H2及原生feed，
 改名/重置/换机则从global ClientRecord补Auth与独立LimitHwid后提交完整Client DTO，绝不把Record形状直接写回。
@@ -493,38 +499,72 @@ TCP与UDP监听分别核验PID/可执行文件/cgroup；TCP8443证书成功不�
 新test_dual_transport验证双拓扑/证书/receipt边界，真实三份固定二进制的双协议行为由test_native_dual单独验证。
 所有这些均不代替真实systemd、公开ACME、公司/Y/手机实际导入和SSH-over-H2的逐路径验收。
 
-## CDN 入口模式：VLESS/XHTTP 经 Cloudflare，保留 H2
+## CDN 入口模式：新增 VLESS/XHTTP 经 Cloudflare，保留 REALITY 与 H2
 
-`cdn` 命令把同一节点的活动 TCP 入口从 REALITY 受控切换为 Cloudflare + VLESS/XHTTP/TLS，
-复用既有 `transport-prepare` / `transport-commit` 事务（`feature=tcp-cdn`），不是新事务框架。
-最终恰好两个原生入站、两个 Host、每个 global client 两个 join：SELF-cdn 与 SELF-h2；
-不永久保留第三入口，不新增 daemon/unit/账户数据库/节点转换器/软件 pin，global FORMAT 不变。
+`cdn` 命令把同一节点从双协议受控扩展为**三条并存的原生入口**，复用既有 `transport-prepare` / `transport-commit`
+事务（`feature=tcp-cdn`），不是新事务框架。最终恰好三个原生入站、三个单入站 Host、每个 global client 精确三个 join：
+SELF-main（保留的 REALITY，新 TCP 端口）、SELF-cdn（新增 XHTTP）与 SELF-h2（不变的 H2）；
+不新增 daemon/unit/账户数据库/节点转换器/软件 pin，global FORMAT 不变。一个原生 global Client 同时加入三个入口，
+UUID/Auth/SubID/启用/到期/额度/HWID 等策略不变。
 
-- 原 main VLESS 入站**原地**转为 127.0.0.1:2080 明文 XHTTP（security none、disableFlow）；入站 ID、
-  Host group ID、全部 UUID/Auth/SubID 与两个 join 保持，合法变化仅为 Vision flow 退役和已知 createdAt 归一。
-  Host 广告 CDN 域名:443 TLS（匹配 SNI/Host/path、ALPN h2、allowInsecure false），与回环明文入站分离。
+- REALITY：保留原 main 入站 ID、remark SELF-main、根 Host group ID、全部密钥/shortID/目标/UUID 与 Vision flow；
+  唯一预期变化是监听/广告端口迁到 `tcp_cdn.reality_port`（默认9443，命令行显式核验选择，无自动空闲端口搜索）。
+  原生 HostGroup 更新会删除并重建其物理 Host 行：逻辑 groupId/入站身份保留，REALITY 物理行 ID 及自动
+  created/updated 时间戳随端口变更重建——这是已证实的原生行为，不是账户/密钥身份丢失。H2 的完整 Host 行不变。
+- CDN：新增入站 tag/remark SELF-cdn，监听 127.0.0.1:2080 明文 XHTTP（security none、path、mode packet-up），
+  顶层 `disableFlow:true`；全局 Client flow 保留原 Vision，REALITY 有效 flow 仍为 Vision，仅 CDN 的
+  per-inbound/per-join 投影为空，不做全局清空再修复。新增 Host 广告 CDN 域名:443 TLS（匹配 SNI/Host/path、
+  ALPN h2、allowInsecure false），与回环明文入站分离。
+- H2：UDP443、Auth、原订阅域名证书绑定、Host 与管理路由完全不变。
 - Caddy 最终监听 CDN 域名:443，仅把精确 XHTTP 路径及子孙反代到 127.0.0.1:2080（不去前缀），其余路径404；
   全局 `protocols h1 h2` 保持不变——不引入 h3，UDP443 始终属于 H2。原 sub:8443 订阅与 HTTP01:80 保留。
   新证书是该域名在受管 Caddy storage 内唯一匹配的一对普通文件；H2 证书选择器按原订阅域名过滤，第二对证书不造成歧义。
 - Cloudflare443 → 源站443，同主机名/SNI，无长期443→8443 Origin Rule。端口归属按活动模式：
-  CDN 模式 FRONT 拥有 TCP443/8443/80，PANEL 拥有回环2080与 UDP443；REALITY 模式仍是 PANEL 拥有 TCP443。
-- config 四键不变；`tcp_cdn` 为独立 schema1 元数据（domain/inbound_id/path/mode/证书相对路径）。
-  三种精确归档模式并存：旧单 TCP、REALITY+H2、CDN+H2；旧 TAR 不改写，恢复旧归档不隐式升级模式。
-  PROXY 顺序 `[SELF-h2, SELF-cdn, DIRECT]`，H2 保持默认，无 GUI 自动选择；原生 H2 管理导出字节语义不变。
+  CDN 模式 FRONT 拥有 TCP443/8443/80，PANEL 拥有回环2080、REALITY 选定 TCP 端口与 UDP443；
+  双协议模式仍是 PANEL 拥有 TCP443/UDP443。
+- config 四键不变（本迁移要求 proxy_port=443，H2 继续使用它）；`tcp_cdn` 为独立 schema1 元数据
+  （domain/inbound_id/host_group_id/reality_port/reality_tag/path/mode/证书相对路径）。`reality_tag`
+  保存迁移前核验的原 main 原生 tag（通常 `in-443-tcp`），端口迁移、重启与冷恢复后必须显式保持。
+  三种精确归档模式并存：旧单 TCP、REALITY+H2、三入口；旧 TAR 不改写，恢复旧归档不隐式升级模式；
+  未发布过的旧两入口 CDN 形状缺少新字段，明确拒绝，不做兼容模式。
+  PROXY 顺序 `[SELF-h2, SELF-cdn, SELF-main, DIRECT]`，FEED 仍为 `[SELF-h2, DIRECT]`；
+  H2 保持默认，无 GUI 自动选择；原生 H2 管理导出字节语义不变。
 
-事务顺序：只读核验与变更前离机备份（先安装当前 guard）→ 持久化绑定请求/回滚意图 →
-FRONT/PANEL 停止期间取**关闭的 Caddy storage 子树**与 DB/manifest/front 快照（phase=ready 前完成，半成品不用于恢复）→
-临时8443纯证书 vhost 取得新域名公开可信证书（可预测的 HTTP01 bootstrap，不宣称 HTTP01 普遍必须灰云）→
-原地转换入站/Host，FRONT 接管443 → prepared 返回绝对 deadline，订阅不发布，H2 保持默认 →
-操作员在期限内仅把 cdn 记录转橙云并确认 → 控制器基于实际原生输出，在专用 noTUN/loopback 临时客户端中探针
-（绑定物理接口；私有127控制器 PUT 相同配置待204为就绪屏障；核验真实 CF 边缘 TLS、内层 HTTPS+VPS 出口、
-错误 UUID 拒绝后正确恢复、重连/短空闲、原 H2 新鲜认证）→ 全部通过后持久化私有 proof，
-随候选归档摘要一并 commit（proof 绑定 operation/请求指纹/候选 SHA/域名，是控制器证明而非密码学远端观测，
-不设永久在线健康标志）。超时/失败走既有 abort/recover：先停 FRONT 释放443，再恢复旧 DB/manifest/
-sub:8443-only Caddyfile 与关闭的证书存储，recovering → restore-queued → 后续实际就绪（含原 H2 证书对/绑定/Auth）后才解除；
+事务顺序：只读核验旧双协议状态与选定 REALITY TCP 端口可用性、变更前离机备份（先安装当前 guard）→
+持久化绑定请求/回滚意图 → FRONT/PANEL 停止期间取**关闭的 Caddy storage 子树**与 DB/manifest/front 快照
+（phase=ready 前完成，半成品不用于恢复）→ 旧 REALITY 仍占443期间，临时8443纯证书 vhost 取得新域名公开可信证书
+（可预测的 HTTP01 bootstrap，不宣称 HTTP01 普遍必须灰云）→ 经完整原生对象把 REALITY 迁移到选定端口
+（保留 tag/密钥/设置/Clients）、新增顶层 disableFlow 的 CDN 入站（完整 Client DTO，不以 manifest 投影代替）
+并显式只加一个 CDN Host → 核验 REALITY 在新端口、XHTTP 仅回环2080、H2 UDP443、精确三角色与有效 flow，
+**确认 TCP443 已释放后才启动最终 Caddy443** → prepared 返回绝对 deadline，订阅不发布，H2 保持默认 →
+操作员在期限内仅把 cdn 记录转橙云并确认 → 控制器基于实际原生输出，在专用 noTUN/loopback 临时客户端中强制
+唯一 SELF-cdn 路由探针（绑定物理接口与新鲜 CF 边缘；私有127控制器 PUT 相同配置待204为就绪屏障；
+核验真实 CF 边缘 TLS、内层 HTTPS+VPS 出口、错误 UUID 拒绝后正确恢复、重连/短空闲、原 H2 新鲜认证）→
+全部通过后持久化私有 proof，随候选归档摘要一并 commit（proof 绑定 operation/请求指纹/候选 SHA/域名，
+是控制器证明而非密码学远端观测，不设永久在线健康标志）。超时/失败走既有 abort/recover：**先停候选 FRONT 释放443，
+再恢复旧 REALITY443**；恢复关闭的原 DB/manifest/sub:8443-only Caddyfile 与关闭的证书存储，移除新增 CDN 入站/Host
+并还原 REALITY 端口/Host/tag，保留原 H2；recovering → restore-queued → 后续实际就绪（含原 H2 证书对/绑定/Auth）后才解除；
 CF 侧手动改动不在 guest 回滚范围内，操作员把 cdn 转回灰云。丢 ACK 凭 durable receipt 对账，不重放迁移或轮换。
-模块只核验原生 YAML/URI 字段，不写 converter；dashboard 仅按原生 transport/security 把该 VLESS 显示为 XHTTP/CDN，
-URI/QR 字节不变。探针所需 mihomo/PyYAML 仅属本命令，普通本地导出依赖不变。
+
+错误 UUID witness 复用既有有界机制：仅捕获原模板、停止 PANEL 后只写 xrayTemplateConfig、临时 info/error 日志
+（access:none）、钉住实际日志路径/inode/offset/核心 epoch、新鲜 nonce 的精确原生拒绝判定、**最终归档B之前
+无条件精确恢复原模板**；不产生常开流量日志，服务器日志保持 root 私有。原单 VLESS 假设替换为精确双 VLESS 归属：
+按保存的 REALITY tag 与 SELF-cdn 分别查询两个实际活跃 Xray 注册表，nonce 排除覆盖两注册表与已配置 UUID 的并集；
+路径归属由原生精确拒绝判定加控制器强制的唯一 CDN 路由组合而成，不臆造日志格式中不存在的入站标签字段。
+服务器端口空闲或注册表不变不等于公司直连可达；REALITY 直连实测按所测网络单独记录，
+公司 TCP 失败不否决 CDN 验收，也不构成 REALITY 从该公司网络可用的声明。
+
+生命周期：add 为三个入口各加精确 join；rename 保留全局身份；reset 一次轮换 UUID/Auth/SubID 并同时撤销三个节点；
+remove 删除全局身份与全部 join。每次原生变更后重新断言 per-role flow。三入口冷恢复保留入站 ID/逻辑 Host
+group ID/tag、选定 REALITY 端口、CDN 域名/path/Host TLS 与 H2 原证书绑定；replace 遵循既有轮换语义。
+已知 createdAt 毫秒尾数归一披露不变，不做账户 SQL 或政策放宽。
+原生 AddClientStat 会把共享流量行的 inboundId 重指到新增入站，H2 API clientStats 因此反映该共享关联；
+这不是 H2 传输归属或 join 成员关系变化，不据此断言配额/统计精度（下文统计限制不变）。
+
+模块只核验原生 YAML/URI 字段，不写 converter；dashboard 仅按原生 transport/security 区分显示三个节点，
+URI/QR 字节不变；每设备5个二维码（3个节点+2个订阅 URL），旧双协议/单 TCP 模式为4/3个。
+探针所需 mihomo/PyYAML 仅属本命令，普通本地导出依赖不变。同一 CDN 域名已三入口后重复运行 cdn 拒绝重新验证
+（刷新事务未实现），换域名/端口同样拒绝；status/backup/export 正常。
 
 ## 已知限制与流量统计
 
