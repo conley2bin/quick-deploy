@@ -123,12 +123,17 @@ class ThreeFixture:
         self.evidence = root / self._testMethodName
         self.evidence.mkdir(mode=0o700, parents=True, exist_ok=True)
         self.evidence.chmod(0o700)
+        version = subprocess.run([vps.resolve_mihomo(), '-v'], capture_output=True, timeout=5)
+        self.assertEqual(version.returncode, 0, 'Pinned local Mihomo version check failed')
+        self.assertIn(b'v1.19.32', version.stdout, 'Unexpected local Mihomo version')
+        self.save('runtime-pins.json', {'mihomo': '1.19.32', 'release_lock_sha256': self.lock_digests})
         self.fx = dual.NativeDual('test_enable_preserves_full_native_policy_and_exports')
         self.fx._outcome = self._outcome
         self.addCleanup(self.fx.doCleanups)
         self.fx.setUp()
         self.front = None
         self.access_logs = []
+        self.client_directories = []
         self.addCleanup(self.stop_front)
         self.addCleanup(self.retain)
         self.enterContext(mock.patch.object(host, 'CDN_PORT', self.fx.manifest['config']['proxy_port']))
@@ -196,6 +201,7 @@ class ThreeFixture:
         after = fx.records()
         for name, record in before.items():
             self.record_contract(record, after[name], earliest[name], ('updatedAt',))
+        self.persisted_contract(old['clients'], fx.rows('clients'), ('created_at', 'updated_at'))
         h2_id = fx.manifest['hysteria2']['inbound_id']
         self.assertEqual([h for h in old['hosts'] if h['inbound_id'] == h2_id],
                          [h for h in fx.rows('hosts') if h['inbound_id'] == h2_id])
@@ -216,17 +222,49 @@ class ThreeFixture:
         self.assertEqual(after_h2['clientStats'], [dict(s, inboundId=cdn['id']) for s in before_h2['clientStats']])
         self.assertEqual({k: v for k, v in before_h2.items() if k != 'clientStats'},
                          {k: v for k, v in after_h2.items() if k != 'clientStats'})
+        # Complete supported native settings read/update selects the approved
+        # THREE-node template, not a hand-built subscription serializer.
+        settings = api.call('/panel/api/setting/all', {})
+        settings['subClashRules'] = host.clash_rules(fx.manifest)
+        api.call('/panel/api/setting/update', settings)
+        self.assertEqual(api.call('/panel/api/setting/all', {})['subClashRules'], settings['subClashRules'])
+        fx.fx.stop(); fx.fx.start(); fx.api()
         # Let actual ownership/account/output code attest the constructed INPUT.
+        # Restart/tag preservation is part of input attestation, not migration.
         host.backend_health(fx.folder, fx.manifest)
         fx.manifest['published'] = True
         host.atomic(fx.folder / 'manifest.json', host.dumps(fx.manifest))
         host.front_config(fx.folder, fx.manifest, True)
-        self.save('input-records.private.json', after)
+        for name, record in before.items():
+            self.record_contract(record, fx.records()[name], earliest[name], ('updatedAt',))
+        self.save('input-records.private.json', fx.records())
         self.save('input-db.private.json', {t: fx.rows(t) for t in old})
         self.save('scope.json', {'input': 'already-triple via real native API/readbacks',
             'module_migration_commit_proof': False, 'public_cloudflare': False, 'production_443_acme': False,
             'createdAt_boundary': 'predicted earliest native timestamp; same second; delta<1000ms',
             'shared_client_stats': 'inboundId is new association, not membership or accounting accuracy'})
+
+    def persisted_contract(self, before, after, except_fields=()):
+        """Full persisted globals, including fields omitted from Client DTOs."""
+        self.assertEqual({r['id'] for r in before}, {r['id'] for r in after}, 'Native global row IDs changed')
+        for old in before:
+            new = next(r for r in after if r['id'] == old['id'])
+            changed = sorted(k for k in old.keys() | new.keys()
+                             if k not in except_fields and old.get(k) != new.get(k))
+            self.assertFalse(changed, 'Changed persisted Client fields (values withheld): ' + ','.join(changed))
+
+    def seed_three_policy(self, name):
+        # Main-ID scoped full DTO: CDN is another VLESS with empty effective
+        # Flow, so NativeDual.dto's first-VLESS assumption is unsuitable here.
+        api = self.fx.api()
+        main = next(i for i in api.call('/panel/api/inbounds/list') if i['id'] == self.main_id)
+        client = copy.deepcopy(next(c for c in dual.decoded(main['settings'])['clients'] if c['email'] == name))
+        record = api.call('/panel/api/clients/get/' + name)['client']
+        client.update(auth=record['auth'], limitHwid=record['limitHwid'], totalGB=1234567890,
+            expiryTime=int(time.time() * 1000) + 86400000, limitIp=2, trafficReset='monthly',
+            trafficResetDay=6, reset=7, resetMax=9, comment='three-policy', group='three-fixture')
+        api.call('/panel/api/clients/update/' + name, client)
+        self.topology()
 
     def control(self, action, *units):
         if action == 'daemon-reload':
@@ -332,7 +370,8 @@ class ThreeFixture:
         main = next(i for i in api.call('/panel/api/inbounds/list') if i['id'] == self.main_id)
         self.assertEqual((main['tag'], main['port'], main['remark']),
                          (self.original_tag, fx.manifest['tcp_cdn']['reality_port'], 'SELF-main'))
-        self.assertEqual(dual.decoded(main['streamSettings'])['realitySettings']['privateKey'], fx.manifest['reality']['privateKey'])
+        self.assertTrue(dual.decoded(main['streamSettings'])['realitySettings']['privateKey'] == fx.manifest['reality']['privateKey'],
+                        'Native REALITY key differs from manifest (values withheld)')
         for role, inbound_id, group_id, address, port in (
                 ('reality', self.main_id, self.original_group, fx.manifest['endpoint'], fx.manifest['tcp_cdn']['reality_port']),
                 ('cdn', fx.manifest['tcp_cdn']['inbound_id'], fx.manifest['tcp_cdn']['host_group_id'], 'cdn.example.org', host.CDN_PORT),
@@ -352,9 +391,11 @@ class ThreeFixture:
         cdn = next(i for i in config['inbounds'] if i.get('tag') == 'SELF-cdn')
         h2 = next(i for i in config['inbounds'] if i.get('tag') == 'SELF-h2')
         for inbound, flow in ((real, VISION), (cdn, '')):
-            self.assertEqual({c['id'] for c in inbound['settings']['clients']}, expected)
+            self.assertTrue({c['id'] for c in inbound['settings']['clients']} == expected,
+                            'Generated VLESS authenticators differ from global authority (values withheld)')
             self.assertTrue(all(c.get('flow', '') == flow for c in inbound['settings']['clients']))
-        self.assertEqual({c['auth'] for c in h2['settings']['clients']}, expected_auth)
+        self.assertTrue({c['auth'] for c in h2['settings']['clients']} == expected_auth,
+                        'Generated H2 authenticators differ from global authority (values withheld)')
         self.assertEqual((real['port'], h2['port']), (self.fx.manifest['tcp_cdn']['reality_port'], host.CDN_PORT))
         self.assertEqual((cdn['listen'], cdn['port'], cdn['streamSettings']['security']), ('127.0.0.1', host.XHTTP_PORT, 'none'))
         self.save('generated-' + str(time.monotonic_ns()) + '.private.json', config)
@@ -370,8 +411,8 @@ class ThreeFixture:
         profile = yaml.safe_load(files['mihomo'])
         nodes = native_nodes(profile)
         reality, cdn, h2 = (nodes[r] for r in ROLES)
-        self.assertEqual({reality['uuid'], cdn['uuid']}, {record['uuid']})
-        self.assertEqual(h2['password'], record['auth'])
+        self.assertTrue({reality['uuid'], cdn['uuid']} == {record['uuid']}, 'Native VLESS UUID mismatch (values withheld)')
+        self.assertTrue(h2['password'] == record['auth'], 'Native H2 Auth mismatch (values withheld)')
         self.assertEqual((reality['server'], reality['port'], reality['flow']),
                          (self.fx.manifest['endpoint'], self.fx.manifest['tcp_cdn']['reality_port'], VISION))
         self.assertEqual((cdn['server'], cdn['port'], cdn['network'], cdn['tls']), ('cdn.example.org', host.CDN_PORT, 'xhttp', True))
@@ -390,17 +431,20 @@ class ThreeFixture:
         h_uri = next(p for p in links if p.scheme == 'hysteria2')
         r_uri = next(p for p in links if parse_qs(p.query).get('security') == ['reality'])
         x_uri = next(p for p in links if parse_qs(p.query).get('type') == ['xhttp'])
-        self.assertEqual((r_uri.username, r_uri.hostname, r_uri.port), (record['uuid'], reality['server'], reality['port']))
+        self.assertTrue((r_uri.username, r_uri.hostname, r_uri.port) == (record['uuid'], reality['server'], reality['port']),
+                        'Native REALITY URI identity/endpoint mismatch (values withheld)')
         self.assertEqual(parse_qs(r_uri.query)['flow'], [VISION])
-        self.assertEqual((x_uri.username, x_uri.hostname, x_uri.port), (record['uuid'], 'cdn.example.org', host.CDN_PORT))
+        self.assertTrue((x_uri.username, x_uri.hostname, x_uri.port) == (record['uuid'], 'cdn.example.org', host.CDN_PORT),
+                        'Native CDN URI identity/endpoint mismatch (values withheld)')
         self.assertEqual(json.loads(parse_qs(x_uri.query)['extra'][0]), {'mode': host.XHTTP_MODE})
         self.assertFalse(parse_qs(x_uri.query).get('flow'))
-        self.assertEqual(unquote(h_uri.username), record['auth'])
+        self.assertTrue(unquote(h_uri.username) == record['auth'], 'Native H2 URI Auth mismatch (values withheld)')
         return profile, files
 
     def client(self, profile, role, owner):
         directory = self.fx.fx.root / ('three-client-' + str(time.monotonic_ns()))
         directory.mkdir(mode=0o700)
+        self.client_directories.append(directory)
         port = self.fx.manifest['tcp_cdn']['reality_port'] if role == 'reality' else host.CDN_PORT
         node = coordinate_node(profile, role, '127.0.0.1', port)
         cert = (host.cdn_certificate_paths(self.fx.folder, self.fx.manifest)[0] if role == 'cdn'
@@ -408,7 +452,9 @@ class ThreeFixture:
         config = {'mixed-port': native.free_port(), 'bind-address': '127.0.0.1', 'allow-lan': False,
             'log-level': 'debug', 'dns': {'enable': False}, 'tun': {'enable': False}, 'proxies': [node],
             'proxy-groups': [{'name': 'PROXY', 'type': 'select', 'proxies': [node['name']]}], 'rules': ['MATCH,PROXY']}
-        return native.start_mihomo(owner, directory, config, cert)
+        mixed = native.start_mihomo(owner, directory, config, cert)
+        self.save('readiness-' + str(time.monotonic_ns()) + '.json', owner._mihomo_readiness[-1])
+        return mixed
 
     def fresh(self, profile, role, origin, expected):
         owner = unittest.TestCase()
@@ -493,7 +539,7 @@ class ThreeFixture:
         try:
             stream.sendall(b'GET / HTTP/1.1\r\nHost: sub.example.org\r\n\r\n')
             self.assertEqual(stream.recv(4096), b'', 'Revoked established stream still usable')
-        except (ConnectionResetError, BrokenPipeError, ssl.SSLEOFError):
+        except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, ssl.SSLEOFError, ssl.SSLZeroReturnError):
             pass
         finally:
             stream.close()
@@ -511,6 +557,8 @@ class ThreeFixture:
             self.fx.fx.log.flush()
         if self.fx.folder.exists():
             shutil.copytree(self.fx.folder, self.evidence / 'fixture', dirs_exist_ok=True)
+        for index, directory in enumerate(self.client_directories):
+            shutil.copytree(directory, self.evidence / ('client-' + str(index)), dirs_exist_ok=True)
         for index, path in enumerate(self.access_logs):
             if path.exists():
                 host.atomic(self.evidence / ('front-' + str(index) + '.private.jsonl'), path.read_bytes())
@@ -525,13 +573,15 @@ class NativeThreeDevices(ThreeFixture, unittest.TestCase):
     def test_actual_module_add_rename_reset_remove_all_three(self):
         fx = self.fx
         original, joins = fx.records(), fx.rows('client_inbounds')
+        original_globals = fx.rows('clients')
         fx.device('add', 'tablet')
         self.topology()
         self.assertEqual(len(fx.rows('clients')), len(original) + 1)
         self.assertTrue(all(j in fx.rows('client_inbounds') for j in joins))
         for name, record in original.items():
             self.unchanged(record, fx.records()[name])
-        fx.seed_policy('tablet')
+        self.persisted_contract(original_globals, [r for r in fx.rows('clients') if r['email'] != 'tablet'])
+        self.seed_three_policy('tablet')
         host.backend_health(fx.folder, fx.manifest)
         before, earliest = fx.records(), self.earliest(fx.records())
         profile, _ = self.exports('tablet')
@@ -539,21 +589,33 @@ class NativeThreeDevices(ThreeFixture, unittest.TestCase):
         origin.RequestHandlerClass.protocol_version = 'HTTP/1.1'
         self.all_three(profile, origin)
         self.wrong_uuid(profile, origin)
+        rename_globals = fx.rows('clients')
+        rename_joins = fx.rows('client_inbounds')
         fx.device('rename', 'tablet', 'reader')
         renamed = fx.records()
         self.record_contract(before['tablet'], renamed['reader'], earliest['tablet'], ('email', 'updatedAt'))
         self.assertEqual(renamed['reader']['id'], before['tablet']['id'])
+        self.persisted_contract(rename_globals, fx.rows('clients'), ('email', 'created_at', 'updated_at'))
+        self.assertEqual(fx.rows('client_inbounds'), rename_joins, 'Rename changed full join metadata')
+        for name, record in original.items():
+            self.unchanged(record, renamed[name])
         self.topology(); self.exports('reader')
         self.all_three(profile, origin)  # exact pre-rename native maps remain valid
         earliest = self.earliest(renamed)
+        reset_globals = fx.rows('clients')
+        reset_joins = fx.rows('client_inbounds')
         reset = fx.device('reset', 'reader')
         current = fx.records()
         self.record_contract(renamed['reader'], current['reader'], earliest['reader'], ('uuid', 'auth', 'subId', 'updatedAt'))
         self.assertTrue(all(current['reader'][k] != renamed['reader'][k] for k in ('uuid', 'auth', 'subId')))
+        self.persisted_contract(reset_globals, fx.rows('clients'), ('uuid', 'auth', 'sub_id', 'created_at', 'updated_at'))
+        self.assertEqual(fx.rows('client_inbounds'), reset_joins, 'Reset changed full join metadata')
+        for name, record in original.items():
+            self.unchanged(record, current[name])
         self.topology()
         stable = copy.deepcopy(current)
         self.assertTrue(fx.fx.device_prepare(reset)['committed'])
-        self.assertEqual(fx.records(), stable, 'Reset replay rotated credentials more than once')
+        self.assertTrue(fx.records() == stable, 'Reset replay rotated credentials more than once (values withheld)')
         self.all_three(profile, origin, False)
         fresh, _ = self.exports('reader')
         self.all_three(fresh, origin)
@@ -584,6 +646,7 @@ class NativeThreeCold(ThreeFixture, unittest.TestCase):
     def cold(self, mode):
         fx = self.fx
         before, joins = fx.records(), fx.rows('client_inbounds')
+        global_rows = fx.rows('clients')
         earliest = self.earliest(before)
         original = copy.deepcopy(fx.manifest)
         hosts = fx.rows('hosts')
@@ -621,16 +684,18 @@ class NativeThreeCold(ThreeFixture, unittest.TestCase):
             self.assertEqual(fx.rows('client_inbounds'), joins, 'Cold path changed complete join metadata')
             self.topology()
             after = fx.records()
+            allowed_db = ('created_at', 'updated_at', 'uuid', 'auth') if mode == 'replace' else ('created_at', 'updated_at')
+            self.persisted_contract(global_rows, fx.rows('clients'), allowed_db)
             for name, record in before.items():
                 allowed = ('uuid', 'auth', 'updatedAt') if mode == 'replace' else ('updatedAt',)
                 self.record_contract(record, after[name], earliest[name], allowed)
-                self.assertEqual(after[name]['subId'], record['subId'])
+                self.assertTrue(after[name]['subId'] == record['subId'], 'Cold path changed SubID (values withheld)')
                 for key in ('uuid', 'auth'):
                     self.assertEqual(after[name][key] == record[key], mode == 'restore')
             for key in ('privateKey', 'publicKey', 'shortIds'):
                 self.assertEqual(fx.manifest['reality'][key] == original['reality'][key], mode == 'restore')
             for relative, data in cert_bytes.items():
-                self.assertEqual((fx.folder / relative).read_bytes(), data, 'Cold path changed certificate/key bytes')
+                self.assertTrue((fx.folder / relative).read_bytes() == data, 'Cold path changed certificate/key bytes (values withheld)')
             # Native Host updates recreate physical ID+auto timestamps only.
             # Every other full Host policy, logical group and inbound is exact.
             current_hosts = fx.rows('hosts')
@@ -656,16 +721,18 @@ class NativeThreeCold(ThreeFixture, unittest.TestCase):
                 for fmt in files:
                     old = base64.b64decode(old_files[fmt]) if fmt == 'sub' else old_files[fmt]
                     new = base64.b64decode(files[fmt]) if fmt == 'sub' else files[fmt]
-                    self.assertEqual(new, old.replace(original['endpoint'].encode(), endpoint.encode()),
-                                     'Native restore bytes changed beyond numeric endpoint relocation')
+                    self.assertTrue(new == old.replace(original['endpoint'].encode(), endpoint.encode()),
+                                    'Native restore bytes changed beyond numeric endpoint relocation (values withheld)')
             candidate, _, _ = fx.archive()
             committed = host.commit(dict(request, offnode_sha256=host.digest(candidate)))
             self.assertTrue(committed['published'])
+            self.assertTrue(host.commit(dict(request, offnode_sha256=host.digest(candidate)))['published'])
+            self.assertTrue(fx.records() == after, 'Repeated publication rerotated native credentials (values withheld)')
             fx.fx.manifest = host.read_json(fx.folder / 'manifest.json')
             origin = fx.origin()
             self.all_three(old_profile, origin, mode == 'restore')
             self.all_three(profile, origin)
-            self.assertEqual(fx.records(), after, 'Commit/health rerotated identities/policies')
+            self.assertTrue(fx.records() == after, 'Commit/health rerotated identities/policies (values withheld)')
             self.assertEqual(host.digest(exported), old_digest, 'Original source closed archive changed')
             self.assertEqual(host.digest(archive), old_digest, 'Retained original archive changed')
             self.http2_evidence()
