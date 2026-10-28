@@ -158,19 +158,37 @@
     qrDevice = null;
   });
   byId('qr-copy').addEventListener('click', () => { if (qrLink && qrDevice) copyURI(qrLink, qrDevice); });
-  const protocolName = value => {
-    const protocol = String(value || 'URI');
-    if (/^(hy2|hysteria2|hysteria)$/i.test(protocol)) return 'Hysteria2';
-    if (/^(vless|reality)$/i.test(protocol)) return 'VLESS / REALITY';
-    return protocol;
+  const protocolDisplay = link => {
+    const scheme = /^([A-Za-z][A-Za-z0-9+.-]*):/.exec(link.uri);
+    const protocol = scheme ? scheme[1] : String(link.protocol || 'URI');
+    if (/^vless$/i.test(protocol)) {
+      const parts = ['VLESS'];
+      let transport = '';
+      let security = '';
+      try {
+        // Inspect native query fields for display only; never serialize the URL
+        // back into the link, its QR, or the clipboard payload.
+        const query = new URL(link.uri).searchParams;
+        transport = (query.get('type') || '').toLowerCase();
+        security = (query.get('security') || '').toLowerCase();
+      } catch (_) { /* Unknown/malformed VLESS remains a generic VLESS node. */ }
+      if (transport === 'xhttp') parts.push('XHTTP');
+      if (security === 'reality') parts.push('REALITY');
+      else if (security === 'tls') parts.push('TLS');
+      return { name: parts.join(' / '), icon: transport === 'xhttp' ? 'X' : security === 'reality' ? 'R' : 'V', scheme };
+    }
+    if (/^(hy2|hysteria2|hysteria)$/i.test(protocol)) return { name: 'Hysteria2', icon: 'H2', scheme };
+    return { name: protocol, icon: 'URI', scheme };
   };
   const renderCard = (link, device) => {
     const card = make('article', `connection-card ${link.kind}`);
     const topline = make('div', 'card-topline');
     const isSubscription = link.kind === 'subscription';
-    topline.append(make('span', 'protocol-icon', isSubscription ? '订' : /hysteria|hy2/i.test(link.protocol) ? 'H2' : 'R'));
-    const scheme = /^([A-Za-z][A-Za-z0-9+.-]*):/.exec(link.uri);
-    topline.append(make('span', 'protocol-tag', `${protocolName(link.protocol)}${scheme ? ` · ${scheme[1]}://` : ''}`));
+    const display = protocolDisplay(link);
+    topline.append(make('span', 'protocol-icon', isSubscription ? '订' : display.icon));
+    // Subscription names describe the target client, not the HTTPS transport.
+    const name = isSubscription ? String(link.protocol || 'URI') : display.name;
+    topline.append(make('span', 'protocol-tag', `${name}${display.scheme ? ` · ${display.scheme[1]}://` : ''}`));
     card.append(topline, make('h3', '', link.label), make('p', 'card-description', isSubscription ? '使用对应客户端的订阅导入功能。' : '原生链接 · 连接凭据默认隐藏'));
     const actions = make('div', 'card-actions');
     const show = make('button', 'button primary', '显示二维码');
