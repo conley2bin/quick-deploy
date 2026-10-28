@@ -15,7 +15,6 @@ import json
 import os
 from pathlib import Path
 import shutil
-import signal
 import sqlite3
 import ssl
 import subprocess
@@ -329,7 +328,6 @@ class NativeDual(unittest.TestCase):
         return server
 
     def client(self, profile, protocol='hysteria2', trust=None):
-        import yaml
         proxy = copy.deepcopy(next(p for p in profile['proxies'] if p['type'] == protocol))
         # Only advertised endpoint is redirected to this disposable loopback
         # server. All native protocol/auth/TLS/REALITY fields stay intact.
@@ -342,29 +340,7 @@ class NativeDual(unittest.TestCase):
         config = {'mixed-port': port, 'bind-address': '127.0.0.1', 'allow-lan': False, 'log-level': 'info',
                   'dns': {'enable': False}, 'tun': {'enable': False}, 'proxies': [proxy],
                   'proxy-groups': [{'name': 'PROXY', 'type': 'select', 'proxies': [proxy['name']]}], 'rules': ['MATCH,PROXY']}
-        path = directory / 'config.yaml'; path.write_text(yaml.safe_dump(config))
-        proc = subprocess.Popen([vps.resolve_mihomo(), '-d', str(directory), '-f', str(path)],
-            env=dict(os.environ, SSL_CERT_FILE=str(trust_file)), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, start_new_session=True)
-        ready = threading.Event()
-        if not hasattr(self, '_client_log_paths'):
-            self._client_log_paths = {}
-        self._client_log_paths[port] = directory / 'private.log'
-        def capture():
-            with (directory / 'private.log').open('w') as log:
-                for line in proc.stdout:
-                    log.write(line); log.flush()
-                    if 'proxy listening at:' in line: ready.set()
-        threading.Thread(target=capture, daemon=True).start()
-        def stop():
-            if proc.poll() is None:
-                os.killpg(proc.pid, signal.SIGTERM)
-                try: proc.wait(timeout=5)
-                except subprocess.TimeoutExpired: os.killpg(proc.pid, signal.SIGKILL); proc.wait()
-            proc.stdout.close()
-        self.addCleanup(stop)
-        self.assertTrue(ready.wait(10), 'Owned Mihomo listener readiness event missing')
-        return port
+        return native.start_mihomo(self, directory, config, trust_file)
 
     def https(self, port, origin):
         def core_children():

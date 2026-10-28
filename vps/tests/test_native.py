@@ -15,6 +15,7 @@ import ssl
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from unittest import mock
@@ -30,6 +31,67 @@ def free_port():
     with socket.socket() as sock:
         sock.bind(('127.0.0.1', 0))
         return sock.getsockname()[1]
+
+
+def start_mihomo(test, directory, config, trust=None):
+    """Start one owned client; listener/selector presence precedes tunnel readiness."""
+    import yaml
+    config = copy.deepcopy(config)
+    controller, secret = free_port(), os.urandom(24).hex()
+    config.update({'external-controller': '127.0.0.1:' + str(controller), 'secret': secret})
+    path, logfile = directory / 'config.yaml', directory / 'private.log'
+    host.atomic(path, yaml.safe_dump(config))
+    environment = dict(os.environ)
+    if trust is not None:
+        environment['SSL_CERT_FILE'] = str(trust)
+    process = subprocess.Popen([vps.resolve_mihomo(), '-d', str(directory), '-f', str(path)],
+        env=environment, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True, start_new_session=True)
+    ready = threading.Event()
+    def capture():
+        with logfile.open('w') as log:
+            for line in process.stdout:
+                log.write(line); log.flush()
+                if 'proxy listening at:' in line:
+                    ready.set()
+    worker = threading.Thread(target=capture, daemon=True)
+    worker.start()
+    def stop():
+        if process.poll() is None:
+            os.killpg(process.pid, signal.SIGTERM)
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                os.killpg(process.pid, signal.SIGKILL); process.wait()
+        worker.join(timeout=2)
+        process.stdout.close()
+    test.addCleanup(stop)
+    port = config.get('mixed-port') or config['socks-port']
+    if not hasattr(test, '_client_log_paths'):
+        test._client_log_paths = {}
+    test._client_log_paths[port] = logfile
+    test.assertTrue(ready.wait(10), 'Owned Mihomo listener event missing; private log: ' + str(logfile))
+    # Mihomo v1.19.32 ACKs SOCKS/CONNECT before tunnel.OnRunning(). The
+    # controller serializes ApplyConfig and returns only after OnRunning;
+    # reapply identical private bytes, never the desktop controller/config.
+    opener = build_opener(ProxyHandler({}))
+    endpoint = 'http://127.0.0.1:' + str(controller)
+    headers = {'Authorization': 'Bearer ' + secret, 'Content-Type': 'application/json'}
+    started = time.monotonic()
+    request = Request(endpoint + '/configs', data=json.dumps({'path': str(path)}).encode(),
+                      headers=headers, method='PUT')
+    with opener.open(request, timeout=8) as response:
+        test.assertEqual(response.status, 204, 'Owned Mihomo ApplyConfig barrier failed')
+    with opener.open(Request(endpoint + '/proxies/PROXY', headers=headers), timeout=2) as response:
+        group = json.load(response)
+    expected = next(g['proxies'] for g in config['proxy-groups'] if g['name'] == 'PROXY')
+    test.assertEqual(group['now'], expected[0])
+    test.assertEqual(group['all'], expected)
+    if not hasattr(test, '_mihomo_readiness'):
+        test._mihomo_readiness = []
+    test._mihomo_readiness.append({'barrier': 'authenticated-serialized-ApplyConfig-204',
+        'elapsedSeconds': round(time.monotonic() - started, 6), 'selected': group['now'], 'all': group['all']})
+    return port
 
 
 @unittest.skipUnless(os.environ.get('QD_VPS_ARTIFACTS'), 'Native release test requires explicit QD_VPS_ARTIFACTS; unit fixtures are not native evidence')
@@ -682,18 +744,10 @@ class Native(unittest.TestCase):
             proxy = copy.deepcopy(proxy); proxy['server'] = '127.0.0.1'
             proxy['port'] = self.manifest['config']['proxy_port']
             port = free_port()
-            config = {'socks-port':port,'bind-address':'127.0.0.1','allow-lan':False,'log-level':'silent',
+            config = {'socks-port':port,'bind-address':'127.0.0.1','allow-lan':False,'log-level':'info',
                       'dns':{'enable':False},'tun':{'enable':False},'proxies':[proxy],
                       'proxy-groups':[{'name':'PROXY','type':'select','proxies':[proxy['name']]}],'rules':['MATCH,PROXY']}
-            host.atomic(directory / 'config.yaml', yaml.safe_dump(config))
-            process = subprocess.Popen([shutil.which('verge-mihomo') or shutil.which('mihomo'),'-d',str(directory),
-                                        '-f',str(directory/'config.yaml')], stdout=self.log, stderr=self.log)
-            self.addCleanup(lambda: (process.terminate(), process.wait(timeout=10)))
-            for _ in range(100):
-                try:
-                    with socket.create_connection(('127.0.0.1',port),timeout=.1): break
-                except OSError: time.sleep(.05)
-            return port
+            return start_mihomo(self, directory, config)
         def echo(port):
             stream = socket.create_connection(('127.0.0.1',port),timeout=3)
             stream.settimeout(3)
