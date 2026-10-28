@@ -2537,7 +2537,7 @@ def auth_core_epoch(folder):
 def auth_live_users(folder, tag):
     """Pinned Xray HandlerService read; never the panel's cached projection."""
     result = run([Path(folder) / 'bin/xray-linux-amd64', 'api', 'inbounduser',
-                  '--server=127.0.0.1:' + str(API_PORT), '-tag=' + tag, '-timeout=3'], timeout=5)
+                  '--server=127.0.0.1:' + str(API_PORT), '-tag=' + tag, '-timeout=6'], timeout=8)
     try:
         users = json.loads(result.stdout)['users']
         if not isinstance(users, list):
@@ -2560,8 +2560,10 @@ def auth_uuid_key(value):
 
 def auth_native_state(folder, manifest):
     check_lease()
-    process_health()
+    binary_health(Path(folder))
     api = wait_api(manifest)
+    live = auth_live_users(folder, 'SELF-cdn')  # Blocking native gRPC readiness after restart.
+    process_health()
     owned_host_group(folder, api, manifest)
     hysteria_health(folder, manifest, api)
     accounts = snapshot_accounts(Path(folder) / 'db/x-ui.db', manifest)
@@ -2573,7 +2575,6 @@ def auth_native_state(folder, manifest):
     if len(vless) != 1 or vless[0].get('tag') != 'SELF-cdn':
         raise Error('Auth diagnostic requires the single owned native VLESS ingress')
     generated = {c['email']: c['id'] for c in vless[0]['settings']['clients']}
-    live = auth_live_users(folder, vless[0]['tag'])
     if not generated or live != generated:
         raise Error('Native VLESS registry disagrees with generated configuration')
     authority = {c['email']: c['id'] for c in accounts.values()}
