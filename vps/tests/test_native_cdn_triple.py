@@ -200,7 +200,16 @@ class NativeCDNTriple(unittest.TestCase):
         self.assertEqual([j for j in rows['client_inbounds'] if j['inbound_id'] != cdn_id], old_rows['client_inbounds'])
         self.assertTrue(all(j['flow_override'] == (VISION if j['inbound_id'] == main_id else '') for j in rows['client_inbounds']))
         h2_id = fx.manifest['hysteria2']['inbound_id']
-        self.assertEqual(next(i for i in inbounds if i['id'] == h2_id), next(i for i in old_inbounds if i['id'] == h2_id))
+        h2_before = next(i for i in old_inbounds if i['id'] == h2_id)
+        h2_after = next(i for i in inbounds if i['id'] == h2_id)
+        self.assertEqual({k: v for k, v in h2_before.items() if k != 'clientStats'},
+                         {k: v for k, v in h2_after.items() if k != 'clientStats'})
+        self.assertEqual(next(i for i in rows['inbounds'] if i['id'] == h2_id),
+                         next(i for i in old_rows['inbounds'] if i['id'] == h2_id))
+        # Pinned AddClientStat upserts shared email's traffic.inbound_id to the
+        # newly added inbound; this is a projection association, not H2 config.
+        self.assertEqual(h2_after['clientStats'], [dict(row, inboundId=cdn_id) for row in h2_before['clientStats']])
+        self.summary['native_shared_client_stats_inbound_id'] = {'before': h2_id, 'after': cdn_id}
         self.assertEqual([h for h in rows['hosts'] if h['inbound_id'] == h2_id], [h for h in old_rows['hosts'] if h['inbound_id'] == h2_id])
         old_host = next(h for h in old_rows['hosts'] if h['inbound_id'] == main_id)
         new_host = next(h for h in rows['hosts'] if h['inbound_id'] == main_id)
