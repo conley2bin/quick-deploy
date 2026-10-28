@@ -103,6 +103,20 @@ class NativeThreeMappings(unittest.TestCase):
             with self.assertRaises(ValueError):
                 native_nodes({'proxies': invalid})
 
+    def test_tag_seam_compares_complete_decoded_inbound_policy(self):
+        expected = {'id': 7, 'port': 9443, 'tag': 'in-443-tcp',
+            'settings': json.dumps({'clients': [{'id': 'synthetic', 'flow': VISION}]}),
+            'streamSettings': json.dumps({'security': 'reality', 'realitySettings': {'privateKey': 'synthetic'}}),
+            'sniffing': json.dumps({'enabled': True}), 'clientStats': [{'inboundId': 2}]}
+        actual = {k: dual.decoded(v) if k in ('settings', 'streamSettings', 'sniffing') else v
+                  for k, v in expected.items()}
+        actual['clientStats'] = [{'inboundId': 3}]
+        ThreeFixture.inbound_contract(self, expected, actual)
+        for field, wrong in (('tag', 'in-9443-tcp'), ('port', 10443),
+                             ('settings', {'clients': [{'id': 'synthetic', 'flow': ''}]})):
+            with self.subTest(field=field), self.assertRaises(AssertionError):
+                ThreeFixture.inbound_contract(self, expected, dict(actual, **{field: wrong}))
+
 
 class ThreeFixture:
     # Compose shared process/digest/readiness helpers, not any capability tests.
@@ -168,6 +182,24 @@ class ThreeFixture:
         main.update(port=port, tag=self.original_tag, listen='0.0.0.0', streamSettings=json.dumps(stream))
         self.save('input-reality-update.private.json', main)
         api.call('/panel/api/inbounds/update/' + str(self.main_id), main)
+        moved = next(i for i in api.call('/panel/api/inbounds/list') if i['id'] == self.main_id)
+        # Pinned UpdateInbound regenerates an unchanged old AUTOMATIC tag when
+        # the port moves. Verify that exact transition before the second update;
+        # never silently adopt or overwrite an unexplained native tag.
+        self.assertEqual(self.original_tag, 'in-' + str(fx.manifest['config']['proxy_port']) + '-tcp')
+        self.assertEqual(moved['tag'], 'in-' + str(port) + '-tcp')
+        self.inbound_contract(dict(main, tag=moved['tag']), moved)
+        for name, record in before.items():
+            self.record_contract(record, fx.records()[name], earliest[name], ('updatedAt',))
+        self.persisted_contract(old['clients'], fx.rows('clients'), ('created_at', 'updated_at'))
+        retagged = copy.deepcopy(moved)
+        retagged['tag'] = self.original_tag  # now explicitly different from current
+        self.save('input-reality-retag.private.json', retagged)
+        api.call('/panel/api/inbounds/update/' + str(self.main_id), retagged)
+        main = next(i for i in api.call('/panel/api/inbounds/list') if i['id'] == self.main_id)
+        self.assertEqual(main['tag'], self.original_tag, 'Second native update failed to retain original tag')
+        self.inbound_contract(retagged, main)
+        self.save('input-reality-final-readback.private.json', main)
         group = api.call('/panel/api/hosts/get/' + self.original_group)
         group.update(hosts=[fx.manifest['endpoint']], port=port)
         api.call('/panel/api/hosts/update/' + group['groupId'], group)
@@ -243,6 +275,16 @@ class ThreeFixture:
             'module_migration_commit_proof': False, 'public_cloudflare': False, 'production_443_acme': False,
             'createdAt_boundary': 'predicted earliest native timestamp; same second; delta<1000ms',
             'shared_client_stats': 'inboundId is new association, not membership or accounting accuracy'})
+
+    def inbound_contract(self, expected, actual):
+        # API JSON fields are decoded on GET; compare semantic complete objects.
+        # clientStats is the documented shared association, not inbound policy.
+        def policy(inbound):
+            return {k: dual.decoded(v) if k in ('settings', 'streamSettings', 'sniffing') else v
+                    for k, v in inbound.items() if k != 'clientStats'}
+        old, new = policy(expected), policy(actual)
+        changed = sorted(k for k in old.keys() | new.keys() if old.get(k) != new.get(k))
+        self.assertFalse(changed, 'Native inbound fields changed across tag seam (values withheld): ' + ','.join(changed))
 
     def persisted_contract(self, before, after, except_fields=()):
         """Full persisted globals, including fields omitted from Client DTOs."""
