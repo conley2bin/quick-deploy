@@ -2293,9 +2293,7 @@ def devices_prepare(upload, transport=False):
             if cdn_enabled(manifest):
                 if manifest['tcp_cdn']['domain'] != request['tcp_cdn']['domain']:
                     raise Error('CDN domain differs from the owned target')
-                backend_health(ROOT / 'active', manifest)
-                tls_probe(manifest)
-                process_health()
+                raise Error('Owned CDN is already committed; a fresh CDN verification transaction is unsupported')
             elif not dual_enabled(manifest):
                 raise Error('CDN migration requires the exact REALITY+Hysteria2 source')
             else:
@@ -2606,13 +2604,21 @@ def auth_directory(pending):
     return ROOT / ('auth-witness-' + pending['operation_id'])
 
 
+def auth_log_path(pending, record):
+    # Pinned panel confines every template log path to XUI_LOG_FOLDER/basename.
+    return ROOT / 'active/logs' / ('qd-auth-' + pending['operation_id'] + '-' + record['nonce'] + '.log')
+
+
 def auth_file(pending, record):
     directory = auth_directory(pending)
     ds = directory.lstat()
+    logs = (ROOT / 'active/logs').lstat()
     if (not stat.S_ISDIR(ds.st_mode) or ds.st_uid != os.getuid() or stat.S_IMODE(ds.st_mode) != 0o700 or
-            [ds.st_dev, ds.st_ino] != record['directory_identity']):
+            [ds.st_dev, ds.st_ino] != record['directory_identity'] or
+            not stat.S_ISDIR(logs.st_mode) or logs.st_uid != os.getuid() or
+            [logs.st_dev, logs.st_ino] != record['logs_identity']):
         raise Error('Auth witness directory identity changed')
-    fd = os.open(directory / 'error.log', os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    fd = os.open(auth_log_path(pending, record), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     try:
         info = os.fstat(fd)
         if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o600 or
@@ -2635,7 +2641,7 @@ def auth_cleanup(pending):
     if (not stat.S_ISDIR(ds.st_mode) or ds.st_uid != os.getuid() or stat.S_IMODE(ds.st_mode) != 0o700 or
             ('directory_identity' in record and [ds.st_dev, ds.st_ino] != record['directory_identity'])):
         raise Error('Refusing foreign auth diagnostic directory cleanup')
-    path = directory / 'error.log'
+    path = auth_log_path(pending, record)
     if path.exists() or path.is_symlink():
         if 'file_identity' in record:
             with auth_file(pending, record):
@@ -2666,8 +2672,9 @@ def transport_auth_begin(request):
             state, _ = auth_native_state(active, manifest)
             raw, _ = auth_template(active)
             with auth_file(pending, record) as stream:
-                if os.fstat(stream.fileno()).st_size < record['offset']:
-                    raise Error('Auth witness truncated')
+                if (os.fstat(stream.fileno()).st_size < record['offset'] or
+                        hashlib.sha256(stream.read(record['offset'])).hexdigest() != record['prefix_sha256']):
+                    raise Error('Auth witness truncated or replaced')
             if (auth_core_epoch(active) != record['epoch'] or state != record['native_state'] or
                     raw != record['temporary_template']):
                 raise Error('Active auth diagnostic changed; recovery required')
@@ -2693,13 +2700,18 @@ def transport_auth_begin(request):
         ds = directory.lstat()
         record['directory_identity'] = [ds.st_dev, ds.st_ino]
         atomic(ROOT / 'pending.json', dumps(pending))
-        fd = os.open(directory / 'error.log', os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
+        logs = (active / 'logs').lstat()
+        if not stat.S_ISDIR(logs.st_mode) or logs.st_uid != os.getuid():
+            raise Error('Foreign native log directory')
+        record['logs_identity'] = [logs.st_dev, logs.st_ino]
+        atomic(ROOT / 'pending.json', dumps(pending))
+        fd = os.open(auth_log_path(pending, record), os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
         with os.fdopen(fd, 'wb') as stream:
             stream.flush(); os.fsync(stream.fileno())
             info = os.fstat(stream.fileno())
         record['file_identity'] = [info.st_dev, info.st_ino]
         record['offset'] = info.st_size
-        template['log'] = {'access': 'none', 'error': str(directory / 'error.log'), 'loglevel': 'info'}
+        template['log'] = {'access': 'none', 'error': str(auth_log_path(pending, record)), 'loglevel': 'info'}
         record['temporary_template'] = json.dumps(template)
         record['started_at'] = time.time()
         atomic(ROOT / 'pending.json', dumps(pending))
@@ -2710,10 +2722,14 @@ def transport_auth_begin(request):
         ctl('start', PANEL)
         wait_api(manifest)
         current, _ = auth_native_state(active, manifest)
-        if current != state or auth_template(active)[0] != record['temporary_template']:
-            raise Error('Temporary logging changed native identity/configuration')
+        if (current != state or auth_template(active)[0] != record['temporary_template'] or
+                read_json(active / 'bin/config.json').get('log') != template['log']):
+            raise Error('Temporary logging changed native identity/configuration or confined log destination')
         with auth_file(pending, record) as stream:
             record['offset'] = os.fstat(stream.fileno()).st_size
+            if record['offset'] > 4 * 1024 * 1024:
+                raise Error('Auth startup witness exceeds bounded size')
+            record['prefix_sha256'] = hashlib.sha256(stream.read(record['offset'])).hexdigest()
         epoch = auth_core_epoch(active)
         if epoch == record['original_epoch']:
             raise Error('Native logger did not enter a fresh core epoch')
@@ -2731,7 +2747,8 @@ def auth_read_verdict(pending, record):
         size = os.fstat(stream.fileno()).st_size
         if size < record['offset'] or size - record['offset'] > 4 * 1024 * 1024:
             raise Error('Auth witness truncated or exceeds bounded read')
-        stream.seek(record['offset'])
+        if hashlib.sha256(stream.read(record['offset'])).hexdigest() != record['prefix_sha256']:
+            raise Error('Auth witness truncated and regrown')
         data = stream.read(4 * 1024 * 1024 + 1)
     nonce = re.escape(record['nonce'])
     pattern = (rb'^(\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2}\.\d{6}) \[Info\] \[\d+\] '
@@ -2785,11 +2802,6 @@ def transport_auth_finish(request):
     record['phase'] = 'restoring'
     atomic(ROOT / 'pending.json', dumps(pending))
     settings_write(active / 'db/x-ui.db', {'xrayTemplateConfig': record['original_template']})
-    cleanup_failed = False
-    try:
-        auth_cleanup(pending)
-    except Exception as exc:
-        failure, cleanup_failed = exc, True
     check_lease()
     ctl('start', PANEL)
     wait_api(manifest)
@@ -2798,6 +2810,11 @@ def transport_auth_finish(request):
             read_json(active / 'bin/config.json').get('log') != json.loads(record['original_template'])['log']):
         raise Error('Auth diagnostic restoration changed native identity/configuration/logging')
     check_lease()
+    cleanup_failed = False
+    try:
+        auth_cleanup(pending)  # The old writer is closed and restored logging verified.
+    except Exception as exc:
+        failure, cleanup_failed = exc, True
     identity = record['native_identity_sha256']
     verdict = {'schema': 1, 'operation_id': request['operation_id'], 'request_fingerprint': fingerprint,
                'nonce_sha256': hashlib.sha256(record['nonce'].encode()).hexdigest(), 'rejected': True,
@@ -2823,7 +2840,8 @@ def auth_commit_verdict(request, pending, fingerprint):
             verdict.get('operation_id') != request['operation_id'] or verdict.get('request_fingerprint') != fingerprint or
             verdict.get('nonce_sha256') != record.get('nonce_sha256') or
             not re.fullmatch(r'[0-9a-f]{64}', verdict.get('nonce_sha256', '')) or
-            auth_directory(pending).exists() or auth_directory(pending).is_symlink()):
+            auth_directory(pending).exists() or auth_directory(pending).is_symlink() or
+            any((ROOT / 'active/logs').glob('qd-auth-' + pending['operation_id'] + '-*.log'))):
         raise Error('CDN commit requires its bound restored native auth verdict and no active diagnostic')
     active = ROOT / 'active'
     raw, template = auth_template(active)

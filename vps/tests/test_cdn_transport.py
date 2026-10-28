@@ -186,6 +186,7 @@ class CdnHost(unittest.TestCase):
 
     def install_auth_runtime(self):
         epoch = {'boot_id': self.h.boot_id(), 'pid': 55, 'start_ticks': 10}
+        (self.active / 'logs').mkdir(mode=0o700, exist_ok=True)
         original_ctl = self.h.ctl.side_effect
         def generated():
             _, template = self.h.auth_template(self.active)
@@ -214,7 +215,7 @@ class CdnHost(unittest.TestCase):
         self.install_auth_runtime()
         begun = self.h.transport_auth_begin(self.request)
         pending = self.h.read_json(self.h.ROOT / 'pending.json')
-        path = self.h.auth_directory(pending) / 'error.log'
+        path = self.h.auth_log_path(pending, pending['cdn_auth'])
         line = datetime.now().strftime('%Y/%m/%d %H:%M:%S.%f') + ' [Info] [123] app/proxyman/inbound: connection ends > proxy/vless/inbound: invalid request from 127.0.0.1:4567 > proxy/vless/encoding: invalid request user id: ' + begun['nonce'] + '\n'
         with path.open('a') as stream: stream.write(line)
         return self.h.transport_auth_finish(dict(self.request, cdn_auth_nonce=begun['nonce']))
@@ -593,7 +594,7 @@ class AuthWitness(unittest.TestCase):
     def begin(self):
         self.begun = self.h.transport_auth_begin(self.request)
         self.pending = self.h.read_json(self.h.ROOT / 'pending.json')
-        self.path = self.h.auth_directory(self.pending) / 'error.log'
+        self.path = self.h.auth_log_path(self.pending, self.pending['cdn_auth'])
         return self.begun
 
     def append(self, nonce=None, when=None):
@@ -621,7 +622,7 @@ class AuthWitness(unittest.TestCase):
             self.assertEqual(set(result), {'schema', 'operation_id', 'request_fingerprint', 'nonce', 'native_identity_sha256'})
             self.assertEqual(self.path.stat().st_mode & 0o777, 0o600)
             self.assertEqual(self.path.parent.stat().st_mode & 0o777, 0o700)
-            self.assertNotIn(self.active, self.path.parents)
+            self.assertEqual(self.path.parent, self.active / 'logs')
             self.assertEqual(self.begin(), result, 'Begin lost ACK must reuse the nonce and logger')
             self.append()
             finished = self.finish()
@@ -658,7 +659,7 @@ class AuthWitness(unittest.TestCase):
 
     def test_processuuid_registered_collision_regenerates_boundedly(self):
         import uuid
-        registered = next(iter(self.owner.model.records.values()))['uuid']
+        registered = list(self.owner.model.records.values())[1]['uuid']
         raw = bytearray(uuid.UUID(registered).bytes); raw[6] ^= 0x0f; raw[7] ^= 0xff
         equivalent = uuid.UUID(bytes=bytes(raw))
         self.assertNotEqual(str(equivalent), registered)
@@ -686,10 +687,55 @@ class AuthWitness(unittest.TestCase):
         self.assertTrue(self.path.exists()); self.assertTrue(original.exists())
         self.assertTrue((self.h.ROOT / 'pending.json').exists())
 
-    def test_epoch_change_and_wrong_nonce_fail_after_restoration(self):
+    def test_epoch_change_fails_after_restoration(self):
         self.begin(); self.append(); self.epoch['start_ticks'] += 1
+        with self.assertRaisesRegex(self.h.Error, 'verdict unavailable'): self.finish()
+        self.assert_restored()
+
+    def test_wrong_nonce_fails_after_restoration(self):
+        self.begin(); self.append()
         with self.assertRaisesRegex(self.h.Error, 'verdict unavailable'): self.finish('00000000-0000-4000-8000-000000000001')
         self.assert_restored()
+
+    def test_truncate_regrow_over_offset_still_refuses_verdict(self):
+        self.begin()
+        self.path.write_bytes(b'foreign prefix replaces original startup marker\n')
+        self.append()
+        self.assertGreater(self.path.stat().st_size, self.pending['cdn_auth']['offset'])
+        with self.assertRaisesRegex(self.h.Error, 'verdict unavailable'): self.finish()
+        self.assert_restored()
+
+    def test_crash_after_template_write_rolls_back_original_db_and_owned_file(self):
+        original_write = self.h.settings_write
+        def crash_after_write(database, values):
+            original_write(database, values)
+            if 'xrayTemplateConfig' in values and json.loads(values['xrayTemplateConfig'])['log']['loglevel'] == 'info':
+                os._exit(77)
+        pid = os.fork()
+        if pid == 0:
+            with mock.patch.object(self.h, 'settings_write', side_effect=crash_after_write): self.begin()
+            os._exit(99)
+        _, status = os.waitpid(pid, 0)
+        self.assertEqual(os.waitstatus_to_exitcode(status), 77)
+        pending = self.h.read_json(self.h.ROOT / 'pending.json')
+        path = self.h.auth_log_path(pending, pending['cdn_auth'])
+        self.assertTrue(path.exists())
+        self.assertEqual(pending['cdn_auth']['phase'], 'arming')
+        self.assertTrue(self.h.abort(self.request)['queued'])
+        self.assertFalse(path.exists())
+        self.assertEqual((self.active / 'db/x-ui.db').read_bytes(), (self.h.ROOT / 'device-rollback/x-ui.db').read_bytes())
+
+    def test_postrestore_policy_log_and_order_drift_cannot_commit(self):
+        self.begin(); self.append(); self.finish()
+        pending = self.h.read_json(self.h.ROOT / 'pending.json')
+        original = self.h.read_json(self.active / 'bin/config.json')
+        for mutate in (lambda c: c['outbounds'].reverse(), lambda c: c.update(log={'access': 'none', 'error': 'foreign.log', 'loglevel': 'info'})):
+            config = copy.deepcopy(original); mutate(config)
+            self.h.atomic(self.active / 'bin/config.json', self.h.dumps(config))
+            with self.assertRaises(self.h.Error): self.h.auth_commit_verdict(self.request, pending, self.h.transport_request(self.request))
+        self.h.atomic(self.active / 'bin/config.json', self.h.dumps(original))
+        self.owner.model.records['company']['limitHwid'] += 1
+        with self.assertRaises(self.h.Error): self.h.auth_commit_verdict(self.request, pending, self.h.transport_request(self.request))
 
     def test_restore_failure_leaves_guard_armed_and_commit_denied(self):
         self.begin(); self.append()
@@ -715,7 +761,7 @@ class AuthWitness(unittest.TestCase):
         self.assertEqual(self.h.transport_commit(request)['cdn_auth_verdict']['rejected'], True)
 
     def test_deadline_and_crash_recovery_remove_only_owned_logger(self):
-        self.begin(); directory = self.path.parent
+        self.begin(); directory = self.h.auth_directory(self.pending)
         unrelated = self.h.ROOT / 'auth-witness-foreign'; unrelated.mkdir(); (unrelated / 'keep').write_bytes(b'keep')
         pending = self.h.read_json(self.h.ROOT / 'pending.json'); pending['deadline'] = 0
         self.h.atomic(self.h.ROOT / 'pending.json', self.h.dumps(pending))
@@ -874,8 +920,8 @@ class SourceNativeCDN(unittest.TestCase):
                 if pending.is_file():
                     host.atomic(destination / 'retained-pending.json', pending.read_bytes())
                     state = host.read_json(pending)
-                    if state.get('cdn_auth'):
-                        path = host.auth_directory(state) / 'error.log'
+                    if state.get('cdn_auth', {}).get('nonce'):
+                        path = host.auth_log_path(state, state['cdn_auth'])
                         if path.is_file(): host.atomic(destination / 'retained-witness.log', path.read_bytes())
             self.addCleanup(retain_private)
         fx.seed_policy(); fx.enable()
