@@ -558,6 +558,9 @@ CF 侧手动改动不在 guest 回滚范围内，操作员把 cdn 转回灰云�
 remove 删除全局身份与全部 join。每次原生变更后重新断言 per-role flow。三入口冷恢复保留入站 ID/逻辑 Host
 group ID/tag、选定 REALITY 端口、CDN 域名/path/Host TLS 与 H2 原证书绑定；replace 遵循既有轮换语义。
 已知 createdAt 毫秒尾数归一披露不变，不做账户 SQL 或政策放宽。
+设备事务等待离机备份/receipt 期间，在线 FRONT 仍保留旧精确订阅路径；未发布三入口候选归档在临时打包目录
+按候选 manifest 生成不发布订阅的 Caddyfile，冷恢复时与其 published=false 精确一致。在线 FRONT、回滚快照及
+已存在的原始归档不因此改写；已提交归档仍保留原配置字节，归档校验不接受任意 front 配置。
 原生 AddClientStat 会把共享流量行的 inboundId 重指到新增入站，H2 API clientStats 因此反映该共享关联；
 这不是 H2 传输归属或 join 成员关系变化，不据此断言配额/统计精度（下文统计限制不变）。
 

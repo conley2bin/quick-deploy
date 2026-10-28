@@ -2005,6 +2005,12 @@ def export_backup(request=None):
             manifest['accounts'] = snapshot_accounts(stage / 'deployment/db/x-ui.db', manifest)
             manifest['host_group_id'] = snapshot_host_group(stage / 'deployment/db/x-ui.db', manifest)
             atomic(stage / 'deployment/manifest.json', dumps(manifest))
+            if cdn_enabled(manifest) and not manifest['published']:
+                # Device prepare keeps OLD live feed paths until its receipt.
+                # The unpublished candidate archive must instead restore its
+                # own private front, without publishing new capabilities or
+                # changing the active/rollback front configuration.
+                atomic(stage / 'deployment/Caddyfile', caddyfile(manifest, False))
             metadata.update(format=FORMAT, encryption='none', panel_version=read_json(active / 'release-lock.json')['panel']['version'])
             atomic(stage / 'database-schema.sql', metadata.pop('schema'))
             atomic(stage / 'backup.json', dumps(metadata))

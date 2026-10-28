@@ -518,8 +518,19 @@ class CdnHost(unittest.TestCase):
                                                 ('reset', ['work']), ('remove', ['tablet'])), 3):
             request = {k: v for k, v in self.base.request.items() if k not in ('mode', 'before_sha256')}
             request.update(device_action=action, names=names, operation_id=str(index) * 32)
+            live_front = (self.active / 'Caddyfile').read_bytes()
             self.h.devices_prepare(self.base.upload(request))
             current = self.h.read_json(self.active / 'manifest.json')
+            self.assertEqual((self.active / 'Caddyfile').read_bytes(), live_front)
+            self.assertEqual((self.h.ROOT / 'device-rollback/Caddyfile').read_bytes(), live_front)
+            archive = self.h.export_backup()
+            stage = self.f.root / ('verified-device-' + action); stage.mkdir()
+            with archive.open('rb') as stream:
+                self.h.safe_unpack(stream, stage)
+            candidate = self.h.verify_backup(stage, self.f.request['lock'])
+            self.assertFalse(candidate['published'])
+            self.assertEqual((stage / 'deployment/Caddyfile').read_text(), self.h.caddyfile(candidate, False))
+            self.assertEqual((self.active / 'Caddyfile').read_bytes(), live_front)
             with sqlite3.connect(self.model.database) as db:
                 joins = db.execute('select client_id,inbound_id from client_inbounds').fetchall()
                 self.assertEqual(len(joins), 3 * len(current['accounts']))
