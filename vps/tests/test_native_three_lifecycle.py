@@ -311,6 +311,10 @@ class ThreeFixture:
     def control(self, action, *units):
         if action == 'daemon-reload':
             return
+        if '--no-block' in units:
+            self.assertEqual(action, 'start')
+            self.assertEqual(units.count('--no-block'), 1)
+            units = tuple(unit for unit in units if unit != '--no-block')
         for unit in units:
             if action in ('enable', 'disable') or unit in (host.RECOVER, host.TIMER):
                 continue
@@ -327,6 +331,21 @@ class ThreeFixture:
                     self.stop_front()
                 if action in ('start', 'restart'):
                     self.start_front()
+
+    def origin(self):
+        origin = self.fx.origin()
+        # The shared traffic fixture inserts its narrow loopback-origin rule
+        # first. Preserve the real module's management-rule-first invariant.
+        self.fx.fx.stop()
+        raw, template = host.auth_template(self.fx.folder)
+        rule = host.management_rule(template, self.fx.manifest, 'SELF-h2')
+        rules = template['routing']['rules']
+        self.assertEqual(sum(item == rule for item in rules), 1)
+        template['routing']['rules'] = [rule] + [item for item in rules if item != rule]
+        host.settings_write(self.fx.folder / 'db/x-ui.db', {'xrayTemplateConfig': json.dumps(template)})
+        self.fx.fx.start()
+        host.hysteria_health(self.fx.folder, self.fx.manifest, self.fx.api())
+        return origin
 
     def stop_front(self):
         if self.front is not None and self.front.poll() is None:
@@ -627,7 +646,7 @@ class NativeThreeDevices(ThreeFixture, unittest.TestCase):
         host.backend_health(fx.folder, fx.manifest)
         before, earliest = fx.records(), self.earliest(fx.records())
         profile, _ = self.exports('tablet')
-        origin = fx.origin()
+        origin = self.origin()
         origin.RequestHandlerClass.protocol_version = 'HTTP/1.1'
         self.all_three(profile, origin)
         self.wrong_uuid(profile, origin)
@@ -700,7 +719,7 @@ class NativeThreeCold(ThreeFixture, unittest.TestCase):
         shutil.copy2(exported, archive); archive.chmod(0o600)
         old_digest = host.digest(archive)
         self.assertEqual(verified['tcp_cdn'], original['tcp_cdn'])
-        source_origin = fx.origin()
+        source_origin = self.origin()
         self.all_three(old_profile, source_origin)
         self.stop_front(); fx.fx.stop()
         target, units = fx.fx.root / ('fresh-three-' + mode), fx.fx.root / ('fresh-three-units-' + mode)
@@ -774,7 +793,7 @@ class NativeThreeCold(ThreeFixture, unittest.TestCase):
             self.assertTrue(host.commit(dict(request, offnode_sha256=host.digest(candidate)))['published'])
             self.assertTrue(fx.records() == after, 'Repeated publication rerotated native credentials (values withheld)')
             fx.fx.manifest = host.read_json(fx.folder / 'manifest.json')
-            origin = fx.origin()
+            origin = self.origin()
             self.all_three(old_profile, origin, mode == 'restore')
             self.all_three(profile, origin)
             self.assertTrue(fx.records() == after, 'Commit/health rerotated identities/policies (values withheld)')
