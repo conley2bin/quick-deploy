@@ -135,6 +135,8 @@ OpenSSL、systemd/`systemd-analyze`、`ss`、`nft`、可信 CA 包及至少2GiB�
 | 127.0.0.1:2053 / :2096 / :62789 | 面板 / 原生订阅后端 / Xray API；不公开 |
 | 实际 SSH 端口 | 原样保留，`--port` **只代表 SSH** |
 
+cdn 切换后 TCP443 归 Caddy（CDN TLS 终止 → 回环 XHTTP2080），UDP443 仍属 Xray H2，见下文「CDN 入口模式」。
+
 唯一代理端口设置是首次 `--proxy-port`，默认443，保存在原有四键私有 config 中；TCP与UDP共用数值，
 不与上述保留入口或实际 SSH 端口冲突。两个入站、原生导出、分开核验的TCP/UDP进程/端口及备份共用此设置。
 以后不会隐式改监听端口；换端口需单独规划迁移。没有证据表明3280更不易被封，
@@ -490,6 +492,39 @@ TCP与UDP监听分别核验PID/可执行文件/cgroup；TCP8443证书成功不�
 旧fast FakeHost只验证旧DB形状的事务控制，其enable_hysteria为明确mock、UDP inventory独立为空；
 新test_dual_transport验证双拓扑/证书/receipt边界，真实三份固定二进制的双协议行为由test_native_dual单独验证。
 所有这些均不代替真实systemd、公开ACME、公司/Y/手机实际导入和SSH-over-H2的逐路径验收。
+
+## CDN 入口模式：VLESS/XHTTP 经 Cloudflare，保留 H2
+
+`cdn` 命令把同一节点的活动 TCP 入口从 REALITY 受控切换为 Cloudflare + VLESS/XHTTP/TLS，
+复用既有 `transport-prepare` / `transport-commit` 事务（`feature=tcp-cdn`），不是新事务框架。
+最终恰好两个原生入站、两个 Host、每个 global client 两个 join：SELF-cdn 与 SELF-h2；
+不永久保留第三入口，不新增 daemon/unit/账户数据库/节点转换器/软件 pin，global FORMAT 不变。
+
+- 原 main VLESS 入站**原地**转为 127.0.0.1:2080 明文 XHTTP（security none、disableFlow）；入站 ID、
+  Host group ID、全部 UUID/Auth/SubID 与两个 join 保持，合法变化仅为 Vision flow 退役和已知 createdAt 归一。
+  Host 广告 CDN 域名:443 TLS（匹配 SNI/Host/path、ALPN h2、allowInsecure false），与回环明文入站分离。
+- Caddy 最终监听 CDN 域名:443，仅把精确 XHTTP 路径及子孙反代到 127.0.0.1:2080（不去前缀），其余路径404；
+  全局 `protocols h1 h2` 保持不变——不引入 h3，UDP443 始终属于 H2。原 sub:8443 订阅与 HTTP01:80 保留。
+  新证书是该域名在受管 Caddy storage 内唯一匹配的一对普通文件；H2 证书选择器按原订阅域名过滤，第二对证书不造成歧义。
+- Cloudflare443 → 源站443，同主机名/SNI，无长期443→8443 Origin Rule。端口归属按活动模式：
+  CDN 模式 FRONT 拥有 TCP443/8443/80，PANEL 拥有回环2080与 UDP443；REALITY 模式仍是 PANEL 拥有 TCP443。
+- config 四键不变；`tcp_cdn` 为独立 schema1 元数据（domain/inbound_id/path/mode/证书相对路径）。
+  三种精确归档模式并存：旧单 TCP、REALITY+H2、CDN+H2；旧 TAR 不改写，恢复旧归档不隐式升级模式。
+  PROXY 顺序 `[SELF-h2, SELF-cdn, DIRECT]`，H2 保持默认，无 GUI 自动选择；原生 H2 管理导出字节语义不变。
+
+事务顺序：只读核验与变更前离机备份（先安装当前 guard）→ 持久化绑定请求/回滚意图 →
+FRONT/PANEL 停止期间取**关闭的 Caddy storage 子树**与 DB/manifest/front 快照（phase=ready 前完成，半成品不用于恢复）→
+临时8443纯证书 vhost 取得新域名公开可信证书（可预测的 HTTP01 bootstrap，不宣称 HTTP01 普遍必须灰云）→
+原地转换入站/Host，FRONT 接管443 → prepared 返回绝对 deadline，订阅不发布，H2 保持默认 →
+操作员在期限内仅把 cdn 记录转橙云并确认 → 控制器基于实际原生输出，在专用 noTUN/loopback 临时客户端中探针
+（绑定物理接口；私有127控制器 PUT 相同配置待204为就绪屏障；核验真实 CF 边缘 TLS、内层 HTTPS+VPS 出口、
+错误 UUID 拒绝后正确恢复、重连/短空闲、原 H2 新鲜认证）→ 全部通过后持久化私有 proof，
+随候选归档摘要一并 commit（proof 绑定 operation/请求指纹/候选 SHA/域名，是控制器证明而非密码学远端观测，
+不设永久在线健康标志）。超时/失败走既有 abort/recover：先停 FRONT 释放443，再恢复旧 DB/manifest/
+sub:8443-only Caddyfile 与关闭的证书存储，recovering → restore-queued → 后续实际就绪（含原 H2 证书对/绑定/Auth）后才解除；
+CF 侧手动改动不在 guest 回滚范围内，操作员把 cdn 转回灰云。丢 ACK 凭 durable receipt 对账，不重放迁移或轮换。
+模块只核验原生 YAML/URI 字段，不写 converter；dashboard 仅按原生 transport/security 把该 VLESS 显示为 XHTTP/CDN，
+URI/QR 字节不变。探针所需 mihomo/PyYAML 仅属本命令，普通本地导出依赖不变。
 
 ## 已知限制与流量统计
 
