@@ -440,6 +440,46 @@ class CDNCLI(unittest.TestCase):
         self.assertEqual(samples[0]['type'], 'TimeoutError')
         self.assertEqual(samples[1]['peer'], addresses[1])
 
+    def test_optional_preferred_edge_is_invocation_only_and_default_is_absent(self):
+        self.assertIsNone(self.args.edge_ip)
+        self.args = vps.parser().parse_args(['cdn', '--domain', 'cdn.example.org', '--interface', 'eno1',
+                                            '--dns-server', '1.1.1.1', '--edge-ip', '172.67.1.2'])
+        with mock.patch.object(cdn_probe, 'resolve_a', return_value=['104.16.1.2', '172.67.1.2']), \
+                mock.patch.object(cdn_probe, 'edge_tls', return_value={'peer': '172.67.1.2', 'port': 443}) as tls:
+            self.run_cdn()
+        self.assertEqual(tls.call_args.args[1], '172.67.1.2')
+        self.assertNotIn('edge_ip', self.request)
+        self.assertNotIn('edge_ip', vps.load(self.state / 'state.json'))
+
+    def test_preferred_nonmember_or_noncf_refuses_before_backup(self):
+        for preferred, answers in (('172.67.1.2', ['104.16.1.2']), ('1.1.1.1', ['104.16.1.2']),
+                                   ('172.67.1.2', [self.record['endpoint']]),
+                                   ('172.67.1.2', ['172.67.1.2', '1.1.1.1'])):
+            self.args.edge_ip = preferred
+            self.events.clear()
+            with self.subTest(preferred=preferred, answers=answers), \
+                    mock.patch.object(cdn_probe, 'resolve_a', return_value=answers), \
+                    mock.patch.object(cdn_probe, 'edge_tls') as tls:
+                with self.assertRaisesRegex(host.Error, 'preflight failed'): self.run_cdn()
+                tls.assert_not_called()
+                self.assertEqual(self.events, ['status'])
+                self.assertFalse((self.state / 'pending.json').exists())
+
+    def test_preferred_disappears_from_postprepare_fresh_dns_aborts_before_tls_or_auth(self):
+        self.args.edge_ip = '172.67.1.2'
+        def probe(**kwargs): return REAL_CDN_PROBE(**kwargs)
+        with mock.patch.object(cdn_probe, 'validate_cdn_candidate', side_effect=probe), \
+                mock.patch.object(cdn_probe, 'resolve_a', side_effect=[['104.16.1.2', '172.67.1.2'], ['104.16.1.2']]), \
+                mock.patch.object(cdn_probe, 'edge_tls', return_value={'peer': '172.67.1.2', 'port': 443}) as tls:
+            with self.assertRaisesRegex(host.Error, 'absent from the fresh authoritative'): self.run_cdn()
+        self.assertEqual(tls.call_count, 1)
+        self.assertIn('transport-prepare', self.events)
+        self.assertIn('abort', self.events)
+        self.assertNotIn('transport-auth-begin', self.events)
+        self.assertNotIn('transport-commit', self.events)
+        self.assertFalse((self.state / 'cdn-proofs').exists())
+        self.assertFalse((self.state / 'pending.json').exists())
+
     def test_preflight_all_addresses_fail_no_backup_prepare_or_proof(self):
         with mock.patch.object(cdn_probe, 'resolve_a', return_value=['104.16.1.2', '172.67.1.2']), \
                 mock.patch.object(cdn_probe, 'edge_tls', side_effect=TimeoutError()) as tls:

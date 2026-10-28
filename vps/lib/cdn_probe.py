@@ -364,13 +364,19 @@ def edge_tls(domain, edge_ip, interface, budget):
             return {'peer': edge_ip, 'port': 443, 'tls': tls.version(), 'http': trace['http']}
 
 
-def select_edge(domain, ips, origin, interface, budget, observations=None):
+def select_edge(domain, ips, origin, interface, budget, observations=None, edge_ip=None):
     """Validate the whole fresh answer, then try at most two distinct CF edges.
 
     Only transport availability permits another address. Certificate, protocol,
     peer and trace failures remain terminal; no DNS refresh or client fallback.
     """
-    edges = list(dict.fromkeys(edge_addresses(ips, origin)))[:2]
+    edges = list(dict.fromkeys(edge_addresses(ips, origin)))
+    if edge_ip is not None:
+        preferred = public_ipv4(edge_ip)
+        if preferred not in edges:
+            raise Error('Preferred edge IP is absent from the fresh authoritative Cloudflare answer')
+        edges = [preferred] + [address for address in edges if address != preferred]
+    edges = edges[:2]
     samples = [] if observations is None else observations
     failures = []
     for address in edges:
@@ -666,7 +672,7 @@ def normalized_uuid(value):
 
 def validate_cdn_candidate(*, profile_bytes, manifest, before_manifest, device, request,
                            request_fingerprint, candidate_sha256, interface, dns_server, binary, deadline,
-                           auth_begin, auth_finish, final_candidate, observations=None):
+                           auth_begin, auth_finish, final_candidate, observations=None, edge_ip=None):
     """Return exact schema1 successful attestation, never partial proof or raw nodes."""
     try:
         budget = Budget(min(deadline - COMMIT_MARGIN, time.time() + PROBE_SECONDS))
@@ -685,7 +691,7 @@ def validate_cdn_candidate(*, profile_bytes, manifest, before_manifest, device, 
             raise Error('Candidate changed original Hysteria2/account identity')
         ips = resolve_a(domain, interface, dns_server, budget)
         samples = [] if observations is None else observations
-        edge_ip = select_edge(domain, ips, manifest['endpoint'], interface, budget, samples)
+        edge_ip = select_edge(domain, ips, manifest['endpoint'], interface, budget, samples, edge_ip=edge_ip)
         def client(node):
             return Client(binary, node, domain, edge_ip, interface, dns_server, budget)
         def https(active, name, edge=None):

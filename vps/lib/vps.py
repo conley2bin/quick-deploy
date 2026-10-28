@@ -1087,7 +1087,7 @@ def cdn_evidence(state, document, record, request, fingerprint, candidate, befor
         proof = cdn_probe.validate_cdn_candidate(profile_bytes=files[device + '.yaml'], manifest=manifest,
             before_manifest=before, device=device, request=request, request_fingerprint=fingerprint,
             candidate_sha256=digest, interface=args.interface, dns_server=args.dns_server, binary=binary,
-            deadline=deadline, observations=observations,
+            deadline=deadline, observations=observations, edge_ip=args.edge_ip,
             auth_begin=auth_begin, auth_finish=auth_finish,
             final_candidate=final_candidate)
     except cdn_probe.Error as exc:
@@ -1158,6 +1158,8 @@ def _cdn(state, document, args):
     try:
         domain = cdn_probe.domain_name(args.cdn_domain)
         cdn_probe.public_ipv4(args.dns_server)
+        if args.edge_ip is not None:
+            cdn_probe.public_ipv4(args.edge_ip)
         cdn_reality_port(args.reality_port, record['port'])
     except cdn_probe.Error as exc:
         raise host.Error(str(exc)) from None
@@ -1194,8 +1196,9 @@ def _cdn(state, document, args):
         budget = cdn_probe.Budget(time.time() + 15)
         answers = cdn_probe.resolve_a(domain, args.interface, args.dns_server, budget)
         already_proxied = answers != [record['endpoint']]
-        if already_proxied:
-            cdn_probe.select_edge(domain, answers, record['endpoint'], args.interface, budget, preflight_observations)
+        if already_proxied or args.edge_ip is not None:
+            cdn_probe.select_edge(domain, answers, record['endpoint'], args.interface, budget, preflight_observations,
+                                  edge_ip=args.edge_ip)
     except (cdn_probe.Error, OSError, ValueError) as exc:
         raise host.Error('Physical authoritative DNS/Cloudflare TLS preflight failed; no remote mutation') from exc
     print('Use an independent SSH carrier/console for this core-changing transaction; '
@@ -1547,6 +1550,7 @@ def parser():
     a.add_argument('--reality-port', type=int, default=9443, help='retained REALITY TCP port; default9443, no automatic fallback')
     a.add_argument('--interface', required=True, help='explicit local physical Linux interface for isolated direct-underlay probes')
     a.add_argument('--dns-server', required=True, help='independently verified zone-authoritative Cloudflare NS public IPv4; queries require AA and bypass recursive gray-answer caches')
+    a.add_argument('--edge-ip', help='invocation-only public IPv4 verification preference; must appear in every fresh authoritative CF answer; not a persistent profile pin')
     a.add_argument('--mihomo', help='supported native Mihomo v1.19.32 executable')
     a.add_argument('--ssh-proxy', type=proxy_argument, help='independent explicit loopback SSH carrier; default direct')
     a = sub.add_parser('devices', help='manage manifest-owned device credentials')

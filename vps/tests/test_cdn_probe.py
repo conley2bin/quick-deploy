@@ -285,6 +285,19 @@ class Probe(unittest.TestCase):
         self.assertNotIn('private raw', json.dumps(samples))
         self.assert_processes_clean()
 
+    def test_preferred_actual_selected_ip_binds_full_proof_and_every_client(self):
+        second = '172.67.1.2'
+        attempted = []
+        def edge(domain, address, interface, budget):
+            attempted.append(address)
+            return {'peer': address, 'port': 443}
+        proof = self.run_proof(answers=[EDGE, second], edge_effect=edge, selected_edge=second, edge_ip=second)
+        self.assertEqual(attempted, [second])
+        self.assertEqual(proof['edge_ips'], [second])
+        self.assertTrue(all(event['hosts'] == {'cdn.example.org': second}
+                            for event in self.events() if 'pid' in event))
+        self.assert_processes_clean()
+
     def test_five_fresh_clients_negative_valid_reconnect_and_h2_proof(self):
         samples = []
         proof = self.run_proof(observations=samples)
@@ -465,9 +478,24 @@ class Probe(unittest.TestCase):
 class EdgeSelection(unittest.TestCase):
     SECOND = '172.67.1.2'
 
-    def choose(self, answers, observations=None, budget=None):
+    def choose(self, answers, observations=None, budget=None, edge_ip=None):
         return probe.select_edge('cdn.example.org', answers, ORIGIN, 'eno1',
-                                 budget or probe.Budget(time.time() + 15), observations)
+                                 budget or probe.Budget(time.time() + 15), observations, edge_ip=edge_ip)
+
+    def test_preferred_advertised_address_first_then_unique_remaining_with_same_bound(self):
+        third = '104.16.2.3'
+        with mock.patch.object(probe, 'edge_tls', side_effect=TimeoutError()) as tls:
+            with self.assertRaisesRegex(probe.Error, 'No validated'):
+                self.choose([EDGE, EDGE, self.SECOND, third], edge_ip=self.SECOND)
+        self.assertEqual([call.args[1] for call in tls.call_args_list], [self.SECOND, EDGE])
+
+    def test_nonmember_noncf_private_or_mixed_preference_rejects_before_calls(self):
+        for preferred, answers in (('104.16.2.3', [EDGE, self.SECOND]),
+                                   ('1.1.1.1', [EDGE, self.SECOND]), ('10.0.0.1', [EDGE]),
+                                   (self.SECOND, [EDGE, self.SECOND, '1.1.1.1'])):
+            with self.subTest(preferred=preferred, answers=answers), mock.patch.object(probe, 'edge_tls') as tls:
+                with self.assertRaises(probe.Error): self.choose(answers, edge_ip=preferred)
+                tls.assert_not_called()
 
     def test_first_success_stops_and_each_attempt_budget_is_six_seconds(self):
         outer = probe.Budget(time.time() + 15)
