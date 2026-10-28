@@ -6,6 +6,7 @@ import argparse
 import base64
 import contextlib
 from contextvars import ContextVar
+from datetime import datetime, timezone
 import fcntl
 import hashlib
 import io
@@ -14,6 +15,7 @@ import os
 from pathlib import Path
 import re
 import secrets
+import select
 import shlex
 import shutil
 import stat
@@ -28,6 +30,7 @@ import uuid
 import zlib
 
 import bootstrap
+import cdn_probe
 import host
 import link_dashboard
 import ssh_proxy
@@ -534,10 +537,13 @@ def profile_names(manifest):
 
 
 def generation_binding(manifest, digest):
-    return {'format': 1, 'backup_sha256': digest, 'owner': manifest['owner'], 'node_id': manifest['node_id'],
-            'endpoint': manifest['endpoint'], 'config': manifest['config'],
-            'roster': {name: manifest['accounts'][name]['enable'] for name in host.device_names(manifest)},
-            'accounts_sha256': hashlib.sha256(json.dumps(manifest['accounts'], sort_keys=True).encode()).hexdigest()}
+    result = {'format': 1, 'backup_sha256': digest, 'owner': manifest['owner'], 'node_id': manifest['node_id'],
+              'endpoint': manifest['endpoint'], 'config': manifest['config'],
+              'roster': {name: manifest['accounts'][name]['enable'] for name in host.device_names(manifest)},
+              'accounts_sha256': hashlib.sha256(json.dumps(manifest['accounts'], sort_keys=True).encode()).hexdigest()}
+    if 'tcp_cdn' in manifest:
+        result['tcp_cdn'] = manifest['tcp_cdn']
+    return result
 
 
 def read_generation(state, manifest, digest):
@@ -871,17 +877,20 @@ def sync_outputs(state, document, files=None, manifest=None):
         os.fsync(directory)
 
 
-def remember_commit(state, document, record, backup, result, use_generation=True):
+def remember_commit(state, document, record, backup, result, use_generation=True, verified_manifest=None):
     previous = document['current']
     if previous and previous['endpoint'] != record['endpoint'] and previous not in document['previous']:
         document['previous'].append(previous)
     record = dict(record, machine_id=result['machine_id'])
     digest = host.digest(backup)
-    files = manifest = None
-    if use_generation and ((state / 'generations' / digest).exists() or (state / 'generations' / digest).is_symlink()):
+    files, manifest = None, verified_manifest
+    has_generation = use_generation and ((state / 'generations' / digest).exists() or (state / 'generations' / digest).is_symlink())
+    if has_generation or document.get('tcp_cdn'):
         manifest = checked_backup(document, record, backup)
+    if manifest is not None:
         if result.get('node_id', manifest['node_id']) != manifest['node_id'] or not manifest.get('published'):
             raise host.Error('Commit result does not match published native snapshot')
+    if has_generation:
         files = read_generation(state, manifest, digest)
     try:
         sync_outputs(state, document, files, manifest)
@@ -895,6 +904,13 @@ def remember_commit(state, document, record, backup, result, use_generation=True
     else:
         document.pop('native_generation', None)
     document.update(current=record, backup=str(backup.absolute()))
+    if manifest is not None:
+        if 'tcp_cdn' in manifest:
+            if not host.cdn_enabled(manifest):
+                raise host.Error('Published backup contains invalid CDN mode')
+            document['tcp_cdn'] = {'schema': 1, 'domain': manifest['tcp_cdn']['domain']}
+        else:
+            document.pop('tcp_cdn', None)
     host.atomic(state / 'state.json', host.dumps(document))
     if (state / 'pending.json').exists():
         pending = load(state / 'pending.json')
@@ -917,8 +933,236 @@ def backup_committed(state, document, record, backup, mihomo=None):
         validate_outputs(state, document, record, mihomo, backup)
         remember_commit(state, document, record, backup, result)
     except (host.Error, OSError, ValueError, tarfile.TarError):
-        remember_commit(state, document, record, backup, result, use_generation=False)
+        remember_commit(state, document, record, backup, result, use_generation=False, verified_manifest=manifest)
         raise host.Error('Backup committed; offline snapshot not captured. Latest offline outputs invalidated; retry capture through a working carrier/core') from None
+
+
+def cdn_request(document, record, domain, before, adapter):
+    request = dict(request_for(document, record), mode='transport-upgrade', feature='tcp-cdn',
+                   operation_id=secrets.token_hex(16), adapter_sha256=adapter, before_sha256=host.digest(before),
+                   source_transports=['tcp-reality', 'hysteria2'], target_transports=['tcp-xhttp-cdn', 'hysteria2'],
+                   tcp_cdn={'schema': 1, 'domain': domain})
+    return request, host.transport_request(request)
+
+
+def cdn_deadline(prepared, fingerprint):
+    deadline = prepared.get('deadline')
+    try:
+        cdn_probe.Budget(deadline)
+    except cdn_probe.Error as exc:
+        raise host.Error(str(exc)) from None
+    if (prepared.get('prepared') is not True or prepared.get('committed') or prepared.get('unchanged') or
+            prepared.get('request_sha256', fingerprint) != fingerprint):
+        raise host.Error('CDN prepare did not return a bound uncommitted candidate')
+    if deadline - time.time() <= cdn_probe.PROBE_SECONDS + cdn_probe.COMMIT_MARGIN:
+        raise host.Error('Insufficient candidate deadline for bounded CDN proof and commit; recover first')
+    return deadline
+
+
+def acknowledge_orange(domain, deadline):
+    # Reserve a complete proof window and commit margin before accepting input.
+    until = min(time.monotonic() + 300,
+                time.monotonic() + deadline - time.time() - cdn_probe.PROBE_SECONDS - cdn_probe.COMMIT_MARGIN)
+    remaining = int(deadline - time.time())
+    print(f'CDN candidate active on TCP443, NOT COMMITTED; rollback deadline in {remaining}s (Unix {int(deadline)}).')
+    print('Source certificate is ready. Change ONLY ' + domain + ' to orange-cloud/proxied now; '
+          'leave sub and other DNS records unchanged. No Origin Rule or account SSL-setting audit is performed.')
+    print('After that change, type ORANGE and Enter within the bounded window. '
+          'EOF/timeout/failure aborts; the server rollback cannot undo your Cloudflare DNS click.', flush=True)
+    data = bytearray()
+    try:
+        fd = sys.stdin.fileno()
+        while len(data) <= 64:
+            timeout = until - time.monotonic()
+            if timeout <= 0 or not select.select([fd], [], [], max(0, timeout))[0]:
+                raise host.Error('Orange-cloud acknowledgment timed out; restoring original transport')
+            part = os.read(fd, 1)
+            if not part:
+                raise host.Error('Orange-cloud acknowledgment ended at EOF; restoring original transport')
+            if part == b'\n':
+                if bytes(data).strip() != b'ORANGE':
+                    raise host.Error('Orange-cloud acknowledgment was not ORANGE; restoring original transport')
+                return
+            data.extend(part)
+    except (OSError, ValueError, io.UnsupportedOperation):
+        raise host.Error('CDN acknowledgment requires bounded readable stdin; restoring original transport') from None
+    raise host.Error('Orange-cloud acknowledgment exceeds input limit; restoring original transport')
+
+
+def cdn_evidence(state, document, record, request, fingerprint, candidate, before, args, deadline, binary, *, verification_only=False):
+    manifest = checked_backup(document, record, candidate)
+    if not host.cdn_enabled(manifest) or manifest['tcp_cdn']['domain'] != args.cdn_domain:
+        raise host.Error('Candidate archive is not the exact proposed CDN mode/domain')
+    digest = host.digest(candidate)
+    if digest == request['before_sha256'] and not verification_only:
+        raise host.Error('CDN candidate archive must differ from the pre-change archive')
+    files = read_generation(state, manifest, digest)
+    enabled = [name for name in host.device_names(manifest) if manifest['accounts'][name]['enable']]
+    if not enabled:
+        raise host.Error('CDN proof requires an enabled native device; no identity is created automatically')
+    device = enabled[0]
+    observations = []
+    try:
+        proof = cdn_probe.validate_cdn_candidate(profile_bytes=files[device + '.yaml'], manifest=manifest,
+            before_manifest=before, device=device, request=request, request_fingerprint=fingerprint,
+            candidate_sha256=digest, interface=args.interface, dns_server=args.dns_server, binary=binary,
+            deadline=deadline, observations=observations)
+    except cdn_probe.Error as exc:
+        raise host.Error(str(exc)) from None
+    expected = {'schema', 'operation_id', 'request_fingerprint', 'candidate_sha256', 'domain',
+                'device_identity_sha256', 'observed_at', 'interface', 'edge_ips', 'checks'}
+    account = manifest['accounts'][device]
+    identity = hashlib.sha256(cdn_probe.canonical({'device': device, 'id': account['id'], 'auth': account['auth']})).hexdigest()
+    if (type(proof) is not dict or set(proof) != expected or type(proof.get('schema')) is not int or proof['schema'] != 1 or
+            proof.get('operation_id') != request['operation_id'] or proof.get('request_fingerprint') != fingerprint or
+            proof.get('candidate_sha256') != digest or proof.get('domain') != args.cdn_domain or
+            proof.get('device_identity_sha256') != identity or proof.get('interface') != args.interface or
+            type(proof.get('checks')) is not dict or set(proof['checks']) != set(cdn_probe.CHECKS) or
+            any(value is not True for value in proof['checks'].values()) or
+            type(proof.get('edge_ips')) is not list or not proof['edge_ips']):
+        raise host.Error('CDN probe returned missing, partial, stale-identity or mismatched proof')
+    try:
+        observed = datetime.fromisoformat(proof['observed_at'])
+        if (observed.utcoffset() is None or observed.utcoffset().total_seconds() != 0 or
+                abs((datetime.now(timezone.utc) - observed).total_seconds()) > cdn_probe.PROBE_SECONDS):
+            raise ValueError
+        cdn_probe.edge_addresses(proof['edge_ips'], manifest['endpoint'])
+    except (ValueError, TypeError, cdn_probe.Error):
+        raise host.Error('CDN proof has stale observation time or invalid edge evidence') from None
+    if host.digest(candidate) != digest:
+        raise host.Error('CDN candidate archive changed during live proof')
+    proof_sha256 = host.cdn_proof_digest(proof)
+    if proof_sha256 != hashlib.sha256(cdn_probe.canonical(proof)).hexdigest():
+        raise host.Error('CDN proof canonical digest disagrees with Host contract')
+    # Public metadata only, retained privately before any commit request is sent.
+    with directory_fd(state / 'cdn-proofs', create=True) as directory:
+        write_at(directory, request['operation_id'] + '.samples.json', host.dumps(observations).encode())
+        write_at(directory, request['operation_id'] + '.json', host.dumps(proof).encode())
+    return proof, proof_sha256
+
+
+def check_cdn_receipt(state, pending, receipt):
+    request = pending['request']
+    proof = load(state / 'cdn-proofs' / (request['operation_id'] + '.json'))
+    proof_sha = host.cdn_proof_digest(proof)
+    if (receipt.get('committed') is not True or receipt.get('request_sha256') != host.transport_request(request) or
+            not pending.get('backup') or receipt.get('offnode_sha256') != host.digest(Path(pending['backup'])) or
+            receipt.get('cdn_proof_sha256') != proof_sha or pending.get('cdn_proof_sha256') != proof_sha or
+            proof.get('candidate_sha256') != receipt.get('offnode_sha256') or
+            proof.get('operation_id') != request['operation_id'] or
+            proof.get('request_fingerprint') != receipt.get('request_sha256')):
+        raise host.Error('CDN commit receipt does not match private request/candidate/proof; pending retained')
+
+
+def cdn(state, document, args):
+    record = document.get('current')
+    if not record or (state / 'pending.json').exists() or (state / 'pending.json').is_symlink():
+        raise host.Error('CDN requires a committed current node and no pending operation; use recover first')
+    if document['config']['proxy_port'] != 443:
+        raise host.Error('CDN transition requires the existing REALITY+H2 source on port443')
+    try:
+        domain = cdn_probe.domain_name(args.cdn_domain)
+        cdn_probe.public_ipv4(args.dns_server)
+    except cdn_probe.Error as exc:
+        raise host.Error(str(exc)) from None
+    if domain == document['config']['domain']:
+        raise host.Error('CDN requires a separate hostname; subscription domain stays unchanged')
+    binary = resolve_mihomo(args.mihomo)
+    try:
+        cdn_probe.environment(binary, args.interface, args.dns_server)
+    except cdn_probe.Error as exc:
+        raise host.Error(str(exc)) from None
+    checked = remote(record, 'status', request_for(document, record))
+    adapter = host.digest(MODULE / 'lib/host.py')
+    if not host.accepted_adapter_digest(checked.get('adapter_sha256'), adapter):
+        raise host.Error('Unknown stored adapter digest; no CDN backup/service mutation')
+    transports = checked.get('transports')
+    if checked.get('needs_transport_upgrade') is not False or transports not in (
+            ['tcp-reality', 'hysteria2'], ['tcp-xhttp-cdn', 'hysteria2']):
+        raise host.Error('CDN requires exact owned REALITY+H2 or same-domain CDN+H2 topology')
+    current = checked_backup(document, record, Path(document['backup']))
+    if not current.get('published'):
+        raise host.Error('CDN requires the verified published current archive, not candidate state')
+    already = host.cdn_enabled(current)
+    if transports != (['tcp-xhttp-cdn', 'hysteria2'] if already else ['tcp-reality', 'hysteria2']):
+        raise host.Error('Saved archive transport differs from current native status; recover first')
+    if checked.get('machine_id') != record.get('machine_id') or checked.get('node_id') != current['node_id']:
+        raise host.Error('CDN status differs from saved machine/node identity')
+    if already and current['tcp_cdn']['domain'] != domain:
+        raise host.Error('A different CDN domain is already committed; no implicit domain migration')
+    if not already:
+        try:
+            answers = cdn_probe.resolve_a(domain, args.interface, args.dns_server, cdn_probe.Budget(time.time() + 15))
+        except (cdn_probe.Error, OSError) as exc:
+            raise host.Error('Direct public DNS preflight failed; no remote mutation') from None
+        if answers != [record['endpoint']]:
+            raise host.Error('Before preparation, only the new CDN A record must be gray/DNS-only at the owned origin IPv4')
+    print('Use an independent SSH carrier/console for this core-changing transaction; '
+          'shared Xray may briefly reconnect H2. No desktop selection or system DNS will be changed.')
+    # This complete backup hands the guard to the current capable adapter BEFORE
+    # publishing feature intent. Existing adapter acceptance remains authoritative.
+    before_path = backup_remote(state, document, record)
+    before = checked_backup(document, record, before_path)
+    if (not before.get('published') or before['node_id'] != current['node_id'] or
+            host.cdn_enabled(before) != already or not host.dual_enabled(before)):
+        raise host.Error('Fresh pre-change archive differs from current exact source topology')
+    request, fingerprint = cdn_request(document, record, domain, before_path, adapter)
+    if already:
+        # No transport-prepare/commit and no credential generation in this path.
+        # A verification request binds this finite local observation, not a new
+        # remote migration or perpetual health flag.
+        validate_outputs(state, document, record, binary, before_path)
+        cdn_evidence(state, document, record, request, fingerprint, before_path, before, args,
+                     time.time() + cdn_probe.PROBE_SECONDS + cdn_probe.COMMIT_MARGIN, binary, verification_only=True)
+        backup_committed(state, document, record, before_path, binary)
+        export_after_commit(state)
+        print('Same-domain CDN verified; committed native backup refreshed without transport replay or credential rotation.')
+        return
+    pending = {'record': record, 'mode': 'transport-upgrade', 'request': request,
+               'before': str(before_path.absolute()), 'backup': None, 'mihomo': binary}
+    host.atomic(state / 'pending.json', host.dumps(pending))
+    commit_attempted = False
+    try:
+        with upload_bundle(request) as stream:
+            prepared = remote(record, 'transport-prepare', stdin=stream)
+        if prepared.get('pending') or prepared.get('queued'):
+            raise host.Error('CDN preparation is incomplete; restoring original transport')
+        deadline = cdn_deadline(prepared, fingerprint)
+        candidate = backup_remote(state, document, record)
+        pending['backup'] = str(candidate.absolute())
+        host.atomic(state / 'pending.json', host.dumps(pending))
+        validate_outputs(state, document, record, binary, candidate)
+        acknowledge_orange(domain, deadline)
+        proof, proof_sha256 = cdn_evidence(state, document, record, request, fingerprint, candidate, before,
+                                         args, deadline, binary)
+        if deadline - time.time() < cdn_probe.COMMIT_MARGIN:
+            raise host.Error('CDN proof exhausted commit margin; restoring original transport')
+        pending.update(cdn_proof_sha256=proof_sha256)
+        host.atomic(state / 'pending.json', host.dumps(pending))
+        commit_attempted = True
+        receipt = remote(record, 'transport-commit', dict(request, offnode_sha256=host.digest(candidate),
+                                                        cdn_proof=proof, cdn_proof_sha256=proof_sha256))
+        check_cdn_receipt(state, pending, receipt)
+        after = backup_remote(state, document, record)
+        validate_outputs(state, document, record, binary, after)
+        result = remote(record, 'status', request_for(document, record))
+        remember_commit(state, document, record, after, result)
+    except BaseException:
+        # Abort also reconciles a durable successful receipt. Never repeat the
+        # migration or regenerate proof/credentials after an ambiguous commit.
+        try:
+            recover_local(state, document, binary)
+        except BaseException:
+            print('CDN reconciliation pending; use recover with the same independent SSH carrier. No migration replay.', file=sys.stderr)
+        print('CDN attempt ended. If rollback occurred, return ONLY the CDN DNS record to gray before retry; '
+              'sub/H2 credentials and desktop selection are unchanged.', file=sys.stderr)
+        if commit_attempted and not (state / 'pending.json').exists() and document.get('tcp_cdn', {}).get('domain') == domain:
+            print('CDN commit receipt reconciled; no credential replay.')
+            return
+        raise
+    export_after_commit(state)
+    print('Cloudflare/XHTTP TCP443 committed after real acceptance; original H2 UDP443 remains the default/backup. '
+          'Choose SELF-cdn explicitly when desired; no desktop selection was changed.')
 
 
 def deploy_existing(state, document, record, args):
@@ -929,6 +1173,8 @@ def deploy_existing(state, document, record, args):
         raise host.Error('Unknown stored adapter digest; no transport backup/service mutation')
     upgrading = checked.get('needs_transport_upgrade')
     expected = ['tcp-reality'] if upgrading is True else ['tcp-reality', 'hysteria2']
+    if not upgrading and checked.get('transports') == ['tcp-xhttp-cdn', 'hysteria2']:
+        expected = ['tcp-xhttp-cdn', 'hysteria2']
     if type(upgrading) is not bool or checked.get('transports') != expected:
         raise host.Error('Unrecognized owned transport topology; no implicit migration')
     binary = resolve_mihomo(args.mihomo)
@@ -1008,7 +1254,11 @@ def deploy(state, document, args):
     record['machine_id'] = info['machine_id']
     request = dict(request_for(document, record), lock=lock, mode=args.command,
                    adapter_sha256=host.digest(MODULE / 'lib/host.py'))
-    print(f"Preflight passed. This dedicated node will run TCP/REALITY + UDP/Hysteria2 on{document['config']['proxy_port']}, TLS subscriptions8443 and HTTP01 on80. SSH/firewall/Tailscale stay unchanged.")
+    topology = 'TCP/REALITY + UDP/Hysteria2'
+    if backup:
+        topology = ('TCP/XHTTP CDN + UDP/Hysteria2' if 'tcp_cdn' in manifest else
+                    'TCP/REALITY + UDP/Hysteria2' if host.dual_enabled(manifest) else 'TCP/REALITY')
+    print(f"Preflight passed. This dedicated node will run {topology} on{document['config']['proxy_port']}, TLS subscriptions8443 and HTTP01 on80. SSH/firewall/Tailscale stay unchanged.")
     folder = None if backup else artifacts(state, lock, getattr(args, 'artifacts_dir', None))
     pending = {'record': record, 'mode': args.command, 'backup': None, 'mihomo': resolve_mihomo(args.mihomo)}
     host.atomic(state / 'pending.json', host.dumps(pending))
@@ -1119,6 +1369,8 @@ def recover_local(state, document, mihomo=None):
         print('Recovery queued/waiting; local pending retained. Retry recover after the owned recovery unit exits.')
         return
     if result.get('committed'):
+        if mode == 'transport-upgrade' and request.get('feature') == 'tcp-cdn':
+            check_cdn_receipt(state, pending, result)
         # A standalone backup preserves an intentionally inactive front; its
         # verified DB/artifact snapshot does not require publishing feeds. The
         # timer may already have completed and removed the remote stop intent.
@@ -1192,6 +1444,12 @@ def parser():
             a.add_argument('--device', help='show only this enabled committed device')
         if name == 'restore':
             a.set_defaults(backup_required=True)
+    a = sub.add_parser('cdn', help='recoverably replace REALITY TCP443 with verified Cloudflare/XHTTP; keep H2 unchanged')
+    a.add_argument('--domain', dest='cdn_domain', required=True, help='new CDN hostname; subscription domain remains unchanged')
+    a.add_argument('--interface', required=True, help='explicit local physical Linux interface for isolated direct-underlay probes')
+    a.add_argument('--dns-server', required=True, help='independently verified zone-authoritative Cloudflare NS public IPv4; queries require AA and bypass recursive gray-answer caches')
+    a.add_argument('--mihomo', help='supported native Mihomo v1.19.32 executable')
+    a.add_argument('--ssh-proxy', type=proxy_argument, help='independent explicit loopback SSH carrier; default direct')
     a = sub.add_parser('devices', help='manage manifest-owned device credentials')
     operations = a.add_subparsers(dest='device_action', required=True)
     listing = operations.add_parser('list', help='names/enabled status only, no credentials')
@@ -1234,6 +1492,8 @@ def main(argv=None):
                 deploy(state, document, args)
             elif args.command == 'devices':
                 devices(state, document, args)
+            elif args.command == 'cdn':
+                cdn(state, document, args)
             elif args.command == 'preflight':
                 record = target_record(args, document['current'])
                 print(host.dumps(remote(record, 'preflight', request_for(document, record))), end='')

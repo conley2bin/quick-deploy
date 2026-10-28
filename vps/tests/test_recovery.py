@@ -29,6 +29,8 @@ class OrderedServices:
         self.oneshot = False
         self.probes = []
         self.crash_queue = False
+        self.enforce443 = False
+        self.events = []
         self.save({'active': {u: True for u in (host.PANEL, host.FRONT)},
                    'enabled': {host.PANEL: False, host.FRONT: True}, 'jobs': []})
         texts = fixture.h.unit_texts()
@@ -47,6 +49,7 @@ class OrderedServices:
     def ctl(self, action, *args):
         unit = args[-1]
         value = host.read_json(self.file)
+        self.events.append((action, *args))
         if action == 'stop':
             value['active'][unit] = False
             value['jobs'] = [u for u in value['jobs'] if u != unit]
@@ -58,17 +61,25 @@ class OrderedServices:
                     raise subprocess.TimeoutExpired(['systemctl', action, *args], 60)
                 if unit not in value['jobs']: value['jobs'].append(unit)
             else:
+                self.check443(unit, value)
                 value['active'][unit] = True
         else:
             raise AssertionError((action, args))
         self.save(value)
         if self.crash_queue and action == 'start': os._exit(76)
 
+    def check443(self, unit, value):
+        if self.enforce443 and unit == host.PANEL and value['active'][host.FRONT]:
+            front = (self.f.h.ROOT / 'active/Caddyfile').read_text()
+            if ':443 {' in front:
+                raise AssertionError('restored REALITY cannot start while candidate Caddy owns TCP443')
+
     def exit_oneshot(self, adapter):
         self.oneshot = False
         value = host.read_json(self.file)
         for unit in value['jobs']:
             adapter.guard()  # real stored guard, after predecessor exited
+            self.check443(unit, value)
             value['active'][unit] = True
         value['jobs'] = []
         self.save(value)
@@ -380,6 +391,75 @@ class Recovery(unittest.TestCase):
             control.assert_not_called()
         self.assertEqual(predecessor.read_bytes(),b'tampered-after-adapter-install')
         self.assertFalse((h.ROOT/'backup-stop.json').exists())
+
+    def closed_store_intent(self):
+        h = self.f.h
+        self.store = h.ROOT / 'active/caddy'
+        h.atomic(self.store / 'data/caddy/certificates/issuer/sub.example.org.crt', 'old-certificate')
+        h.atomic(self.store / 'data/caddy/certificates/issuer/sub.example.org.key', 'old-key')
+        h.atomic(self.store / 'data/caddy/acme/account.json', 'old-renewal-account')
+        h.atomic(self.store / 'config/caddy/autosave.json', 'old-config')
+        self.original_store = {str(p.relative_to(self.store)): p.read_bytes() for p in self.store.rglob('*') if p.is_file()}
+        pending = self.intent()
+        h.copy_caddy_tree(self.store, h.ROOT / 'device-rollback/caddy')
+        pending['caddy_snapshot'] = True
+        h.atomic(h.ROOT / 'pending.json', h.dumps(pending))
+        return pending
+
+    def test_closed_caddy_restore_hard_loss_retries_before_queued_start(self):
+        h = self.f.h; self.closed_store_intent(); self.graph.enforce443 = True
+        h.atomic(self.store / 'data/caddy/certificates/issuer/sub.example.org.crt', 'half-renewal')
+        h.atomic(self.store / 'data/caddy/certificates/issuer/cdn.example.org.crt', 'candidate-cert')
+        h.atomic(h.ROOT / 'active/Caddyfile', 'https://cdn.example.org:443 {\n respond 404\n}\n')
+        current = self.stored(); self.graph.oneshot = True
+        real_replace = current.os.replace
+        def die_after_store_detach(source, target):
+            real_replace(source, target)
+            if Path(source) == self.store: os._exit(78)
+        pid = os.fork()
+        if pid == 0:
+            with mock.patch.object(current.os, 'replace', side_effect=die_after_store_detach): current.recover()
+            os._exit(99)
+        _, status = os.waitpid(pid, 0)
+        self.assertEqual(os.waitstatus_to_exitcode(status), 78)
+        self.assertEqual(h.read_json(h.ROOT / 'pending.json')['phase'], 'recovering')
+        self.assertFalse(self.store.exists()); self.assertFalse(self.graph.state(host.FRONT)['running'])
+        self.assertFalse(self.graph.state(host.PANEL)['running'])
+        with self.assertRaises(current.Error): current.guard()
+        self.assertTrue(current.recover()['queued'])
+        self.assertEqual(self.graph.probes, [])
+        self.assertEqual({str(p.relative_to(self.store)): p.read_bytes() for p in self.store.rglob('*') if p.is_file()}, self.original_store)
+        self.assertNotIn(':443 {', (h.ROOT / 'active/Caddyfile').read_text())
+        self.graph.exit_oneshot(current)
+        self.assertFalse(current.recover()['pending'])
+        self.assertEqual(self.graph.events[:2], [('stop', host.FRONT), ('stop', host.PANEL)])
+
+    def test_incomplete_initial_caddy_copy_is_never_restoration_authority(self):
+        h = self.f.h; self.closed_store_intent()
+        pending = h.read_json(h.ROOT / 'pending.json'); pending['phase'] = 'snapshot'; pending.pop('caddy_snapshot')
+        h.atomic(h.ROOT / 'pending.json', h.dumps(pending))
+        # Model hard loss during the initial closed copy. Candidate has NEVER
+        # started; live original store is intact and the partial copy is poison.
+        h.atomic(h.ROOT / 'device-rollback/caddy/data/caddy/certificates/issuer/sub.example.org.crt', 'partial-poison')
+        current = self.stored(); self.graph.oneshot = True
+        self.assertTrue(current.recover()['queued'])
+        self.assertEqual({str(p.relative_to(self.store)): p.read_bytes() for p in self.store.rglob('*') if p.is_file()}, self.original_store)
+        self.graph.exit_oneshot(current)
+        self.assertFalse(current.recover()['pending'])
+
+    def test_caddy_snapshot_refuses_links_and_fifo_without_blocking(self):
+        import signal
+        h = self.f.h; source = self.f.root / 'caddy-special'; source.mkdir()
+        for kind in ('link', 'fifo'):
+            path = source / 'entry'
+            if kind == 'link': path.symlink_to(self.f.root / 'outside')
+            else: os.mkfifo(path)
+            old_handler = signal.signal(signal.SIGALRM, lambda *_: self.fail('Caddy FIFO input blocked'))
+            try:
+                signal.alarm(2)
+                with self.assertRaises((h.Error, OSError)): h.copy_caddy_tree(source, self.f.root / ('copy-' + kind))
+            finally:
+                signal.alarm(0); signal.signal(signal.SIGALRM, old_handler); path.unlink()
 
     def test_backup_initially_inactive_stays_inactive(self):
         h=self.f.h; value=host.read_json(self.graph.file); value['active'][host.FRONT]=False; self.graph.save(value)

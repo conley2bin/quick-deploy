@@ -1,0 +1,364 @@
+"""Controller contract tests: no Host implementation, SSH, panel or native API.
+
+Explicit Host API stubs model the frozen interface while the Host owner works
+independently. Existing test_dual_cli exercises real archive/generation readers;
+these tests discriminate controller ordering, proof binding and reconciliation.
+"""
+import copy
+from datetime import datetime, timezone, timedelta
+import hashlib
+import io
+import json
+import os
+from pathlib import Path
+import sys
+import tempfile
+import time
+import unittest
+from unittest import mock
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'lib'))
+import cdn_probe
+import host
+import vps
+from test_cdn_probe import manifest as node_manifest, nodes
+
+
+def transport_contract(request):
+    """Only the documented request shape/hash; not a fake Host migration."""
+    required = ('owner', 'machine_id', 'endpoint', 'config', 'operation_id', 'adapter_sha256',
+                'ssh_port', 'mode', 'before_sha256', 'feature', 'source_transports', 'target_transports', 'tcp_cdn')
+    if (set(required) - request.keys() or request['feature'] != 'tcp-cdn' or
+            request['source_transports'] != ['tcp-reality', 'hysteria2'] or
+            request['target_transports'] != ['tcp-xhttp-cdn', 'hysteria2']):
+        raise host.Error('contract shape mismatch')
+    return hashlib.sha256(host.dumps({key: request[key] for key in required}).encode()).hexdigest()
+
+
+class CDNCLI(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix='qd-cdn-cli-')
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.state = vps.private_dir(self.root / 'private')
+        self.config = {'domain': 'sub.example.org', 'reality_target': 'target.example.org', 'acme_email': '', 'proxy_port': 443}
+        self.record = {'endpoint': '93.184.216.34', 'target': 'saved-alias', 'machine_id': 'b' * 32,
+                       'port': 22, 'user': 'root', 'options': vps.SSH_OPTIONS, 'host_key_alias': None}
+        self.before = node_manifest()
+        self.before.pop('tcp_cdn')
+        self.before.update(owner='owner-fixture', config=self.config, node_id='node-fixture', published=True)
+        self.candidate = dict(copy.deepcopy(self.before), tcp_cdn=node_manifest()['tcp_cdn'], published=False)
+        self.after = dict(copy.deepcopy(self.candidate), published=True)
+        self.paths = {}
+        for name, manifest in [('before', self.before), ('candidate', self.candidate), ('after', self.after)]:
+            path = self.state / (name + '.tar')
+            host.atomic(path, name.encode())
+            self.paths[path] = manifest
+            setattr(self, name + '_path', path)
+        self.doc = {'format': host.FORMAT, 'owner': self.before['owner'], 'config': self.config,
+                    'current': self.record, 'previous': [], 'backup': str(self.before_path)}
+        host.atomic(self.state / 'state.json', host.dumps(self.doc))
+        self.args = vps.parser().parse_args(['cdn', '--domain', 'cdn.example.org', '--interface', 'eno1',
+                                           '--dns-server', '1.1.1.1', '--mihomo', '/fixture/mihomo'])
+        self.events, self.backups = [], [self.before_path, self.candidate_path, self.after_path]
+        self.committed = False
+        self.proof_change = None
+        self.prepare_change = None
+        self.lost_ack = False
+        self.queued = False
+        self.patch(host, 'cdn_enabled', side_effect=lambda m: 'tcp_cdn' in m, create=True)
+        self.patch(host, 'cdn_proof_digest', side_effect=lambda proof: hashlib.sha256(cdn_probe.canonical(proof)).hexdigest(), create=True)
+        self.patch(host, 'transport_request', side_effect=transport_contract)
+        self.patch(host, 'dual_enabled', return_value=True)
+        self.patch(host, 'validate_feed_scope')
+        self.patch(vps, 'checked_backup', side_effect=lambda doc, rec, path: self.paths[Path(path)])
+        self.patch(vps, 'resolve_mihomo', return_value='/fixture/mihomo')
+        self.patch(cdn_probe, 'environment')
+        self.patch(cdn_probe, 'resolve_a', return_value=[self.record['endpoint']])
+        self.patch(vps, 'backup_remote', side_effect=self.backup)
+        self.patch(vps, 'validate_outputs', side_effect=self.outputs)
+        self.patch(vps, 'remote', side_effect=self.remote)
+        self.patch(vps, 'acknowledge_orange', side_effect=lambda *_: self.events.append('ack'))
+        self.patch(cdn_probe, 'validate_cdn_candidate', side_effect=self.probe)
+        self.patch(vps, 'export_after_commit', side_effect=lambda *_: self.events.append('export'))
+        self.patch(sys, 'stdout', new=io.StringIO())
+        self.patch(sys, 'stderr', new=io.StringIO())
+
+    def patch(self, obj, name, **kwargs):
+        patch = mock.patch.object(obj, name, **kwargs)
+        result = patch.start(); self.addCleanup(patch.stop)
+        return result
+
+    def backup(self, *_):
+        self.events.append('backup')
+        return self.backups.pop(0)
+
+    def outputs(self, state, doc, record, binary, backup):
+        self.events.append('outputs')
+        manifest = self.paths[Path(backup)]
+        data = cdn_probe.canonical({'proxies': nodes()})
+        vps.store_generation(state, manifest, host.digest(backup), {'company.yaml': data, 'company.txt': b'native-uri-fixture'})
+        return host.digest(backup)
+
+    def status(self):
+        return {'adapter_sha256': host.digest(vps.MODULE / 'lib/host.py'), 'needs_transport_upgrade': False,
+                'transports': ['tcp-xhttp-cdn' if self.committed else 'tcp-reality', 'hysteria2'],
+                'machine_id': self.record['machine_id'], 'node_id': self.before['node_id']}
+
+    def remote(self, record, action, request=None, stdin=None, **kwargs):
+        self.events.append(action)
+        self.assertEqual(record, self.record)
+        if action == 'status': return self.status()
+        if action == 'transport-prepare':
+            import tarfile
+            with tarfile.open(fileobj=stdin) as archive:
+                self.assertEqual(set(archive.getnames()), {'host.py', 'request.json'})
+                self.request = json.load(archive.extractfile('request.json'))
+            self.assertNotIn('tcp_cdn', vps.load(self.state / 'state.json'))
+            self.assertEqual(self.request['config'], self.config)
+            self.assertEqual(self.request['before_sha256'], host.digest(self.before_path))
+            self.assertEqual(self.events[:3], ['status', 'backup', 'transport-prepare'])
+            result = {'prepared': True, 'deadline': time.time() + 600,
+                      'request_sha256': host.transport_request(self.request)}
+            if self.prepare_change: self.prepare_change(result)
+            return result
+        if action == 'transport-commit':
+            self.assertEqual(request['offnode_sha256'], host.digest(self.candidate_path))
+            self.assertNotEqual(request['offnode_sha256'], self.request['before_sha256'])
+            proof_path = self.state / 'cdn-proofs' / (self.request['operation_id'] + '.json')
+            self.assertEqual(proof_path.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(vps.load(proof_path), request['cdn_proof'])
+            self.assertNotIn('tcp_cdn', vps.load(self.state / 'state.json'))
+            self.receipt = {'committed': True, 'request_sha256': host.transport_request(self.request),
+                            'offnode_sha256': request['offnode_sha256'], 'cdn_proof_sha256': request['cdn_proof_sha256']}
+            self.committed = True
+            if self.lost_ack: raise host.Error('lost commit ACK')
+            return self.receipt
+        if action == 'abort':
+            self.assertEqual(request, self.request)
+            if self.queued: return {'queued': True}
+            return self.receipt if self.committed else {'committed': False}
+        raise AssertionError('Unmocked remote action: ' + action)
+
+    def probe(self, **kwargs):
+        self.events.append('probe')
+        self.assertEqual(kwargs['profile_bytes'], cdn_probe.canonical({'proxies': nodes()}))
+        self.assertEqual(kwargs['before_manifest'], self.before if not self.committed else self.after)
+        account = self.after['accounts']['company']
+        proof = {'schema': 1, 'operation_id': kwargs['request']['operation_id'],
+                 'request_fingerprint': kwargs['request_fingerprint'], 'candidate_sha256': kwargs['candidate_sha256'],
+                 'domain': 'cdn.example.org', 'device_identity_sha256': hashlib.sha256(cdn_probe.canonical({
+                     'device': 'company', 'id': account['id'], 'auth': account['auth']})).hexdigest(),
+                 'observed_at': datetime.now(timezone.utc).isoformat(), 'interface': 'eno1',
+                 'edge_ips': ['104.16.1.2'], 'checks': dict.fromkeys(cdn_probe.CHECKS, True)}
+        if self.proof_change: self.proof_change(proof)
+        return proof
+
+    def run_cdn(self):
+        return vps.cdn(self.state, self.doc, self.args)
+
+    def test_cli_separates_cdn_domain_and_requires_public_resolver_underlay(self):
+        self.assertEqual(self.args.cdn_domain, 'cdn.example.org')
+        self.assertFalse(hasattr(self.args, 'domain'))
+        self.assertEqual(vps.configuration(self.args, self.config), self.config)
+        with self.assertRaises(SystemExit):
+            vps.parser().parse_args(['cdn', '--domain', 'cdn.example.org', '--interface', 'eno1'])
+        for flag in ('--ssh', '--proxy-port', '--reality-target'):
+            with self.assertRaises(SystemExit):
+                vps.parser().parse_args(['cdn', '--domain', 'cdn.example.org', '--interface', 'eno1',
+                                        '--dns-server', '1.1.1.1', flag, 'anything'])
+
+    def test_candidate_proof_before_commit_published_archive_only_projection(self):
+        self.run_cdn()
+        self.assertEqual(self.events, ['status', 'backup', 'transport-prepare', 'backup', 'outputs', 'ack', 'probe',
+                                      'transport-commit', 'backup', 'outputs', 'status', 'export'])
+        saved = vps.load(self.state / 'state.json')
+        self.assertEqual(saved['tcp_cdn'], {'schema': 1, 'domain': 'cdn.example.org'})
+        self.assertEqual(saved['backup'], str(self.after_path))
+        self.assertEqual(saved['config'], self.config)
+        self.assertFalse((self.state / 'pending.json').exists())
+        proof = vps.load(self.state / 'cdn-proofs' / (self.request['operation_id'] + '.json'))
+        self.assertNotIn(self.after['accounts']['company']['id'], json.dumps(proof))
+
+    def test_invalid_proofs_never_commit_and_abort_original_mode(self):
+        modifications = [lambda p: p.pop('checks'), lambda p: p.update(candidate_sha256='d' * 64),
+                         lambda p: p.update(device_identity_sha256='e' * 64),
+                         lambda p: p.update(domain='wrong.example.org'), lambda p: p.update(schema=True),
+                         lambda p: p['checks'].update(edge_tls=False), lambda p: p.update(edge_ips=['93.184.216.34']),
+                         lambda p: p.update(observed_at=(datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()),
+                         lambda p: p.update(secret='must-not-be-written')]
+        for change in modifications:
+            with self.subTest(change=change):
+                self.events.clear(); self.backups = [self.before_path, self.candidate_path]
+                self.proof_change = change
+                with self.assertRaises(host.Error): self.run_cdn()
+                self.assertNotIn('transport-commit', self.events); self.assertIn('abort', self.events)
+                self.assertNotIn('tcp_cdn', vps.load(self.state / 'state.json'))
+                self.assertFalse((self.state / 'pending.json').exists())
+                self.assertFalse((self.state / 'cdn-proofs').exists())
+
+    def test_failed_probe_or_eof_abort_and_queued_recovery_retains_pending(self):
+        self.queued = True
+        with mock.patch.object(vps, 'acknowledge_orange', side_effect=host.Error('EOF')):
+            with self.assertRaisesRegex(host.Error, 'EOF'): self.run_cdn()
+        self.assertTrue((self.state / 'pending.json').exists())
+        self.assertNotIn('probe', self.events); self.assertNotIn('transport-commit', self.events)
+        self.assertNotIn('tcp_cdn', vps.load(self.state / 'state.json'))
+
+    def test_missing_expired_or_too_short_prepare_deadline_aborts(self):
+        for deadline in (None, time.time() - 1, time.time() + 30, float('inf')):
+            self.events.clear(); self.backups = [self.before_path]
+            self.prepare_change = lambda prepared: prepared.update(deadline=deadline)
+            with self.subTest(deadline=deadline), self.assertRaises(host.Error): self.run_cdn()
+            self.assertIn('abort', self.events); self.assertNotIn('ack', self.events)
+            self.assertFalse((self.state / 'pending.json').exists())
+
+    def test_lost_ack_reconciles_exact_receipt_without_replay_or_reproof(self):
+        self.lost_ack = True
+        self.run_cdn()
+        self.assertEqual(self.events.count('transport-prepare'), 1)
+        self.assertEqual(self.events.count('transport-commit'), 1)
+        self.assertEqual(self.events.count('probe'), 1)
+        self.assertEqual(self.events.count('abort'), 1)
+        self.assertEqual(vps.load(self.state / 'state.json')['tcp_cdn']['domain'], 'cdn.example.org')
+        self.assertFalse((self.state / 'pending.json').exists())
+
+    def test_receipt_wrong_proof_hash_preserves_pending_instead_of_adopting(self):
+        self.lost_ack = True
+        remote = self.remote
+        def changed(*args, **kwargs):
+            if args[1] == 'abort':
+                self.receipt['cdn_proof_sha256'] = 'f' * 64
+            return remote(*args, **kwargs)
+        with mock.patch.object(vps, 'remote', side_effect=changed), self.assertRaises(host.Error):
+            self.run_cdn()
+        self.assertTrue((self.state / 'pending.json').exists())
+        self.assertNotIn('tcp_cdn', vps.load(self.state / 'state.json'))
+
+    def test_non443_pending_legacy_foreign_domain_refuse_without_mutation(self):
+        self.doc['config']['proxy_port'] = 8443
+        with self.assertRaisesRegex(host.Error, 'port443'): self.run_cdn()
+        self.assertEqual(self.events, [])
+        self.doc['config']['proxy_port'] = 443
+        host.atomic(self.state / 'pending.json', '{}')
+        with self.assertRaisesRegex(host.Error, 'pending'): self.run_cdn()
+        self.assertEqual(self.events, [])
+        (self.state / 'pending.json').unlink()
+        with mock.patch.object(vps, 'remote', return_value=dict(self.status(), needs_transport_upgrade=True)):
+            with self.assertRaisesRegex(host.Error, 'topology'): self.run_cdn()
+        self.assertNotIn('backup', self.events)
+
+    def test_same_domain_verifies_and_backs_up_without_migration(self):
+        self.committed = True
+        self.doc.update(backup=str(self.after_path), tcp_cdn={'schema': 1, 'domain': 'cdn.example.org'})
+        self.backups = [self.after_path]
+        self.run_cdn()
+        self.assertNotIn('transport-prepare', self.events); self.assertNotIn('transport-commit', self.events)
+        self.assertNotIn('ack', self.events); self.assertEqual(self.events.count('probe'), 1)
+        self.assertEqual(vps.load(self.state / 'state.json')['backup'], str(self.after_path))
+        self.args.cdn_domain = 'different.example.org'; self.events.clear()
+        with self.assertRaisesRegex(host.Error, 'different CDN domain'): self.run_cdn()
+        self.assertNotIn('backup', self.events)
+
+    def test_backup_capture_failure_still_projects_verified_published_cdn(self):
+        with mock.patch.object(vps, 'validate_outputs', side_effect=host.Error('native output unavailable')):
+            with self.assertRaisesRegex(host.Error, 'Backup committed; offline snapshot not captured'):
+                vps.backup_committed(self.state, self.doc, self.record, self.after_path)
+        saved = vps.load(self.state / 'state.json')
+        self.assertEqual(saved['tcp_cdn'], {'schema': 1, 'domain': 'cdn.example.org'})
+        self.assertEqual(saved['backup'], str(self.after_path))
+        self.assertNotIn('native_generation', saved)
+
+    def test_preflight_gray_origin_and_prerequisite_failures_do_not_mutate(self):
+        with mock.patch.object(cdn_probe, 'resolve_a', return_value=['104.16.1.2']):
+            with self.assertRaisesRegex(host.Error, 'gray/DNS-only'): self.run_cdn()
+        self.assertEqual(self.events, ['status'])
+        self.events.clear()
+        with mock.patch.object(cdn_probe, 'environment', side_effect=cdn_probe.Error('prerequisite absent')):
+            with self.assertRaisesRegex(host.Error, 'prerequisite absent'): self.run_cdn()
+        self.assertEqual(self.events, [])
+
+    def test_candidate_archive_mutation_during_probe_refuses_commit(self):
+        self.proof_change = lambda proof: host.atomic(self.candidate_path, b'changed-after-validation')
+        with self.assertRaisesRegex(host.Error, 'archive changed'): self.run_cdn()
+        self.assertNotIn('transport-commit', self.events); self.assertIn('abort', self.events)
+        self.assertNotIn('tcp_cdn', vps.load(self.state / 'state.json'))
+
+    def test_generation_binding_legacy_shape_unchanged_cdn_adds_metadata_only(self):
+        before = vps.generation_binding(self.before, 'd' * 64)
+        cdn = vps.generation_binding(self.after, 'd' * 64)
+        self.assertNotIn('tcp_cdn', before)
+        self.assertEqual({k: v for k, v in cdn.items() if k != 'tcp_cdn'}, before)
+        self.assertEqual(cdn['tcp_cdn'], self.after['tcp_cdn'])
+
+    def test_backup_only_projection_and_old_mode_restore_clear_it(self):
+        self.doc['tcp_cdn'] = {'schema': 1, 'domain': 'stale.example.org'}
+        result = {'machine_id': self.record['machine_id'], 'node_id': self.after['node_id']}
+        vps.remember_commit(self.state, self.doc, self.record, self.after_path, result, use_generation=False)
+        self.assertEqual(self.doc['tcp_cdn'], {'schema': 1, 'domain': 'cdn.example.org'})
+        vps.remember_commit(self.state, self.doc, self.record, self.before_path, result, use_generation=False)
+        self.assertNotIn('tcp_cdn', self.doc)
+        with self.assertRaisesRegex(host.Error, 'published'):
+            vps.remember_commit(self.state, self.doc, self.record, self.candidate_path, result,
+                                use_generation=False, verified_manifest=self.candidate)
+
+    def test_acknowledgment_real_pipe_is_bounded_eof_timeout_or_exact_orange(self):
+        # Temporarily restore the actual implementation, not input()/isatty().
+        acknowledge = ORIGINAL_ACK
+        for data, expect in ((b'ORANGE\n', None), (b'', 'EOF'), (b'yes\n', 'not ORANGE'), (b'x' * 66, 'input limit')):
+            read, write = os.pipe()
+            os.write(write, data); os.close(write)
+            with os.fdopen(read) as stream, mock.patch.object(sys, 'stdin', stream):
+                if expect:
+                    with self.assertRaisesRegex(host.Error, expect): acknowledge('cdn.example.org', time.time() + 300)
+                else:
+                    acknowledge('cdn.example.org', time.time() + 300)
+        read, write = os.pipe()
+        try:
+            with os.fdopen(read) as stream, mock.patch.object(sys, 'stdin', stream):
+                with self.assertRaisesRegex(host.Error, 'timed out'):
+                    acknowledge('cdn.example.org', time.time() + cdn_probe.PROBE_SECONDS + cdn_probe.COMMIT_MARGIN + .01)
+        finally:
+            os.close(write)
+
+
+class CombinedHostContract(unittest.TestCase):
+    """Use actual Host validators rather than the independent controller stubs."""
+    def test_request_proposal_full_metadata_and_proof_share_host_contract(self):
+        with tempfile.TemporaryDirectory(prefix='qd-cdn-binding-') as folder:
+            before = Path(folder) / 'before.tar'
+            host.atomic(before, b'closed-source-fixture')
+            document = {'owner': 'fixture-owner', 'config': {'domain': 'sub.example.org',
+                'reality_target': 'target.example.org', 'acme_email': '', 'proxy_port': 443}}
+            record = {'machine_id': 'b' * 32, 'endpoint': '93.184.216.34', 'port': 22}
+            request, fingerprint = vps.cdn_request(document, record, 'cdn.example.org', before, 'a' * 64)
+            self.assertEqual(fingerprint, host.transport_request(request))
+            self.assertEqual(request['tcp_cdn'], {'schema': 1, 'domain': 'cdn.example.org'})
+            target = host.new_manifest(document['owner'], document['config'], record['endpoint'])
+            target.update(host_group_id='main-group', management={'ssh_port': 22}, hysteria2={
+                'schema': 1, 'inbound_id': 2, 'host_group_id': 'h2-group',
+                'certificate_file': 'caddy/data/caddy/certificates/issuer/sub.example.org.crt',
+                'key_file': 'caddy/data/caddy/certificates/issuer/sub.example.org.key'})
+            target['tcp_cdn'] = dict(request['tcp_cdn'], inbound_id=1, path='/qd-xhttp/', mode='packet-up',
+                certificate_file='caddy/data/caddy/certificates/issuer/cdn.example.org.crt',
+                key_file='caddy/data/caddy/certificates/issuer/cdn.example.org.key')
+            self.assertTrue(host.cdn_enabled(target))
+            self.assertEqual(request['target_transports'], host.transports(target))
+            proof = {'schema': 1, 'operation_id': request['operation_id'], 'request_fingerprint': fingerprint,
+                'candidate_sha256': 'c' * 64, 'domain': request['tcp_cdn']['domain'],
+                'device_identity_sha256': 'd' * 64, 'observed_at': datetime.now(timezone.utc).isoformat(),
+                'interface': 'eno1', 'edge_ips': ['104.16.1.2'], 'checks': dict.fromkeys(cdn_probe.CHECKS, True)}
+            proof_hash = hashlib.sha256(cdn_probe.canonical(proof)).hexdigest()
+            self.assertEqual(host.cdn_proof_digest(proof), proof_hash)
+            self.assertEqual(host.validate_cdn_proof(dict(request, offnode_sha256='c' * 64,
+                cdn_proof=proof, cdn_proof_sha256=proof_hash), fingerprint), proof)
+            # Proposal and accepted metadata have different roles: request must
+            # never smuggle candidate paths or assume they already exist.
+            with self.assertRaises(host.Error):
+                host.transport_request(dict(request, tcp_cdn=target['tcp_cdn']))
+
+
+ORIGINAL_ACK = vps.acknowledge_orange
+
+if __name__ == '__main__':
+    unittest.main()

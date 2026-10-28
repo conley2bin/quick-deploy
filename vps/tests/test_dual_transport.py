@@ -175,7 +175,7 @@ class DualSnapshot(unittest.TestCase):
         (duplicate/cert.name).unlink();duplicate.rmdir()
         original=key.read_bytes();key.unlink();key.symlink_to(cert)
         with self.assertRaisesRegex(host.Error,'Symlink'):host.hysteria_certificate_paths(self.folder,self.manifest)
-        key.unlink();key.write_bytes(original)
+        key.unlink();key.write_bytes(original);key.chmod(0o600)
         alternate=storage/'alternate.key'
         subprocess.run(['openssl','genpkey','-algorithm','EC','-pkeyopt','ec_paramgen_curve:P-256','-out',str(alternate)],
             check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
@@ -200,18 +200,22 @@ class BaselineAdapterRetention(unittest.TestCase):
         self.pin = self.h.BASELINE_ADAPTER_SHA256
         self.previous = self.h.ROOT / ('adapter-before-' + self.pin + '.py')
 
-    def test_exact_reviewed_baseline_migration_exports_all_three_pinned_sources(self):
+    def test_exact_reviewed_baseline_migration_exports_all_four_pinned_sources(self):
         self.assertEqual(self.baseline, subprocess.check_output(['git', 'show', '6c02d25:vps/lib/host.py']))
         self.assertEqual(hashlib.sha256(self.baseline).hexdigest(), self.pin)
         self.assertEqual(self.pin, 'b52adbbfb7efc3593c5fa266e8f148ed60deaa2b685d72b926e549b9425f6d7e')
         self.assertEqual(self.h.ADAPTER_PREDECESSORS, {
             self.h.LEGACY_ADAPTER_SHA256: 'previous-host.py',
             self.h.DEPLOYED_ADAPTER_SHA256: 'previous-host-918103e.py',
-            self.pin: 'previous-host-ae72036.py'})
+            self.pin: 'previous-host-ae72036.py',
+            self.h.DUAL_ADAPTER_SHA256: 'previous-host-51f71ce.py'})
         originals = {
             self.h.LEGACY_ADAPTER_SHA256: subprocess.check_output(['git', 'show', '18d1b3b:vps/lib/host.py']),
             self.h.DEPLOYED_ADAPTER_SHA256: subprocess.check_output(['git', 'show', '918103e:vps/lib/host.py']),
-            self.pin: self.baseline}
+            self.pin: self.baseline,
+            self.h.DUAL_ADAPTER_SHA256: subprocess.check_output(['git', 'show', '51f71ce:vps/lib/host.py'])}
+        self.assertEqual(originals[self.h.DUAL_ADAPTER_SHA256], subprocess.check_output(['git', 'show', 'e754605:vps/lib/host.py']))
+        self.assertEqual(hashlib.sha256(originals[self.h.DUAL_ADAPTER_SHA256]).hexdigest(), self.h.DUAL_ADAPTER_SHA256)
         inodes = {}
         for pin, source in originals.items():
             if pin != self.pin:
@@ -230,6 +234,44 @@ class BaselineAdapterRetention(unittest.TestCase):
                     inodes[pin] = retained.stat().st_ino
             self.assertEqual(self.h.digest(self.h.ROOT / 'host.py'), host.digest(Path(host.__file__)))
         self.assertTrue(self.h.accepted_adapter_digest(self.pin, host.digest(Path(host.__file__))))
+
+    def test_deployed_ecdb_guard_handoff_retains_distinct_slot_and_reuses_inode(self):
+        source = subprocess.check_output(['git', 'show', '51f71ce:vps/lib/host.py'])
+        pin = self.h.DUAL_ADAPTER_SHA256
+        self.assertEqual(hashlib.sha256(source).hexdigest(), pin)
+        retained = self.h.ROOT / ('adapter-before-' + pin + '.py')
+        self.h.atomic(self.h.ROOT / 'host.py', source, 0o700)
+        inode = None
+        for attempt in range(2):
+            with tarfile.open(self.h.export_backup()) as archive:
+                self.assertEqual(archive.extractfile('previous-host-51f71ce.py').read(), source)
+            self.assertEqual(retained.read_bytes(), source)
+            if inode is not None: self.assertEqual(retained.stat().st_ino, inode)
+            inode = retained.stat().st_ino
+            self.assertEqual((self.h.ROOT / 'host.py').read_bytes(), Path(host.__file__).read_bytes())
+
+    def test_stored_adapter_link_fifo_and_unknown_source_refuse_without_stop(self):
+        import signal
+        path = self.h.ROOT / 'host.py'; source = path.read_bytes()
+        outside = self.f.root / 'outside-adapter'; outside.write_bytes(source)
+        for kind in ('link', 'fifo', 'directory'):
+            path.unlink()
+            if kind == 'link': path.symlink_to(outside)
+            elif kind == 'fifo': os.mkfifo(path)
+            else: path.mkdir()
+            old_handler = signal.signal(signal.SIGALRM, lambda *_: self.fail('Stored adapter FIFO blocked'))
+            try:
+                signal.alarm(2)
+                with mock.patch.object(self.h, 'ctl', wraps=self.h.ctl) as control, mock.patch.object(self.h, 'atomic', wraps=self.h.atomic) as writes:
+                    expected = 'Symlink recovery adapter cannot be exported' if kind == 'link' else 'Unknown stored backup adapter'
+                    with self.assertRaisesRegex(self.h.Error, expected): self.h.export_backup()
+                    control.assert_not_called(); writes.assert_not_called()
+                self.assertEqual(outside.read_bytes(), source)
+            finally:
+                signal.alarm(0); signal.signal(signal.SIGALRM, old_handler)
+                if kind == 'directory': path.rmdir()
+                else: path.unlink()
+                self.h.atomic(path, source, 0o700)
 
     def test_baseline_retention_unsafe_inputs_refuse_before_migration_or_stop(self):
         outside = self.f.root / 'outside-baseline-sentinel'
