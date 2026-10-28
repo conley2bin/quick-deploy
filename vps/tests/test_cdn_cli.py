@@ -44,7 +44,7 @@ def transport_contract(request):
             request['target_transports'] != ['tcp-reality', 'tcp-xhttp-cdn', 'hysteria2'] or
             set(request['tcp_cdn']) != {'schema', 'domain', 'reality_port'}):
         raise host.Error('contract shape mismatch')
-    return hashlib.sha256(host.dumps({key: request[key] for key in required}).encode()).hexdigest()
+    return hashlib.sha256(cdn_probe.canonical({key: request[key] for key in required})).hexdigest()
 
 
 class CDNCLI(unittest.TestCase):
@@ -807,6 +807,9 @@ class CombinedHostContract(unittest.TestCase):
             request, fingerprint = vps.cdn_request(document, record, 'cdn.example.org', before, 'a' * 64, 9443)
             self.assertEqual(fingerprint, host.transport_request(request))
             self.assertEqual(fingerprint, transport_contract(request))
+            reordered = dict(reversed(list(request.items())))
+            reordered['tcp_cdn'] = dict(reversed(list(request['tcp_cdn'].items())))
+            self.assertEqual(fingerprint, host.transport_request(reordered))
             self.assertNotEqual(fingerprint, host.transport_request(dict(request,
                 tcp_cdn=dict(request['tcp_cdn'], reality_port=10443))))
             self.assertEqual(request['tcp_cdn'], {'schema': 1, 'domain': 'cdn.example.org', 'reality_port': 9443})
@@ -843,6 +846,7 @@ class NativeCandidateContinuity(unittest.TestCase):
             manifest = node_manifest()
             manifest['config'].update(proxy_port=443, reality_target='target.example.org')
             manifest['management'] = {'ssh_port': 22}
+            manifest['host_group_id'] = 'main-group'
             manifest['hysteria2'].update(host_group_id='h2-group',
                 certificate_file='caddy/data/caddy/certificates/issuer/sub.example.org.crt',
                 key_file='caddy/data/caddy/certificates/issuer/sub.example.org.key')
@@ -882,10 +886,7 @@ class NativeCandidateContinuity(unittest.TestCase):
             def identity():
                 with tarfile.open(archive, 'w') as out:
                     out.add(db_path, arcname='deployment/db/x-ui.db')
-                # Only Host's old metadata discriminator is a temporary dependency
-                # stub. SQLite extraction, all native roles and continuity are real.
-                with mock.patch.object(host, 'cdn_metadata'):
-                    return vps.cdn_candidate_identity(archive, manifest, files, 'eno1')
+                return vps.cdn_candidate_identity(archive, manifest, files, 'eno1')
             original = identity()
             with sqlite3.connect(db_path) as db:
                 db.execute('update inbounds set up=up+10,down=down+20,last_traffic_reset_time=50')

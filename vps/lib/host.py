@@ -2281,7 +2281,11 @@ def transport_request(request):
                 bound[key] = request[key]
         if 'tcp_cdn' in request:
             raise Error('CDN proposal requires the explicit feature discriminator')
-    return hashlib.sha256(dumps(bound).encode()).hexdigest()
+    # New feature requests have a canonical fingerprint independent of object
+    # insertion order. Featureless receipt hashes retain their historical bytes.
+    encoded = (json.dumps(bound, sort_keys=True, separators=(',', ':'), ensure_ascii=False)
+               if 'feature' in request else dumps(bound))
+    return hashlib.sha256(encoded.encode()).hexdigest()
 
 
 def cdn_proof_digest(proof):
