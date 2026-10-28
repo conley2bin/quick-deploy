@@ -49,7 +49,7 @@ class Error(ValueError):
 
 
 class Rejected(Error):
-    """An established fresh client explicitly denied/closed the inner connection."""
+    """Generic inner connection failure; only a native nonce witness proves auth."""
 
 
 class Cancelled(BaseException):
@@ -559,8 +559,39 @@ class Client:
             raise Error('Inner HTTPS timed out; authentication rejection is unproven') from None
 
 
+def auth_binding(answer, request, fingerprint, *, begin=None):
+    """Validate sanitized host answers; never expose the nonce or private record."""
+    keys = {'schema', 'operation_id', 'request_fingerprint', 'native_identity_sha256'}
+    keys |= {'nonce'} if begin is None else {'nonce_sha256', 'rejected'}
+    if (type(answer) is not dict or set(answer) != keys or type(answer.get('schema')) is not int or
+            answer['schema'] != 1 or answer.get('operation_id') != request['operation_id'] or
+            answer.get('request_fingerprint') != fingerprint or
+            not isinstance(answer.get('native_identity_sha256'), str) or
+            not re.fullmatch(r'[0-9a-f]{64}', answer['native_identity_sha256'])):
+        raise Error('Native auth witness has missing or mismatched operation/identity binding')
+    if begin is None:
+        try:
+            if type(answer['nonce']) is not str or str(uuid.UUID(answer['nonce'])) != answer['nonce']:
+                raise ValueError
+        except (ValueError, AttributeError):
+            raise Error('Native auth begin returned an invalid nonce') from None
+    elif (answer['rejected'] is not True or
+            answer['nonce_sha256'] != hashlib.sha256(begin['nonce'].encode()).hexdigest() or
+            answer['native_identity_sha256'] != begin['native_identity_sha256']):
+        raise Error('Native auth witness missing exact nonce verdict or restored identity')
+    return answer
+
+
+def normalized_uuid(value):
+    # Pinned Xray ProcessUUID ignores bytes6/7, not just UUID text equality.
+    raw = bytearray(uuid.UUID(value).bytes)
+    raw[6:8] = b'\0\0'
+    return bytes(raw)
+
+
 def validate_cdn_candidate(*, profile_bytes, manifest, before_manifest, device, request,
-                           request_fingerprint, candidate_sha256, interface, dns_server, binary, deadline, observations=None):
+                           request_fingerprint, candidate_sha256, interface, dns_server, binary, deadline,
+                           auth_begin, auth_finish, final_candidate, observations=None):
     """Return exact schema1 successful attestation, never partial proof or raw nodes."""
     try:
         budget = Budget(min(deadline - COMMIT_MARGIN, time.time() + PROBE_SECONDS))
@@ -589,13 +620,17 @@ def validate_cdn_candidate(*, profile_bytes, manifest, before_manifest, device, 
             body = https(active, 'api.ipify.org', edge)
             if body.decode('ascii').strip() != manifest['endpoint']:
                 raise Error('Authenticated proxy egress differs from expected VPS public endpoint')
+        # Begin owns a live bounded diagnostic before the positive control and
+        # the sole negative leg. Early errors use the controller's guarded abort.
+        begin = auth_binding(auth_begin(), request, request_fingerprint)
+        if any(normalized_uuid(begin['nonce']) == normalized_uuid(account['id'])
+               for account in manifest['accounts'].values()):
+            raise Error('Native auth nonce overlaps an existing normalized identity')
         with client(cdn) as active:
             https(active, 'www.python.org', edge_ip)
             egress(active, edge_ip)
         wrong = copy.deepcopy(cdn)
-        wrong['uuid'] = str(uuid.uuid4())
-        if wrong['uuid'] == cdn['uuid']:
-            raise Error('Negative authentication identity was not changed')
+        wrong['uuid'] = begin['nonce']
         with client(wrong) as active:
             try:
                 active.https('www.python.org', '/', edge_ip)
@@ -603,6 +638,11 @@ def validate_cdn_candidate(*, profile_bytes, manifest, before_manifest, device, 
                 pass
             else:
                 raise Error('Wrong UUID was accepted; CDN authentication proof failed')
+        # Reset/EOF only permits checking the exact fresh decoder verdict.
+        # Finish means writer closed and original template/runtime restored;
+        # a correctly rejected connection need not remain TCP-open afterward.
+        auth_binding(auth_finish(begin['nonce']), request, request_fingerprint, begin=begin)
+        budget.left()
         with client(cdn) as active:
             egress(active, edge_ip)
         # Deliberate short idle measurement, not a startup sleep or until-pass retry.
@@ -617,8 +657,14 @@ def validate_cdn_candidate(*, profile_bytes, manifest, before_manifest, device, 
             https(active, 'www.python.org')
             egress(active)
         budget.left()
+        # Controller refreshes B and checks A/B semantic continuity only after
+        # diagnostic restoration and all correct-again/reconnect/H2 checks.
+        final_sha256 = final_candidate()
+        if type(final_sha256) is not str or not re.fullmatch(r'[0-9a-f]{64}', final_sha256):
+            raise Error('Final CDN candidate binding is missing or malformed')
+        budget.left()
         return {'schema': 1, 'operation_id': request['operation_id'], 'request_fingerprint': request_fingerprint,
-                'candidate_sha256': candidate_sha256, 'domain': domain, 'device_identity_sha256': identity,
+                'candidate_sha256': final_sha256, 'domain': domain, 'device_identity_sha256': identity,
                 'observed_at': datetime.now(timezone.utc).isoformat(), 'interface': interface,
                 'edge_ips': [edge_ip], 'checks': dict.fromkeys(CHECKS, True)}
     except Error:

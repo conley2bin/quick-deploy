@@ -20,6 +20,7 @@ import sys
 import tempfile
 import time
 import unittest
+import uuid
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'lib'))
@@ -53,9 +54,10 @@ class CDNCLI(unittest.TestCase):
         self.before.pop('tcp_cdn')
         self.before.update(owner='owner-fixture', config=self.config, node_id='node-fixture', published=True)
         self.candidate = dict(copy.deepcopy(self.before), tcp_cdn=node_manifest()['tcp_cdn'], published=False)
-        self.after = dict(copy.deepcopy(self.candidate), published=True)
+        self.final = copy.deepcopy(self.candidate)
+        self.after = dict(copy.deepcopy(self.final), published=True)
         self.paths = {}
-        for name, manifest in [('before', self.before), ('candidate', self.candidate), ('after', self.after)]:
+        for name, manifest in [('before', self.before), ('candidate', self.candidate), ('final', self.final), ('after', self.after)]:
             path = self.state / (name + '.tar')
             host.atomic(path, name.encode())
             self.paths[path] = manifest
@@ -65,7 +67,9 @@ class CDNCLI(unittest.TestCase):
         host.atomic(self.state / 'state.json', host.dumps(self.doc))
         self.args = vps.parser().parse_args(['cdn', '--domain', 'cdn.example.org', '--interface', 'eno1',
                                            '--dns-server', '1.1.1.1', '--mihomo', '/fixture/mihomo'])
-        self.events, self.backups = [], [self.before_path, self.candidate_path, self.after_path]
+        self.events, self.backups = [], [self.before_path, self.candidate_path, self.final_path, self.after_path]
+        self.auth_change = None
+        self.auth_nonce = str(uuid.uuid4())
         self.committed = False
         self.proof_change = None
         self.prepare_change = None
@@ -77,6 +81,8 @@ class CDNCLI(unittest.TestCase):
         self.patch(host, 'dual_enabled', return_value=True)
         self.patch(host, 'validate_feed_scope')
         self.patch(vps, 'checked_backup', side_effect=lambda doc, rec, path: self.paths[Path(path)])
+        self.patch(vps, 'cdn_candidate_identity', side_effect=lambda path, manifest, files, interface:
+                   copy.deepcopy({'manifest': manifest, 'files': files}))
         self.patch(vps, 'resolve_mihomo', return_value='/fixture/mihomo')
         self.patch(cdn_probe, 'environment')
         self.patch(cdn_probe, 'resolve_a', return_value=[self.record['endpoint']])
@@ -127,8 +133,23 @@ class CDNCLI(unittest.TestCase):
                       'request_sha256': host.transport_request(self.request)}
             if self.prepare_change: self.prepare_change(result)
             return result
+        if action == 'transport-auth-begin':
+            self.assertEqual(request, self.request)
+            result = {'schema': 1, 'operation_id': request['operation_id'],
+                      'request_fingerprint': host.transport_request(request), 'nonce': self.auth_nonce,
+                      'native_identity_sha256': 'e' * 64}
+            if self.auth_change: self.auth_change(action, result)
+            return result
+        if action == 'transport-auth-finish':
+            self.assertEqual(request, dict(self.request, cdn_auth_nonce=self.auth_nonce))
+            result = {'schema': 1, 'operation_id': request['operation_id'],
+                      'request_fingerprint': host.transport_request(request),
+                      'nonce_sha256': hashlib.sha256(self.auth_nonce.encode()).hexdigest(),
+                      'rejected': True, 'native_identity_sha256': 'e' * 64}
+            if self.auth_change: self.auth_change(action, result)
+            return result
         if action == 'transport-commit':
-            self.assertEqual(request['offnode_sha256'], host.digest(self.candidate_path))
+            self.assertEqual(request['offnode_sha256'], host.digest(self.final_path))
             self.assertNotEqual(request['offnode_sha256'], self.request['before_sha256'])
             proof_path = self.state / 'cdn-proofs' / (self.request['operation_id'] + '.json')
             self.assertEqual(proof_path.stat().st_mode & 0o777, 0o600)
@@ -149,9 +170,13 @@ class CDNCLI(unittest.TestCase):
         self.events.append('probe')
         self.assertEqual(kwargs['profile_bytes'], cdn_probe.canonical({'proxies': nodes()}))
         self.assertEqual(kwargs['before_manifest'], self.before if not self.committed else self.after)
+        begin = cdn_probe.auth_binding(kwargs['auth_begin'](), kwargs['request'], kwargs['request_fingerprint'])
+        cdn_probe.auth_binding(kwargs['auth_finish'](begin['nonce']), kwargs['request'],
+                               kwargs['request_fingerprint'], begin=begin)
+        final_digest = kwargs['final_candidate']()
         account = self.after['accounts']['company']
         proof = {'schema': 1, 'operation_id': kwargs['request']['operation_id'],
-                 'request_fingerprint': kwargs['request_fingerprint'], 'candidate_sha256': kwargs['candidate_sha256'],
+                 'request_fingerprint': kwargs['request_fingerprint'], 'candidate_sha256': final_digest,
                  'domain': 'cdn.example.org', 'device_identity_sha256': hashlib.sha256(cdn_probe.canonical({
                      'device': 'company', 'id': account['id'], 'auth': account['auth']})).hexdigest(),
                  'observed_at': datetime.now(timezone.utc).isoformat(), 'interface': 'eno1',
@@ -176,6 +201,7 @@ class CDNCLI(unittest.TestCase):
     def test_candidate_proof_before_commit_published_archive_only_projection(self):
         self.run_cdn()
         self.assertEqual(self.events, ['status', 'backup', 'transport-prepare', 'backup', 'outputs', 'ack', 'probe',
+                                      'transport-auth-begin', 'transport-auth-finish', 'backup', 'outputs',
                                       'transport-commit', 'backup', 'outputs', 'status', 'export'])
         saved = vps.load(self.state / 'state.json')
         self.assertEqual(saved['tcp_cdn'], {'schema': 1, 'domain': 'cdn.example.org'})
@@ -184,6 +210,8 @@ class CDNCLI(unittest.TestCase):
         self.assertFalse((self.state / 'pending.json').exists())
         proof = vps.load(self.state / 'cdn-proofs' / (self.request['operation_id'] + '.json'))
         self.assertNotIn(self.after['accounts']['company']['id'], json.dumps(proof))
+        self.assertEqual(proof['candidate_sha256'], host.digest(self.final_path))
+        self.assertNotEqual(proof['candidate_sha256'], host.digest(self.candidate_path))
 
     def test_invalid_proofs_never_commit_and_abort_original_mode(self):
         modifications = [lambda p: p.pop('checks'), lambda p: p.update(candidate_sha256='d' * 64),
@@ -194,7 +222,7 @@ class CDNCLI(unittest.TestCase):
                          lambda p: p.update(secret='must-not-be-written')]
         for change in modifications:
             with self.subTest(change=change):
-                self.events.clear(); self.backups = [self.before_path, self.candidate_path]
+                self.events.clear(); self.backups = [self.before_path, self.candidate_path, self.final_path]
                 self.proof_change = change
                 with self.assertRaises(host.Error): self.run_cdn()
                 self.assertNotIn('transport-commit', self.events); self.assertIn('abort', self.events)
@@ -253,14 +281,16 @@ class CDNCLI(unittest.TestCase):
             with self.assertRaisesRegex(host.Error, 'topology'): self.run_cdn()
         self.assertNotIn('backup', self.events)
 
-    def test_same_domain_verifies_and_backs_up_without_migration(self):
+    def test_same_domain_refuses_fresh_proof_without_prepared_witness(self):
         self.committed = True
         self.doc.update(backup=str(self.after_path), tcp_cdn={'schema': 1, 'domain': 'cdn.example.org'})
         self.backups = [self.after_path]
-        self.run_cdn()
-        self.assertNotIn('transport-prepare', self.events); self.assertNotIn('transport-commit', self.events)
-        self.assertNotIn('ack', self.events); self.assertEqual(self.events.count('probe'), 1)
-        self.assertEqual(vps.load(self.state / 'state.json')['backup'], str(self.after_path))
+        original = (self.state / 'state.json').read_bytes()
+        with self.assertRaisesRegex(host.Error, 'already CDN.*No fresh proof'):
+            self.run_cdn()
+        self.assertEqual(self.events, ['status'])
+        self.assertEqual((self.state / 'state.json').read_bytes(), original)
+        self.assertFalse((self.state / 'pending.json').exists())
         self.args.cdn_domain = 'different.example.org'; self.events.clear()
         with self.assertRaisesRegex(host.Error, 'different CDN domain'): self.run_cdn()
         self.assertNotIn('backup', self.events)
@@ -320,7 +350,7 @@ class CDNCLI(unittest.TestCase):
             self.assertNotIn('transport-commit', self.events)
             self.assertIn('abort', self.events)
             self.assertFalse((self.state / 'pending.json').exists())
-            self.backups = [self.before_path, self.candidate_path, self.after_path]
+            self.backups = [self.before_path, self.candidate_path, self.final_path, self.after_path]
             self.events.clear()
             self.run_cdn()
             self.assertIs(signal.getsignal(signal.SIGTERM), restored)

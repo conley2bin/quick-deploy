@@ -5,6 +5,7 @@ The fixture CA is injected only here; production has no custom-CA parameter.
 """
 import copy
 import http.server
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -19,6 +20,7 @@ import tempfile
 import threading
 import time
 import unittest
+import uuid
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'lib'))
@@ -96,7 +98,9 @@ class Socks(socketserver.BaseRequestHandler):
    exact(size+2);s.sendall(b'\x05\x00\x00\x01\x7f\x00\x00\x01\x01\xbb')
    record({'event':'socks','running':running,'type':node['type']})
    wrong=(node['type']=='vless' and node['uuid']!='11111111-1111-4111-8111-111111111111')
-   if not running or (wrong and mode!='accept-wrong'):return
+   if wrong and mode=='accept-reset':
+    record({'event':'injected-reset'});return
+   if not running or (wrong and mode not in ('accept-wrong','accept-reset')):return
    if mode=='hang':threading.Event().wait(3);return
    with socket.create_connection(('127.0.0.1',origin)) as dest:
     while True:
@@ -155,6 +159,30 @@ class Probe(unittest.TestCase):
         patch.start(); self.addCleanup(patch.stop)
         self.m = manifest()
         self.request = {'feature': 'tcp-cdn', 'tcp_cdn': {'schema': 1, 'domain': 'cdn.example.org'}, 'operation_id': 'a' * 32}
+        self.auth_events = []
+        self.nonce = str(uuid.uuid4())
+
+    def auth_begin(self):
+        self.auth_events.append('begin')
+        self.assertFalse((self.root / 'events').exists())
+        return {'schema': 1, 'operation_id': self.request['operation_id'], 'request_fingerprint': 'b' * 64,
+                'nonce': self.nonce, 'native_identity_sha256': 'd' * 64}
+
+    def auth_finish(self, nonce):
+        self.assertEqual(nonce, self.nonce)
+        self.assertEqual(len([e for e in self.events() if 'pid' in e]), 2)
+        self.assert_processes_clean()
+        self.auth_events.append('restored')
+        return {'schema': 1, 'operation_id': self.request['operation_id'], 'request_fingerprint': 'b' * 64,
+                'nonce_sha256': hashlib.sha256(nonce.encode()).hexdigest(), 'rejected': True,
+                'native_identity_sha256': 'd' * 64}
+
+    def final_candidate(self):
+        self.assertEqual(self.auth_events, ['begin', 'restored'])
+        self.assertEqual(len([e for e in self.events() if 'pid' in e]), 5)
+        self.assert_processes_clean()
+        self.auth_events.append('final-B')
+        return 'e' * 64
 
     def stop_origin(self):
         self.origin.shutdown(); self.origin.server_close(); self.thread.join()
@@ -170,7 +198,8 @@ class Probe(unittest.TestCase):
         options = dict(profile_bytes=probe.canonical({'proxies': nodes()}), manifest=self.m,
                        before_manifest=copy.deepcopy(self.m), device='company', request=self.request,
                        request_fingerprint='b' * 64, candidate_sha256='c' * 64, interface='eno1',
-                       dns_server='1.1.1.1', binary=str(self.binary), deadline=time.time() + 100)
+                       dns_server='1.1.1.1', binary=str(self.binary), deadline=time.time() + 100,
+                       auth_begin=self.auth_begin, auth_finish=self.auth_finish, final_candidate=self.final_candidate)
         options.update(changes)
         with mock.patch.object(probe, 'resolve_a', return_value=[EDGE]), \
                 mock.patch.object(probe, 'edge_tls', return_value={'peer': EDGE, 'port': 443}), \
@@ -223,6 +252,8 @@ class Probe(unittest.TestCase):
         self.assertEqual(set(proof), {'schema', 'operation_id', 'request_fingerprint', 'candidate_sha256', 'domain',
             'device_identity_sha256', 'observed_at', 'interface', 'edge_ips', 'checks'})
         self.assertTrue(all(proof['checks'].values()))
+        self.assertEqual(proof['candidate_sha256'], 'e' * 64)
+        self.assertEqual(self.auth_events, ['begin', 'restored', 'final-B'])
         self.assertNotIn(UUID, json.dumps(proof)); self.assertNotIn('fixture-h2-auth', json.dumps(proof))
         self.assertEqual(len([e for e in self.events() if 'pid' in e]), 5)
         self.assertEqual([e['type'] for e in self.events() if e.get('event') == 'socks'],
@@ -235,6 +266,45 @@ class Probe(unittest.TestCase):
         with self.assertRaisesRegex(probe.Error, 'Wrong UUID was accepted'):
             self.run_proof()
         self.assert_processes_clean()
+
+    def test_accept_all_one_wrong_attempt_reset_without_witness_fails(self):
+        (self.root / 'mode').write_text('accept-reset')
+        with self.assertRaisesRegex(probe.Error, 'witness'):
+            self.run_proof(auth_finish=lambda _: None)
+        self.assertEqual(sum(e.get('event') == 'injected-reset' for e in self.events()), 1)
+        self.assertEqual(len([e for e in self.events() if 'pid' in e]), 2)
+        self.assertEqual(self.auth_events, ['begin'])
+        self.assert_processes_clean()
+
+    def test_mismatched_or_unrestored_witness_never_runs_postrestore_clients(self):
+        changes = [dict(nonce_sha256='f' * 64), dict(operation_id='f' * 32),
+                   dict(request_fingerprint='f' * 64), dict(native_identity_sha256='f' * 64),
+                   dict(rejected=False), dict(schema=True)]
+        original = self.auth_finish
+        for change in changes:
+            with self.subTest(change=change):
+                self.auth_events.clear()
+                (self.root / 'events').unlink(missing_ok=True)
+                def finish(nonce):
+                    return dict(original(nonce), **change)
+                with self.assertRaises(probe.Error):
+                    self.run_proof(auth_finish=finish)
+                self.assertEqual(len([e for e in self.events() if 'pid' in e]), 2)
+                self.assert_processes_clean()
+        (self.root / 'events').unlink()
+        self.auth_events.clear()
+        with self.assertRaisesRegex(probe.Error, 'restoration failed'):
+            self.run_proof(auth_finish=mock.Mock(side_effect=probe.Error('restoration failed')))
+        self.assertEqual(len([e for e in self.events() if 'pid' in e]), 2)
+        self.assert_processes_clean()
+
+    def test_nonce_excludes_normalized_registered_users_before_any_client(self):
+        # The full wire UUID differs while pinned ProcessUUID is identical.
+        raw = bytearray(uuid.UUID(UUID).bytes); raw[6:8] = b'\x55\x66'
+        self.nonce = str(uuid.UUID(bytes=bytes(raw)))
+        with self.assertRaisesRegex(probe.Error, 'normalized identity'):
+            self.run_proof()
+        self.assertFalse((self.root / 'events').exists())
 
     def test_no_actual_edge_socket_fails_even_with_trace_and_https(self):
         with mock.patch.object(probe, 'socket_peers', return_value=set()):
