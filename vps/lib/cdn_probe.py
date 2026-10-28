@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import contextlib
 import copy
+from contextvars import ContextVar
 from datetime import datetime, timezone
 import hashlib
 import http.client
@@ -49,6 +50,64 @@ class Error(ValueError):
 
 class Rejected(Error):
     """An established fresh client explicitly denied/closed the inner connection."""
+
+
+class Cancelled(BaseException):
+    """Scoped CLI SIGTERM cancellation; never an authentication/probe verdict."""
+
+
+class _Cancellation:
+    def __init__(self):
+        self.requested = self.delivered = False
+        self.deferred = 0
+
+    def check(self):
+        if self.requested and not self.delivered and not self.deferred:
+            self.delivered = True
+            raise Cancelled()
+
+    def terminate(self, *_):
+        self.requested = True
+        self.check()
+
+
+_CANCELLATION = ContextVar('cdn_cancellation', default=None)
+
+
+@contextlib.contextmanager
+def cancel_on_sigterm():
+    """Unwind this CDN action once; repeated TERM cannot interrupt its cleanup."""
+    if _CANCELLATION.get() is not None:
+        yield
+        return
+    cancellation = _Cancellation()
+    previous = signal.getsignal(signal.SIGTERM)
+    token = _CANCELLATION.set(cancellation)
+    try:
+        signal.signal(signal.SIGTERM, cancellation.terminate)
+        yield
+    finally:
+        signal.signal(signal.SIGTERM, previous)
+        _CANCELLATION.reset(token)
+        # Receipt reconciliation may return normally after an ambiguous commit.
+        # A cancelled invocation must still report cancellation, not success.
+        if cancellation.requested:
+            raise Cancelled()
+
+
+@contextlib.contextmanager
+def defer_cancellation():
+    """Finish acquiring ownership or releasing resources before raising TERM."""
+    cancellation = _CANCELLATION.get()
+    if cancellation is None:
+        yield
+        return
+    cancellation.deferred += 1
+    try:
+        yield
+    finally:
+        cancellation.deferred -= 1
+        cancellation.check()
 
 
 class Budget:
@@ -380,6 +439,7 @@ class Client:
         self.secret = secrets.token_hex(32)
         self.config = runtime(node, domain, edge_ip, interface, dns_server, self.mixed, self.controller, self.secret)
         self.process = None
+        self.temporary = None
 
     def control(self, method, path, payload=None):
         connection = http.client.HTTPConnection('127.0.0.1', self.controller, timeout=self.budget.left(10))
@@ -395,18 +455,21 @@ class Client:
             connection.close()
 
     def __enter__(self):
-        self.temporary = tempfile.TemporaryDirectory(prefix='qd-cdn-client-')
-        folder = Path(self.temporary.name)
-        folder.chmod(0o700)
-        config = folder / 'config.json'
-        with config.open('xb') as out:
-            os.fchmod(out.fileno(), 0o600)
-            out.write(canonical(self.config))
-        ready = threading.Event()
         try:
-            self.process = subprocess.Popen([self.binary, '-d', str(folder), '-f', str(config)],
-                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
-                env=client_environment(), start_new_session=True)
+            # Do not interrupt Popen between spawning and recording its PID.
+            # Deferral is in Python, not a signal mask inherited by the child.
+            with defer_cancellation():
+                self.temporary = tempfile.TemporaryDirectory(prefix='qd-cdn-client-')
+                folder = Path(self.temporary.name)
+                folder.chmod(0o700)
+                config = folder / 'config.json'
+                with config.open('xb') as out:
+                    os.fchmod(out.fileno(), 0o600)
+                    out.write(canonical(self.config))
+                self.process = subprocess.Popen([self.binary, '-d', str(folder), '-f', str(config)],
+                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                    env=client_environment(), start_new_session=True)
+            ready = threading.Event()
             def drain():
                 markers = set()
                 while chunk := self.process.stdout.readline(65536):
@@ -436,19 +499,23 @@ class Client:
             raise
 
     def __exit__(self, *_):
-        if self.process is not None:
-            if self.process.poll() is None:
-                try:
-                    os.killpg(self.process.pid, signal.SIGTERM)
-                    self.process.wait(timeout=3)
-                except (ProcessLookupError, subprocess.TimeoutExpired):
-                    with contextlib.suppress(ProcessLookupError):
-                        os.killpg(self.process.pid, signal.SIGKILL)
-                    self.process.wait(timeout=3)
-            if hasattr(self, 'reader'):
-                self.reader.join(timeout=3)
-            self.process.stdout.close()
-        self.temporary.cleanup()
+        with defer_cancellation():
+            try:
+                if self.process is not None:
+                    if self.process.poll() is None:
+                        try:
+                            os.killpg(self.process.pid, signal.SIGTERM)
+                            self.process.wait(timeout=3)
+                        except (ProcessLookupError, subprocess.TimeoutExpired):
+                            with contextlib.suppress(ProcessLookupError):
+                                os.killpg(self.process.pid, signal.SIGKILL)
+                            self.process.wait(timeout=3)
+                    if hasattr(self, 'reader'):
+                        self.reader.join(timeout=3)
+                    self.process.stdout.close()
+            finally:
+                if self.temporary is not None:
+                    self.temporary.cleanup()
 
     def https(self, name, path='/', edge_ip=None):
         start = time.monotonic()

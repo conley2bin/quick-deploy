@@ -4,6 +4,7 @@ Explicit Host API stubs model the frozen interface while the Host owner works
 independently. Existing test_dual_cli exercises real archive/generation readers;
 these tests discriminate controller ordering, proof binding and reconciliation.
 """
+import contextlib
 import copy
 from datetime import datetime, timezone, timedelta
 import hashlib
@@ -11,6 +12,10 @@ import io
 import json
 import os
 from pathlib import Path
+import select
+import signal
+import shutil
+import subprocess
 import sys
 import tempfile
 import time
@@ -21,7 +26,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'lib'))
 import cdn_probe
 import host
 import vps
-from test_cdn_probe import manifest as node_manifest, nodes
+from test_cdn_probe import FAKE_CLIENT, manifest as node_manifest, nodes
 
 
 def transport_contract(request):
@@ -302,6 +307,43 @@ class CDNCLI(unittest.TestCase):
             vps.remember_commit(self.state, self.doc, self.record, self.candidate_path, result,
                                 use_generation=False, verified_manifest=self.candidate)
 
+    def test_sigterm_restores_previous_handler_after_cancellation_and_success(self):
+        previous = signal.getsignal(signal.SIGTERM)
+        restored = mock.Mock()
+        signal.signal(signal.SIGTERM, restored)
+        try:
+            with mock.patch.object(cdn_probe, 'validate_cdn_candidate',
+                                   side_effect=lambda **_: os.kill(os.getpid(), signal.SIGTERM)):
+                with self.assertRaises(cdn_probe.Cancelled):
+                    self.run_cdn()
+            self.assertIs(signal.getsignal(signal.SIGTERM), restored)
+            self.assertNotIn('transport-commit', self.events)
+            self.assertIn('abort', self.events)
+            self.assertFalse((self.state / 'pending.json').exists())
+            self.backups = [self.before_path, self.candidate_path, self.after_path]
+            self.events.clear()
+            self.run_cdn()
+            self.assertIs(signal.getsignal(signal.SIGTERM), restored)
+            restored.assert_not_called()
+        finally:
+            signal.signal(signal.SIGTERM, previous)
+
+    def test_first_sigterm_during_reconciliation_finishes_abort(self):
+        remote = self.remote
+        def abort(*args, **kwargs):
+            if args[1] == 'abort':
+                os.kill(os.getpid(), signal.SIGTERM)
+                os.kill(os.getpid(), signal.SIGTERM)
+            return remote(*args, **kwargs)
+        previous = signal.getsignal(signal.SIGTERM)
+        with mock.patch.object(cdn_probe, 'validate_cdn_candidate', side_effect=host.Error('failed probe')), \
+                mock.patch.object(vps, 'remote', side_effect=abort):
+            with self.assertRaises(cdn_probe.Cancelled):
+                self.run_cdn()
+        self.assertIs(signal.getsignal(signal.SIGTERM), previous)
+        self.assertFalse((self.state / 'pending.json').exists())
+        self.assertNotIn('transport-commit', self.events)
+
     def test_acknowledgment_real_pipe_is_bounded_eof_timeout_or_exact_orange(self):
         # Temporarily restore the actual implementation, not input()/isatty().
         acknowledge = ORIGINAL_ACK
@@ -320,6 +362,147 @@ class CDNCLI(unittest.TestCase):
                     acknowledge('cdn.example.org', time.time() + cdn_probe.PROBE_SECONDS + cdn_probe.COMMIT_MARGIN + .01)
         finally:
             os.close(write)
+
+
+# Run the real CLI dispatch, Client ownership/cleanup and pending reconciliation
+# in a fresh interpreter. Only remote operations and public acceptance are fake.
+SIGTERM_CONTROLLER = r'''
+import contextlib,json,os,pathlib,signal,sys,time
+from unittest import mock
+sys.path.insert(0,sys.argv[1])
+from test_cdn_cli import CDNCLI,FAKE_CLIENT,nodes
+import cdn_probe,host,vps
+phase,outcome=sys.argv[2:4]; events,release=map(int,sys.argv[4:6])
+test=CDNCLI();test.setUp()
+binary=test.root/'fake-mihomo';binary.write_text(FAKE_CLIENT);binary.chmod(0o700)
+(test.root/'origin-port').write_text('0');(test.root/'mode').write_text('normal')
+clients=[];spawned=[]
+def announce(stage):
+ os.write(events,(json.dumps({'stage':stage,'clients':[{'pid':(c.process or spawned[-1]).pid,'folder':c.temporary.name} for c in clients]})+'\n').encode())
+def hold(stage):
+ announce(stage);os.read(release,1)
+original_control=cdn_probe.Client.control
+original_popen=cdn_probe.subprocess.Popen
+original_killpg=cdn_probe.os.killpg
+original_remote=test.remote
+previous=signal.getsignal(signal.SIGTERM)
+def control(client,*args,**kwargs):
+ if phase=='enter' and args[0]=='PUT':hold('owned-ready')
+ return original_control(client,*args,**kwargs)
+def popen(*args,**kwargs):
+ child=original_popen(*args,**kwargs)
+ if phase=='spawn':
+  # Popen has spawned, but Client.process has not yet received the object.
+  spawned.append(child)
+  hold('owned-ready')
+ return child
+def killpg(pid,sig):
+ if sig==signal.SIGTERM and phase in ('cleanup','repeat'):
+  hold('owned-ready' if phase=='cleanup' else 'cleanup-ready')
+ return original_killpg(pid,sig)
+def remote(*args,**kwargs):
+ if args[1]=='abort' and outcome=='failed':raise host.Error('fixture reconciliation unavailable')
+ return original_remote(*args,**kwargs)
+def probe(**kwargs):
+ with contextlib.ExitStack() as stack:
+  for node in (nodes() if phase=='nested' else nodes()[:1]):
+   client=cdn_probe.Client(str(binary),node,'cdn.example.org','104.16.1.2','eno1','1.1.1.1',cdn_probe.Budget(time.time()+30))
+   clients.append(client);stack.enter_context(client)
+  if phase!='cleanup':hold('owned-ready')
+ raise AssertionError('cancelled probe returned without cancellation')
+test.queued=outcome=='queued'
+with mock.patch.object(cdn_probe,'validate_cdn_candidate',side_effect=probe), \
+     mock.patch.object(cdn_probe.Client,'control',control), \
+     mock.patch.object(cdn_probe.subprocess,'Popen',side_effect=popen), \
+     mock.patch.object(cdn_probe.os,'killpg',side_effect=killpg), \
+     mock.patch.object(vps,'remote',side_effect=remote):
+ code=vps.main(['--state-dir',str(test.state),'cdn','--domain','cdn.example.org','--interface','eno1','--dns-server','1.1.1.1'])
+report={'stage':'result','code':code,'events':test.events,'pending':(test.state/'pending.json').exists(),
+        'saved_cdn':'tcp_cdn' in vps.load(test.state/'state.json'),'proof':(test.state/'cdn-proofs').exists(),
+        'stderr':sys.stderr.getvalue(),'restored':signal.getsignal(signal.SIGTERM)==previous}
+if report['pending']:report['pending_mode']=vps.load(test.state/'pending.json')['mode']
+os.write(events,(json.dumps(report)+'\n').encode())
+test.doCleanups()
+sys.exit(code)
+'''
+
+
+class SIGTERMSubprocess(unittest.TestCase):
+    def test_term_unwinds_owned_clients_and_reconciles_or_retains_pending(self):
+        cases = [('active', 'restored'), ('enter', 'queued'), ('spawn', 'restored'),
+                 ('nested', 'failed'), ('cleanup', 'restored'), ('repeat', 'restored')]
+        for phase, outcome in cases:
+            with self.subTest(phase=phase, outcome=outcome):
+                self.run_controller(phase, outcome)
+
+    def run_controller(self, phase, outcome):
+        read, write = os.pipe()
+        release, send = os.pipe()
+        child = subprocess.Popen([sys.executable, '-B', '-c', SIGTERM_CONTROLLER,
+            str(Path(__file__).resolve().parent), phase, outcome, str(write), str(release)],
+            pass_fds=(write, release), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        os.close(write); os.close(release)
+        clients = []
+        deadline = time.monotonic() + 12
+        def event():
+            data = bytearray()
+            while not data.endswith(b'\n'):
+                remaining = deadline - time.monotonic()
+                self.assertGreater(remaining, 0, 'controller lifecycle deadline expired')
+                self.assertTrue(select.select([read], [], [], remaining)[0], 'controller event timeout')
+                chunk = os.read(read, 1)
+                self.assertTrue(chunk, 'controller exited before lifecycle event')
+                data.extend(chunk)
+            return json.loads(data)
+        try:
+            ready = event()
+            self.assertEqual(ready['stage'], 'owned-ready')
+            clients = ready['clients']
+            self.assertEqual(len(clients), 2 if phase == 'nested' else 1)
+            for client in clients:
+                self.assertTrue(Path('/proc', str(client['pid'])).exists())
+                config = Path(client['folder']) / 'config.json'
+                self.assertEqual(config.stat().st_mode & 0o777, 0o600)
+                node = json.loads(config.read_text())['proxies'][0]
+                self.assertIn(node.get('uuid', node.get('password')),
+                              ('11111111-1111-4111-8111-111111111111', 'fixture-h2-auth-original'))
+            os.kill(child.pid, signal.SIGTERM)
+            if phase in ('spawn', 'cleanup'):
+                os.write(send, b'x')
+            if phase == 'repeat':
+                self.assertEqual(event()['stage'], 'cleanup-ready')
+                os.kill(child.pid, signal.SIGTERM)
+                os.write(send, b'x')
+            result = event()
+            stdout, stderr = child.communicate(timeout=max(.1, deadline - time.monotonic()))
+            self.assertEqual(child.returncode, 143, (stdout, stderr))
+            self.assertEqual(result['code'], 143)
+            self.assertTrue(result['restored'])
+            self.assertNotIn('transport-commit', result['events'])
+            self.assertFalse(result['saved_cdn']); self.assertFalse(result['proof'])
+            self.assertEqual(result['pending'], outcome != 'restored')
+            if result['pending']:
+                self.assertEqual(result['pending_mode'], 'transport-upgrade')
+                self.assertIn('pending', result['stderr'])
+            for client in clients:
+                self.assertFalse(Path('/proc', str(client['pid'])).exists())
+                self.assertFalse(Path(client['folder']).exists())
+        finally:
+            if child.poll() is None:
+                with contextlib.suppress(BrokenPipeError):
+                    os.write(send, b'xxx')
+                child.terminate()
+                try:
+                    child.communicate(timeout=3)
+                except subprocess.TimeoutExpired:
+                    child.kill()
+            child.communicate(timeout=3)
+            os.close(read); os.close(send)
+            # Test failures must not strand fake credential-bearing processes.
+            for client in clients:
+                with contextlib.suppress(ProcessLookupError):
+                    os.killpg(client['pid'], signal.SIGKILL)
+                shutil.rmtree(client['folder'], ignore_errors=True)
 
 
 class CombinedHostContract(unittest.TestCase):

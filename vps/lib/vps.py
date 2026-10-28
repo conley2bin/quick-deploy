@@ -1055,6 +1055,11 @@ def check_cdn_receipt(state, pending, receipt):
 
 
 def cdn(state, document, args):
+    with cdn_probe.cancel_on_sigterm():
+        return _cdn(state, document, args)
+
+
+def _cdn(state, document, args):
     record = document.get('current')
     if not record or (state / 'pending.json').exists() or (state / 'pending.json').is_symlink():
         raise host.Error('CDN requires a committed current node and no pending operation; use recover first')
@@ -1150,15 +1155,18 @@ def cdn(state, document, args):
     except BaseException:
         # Abort also reconciles a durable successful receipt. Never repeat the
         # migration or regenerate proof/credentials after an ambiguous commit.
-        try:
-            recover_local(state, document, binary)
-        except BaseException:
-            print('CDN reconciliation pending; use recover with the same independent SSH carrier. No migration replay.', file=sys.stderr)
-        print('CDN attempt ended. If rollback occurred, return ONLY the CDN DNS record to gray before retry; '
-              'sub/H2 credentials and desktop selection are unchanged.', file=sys.stderr)
-        if commit_attempted and not (state / 'pending.json').exists() and document.get('tcp_cdn', {}).get('domain') == domain:
-            print('CDN commit receipt reconciled; no credential replay.')
-            return
+        # A first TERM during recovery is deferred; repeated TERM after the
+        # original cancellation cannot interrupt client/transaction cleanup.
+        with cdn_probe.defer_cancellation():
+            try:
+                recover_local(state, document, binary)
+            except BaseException:
+                print('CDN reconciliation pending; use recover with the same independent SSH carrier. No migration replay.', file=sys.stderr)
+            print('CDN attempt ended. If rollback occurred, return ONLY the CDN DNS record to gray before retry; '
+                  'sub/H2 credentials and desktop selection are unchanged.', file=sys.stderr)
+            if commit_attempted and not (state / 'pending.json').exists() and document.get('tcp_cdn', {}).get('domain') == domain:
+                print('CDN commit receipt reconciled; no credential replay.')
+                return
         raise
     export_after_commit(state)
     print('Cloudflare/XHTTP TCP443 committed after real acceptance; original H2 UDP443 remains the default/backup. '
@@ -1523,6 +1531,9 @@ def main(argv=None):
     except (host.Error, OSError, ValueError, EOFError, tarfile.TarError) as exc:
         print('vps: ' + str(exc), file=sys.stderr)
         return 1
+    except cdn_probe.Cancelled:
+        print('vps: SIGTERM cancelled CDN action; inspect any retained pending state with recover', file=sys.stderr)
+        return 143
     except KeyboardInterrupt:
         print('vps: interrupted; inspect pending state with recover', file=sys.stderr)
         return 130
