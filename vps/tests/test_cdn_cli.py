@@ -41,7 +41,8 @@ def transport_contract(request):
                 'ssh_port', 'mode', 'before_sha256', 'feature', 'source_transports', 'target_transports', 'tcp_cdn')
     if (set(required) - request.keys() or request['feature'] != 'tcp-cdn' or
             request['source_transports'] != ['tcp-reality', 'hysteria2'] or
-            request['target_transports'] != ['tcp-xhttp-cdn', 'hysteria2']):
+            request['target_transports'] != ['tcp-reality', 'tcp-xhttp-cdn', 'hysteria2'] or
+            set(request['tcp_cdn']) != {'schema', 'domain', 'reality_port'}):
         raise host.Error('contract shape mismatch')
     return hashlib.sha256(host.dumps({key: request[key] for key in required}).encode()).hexdigest()
 
@@ -119,7 +120,7 @@ class CDNCLI(unittest.TestCase):
 
     def status(self):
         return {'adapter_sha256': host.digest(vps.MODULE / 'lib/host.py'), 'needs_transport_upgrade': False,
-                'transports': ['tcp-xhttp-cdn' if self.committed else 'tcp-reality', 'hysteria2'],
+                'transports': ['tcp-reality', 'tcp-xhttp-cdn', 'hysteria2'] if self.committed else ['tcp-reality', 'hysteria2'],
                 'machine_id': self.record['machine_id'], 'node_id': self.before['node_id']}
 
     def remote(self, record, action, request=None, stdin=None, **kwargs):
@@ -136,7 +137,8 @@ class CDNCLI(unittest.TestCase):
             self.assertEqual(self.request['before_sha256'], host.digest(self.before_path))
             self.assertEqual(self.events[:3], ['status', 'backup', 'transport-prepare'])
             result = {'prepared': True, 'deadline': time.time() + 600,
-                      'request_sha256': host.transport_request(self.request)}
+                      'request_sha256': host.transport_request(self.request),
+                      'transports': self.request['target_transports'], 'tcp_cdn': self.candidate['tcp_cdn']}
             if self.prepare_change: self.prepare_change(result)
             return result
         if action == 'transport-auth-begin':
@@ -144,7 +146,7 @@ class CDNCLI(unittest.TestCase):
             self.diagnostic_active = True
             result = {'schema': 1, 'operation_id': request['operation_id'],
                       'request_fingerprint': host.transport_request(request), 'nonce': self.auth_nonce,
-                      'native_identity_sha256': 'e' * 64}
+                      'native_identity_sha256': 'e' * 64, 'inbound_id': 3, 'inbound_tag': 'SELF-cdn'}
             if self.auth_change: self.auth_change(action, result)
             return result
         if action == 'transport-auth-finish':
@@ -155,7 +157,8 @@ class CDNCLI(unittest.TestCase):
             result = {'schema': 1, 'operation_id': request['operation_id'],
                       'request_fingerprint': host.transport_request(request),
                       'nonce_sha256': hashlib.sha256(self.auth_nonce.encode()).hexdigest(),
-                      'rejected': True, 'native_identity_sha256': 'e' * 64}
+                      'rejected': True, 'native_identity_sha256': 'e' * 64, 'inbound_id': 3, 'inbound_tag': 'SELF-cdn'}
+            self.verdict = copy.deepcopy(result)
             if self.auth_change: self.auth_change(action, result)
             return result
         if action == 'transport-commit':
@@ -170,7 +173,8 @@ class CDNCLI(unittest.TestCase):
             self.assertEqual(vps.load(proof_path), request['cdn_proof'])
             self.assertNotIn('tcp_cdn', vps.load(self.state / 'state.json'))
             self.receipt = {'committed': True, 'request_sha256': host.transport_request(self.request),
-                            'offnode_sha256': request['offnode_sha256'], 'cdn_proof_sha256': request['cdn_proof_sha256']}
+                            'offnode_sha256': request['offnode_sha256'], 'cdn_proof_sha256': request['cdn_proof_sha256'],
+                            'cdn_auth_verdict': copy.deepcopy(self.verdict)}
             self.committed = True
             if self.lost_ack: raise host.Error('lost commit ACK')
             return self.receipt
@@ -185,9 +189,9 @@ class CDNCLI(unittest.TestCase):
         self.events.append('probe')
         self.assertEqual(kwargs['profile_bytes'], cdn_probe.canonical({'proxies': nodes()}))
         self.assertEqual(kwargs['before_manifest'], self.before if not self.committed else self.after)
-        begin = cdn_probe.auth_binding(kwargs['auth_begin'](), kwargs['request'], kwargs['request_fingerprint'])
+        begin = cdn_probe.auth_binding(kwargs['auth_begin'](), kwargs['request'], kwargs['request_fingerprint'], kwargs['manifest'])
         cdn_probe.auth_binding(kwargs['auth_finish'](begin['nonce']), kwargs['request'],
-                               kwargs['request_fingerprint'], begin=begin)
+                               kwargs['request_fingerprint'], kwargs['manifest'], begin=begin)
         final_digest = kwargs['final_candidate']()
         account = self.after['accounts']['company']
         proof = {'schema': 1, 'operation_id': kwargs['request']['operation_id'],
@@ -219,7 +223,7 @@ class CDNCLI(unittest.TestCase):
                                       'transport-auth-begin', 'transport-auth-finish', 'backup', 'outputs',
                                       'transport-commit', 'backup', 'outputs', 'status', 'export'])
         saved = vps.load(self.state / 'state.json')
-        self.assertEqual(saved['tcp_cdn'], {'schema': 1, 'domain': 'cdn.example.org'})
+        self.assertEqual(saved['tcp_cdn'], {'schema': 1, 'domain': 'cdn.example.org', 'reality_port': 9443})
         self.assertEqual(saved['backup'], str(self.after_path))
         self.assertEqual(saved['config'], self.config)
         self.assertFalse((self.state / 'pending.json').exists())
@@ -307,7 +311,7 @@ class CDNCLI(unittest.TestCase):
         self.assertEqual((self.state / 'state.json').read_bytes(), original)
         self.assertFalse((self.state / 'pending.json').exists())
         self.args.cdn_domain = 'different.example.org'; self.events.clear()
-        with self.assertRaisesRegex(host.Error, 'different CDN domain'): self.run_cdn()
+        with self.assertRaisesRegex(host.Error, 'different CDN domain or REALITY port'): self.run_cdn()
         self.assertNotIn('backup', self.events)
 
     def test_backup_capture_failure_still_projects_verified_published_cdn(self):
@@ -315,7 +319,7 @@ class CDNCLI(unittest.TestCase):
             with self.assertRaisesRegex(host.Error, 'Backup committed; offline snapshot not captured'):
                 vps.backup_committed(self.state, self.doc, self.record, self.after_path)
         saved = vps.load(self.state / 'state.json')
-        self.assertEqual(saved['tcp_cdn'], {'schema': 1, 'domain': 'cdn.example.org'})
+        self.assertEqual(saved['tcp_cdn'], {'schema': 1, 'domain': 'cdn.example.org', 'reality_port': 9443})
         self.assertEqual(saved['backup'], str(self.after_path))
         self.assertNotIn('native_generation', saved)
 
@@ -470,7 +474,7 @@ class CDNCLI(unittest.TestCase):
         self.doc['tcp_cdn'] = {'schema': 1, 'domain': 'stale.example.org'}
         result = {'machine_id': self.record['machine_id'], 'node_id': self.after['node_id']}
         vps.remember_commit(self.state, self.doc, self.record, self.after_path, result, use_generation=False)
-        self.assertEqual(self.doc['tcp_cdn'], {'schema': 1, 'domain': 'cdn.example.org'})
+        self.assertEqual(self.doc['tcp_cdn'], {'schema': 1, 'domain': 'cdn.example.org', 'reality_port': 9443})
         vps.remember_commit(self.state, self.doc, self.record, self.before_path, result, use_generation=False)
         self.assertNotIn('tcp_cdn', self.doc)
         with self.assertRaisesRegex(host.Error, 'published'):
@@ -576,7 +580,7 @@ def remote(*args,**kwargs):
 def probe(**kwargs):
  kwargs['auth_begin']()
  with contextlib.ExitStack() as stack:
-  for node in (nodes() if phase=='nested' else nodes()[:1]):
+  for node in (nodes()[:2] if phase=='nested' else nodes()[:1]):
    client=cdn_probe.Client(str(binary),node,'cdn.example.org','104.16.1.2','eno1','1.1.1.1',cdn_probe.Budget(time.time()+30))
    clients.append(client);stack.enter_context(client)
   if phase!='cleanup':hold('owned-ready')
@@ -679,7 +683,11 @@ class SIGTERMSubprocess(unittest.TestCase):
 
 
 class CombinedHostContract(unittest.TestCase):
-    """Use actual Host validators rather than the independent controller stubs."""
+    """Real integration gate, deliberately NOT stubbed to hide old BASE Host.
+
+    BASE8f1da15 rejects the new proposal: this gate must fail until the separately
+    owned Host implementation is integrated. Controller-only suites exclude it.
+    """
     def test_request_proposal_full_metadata_and_proof_share_host_contract(self):
         with tempfile.TemporaryDirectory(prefix='qd-cdn-binding-') as folder:
             before = Path(folder) / 'before.tar'
@@ -687,15 +695,15 @@ class CombinedHostContract(unittest.TestCase):
             document = {'owner': 'fixture-owner', 'config': {'domain': 'sub.example.org',
                 'reality_target': 'target.example.org', 'acme_email': '', 'proxy_port': 443}}
             record = {'machine_id': 'b' * 32, 'endpoint': '93.184.216.34', 'port': 22}
-            request, fingerprint = vps.cdn_request(document, record, 'cdn.example.org', before, 'a' * 64)
+            request, fingerprint = vps.cdn_request(document, record, 'cdn.example.org', before, 'a' * 64, 9443)
             self.assertEqual(fingerprint, host.transport_request(request))
-            self.assertEqual(request['tcp_cdn'], {'schema': 1, 'domain': 'cdn.example.org'})
+            self.assertEqual(request['tcp_cdn'], {'schema': 1, 'domain': 'cdn.example.org', 'reality_port': 9443})
             target = host.new_manifest(document['owner'], document['config'], record['endpoint'])
             target.update(host_group_id='main-group', management={'ssh_port': 22}, hysteria2={
                 'schema': 1, 'inbound_id': 2, 'host_group_id': 'h2-group',
                 'certificate_file': 'caddy/data/caddy/certificates/issuer/sub.example.org.crt',
                 'key_file': 'caddy/data/caddy/certificates/issuer/sub.example.org.key'})
-            target['tcp_cdn'] = dict(request['tcp_cdn'], inbound_id=1, path='/qd-xhttp/', mode='packet-up',
+            target['tcp_cdn'] = dict(request['tcp_cdn'], inbound_id=3, host_group_id='cdn-group', reality_tag='in-443-tcp', path='/qd-xhttp/', mode='packet-up',
                 certificate_file='caddy/data/caddy/certificates/issuer/cdn.example.org.crt',
                 key_file='caddy/data/caddy/certificates/issuer/cdn.example.org.key')
             self.assertTrue(host.cdn_enabled(target))
@@ -726,7 +734,7 @@ class NativeCandidateContinuity(unittest.TestCase):
             manifest['hysteria2'].update(host_group_id='h2-group',
                 certificate_file='caddy/data/caddy/certificates/issuer/sub.example.org.crt',
                 key_file='caddy/data/caddy/certificates/issuer/sub.example.org.key')
-            manifest['tcp_cdn'].update(inbound_id=1,
+            manifest['tcp_cdn'].update(inbound_id=3,
                 certificate_file='caddy/data/caddy/certificates/issuer/cdn.example.org.crt',
                 key_file='caddy/data/caddy/certificates/issuer/cdn.example.org.key')
             files = {'company.yaml': cdn_probe.canonical({'proxies': nodes()})}
@@ -737,24 +745,30 @@ class NativeCandidateContinuity(unittest.TestCase):
                     create table inbounds(id integer primary key,settings text,stream_settings text,
                         sniffing text,up integer,down integer,total integer,last_traffic_reset_time integer);
                     create table hosts(id integer primary key,inbound_id integer,address text,alpn text);
-                    create table client_inbounds(client_id integer,inbound_id integer);
+                    create table client_inbounds(client_id integer,inbound_id integer,flow_override text);
                     create table settings(id integer primary key,key text,value text);
                     insert into inbounds values(1,'{"clients":[],"decryption":"none"}',
-                        '{"network":"xhttp","routing":{"rules":["first","second"]}}','{}',1,2,1000,0);
+                        '{"network":"tcp","security":"reality","port":9443,"tag":"in-443-tcp"}','{}',1,2,1000,0);
                     insert into inbounds values(2,'{"version":2}','{"network":"hysteria"}','{}',3,4,1000,0);
-                    insert into hosts values(1,1,'cdn.example.org','["h2"]');
+                    insert into inbounds values(3,'{"clients":[],"decryption":"none"}',
+                        '{"network":"xhttp","routing":{"rules":["first","second"]}}','{}',0,0,1000,0);
+                    insert into hosts values(1,1,'93.184.216.34:9443','[]');
                     insert into hosts values(2,2,'93.184.216.34','["h3"]');
-                    insert into client_inbounds values(1,1),(1,2);
+                    insert into hosts values(3,3,'cdn.example.org','["h2"]');
+                    insert into client_inbounds values(1,1,'xtls-rprx-vision'),(1,2,''),(1,3,'');
                     insert into settings values(1,'xrayTemplateConfig','{"log":{"loglevel":"none"}}');
                 ''')
                 account = manifest['accounts']['company']
                 db.execute('insert into clients values(1,?,?,?,1,12345,1893456000000,3,?)',
-                           (account['id'], account['auth'], account['subId'], ''))
+                           (account['id'], account['auth'], account['subId'], 'xtls-rprx-vision'))
             archive = root / 'candidate.tar'
             def identity():
                 with tarfile.open(archive, 'w') as out:
                     out.add(db_path, arcname='deployment/db/x-ui.db')
-                return vps.cdn_candidate_identity(archive, manifest, files, 'eno1')
+                # Only Host's old metadata discriminator is a temporary dependency
+                # stub. SQLite extraction, all native roles and continuity are real.
+                with mock.patch.object(host, 'cdn_metadata'):
+                    return vps.cdn_candidate_identity(archive, manifest, files, 'eno1')
             original = identity()
             with sqlite3.connect(db_path) as db:
                 db.execute('update inbounds set up=up+10,down=down+20,last_traffic_reset_time=50')
@@ -777,7 +791,7 @@ class NativeCandidateContinuity(unittest.TestCase):
                 db.execute('delete from client_inbounds where inbound_id=2')
             self.assertNotEqual(identity(), original)
             with sqlite3.connect(db_path) as db:
-                db.execute('insert into client_inbounds values(1,2)')
+                db.execute("insert into client_inbounds values(1,2,'')")
             changed_nodes = nodes(); changed_nodes[0]['client-fingerprint'] = 'firefox'
             files['company.yaml'] = cdn_probe.canonical({'proxies': changed_nodes})
             self.assertNotEqual(identity(), original)

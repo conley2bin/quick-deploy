@@ -355,16 +355,35 @@ def native_nodes(profile_bytes, manifest, device, interface):
         yaml = bootstrap._yaml()
         profile = bootstrap._load_profile(profile_bytes, yaml)
         nodes = profile['proxies']
-        if len(nodes) != 2 or {node.get('type') for node in nodes} != {'vless', 'hysteria2'}:
-            raise Error('CDN candidate must contain exactly the two native protocol mappings')
-        h2 = bootstrap._native_node(profile, manifest['endpoint'], 443, manifest['config']['domain'], interface)
-        cdn = copy.deepcopy(next(node for node in nodes if node['type'] == 'vless'))
+        if (len(nodes) != 3 or any(type(node) is not dict for node in nodes) or
+                {node.get('name') for node in nodes} != {'SELF-main', 'SELF-cdn', 'SELF-h2'}):
+            raise Error('CDN candidate must contain exactly three distinct native role mappings')
+        roles = {node['name']: node for node in nodes}
+        h2 = bootstrap._native_node(profile, manifest['endpoint'], manifest['config']['proxy_port'], manifest['config']['domain'], interface)
+        cdn, reality = copy.deepcopy(roles['SELF-cdn']), roles['SELF-main']
         account, target = manifest['accounts'][device], manifest['tcp_cdn']
+        if (type(target.get('reality_port')) is not int or not 1 <= target['reality_port'] <= 65535 or
+                not target.get('reality_tag') or type(target.get('inbound_id')) is not int or target['inbound_id'] <= 0 or
+                target['inbound_id'] == manifest['hysteria2']['inbound_id'] or
+                reality.get('type') != 'vless' or reality.get('network', 'tcp') != 'tcp' or
+                reality.get('server') != manifest['endpoint'] or type(reality.get('port')) is not int or
+                reality['port'] != target['reality_port'] or reality.get('tls') is not True or
+                reality.get('uuid') != account['id'] or reality.get('flow') != 'xtls-rprx-vision' or
+                reality.get('servername') != manifest['config']['reality_target'] or
+                reality.get('reality-opts') != {'public-key': manifest['reality']['publicKey'],
+                                               'short-id': manifest['reality']['shortIds'][0]}):
+            raise Error('Native REALITY role has wrong port, identity, keys, transport or Vision flow')
+        for key in ('skip-cert-verify', 'insecure', 'disable-sni'):
+            if key in reality and reality[key] is not False:
+                raise Error('Native REALITY has an unsupported trust override')
+        for key in ('ca', 'ca-str', 'fingerprint', 'dialer-proxy', 'ip-version', 'xhttp-opts', 'ws-opts', 'http-opts'):
+            if key in reality and reality[key] not in (None, ''):
+                raise Error('Native REALITY has an unsupported trust/outer-dial override')
         if (type(target.get('schema')) is not int or target['schema'] != 1 or
                 target.get('path') != '/qd-xhttp/' or target.get('mode') != 'packet-up' or h2.get('alpn') != ['h3'] or
-                not account['enable'] or cdn.get('name') != 'SELF-cdn' or h2['name'] != 'SELF-h2' or
+                not account['enable'] or cdn.get('type') != 'vless' or h2['name'] != 'SELF-h2' or
                 cdn.get('uuid') != account['id'] or h2['password'] != account['auth'] or
-                cdn.get('server') != target['domain'] or cdn.get('port') != 443 or cdn.get('tls') is not True or
+                cdn.get('server') != target['domain'] or type(cdn.get('port')) is not int or cdn.get('port') != 443 or cdn.get('tls') is not True or
                 cdn.get('network') != 'xhttp' or cdn.get('servername') != target['domain'] or
                 cdn.get('alpn') != ['h2'] or cdn.get('flow') not in (None, '') or
                 cdn.get('xhttp-opts') != {'path': target['path'], 'host': target['domain'], 'mode': target['mode']}):
@@ -378,13 +397,13 @@ def native_nodes(profile_bytes, manifest, device, interface):
         for key in ('sni', 'name-cert-verify'):
             if key in cdn and cdn[key] != target['domain']:
                 raise Error('Native CDN has conflicting TLS names')
-        for node in (cdn, h2):
+        for node in (reality, cdn, h2):
             if ('interface-name' in node and node['interface-name'] != interface) or node.get('routing-mark'):
                 raise Error('Native node conflicts with required physical interface')
         identity = hashlib.sha256(canonical({'device': device, 'id': account['id'], 'auth': account['auth']})).hexdigest()
         return cdn, h2, identity
     except (bootstrap.BootstrapError, KeyError, TypeError, StopIteration, AttributeError):
-        raise Error('Invalid complete native CDN/H2 profile or candidate identity') from None
+        raise Error('Invalid complete native REALITY/CDN/H2 profile or candidate identity') from None
 
 
 def client_environment():
@@ -559,16 +578,18 @@ class Client:
             raise Error('Inner HTTPS timed out; authentication rejection is unproven') from None
 
 
-def auth_binding(answer, request, fingerprint, *, begin=None):
+def auth_binding(answer, request, fingerprint, manifest, *, begin=None):
     """Validate sanitized host answers; never expose the nonce or private record."""
-    keys = {'schema', 'operation_id', 'request_fingerprint', 'native_identity_sha256'}
+    keys = {'schema', 'operation_id', 'request_fingerprint', 'native_identity_sha256', 'inbound_id', 'inbound_tag'}
     keys |= {'nonce'} if begin is None else {'nonce_sha256', 'rejected'}
     if (type(answer) is not dict or set(answer) != keys or type(answer.get('schema')) is not int or
             answer['schema'] != 1 or answer.get('operation_id') != request['operation_id'] or
             answer.get('request_fingerprint') != fingerprint or
+            type(answer.get('inbound_id')) is not int or answer['inbound_id'] != manifest['tcp_cdn']['inbound_id'] or
+            answer.get('inbound_tag') != 'SELF-cdn' or
             not isinstance(answer.get('native_identity_sha256'), str) or
             not re.fullmatch(r'[0-9a-f]{64}', answer['native_identity_sha256'])):
-        raise Error('Native auth witness has missing or mismatched operation/identity binding')
+        raise Error('Native auth witness has missing or mismatched operation/identity/CDN role binding')
     if begin is None:
         try:
             if type(answer['nonce']) is not str or str(uuid.UUID(answer['nonce'])) != answer['nonce']:
@@ -577,7 +598,8 @@ def auth_binding(answer, request, fingerprint, *, begin=None):
             raise Error('Native auth begin returned an invalid nonce') from None
     elif (answer['rejected'] is not True or
             answer['nonce_sha256'] != hashlib.sha256(begin['nonce'].encode()).hexdigest() or
-            answer['native_identity_sha256'] != begin['native_identity_sha256']):
+            answer['native_identity_sha256'] != begin['native_identity_sha256'] or
+            answer['inbound_id'] != begin['inbound_id'] or answer['inbound_tag'] != begin['inbound_tag']):
         raise Error('Native auth witness missing exact nonce verdict or restored identity')
     return answer
 
@@ -596,7 +618,10 @@ def validate_cdn_candidate(*, profile_bytes, manifest, before_manifest, device, 
     try:
         budget = Budget(min(deadline - COMMIT_MARGIN, time.time() + PROBE_SECONDS))
         domain = domain_name(manifest['tcp_cdn']['domain'])
-        if (request.get('feature') != 'tcp-cdn' or request.get('tcp_cdn') != {'schema': 1, 'domain': domain} or
+        if (request.get('feature') != 'tcp-cdn' or
+                request.get('tcp_cdn') != {'schema': 1, 'domain': domain, 'reality_port': manifest['tcp_cdn']['reality_port']} or
+                request.get('source_transports') != ['tcp-reality', 'hysteria2'] or
+                request.get('target_transports') != ['tcp-reality', 'tcp-xhttp-cdn', 'hysteria2'] or
                 not re.fullmatch(r'[0-9a-f]{32}', request.get('operation_id', '')) or
                 not re.fullmatch(r'[0-9a-f]{64}', request_fingerprint) or
                 not re.fullmatch(r'[0-9a-f]{64}', candidate_sha256)):
@@ -622,7 +647,7 @@ def validate_cdn_candidate(*, profile_bytes, manifest, before_manifest, device, 
                 raise Error('Authenticated proxy egress differs from expected VPS public endpoint')
         # Begin owns a live bounded diagnostic before the positive control and
         # the sole negative leg. Early errors use the controller's guarded abort.
-        begin = auth_binding(auth_begin(), request, request_fingerprint)
+        begin = auth_binding(auth_begin(), request, request_fingerprint, manifest)
         if any(normalized_uuid(begin['nonce']) == normalized_uuid(account['id'])
                for account in manifest['accounts'].values()):
             raise Error('Native auth nonce overlaps an existing normalized identity')
@@ -641,7 +666,7 @@ def validate_cdn_candidate(*, profile_bytes, manifest, before_manifest, device, 
         # Reset/EOF only permits checking the exact fresh decoder verdict.
         # Finish means writer closed and original template/runtime restored;
         # a correctly rejected connection need not remain TCP-open afterward.
-        auth_binding(auth_finish(begin['nonce']), request, request_fingerprint, begin=begin)
+        auth_binding(auth_finish(begin['nonce']), request, request_fingerprint, manifest, begin=begin)
         budget.left()
         with client(cdn) as active:
             egress(active, edge_ip)

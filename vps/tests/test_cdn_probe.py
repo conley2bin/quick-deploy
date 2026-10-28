@@ -33,8 +33,10 @@ REAL_SELECT = select.select
 
 
 def manifest():
-    return {'endpoint': ORIGIN, 'config': {'domain': 'sub.example.org'},
-            'tcp_cdn': {'schema': 1, 'domain': 'cdn.example.org', 'path': '/qd-xhttp/', 'mode': 'packet-up'},
+    return {'endpoint': ORIGIN, 'config': {'domain': 'sub.example.org', 'proxy_port': 443, 'reality_target': 'target.example.org'},
+            'reality': {'publicKey': 'R' * 43, 'shortIds': ['0123456789abcdef']},
+            'tcp_cdn': {'schema': 1, 'domain': 'cdn.example.org', 'inbound_id': 3, 'host_group_id': 'cdn-group',
+                        'reality_port': 9443, 'reality_tag': 'in-443-tcp', 'path': '/qd-xhttp/', 'mode': 'packet-up'},
             'hysteria2': {'schema': 1, 'inbound_id': 2},
             'accounts': {'company': {'email': 'company', 'id': UUID, 'auth': 'fixture-h2-auth-original',
                                      'subId': 'fixture-subscription-original', 'enable': True}}}
@@ -47,7 +49,11 @@ def nodes():
              'xhttp-opts': {'path': '/qd-xhttp/', 'host': 'cdn.example.org', 'mode': 'packet-up'},
              'client-fingerprint': 'chrome', 'udp': True},
             {'name': 'SELF-h2', 'type': 'hysteria2', 'server': ORIGIN, 'port': 443,
-             'password': 'fixture-h2-auth-original', 'sni': 'sub.example.org', 'alpn': ['h3'], 'skip-cert-verify': False}]
+             'password': 'fixture-h2-auth-original', 'sni': 'sub.example.org', 'alpn': ['h3'], 'skip-cert-verify': False},
+            {'name': 'SELF-main', 'type': 'vless', 'server': ORIGIN, 'port': 9443, 'uuid': UUID,
+             'tls': True, 'servername': 'target.example.org', 'network': 'tcp', 'flow': 'xtls-rprx-vision',
+             'reality-opts': {'public-key': 'R' * 43, 'short-id': '0123456789abcdef'},
+             'client-fingerprint': 'chrome', 'udp': True}]
 
 
 # The listener deliberately ACKs SOCKS while Running=False and the selector is
@@ -159,7 +165,9 @@ class Probe(unittest.TestCase):
         patch = mock.patch.object(probe, 'strict_context', return_value=self.context)
         patch.start(); self.addCleanup(patch.stop)
         self.m = manifest()
-        self.request = {'feature': 'tcp-cdn', 'tcp_cdn': {'schema': 1, 'domain': 'cdn.example.org'}, 'operation_id': 'a' * 32}
+        self.request = {'feature': 'tcp-cdn', 'tcp_cdn': {'schema': 1, 'domain': 'cdn.example.org', 'reality_port': 9443},
+                        'source_transports': ['tcp-reality', 'hysteria2'],
+                        'target_transports': ['tcp-reality', 'tcp-xhttp-cdn', 'hysteria2'], 'operation_id': 'a' * 32}
         self.auth_events = []
         self.nonce = str(uuid.uuid4())
 
@@ -167,7 +175,7 @@ class Probe(unittest.TestCase):
         self.auth_events.append('begin')
         self.assertFalse((self.root / 'events').exists())
         return {'schema': 1, 'operation_id': self.request['operation_id'], 'request_fingerprint': 'b' * 64,
-                'nonce': self.nonce, 'native_identity_sha256': 'd' * 64}
+                'nonce': self.nonce, 'native_identity_sha256': 'd' * 64, 'inbound_id': 3, 'inbound_tag': 'SELF-cdn'}
 
     def auth_finish(self, nonce):
         self.assertEqual(nonce, self.nonce)
@@ -176,7 +184,7 @@ class Probe(unittest.TestCase):
         self.auth_events.append('restored')
         return {'schema': 1, 'operation_id': self.request['operation_id'], 'request_fingerprint': 'b' * 64,
                 'nonce_sha256': hashlib.sha256(nonce.encode()).hexdigest(), 'rejected': True,
-                'native_identity_sha256': 'd' * 64}
+                'native_identity_sha256': 'd' * 64, 'inbound_id': 3, 'inbound_tag': 'SELF-cdn'}
 
     def final_candidate(self):
         self.assertEqual(self.auth_events, ['begin', 'restored'])
@@ -282,7 +290,7 @@ class Probe(unittest.TestCase):
     def test_mismatched_or_unrestored_witness_never_runs_postrestore_clients(self):
         changes = [dict(nonce_sha256='f' * 64), dict(operation_id='f' * 32),
                    dict(request_fingerprint='f' * 64), dict(native_identity_sha256='f' * 64),
-                   dict(rejected=False), dict(schema=True)]
+                   dict(rejected=False), dict(schema=True), dict(inbound_id=1), dict(inbound_tag='in-443-tcp')]
         original = self.auth_finish
         for change in changes:
             with self.subTest(change=change):
@@ -305,7 +313,7 @@ class Probe(unittest.TestCase):
         original = self.auth_begin
         changes = [dict(operation_id='f' * 32), dict(request_fingerprint='f' * 64),
                    dict(native_identity_sha256=None), dict(nonce='malformed-private-nonce'),
-                   dict(schema=True), dict(raw_log='untrusted-extra-metadata')]
+                   dict(schema=True), dict(raw_log='untrusted-extra-metadata'), dict(inbound_id=1), dict(inbound_tag='SELF-main')]
         for change in changes:
             self.auth_events.clear()
             with self.subTest(change=change), self.assertRaises(probe.Error):
@@ -339,7 +347,7 @@ class Probe(unittest.TestCase):
     def test_native_mappings_preserved_and_unsafe_overrides_rejected(self):
         original = nodes()
         cdn, h2, identity = probe.native_nodes(probe.canonical({'proxies': original}), self.m, 'company', 'eno1')
-        self.assertEqual([cdn, h2], original); self.assertEqual(len(identity), 64)
+        self.assertEqual([cdn, h2], original[:2]); self.assertEqual(len(identity), 64)
         for key, value in [('skip-cert-verify', True), ('tls', False), ('uuid', str(__import__('uuid').uuid4())),
                            ('server', ORIGIN), ('flow', 'xtls-rprx-vision'), ('ca-str', 'fake-ca'),
                            ('dialer-proxy', 'DIRECT'), ('servername', 'wrong.example.org')]:
@@ -348,6 +356,37 @@ class Probe(unittest.TestCase):
                 probe.native_nodes(probe.canonical({'proxies': modified}), self.m, 'company', 'eno1')
         with self.assertRaises(probe.Error):
             probe.native_nodes(b'proxies: []\nproxies: []\n', self.m, 'company', 'eno1')
+
+    def test_first_vless_is_reality_but_only_exact_cdn_role_is_selected(self):
+        original = nodes()
+        reordered = [original[2], original[1], original[0]]
+        cdn, h2, _ = probe.native_nodes(probe.canonical({'proxies': reordered}), self.m, 'company', 'eno1')
+        self.assertEqual(cdn, original[0])
+        self.assertEqual(h2, original[1])
+        runtime = probe.runtime(cdn, 'cdn.example.org', EDGE, 'eno1', '1.1.1.1', 12345, 12346, 'secret')
+        self.assertEqual(runtime['proxies'], [original[0]])
+        self.assertEqual(runtime['proxy-groups'][0]['proxies'], ['SELF-cdn'])
+        for bad in ([original[2], original[1]], [original[2], original[1], original[2]]):
+            with self.assertRaises(probe.Error):
+                probe.native_nodes(probe.canonical({'proxies': bad}), self.m, 'company', 'eno1')
+
+    def test_each_native_role_wrong_port_flow_or_credential_is_rejected(self):
+        cases = [(0, 'port', 9443), (0, 'flow', 'xtls-rprx-vision'), (0, 'uuid', str(uuid.uuid4())),
+                 (1, 'port', 9443), (1, 'password', 'wrong-auth'), (1, 'sni', 'cdn.example.org'),
+                 (2, 'port', 443), (2, 'flow', ''), (2, 'uuid', str(uuid.uuid4())),
+                 (2, 'network', 'xhttp'), (2, 'reality-opts', {'public-key': 'wrong', 'short-id': 'bad'})]
+        for index, key, value in cases:
+            modified = nodes(); modified[index][key] = value
+            with self.subTest(role=modified[index]['name'], key=key), self.assertRaises(probe.Error):
+                probe.native_nodes(probe.canonical({'proxies': modified}), self.m, 'company', 'eno1')
+
+    def test_port_or_obsolete_two_target_request_refuses_before_any_client(self):
+        for change in ({'tcp_cdn': {'schema': 1, 'domain': 'cdn.example.org', 'reality_port': 10443}},
+                       {'tcp_cdn': {'schema': 1, 'domain': 'cdn.example.org'}},
+                       {'target_transports': ['tcp-xhttp-cdn', 'hysteria2']}):
+            with self.subTest(change=change), self.assertRaisesRegex(probe.Error, 'binding'):
+                self.run_proof(request=dict(self.request, **change))
+        self.assertFalse((self.root / 'events').exists())
 
     def test_stale_h2_and_missing_request_binding_refuse_before_clients(self):
         old = copy.deepcopy(self.m); old['accounts']['company']['auth'] = 'different-original-auth'

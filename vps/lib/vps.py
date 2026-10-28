@@ -909,7 +909,7 @@ def remember_commit(state, document, record, backup, result, use_generation=True
         if 'tcp_cdn' in manifest:
             if not host.cdn_enabled(manifest):
                 raise host.Error('Published backup contains invalid CDN mode')
-            document['tcp_cdn'] = {'schema': 1, 'domain': manifest['tcp_cdn']['domain']}
+            document['tcp_cdn'] = {key: manifest['tcp_cdn'][key] for key in ('schema', 'domain', 'reality_port')}
         else:
             document.pop('tcp_cdn', None)
     host.atomic(state / 'state.json', host.dumps(document))
@@ -938,12 +938,21 @@ def backup_committed(state, document, record, backup, mihomo=None):
         raise host.Error('Backup committed; offline snapshot not captured. Latest offline outputs invalidated; retry capture through a working carrier/core') from None
 
 
-def cdn_request(document, record, domain, before, adapter):
+def cdn_request(document, record, domain, before, adapter, reality_port):
+    cdn_reality_port(reality_port, record['port'])
     request = dict(request_for(document, record), mode='transport-upgrade', feature='tcp-cdn',
                    operation_id=secrets.token_hex(16), adapter_sha256=adapter, before_sha256=host.digest(before),
-                   source_transports=['tcp-reality', 'hysteria2'], target_transports=['tcp-xhttp-cdn', 'hysteria2'],
-                   tcp_cdn={'schema': 1, 'domain': domain})
+                   source_transports=['tcp-reality', 'hysteria2'], target_transports=['tcp-reality', 'tcp-xhttp-cdn', 'hysteria2'],
+                   tcp_cdn={'schema': 1, 'domain': domain, 'reality_port': reality_port})
     return request, host.transport_request(request)
+
+
+def cdn_reality_port(port, ssh_port):
+    # Host additionally attests actual listener occupancy before any mutation.
+    if (type(port) is not int or not 1 <= port <= 65535 or
+            port in {ssh_port, 80, 443, 8443, 2080, host.ADMIN_PORT, host.SUB_PORT, host.API_PORT}):
+        raise host.Error('REALITY port must be an explicit non-reserved TCP port in 1..65535')
+    return port
 
 
 def cdn_deadline(prepared, fingerprint):
@@ -1032,8 +1041,9 @@ def cdn_candidate_identity(candidate, manifest, files, interface):
 
 def cdn_evidence(state, document, record, request, fingerprint, candidate, before, args, deadline, binary):
     manifest = checked_backup(document, record, candidate)
-    if not host.cdn_enabled(manifest) or manifest['tcp_cdn']['domain'] != args.cdn_domain:
-        raise host.Error('Candidate archive is not the exact proposed CDN mode/domain')
+    if (not host.cdn_enabled(manifest) or
+            {key: manifest['tcp_cdn'][key] for key in ('schema', 'domain', 'reality_port')} != request['tcp_cdn']):
+        raise host.Error('Candidate archive is not the exact proposed CDN mode/domain/REALITY port')
     digest = host.digest(candidate)
     if digest == request['before_sha256']:
         raise host.Error('CDN candidate archive must differ from the pre-change archive')
@@ -1044,7 +1054,17 @@ def cdn_evidence(state, document, record, request, fingerprint, candidate, befor
     device = enabled[0]
     identity_a = cdn_candidate_identity(candidate, manifest, files, args.interface)
     initial_candidate, initial_digest = candidate, digest
-    observations, final = [], {}
+    observations, final, witness = [], {}, {}
+    def auth_begin():
+        answer = cdn_probe.auth_binding(remote(record, 'transport-auth-begin', request), request, fingerprint, manifest)
+        witness['begin'] = answer
+        return answer
+    def auth_finish(nonce):
+        if not witness.get('begin') or nonce != witness['begin']['nonce']:
+            raise host.Error('Native auth finish differs from the bound CDN nonce')
+        answer = remote(record, 'transport-auth-finish', dict(request, cdn_auth_nonce=nonce))
+        witness['verdict'] = cdn_probe.auth_binding(answer, request, fingerprint, manifest, begin=witness['begin'])
+        return answer
     def final_candidate():
         if host.digest(candidate) != digest:
             raise host.Error('CDN candidate archive changed during live proof')
@@ -1067,13 +1087,12 @@ def cdn_evidence(state, document, record, request, fingerprint, candidate, befor
             before_manifest=before, device=device, request=request, request_fingerprint=fingerprint,
             candidate_sha256=digest, interface=args.interface, dns_server=args.dns_server, binary=binary,
             deadline=deadline, observations=observations,
-            auth_begin=lambda: remote(record, 'transport-auth-begin', request),
-            auth_finish=lambda nonce: remote(record, 'transport-auth-finish', dict(request, cdn_auth_nonce=nonce)),
+            auth_begin=auth_begin, auth_finish=auth_finish,
             final_candidate=final_candidate)
     except cdn_probe.Error as exc:
         raise host.Error(str(exc)) from None
-    if not final:
-        raise host.Error('CDN probe did not validate a post-restoration final candidate')
+    if not final or 'verdict' not in witness:
+        raise host.Error('CDN probe did not validate a restored native verdict and final candidate')
     candidate, digest = final['path'], final['digest']
     expected = {'schema', 'operation_id', 'request_fingerprint', 'candidate_sha256', 'domain',
                 'device_identity_sha256', 'observed_at', 'interface', 'edge_ips', 'checks'}
@@ -1103,6 +1122,7 @@ def cdn_evidence(state, document, record, request, fingerprint, candidate, befor
     # Public metadata only, retained privately before any commit request is sent.
     with directory_fd(state / 'cdn-proofs', create=True) as directory:
         write_at(directory, request['operation_id'] + '.samples.json', host.dumps(observations).encode())
+        write_at(directory, request['operation_id'] + '.auth.json', host.dumps(witness['verdict']).encode())
         write_at(directory, request['operation_id'] + '.json', host.dumps(proof).encode())
     return proof, proof_sha256, candidate
 
@@ -1111,7 +1131,9 @@ def check_cdn_receipt(state, pending, receipt):
     request = pending['request']
     proof = load(state / 'cdn-proofs' / (request['operation_id'] + '.json'))
     proof_sha = host.cdn_proof_digest(proof)
-    if (receipt.get('committed') is not True or receipt.get('request_sha256') != host.transport_request(request) or
+    verdict = load(state / 'cdn-proofs' / (request['operation_id'] + '.auth.json'))
+    if (type(receipt.get('cdn_auth_verdict')) is not dict or receipt['cdn_auth_verdict'] != verdict or
+            receipt.get('committed') is not True or receipt.get('request_sha256') != host.transport_request(request) or
             not pending.get('backup') or receipt.get('offnode_sha256') != host.digest(Path(pending['backup'])) or
             receipt.get('cdn_proof_sha256') != proof_sha or pending.get('cdn_proof_sha256') != proof_sha or
             proof.get('candidate_sha256') != receipt.get('offnode_sha256') or
@@ -1134,10 +1156,11 @@ def _cdn(state, document, args):
     try:
         domain = cdn_probe.domain_name(args.cdn_domain)
         cdn_probe.public_ipv4(args.dns_server)
+        cdn_reality_port(args.reality_port, record['port'])
     except cdn_probe.Error as exc:
         raise host.Error(str(exc)) from None
-    if domain == document['config']['domain']:
-        raise host.Error('CDN requires a separate hostname; subscription domain stays unchanged')
+    if domain in (document['config']['domain'], document['config']['reality_target']):
+        raise host.Error('CDN requires a separate hostname from subscription and REALITY target')
     binary = resolve_mihomo(args.mihomo)
     try:
         cdn_probe.environment(binary, args.interface, args.dns_server)
@@ -1149,18 +1172,18 @@ def _cdn(state, document, args):
         raise host.Error('Unknown stored adapter digest; no CDN backup/service mutation')
     transports = checked.get('transports')
     if checked.get('needs_transport_upgrade') is not False or transports not in (
-            ['tcp-reality', 'hysteria2'], ['tcp-xhttp-cdn', 'hysteria2']):
-        raise host.Error('CDN requires exact owned REALITY+H2 or same-domain CDN+H2 topology')
+            ['tcp-reality', 'hysteria2'], ['tcp-reality', 'tcp-xhttp-cdn', 'hysteria2']):
+        raise host.Error('CDN requires exact owned REALITY+H2 or committed three-entry topology')
     current = checked_backup(document, record, Path(document['backup']))
     if not current.get('published'):
         raise host.Error('CDN requires the verified published current archive, not candidate state')
     already = host.cdn_enabled(current)
-    if transports != (['tcp-xhttp-cdn', 'hysteria2'] if already else ['tcp-reality', 'hysteria2']):
+    if transports != (['tcp-reality', 'tcp-xhttp-cdn', 'hysteria2'] if already else ['tcp-reality', 'hysteria2']):
         raise host.Error('Saved archive transport differs from current native status; recover first')
     if checked.get('machine_id') != record.get('machine_id') or checked.get('node_id') != current['node_id']:
         raise host.Error('CDN status differs from saved machine/node identity')
-    if already and current['tcp_cdn']['domain'] != domain:
-        raise host.Error('A different CDN domain is already committed; no implicit domain migration')
+    if already and (current['tcp_cdn']['domain'] != domain or current['tcp_cdn']['reality_port'] != args.reality_port):
+        raise host.Error('A different CDN domain or REALITY port is already committed; no implicit migration')
     if already:
         raise host.Error('Source is already CDN; a new auth acceptance proof requires a prepared transition. '
                          'No fresh proof produced; use status to inspect the committed deployment')
@@ -1180,7 +1203,7 @@ def _cdn(state, document, args):
     if (not before.get('published') or before['node_id'] != current['node_id'] or
             host.cdn_enabled(before) != already or not host.dual_enabled(before)):
         raise host.Error('Fresh pre-change archive differs from current exact source topology')
-    request, fingerprint = cdn_request(document, record, domain, before_path, adapter)
+    request, fingerprint = cdn_request(document, record, domain, before_path, adapter, args.reality_port)
     pending = {'record': record, 'mode': 'transport-upgrade', 'request': request,
                'before': str(before_path.absolute()), 'backup': None, 'mihomo': binary}
     host.atomic(state / 'pending.json', host.dumps(pending))
@@ -1195,6 +1218,9 @@ def _cdn(state, document, args):
         pending['backup'] = str(candidate.absolute())
         host.atomic(state / 'pending.json', host.dumps(pending))
         validate_outputs(state, document, record, binary, candidate)
+        target = checked_backup(document, record, candidate)
+        if (prepared.get('transports') != request['target_transports'] or prepared.get('tcp_cdn') != target.get('tcp_cdn')):
+            raise host.Error('CDN prepare differs from the bound three-entry candidate topology')
         acknowledge_orange(domain, deadline)
         proof, proof_sha256, candidate = cdn_evidence(state, document, record, request, fingerprint, candidate, before,
                                          args, deadline, binary)
@@ -1227,7 +1253,8 @@ def _cdn(state, document, args):
                 return
         raise
     export_after_commit(state)
-    print('Cloudflare/XHTTP TCP443 committed after real acceptance; original H2 UDP443 remains the default/backup. '
+    print('Cloudflare/XHTTP TCP443 committed after real acceptance; H2 UDP443 remains default. '
+          f'Retained REALITY TCP{args.reality_port}; direct-path availability requires separate network verification. '
           'Choose SELF-cdn explicitly when desired; no desktop selection was changed.')
 
 
@@ -1239,8 +1266,8 @@ def deploy_existing(state, document, record, args):
         raise host.Error('Unknown stored adapter digest; no transport backup/service mutation')
     upgrading = checked.get('needs_transport_upgrade')
     expected = ['tcp-reality'] if upgrading is True else ['tcp-reality', 'hysteria2']
-    if not upgrading and checked.get('transports') == ['tcp-xhttp-cdn', 'hysteria2']:
-        expected = ['tcp-xhttp-cdn', 'hysteria2']
+    if not upgrading and checked.get('transports') == ['tcp-reality', 'tcp-xhttp-cdn', 'hysteria2']:
+        expected = ['tcp-reality', 'tcp-xhttp-cdn', 'hysteria2']
     if type(upgrading) is not bool or checked.get('transports') != expected:
         raise host.Error('Unrecognized owned transport topology; no implicit migration')
     binary = resolve_mihomo(args.mihomo)
@@ -1260,7 +1287,7 @@ def deploy_existing(state, document, record, args):
         checked = remote(record, 'status', request_for(document, record))
         remember_commit(state, document, record, backup, checked)
         export_after_commit(state)
-        print('Owned dual transport unchanged; committed native snapshot refreshed.')
+        print('Owned native transports unchanged; committed snapshot refreshed.')
         return
     before = backup_remote(state, document, record)
     manifest = checked_backup(document, record, before)
@@ -1322,7 +1349,7 @@ def deploy(state, document, args):
                    adapter_sha256=host.digest(MODULE / 'lib/host.py'))
     topology = 'TCP/REALITY + UDP/Hysteria2'
     if backup:
-        topology = ('TCP/XHTTP CDN + UDP/Hysteria2' if 'tcp_cdn' in manifest else
+        topology = (f"TCP/REALITY:{manifest['tcp_cdn']['reality_port']} + TCP/XHTTP CDN:443 + UDP/Hysteria2" if 'tcp_cdn' in manifest else
                     'TCP/REALITY + UDP/Hysteria2' if host.dual_enabled(manifest) else 'TCP/REALITY')
     print(f"Preflight passed. This dedicated node will run {topology} on{document['config']['proxy_port']}, TLS subscriptions8443 and HTTP01 on80. SSH/firewall/Tailscale stay unchanged.")
     folder = None if backup else artifacts(state, lock, getattr(args, 'artifacts_dir', None))
@@ -1510,8 +1537,9 @@ def parser():
             a.add_argument('--device', help='show only this enabled committed device')
         if name == 'restore':
             a.set_defaults(backup_required=True)
-    a = sub.add_parser('cdn', help='recoverably replace REALITY TCP443 with verified Cloudflare/XHTTP; keep H2 unchanged')
+    a = sub.add_parser('cdn', help='add verified Cloudflare/XHTTP; retain REALITY on a separate TCP port and unchanged H2')
     a.add_argument('--domain', dest='cdn_domain', required=True, help='new CDN hostname; subscription domain remains unchanged')
+    a.add_argument('--reality-port', type=int, default=9443, help='retained REALITY TCP port; default9443, no automatic fallback')
     a.add_argument('--interface', required=True, help='explicit local physical Linux interface for isolated direct-underlay probes')
     a.add_argument('--dns-server', required=True, help='independently verified zone-authoritative Cloudflare NS public IPv4; queries require AA and bypass recursive gray-answer caches')
     a.add_argument('--mihomo', help='supported native Mihomo v1.19.32 executable')
