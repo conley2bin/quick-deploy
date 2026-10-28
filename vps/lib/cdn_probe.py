@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import contextlib
 import copy
+import errno
 from contextvars import ContextVar
 from datetime import datetime, timezone
 import hashlib
@@ -46,6 +47,10 @@ CF_NETWORKS = tuple(ipaddress.ip_network(net) for net in (
 
 class Error(ValueError):
     """Probe errors never include native credentials, source YAML, or URIs."""
+
+
+class DeadlineExceeded(Error):
+    """A finite operation/acceptance budget expired, never an auth verdict."""
 
 
 class Rejected(Error):
@@ -119,8 +124,14 @@ class Budget:
     def left(self, maximum=12):
         remaining = self.end - time.monotonic()
         if remaining <= 0:
-            raise Error('CDN acceptance deadline expired; recover the transaction')
+            raise DeadlineExceeded('CDN acceptance deadline expired; recover the transaction')
         return min(maximum, remaining)
+
+    def bounded(self, seconds):
+        self.left()
+        child = object.__new__(Budget)
+        child.end = min(self.end, time.monotonic() + seconds)
+        return child
 
 
 def canonical(value):
@@ -301,17 +312,20 @@ def operation_deadline(budget):
     def watch(sock):
         current[:] = [sock]
         if expired.is_set():
-            raise Error('HTTPS operation exceeded its finite deadline')
+            raise DeadlineExceeded('HTTPS operation exceeded its finite deadline')
     timer = threading.Timer(budget.left(), interrupt)
     timer.daemon = True
     timer.start()
     try:
         yield watch
         if expired.is_set():
-            raise Error('HTTPS operation exceeded its finite deadline')
-    except BaseException:
-        if expired.is_set():
-            raise Error('HTTPS operation timed out; authentication rejection is unproven') from None
+            raise DeadlineExceeded('HTTPS operation exceeded its finite deadline')
+    except BaseException as exc:
+        # Deadline-induced EOF/reset is inconclusive, never an auth rejection.
+        # Explicit integrity errors and cancellation retain their own verdict.
+        if expired.is_set() and (isinstance(exc, (ssl.SSLEOFError, Rejected)) or
+                                not isinstance(exc, (ValueError, ssl.SSLError, http.client.HTTPException, Cancelled))):
+            raise DeadlineExceeded('HTTPS operation timed out; authentication rejection is unproven') from None
         raise
     finally:
         timer.cancel()
@@ -348,6 +362,43 @@ def edge_tls(domain, edge_ip, interface, budget):
                     trace.get('http') != 'http/1.1'):
                 raise Error('Strict outer TLS response lacks matching Cloudflare trace evidence')
             return {'peer': edge_ip, 'port': 443, 'tls': tls.version(), 'http': trace['http']}
+
+
+def select_edge(domain, ips, origin, interface, budget, observations=None):
+    """Validate the whole fresh answer, then try at most two distinct CF edges.
+
+    Only transport availability permits another address. Certificate, protocol,
+    peer and trace failures remain terminal; no DNS refresh or client fallback.
+    """
+    edges = list(dict.fromkeys(edge_addresses(ips, origin)))[:2]
+    samples = [] if observations is None else observations
+    failures = []
+    for address in edges:
+        attempt = budget.bounded(6)
+        start = time.monotonic()
+        try:
+            edge = edge_tls(domain, address, interface, attempt)
+            attempt.left()
+        except (Error, OSError, ValueError, http.client.HTTPException) as exc:
+            failure = {'check': 'outer_cloudflare_failed', 'phase': 'edge_tls',
+                       'type': type(exc).__name__, 'address': address,
+                       'seconds': round(time.monotonic() - start, 6)}
+            samples.append(failure)
+            failures.append(failure)
+            transport = (isinstance(exc, (DeadlineExceeded, TimeoutError, ConnectionError, ssl.SSLEOFError)) or
+                         (isinstance(exc, OSError) and not isinstance(exc, ssl.SSLError) and
+                          exc.errno in (errno.ENETUNREACH, errno.EHOSTUNREACH, errno.ECONNREFUSED,
+                                        errno.ETIMEDOUT, errno.ECONNRESET, errno.ECONNABORTED, errno.EPIPE)))
+            if not transport:
+                raise Error('Strict Cloudflare edge validation rejected: ' + canonical(failures).decode()) from None
+            try:
+                budget.left()  # Global expiry must not become another address attempt.
+            except DeadlineExceeded:
+                raise DeadlineExceeded('Cloudflare selection deadline expired: ' + canonical(failures).decode()) from None
+            continue
+        samples.append({'check': 'outer_cloudflare', **edge})
+        return address
+    raise Error('No validated Cloudflare edge within bounded attempts: ' + canonical(failures).decode())
 
 
 def native_nodes(profile_bytes, manifest, device, interface):
@@ -632,11 +683,9 @@ def validate_cdn_candidate(*, profile_bytes, manifest, before_manifest, device, 
         if (manifest['endpoint'] != before_manifest['endpoint'] or manifest['hysteria2'] != before_manifest['hysteria2'] or
                 any(manifest['accounts'][device][key] != before_manifest['accounts'][device][key] for key in ('id', 'auth', 'subId'))):
             raise Error('Candidate changed original Hysteria2/account identity')
-        ips = edge_addresses(resolve_a(domain, interface, dns_server, budget), manifest['endpoint'])
-        edge_ip = ips[0]
-        edge = edge_tls(domain, edge_ip, interface, budget)
+        ips = resolve_a(domain, interface, dns_server, budget)
         samples = [] if observations is None else observations
-        samples.append({'check': 'outer_cloudflare', **edge})
+        edge_ip = select_edge(domain, ips, manifest['endpoint'], interface, budget, samples)
         def client(node):
             return Client(binary, node, domain, edge_ip, interface, dns_server, budget)
         def https(active, name, edge=None):

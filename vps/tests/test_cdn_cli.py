@@ -428,6 +428,39 @@ class CDNCLI(unittest.TestCase):
         self.assertEqual(self.receipt['offnode_sha256'], host.digest(self.final_path))
         self.assertFalse((self.state / 'pending.json').exists())
 
+    def test_preflight_transport_failover_is_bounded_and_all_failure_never_backs_up(self):
+        addresses = ['104.16.1.2', '172.67.1.2']
+        with mock.patch.object(cdn_probe, 'resolve_a', return_value=addresses), \
+                mock.patch.object(cdn_probe, 'edge_tls', side_effect=[TimeoutError(), {'peer': addresses[1], 'port': 443}]) as tls:
+            self.run_cdn()
+        self.assertEqual([call.args[1] for call in tls.call_args_list], addresses)
+        self.assertIn('transport-commit', self.events)
+
+    def test_preflight_all_addresses_fail_no_backup_prepare_or_proof(self):
+        with mock.patch.object(cdn_probe, 'resolve_a', return_value=['104.16.1.2', '172.67.1.2']), \
+                mock.patch.object(cdn_probe, 'edge_tls', side_effect=TimeoutError()) as tls:
+            with self.assertRaisesRegex(host.Error, 'preflight failed') as error: self.run_cdn()
+        self.assertEqual(tls.call_count, 2)
+        self.assertEqual(self.events, ['status'])
+        self.assertIn('104.16.1.2', str(error.exception.__cause__))
+        self.assertFalse((self.state / 'pending.json').exists())
+        self.assertFalse((self.state / 'cdn-proofs').exists())
+
+    def test_postprepare_all_edges_fail_recovers_without_auth_or_fresh_proof(self):
+        def probe(**kwargs):
+            return REAL_CDN_PROBE(**kwargs)
+        with mock.patch.object(cdn_probe, 'validate_cdn_candidate', side_effect=probe), \
+                mock.patch.object(cdn_probe, 'resolve_a', side_effect=[[self.record['endpoint']], ['104.16.1.2', '172.67.1.2']]), \
+                mock.patch.object(cdn_probe, 'edge_tls', side_effect=TimeoutError()) as tls:
+            with self.assertRaisesRegex(host.Error, 'No validated'): self.run_cdn()
+        self.assertEqual(tls.call_count, 2)
+        self.assertIn('transport-prepare', self.events)
+        self.assertIn('abort', self.events)
+        self.assertNotIn('transport-auth-begin', self.events)
+        self.assertNotIn('transport-commit', self.events)
+        self.assertFalse((self.state / 'cdn-proofs').exists())
+        self.assertFalse((self.state / 'pending.json').exists())
+
     def test_preflight_wrong_dns_edge_certificate_or_trace_refuses_before_backup(self):
         for answers in ([], ['1.1.1.1'], ['10.0.0.1'], ['198.18.0.1'],
                         ['104.16.1.2', self.record['endpoint']], ['104.16.1.2', '1.1.1.1']):

@@ -68,7 +68,7 @@ mode=(root/'mode').read_text(); running=False
 node=cfg['proxies'][0]
 def record(item):
  with (root/'events').open('a') as f:f.write(json.dumps(item)+'\n')
-record({'pid':os.getpid(),'config':str(path),'argv':sys.argv,'role':node['name']})
+record({'pid':os.getpid(),'config':str(path),'argv':sys.argv,'role':node['name'],'hosts':cfg['hosts']})
 class Control(http.server.BaseHTTPRequestHandler):
  def log_message(self,*a):pass
  def do_PUT(self):
@@ -205,16 +205,17 @@ class Probe(unittest.TestCase):
     def events(self):
         return [json.loads(line) for line in (self.root / 'events').read_text().splitlines()]
 
-    def run_proof(self, **changes):
+    def run_proof(self, answers=None, edge_effect=None, selected_edge=EDGE, **changes):
         options = dict(profile_bytes=probe.canonical({'proxies': nodes()}), manifest=self.m,
                        before_manifest=copy.deepcopy(self.m), device='company', request=self.request,
                        request_fingerprint='b' * 64, candidate_sha256='c' * 64, interface='eno1',
                        dns_server='1.1.1.1', binary=str(self.binary), deadline=time.time() + 100,
                        auth_begin=self.auth_begin, auth_finish=self.auth_finish, final_candidate=self.final_candidate)
         options.update(changes)
-        with mock.patch.object(probe, 'resolve_a', return_value=[EDGE]), \
-                mock.patch.object(probe, 'edge_tls', return_value={'peer': EDGE, 'port': 443}), \
-                mock.patch.object(probe, 'socket_peers', return_value={(EDGE, 443)}), \
+        with mock.patch.object(probe, 'resolve_a', return_value=answers or [EDGE]), \
+                mock.patch.object(probe, 'edge_tls', side_effect=edge_effect,
+                                  return_value={'peer': selected_edge, 'port': 443}), \
+                mock.patch.object(probe, 'socket_peers', return_value={(selected_edge, 443)}), \
                 mock.patch.object(probe.select, 'select', wraps=select_without_idle):
             return probe.validate_cdn_candidate(**options)
 
@@ -262,6 +263,26 @@ class Probe(unittest.TestCase):
             with self.assertRaisesRegex(probe.Error, 'CA/hostname') as error:
                 client.https('wrong-name.example.org')
             self.assertNotIsInstance(error.exception, probe.Rejected)
+        self.assert_processes_clean()
+
+    def test_second_edge_selected_pinned_in_all_clients_and_proof_with_failure_evidence(self):
+        second, samples, attempted = '172.67.1.2', [], []
+        def edge(domain, address, interface, budget):
+            attempted.append(address)
+            if address == EDGE:
+                raise TimeoutError('private raw exception must not be retained')
+            return {'peer': address, 'port': 443}
+        proof = self.run_proof(answers=[EDGE, second], edge_effect=edge,
+                               selected_edge=second, observations=samples)
+        self.assertEqual(attempted, [EDGE, second])
+        self.assertEqual(proof['edge_ips'], [second])
+        clients = [event for event in self.events() if 'pid' in event]
+        self.assertEqual(len(clients), 5)
+        self.assertTrue(all(event['hosts'] == {'cdn.example.org': second} for event in clients))
+        self.assertEqual(samples[0]['address'], EDGE)
+        self.assertEqual(samples[0]['type'], 'TimeoutError')
+        self.assertEqual(samples[0]['phase'], 'edge_tls')
+        self.assertNotIn('private raw', json.dumps(samples))
         self.assert_processes_clean()
 
     def test_five_fresh_clients_negative_valid_reconnect_and_h2_proof(self):
@@ -439,6 +460,95 @@ class Probe(unittest.TestCase):
                                     (123, 'cdn.example.org', packet[:-3]),
                                     (123, 'cdn.example.org', packet[:-4] + socket.inet_aton('198.18.0.1'))):
             with self.assertRaises(probe.Error): probe.dns_answers(data, txid, domain)
+
+
+class EdgeSelection(unittest.TestCase):
+    SECOND = '172.67.1.2'
+
+    def choose(self, answers, observations=None, budget=None):
+        return probe.select_edge('cdn.example.org', answers, ORIGIN, 'eno1',
+                                 budget or probe.Budget(time.time() + 15), observations)
+
+    def test_first_success_stops_and_each_attempt_budget_is_six_seconds(self):
+        outer = probe.Budget(time.time() + 15)
+        def edge(domain, address, interface, budget):
+            self.assertLessEqual(budget.left(), 6)
+            self.assertLessEqual(budget.end, outer.end)
+            return {'peer': address, 'port': 443}
+        with mock.patch.object(probe, 'edge_tls', side_effect=edge) as tls:
+            self.assertEqual(self.choose([EDGE, self.SECOND], budget=outer), EDGE)
+        self.assertEqual(tls.call_count, 1)
+
+    def test_address_deadline_timeout_reset_and_tls_eof_allow_second_strict_attempt(self):
+        for failure in (probe.DeadlineExceeded('address'), TimeoutError(), ConnectionResetError(), ssl.SSLEOFError()):
+            with self.subTest(failure=type(failure).__name__), \
+                    mock.patch.object(probe, 'edge_tls', side_effect=[failure, {'peer': self.SECOND, 'port': 443}]) as tls:
+                self.assertEqual(self.choose([EDGE, self.SECOND]), self.SECOND)
+                self.assertEqual(tls.call_count, 2)
+
+    def test_transport_failures_only_try_two_distinct_addresses_once(self):
+        for answers in ([EDGE], [EDGE, EDGE], [EDGE, EDGE, self.SECOND, '104.16.2.3']):
+            samples = []
+            with self.subTest(answers=answers), mock.patch.object(probe, 'edge_tls', side_effect=ConnectionResetError()) as tls:
+                with self.assertRaisesRegex(probe.Error, 'No validated') as error:
+                    self.choose(answers, samples)
+                expected = list(dict.fromkeys(answers))[:2]
+                self.assertEqual([call.args[1] for call in tls.call_args_list], expected)
+                self.assertEqual([sample['address'] for sample in samples], expected)
+                self.assertIn(EDGE, str(error.exception))
+
+    def test_whole_answer_validation_precedes_any_attempt(self):
+        for bad in (ORIGIN, '1.1.1.1', '10.0.0.1', '198.18.0.1'):
+            with self.subTest(bad=bad), mock.patch.object(probe, 'edge_tls') as tls:
+                with self.assertRaises(probe.Error): self.choose([EDGE, self.SECOND, bad])
+                tls.assert_not_called()
+
+    def test_certificate_hostname_peer_trace_and_protocol_failures_are_terminal(self):
+        for error in (ssl.SSLCertVerificationError('bad CA/name'), ssl.SSLError('TLS protocol'),
+                      probe.Error('peer mismatch'), probe.Error('trace mismatch'), ValueError('integrity')):
+            with self.subTest(error=type(error).__name__), mock.patch.object(probe, 'edge_tls', side_effect=error) as tls:
+                with self.assertRaisesRegex(probe.Error, 'Strict Cloudflare'): self.choose([EDGE, self.SECOND])
+                self.assertEqual(tls.call_count, 1)
+
+    def test_global_deadline_and_cancellation_never_start_second_address(self):
+        budget = probe.Budget(time.time() + 15)
+        def expire(*args):
+            budget.end = time.monotonic() - 1
+            raise probe.DeadlineExceeded('address timeout')
+        with mock.patch.object(probe, 'edge_tls', side_effect=expire) as tls:
+            with self.assertRaises(probe.DeadlineExceeded): self.choose([EDGE, self.SECOND], budget=budget)
+            self.assertEqual(tls.call_count, 1)
+        with mock.patch.object(probe, 'edge_tls', side_effect=probe.Cancelled()) as tls:
+            with self.assertRaises(probe.Cancelled): self.choose([EDGE, self.SECOND])
+            self.assertEqual(tls.call_count, 1)
+
+    def test_real_wall_clock_deadline_caps_trickle_and_preserves_security_and_cancel(self):
+        budget = probe.Budget(time.time() + 15).bounded(.03)
+        start = time.monotonic()
+        with self.assertRaises(probe.DeadlineExceeded):
+            with probe.operation_deadline(budget):
+                threading.Event().wait(.06)
+        self.assertLess(time.monotonic() - start, .5)
+        for failure in (probe.Cancelled(), probe.Error('trace'), UnicodeError('trace encoding'),
+                        ssl.SSLCertVerificationError('CA')):
+            budget = probe.Budget(time.time() + 15).bounded(.01)
+            with self.subTest(failure=type(failure).__name__), self.assertRaises(type(failure)):
+                with probe.operation_deadline(budget):
+                    threading.Event().wait(.03)
+                    raise failure
+        budget = probe.Budget(time.time() + 15).bounded(.03)
+        left, right = socket.socketpair()
+        start = time.monotonic()
+        with left, right, self.assertRaises(probe.DeadlineExceeded):
+            with probe.operation_deadline(budget) as watch:
+                watch(left)
+                self.assertEqual(left.recv(1), b'')
+        self.assertLess(time.monotonic() - start, .5)
+        budget = probe.Budget(time.time() + 15).bounded(.01)
+        with self.assertRaises(probe.DeadlineExceeded):
+            with probe.operation_deadline(budget):
+                threading.Event().wait(.03)
+                raise probe.Rejected('deadline-raced CONNECT denial stays inconclusive')
 
 
 class DNSAndOuter(unittest.TestCase):

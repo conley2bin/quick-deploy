@@ -1193,8 +1193,7 @@ def _cdn(state, document, args):
         answers = cdn_probe.resolve_a(domain, args.interface, args.dns_server, budget)
         already_proxied = answers != [record['endpoint']]
         if already_proxied:
-            edges = cdn_probe.edge_addresses(answers, record['endpoint'])
-            cdn_probe.edge_tls(domain, edges[0], args.interface, budget)
+            cdn_probe.select_edge(domain, answers, record['endpoint'], args.interface, budget)
     except (cdn_probe.Error, OSError, ValueError) as exc:
         raise host.Error('Physical authoritative DNS/Cloudflare TLS preflight failed; no remote mutation') from exc
     print('Use an independent SSH carrier/console for this core-changing transaction; '
