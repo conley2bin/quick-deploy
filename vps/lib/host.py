@@ -1184,7 +1184,8 @@ def validate_cdn_yaml(manifest, current, text):
     reality = next(n for n in nodes if n['name'] == 'SELF-main')
     expected_reality = {'type': 'vless', 'server': manifest['endpoint'], 'port': reality_port(manifest),
         'uuid': current['id'], 'network': 'tcp', 'tls': True, 'servername': manifest['config']['reality_target'],
-        'flow': current['flow'], 'reality-opts': {'public-key': manifest['reality']['publicKey'], 'short-id': manifest['reality']['shortIds'][0]}}
+        'flow': current['flow'], 'reality-opts': {'public-key': manifest['reality']['publicKey'],
+            'short-id': manifest['reality']['shortIds'][0], 'support-x25519mlkem768': True}}
     if (any(reality.get(k) != v for k, v in expected_reality.items()) or reality.get('tls') is not True or
             reality.get('skip-cert-verify', False) is not False or not set(reality) <=
             set(expected_reality) | {'name', 'udp', 'client-fingerprint', 'skip-cert-verify', 'packet-encoding'}):
