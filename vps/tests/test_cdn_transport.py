@@ -33,6 +33,32 @@ def real_function(module, name):
     return function
 
 
+class ApiDispatch(unittest.TestCase):
+    def test_move_only_exact_api_rule_preserves_h2_and_all_non_api_order(self):
+        h2 = {'type': 'field', 'inboundTag': ['SELF-h2'], 'ip': ['93.184.216.34/32'],
+              'network': 'tcp', 'port': '22,8443', 'outboundTag': 'direct'}
+        block = {'type': 'field', 'ip': ['geoip:private', '93.184.216.34/32'], 'outboundTag': 'blocked'}
+        extra = {'type': 'field', 'protocol': ['bittorrent'], 'outboundTag': 'blocked'}
+        template = {'routing': {'rules': [h2, block, host.api_dispatch_rule(), extra]}}
+        host.order_api_dispatch(template)
+        self.assertEqual(template['routing']['rules'], [h2, host.api_dispatch_rule(), block, extra])
+        before = copy.deepcopy(template)
+        host.order_api_dispatch(template)
+        self.assertEqual(template, before)
+        self.assertEqual([r for r in template['routing']['rules'] if r != host.api_dispatch_rule()], [h2, block, extra])
+
+    def test_refuse_missing_duplicate_or_broadened_api_dispatch_without_mutation(self):
+        block = {'type': 'field', 'ip': ['geoip:private'], 'outboundTag': 'blocked'}
+        for api_rules in ([], [host.api_dispatch_rule()] * 2,
+                [dict(host.api_dispatch_rule(), inboundTag=['api', 'SELF-h2'])],
+                [dict(host.api_dispatch_rule(), ip=['127.0.0.1/32'])]):
+            template = {'routing': {'rules': [block] + api_rules}}
+            before = copy.deepcopy(template)
+            with self.assertRaisesRegex(host.Error, 'exact native API'):
+                host.order_api_dispatch(template)
+            self.assertEqual(template, before)
+
+
 class NativeModel:
     """Model supported API boundaries on the existing real closed-DB fixture."""
     def __init__(self, fixture, manifest):
@@ -65,7 +91,9 @@ class NativeModel:
             db.execute('create table inbound_client_ips(client_email text)')
         template = {'log': {'access': 'none', 'error': 'none', 'loglevel': 'none'},
                     'outbounds': [{'tag': 'direct', 'protocol': 'freedom'}, {'tag': 'blocked', 'protocol': 'blackhole'}]}
-        template['routing'] = {'rules': [host.management_rule(template, manifest, 'SELF-h2')]}
+        template['routing'] = {'rules': [host.management_rule(template, manifest, 'SELF-h2'),
+            {'type': 'field', 'ip': ['geoip:private', manifest['endpoint'] + '/32'], 'outboundTag': 'blocked'},
+            host.api_dispatch_rule()]}  # Historical production order, deliberately shadowed.
         self.h.settings_write(self.database, {'xrayTemplateConfig': json.dumps(template)})
         self.sync()
 
@@ -180,6 +208,7 @@ class CdnHost(unittest.TestCase):
         self.h.API.return_value = self.model; self.h.wait_api.return_value = self.model
         self.h.owned_host_group.side_effect = real_function(self.h, 'owned_host_group')
         self.f.patch(self.h, 'core_check')
+        self.f.patch(self.h, 'control_api_health')  # Real gRPC is in SourceNativeCDN.
         self.f.patch(self.h, 'hysteria_health', side_effect=real_function(self.h, 'hysteria_health'))
         self.f.patch(self.h, 'tls_hostname_probe')
         self.f.patch(self.h, 'certificate_paths', side_effect=lambda folder, domain, metadata=None:
@@ -1103,6 +1132,9 @@ class SourceNativeCDN(unittest.TestCase):
                         path = host.auth_log_path(state, state['cdn_auth'])
                         if path.is_file(): host.atomic(destination / 'retained-witness.log', path.read_bytes())
             self.addCleanup(retain_private)
+        add = fx.fx.device_request('add', 'device4', 'device5')
+        fx.fx.device_prepare(add); fx.fx.device_finish(add)
+        self.assertEqual(len(fx.manifest['accounts']), 5)
         fx.seed_policy(); fx.enable()
         import test_native_cdn as native_cdn
         import test_native_cdn_triple as triple
@@ -1126,8 +1158,13 @@ class SourceNativeCDN(unittest.TestCase):
         _, template = host.auth_template(fx.folder)
         template['log'] = {'access': 'none', 'error': 'none', 'loglevel': 'none'}
         rule = host.management_rule(template, fx.manifest, 'SELF-h2')
-        template['routing']['rules'] = [rule] + [r for r in template['routing']['rules'] if r != rule]
-        host.settings_write(fx.folder / 'db/x-ui.db', {'xrayTemplateConfig': json.dumps(template)})
+        # Archive the actual old production ordering, not a fixture-repaired
+        # source. Only target preparation inside the closed journal may fix it.
+        rules = template['routing']['rules']
+        api_rule = host.api_dispatch_rule()
+        template['routing']['rules'] = [rule] + [r for r in rules if r not in (rule, api_rule)] + [api_rule]
+        old_template = json.dumps(template)
+        host.settings_write(fx.folder / 'db/x-ui.db', {'xrayTemplateConfig': old_template})
         fx.fx.start(); host.wait_api(fx.manifest)
         original = copy.deepcopy(fx.manifest)
         records, joins = fx.records(), fx.rows('client_inbounds')
@@ -1226,6 +1263,10 @@ class SourceNativeCDN(unittest.TestCase):
                     {k: v for k, v in record.items() if k not in ('createdAt', 'updatedAt')})
                 self.assertEqual(after['flow'], record['flow'])
             host.backend_health(fx.folder, current)
+            host.control_api_health(fx.folder, current)
+            with sqlite3.connect(host.ROOT / 'device-rollback/x-ui.db') as db:
+                self.assertEqual(db.execute("select value from settings where key='xrayTemplateConfig'").fetchone()[0],
+                    old_template, 'Closed rollback snapshot must precede API repair')
             candidate, _, verified = fx.archive()
             candidate_a = host.digest(candidate)
             controller_a = controller_identity(candidate, verified)
@@ -1309,6 +1350,7 @@ class SourceNativeCDN(unittest.TestCase):
                 self.assertFalse(host.abort(request)['pending'])
                 restored = host.read_json(fx.folder / 'manifest.json')
                 self.assertEqual(restored, original)
+                self.assertEqual(host.auth_template(fx.folder)[0], old_template, 'Rollback must retain original bad-order template exactly')
                 host.backend_health(fx.folder, restored)
             host.atomic(wire.evidence / 'final-manifest.json', host.dumps(host.read_json(fx.folder / 'manifest.json')))
             host.atomic(wire.evidence / 'final-database.sqlite', (fx.folder / 'db/x-ui.db').read_bytes())

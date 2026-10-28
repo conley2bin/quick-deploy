@@ -124,6 +124,9 @@ class NativeCDNTriple(unittest.TestCase):
         self.summary['lock_digests'] = self.lock_digests
         version = subprocess.run([vps.resolve_mihomo(), '-v'], capture_output=True, timeout=5)
         self.assertIn(b'v1.19.32', version.stdout)
+        request = fx.fx.device_request('add', 'device4', 'device5')
+        fx.fx.device_prepare(request); fx.fx.device_finish(request)
+        self.assertEqual(len(fx.manifest['accounts']), 5)
         fx.seed_policy()
         host.backend_health(fx.folder, fx.manifest)
         fx.enable(); fx.topology()
@@ -145,12 +148,11 @@ class NativeCDNTriple(unittest.TestCase):
         shutil.copy2(archive, self.evidence / 'original-closed-dual.tar')
         archive_sha = host.digest(archive)
         self.summary['original_archive_sha256'] = archive_sha
-        # Fixture-only local origin routing/logging; account SQL is never used.
-        origin = fx.origin(); self.await_core_started()
+        # No fixture origin rule has been added: production dispatch must work.
+        host.control_api_health(fx.folder, fx.manifest)
         original_port = fx.manifest['config']['proxy_port']
         h2_node = next(p for p in baseline['company']['proxies'] if p['type'] == 'hysteria2')
         h2_cert = fx.certificate_paths(fx.folder, fx.manifest)[0]
-        self.assertTrue(self.https(self.client(h2_node, original_port, h2_cert), origin), 'Original H2 baseline failed')
         target_port, reality_port, backend_port = native.free_port(), native.free_port(), native.free_port()
         self.assertEqual(len({target_port, reality_port, backend_port, original_port}), 4)
         self.front(target_port)
@@ -247,7 +249,6 @@ class NativeCDNTriple(unittest.TestCase):
         profiles = self.triple_exports(before, baseline, reality_port, original_port)
         generated = api.call('/panel/api/server/getConfigJson')
         self.save('generated-xray.json', generated)
-        self.await_core_started()
         xr = next(i for i in generated['inbounds'] if i.get('protocol') == 'vless' and i['port'] == reality_port)
         xx = next(i for i in generated['inbounds'] if i.get('tag') == cdn_in['tag'])
         xh = next(i for i in generated['inbounds'] if i.get('tag') == 'SELF-h2')
@@ -260,12 +261,91 @@ class NativeCDNTriple(unittest.TestCase):
         self.assertEqual(xh['port'], original_port)
         self.assertEqual(xh['streamSettings']['network'], 'hysteria')
         self.assertEqual({c['auth'] for c in xh['settings']['clients']}, {a['auth'] for a in before.values()})
+        # Native hot updates can leave bin/config.json at the pre-update tag.
+        # A cold panel/core barrier materializes the actual production template.
+        fx.fx.stop(); fx.fx.start(); host.wait_api(fx.manifest)
+        for role in (xr['tag'], xx['tag']):
+            self.assertEqual(set(host.auth_live_users(fx.folder, role)), set(before))
+        # Both real VLESS registries must work on UNADAPTED production routing.
+        host.control_api_health(fx.folder, fx.manifest)
+        fx.fx.stop()
+        _, template = host.auth_template(fx.folder)
+        good_rules = copy.deepcopy(template['routing']['rules'])
+        api_rule = host.api_dispatch_rule()
+        template['routing']['rules'] = [r for r in good_rules if r != api_rule] + [api_rule]
+        host.settings_write(fx.folder / 'db/x-ui.db', {'xrayTemplateConfig': json.dumps(template)})
+        fx.fx.start(); host.wait_api(fx.manifest)
+        failures = []
+        for role in (xr['tag'], xx['tag']):
+            result = subprocess.run([str(fx.folder / 'bin/xray-linux-amd64'), 'api', 'inbounduser',
+                '--server=127.0.0.1:62789', '-tag=' + role, '-timeout=1'], capture_output=True, timeout=3)
+            self.assertNotEqual(result.returncode, 0, 'Historical private block unexpectedly dispatched API')
+            self.assertIn(b'failed to dial 127.0.0.1:62789', result.stderr)
+            failures.append({'role': role, 'returncode': result.returncode, 'stderr': result.stderr.decode()})
+        self.save('production-old-order-api-failures.json', failures)
+        fx.fx.stop()
+        host.order_api_dispatch(template)
+        self.assertEqual(template['routing']['rules'], good_rules)
+        host.settings_write(fx.folder / 'db/x-ui.db', {'xrayTemplateConfig': json.dumps(template)})
+        fx.fx.start(); host.wait_api(fx.manifest)
+        host.control_api_health(fx.folder, fx.manifest)
+        self.save('production-fixed-api-routing.json', host.read_json(fx.folder / 'bin/config.json'))
+        self.summary['unadapted_production_both_roles_api_old_fails_fixed_works'] = True
+        # Only now may the fixture add its narrow HTTPS-origin allowance.
+        origin = fx.origin(); self.await_core_started()
+        self.assertTrue(self.https(self.client(h2_node, original_port, h2_cert), origin), 'Original H2 baseline failed')
         node = next(p for p in profiles['company']['proxies'] if p.get('network') == 'xhttp')
         original_reality = next(p for p in baseline['company']['proxies'] if p.get('reality-opts'))
         self.assertTrue(self.https(self.client(original_reality, reality_port, h2_cert), origin), 'Original UUID/REALITY keys/Vision failed on new port')
         self.summary['original_reality_vision_new_port'] = True
         self.assertTrue(self.https(self.client(node, original_port, cert), origin), 'Valid XHTTP failed')
         self.summary['xhttp_before_negative'] = True
+        # An authenticated business inbound cannot borrow the internal API tag.
+        import http.server
+        import threading
+        hits = []
+        class ForbiddenOrigin(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                hits.append(self.path); self.send_response(200); self.end_headers()
+            def log_message(self, *_): pass
+        forbidden = http.server.ThreadingHTTPServer(('127.0.0.1', 0), ForbiddenOrigin)
+        threading.Thread(target=forbidden.serve_forever, daemon=True).start()
+        self.addCleanup(forbidden.server_close); self.addCleanup(forbidden.shutdown)
+        for business, port, trust in ((original_reality, reality_port, h2_cert),
+                (node, original_port, cert), (h2_node, original_port, h2_cert)):
+            client = self.client(business, port, trust)
+            result = subprocess.run(['curl', '--fail', '--silent', '--show-error', '--max-time', '2', '--noproxy', '',
+                '--proxy', 'http://127.0.0.1:' + str(client),
+                'http://127.0.0.1:' + str(forbidden.server_port) + '/private-negative'], capture_output=True, timeout=4)
+            self.assertNotEqual(result.returncode, 0, 'Business inbound escaped native private block')
+        self.assertEqual(hits, [], 'Private business traffic reached loopback origin')
+        access_log = (fx.folder / 'logs/dual-access.log').read_text()
+        for tag in (xr['tag'], xx['tag'], 'SELF-h2'):
+            self.assertRegex(access_log, r'tcp:127\.0\.0\.1:' + str(forbidden.server_port) + r' \[' + re.escape(tag) + r' -> blocked\]')
+        self.summary['all_three_business_inbounds_private_destination_rejected'] = True
+        # Coordinate-only self-IP substitution makes the existing exact H2
+        # TCP8443 exception reachable locally; VLESS/CDN remain blocked.
+        management = http.server.ThreadingHTTPServer(('127.0.0.1', 8443), ForbiddenOrigin)
+        threading.Thread(target=management.serve_forever, daemon=True).start()
+        self.addCleanup(management.server_close); self.addCleanup(management.shutdown)
+        fx.fx.stop()
+        raw, template = host.auth_template(fx.folder)
+        self.assertEqual(template['routing']['rules'][0], host.management_rule(template, fx.manifest, 'SELF-h2'))
+        template['routing']['rules'][0]['ip'] = ['127.0.0.1/32']
+        direct = next(o for o in template['outbounds'] if o['tag'] == 'direct')
+        direct['settings']['finalRules'].insert(0, {'action': 'allow', 'network': 'tcp', 'ip': ['127.0.0.1/32'], 'port': '8443'})
+        host.settings_write(fx.folder / 'db/x-ui.db', {'xrayTemplateConfig': json.dumps(template)})
+        fx.fx.start(); host.wait_api(fx.manifest)
+        for business, port, trust in ((original_reality, reality_port, h2_cert),
+                (node, original_port, cert), (h2_node, original_port, h2_cert)):
+            client = self.client(business, port, trust)
+            result = subprocess.run(['curl', '--fail', '--silent', '--show-error', '--max-time', '2', '--noproxy', '',
+                '--proxy', 'http://127.0.0.1:' + str(client), 'http://127.0.0.1:8443/h2-self'], capture_output=True, timeout=4)
+            self.assertEqual(result.returncode == 0, business['type'] == 'hysteria2')
+        self.assertEqual(hits, ['/h2-self'])
+        fx.fx.stop(); host.settings_write(fx.folder / 'db/x-ui.db', {'xrayTemplateConfig': raw})
+        fx.fx.start(); host.wait_api(fx.manifest)
+        self.summary['h2_only_exact_self_tcp8443_allowed_with_fixture_ip_mapping'] = True
         error_log = fx.folder / 'logs/dual-error.log'
         offset, hits = error_log.stat().st_size, len(origin.peers)
         def normalized(value):

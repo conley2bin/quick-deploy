@@ -576,6 +576,14 @@ def enable_cdn(folder, manifest, domain, port):
     api = wait_api(manifest)
     original, group = owned_host_group(folder, api, manifest)
     reality_source_health(original, manifest)
+    # Caller has closed the rollback DB/Caddy snapshot and armed the journal.
+    # Old dual archives legitimately retain the shadowed API order.
+    _, template = auth_template(folder)
+    order_api_dispatch(template)
+    ctl('stop', PANEL)
+    settings_write(Path(folder) / 'db/x-ui.db', {'xrayTemplateConfig': json.dumps(template)})
+    ctl('start', PANEL)
+    api = wait_api(manifest)
     before = snapshot_accounts(Path(folder) / 'db/x-ui.db', manifest)
     records = {n: api.call('/panel/api/clients/get/' + n)['client'] for n in device_names(manifest)}
     earliest = {n: r.get('createdAt') for n, r in records.items()}
@@ -805,6 +813,47 @@ def enable_hysteria(folder, manifest, ssh_port):
     core_check(folder)
 
 
+def api_dispatch_rule():
+    return {'type': 'field', 'inboundTag': ['api'], 'outboundTag': 'api'}
+
+
+def order_api_dispatch(template):
+    """Move only the exact native API rule; keep every non-API rule in order."""
+    rules = template.get('routing', {}).get('rules', [])
+    api_rules = [r for r in rules if r.get('outboundTag') == 'api' or 'api' in r.get('inboundTag', [])]
+    if api_rules != [api_dispatch_rule()]:
+        raise Error('Missing, duplicate or changed exact native API dispatch')
+    remaining = [r for r in rules if r != api_rules[0]]
+    blocks = [i for i, r in enumerate(remaining) if r.get('outboundTag') == 'blocked' and
+              'geoip:private' in r.get('ip', []) and not r.get('inboundTag')]
+    if not blocks:
+        raise Error('Missing owned private-destination block')
+    if rules.index(api_rules[0]) <= blocks[0]:
+        return
+    remaining.insert(blocks[0], api_rules[0])
+    rules[:] = remaining
+
+
+def control_api_health(folder, manifest):
+    """Attest generated routing and actual HandlerService, never just its socket."""
+    config = read_json(Path(folder) / 'bin/config.json')
+    api = config.get('api', {})
+    listeners = [i for i in config.get('inbounds', []) if i.get('tag') == 'api']
+    if (api.get('tag') != 'api' or 'HandlerService' not in api.get('services', []) or len(listeners) != 1 or
+            listeners[0].get('listen') != '127.0.0.1' or listeners[0].get('port') != API_PORT or
+            listeners[0].get('protocol') != 'tunnel'):
+        raise Error('Changed native loopback HandlerService configuration')
+    ordered = copy.deepcopy(config)
+    order_api_dispatch(ordered)
+    if ordered['routing']['rules'] != config['routing']['rules']:
+        raise Error('Native API dispatch is shadowed by private-destination block')
+    for inbound in config['inbounds']:
+        if inbound.get('protocol') == 'vless':
+            expected = {c['email']: {'id': c['id'], 'flow': c.get('flow', '')} for c in inbound['settings']['clients']}
+            if auth_live_users(folder, inbound['tag']) != expected:
+                raise Error('HandlerService registry differs from generated VLESS role')
+
+
 def configure_native(folder, manifest, fresh, rotate=False):
     if fresh:
         # admin/admin exists only in the loopback candidate; change via native API,
@@ -843,6 +892,7 @@ def configure_native(folder, manifest, fresh, rotate=False):
         routing['rules'].insert(0, management_rule(template, manifest, 'SELF-h2'))
     if not any(o.get('tag') == 'blocked' and o.get('protocol') == 'blackhole' for o in template.get('outbounds', [])):
         raise Error('Unexpected native template: missing blocked outbound')
+    order_api_dispatch(template)
     # Stop before changing persistent template/settings; cached panel state is
     # refreshed by restart. Inbounds/accounts still use the native API.
     ctl('stop', PANEL)
@@ -2197,11 +2247,14 @@ BASELINE_ADAPTER_SHA256 = 'b52adbbfb7efc3593c5fa266e8f148ed60deaa2b685d72b926e54
 DUAL_ADAPTER_SHA256 = 'ecdb5af7d782bb41b9aa2e8794b5659724bfd468a2c7d82c67da330df81e8df7'
 # Independently byte-verified git-show7849ef1; authorized before-backup guard.
 DRAIN_ADAPTER_SHA256 = '3948c13793f7e50d1600d88036c8ffd3c174fd74fe16481d1d75000b6b4d425a'
+# Independently byte-verified git-show868121c AND actual CLOSED-before guard.
+PROXIED_ADAPTER_SHA256 = 'c278f2145198a66d95b406fe7c9da4d0d38b1ec656f69c3785fb9af205abd637'
 ADAPTER_PREDECESSORS = {LEGACY_ADAPTER_SHA256: 'previous-host.py',
                         DEPLOYED_ADAPTER_SHA256: 'previous-host-918103e.py',
                         BASELINE_ADAPTER_SHA256: 'previous-host-ae72036.py',
                         DUAL_ADAPTER_SHA256: 'previous-host-51f71ce.py',
-                        DRAIN_ADAPTER_SHA256: 'previous-host-7849ef1.py'}
+                        DRAIN_ADAPTER_SHA256: 'previous-host-7849ef1.py',
+                        PROXIED_ADAPTER_SHA256: 'previous-host-868121c.py'}
 
 
 def accepted_adapter_digest(stored, current):
@@ -2569,6 +2622,8 @@ def devices_prepare(upload, transport=False):
             ctl('start', PANEL)
             wait_api(manifest)
             backend_health(active, manifest)
+            if cdn:
+                control_api_health(active, manifest)
             manifest['published'] = False
             atomic(active / 'manifest.json', dumps(manifest))
             # Keep the OLD exact front paths until backup receipt/commit. New
@@ -2713,6 +2768,7 @@ def auth_native_state(folder, manifest):
     check_lease()
     binary_health(Path(folder))
     api = wait_api(manifest)
+    control_api_health(folder, manifest)
     live = {tag: auth_live_users(folder, tag) for tag in (reality_tag(manifest), 'SELF-cdn')}
     process_health()
     owned_host_group(folder, api, manifest)

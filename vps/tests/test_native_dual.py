@@ -306,6 +306,9 @@ class NativeDual(unittest.TestCase):
         server.socket = context.wrap_socket(server.socket, server_side=True)
         threading.Thread(target=server.serve_forever, daemon=True).start()
         self.addCleanup(server.server_close); self.addCleanup(server.shutdown)
+        # Assert the production-generated route AND real HandlerService before
+        # adding fixture origin allowances. Never repair API order here.
+        host.control_api_health(self.folder, self.manifest)
         self.fx.stop()
         with closing(sqlite3.connect(self.folder / 'db/x-ui.db')) as db:
             template = json.loads(db.execute("select value from settings where key='xrayTemplateConfig'").fetchone()[0])
@@ -320,9 +323,9 @@ class NativeDual(unittest.TestCase):
                 outbound['settings'] = {'finalRules': [{'action': 'allow', 'network': 'tcp',
                     'ip': ['127.0.0.1/32'], 'port': str(server.server_port)}, {'action': 'block'}]}
         rules = template['routing']['rules']
-        api_rules = [rule for rule in rules if rule.get('outboundTag') == 'api']
-        template['routing']['rules'] = api_rules + [{'type': 'field', 'ip': ['127.0.0.1/32'],
-            'network': 'tcp', 'port': str(server.server_port), 'outboundTag': 'direct'}] + [rule for rule in rules if rule not in api_rules]
+        block = next(i for i, rule in enumerate(rules) if rule.get('outboundTag') == 'blocked')
+        rules.insert(block, {'type': 'field', 'ip': ['127.0.0.1/32'],
+            'network': 'tcp', 'port': str(server.server_port), 'outboundTag': 'direct'})
         host.settings_write(self.folder / 'db/x-ui.db', {'xrayTemplateConfig': json.dumps(template)})
         self.fx.start(); self.api().call('/panel/api/server/restartXrayService', {})
         return server

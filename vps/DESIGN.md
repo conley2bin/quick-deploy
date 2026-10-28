@@ -591,7 +591,20 @@ URI/QR 字节不变；每设备5个二维码（3个节点+2个订阅 URL），�
 保留精确相等的 `KNOWN_NATIVE_LIMIT` expected-failure；上游修正后应出现 unexpected-success 并审阅重锁版本，
 不能把它报告为完整记录精度通过，也不能据此容许任意创建日期丢失。
 
-Xray 的现有 `geoip:private` 阻断规则在 `api → api` 例外之前，阻断内部127.0.0.1
-统计 API 路径，所以当前流量计数不可信。不要据此判断是否走代理。
-流量展示需求已取消，此次不修改统计或路由；实际连接以客户端 HTTPS/出口验收为准。
+历史部署的 `geoip:private` 阻断规则位于 `api → api` 例外之前，阻断内部127.0.0.1
+控制 API。下述修复仅恢复认证验收所需的 HandlerService；未验证统计计数准确性，
+流量展示需求仍已取消。实际连接以客户端 HTTPS/出口验收为准。
 备份明文、容量手动管理、原机二进制升级未实现及冷换机停机等边界见上文。
+
+### Native control API routing invariant
+
+The exact native `inboundTag:[api] -> api` dispatch precedes the unrestricted
+private/self-IP block; the narrow H2 self-management rule remains first. Only
+that single API rule moves: business inbounds cannot forge its tag, and all
+non-API routing order/private blocking stays unchanged. Fresh generation and
+additive dual→triple preparation repair the owned template through native
+settings; the latter runs only after the closed rollback journal. Prepared
+triple validation reads both actual HandlerService registries on127.0.0.1:62789
+before client/auth probes. Read-only status and exact rollback/old archives do
+not repair historical ordering. This control-plane dependency fix makes no
+statistics/counter accuracy claim.
