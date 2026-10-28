@@ -586,8 +586,9 @@ URI/QR 字节不变；每设备5个二维码（3个节点+2个订阅 URL），�
 选择更早的创建时间；[ClientUpdate 入站同步](https://github.com/MHSanaei/3x-ui/blob/608ef4e4010bf83e2e78328e08f77efc051ad4d7/internal/web/service/client_inbound_apply.go#L808-L822)
 也会覆盖提交的 `created_at`。因此冷 restore/replace、reset/rename 可能把全局 `createdAt` 的毫秒尾数
 归一到较早的整秒入站元数据；已验证样本整秒不变，变化小于1000ms。这不改变网络、认证身份或到期/配额等策略语义，
-原始TAR中的关闭DB仍保留精确原始元数据。当前上线功能迁移保留了基线记录，但未来这些操作不能承诺
-`createdAt` 位级一致。`test_native_dual_recovery.py` 分开核验功能及该已知原生精度限制，
+原始TAR中的关闭DB仍保留精确原始元数据。首次双协议上线迁移保留了基线记录；后续实际三入口迁移中，
+3条记录的整数毫秒 `createdAt` 向更早的已有入站投影归一，各减少993ms，符合上述同秒且小于1000ms的边界；
+认证身份、到期、配额及其他全部客户端字段不变。因此功能迁移及上述操作不能承诺 `createdAt` 位级一致。`test_native_dual_recovery.py` 分开核验功能及该已知原生精度限制，
 保留精确相等的 `KNOWN_NATIVE_LIMIT` expected-failure；上游修正后应出现 unexpected-success 并审阅重锁版本，
 不能把它报告为完整记录精度通过，也不能据此容许任意创建日期丢失。
 
