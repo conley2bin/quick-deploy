@@ -1,0 +1,79 @@
+/* BEGIN quick-deploy owned-node-labels v1 (Clash Verge Rev 2.5.8)
+ * Display only. Exact node titles; group cards and other providers are excluded.
+ * Native transports: SELF-h2 QUIC/UDP443; SELF-cdn XHTTP/TLS/TCP443;
+ * SELF-main REALITY/TCP9443. Update these annotations if native paths change.
+ */
+
+/* First direct tag is protocol; every later tag is a capability.
+ * Full rows use spans. Mini styled(Box) filters its component prop, so use
+ * direct tag siblings rather than assuming spans. Preserve dynamic text,
+ * including future TFO/MPTCP/SMUX tags.
+ */
+.MuiListItemText-root:is([title="SELF-h2"], [title="SELF-cdn"], [title="SELF-main"], [title="DIRECT"])
+  > .MuiListItemText-secondary > span ~ span::before,
+:is([title="SELF-h2\a"], [title="SELF-cdn\a"], [title="SELF-main\a"], [title="DIRECT\a"])
+  > .MuiBox-root > :first-child ~ *::before {
+  content: "支持";
+}
+
+/* Mini node titles include a trailing newline; group titles include their now
+ * value and cannot match these exact selectors. Give the extra line room.
+ */
+.MuiListItemButton-root:has(> :is([title="SELF-h2\a"], [title="SELF-cdn\a"], [title="SELF-main\a"])) {
+  height: auto;
+  min-height: 80px;
+  padding-top: 8px;
+  padding-bottom: 8px;
+}
+:is([title="SELF-h2\a"], [title="SELF-cdn\a"], [title="SELF-main\a"]) {
+  flex: 1;
+  min-width: 0;
+  overflow: visible;
+}
+:is([title="SELF-h2\a"], [title="SELF-cdn\a"], [title="SELF-main\a"])
+  > .MuiBox-root {
+  flex-wrap: wrap;
+  row-gap: 3px;
+}
+:is([title="SELF-h2\a"], [title="SELF-cdn\a"], [title="SELF-main\a"])
+  > .MuiBox-root > * {
+  flex-shrink: 0;
+}
+
+/* Full layout also grows instead of clipping a wrapped name or annotation. */
+.MuiListItemButton-root:has(> .MuiListItemText-root:is([title="SELF-h2"], [title="SELF-cdn"], [title="SELF-main"])) {
+  height: auto;
+  min-height: 60px;
+}
+
+.MuiListItemText-root[title="SELF-h2"] > .MuiListItemText-secondary::after,
+[title="SELF-h2\a"] > .MuiBox-root::after {
+  content: "外层UDP443";
+}
+.MuiListItemText-root[title="SELF-cdn"] > .MuiListItemText-secondary::after,
+[title="SELF-cdn\a"] > .MuiBox-root::after {
+  content: "XHTTP/TLS · 外层TCP443";
+}
+.MuiListItemText-root[title="SELF-main"] > .MuiListItemText-secondary::after,
+[title="SELF-main\a"] > .MuiBox-root::after {
+  content: "REALITY · 外层TCP9443";
+}
+.MuiListItemText-root:is([title="SELF-h2"], [title="SELF-cdn"], [title="SELF-main"])
+  > .MuiListItemText-secondary::after,
+:is([title="SELF-h2\a"], [title="SELF-cdn\a"], [title="SELF-main\a"])
+  > .MuiBox-root::after {
+  display: block;
+  flex-basis: 100%;
+  width: fit-content;
+  box-sizing: border-box;
+  margin-top: 3px;
+  padding: 1px 4px;
+  border: 1px solid currentColor;
+  border-radius: 4px;
+  color: var(--primary-main);
+  font-size: 10px;
+  line-height: 15px;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+/* END quick-deploy owned-node-labels v1 */
