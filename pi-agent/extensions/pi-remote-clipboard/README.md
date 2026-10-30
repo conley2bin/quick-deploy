@@ -132,11 +132,15 @@ piox
 
 会话关闭（`session_shutdown`）会取消本会话启动的全部剪贴板操作，并在返回前等待清理完成：POSIX 下每个 tmux/Python 辅助进程自成进程组，取消或 8 秒超时时对整个进程组先 TERM、1 秒后 KILL（含已提前退出的领导进程遗留的、仍持有管道的后代；只向本扩展自己启动的进程组发信号），Windows 下只能终止直接子进程。操作的 promise 结算（超时/取消/溢出）与资源清理分离，shutdown 的 await 会等待已超时但仍在 TERM→KILL 宽限中的辅助进程，因此 Pi 在 shutdown 后退出进程不会遗留它们；重复 start 会取消并记录前任，随后的 shutdown 一并等待。之后不再插入编辑器、不再发出 OSC 52/原生回退/通知；已退役的复制 sink 以 `AbortError` 拒绝（取消发生在“非对端”判定之后同样如此）。输出预算与 `execFile` 的 `maxBuffer` 相同：stdout、stderr 各 1 MiB **字节**。
 
+私有复制/粘贴入口和全局复制 sink 按安装者独立恢复：重叠的扩展实例可按任意顺序结束，恢复最近仍活跃的前任，最后恢复原始属性描述符（包括 sink 原先不存在或不是函数）。本扩展的包装层互为替代所有者，本地回退会越过所有已标记层直接调用原生/外来入口，保留 receiver 和参数；捕获的旧函数始终绑定原会话，退役后不会转向新会话。退役记录清除自身 callable，只留下可压缩的前任记录链接，不保存历史函数快照或全局所有者列表。
+
+只接管自身可写的数据函数属性；sink 另支持原本不存在的属性和可写非函数值。访问器、只读属性不调用 getter/setter，也不修改。卸载仅在当前数据函数及三个属性标志仍与本次安装相同时恢复，外来值/访问器/删除/标志变化均保留。重复 start 在安装新入口或转非 TUI 前先独立撤销旧入口；shutdown 即使属性检查/恢复/删除失败，仍尝试全部入口并等待 OS/制品清理后报告首个失败。无法改写外来包装器内部捕获的旧函数，也不追溯修复运行中的未标记旧版闭包；正常 Pi 会话替换仍是顺序 shutdown→start，不因此引入多租户能力约定。
+
 ```bash
 python3 pi-agent/extensions/pi-remote-clipboard/tests/test_all.py
 python3 pi-agent/extensions/pi-remote-clipboard/tests/test_installer.py
 python3 pi-agent/extensions/pi-remote-clipboard/tests/native_activation.py
-node --experimental-strip-types --test pi-agent/extensions/pi-remote-clipboard/tests/activation.test.mjs pi-agent/extensions/pi-remote-clipboard/tests/lifecycle.test.mjs pi-agent/extensions/pi-remote-clipboard/tests/paste-framing.test.mjs
+node --experimental-strip-types --test pi-agent/extensions/pi-remote-clipboard/tests/activation.test.mjs pi-agent/extensions/pi-remote-clipboard/tests/lifecycle.test.mjs pi-agent/extensions/pi-remote-clipboard/tests/paste-framing.test.mjs pi-agent/extensions/pi-remote-clipboard/tests/ownership.test.mjs
 cd pi-agent/extensions/pi-remote-clipboard/pi-extension && ../../pi-copy-links/node_modules/.bin/tsc -p tsconfig.json --noEmit
 ```
 

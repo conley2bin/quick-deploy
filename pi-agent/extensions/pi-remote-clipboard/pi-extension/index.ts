@@ -38,7 +38,105 @@ const MAX_OSC52_ENCODED = 100_000;
 /** pi-copy-links 等扩展查询的复制分流函数；返回 true 表示已写往对端剪贴板。 */
 const COPY_SINK_KEY = Symbol.for("pi-remote-clipboard:copy-sink");
 
-type CopySink = (text: string) => Promise<boolean>;
+/** Shared across module URLs; tagged wrappers are replacement owners, not middleware. */
+const OWNED_LAYER_KEY = Symbol.for("pi-remote-clipboard:owned-layer:v1");
+type SlotFlags = { writable: boolean; enumerable: boolean; configurable: boolean };
+type Predecessor = { kind: "owned"; record: OwnedLayer; flags: SlotFlags }
+  | { kind: "base"; descriptor: PropertyDescriptor | undefined };
+interface OwnedLayer {
+  live: boolean;
+  callable: Function | undefined;
+  previous: Predecessor;
+}
+interface Hook {
+  target: object;
+  key: PropertyKey;
+  record: OwnedLayer;
+  flags: SlotFlags;
+}
+const slotFlags = (d: PropertyDescriptor): SlotFlags => ({
+  writable: d.writable === true, enumerable: d.enumerable === true, configurable: d.configurable === true,
+});
+const sameFlags = (d: PropertyDescriptor, flags: SlotFlags): boolean =>
+  d.writable === flags.writable && d.enumerable === flags.enumerable && d.configurable === flags.configurable;
+
+/** Metadata inspection never evaluates a function's foreign getters. */
+function ownedLayer(value: unknown): OwnedLayer | undefined {
+  if (typeof value !== "function") return undefined;
+  const tagged = Object.getOwnPropertyDescriptor(value, OWNED_LAYER_KEY);
+  if (!tagged || !("value" in tagged) || typeof tagged.value !== "object" || tagged.value === null) return undefined;
+  const record = tagged.value as OwnedLayer;
+  const live = Object.getOwnPropertyDescriptor(record, "live");
+  const callable = Object.getOwnPropertyDescriptor(record, "callable");
+  const previous = Object.getOwnPropertyDescriptor(record, "previous");
+  if (!live || !("value" in live) || typeof live.value !== "boolean"
+    || !callable || !("value" in callable) || (live.value && callable.value !== value)
+    || !previous || !("value" in previous) || typeof previous.value !== "object" || previous.value === null) return undefined;
+  const kind = Object.getOwnPropertyDescriptor(previous.value, "kind");
+  if (!kind || !("value" in kind) || (kind.value !== "owned" && kind.value !== "base")) return undefined;
+  return record;
+}
+
+/** Dead nodes contain forwarding information only; compress them without bypassing live restoration owners. */
+function normalize(link: Predecessor): Predecessor {
+  if (link.kind === "owned" && !link.record.live) {
+    link.record.previous = normalize(link.record.previous);
+    return link.record.previous;
+  }
+  return link;
+}
+function fallbackBase(record: OwnedLayer): Function {
+  record.previous = normalize(record.previous);
+  let link = record.previous;
+  while (link.kind === "owned") {
+    link.record.previous = normalize(link.record.previous);
+    link = link.record.previous;
+  }
+  return link.descriptor!.value as Function;
+}
+function restorePredecessor(record: OwnedLayer): PropertyDescriptor | undefined {
+  record.previous = normalize(record.previous);
+  const link = record.previous;
+  return link.kind === "base" ? link.descriptor : { ...link.flags, value: link.record.callable };
+}
+function uninstall(hook: Hook, callable: Function | undefined): void {
+  const current = Object.getOwnPropertyDescriptor(hook.target, hook.key);
+  if (!current || !("value" in current) || current.value !== callable || !sameFlags(current, hook.flags)) return;
+  const previous = restorePredecessor(hook.record);
+  if (previous) Object.defineProperty(hook.target, hook.key, previous);
+  else if (!Reflect.deleteProperty(hook.target, hook.key)) throw new Error("pi-remote-clipboard: failed to remove owned hook");
+}
+/** Only own writable data slots are supported; absence is allowed solely for the global sink. */
+function installHook(
+  target: object | undefined, key: PropertyKey, method: boolean, create: (record: OwnedLayer) => Function,
+): Hook | undefined {
+  if (!target) return undefined;
+  const descriptor = Object.getOwnPropertyDescriptor(target, key);
+  if (descriptor ? (!("value" in descriptor) || descriptor.writable !== true
+    || (method && typeof descriptor.value !== "function")) : method) return undefined;
+  const predecessor = descriptor && ownedLayer(descriptor.value);
+  const previous: Predecessor = predecessor
+    ? normalize({ kind: "owned", record: predecessor, flags: slotFlags(descriptor!) })
+    : { kind: "base", descriptor };
+  const record: OwnedLayer = { live: true, callable: undefined, previous };
+  const callable = create(record);
+  record.callable = callable;
+  Object.defineProperty(callable, OWNED_LAYER_KEY, { value: record });
+  const flags = descriptor ? slotFlags(descriptor) : { writable: true, enumerable: true, configurable: true };
+  const hook = { target, key, record, flags };
+  try {
+    Object.defineProperty(target, key, { ...flags, value: callable });
+  } catch (error) {
+    record.live = false;
+    record.callable = undefined;
+    // A custom define trap can publish and then throw. Undo any observable owned publication.
+    try { uninstall(hook, callable); } catch (cleanupError) {
+      console.error("pi-remote-clipboard: failed installation rollback", cleanupError);
+    }
+    throw error;
+  }
+  return hook;
+}
 
 /** 会话已结束的取消结果；调用方必须能与“不是对端 / 复制失败”区分开。 */
 class ClipboardCancelled extends Error {
@@ -57,7 +155,6 @@ interface Owner {
   readonly helpers: Set<Helper>;
   /** 进行中的制品操作（私有暂存目录、交付文件）；结算即其暂存与未交付文件已清理。永不 reject。 */
   readonly operations: Set<Promise<void>>;
-  sink?: CopySink;
 }
 
 interface Helper {
@@ -515,8 +612,24 @@ export default function piRemoteClipboard(pi: ExtensionAPI): void {
     void cleanup.then(() => retiring.delete(cleanup));
     return cleanup;
   }
-  let restoreCopy: (() => void) | undefined;
-  let restorePaste: (() => void) | undefined;
+  let hooks: Hook[] = [];
+  function releaseHooks(): void {
+    const pending = hooks.map((hook) => ({ hook, callable: hook.record.callable }));
+    hooks = []; // Release all handles even when a descriptor operation throws.
+    for (const { hook } of pending) {
+      hook.record.live = false;
+      hook.record.callable = undefined;
+      hook.record.previous = normalize(hook.record.previous);
+    }
+    let failed = false;
+    let firstError: unknown;
+    for (const { hook, callable } of pending) {
+      try { uninstall(hook, callable); } catch (error) {
+        if (!failed) { failed = true; firstError = error; }
+      }
+    }
+    if (failed) throw firstError;
+  }
 
   interface PasteHost {
     editor?: { insertTextAtCursor?: (text: string) => void };
@@ -611,6 +724,7 @@ export default function piRemoteClipboard(pi: ExtensionAPI): void {
   pi.on("session_start", (_event, ctx) => {
     // 每次启动都开启新的所有者；仍存活的前任（未经 shutdown 的重叠启动）在此被取消。
     void retire(current);
+    releaseHooks();
     const owner = newOwner();
     current = owner;
     if (ctx.mode !== "tui") return;
@@ -618,78 +732,60 @@ export default function piRemoteClipboard(pi: ExtensionAPI): void {
     // 复制方向分流：SSH 客户端在观看时，文本复制改走 OSC 52（经 tmux 到对端剪贴板）。
     // 本地会话完全走原生路径，一行行为不变。
     const unavailable: string[] = [];
-    const altProto = PiTui.TuiAltScreen?.prototype as unknown as {
-      copyTextToClipboard?: (this: { flash?: (msg: string) => void }, text: string) => Promise<boolean>;
-    } | undefined;
-    if (typeof altProto?.copyTextToClipboard === "function"
-      && Object.getOwnPropertyDescriptor(altProto, "copyTextToClipboard")?.writable) {
-      const original = altProto.copyTextToClipboard;
-      altProto.copyTextToClipboard = async function (text: string): Promise<boolean> {
-        try {
-          if (await copyToClientIfRemote(owner, text)) {
-            if (owner.dead) return true; // 写入已发生；会话已结束，不再提示
-            try {
-              this.flash?.("已复制到对端剪贴板");
-            } catch {
-              // 提示失败不改变复制结果
+    const altProto = PiTui.TuiAltScreen?.prototype;
+    const modeProto = PiAgent.InteractiveMode?.prototype;
+    try {
+      const copy = installHook(altProto, "copyTextToClipboard", true, (record) =>
+        async function (this: { flash?: (msg: string) => void }, ...args: [string, ...unknown[]]): Promise<boolean> {
+          try {
+            if (await copyToClientIfRemote(owner, args[0])) {
+              if (owner.dead) return true; // 写入已发生；会话已结束，不再提示
+              try { this.flash?.("已复制到对端剪贴板"); } catch { /* 提示失败不改变复制结果 */ }
+              return true;
             }
-            return true;
+          } catch (error: unknown) {
+            if (isCancelled(error)) return false;
+            throw error;
           }
-        } catch (error: unknown) {
-          if (isCancelled(error)) return false;
-          throw error;
-        }
-        if (owner.dead) return false;
-        return original.call(this, text);
-      };
-      restoreCopy = () => {
-        if (altProto.copyTextToClipboard !== undefined && altProto.copyTextToClipboard !== original) {
-          altProto.copyTextToClipboard = original;
-        }
-      };
-    } else {
-      unavailable.push("TuiAltScreen.copyTextToClipboard 不可用，未接管文本复制");
-    }
+          if (owner.dead) return false;
+          return fallbackBase(record).apply(this, args);
+        });
+      if (copy) hooks.push(copy);
+      else unavailable.push("TuiAltScreen.copyTextToClipboard 不可用，未接管文本复制");
 
-    // 粘贴方向分流：Ctrl+V 按键不变，包住 Pi 的粘贴入口。
-    // SSH 客户端在观看时走剪贴板桥（文本直接插入，图片落临时文件插路径）；
-    // 本地会话原样调用原生 handleClipboardPaste（图片优先语义不变）。
-    const modeProto = PiAgent.InteractiveMode?.prototype as unknown as {
-      handleClipboardPaste?: (this: PasteHost) => Promise<void>;
-    } | undefined;
-    if (typeof modeProto?.handleClipboardPaste === "function"
-      && Object.getOwnPropertyDescriptor(modeProto, "handleClipboardPaste")?.writable) {
-      const originalPaste = modeProto.handleClipboardPaste;
-      modeProto.handleClipboardPaste = async function (this: PasteHost): Promise<void> {
-        try {
-          if (!(await isRemoteClient(owner))) {
-            assertLive(owner);
-            return originalPaste.call(this);
+      // 本地会话和桥的 local 回执均跳过所有本扩展层，原样调用不透明的原生/外来入口。
+      const paste = installHook(modeProto, "handleClipboardPaste", true, (record) =>
+        async function (this: PasteHost, ...args: unknown[]): Promise<void> {
+          try {
+            if (!(await isRemoteClient(owner))) {
+              assertLive(owner);
+              return fallbackBase(record).apply(this, args);
+            }
+            const outcome = await pasteFromBridge(owner, this);
+            if (outcome === "local") {
+              assertLive(owner);
+              return fallbackBase(record).apply(this, args);
+            }
+          } catch (error: unknown) {
+            if (isCancelled(error)) return;
+            throw error;
           }
-          const outcome = await pasteFromBridge(owner, this);
-          if (outcome === "local") {
-            assertLive(owner);
-            return originalPaste.call(this);
-          }
-        } catch (error: unknown) {
-          if (isCancelled(error)) return;
-          throw error;
-        }
-      };
-      restorePaste = () => {
-        if (modeProto.handleClipboardPaste !== undefined && modeProto.handleClipboardPaste !== originalPaste) {
-          modeProto.handleClipboardPaste = originalPaste;
-        }
-      };
-    } else {
-      unavailable.push("InteractiveMode.handleClipboardPaste 不可用，Ctrl+V 未通过桥接管");
-    }
+        });
+      if (paste) hooks.push(paste);
+      else unavailable.push("InteractiveMode.handleClipboardPaste 不可用，Ctrl+V 未通过桥接管");
 
-    // 供 pi-copy-links 等扩展在点击时调用：返回 true 表示已写往对端。
-    // 已退役的 sink 以 AbortError 拒绝，调用方不会误入原生复制回退。
-    const sink: CopySink = (text) => copyToClientIfRemote(owner, text);
-    owner.sink = sink;
-    (globalThis as Record<symbol, unknown>)[COPY_SINK_KEY] = sink;
+      // Sink 保持来源 owner 绑定：活跃本地返回 false，退役后拒绝 AbortError。
+      const sink = installHook(globalThis, COPY_SINK_KEY, false, () =>
+        (text: string) => copyToClientIfRemote(owner, text));
+      if (sink) hooks.push(sink);
+      else unavailable.push("复制 sink 不可写，未接管复制分流");
+    } catch (error) {
+      void retire(owner);
+      try { releaseHooks(); } catch (cleanupError) {
+        console.error("pi-remote-clipboard: failed hook rollback", cleanupError);
+      }
+      throw error;
+    }
     if (unavailable.length > 0) {
       ctx.ui.notify(`pi-remote-clipboard: ${unavailable.join("；")}；Ctrl+Alt+V 和 /rpush 仍可用`, "warning");
     }
@@ -699,22 +795,11 @@ export default function piRemoteClipboard(pi: ExtensionAPI): void {
     // 先标记死亡并取消全部进行中的操作，再做可能抛错的钩子恢复；
     // 无论恢复是否抛错，都等待所有 owner（含已超时、已被替换的）的子进程组清理完毕，
     // 因为 Pi 在 shutdown 返回后即退出进程，会销毁尚未触发的 KILL 定时器。
-    const owner = current;
-    retire(owner);
+    retire(current);
     try {
-      restoreCopy?.();
+      releaseHooks();
     } finally {
-      restoreCopy = undefined;
-      try {
-        restorePaste?.();
-      } finally {
-        restorePaste = undefined;
-        const globals = globalThis as Record<symbol, unknown>;
-        if (owner.sink && globals[COPY_SINK_KEY] === owner.sink) {
-          delete globals[COPY_SINK_KEY];
-        }
-        await Promise.all([...retiring]);
-      }
+      await Promise.all([...retiring]);
     }
   });
 }

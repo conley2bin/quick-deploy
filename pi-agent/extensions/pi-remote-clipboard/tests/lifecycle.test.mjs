@@ -467,21 +467,71 @@ test("a second start retires the predecessor and the following shutdown joins bo
   assert.equal(startedPids().filter(alive).length, 0);
 });
 
-test("shutdown still joins cleanup when hook restoration throws", async () => {
+test("shutdown skips foreign accessor without getter/setter calls and still joins cleanup", async () => {
   process.env.SSH_CONNECTION = "fixture";
   writeFileSync(join(temp, "mode"), "ignoreterm");
   const extension = loadExtension();
   extension.start();
   const operation = extension.explicitPaste();
   await until(() => startedPids().length === 1, "helper");
-  Object.defineProperty(copyOwner, "copyTextToClipboard", { configurable: true, get() { throw new Error("restore boom"); }, set() { throw new Error("restore boom"); } });
+  let accessors = 0;
+  Object.defineProperty(copyOwner, "copyTextToClipboard", { configurable: true, get() { accessors++; throw new Error("restore boom"); }, set() { accessors++; throw new Error("restore boom"); } });
   mock.timers.enable({ apis: ["setTimeout"] });
   const shutdown = extension.shutdown().then(() => "ok", (error) => error.message);
   await until(() => names("term-").length === 1, "TERM delivery");
   mock.timers.tick(1000);
-  assert.equal(await shutdown, "restore boom");
+  assert.equal(await shutdown, "ok");
+  assert.equal(accessors, 0);
   await operation;
   assert.equal(startedPids().filter(alive).length, 0);
+});
+
+// Real descriptor-operation failures must not bypass either OS or artifact cleanup.
+for (const fault of ["inspect", "define", "delete"]) test(`shutdown joins OS/FS and tries every hook after ${fault} failure`, async () => {
+  process.env.SSH_CONNECTION = "fixture";
+  writeFileSync(join(temp, "mode"), "ignoreterm");
+  const beforePaste = Object.getOwnPropertyDescriptor(pasteOwner, "handleClipboardPaste");
+  const extension = loadExtension();
+  extension.start();
+  const operation = extension.explicitPaste();
+  await until(() => startedPids().length === 1, "helper");
+  assert.ok(readdirSync(join(temp, "tmpdir")).length > 0, "operation owns staging");
+  mock.timers.enable({ apis: ["setTimeout"] });
+  const get = Object.getOwnPropertyDescriptor;
+  const define = Object.defineProperty;
+  const remove = Reflect.deleteProperty;
+  let shutdown;
+  let completed = false;
+  try {
+    Object.getOwnPropertyDescriptor = function (target, key) {
+      if (fault === "inspect" && target === copyOwner && key === "copyTextToClipboard") throw Error("inspect failure");
+      return get(target, key);
+    };
+    Object.defineProperty = function (target, key, descriptor) {
+      if (fault === "define" && target === copyOwner && key === "copyTextToClipboard") throw Error("define failure");
+      return define(target, key, descriptor);
+    };
+    Reflect.deleteProperty = function (target, key) {
+      if (fault === "delete" && target === globalThis && key === sinkKey) throw Error("delete failure");
+      return remove(target, key);
+    };
+    shutdown = extension.shutdown().then(() => "ok", error => error.message).then(result => { completed = true; return result; });
+  } finally {
+    Object.getOwnPropertyDescriptor = get;
+    Object.defineProperty = define;
+    Reflect.deleteProperty = remove;
+  }
+  await until(() => names("term-").length === 1, "TERM delivery");
+  assert.equal(completed, false, "failure must wait for cleanup");
+  assert.equal(alive(startedPids()[0]), true);
+  assert.deepEqual(Object.getOwnPropertyDescriptor(pasteOwner, "handleClipboardPaste"), beforePaste, "other hooks were attempted");
+  if (fault !== "delete") assert.equal(Object.getOwnPropertyDescriptor(globalThis, sinkKey), undefined);
+  mock.timers.tick(1000); // Supply KILL before awaiting shutdown or resetting this clock.
+  assert.equal(await shutdown, `${fault} failure`);
+  await operation;
+  assert.equal(startedPids().filter(alive).length, 0);
+  assert.deepEqual(readdirSync(join(temp, "tmpdir")), [], "FS cleanup joined as well");
+  await extension.shutdown(); // Handles were released even on failure.
 });
 
 // --- closure: actual quit ---------------------------------------------------------------------
