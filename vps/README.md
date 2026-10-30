@@ -201,6 +201,17 @@ bash vps/setup.sh dashboard --device phone --output-dir "$HOME/.local/state/quic
 网页不是实时面板：reset/remove/禁用后，先通过正常模块流程同步备份及原生 generation，再重新运行 dashboard 或对应 bootstrap export。
 浏览器刷新不读取服务器；旧二维码、已复制链接、另存网页和历史备份不会被自动擦除。以最新撤销后备份为准。
 
+## 本机设备管理页（manage）
+
+```bash
+bash vps/setup.sh manage --independent-carrier --ssh-proxy http://127.0.0.1:PORT   # 写操作需二者；否则只读
+```
+
+保持终端运行，再打开生成的 `vps/index.html`（会话结束后该入口保留为不含令牌的“已结束”提示页，需重新运行 manage 才能进入） 并点击进入（不自动开浏览器；会话最长 45 分钟，期间可重新打开，F5 后需重新从 `vps/index.html` 进入）。
+页面支持新增、改名、重置凭据、删除整个设备；任何变更都可能短暂中断全部设备，重置/删除需输入设备名确认。
+二维码、配置与链接取自已提交的原生字节，不转换；`pending` 时清空凭据，仅提供显式“恢复”。`committed_export_failed` 表示已提交，只核对状态，不要重做。
+令牌仅存内存；不新增 VPS 守护进程。
+
 ## 独立 H2 管理监听
 
 GUI/TUN 的规则可能把 VPS 地址、SSH22强制 DIRECT，普通 GUI7897监听不代表 SSH 已走 H2。

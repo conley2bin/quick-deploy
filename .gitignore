@@ -18,6 +18,8 @@ codoxear/.env
 codoxear/.runtime/
 /vps/subscription-urls.json
 /vps/.subscription-urls-*.tmp
+/vps/index.html
+/vps/.index-*.tmp
 
 !.claude/
 !.agents/
