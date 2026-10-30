@@ -1208,13 +1208,27 @@ test("wheel and selection gestures crossing a private cell retain native fullscr
 test("overlay routing uses exact geometry/capture ownership and preserves transcript policy", async () => {
   const transcript = "https://example.com/transcript";
   const f = fixture(`prefix prefix prefix [ordinary](${transcript})\n\n\`\`\`sh\necho x\n\`\`\``);
+  const nativeWheel = f.tui as unknown as {
+    routeWheel(event: { x: number; y: number }, delta: number): void;
+  };
+  const originalRouteWheel = nativeWheel.routeWheel;
+  const nativeWheels: { x: number; y: number; delta: number }[] = [];
+  nativeWheel.routeWheel = function (event, delta) {
+    nativeWheels.push({ x: event.x, y: event.y, delta });
+    return originalRouteWheel.call(this, event, delta);
+  };
   try {
     const transcriptButton = target(f.tui, "pi-copy://");
     const keyboardInputs: string[] = [];
+    const wheelInputs: string[] = [];
     const focusedOverlay = f.tui.showOverlay({
       render: () => ["modal"],
       invalidate() {},
       handleInput: (data: string) => { keyboardInputs.push(data); },
+      handleMouse: (event) => {
+        wheelInputs.push(event.type);
+        return { handled: true };
+      },
     }, { anchor: "top-left", width: 8 });
     f.tui.renderNow();
     assert.equal(focusedOverlay.isFocused(), true);
@@ -1235,7 +1249,16 @@ test("overlay routing uses exact geometry/capture ownership and preserves transc
 
     const wheel = sgr(transcriptButton.x, transcriptButton.y, 64);
     f.terminal.input(wheel);
-    assert.deepEqual(keyboardInputs, [wheel], "unclaimed wheel input reaches the focused overlay");
+    assert.deepEqual(keyboardInputs, [], "wheel input uses mouse dispatch, not keyboard focus");
+    assert.deepEqual(wheelInputs, [], "out-of-bounds wheel does not reach the focused overlay");
+    assert.deepEqual(nativeWheels, [{ x: 22, y: 1, delta: -1 }],
+      "out-of-bounds wheel reaches the native viewport exactly once");
+    f.terminal.input("k");
+    assert.deepEqual(keyboardInputs, ["k"], "focused overlay still receives keyboard input");
+    f.terminal.input(sgr(bounds.col, bounds.row, 64));
+    assert.deepEqual(wheelInputs, ["wheel"], "in-bounds wheel reaches the overlay mouse handler");
+    assert.deepEqual(nativeWheels, [{ x: 22, y: 1, delta: -1 }],
+      "handled in-bounds wheel does not also reach the native viewport");
     focusedOverlay.hide();
 
     const privateEvents: string[] = [];
@@ -1292,7 +1315,10 @@ test("overlay routing uses exact geometry/capture ownership and preserves transc
       "an overlay-owned non-private URL retains Pi's native opener policy");
     assert.deepEqual(f.opened, [transcript], "overlay URLs bypass the extension Ctrl-click action");
     ordinaryOverlay.hide();
-  } finally { f.close(); }
+  } finally {
+    delete (nativeWheel as Partial<typeof nativeWheel>).routeWheel;
+    f.close();
+  }
 });
 
 test("temporary opener filters are reentrant and never clobber a synchronous replacement", async () => {
