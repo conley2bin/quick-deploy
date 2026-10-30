@@ -1581,8 +1581,6 @@ def main(argv=None):
     os.umask(0o077)
     state = args.state_dir.expanduser().absolute()
     try:
-        # The long-lived HTTP session must never own the native state flock.
-        # Each bounded machine request takes that same lock exactly once.
         with locked(state):
             if args.command == 'export':
                 if bool(args.device) != bool(args.bootstrap_dir):

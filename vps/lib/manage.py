@@ -771,6 +771,8 @@ def parser():
 
 
 def main(argv=None):
+    # The long-lived HTTP session must never own the native state flock;
+    # each bounded --job request takes that lock exactly once.
     args = parser().parse_args(argv)
     vps_module.SSH_PROXY.set(args.ssh_proxy)
     os.umask(0o077)
