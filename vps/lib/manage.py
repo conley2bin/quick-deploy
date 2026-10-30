@@ -30,7 +30,8 @@ ACTIONS = {'add', 'rename', 'reset', 'remove'}
 ASSETS = {'/': ('manage.html', 'text/html; charset=utf-8'),
           '/manage.html': ('manage.html', 'text/html; charset=utf-8'),
           '/manage.js': ('manage.js', 'text/javascript; charset=utf-8'),
-          '/manage.css': ('manage.css', 'text/css; charset=utf-8')}
+          '/manage.css': ('manage.css', 'text/css; charset=utf-8'),
+          '/dashboard.css': ('dashboard.css', 'text/css; charset=utf-8')}
 CSP = ("default-src 'self'; connect-src 'self'; img-src 'self' blob:; script-src 'self'; "
        "style-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'")
 

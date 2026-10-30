@@ -5,6 +5,7 @@ import http.client
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import signal
 import subprocess
@@ -168,6 +169,16 @@ class HTTPManagement(unittest.TestCase):
                                          dict(self.headers, **{'Content-Type': kind}))[0], 415)
         self.assertEqual(self.request('OPTIONS', '/api/jobs')[0], 405)
         self.assertEqual(self.executed, [])
+
+    def test_stylesheet_imports_resolve_to_served_assets(self):
+        css = (vps.MODULE / 'assets' / 'manage.css').read_text()
+        targets = re.findall(r'@import\s+url\(["\']?([^"\')]+)', css)
+        self.assertIn('/dashboard.css', targets)
+        for target in ['/manage.css'] + targets:
+            code, body, headers = self.request(path=target, headers={})
+            self.assertEqual(code, 200, target)
+            self.assertTrue(headers['Content-Type'].startswith('text/css'))
+            self.assertEqual(body, (vps.MODULE / 'assets' / target.lstrip('/')).read_bytes())
 
     def test_session_repeat_redemption_no_secrets_in_public_page(self):
         for _ in range(2):
