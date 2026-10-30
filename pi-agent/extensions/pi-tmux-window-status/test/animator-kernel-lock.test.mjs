@@ -143,8 +143,10 @@ test("runAnimator: concurrent starts yield one owner; stop is idempotent, releas
   assert.equal(started.length, 1);
   const first = started[0].stop(), second = started[0].stop();
   assert.equal(first, second, "stop returns the single in-flight release");
-  await first;
-  assert.equal(servers(), before);
+  await second;
+  assert.equal(servers(), before, "a joined waiter resumes only after metadata release and guard close");
+  assert.equal(existsSync(join(d, "quick-deploy", "pi-tmux-status", Buffer.from(socketPath).toString("base64url"), "animator.lock")), false);
+  await started[0].stop();
   const again = await open(); assert.equal(again.started, true); await again.stop();
 });
 
