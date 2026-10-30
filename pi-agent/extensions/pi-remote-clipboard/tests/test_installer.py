@@ -57,6 +57,8 @@ esac
                                     text=True, capture_output=True, timeout=20)
             calls = commands.read_text().splitlines() if commands.exists() else []
             unit = (service_dir / SERVICE).read_text()
+            library = home / ".local/lib/pi-remote-clipboard"
+            self.installed = {path.name: path.stat().st_mode & 0o777 for path in library.iterdir()} if library.is_dir() else {}
             return result, calls, unit, old_link.is_symlink(), new_link.is_symlink()
 
     def test_fresh_install_waits_for_graphical_session(self) -> None:
@@ -73,6 +75,10 @@ esac
                                  "--user is-active --quiet graphical-session.target",
                                  "--user is-active --quiet pi-remote-clipboard.service"])
         self.assertIn("等待 graphical-session.target", result.stdout)
+        # The versioned artifact endpoint ships with the helpers (manual CLI copies; the Pi extension itself
+        # runs the checkout's src/ and does not depend on this copy).
+        self.assertEqual(self.installed.get("ctrlv-artifact-v1.py"), 0o755)
+        self.assertIn("ctrlv.py", self.installed)
 
     def test_migrates_old_default_link_and_restarts_in_graphical_manager(self) -> None:
         result, calls, _, old, new = self.run_installer(

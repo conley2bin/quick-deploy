@@ -74,11 +74,15 @@ export default function(pi) {
   });
 }
 ''')
+            # The extension admits only a helper directory that has the versioned endpoint; the fake
+            # python3 below stands in for running it.
+            (root / "remote-lib").mkdir()
+            (root / "remote-lib/ctrlv-artifact-v1.py").write_text("")
             helper = bin_dir / "python3"
             helper.write_text('''#!/bin/sh
-[ "$1" = "$PI_REMOTE_CLIPBOARD_DIR/ctrlv.py" ] || exit 111
+[ "$1" = "$PI_REMOTE_CLIPBOARD_DIR/ctrlv-artifact-v1.py" ] || exit 111
 echo requested >> "$PROBE_HELPER_LOG"
-[ "$2" = --artifact-staging ] || exit 112
+[ -d "$2" ] || exit 112
 printf '{"protocol":"pi-remote-clipboard/artifact-1","kind":"text"}\\nBRIDGE_FIXTURE\\n'
 ''')
             helper.chmod(0o755)

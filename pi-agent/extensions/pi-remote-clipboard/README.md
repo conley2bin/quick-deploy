@@ -97,12 +97,14 @@ piox
 
 ## 图片制品所有权与助手协议
 
-扩展每次粘贴先在系统临时目录创建本操作私有的 0700 暂存目录，再以 `python3 ctrlv.py --artifact-staging DIR` 运行助手。助手从不创建 DIR，只往里以 `O_EXCL`、0600 写 `image.<ext>`，任何写入/chmod/解码失败都回滚半成品；DIR 被扩展取消并删除后助手不会重建它。stdout 第一行是版本化回执 JSON（`pi-remote-clipboard/artifact-1`）：
+扩展每次粘贴先在系统临时目录创建本操作私有的 0700 暂存目录，再以 `python3 ctrlv-artifact-v1.py DIR` 运行助手（唯一被扩展运行的入口；`ctrlv.py --artifact-staging DIR` 仅为兼容保留）。助手从不创建 DIR，只往里以 `O_EXCL`、0600 写 `image.<ext>`，任何写入/chmod/解码失败都回滚半成品；DIR 被扩展取消并删除后助手不会重建它。stdout 第一行是版本化回执 JSON（`pi-remote-clipboard/artifact-1`）：
 
 ```
 {"protocol":"pi-remote-clipboard/artifact-1","kind":"text"}\n<剪贴板文本原样>
 {"protocol":"pi-remote-clipboard/artifact-1","kind":"image","name":"image.png"}\n
 ```
+
+**准入**：旧版助手的 `ctrlv.py` 会无视命令行参数、自行把图片写到临时目录，扩展无法安全清理（也不得凭文本猜路径）。因此扩展只运行版本化入口 `ctrlv-artifact-v1.py`，它在旧目录里不存在：先对目录做只读存在性检查，缺失即在创建任何东西、运行任何程序之前报协议错误，绝不对旧脚本执行 `--version` 之类的探测。入口本身在读取 SSH/provider 之前先确认同目录的 `ctrlv`/`requester` 提供 `artifact_paste` 与 `staging` 参数，半更新的目录以退出码 70 拒绝。该协议下退出码 2/64/70 一律是协议/解释器错误，不是“本地会话”；本地会话只由回执 `{"kind":"local"}` 表示（手动 CLI 的退出码 2 不变）。声明兼容却写文件的自定义程序属于用户信任的代码，不做沙箱。
 
 扩展据回执而非内容区分图片与文本：文本即使形如路径或回执 JSON 也只当文本粘贴，从不据其删除任何文件。图片回执只接受固定名 `image.(png|jpg|webp|gif)`，并校验它是暂存目录内本用户、单链接、非组/其他可访问的普通文件（拒绝路径穿越、符号链接、硬链接、目录）；通过后以硬链接交付为暂存目录之外的唯一 0600 文件，随后删除暂存目录，插入编辑器成功的那一刻文件才归编辑器/历史所有，此后（包括渲染失败、session shutdown、reload）永不删除。插入前的任何失败或取消，会在助手进程组消失后删除暂存目录和尚未交付的文件。暂存目录的所有权保留到 `rm` 成功为止（主体里的删除失败后由收尾阶段重试），暂存目录与未交付文件的释放相互独立，失败会明确记录到 stderr，已交付（已接收）的文件不受影响；重复的不可恢复 I/O 失败只会留下一个 0700 的残留目录，不设重试循环或清扫器。自动 Ctrl+V 的所有真实失败（协议、I/O、超时）都经 Pi 的错误通道显示，不回退原生路径；失败若发生在 shutdown 之后则按取消处理，不再提示。整个操作登记在 Owner 上，`session_shutdown` 的 await 会等到清理结束；业务结果（含 8 秒超时）先于清理返回。缺失/过期回执是显式协议错误（Ctrl+V 通过 Pi 的错误通道显示，Ctrl+Alt+V 通过通知显示），没有退回纯文本的兼容路径。
 
@@ -110,7 +112,7 @@ piox
 
 ### 部署与激活
 
-`install.sh` 把助手**复制**到 `~/.local/lib/pi-remote-clipboard`，而 Pi 扩展是指向本检出的符号链接。Node 扩展默认使用与自身真实路径同级的 `../src` 助手（经受管符号链接解析），因此协议两端永远来自同一检出，过期的安装副本不会被默认调用；设置 `PI_REMOTE_CLIPBOARD_DIR` 仍可显式指定助手目录，若该目录里是不支持 artifact-1 的旧助手，会得到明确的协议错误。仅当扩展被单独复制、没有同级 `src/` 时才回退安装副本。手动 CLI 用的安装副本需重新运行 `install.sh`（或仅同步 `requester.py`/`ctrlv.py` 两个文件）才会获得新行为，不需要重启 provider。在 Pi 空闲时 `/reload` 或重启后新扩展代码生效。
+`install.sh` 把助手**复制**到 `~/.local/lib/pi-remote-clipboard`，而 Pi 扩展是指向本检出的符号链接。Node 扩展默认使用与自身真实路径同级的 `../src` 助手（经受管符号链接解析），因此协议两端永远来自同一检出，过期的安装副本不会被默认调用；设置 `PI_REMOTE_CLIPBOARD_DIR` 仍可显式指定助手目录，若该目录里没有 `ctrlv-artifact-v1.py`（旧助手），会得到明确的协议错误且旧程序不会运行。真实的 Pi jiti 加载器经受管符号链接加载时同样取检出的 `src/`（有测试）。仅当扩展被单独复制、没有同级 `src/` 时才回退安装副本（旧副本因缺少入口而被拒绝，直到 `install.sh` 复制了 `ctrlv-artifact-v1.py`）。手动 CLI 用的安装副本需重新运行 `install.sh`（或仅同步 `requester.py`、`ctrlv.py`、`ctrlv-artifact-v1.py` 三个文件）才会获得新行为，不需要重启 provider。在 Pi 空闲时 `/reload` 或重启后新扩展代码生效。
 
 ## 边界
 

@@ -4,7 +4,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { existsSync, realpathSync } from "node:fs";
-import { link, lstat, mkdtemp, readFile, rm, unlink } from "node:fs/promises";
+import { link, lstat, mkdtemp, readFile, rm, stat, unlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -18,10 +18,11 @@ function resolveLibDir(): string {
   const override = process.env.PI_REMOTE_CLIPBOARD_DIR;
   if (override !== undefined) return override;
   const colocated = join(dirname(realpathSync(fileURLToPath(import.meta.url))), "..", "src");
-  return existsSync(join(colocated, "ctrlv.py")) ? colocated : `${process.env.HOME}/.local/lib/pi-remote-clipboard`;
+  return existsSync(join(colocated, "ctrlv-artifact-v1.py")) ? colocated : `${process.env.HOME}/.local/lib/pi-remote-clipboard`;
 }
 const LIB_DIR = resolveLibDir();
-const CTRLV_BIN = `${LIB_DIR}/ctrlv.py`;
+/** 受控粘贴只运行这个版本化入口；旧版助手目录里没有它，因此旧生产者（会无视 argv 自行写图片）永远不会被启动。 */
+const ARTIFACT_ENDPOINT = `${LIB_DIR}/ctrlv-artifact-v1.py`;
 const PUSH_BIN = `${LIB_DIR}/push.py`;
 const TIMEOUT_MS = 8000;
 /** TERM 之后给子进程的退出宽限；到期仍存活则 KILL。 */
@@ -259,6 +260,11 @@ function runHelper(
   return startHelper(owner, file, args, timeoutMs).result;
 }
 
+/** 受控协议里表示“当前是本地会话”的唯一方式（回执 kind=local）；进程退出码 2 不再有此含义。 */
+class ClipboardLocalSession extends Error {
+  override name = "ClipboardLocalSession";
+}
+
 /** 助手没有按 artifact-1 协议回应（过期的安装副本、自定义助手或损坏的输出）；绝不据内容猜测。 */
 class ClipboardProtocolError extends Error {
   override name = "ClipboardProtocolError";
@@ -266,10 +272,10 @@ class ClipboardProtocolError extends Error {
 
 type Pasted = { kind: "text"; text: string } | { kind: "image"; path: string };
 
-function parseReceipt(stdout: string): { kind: "text"; text: string } | { kind: "image"; name: string } {
+function parseReceipt(stdout: string): { kind: "text"; text: string } | { kind: "image"; name: string } | { kind: "local" } {
   const fail = (why: string): never => {
     throw new ClipboardProtocolError(
-      `${CTRLV_BIN} ${why}；需要 ${ARTIFACT_PROTOCOL} 助手（过期的安装副本或旧的 PI_REMOTE_CLIPBOARD_DIR 请更新为本检出的 src/）`,
+      `${ARTIFACT_ENDPOINT} ${why}；需要 ${ARTIFACT_PROTOCOL} 助手（过期的安装副本或旧的 PI_REMOTE_CLIPBOARD_DIR 请更新为本检出的 src/）`,
     );
   };
   const newline = stdout.indexOf("\n");
@@ -287,6 +293,7 @@ function parseReceipt(stdout: string): { kind: "text"; text: string } | { kind: 
     if (Buffer.byteLength(body, "utf8") > MAX_OUTPUT_BYTES) return fail(`文本超过 ${MAX_OUTPUT_BYTES} 字节`);
     return { kind: "text", text: body };
   }
+  if (header.kind === "local" && body === "") return { kind: "local" };
   if (header.kind === "image" && typeof header.name === "string" && body === "") {
     return { kind: "image", name: header.name };
   }
@@ -296,17 +303,17 @@ function parseReceipt(stdout: string): { kind: "text"; text: string } | { kind: 
 /** 暂存目录内必须是助手刚创建的、本用户独占的普通图片文件；名字取自固定集合，不含路径。 */
 async function validateStagedImage(staging: string, name: string): Promise<{ source: string; ext: string }> {
   const match = /^image\.(png|jpg|webp|gif)$/.exec(name);
-  if (!match) throw new ClipboardProtocolError(`${CTRLV_BIN} 回执的图片名无效: ${JSON.stringify(name)}`);
+  if (!match) throw new ClipboardProtocolError(`${ARTIFACT_ENDPOINT} 回执的图片名无效: ${JSON.stringify(name)}`);
   const source = join(staging, name);
   let stat;
   try {
     stat = await lstat(source);
   } catch {
-    throw new ClipboardProtocolError(`${CTRLV_BIN} 回执指向未创建的图片: ${name}`);
+    throw new ClipboardProtocolError(`${ARTIFACT_ENDPOINT} 回执指向未创建的图片: ${name}`);
   }
   const owned = typeof process.getuid !== "function" || stat.uid === process.getuid();
   if (!stat.isFile() || stat.nlink !== 1 || stat.size === 0 || (stat.mode & 0o077) !== 0 || !owned) {
-    throw new ClipboardProtocolError(`${CTRLV_BIN} 回执的图片不是私有的普通文件: ${name}`);
+    throw new ClipboardProtocolError(`${ARTIFACT_ENDPOINT} 回执的图片不是私有的普通文件: ${name}`);
   }
   return { source, ext: match[1] };
 }
@@ -332,15 +339,35 @@ function pasteViaHelper<T>(owner: Owner, consume: (pasted: Pasted, adopt: () => 
   };
   const body = (async (): Promise<T> => {
     assertLive(owner);
+    // 准入：没有版本化入口的目录（旧安装副本、旧的自定义目录）在创建任何东西、运行任何程序之前被拒绝。
+    // 只读检查；绝不对旧脚本执行 --version/--probe，它会无视参数并自行写图片。
+    if (!(await stat(ARTIFACT_ENDPOINT).then((entry) => entry.isFile(), () => false))) {
+      throw new ClipboardProtocolError(
+        `${ARTIFACT_ENDPOINT} 不存在；需要 ${ARTIFACT_PROTOCOL} 助手（过期的安装副本或旧的 PI_REMOTE_CLIPBOARD_DIR 请更新为本检出的 src/）`,
+      );
+    }
+    assertLive(owner);
     staging = await mkdtemp(join(tmpdir(), STAGING_PREFIX));
     assertLive(owner);
     const started = startHelper(
-      owner, "python3", [CTRLV_BIN, "--artifact-staging", staging], TIMEOUT_MS, MAX_OUTPUT_BYTES + RECEIPT_HEADER_BYTES,
+      owner, "python3", [ARTIFACT_ENDPOINT, staging], TIMEOUT_MS, MAX_OUTPUT_BYTES + RECEIPT_HEADER_BYTES,
     );
     quiescent = started.quiescent;
-    const { stdout } = await started.result;
+    let stdout: string;
+    try {
+      ({ stdout } = await started.result);
+    } catch (error: unknown) {
+      // 本协议里退出码 2/64/70 只可能是解释器、参数或契约失败（半更新的目录），不是“本地会话”。
+      const code = (error as { code?: unknown }).code;
+      if (code === 2 || code === 64 || code === 70) {
+        const detail = ((error as { stderr?: string }).stderr ?? "").trim() || (error as Error).message;
+        throw new ClipboardProtocolError(`${ARTIFACT_ENDPOINT} 拒绝执行（退出码 ${code}）：${detail}`);
+      }
+      throw error;
+    }
     assertLive(owner);
     const receipt = parseReceipt(stdout);
+    if (receipt.kind === "local") throw new ClipboardLocalSession("local session");
     let pasted: Pasted;
     if (receipt.kind === "text") {
       pasted = receipt;
@@ -497,8 +524,7 @@ export default function piRemoteClipboard(pi: ExtensionAPI): void {
       if (isCancelled(error)) throw error;
       // 失败发生在 shutdown 之后：先于本地回退与任何反馈取消（拒绝可能在 shutdown 前后穿过 await 边界）。
       if (owner.dead) throw new ClipboardCancelled();
-      const code = (error as { code?: number }).code;
-      if (code === 2) return "local";
+      if (error instanceof ClipboardLocalSession) return "local";
       // 真实失败（协议、I/O、超时）与 Pi 原生粘贴失败走同一可见通道，不退化成静默的“无内容”。
       host.showError?.(`Failed to paste from clipboard: ${error instanceof Error ? error.message : String(error)}`);
       return "error";
@@ -522,8 +548,7 @@ export default function piRemoteClipboard(pi: ExtensionAPI): void {
       });
     } catch (error: unknown) {
       if (isCancelled(error) || owner.dead) return;
-      const code = (error as { code?: number }).code;
-      if (code === 2) {
+      if (error instanceof ClipboardLocalSession) {
         ctx.ui.notify("当前为本地会话，请使用原生 Ctrl+V", "info");
         return;
       }

@@ -222,6 +222,80 @@ class CtrlvProtocolTests(unittest.TestCase):
     def test_bad_arguments_fail_loudly(self) -> None:
         self.assertEqual(self.run_main(["--bogus"], {})[0], 64)
 
+    def test_artifact_paste_reports_local_as_a_receipt_not_exit_2(self) -> None:
+        out = io.StringIO()
+        with mock.patch.object(ctrlv, "is_ssh_terminal", return_value=False), \
+             mock.patch.object(ctrlv, "request_clipboard") as request, mock.patch.object(sys, "stdout", out):
+            code = ctrlv.artifact_paste(tempfile.gettempdir())
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(out.getvalue()), {"protocol": requester.ARTIFACT_PROTOCOL, "kind": "local"})
+        request.assert_not_called()
+
+    def test_artifact_paste_never_creates_the_staging_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            gone = os.path.join(tmp, "stage")
+            with mock.patch.object(ctrlv, "request_clipboard") as request, \
+                 mock.patch.object(sys, "stderr", io.StringIO()):
+                self.assertEqual(ctrlv.artifact_paste(gone), 64)
+                self.assertEqual(ctrlv.artifact_paste("relative"), 64)
+            request.assert_not_called()
+            self.assertFalse(os.path.exists(gone))
+
+
+class ArtifactEndpointTests(unittest.TestCase):
+    """The versioned endpoint is a separate process: run it for real against synthetic directories."""
+
+    SRC = Path(__file__).resolve().parent.parent / "src"
+
+    def run_endpoint(self, directory: Path, *args: str):
+        import subprocess
+        return subprocess.run([sys.executable, "-B", str(directory / "ctrlv-artifact-v1.py"), *args],
+                              capture_output=True, text=True, timeout=20, stdin=subprocess.DEVNULL)
+
+    def copy(self, directory: Path, *names: str) -> None:
+        import shutil
+        for name in names:
+            shutil.copy(self.SRC / name, directory / name)
+
+    def test_complete_directory_with_wrong_arguments_exits_64_without_touching_anything(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            self.copy(directory, "ctrlv-artifact-v1.py", "ctrlv.py", "requester.py", "ssh_detect.py")
+            self.assertEqual(self.run_endpoint(directory).returncode, 64)
+            result = self.run_endpoint(directory, str(directory / "missing"))
+            self.assertEqual(result.returncode, 64)
+            self.assertFalse((directory / "missing").exists())
+
+    def test_partial_directories_exit_70_before_any_provider_read_or_file_creation(self) -> None:
+        # A legacy ctrlv.py only does work when *run* (main), exactly what must never happen here.
+        marker_source = ("import pathlib\n"
+                         "def main():\n    pathlib.Path(__file__).with_name('ran').write_text('x')\n")
+        cases = {
+            "old ctrlv": {"ctrlv.py": marker_source, "requester.py": None, "ssh_detect.py": None},
+            "old requester": {"ctrlv.py": None, "ssh_detect.py": None,
+                              "requester.py": "ARTIFACT_PROTOCOL = 'x'\nDEFAULT_PORT = 1\n"
+                                              "def request_clipboard(): open('provider-read', 'w')\n"
+                                              "def handle_response(payload): return None, None\n"},
+            "no requester": {"ctrlv.py": None, "ssh_detect.py": None},
+        }
+        for label, files in cases.items():
+            with self.subTest(label), tempfile.TemporaryDirectory() as tmp:
+                directory = Path(tmp)
+                self.copy(directory, "ctrlv-artifact-v1.py")
+                for name, source in files.items():
+                    if source is None:
+                        self.copy(directory, name)
+                    else:
+                        (directory / name).write_text(source)
+                stage = directory / "stage"
+                stage.mkdir()
+                result = self.run_endpoint(directory, str(stage))
+                self.assertEqual(result.returncode, 70, result.stderr)
+                self.assertIn("契约", result.stderr)
+                self.assertEqual(sorted(p.name for p in directory.iterdir()),
+                                 sorted([*files, "ctrlv-artifact-v1.py", "stage"]), "no file was created")
+                self.assertEqual(list(stage.iterdir()), [])
+
 
 class SshDetectTests(unittest.TestCase):
     def test_non_tmux_uses_process_ancestors(self) -> None:

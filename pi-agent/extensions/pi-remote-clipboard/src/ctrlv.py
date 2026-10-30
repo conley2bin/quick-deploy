@@ -14,26 +14,29 @@ stdout 第一行是版本化回执 JSON，其后是原文：
 扩展据回执而不是内容猜测区分图片与文本，并负责 DIR 的清理与交付。
 
 退出码 2 表示本地会话；其他非 0 时 stderr 携带错误原因。
+
+Pi 扩展实际调用的是 `ctrlv-artifact-v1.py DIR`（见该文件）：它先确认本模块提供 `artifact_paste`，
+再做任何 SSH/provider 读取；本地会话以回执 `{"kind":"local"}` 表示，退出码 2 不再有“本地”含义。
 """
 from __future__ import annotations
 
 import json
+import os
 import sys
 
 from requester import ARTIFACT_PROTOCOL, DEFAULT_PORT, handle_response, request_clipboard
 from ssh_detect import is_ssh_terminal
 
 
-def main(argv: list[str] | None = None) -> int:
-    args = sys.argv[1:] if argv is None else argv
-    staging: str | None = None
-    if args:
-        if len(args) != 2 or args[0] != "--artifact-staging" or not args[1]:
-            print("用法: ctrlv.py [--artifact-staging DIR]", file=sys.stderr)
-            return 64
-        staging = args[1]
+# ctrlv-artifact-v1.py 据此确认同目录的 ctrlv/requester 同属一个版本，先于任何 I/O。
+ARTIFACT_API = 1
 
+
+def _paste(staging: str | None, local_as_receipt: bool) -> int:
     if not is_ssh_terminal():
+        if local_as_receipt:
+            sys.stdout.write(json.dumps({"protocol": ARTIFACT_PROTOCOL, "kind": "local"}) + "\n")
+            return 0
         # 本地 Pi：不接管，返回约定空输出让调用方回退原生逻辑
         return 2
 
@@ -64,6 +67,25 @@ def main(argv: list[str] | None = None) -> int:
         sys.stdout.write(json.dumps(receipt) + "\n")
     sys.stdout.write(text)
     return 0
+
+
+def artifact_paste(staging: str) -> int:
+    """扩展的受控粘贴：staging 必须是调用方已创建的目录，本函数从不创建它。"""
+    if not os.path.isabs(staging) or not os.path.isdir(staging):
+        print("暂存目录必须是已存在的绝对路径目录", file=sys.stderr)
+        return 64
+    return _paste(staging, True)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = sys.argv[1:] if argv is None else argv
+    staging: str | None = None
+    if args:
+        if len(args) != 2 or args[0] != "--artifact-staging" or not args[1]:
+            print("用法: ctrlv.py [--artifact-staging DIR]", file=sys.stderr)
+            return 64
+        staging = args[1]
+    return _paste(staging, False)
 
 
 if __name__ == "__main__":
