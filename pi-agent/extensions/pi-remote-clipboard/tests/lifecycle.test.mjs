@@ -21,6 +21,9 @@ registerHooks({
   resolve(specifier, context, nextResolve) {
     if (specifier === "@earendil-works/pi-coding-agent") return { url: coreUrl, shortCircuit: true };
     if (specifier === "@earendil-works/pi-tui") return { url: tuiUrl, shortCircuit: true };
+    if (specifier === "node:fs/promises" && context.parentURL?.endsWith("index.ts?faulty-fs")) {
+      return { url: new URL("./fs-promises-fault.mjs", import.meta.url).href, shortCircuit: true };
+    }
     return nextResolve(specifier, context);
   },
 });
@@ -33,6 +36,7 @@ process.env.TMPDIR = join(temp, "tmpdir");
 const { InteractiveMode } = await import(coreUrl);
 const { TuiAltScreen } = await import(tuiUrl);
 const { default: piRemoteClipboard } = await import("../pi-extension/index.ts");
+const { default: faultyClipboard } = await import("../pi-extension/index.ts?faulty-fs");
 
 const pasteOwner = InteractiveMode.prototype;
 const copyOwner = TuiAltScreen.prototype;
@@ -84,7 +88,7 @@ writeHelper("ctrlv.py", helperSource);
 writeHelper("push.py", helperSource);
 
 let fixtures = [];
-function loadExtension(mode = "tui") {
+function loadExtension(mode = "tui", factory = piRemoteClipboard) {
   const shortcuts = new Map();
   const commands = new Map();
   const events = new Map();
@@ -92,7 +96,7 @@ function loadExtension(mode = "tui") {
   const notices = [];
   const pastes = [];
   const inserts = [];
-  piRemoteClipboard({
+  factory({
     registerShortcut(key, options) { shortcuts.set(key, options); },
     registerCommand(key, options) { commands.set(key, options); },
     on(event, handler) { events.set(event, handler); },
@@ -122,6 +126,7 @@ function loadExtension(mode = "tui") {
 beforeEach(() => {
   for (const name of readdirSync(join(temp, "tmpdir"))) rmSync(join(temp, "tmpdir", name), { recursive: true, force: true });
   rmSync(join(temp, "victim"), { force: true });
+  delete globalThis.__rcFsFaults;
   for (const key of envKeys) if (key !== "PATH") delete process.env[key];
   for (const name of readdirSync(temp)) if (/^(started|term|grandchild|release|tmux)/.test(name)) rmSync(join(temp, name), { force: true });
   writeFileSync(join(temp, "mode"), "");
@@ -786,4 +791,106 @@ test("through a managed symlink, the default helper is the checkout's even when 
   assert.match(overridden.notices.at(-1).text, /artifact-1/);
   assert.equal(overridden.notices.at(-1).level, "error");
   assert.deepEqual(tmpEntries(), []);
+});
+
+// --- step 4 follow-up: failure ownership ------------------------------------------------------
+const armFaults = (faults) => { globalThis.__rcFsFaults = { rm: 0, rmCalls: [], unlinkCalls: [], ...faults }; return globalThis.__rcFsFaults; };
+
+test("a first staging removal that fails after the image link: the error is visible, the finalizer still removes the staging directory and the unadopted target", async () => {
+  process.env.SSH_CONNECTION = "fixture";
+  const victim = join(temp, "victim");
+  writeFileSync(victim, "precious user data");
+  await withHelper(stagedHelper(imageReceipt), async () => {
+    const faults = armFaults({ rm: 1 });
+    const extension = loadExtension("tui", faultyClipboard);
+    extension.start();
+    await extension.explicitPaste();
+    assert.match(extension.notices.at(-1).text, /对端剪贴板读取失败.*synthetic rm failure/s);
+    assert.deepEqual(extension.pastes, []);
+    // Automatic route: same failure is shown through Pi's error channel, with no fallback.
+    await until(() => tmpEntries().length === 0, "first operation's finalizer");
+    faults.rm = 1;
+    const shown = [];
+    await pasteOwner.handleClipboardPaste.call({ editor: { insertTextAtCursor() { assert.fail("must not insert"); } }, ui: {}, showError: (m) => shown.push(m) });
+    assert.equal(shown.length, 1);
+    assert.match(shown[0], /synthetic rm failure/);
+    assert.equal(globalThis.nativePaste, 0);
+    await extension.shutdown(); // joins both finalizers
+    assert.deepEqual(tmpEntries(), [], "staging directories and unadopted targets are gone (real file counts)");
+    assert.equal(faults.rmCalls.length, 4, "per operation: the body attempt failed once, then the finalizer retried the retained directory");
+    assert.equal(faults.unlinkCalls.length, 2);
+    assert.equal(readFileSync(victim, "utf8"), "precious user data");
+  });
+});
+
+test("a persistent staging removal failure does not skip the independent unlink of the unadopted target; the directory stays private and is reported", async () => {
+  process.env.SSH_CONNECTION = "fixture";
+  await withHelper(stagedHelper(imageReceipt), async () => {
+    const faults = armFaults({ rm: 99 });
+    const logged = [];
+    const originalError = console.error;
+    console.error = (...args) => logged.push(args.join(" "));
+    try {
+      const extension = loadExtension("tui", faultyClipboard);
+      extension.start();
+      await extension.explicitPaste();
+      await extension.shutdown();
+      assert.equal(faults.unlinkCalls.length, 1, "target was unlinked despite the earlier rm failures");
+    } finally {
+      console.error = originalError;
+    }
+    assert.equal(logged.filter((line) => line.includes("暂存目录")).length, 1, "residual directory is reported explicitly");
+    const left = tmpEntries();
+    assert.equal(left.length, 1);
+    assert.equal(left[0].startsWith("pi-remote-clipboard-stage-"), true);
+    assert.equal(statSync(join(temp, "tmpdir", left[0])).mode & 0o777, 0o700);
+    delete globalThis.__rcFsFaults;
+  });
+});
+
+test("a protocol or I/O rejection that crosses shutdown produces no late error, local fallback or feedback", async () => {
+  process.env.SSH_CONNECTION = "fixture";
+  // I/O failure: shutdown lands exactly when the pre-insert removal fails.
+  await withHelper(stagedHelper(imageReceipt), async () => {
+    const extension = loadExtension("tui", faultyClipboard);
+    extension.start();
+    armFaults({ rm: 1, onRmFail: () => { extension.shutdown(); } });
+    const shown = [];
+    await pasteOwner.handleClipboardPaste.call({ editor: { insertTextAtCursor() { assert.fail("must not insert"); } }, ui: {}, showError: (m) => shown.push(m) });
+    await extension.shutdown();
+    assert.deepEqual(shown, []);
+    assert.equal(globalThis.nativePaste, 0);
+    assert.deepEqual(tmpEntries(), []);
+  });
+  // Protocol failure (a staged symlink): shutdown lands right after validation's lstat.
+  const victim = join(temp, "victim");
+  writeFileSync(victim, "precious user data");
+  await withHelper(stagedHelper(`os.symlink(${JSON.stringify(victim)}, os.path.join(stage, 'image.png'))\nsys.stdout.write(${RECEIPT("'kind': 'image', 'name': 'image.png'")})`), async () => {
+    const extension = loadExtension("tui", faultyClipboard);
+    extension.start();
+    armFaults({ afterLstat: () => { extension.shutdown(); } });
+    const shown = [];
+    await pasteOwner.handleClipboardPaste.call({ editor: { insertTextAtCursor() { assert.fail("must not insert"); } }, ui: {}, showError: (m) => shown.push(m) });
+    await extension.shutdown();
+    assert.deepEqual(shown, []);
+    assert.deepEqual(extension.notices, []);
+    assert.equal(globalThis.nativePaste, 0);
+    assert.equal(readFileSync(victim, "utf8"), "precious user data");
+    assert.deepEqual(tmpEntries(), []);
+  });
+});
+
+test("an adopted image survives a failing finalizer removal and a render failure", async () => {
+  process.env.SSH_CONNECTION = "fixture";
+  await withHelper(stagedHelper(imageReceipt), async () => {
+    const extension = loadExtension("tui", faultyClipboard);
+    extension.start();
+    const faults = armFaults({ rm: 0 });
+    const host = { editor: { insertTextAtCursor(text) { host.inserted = text; } }, ui: { requestRender() { throw new Error("render boom"); } }, showError() {} };
+    await pasteOwner.handleClipboardPaste.call(host);
+    await extension.shutdown();
+    assert.equal(existsSync(host.inserted), true);
+    assert.equal(faults.unlinkCalls.length, 0, "adopted file is never unlinked");
+    assert.equal(tmpEntries().length, 1);
+  });
 });

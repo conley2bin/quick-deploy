@@ -326,9 +326,9 @@ function pasteViaHelper<T>(owner: Owner, consume: (pasted: Pasted, adopt: () => 
   let adopted = false;
   let quiescent: Promise<void> = Promise.resolve();
   const removeStaging = async (): Promise<void> => {
-    const directory = staging;
+    if (staging === undefined) return;
+    await rm(staging, { recursive: true, force: true }); // 所有权保留到 rm 成功（force 使 ENOENT 也算已消失）
     staging = undefined;
-    if (directory !== undefined) await rm(directory, { recursive: true, force: true });
   };
   const body = (async (): Promise<T> => {
     assertLive(owner);
@@ -361,10 +361,17 @@ function pasteViaHelper<T>(owner: Owner, consume: (pasted: Pasted, adopt: () => 
   // 只删除本操作创建的暂存目录与本操作链接出的、尚未被编辑器接收的文件；路径绝不取自剪贴板文本。
   const cleanup = body.then(noop, noop).then(async () => {
     await quiescent; // 写入者消失后才删目录：不与删除竞争，也不会在删除后重建
-    await removeStaging();
-    if (delivered !== undefined && !adopted) await unlink(delivered);
-  }).catch((error: NodeJS.ErrnoException) => {
-    if (error.code !== "ENOENT") console.error(`pi-remote-clipboard: 制品清理失败: ${error.message}`);
+    // 两项释放相互独立：暂存目录删除失败（含主体里已失败过一次）不得跳过未交付文件的删除。
+    const release = async (what: string, run: () => Promise<void>): Promise<void> => {
+      try {
+        await run();
+      } catch (error: unknown) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+        console.error(`pi-remote-clipboard: 制品清理失败（${what}）: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    };
+    await release("暂存目录", removeStaging);
+    if (delivered !== undefined && !adopted) await release("未交付文件", () => unlink(delivered as string));
   });
   owner.operations.add(cleanup);
   void cleanup.then(() => owner.operations.delete(cleanup));
@@ -488,10 +495,12 @@ export default function piRemoteClipboard(pi: ExtensionAPI): void {
       });
     } catch (error: unknown) {
       if (isCancelled(error)) throw error;
+      // 失败发生在 shutdown 之后：先于本地回退与任何反馈取消（拒绝可能在 shutdown 前后穿过 await 边界）。
+      if (owner.dead) throw new ClipboardCancelled();
       const code = (error as { code?: number }).code;
       if (code === 2) return "local";
-      // 协议错误必须可见（与 Pi 原生粘贴失败同一通道），不能退化成静默的“无内容”。
-      if (error instanceof ClipboardProtocolError) host.showError?.(`Failed to paste from clipboard: ${error.message}`);
+      // 真实失败（协议、I/O、超时）与 Pi 原生粘贴失败走同一可见通道，不退化成静默的“无内容”。
+      host.showError?.(`Failed to paste from clipboard: ${error instanceof Error ? error.message : String(error)}`);
       return "error";
     }
   }
