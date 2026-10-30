@@ -695,7 +695,7 @@ test("partial tmux batch failure retains attempted window and pane cleanup respo
   }
 });
 
-test("tmux status alone caps each distinct error at five sends and renews on a new error", async (t) => {
+test("default tmux entry has one sender, a shared ten-send allowance, exact renewal, and a retained red lease", async (t) => {
   const h = await statusHarness("single-owner");
   try {
     h.setSignal(new AbortController().signal);
@@ -703,26 +703,53 @@ test("tmux status alone caps each distinct error at five sends and renews on a n
     h.fire("message_end", { message: assistantFailure() }, h.ctx);
     await waitFor(h.errorOption, "1");
     await waitFor(h.paneArmed, "1");
+    assert.equal(h.handlers.message_end.length, 2, "default entry installs recovery and presentation once each");
     t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: Date.now() });
-    for (let trigger = 0; trigger < 2; trigger++) {
+    const startedAt = Date.now();
+    for (let n = 1; n <= 10; n++) {
       h.setSignal(new AbortController().signal);
       h.fire("agent_start", {}, h.ctx);
-      const errorAt = Date.now();
-      h.fire("message_end", { message: assistantFailure() }, h.ctx);
+      h.fire("message_end", { message: assistantFailure("identical text, distinct terminal message") }, h.ctx);
       h.fire("agent_settled", { aborted: false }, h.ctx);
-      for (let n = 1; n <= 5; n++) {
-        t.mock.timers.tick(59_999); assert.equal(h.sent.length, trigger * 5 + n - 1);
-        t.mock.timers.tick(1); assert.equal(h.sent.length, trigger * 5 + n - 1, "the former one-minute deadline never sends");
-        t.mock.timers.tick(539_999); assert.equal(h.sent.length, trigger * 5 + n - 1);
-        t.mock.timers.tick(1); assert.equal(h.sent.length, trigger * 5 + n, "only one sender runs per ten-minute deadline");
-      }
-      t.mock.timers.tick(600_000);
-      assert.equal(h.sent.length, (trigger + 1) * 5, "no sixth send at sixty minutes for this trigger");
-      t.mock.timers.tick(6_000_000);
-      assert.deepEqual(h.sent, Array((trigger + 1) * 5).fill("continue"), "only a new distinct error renews all five attempts; no sixth later");
-      assert.deepEqual(h.sentAt.slice(trigger * 5), [errorAt + 600_000, errorAt + 1_200_000, errorAt + 1_800_000, errorAt + 2_400_000, errorAt + 3_000_000]);
-      assert.equal(h.leaseState(), "error", "budget exhaustion does not clear the error display");
+      h.fire("agent_settled", { aborted: false }, h.ctx);
+      t.mock.timers.tick(59_999); assert.equal(h.sent.length, n - 1);
+      t.mock.timers.tick(1); assert.equal(h.sent.length, n - 1, "the former one-minute deadline never sends");
+      t.mock.timers.tick(539_999); assert.equal(h.sent.length, n - 1);
+      t.mock.timers.tick(1); assert.equal(h.sent.length, n, "only one sender runs per ten-minute deadline");
+      assert.equal(h.leaseState(), "error", "an automatic continue does not clear red");
     }
+    assert.deepEqual(h.sentAt, Array.from({ length: 10 }, (_, n) => startedAt + (n + 1) * 600_000));
+    const lastSentAt = h.sentAt.at(-1);
+    h.setSignal(new AbortController().signal);
+    h.fire("agent_start", {}, h.ctx);
+    h.fire("message_end", { message: assistantFailure("a distinct eleventh error") }, h.ctx);
+    h.fire("agent_settled", { aborted: false }, h.ctx);
+    t.mock.timers.tick(600_000);
+    assert.equal(h.sent.length, 10, "new errors cannot mint another allowance within eight hours");
+    t.mock.timers.tick(28_800_000 - 600_000 - 1);
+    assert.equal(h.sent.length, 10, "no eleventh send at eight hours minus one millisecond since the latest send");
+    assert.equal(h.leaseState(), "error", "exhaustion retains the owning root's red lease");
+    assert.equal(h.errorOption(), "1");
+    assert.equal(h.paneArmed(), "1");
+    t.diagnostic(`tmux renewal boundary: lastSentAt=${lastSentAt}, now=${Date.now()}, sends=${h.sent.length}, lease=${h.leaseState()}, red=${h.errorOption()}, armed=${h.paneArmed()}`);
+    t.mock.timers.tick(1);
+    assert.equal(h.sent.length, 11, "the active error reopens at the exact boundary without another event");
+    assert.equal(h.sentAt.at(-1), lastSentAt + 28_800_000);
+    t.diagnostic(`tmux renewal boundary: now=${Date.now()}, sends=${h.sent.length}, renewedSendAt=${h.sentAt.at(-1)}, lease=${h.leaseState()}`);
+    h.fire("agent_settled", { aborted: false }, h.ctx);
+    h.fire("agent_settled", { aborted: false }, h.ctx);
+    t.mock.timers.tick(0); assert.equal(h.sent.length, 11, "repeated settlement never creates a second sender");
+    for (let n = 0; n < 9; n++) t.mock.timers.tick(600_000);
+    assert.deepEqual(h.sent, Array(20).fill("continue"), "the renewal send consumes one and leaves nine attempts");
+    assert.equal(h.leaseState(), "error");
+    assert.equal(h.errorOption(), "1", "red survives renewed automatic sends too");
+    t.mock.timers.tick(28_800_000 - 1); assert.equal(h.sent.length, 20, "each later send reanchors the next renewal");
+    assert.deepEqual(h.terminalInput(CANCEL_SENTINEL), { consume: true });
+    t.mock.timers.tick(1); t.mock.timers.tick(28_800_000);
+    assert.equal(h.sent.length, 20, "pane cancellation prevents renewal of the retained active error");
+    t.mock.timers.reset();
+    await waitFor(h.errorOption, "");
+    await waitFor(h.paneArmed, "");
   } finally {
     t.mock.timers.reset();
     await h.cleanup();

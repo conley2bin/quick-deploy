@@ -1,7 +1,8 @@
 // One recovery owner for root Pi sessions, independent of tmux and UI mode.
 export const ERROR_STALL_MS = 600_000;
 export const AUTO_CONTINUE_MIN_INTERVAL_MS = 600_000;
-export const AUTO_CONTINUE_MAX = 5;
+export const AUTO_CONTINUE_MAX = 10;
+export const AUTO_CONTINUE_RESET_MS = 28_800_000;
 // Either terminal listener may consume the pane sentinel first. Broadcast the
 // cancellation so both the recovery deadline and tmux's red lease are cleared.
 export const RECOVERY_CANCEL_EVENT = "pi-tmux-window-status:cancel";
@@ -70,11 +71,13 @@ export function installErrorRecovery(pi) {
     cancel();
     pi.events.emit(RECOVERY_CANCEL_EVENT, { signal: activeRunSignal });
   };
-  const eligible = () => sessionActive && settled && errorAt !== undefined && sends < AUTO_CONTINUE_MAX;
+  const eligible = () => sessionActive && settled && errorAt !== undefined;
   const schedule = (notBefore = -Infinity) => {
     cancelTimer();
     if (!eligible()) return;
-    const deadline = Math.max(errorAt + ERROR_STALL_MS, lastSentAt + AUTO_CONTINUE_MIN_INTERVAL_MS, inputNotBefore, notBefore);
+    // Exhaustion delays an active trigger on this same timer; it never rearms one.
+    const budgetNotBefore = sends >= AUTO_CONTINUE_MAX ? lastSentAt + AUTO_CONTINUE_RESET_MS : -Infinity;
+    const deadline = Math.max(errorAt + ERROR_STALL_MS, lastSentAt + AUTO_CONTINUE_MIN_INTERVAL_MS, inputNotBefore, budgetNotBefore, notBefore);
     timer = setTimeout(tryContinue, Math.max(0, deadline - Date.now()));
   };
   const tryContinue = () => {
@@ -92,7 +95,11 @@ export function installErrorRecovery(pi) {
       console.error("pi-tmux-window-status: recovery context expired; cancelled pending continue", error);
       return;
     }
-    lastSentAt = Date.now();
+    const now = Date.now();
+    // Only a gap since the latest automatic send replenishes the session budget.
+    if (now - lastSentAt >= AUTO_CONTINUE_RESET_MS) sends = 0;
+    if (sends >= AUTO_CONTINUE_MAX) { schedule(); return; }
+    lastSentAt = now;
     sends += 1;
     // sendUserMessage is void and an input hook may consume it without starting
     // a run. Retain one bounded watchdog; agent_start/progress/cancel removes it.
@@ -154,17 +161,15 @@ export function installErrorRecovery(pi) {
       if (seenErrors.has(message)) return;
       seenErrors.add(message);
       errorAt = Date.now();
-      sends = 0;
       schedule();
     } else if (!isRetryExhaustedAbort(message)) {
       if (message.stopReason === "aborted") cancel(signalFor(ctx));
-      else { disarm(); sends = 0; }
+      else disarm();
     }
   });
   pi.on("model_select", () => {
     if (!sessionActive) return;
     disarm();
-    sends = 0;
   });
   pi.on("session_shutdown", shutdown);
 }
