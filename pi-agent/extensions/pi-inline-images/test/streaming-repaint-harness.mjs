@@ -16,6 +16,7 @@ process.env.TERM_PROGRAM = "ghostty";
 const imp = (p) => import(pathToFileURL(p).href);
 
 const { InteractiveMode } = await imp(`${core}/dist/modes/interactive/interactive-mode.js`);
+const { ProgramStatusReporter } = await imp(`${core}/dist/modes/interactive/program-status-reporter.js`);
 const { AgentSession } = await imp(`${core}/dist/core/agent-session.js`);
 const { SessionManager } = await imp(`${core}/dist/core/session-manager.js`);
 const { SettingsManager } = await imp(`${core}/dist/core/settings-manager.js`);
@@ -86,6 +87,7 @@ const assistant = (text, calls = []) => ({
 const mode = Object.create(InteractiveMode.prototype);
 Object.assign(mode, {
   // Mirrors the Pi >=0.86 class field the constructor would initialize.
+  programStatus: new ProgramStatusReporter(() => ({ setProgramStatus() {} }), () => undefined),
   entriesRenderedByBoundaryCompaction: new Set(),
   runtimeHost: { session }, isInitialized: true, pendingTools: new Map(), chatContainer: new piTui.Container(),
   footer: { invalidate() {} }, hideThinkingBlock: false, hiddenThinkingLabel: "Thinking...", outputPad: 1,

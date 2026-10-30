@@ -14,6 +14,7 @@ const {TerminalImages}=await imp(base+'/src/terminal.ts');
 const {AssistantMessageComponent}=await imp(core+'/dist/modes/interactive/components/assistant-message.js');
 const {ToolExecutionComponent}=await imp(core+'/dist/modes/interactive/components/tool-execution.js');
 const {InteractiveMode}=await imp(core+'/dist/modes/interactive/interactive-mode.js');
+const {ProgramStatusReporter}=await imp(core+'/dist/modes/interactive/program-status-reporter.js');
 const {AgentSession}=await imp(core+'/dist/core/agent-session.js');
 const {SessionManager}=await imp(core+'/dist/core/session-manager.js');
 const {SettingsManager}=await imp(core+'/dist/core/settings-manager.js');
@@ -50,7 +51,7 @@ const loaded=await loadExtensions([base+'/index.ts',candidate+'/extensions/index
 const runner=new ExtensionRunner(loaded.extensions,loaded.runtime,base,sessionManager,{});runner.mode='tui';
 const session=new EventOnlySession({agent:{state:{tools:[],messages:[]},subscribe(){return ()=>{};}},sessionManager,settingsManager,cwd:base});
 session._extensionRunner=runner;
-const mode=Object.create(InteractiveMode.prototype);Object.assign(mode,{entriesRenderedByBoundaryCompaction:new Set(), /* mirrors the Pi >=0.86 class field the constructor would initialize */ runtimeHost:{session},isInitialized:true,pendingTools:new Map(),chatContainer:new tui.Container(),footer:{invalidate(){}},hideThinkingBlock:false,hiddenThinkingLabel:'Thinking...',outputPad:1,toolOutputExpanded:false,getMarkdownThemeWithSettings:()=>theme.getMarkdownTheme(),getMarkdownTransformers:()=>loaded.extensions.flatMap(e=>e.markdownTransformer?[e.markdownTransformer]:[]),getRegisteredToolDefinition:()=>undefined,maybeShowAssistantDiagnostics(){},maybeShowCacheMissNotice(){},updatePendingMessagesDisplay(){}});
+const mode=Object.create(InteractiveMode.prototype);Object.assign(mode,{programStatus:new ProgramStatusReporter(()=>({setProgramStatus(){}}),()=>undefined),entriesRenderedByBoundaryCompaction:new Set(), /* mirrors the Pi >=0.86 class field the constructor would initialize */ runtimeHost:{session},isInitialized:true,pendingTools:new Map(),chatContainer:new tui.Container(),footer:{invalidate(){}},hideThinkingBlock:false,hiddenThinkingLabel:'Thinking...',outputPad:1,toolOutputExpanded:false,getMarkdownThemeWithSettings:()=>theme.getMarkdownTheme(),getMarkdownTransformers:()=>loaded.extensions.flatMap(e=>e.markdownTransformer?[e.markdownTransformer]:[]),getRegisteredToolDefinition:()=>undefined,maybeShowAssistantDiagnostics(){},maybeShowCacheMissNotice(){},updatePendingMessagesDisplay(){}});
 let widget;let paints=0;let requests=0;let lines=[];let scheduled=false;
 const fakeTui={children:[mode.chatContainer],terminal:{columns:80},invalidate(){for(const child of this.children)child.invalidate();},requestRender(){requests++;if(!scheduled){scheduled=true;setTimeout(()=>{scheduled=false;paint();},1);}}};
 function paint(){paints++;lines=mode.chatContainer.render(80);widget?.render(80);}
