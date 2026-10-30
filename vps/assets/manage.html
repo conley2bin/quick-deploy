@@ -23,7 +23,7 @@
         <button id="add-device" type="button" class="button primary add-device" disabled>＋ 新增设备</button>
         <nav id="device-list" class="device-list" aria-label="设备列表"></nav>
         <p id="search-empty" class="muted" hidden>没有匹配的设备，请换个名称。</p>
-        <div class="sidebar-note"><span class="eyebrow">仅保存在本地</span><p>按设备取用连接资料。二维码和配置来自已提交的原生资料。</p><p>本机桥接不会在 VPS 上添加管理服务。页面包含凭据，请私下使用。</p></div>
+        <div class="sidebar-note"><span class="eyebrow">仅保存在本地</span><p>按设备取用客户端订阅。链接和二维码来自已提交的资料。</p><p>本机桥接不会在 VPS 上添加管理服务。页面包含凭据，请私下使用。</p></div>
       </aside>
       <main id="connection-content" tabindex="-1">
         <section class="session-panel" aria-label="会话状态">
@@ -35,14 +35,12 @@
         <section id="load-error" class="error-panel" role="alert" hidden></section>
         <section id="job-panel" class="job-panel" role="status" hidden><h2>操作结果与恢复</h2><p id="job-status"></p><button id="recover-operation" type="button" class="button danger" hidden disabled>核对并恢复原操作</button></section>
         <div id="device-content" hidden>
-          <header class="device-heading"><div><p class="eyebrow">当前设备 / CONNECTIONS</p><h1 id="device-name"></h1><p class="muted">选择原生节点或客户端订阅；修改操作作用于整个设备账户。</p></div><span id="device-state" class="state-badge"></span></header>
+          <header class="device-heading"><div><p class="eyebrow">当前设备 / CONNECTIONS</p><h1 id="device-name"></h1><p class="muted">导入 Mihomo 或 Shadowrocket 订阅即可使用该设备的全部服务器入口；修改操作作用于整个设备账户。</p></div><span id="device-state" class="state-badge"></span></header>
           <div class="device-actions"><button id="rename-device" type="button" class="button secondary" disabled>修改名称</button><button id="reset-device" type="button" class="button secondary" disabled>重置凭据</button><button id="remove-device" type="button" class="button danger" disabled>删除整个设备</button></div>
           <p id="disabled-notice" class="notice disabled-notice" hidden>此设备在快照中已停用，不提供导入链接或配置。</p>
-          <section class="connection-section" aria-labelledby="nodes-heading"><div class="section-heading"><h2 id="nodes-heading">原生节点</h2><span class="muted">只导入一个入口</span></div><div id="node-links" class="card-grid"></div></section>
-          <section class="connection-section" aria-labelledby="subscriptions-heading"><div class="section-heading"><h2 id="subscriptions-heading">客户端订阅</h2><span class="muted">一次导入本设备全部 3 入口，按客户端选一个，无需全部导入</span></div><div id="subscription-links" class="card-grid"></div></section>
-          <section class="downloads-section" aria-labelledby="downloads-heading"><div><h2 id="downloads-heading">下载配置</h2><p class="muted">同一设备的不同文件格式，不是额外账户或权限：YAML 完整配置、base64 编码订阅、URI 节点清单、URL JSON 订阅地址列表；无需全部导入。</p></div><div id="config-downloads" class="download-list"></div></section>
+          <section class="connection-section" aria-labelledby="subscriptions-heading"><div class="section-heading"><h2 id="subscriptions-heading">客户端订阅</h2><span class="muted">包含本设备全部服务器入口，按客户端选一个，无需全部导入</span></div><div id="subscription-links" class="card-grid"></div></section>
         </div>
-        <section class="access-note"><h2>连接凭据就是访问能力</h2><p>三个入口已经要求有效 UUID / Auth。仅知道 IP、域名或端口不能代理。客户端导入后使用已保存的凭据，无需再打开原 URL；复制凭据也能共享访问，不能绑定为一台物理设备。</p><p>重置或删除会在原生服务端撤销旧凭据。旧二维码和导出副本不会自动擦除；恢复旧归档可能重新启用旧凭据，请保留最新撤销后的备份。</p></section>
+        <section class="access-note"><h2>连接凭据就是访问能力</h2><p>服务器入口均要求有效 UUID / Auth。仅知道 IP、域名或端口不能代理。客户端导入后使用已保存的凭据，无需再打开原 URL；复制凭据也能共享访问，不能绑定为一台物理设备。</p><p>重置或删除会在原生服务端撤销旧凭据。旧二维码和导出副本不会自动擦除；恢复旧归档可能重新启用旧凭据，请保留最新撤销后的备份。</p></section>
         <footer class="snapshot-footer"><div class="snapshot-details"><span>资料生成 <time id="generated-at">—</time></span><span>已提交代次 <code id="backup-digest">—</code></span><span>端点 <span id="endpoint">—</span></span></div><p id="state-note" class="muted">等待读取已提交资料。</p></footer>
       </main>
     </div>
@@ -54,7 +52,7 @@
     <div class="qr-frame"><img id="qr-image" alt="" width="360" height="360"></div>
     <p id="qr-error" role="alert" hidden>二维码无法显示，请核对已提交资料。</p>
     <div class="dialog-actions"><button type="button" id="qr-copy" class="button primary">复制链接</button><a id="qr-download" class="button secondary" download>下载二维码</a></div>
-    <p class="dialog-footnote">原生二维码字节 · 仅在本机显示，不使用在线制码服务</p>
+    <p class="dialog-footnote">二维码字节 · 仅在本机显示，不使用在线制码服务</p>
   </dialog>
   <dialog id="copy-dialog" aria-labelledby="copy-title" aria-describedby="copy-description">
     <div class="dialog-heading"><h2 id="copy-title">手动复制链接</h2><button type="button" id="copy-close" class="icon-button" aria-label="关闭手动复制">×</button></div>

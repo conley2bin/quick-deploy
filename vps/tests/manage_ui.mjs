@@ -59,14 +59,18 @@ async function harness(options={}) {
   return {get,clipboard,downloads,blobs,requests,context,events,get state(){return state;},set state(v){state=v;},set mode(v){mode=v;},set failPost(v){failPost=v;},set jobExtra(v){jobExtra=v;},set status(v){status=v;},async poll(){const entry=[...timers].find(([,t])=>t.delay===0||t.delay===2000);assert.ok(entry,'job timer exists');timers.delete(entry[0]);await entry[1].fn();await flush();}};
 }
 const h=await harness();
-assert.equal(h.get('node-links').children.length,3);assert.equal(h.get('subscription-links').children.length,2);
+assert.equal(fixture.model.devices[0].links.filter(l=>l.kind==='node').length,3);assert.ok(fixture.model.devices[0].downloads.length>0,'input model still carries nodes and downloads');
+for(const id of ['node-links','config-downloads','nodes-heading','downloads-heading'])assert.ok(!html.includes(`id="${id}"`),id+' removed from HTML');
+assert.throws(()=>h.get('node-links'));assert.throws(()=>h.get('config-downloads'));
+assert.doesNotMatch(html,/下载配置|原生节点|\.download-link/);assert.doesNotMatch(readFileSync(new URL('../assets/manage.js',import.meta.url),'utf8'),/node-links|config-downloads/);
+assert.equal(h.get('subscription-links').children.length,2);
 assert.equal(h.requests.filter(r=>r.path==='/api/session').length,1);
 assert.equal(h.requests[0].body.launch_token,'FAKE_LAUNCH');
 assert.equal(h.get('add-device').disabled,false);
 checks.push('fragment cleared before exchange; bearer-only authenticated reads; three nodes and two subscriptions');
-for(const container of ['node-links','subscription-links']){
-  const links=fixture.model.devices[0].links.filter(l=>l.kind===(container==='node-links'?'node':'subscription'));
-  for(const [i,card] of h.get(container).children.entries()){
+{
+  const links=fixture.model.devices[0].links.filter(l=>l.kind==='subscription');
+  for(const [i,card] of h.get('subscription-links').children.entries()){
     assert.equal(card.children[1].textContent,links[i].label);
     await card.children[3].children[1].emit('click');assert.equal(h.clipboard.at(-1),links[i].uri);
     await card.children[3].children[0].emit('click');
@@ -75,12 +79,9 @@ for(const container of ['node-links','subscription-links']){
     h.get('qr-dialog').close();assert.equal(h.get('qr-image').src,'');
   }
 }
-for(const [i,anchor] of h.get('config-downloads').children.entries()){
-  await anchor.emit('click');assert.deepEqual(Buffer.from(await h.downloads.at(-1).blob.arrayBuffer()),Buffer.from(fixture.model.files[fixture.model.devices[0].downloads[i].path],'base64'));
-}
-checks.push('all native URI/QR/config bytes exact, including shared VLESS UUID, percent case and injection-like text');
+checks.push('two subscription URI/QR bytes exact; node/download sections absent, including shared VLESS UUID, percent case and injection-like text');
 h.context.navigator.clipboard.writeText=async()=>{throw Error('denied');};
-await h.get('node-links').children[1].children[3].children[1].emit('click');assert.equal(h.get('copy-dialog').open,true);assert.equal(h.get('manual-copy').value,fixture.model.devices[0].links[1].uri);
+const sub0=fixture.model.devices[0].links.filter(l=>l.kind==='subscription')[0];await h.get('subscription-links').children[0].children[3].children[1].emit('click');assert.equal(h.get('copy-dialog').open,true);assert.equal(h.get('manual-copy').value,sub0.uri);
 h.get('copy-dialog').close();assert.equal(h.get('manual-copy').value,'');
 const d=h.get('edit-dialog'), first=h.get('edit-name'), last=h.get('edit-submit');d.focusables=[first,last];last.focus();let ev=await d.emit('keydown',{key:'Tab'});assert.equal(ev.prevented,true);assert.equal(h.context.document.activeElement,first);
 first.focus();ev=await d.emit('keydown',{key:'Tab',shiftKey:true});assert.equal(h.context.document.activeElement,last);
@@ -104,14 +105,14 @@ for(const action of ['reset','remove']){
 }
 checks.push('reset and delete require impact acknowledgement plus exact target; never optimistic deletion');
 const renamed=await harness();await renamed.get('rename-device').emit('click');renamed.get('edit-name').value='renamed';await renamed.get('edit-form').emit('submit');assert.deepEqual(renamed.requests.find(r=>r.path==='/api/jobs').body.names,['alpha','renamed']);checks.push('rename uses whole native device action with old/new ordered names');
-const p=await harness();await p.get('node-links').children[0].children[3].children[0].emit('click');p.state={...p.state,pending:{present:true,mode:'devices',operation_id:'ORIGINAL_OPERATION'},model:null,writable:false,writable_reason:'pending'};await p.get('refresh-state').emit('click');assert.equal(p.get('qr-image').src,'');assert.equal(p.get('node-links').childElementCount,0);assert.equal(p.get('qr-dialog').open,false);assert.equal(p.get('add-device').disabled,true);assert.equal(p.get('recover-operation').disabled,false);await p.get('recover-operation').emit('click');assert.equal(p.requests.at(-1).path,'/api/recover');assert.equal(p.requests.at(-1).body.expected_operation_id,'ORIGINAL_OPERATION');
+const p=await harness();await p.get('subscription-links').children[0].children[3].children[0].emit('click');p.state={...p.state,pending:{present:true,mode:'devices',operation_id:'ORIGINAL_OPERATION'},model:null,writable:false,writable_reason:'pending'};await p.get('refresh-state').emit('click');assert.equal(p.get('qr-image').src,'');assert.equal(p.get('subscription-links').childElementCount,0);assert.equal(p.get('qr-dialog').open,false);assert.equal(p.get('add-device').disabled,true);assert.equal(p.get('recover-operation').disabled,false);await p.get('recover-operation').emit('click');assert.equal(p.requests.at(-1).path,'/api/recover');assert.equal(p.requests.at(-1).body.expected_operation_id,'ORIGINAL_OPERATION');
 checks.push('pending wipes credential DOM and QR; explicit recovery references original operation');
 const l=await harness();l.failPost=true;await l.get('add-device').emit('click');l.get('edit-name').value='gamma';await l.get('edit-form').emit('submit');await l.get('refresh-state').emit('click');assert.equal(l.requests.filter(r=>r.path==='/api/jobs').length,1);assert.equal(l.get('add-device').disabled,true);assert.match(l.get('job-status').textContent,/响应丢失/);
 checks.push('lost POST response is never retried and blocks new mutations until original job reconciliation');
 const e=await harness();await e.get('add-device').emit('click');e.get('edit-name').value='gamma';await e.get('edit-form').emit('submit');e.mode='committed_export_failed';e.state.last_job=null;await e.poll();assert.match(e.get('job-status').textContent,/已经提交/);assert.equal(e.requests.filter(r=>r.path==='/api/jobs').length,1);
-e.status=401;await e.get('refresh-state').emit('click');assert.equal(e.get('node-links').childElementCount,0);assert.equal(e.get('device-count').textContent,'—');assert.match(e.get('load-error').textContent,/会话/);
+e.status=401;await e.get('refresh-state').emit('click');assert.equal(e.get('subscription-links').childElementCount,0);assert.equal(e.get('device-count').textContent,'—');assert.match(e.get('load-error').textContent,/会话/);
 checks.push('postcommit export failure remains committed; expired session wipes secrets without fake empty roster');
-const ro=await harness({readonly:true});assert.equal(ro.get('add-device').disabled,true);assert.equal(ro.get('node-links').children.length,3);
+const ro=await harness({readonly:true});assert.equal(ro.get('add-device').disabled,true);assert.equal(ro.get('subscription-links').children.length,2);
 const short=await harness({ttl:1200});assert.equal(short.get('add-device').disabled,true);
 const missing=await harness({noFragment:true});assert.equal(missing.requests.length,0);assert.match(missing.get('load-error').textContent,/vps\/index.html/);
 checks.push('read-only preserves committed materials; short TTL prevents admission; F5 without fragment explains entry');
@@ -131,10 +132,10 @@ checks.push('read-only preserves committed materials; short TTL prevents admissi
   assert.equal(a.get('add-device').disabled,false,'new submission allowed after reconciliation');
   // QR/download bytes for the new device still come from model.files.
   const links=clone.links;assert.equal(links.filter(l=>l.kind==='node').length,3);assert.equal(links.filter(l=>l.kind==='subscription').length,2);
-  await a.get('device-list').children[before].emit('click');assert.equal(a.get('node-links').children.length,3);assert.equal(a.get('subscription-links').children.length,2);
-  const seen=[];for(const card of [...a.get('node-links').children,...a.get('subscription-links').children]){await card.children[3].children[1].emit('click');seen.push(a.clipboard.at(-1));}
-  assert.deepEqual(seen,links.map(l=>l.uri),'five exact native URIs, shared UUID not deduplicated');
-  checks.push('add: no optimistic device; export-failed shows committed, refetches, new device renders 3+2 exact URIs, no re-POST');
+  await a.get('device-list').children[before].emit('click');assert.equal(a.get('subscription-links').children.length,2);
+  const seen=[];for(const card of [...a.get('subscription-links').children]){await card.children[3].children[1].emit('click');seen.push(a.clipboard.at(-1));}
+  assert.deepEqual(seen,links.filter(l=>l.kind==='subscription').map(l=>l.uri),'two exact subscription URLs');
+  checks.push('add: no optimistic device; export-failed shows committed, refetches, new device renders 2 exact subscription URLs, no re-POST');
 }
 for(const mode of ['backup','future-mode']){ // pending identity is an opaque string the UI never interprets
   const q=await harness(),opaque='op/ id:'+mode+'-ü';
@@ -174,17 +175,16 @@ checks.push('recover echoes backend-provided opaque operation_id verbatim for an
   assert.doesNotMatch(text,/45 分钟|有效期|节点.*过期/);
   const late=await harness({now,ttl:1200});const lt=late.get('time-note').textContent;
   assert.ok(lt.startsWith(`已停止接收新操作，已提交任务继续执行；仍可查看/复制链接，至 ${hm(now+1200000)}。`),lt);
-  assert.equal(late.get('add-device').disabled,true);assert.equal(late.get('node-links').children.length,3,'links stay visible');
+  assert.equal(late.get('add-device').disabled,true);assert.equal(late.get('subscription-links').children.length,2,'links stay visible');
   assert.equal(late.get('write-reason').textContent,`已停止接收新操作，已提交任务继续执行；仍可查看/复制链接，至 ${hm(now+1200000)}。`);
   checks.push('time copy shows exact submit/session deadlines, timeout-cap explanation and post-cutoff read-only wording');
 }
 { // Import-option copy; QR/copy payloads (checked above) remain the same URI/URL.
   const c=await harness();
-  assert.match(html,/只导入一个入口/);assert.match(html,/一次导入本设备全部 3 入口，按客户端选一个，无需全部导入/);assert.match(html,/YAML 完整配置、base64 编码订阅、URI 节点清单、URL JSON 订阅地址列表/);assert.match(html,/不是额外账户或权限/);
-  const nodeText=[...c.get('node-links').children].map(x=>x.children[2].textContent),subText=[...c.get('subscription-links').children].map(x=>x.children[2].textContent);
-  assert.ok(nodeText.some(t=>t.startsWith('REALITY 直连 · 外层 TCP')));assert.ok(nodeText.some(t=>t.startsWith('H2 直连 · 外层 UDP')));assert.ok(nodeText.every(t=>t.includes('只导入这一个入口')&&t.includes('同一条 URI')));
+  assert.match(html,/包含本设备全部服务器入口，按客户端选一个，无需全部导入/);assert.doesNotMatch(html,/只导入一个入口|3 入口|5 条|五/);
+  const subText=[...c.get('subscription-links').children].map(x=>x.children[2].textContent);
   assert.match(subText[0],/^Clash Verge 等 Mihomo 客户端/);assert.match(subText[1],/^Shadowrocket 客户端/);assert.ok(subText.every(t=>t.includes('同一个订阅 URL')));
   await c.get('subscription-links').children[0].children[3].children[0].emit('click');assert.match(c.get('qr-description').textContent,/同一条订阅 URL/);
-  checks.push('import-option copy distinguishes one-entry nodes from whole-device subscriptions and file formats');
+  checks.push('subscription copy says all server entrances; no single-node or file-format controls');
 }
 console.log(JSON.stringify({status:'passed',checks}));

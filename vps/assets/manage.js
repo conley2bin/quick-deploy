@@ -268,27 +268,15 @@
     byId('device-state').textContent = device.enabled ? '已提交 · 启用' : '已提交 · 停用';
     byId('device-state').className = `state-badge${device.enabled ? '' : ' disabled'}`;
     byId('disabled-notice').hidden = device.enabled;
-    const nodes = byId('node-links');
     const subscriptions = byId('subscription-links');
-    const downloads = byId('config-downloads');
-    nodes.replaceChildren(); subscriptions.replaceChildren(); downloads.replaceChildren();
+    subscriptions.replaceChildren();
     if (device.enabled) {
       device.links.forEach(link => {
-        if (!['node', 'subscription'].includes(link.kind) || typeof link.uri !== 'string' || typeof link.label !== 'string') return;
-        (link.kind === 'node' ? nodes : subscriptions).append(renderCard(link, device));
-      });
-      device.downloads.forEach(download => {
-        const path = localPath(download.path);
-        if (!path) return;
-        const anchor = make('a', 'button secondary download-link', download.label);
-        setDownload(anchor, path);
-        anchor.setAttribute('aria-label', `${device.name}：下载配置 ${download.label}`);
-        downloads.append(anchor);
+        if (link.kind !== 'subscription' || typeof link.uri !== 'string' || typeof link.label !== 'string') return;
+        subscriptions.append(renderCard(link, device));
       });
     }
-    if (!nodes.childElementCount) nodes.append(make('p', 'empty-state', device.enabled ? '此快照没有原生节点。' : '设备已停用，不提供节点。'));
     if (!subscriptions.childElementCount) subscriptions.append(make('p', 'empty-state', device.enabled ? '此快照没有客户端订阅。' : '设备已停用，不提供订阅。'));
-    if (!downloads.childElementCount) downloads.append(make('p', 'muted', '此设备没有可下载的配置。'));
   };
   // A session bearer exists only in this closure. No storage, query token,
   // location reload, automatic POST retry, or client-side credential conversion.
@@ -353,7 +341,7 @@
     byId('qr-download').onclick = null;
     qrLink = null; qrDevice = null; edit = null;
     snapshot = {devices: [], files: {}}; devices = [];
-    for (const id of ['node-links', 'subscription-links', 'config-downloads', 'device-list']) byId(id).replaceChildren();
+    for (const id of ['subscription-links', 'device-list']) byId(id).replaceChildren();
     byId('device-content').hidden = true;
     byId('device-name').textContent = '';
     byId('device-count').textContent = '—';
@@ -528,7 +516,7 @@
     const dangerous = ['reset', 'remove'].includes(action);
     const titles = {add: '新增设备', rename: '修改设备名称', reset: '重置设备凭据', remove: '删除整个设备'};
     byId('edit-title').textContent = titles[action];
-    byId('edit-description').textContent = {add: '创建一个原生账户，提交后显示三个节点和两个订阅 URL。', rename: '修改原生账户名称，保留 UUID / Auth / SubID。全部客户端仍可能短暂重连。', reset: '轮换 UUID / Auth / SubID，旧导入配置和订阅将失效。此设备需要重新导入。', remove: '撤销整个设备的全部入口和订阅，不是只隐藏卡片。已导出的副本仍存在，但不再授权连接。'}[action];
+    byId('edit-description').textContent = {add: '创建一个设备账户，提交后提供 Mihomo 和 Shadowrocket 两种客户端订阅。', rename: '修改设备账户名称，保留 UUID / Auth / SubID。全部客户端仍可能短暂重连。', reset: '轮换 UUID / Auth / SubID，旧导入配置和订阅将失效。此设备需要重新导入。', remove: '撤销整个设备的全部入口和订阅，不是只隐藏卡片。已导出的副本仍存在，但不再授权连接。'}[action];
     byId('edit-name').hidden = dangerous; byId('edit-name-label').hidden = dangerous;
     byId('edit-name').required = !dangerous;
     byId('edit-name').value = action === 'rename' ? device.name : '';
