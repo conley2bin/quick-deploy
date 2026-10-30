@@ -109,11 +109,13 @@ piox
 
 ## 测试
 
+会话关闭（`session_shutdown`）会取消本会话启动的全部剪贴板操作：终止其 tmux/Python 子进程（TERM，1 秒后 KILL），之后不再插入编辑器、不再发出 OSC 52/原生回退/通知；已退役的复制 sink 以 `AbortError` 拒绝。单个子进程另有独立的 8 秒结算期限。
+
 ```bash
 python3 pi-agent/extensions/pi-remote-clipboard/tests/test_all.py
 python3 pi-agent/extensions/pi-remote-clipboard/tests/test_installer.py
 python3 pi-agent/extensions/pi-remote-clipboard/tests/native_activation.py
-node --experimental-strip-types --test pi-agent/extensions/pi-remote-clipboard/tests/activation.test.mjs
+node --experimental-strip-types --test pi-agent/extensions/pi-remote-clipboard/tests/activation.test.mjs pi-agent/extensions/pi-remote-clipboard/tests/lifecycle.test.mjs
 cd pi-agent/extensions/pi-remote-clipboard/pi-extension && ../../pi-copy-links/node_modules/.bin/tsc -p tsconfig.json --noEmit
 ```
 
