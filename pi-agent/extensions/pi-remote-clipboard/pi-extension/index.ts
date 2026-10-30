@@ -465,15 +465,23 @@ async function isRemoteClient(owner: Owner): Promise<boolean> {
 
 // ctx.ui.pasteToEditor wraps its argument in ESC[200~ ... ESC[201~ and feeds the editor, whose parser ends the
 // data frame at the first ESC[201~ and re-enters the rest as raw keystrokes (skipping the paste C0 filter).
-// Remove the native framing sequences so the whole payload stays inside the frame; removal repeats because
-// deleting one marker can join the halves of another.
-function stripPasteFraming(text: string): string {
-  let previous: string;
-  do {
-    previous = text;
-    text = text.replaceAll("\x1b[200~", "").replaceAll("\x1b[201~", "");
-  } while (text !== previous);
-  return text;
+// Remove the native framing sequences so the whole payload stays inside the frame. A single left-to-right stack
+// reduction: every UTF-16 unit is pushed once and the six-unit marker popped at most once, and after a pop the
+// stack is again a fully reduced prefix, so markers rebuilt from the pieces around a removed one are caught by
+// the same suffix check. Linear in the input, unlike repeating whole-string replaces until stable.
+export function stripPasteFraming(text: string): string {
+  const stack: number[] = [];
+  for (let i = 0; i < text.length; i += 1) {
+    stack.push(text.charCodeAt(i));
+    const n = stack.length;
+    if (
+      n >= 6 && stack[n - 1] === 0x7e && (stack[n - 2] === 0x30 || stack[n - 2] === 0x31) && stack[n - 3] === 0x30 &&
+      stack[n - 4] === 0x32 && stack[n - 5] === 0x5b && stack[n - 6] === 0x1b
+    ) stack.length = n - 6;
+  }
+  const chunks: string[] = [];
+  for (let i = 0; i < stack.length; i += 8192) chunks.push(String.fromCharCode(...stack.slice(i, i + 8192)));
+  return chunks.join("");
 }
 
 /** 向 pane 写 OSC 52；tmux set-clipboard=on 会转发给正在观看的客户端。 */

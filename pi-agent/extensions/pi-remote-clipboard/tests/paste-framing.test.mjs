@@ -138,3 +138,67 @@ test("text that is only framing markers is an empty clipboard, not a paste", asy
   assert.equal(result.inputs.length, 0);
   assert.equal(result.notices.length, 1);
 });
+
+// --- stripPasteFraming complexity and equivalence -------------------------------------------------------
+const { stripPasteFraming } = await import("../pi-extension/index.ts");
+
+// The previous implementation: repeat whole-string replaceAll until nothing changes.
+function fixedPointOracle(text) {
+  let previous;
+  do {
+    previous = text;
+    text = text.replaceAll(START, "").replaceAll(END, "");
+  } while (text !== previous);
+  return text;
+}
+// ESC[20 x N, ESC[201~, then "1~" x N: every pass removes only the innermost (re)formed delimiter.
+const nested = (n) => "\x1b[20".repeat(n) + END + "1~".repeat(n);
+
+// Total length handed to whole-string scanning String methods while fn runs; restored before returning.
+function scannedLength(fn) {
+  const names = ["replaceAll", "replace", "split", "indexOf", "includes", "slice", "substring", "concat", "match", "startsWith", "endsWith"];
+  const saved = names.map((name) => [name, String.prototype[name]]);
+  let scanned = 0;
+  try {
+    for (const [name, original] of saved) {
+      String.prototype[name] = function (...args) { scanned += this.length; return original.apply(this, args); };
+    }
+    fn();
+  } finally {
+    for (const [name, original] of saved) String.prototype[name] = original;
+  }
+  return scanned;
+}
+
+test("stripPasteFraming scans linearly: nested-marker work doubles with the input, it does not square", () => {
+  const work = [100, 200, 400].map((n) => scannedLength(() => assert.equal(stripPasteFraming(nested(n)), "")));
+  assert.ok(work[1] <= work[0] * 2.5 && work[2] <= work[1] * 2.5, `scanned lengths ${work} grow superlinearly`);
+  assert.ok(work[2] <= 20 * nested(400).length, "bounded passes over the input");
+});
+
+test("a 1 MiB deeply nested payload is fully reduced", () => {
+  const n = Math.floor((1048576 - 6) / 6);
+  const input = nested(n);
+  assert.ok(input.length <= 1048576);
+  assert.equal(stripPasteFraming(input), "");
+  const withText = "α" + "\x1b[20".repeat(n) + END + "1~".repeat(n) + "😀";
+  assert.equal(stripPasteFraming(withText), "α😀");
+});
+
+test("stripPasteFraming equals the fixed-point oracle on seeded mixed and nested inputs", () => {
+  const pieces = ["\x1b", "[", "2", "0", "1", "~", "a", "é", "😀", "\ud83d", "\\x1b[201~", "\n", "\x00", START, END, "\x1b[20", "1~", "\x1b[2", "0~", "00~"];
+  let seed = 12345;
+  const rand = (limit) => { seed = (Math.imul(seed, 1103515245) + 12345) >>> 0; return seed % limit; };
+  for (let c = 0; c < 4000; c += 1) {
+    let text = "";
+    for (let k = rand(40); k > 0; k -= 1) text += pieces[rand(pieces.length)];
+    const out = stripPasteFraming(text);
+    assert.equal(out, fixedPointOracle(text), JSON.stringify(text));
+    assert.ok(!out.includes(START) && !out.includes(END));
+    assert.equal(stripPasteFraming(out), out, "idempotent");
+    for (const cut of [0, text.length >> 1, text.length]) { // marker halves split across the cut still reduce the same
+      assert.equal(stripPasteFraming(text.slice(0, cut) + text.slice(cut)), out);
+    }
+  }
+  for (const n of [1, 2, 3, 7, 30]) assert.equal(stripPasteFraming(nested(n)), fixedPointOracle(nested(n)));
+});
