@@ -59,8 +59,12 @@ export class ImageSession {
 
   async prepareMessage(message: Message, cwd: string): Promise<PreparedMarkdown[]> {
     if (!message || typeof message !== "object") return [];
+    const generation = this.generation;
     const prepared: PreparedMarkdown[] = [];
-    for (const source of assistantTextBlocks(message)) prepared.push(await this.prepare(source, cwd));
+    for (const source of assistantTextBlocks(message)) {
+      prepared.push(await this.prepare(source, cwd));
+      if (generation !== this.generation) return prepared;
+    }
     this.preparedMessages.set(message, prepared);
     return prepared;
   }
@@ -83,41 +87,42 @@ export class ImageSession {
   }
 
   async restore(entries: readonly Entry[], cwd: string, reusePrepared = false): Promise<void> {
-    const previous = reusePrepared
-      ? new Map([...this.occurrences].map(([source, prepared]) => [source, [...prepared]]))
-      : undefined;
     const generation = ++this.generation;
-    const sources = entries.flatMap((entry) => assistantTextBlocks(entry.type === "message" ? entry.message as Message : undefined));
+    // SessionManager preserves message objects across same-runtime compaction/tree rebuilds.
+    // Source ordinals shift when an earlier duplicate is summarized; only message/block identity
+    // can select the retained occurrence's immutable pixels. Unknown messages load afresh.
+    const messages = entries.flatMap((entry) => {
+      const message = entry.type === "message" && entry.message && typeof entry.message === "object" ? entry.message as Message : undefined;
+      return message ? [{ message, sources: assistantTextBlocks(message), previous: reusePrepared ? this.preparedMessages.get(message) : undefined }] : [];
+    });
     const retained = new Set<string>();
-    if (previous) {
-      const occurrence = new Map<string, number>();
-      for (const source of sources) {
-        const index = occurrence.get(source) ?? 0;
-        occurrence.set(source, index + 1);
-        const prepared = previous.get(source)?.[index];
-        if (prepared?.cwd === cwd) for (const reference of prepared.references) if (!reference.inTable && !reference.error) retained.add(reference.logicalId);
+    if (reusePrepared) {
+      for (const { sources, previous } of messages) {
+        for (const [index, source] of sources.entries()) {
+          const prepared = previous?.[index];
+          if (prepared?.source === source && prepared.cwd === cwd) {
+            for (const reference of prepared.references) if (!reference.inTable && !reference.error) retained.add(reference.logicalId);
+          }
+        }
       }
       await this.terminal.retainOwner("inline", retained);
     } else await this.terminal.resetOwner("inline");
-    this.clearPrepared();
     if (generation !== this.generation) return;
+    this.clearPrepared();
 
-    const occurrence = new Map<string, number>();
-    for (const entry of entries) {
-      const message = entry.type === "message" && entry.message && typeof entry.message === "object" ? entry.message as Message : undefined;
+    for (const { message, sources, previous } of messages) {
       const preparedMessage: PreparedMarkdown[] = [];
-      for (const source of assistantTextBlocks(message)) {
+      for (const [index, source] of sources.entries()) {
         if (generation !== this.generation) return;
-        const index = occurrence.get(source) ?? 0;
-        occurrence.set(source, index + 1);
-        const reusable = previous?.get(source)?.[index];
+        const reusable = previous?.[index]?.source === source ? previous[index] : undefined;
         const resourcesReady = reusable?.references.every((reference) => reference.inTable || (!reference.error && this.terminal.has(reference.logicalId)));
         if (reusable?.cwd === cwd && resourcesReady) {
           this.record(reusable);
           preparedMessage.push(reusable);
         } else preparedMessage.push(await this.prepare(source, cwd));
       }
-      if (message && typeof message === "object") this.preparedMessages.set(message, preparedMessage);
+      if (generation !== this.generation) return;
+      this.preparedMessages.set(message, preparedMessage);
     }
   }
 

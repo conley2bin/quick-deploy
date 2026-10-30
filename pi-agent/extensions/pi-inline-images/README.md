@@ -81,9 +81,12 @@ Pi process needs the next operator-controlled reload or restart to activate them
   panes, not only image traffic. It still requires a ready, nonsuspended attached
   client whose session contains the window; it is not a durable upload queue for
   detached clients. Choose that policy deliberately and scope it appropriately.
-- Current-branch assistant text is restored on session start. Same-runtime tree
-  reconciliation cancels stale queued work but reuses unchanged prepared/uploaded
-  resources, avoiding gratuitous transcode/upload. Shutdown or session replacement
+- Current-context assistant text is restored on session start. Successful compaction
+  and same-runtime tree reconciliation retire summarized/absent inline catalogs and
+  PNG residency while reusing retained message/text-block occurrences, including
+  duplicate Markdown with different historical pixels. Read-preview ownership stays
+  independent. Failed/cancelled compaction preserves prepared state. Retained resources
+  avoid gratuitous transcode/upload. Shutdown or session replacement
   invalidates late loaders, cancels unsent jobs, orders owned deletion after any
   accepted-false write drains, and removes transport listeners/timers. A new
   extension factory starts with no terminal-cache identity and uploads again.

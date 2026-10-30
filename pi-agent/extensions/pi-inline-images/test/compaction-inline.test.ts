@@ -20,6 +20,7 @@ test("production-loader compaction replaces cached unbound notices after newly b
     forcedAfterRebuild: number; boundBeforeFirstPaint: boolean;
     frames: Array<{ glyphs: number; notices: number }>;
     ready: boolean; bitmapUploads: number; rawMessagesUnchanged: boolean;
+    retirement: { rounds: number; capacityFailures: number; indexedAfterCompaction: number; failedPreserved: boolean };
   };
   assert.deepEqual([report.before.glyphs, report.before.notices], [4, 0]);
   assert.equal(report.boundBeforeFirstPaint, false, "new Pi rows first render without an adapter binding");
@@ -33,4 +34,6 @@ test("production-loader compaction replaces cached unbound notices after newly b
   assert.equal(report.forcedAfterRebuild, 0, "recovery must not force a global history replay");
   assert.equal(report.bitmapUploads, 1, "identical unchanged PNG occurrences share one original-size Kitty upload");
   assert.equal(report.rawMessagesUnchanged, true, "compaction display repair leaves persisted messages untouched");
+  assert.deepEqual(report.retirement, { rounds: 66, capacityFailures: 0, indexedAfterCompaction: 0, failedPreserved: true },
+    "successful compaction retires historical catalogs before capacity fills; failed/aborted compaction preserves active state");
 });

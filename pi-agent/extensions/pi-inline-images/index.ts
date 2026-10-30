@@ -171,9 +171,15 @@ export default function piInlineImages(pi: ExtensionAPI) {
     }
   };
   pi.on("session_start", restore as never);
-  pi.on("session_compact", (() => {
+  pi.on("session_compact", (async (_event: unknown, context: HostContext) => {
     host.suspend("compaction component reconstruction");
     reconciliationSignature = undefined;
+    if (context.mode !== "tui") return;
+    hostContext = context;
+    // Pi has already appended the compaction and refreshed context. Its upcoming native
+    // rebuild drops summarized rows, so retire their inline resources before repainting.
+    await session.restore(context.sessionManager.buildContextEntries(), context.cwd, true);
+    syncMonitor();
     wake();
   }) as never);
   pi.on("session_compact_failed", (() => wake()) as never);

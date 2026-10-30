@@ -56,6 +56,7 @@ session._extensionRunner = runner;
 const mode = Object.create(pi.InteractiveMode.prototype);
 Object.assign(mode, {
   entriesRenderedByBoundaryCompaction: new Set(), runtimeHost: { session }, isInitialized: true,
+  programStatus: { handleEvent() {} },
   pendingTools: new Map(), chatContainer: new tui.Container(), footer: { invalidate() {} },
   hideThinkingBlock: false, hiddenThinkingLabel: "Thinking...", outputPad: 1,
   toolOutputExpanded: false, getMarkdownThemeWithSettings: () => pi.getMarkdownTheme(),
@@ -158,6 +159,37 @@ try {
     frames: frames.slice(firstRebuiltFrame), ready: coordination.at(-1)?.ready,
     bitmapUploads: writes.filter((bytes) => bytes.includes("a=t")).length,
     rawMessagesUnchanged: JSON.stringify(manager.getBranch().filter((entry) => entry.type === "message")) === originalBranch };
+
+  // Real loader/runner/SessionManager, >64 distinct historical resources with one current plain row.
+  const transformer = loaded.extensions.find((extension) => extension.path === resolve("index.ts"))?.markdownTransformer
+    ?? loaded.extensions.at(-1).markdownTransformer;
+  const transform = (raw) => transformer(raw, { messageType: "assistant", isStreaming: false, availableWidth: 80 });
+  const historical = [];
+  let capacityFailures = 0;
+  let indexedAfterCompaction = 0;
+  let failedPreserved = false;
+  for (let round = 1; round <= 66; round++) {
+    const raw = `round-${round} ![image](${resolve("test/fixtures/color-block.png")})`;
+    const next = message(); next.content = [{ type: "text", text: raw }];
+    await runner.emitMessageEnd({ type: "message_end", message: next });
+    manager.appendMessage(next);
+    historical.push(raw);
+    const prepared = transform(raw);
+    if (prepared.includes("capacity reached")) capacityFailures++;
+    if (round === 1) {
+      await runner.emit({ type: "session_compact_failed", reason: "manual", errorMessage: "fixture", aborted: false, willRetry: false, fromExtension: false });
+      failedPreserved = transform(raw) === prepared;
+      await runner.emit({ type: "session_compact_failed", reason: "manual", aborted: true, willRetry: false, fromExtension: false });
+      failedPreserved &&= transform(raw) === prepared;
+    }
+    const sentinel = message(); sentinel.content = [{ type: "text", text: `sentinel-${round}` }];
+    const keep = manager.appendMessage(sentinel);
+    const id = manager.appendCompaction("summary", keep, 1000);
+    await runner.emit({ type: "session_compact", compactionEntry: manager.getEntry(id), fromExtension: true, reason: "manual", willRetry: false });
+    assert.equal(manager.buildContextEntries().filter((entry) => entry.type === "message").length, 1);
+    indexedAfterCompaction = historical.filter((raw) => transform(raw) !== raw).length;
+  }
+  report.retirement = { rounds: 66, capacityFailures, indexedAfterCompaction, failedPreserved };
 } finally {
   await runner.emit({ type: "session_shutdown" });
   await settle();
