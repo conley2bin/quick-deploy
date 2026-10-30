@@ -58,7 +58,6 @@ pi                                 # 新会话直接使用 fullscreen；无需�
 | `extensions/pi-copy-links/vscode-video-preview-repair/` | 公司本机 Code 的可选 MP4 预览修复（VS Code UI 扩展） | 单独[打包 VSIX 安装到 Code](extensions/pi-copy-links/vscode-video-preview-repair/README.md)；只修复无文件夹的本地文件窗口，链接打开不依赖它 |
 | `extensions/pi-remote-clipboard/{src,pi-extension}/` | 本机 provider（systemd user service）与 Pi 入口 | 由该功能顶层 `install.sh` 一并安装 |
 | `extensions/pi-inline-images/{patches,vendor}/` | 与本功能桥接协议共同演进的 pi-tmux-images 补丁与 vendored 代码 | 手动 guarded replay（见功能 README） |
-| `patches/<包>-<版本>/` | 不属于任何自有功能的第三方 Pi 包修复 | 手动 guarded replay，仅适用于指定版本；`apply.sh --check` 先核验版本与哈希 |
 | `skills/` | 自有技能 `skills/<name>/`；vendored `skills/<来源>/<name>/` + `UPSTREAM.txt` | `install.sh --skills-only` 调用现有 `skills/install-skills.sh`，交互式选中后复制到 `~/.pi/agent/skills/` |
 
 `skills/responsibility-registry/` 是全局责任登记技能的源码；安装时在 `--skills-only` 菜单只选 `responsibility-registry`。`~/.pi/agent/skills/responsibility-registry/` 是安装副本，不在该目录开发。运行态登记簿位于 `~/.pi/agent/.memory/local/responsibility-registry/`，不随源码或安装复制；已有 Pi 会话 `/reload` 后加载更新。
