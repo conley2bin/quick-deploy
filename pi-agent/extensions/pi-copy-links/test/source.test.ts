@@ -449,3 +449,56 @@ test("ActionStore finalizer delete failure is noexcept and makes actions untrust
     globalThis.FinalizationRegistry = RealFinalizationRegistry;
   }
 });
+
+const LEGACY_PREFIXES = Symbol.for("pi-copy-links:reserved-prefixes");
+const PREFIX_GENERATION = Symbol.for("pi-copy-links:prefix-generation");
+const PREFIX_FORMAT = /^pi-copy:\/\/v2-(\d+)-([0-9a-f]{24})\/$/;
+const globals = globalThis as Record<symbol, unknown>;
+
+test("namespaces are v2-<generation>-<fresh random> with strictly increasing generations", () => {
+  const legacyBefore = (globals[LEGACY_PREFIXES] as Set<string> | undefined)?.size ?? 0;
+  const parsed = Array.from({ length: 2000 }, () => {
+    const match = PREFIX_FORMAT.exec(new ActionStore().prefix);
+    assert.ok(match, "prefix matches v2 format");
+    return { generation: Number(match[1]), nonce: match[2]! };
+  });
+  for (let i = 1; i < parsed.length; i++) assert.ok(parsed[i]!.generation > parsed[i - 1]!.generation);
+  assert.equal(new Set(parsed.map((p) => p.nonce)).size, parsed.length, "every namespace draws a fresh nonce");
+  assert.equal((globals[LEGACY_PREFIXES] as Set<string> | undefined)?.size ?? 0, legacyBefore, "legacy history set does not grow");
+  const counter = globals[PREFIX_GENERATION] as { next: number };
+  assert.ok(counter.next > parsed.at(-1)!.generation);
+  const [a, b] = [new ActionStore(), new ActionStore()];
+  const nonce = (store: ActionStore) => PREFIX_FORMAT.exec(store.prefix)![2]!;
+  assert.notEqual(nonce(a).slice(0, 8), nonce(b).slice(0, 8), "nonce is not derived from the generation");
+  assert.equal(a.owns(`pi-copy://${nonce(a)}/1`), false, "legacy-format URI is never owned by a v2 store");
+});
+
+test("a re-imported module instance continues the shared generation counter", async () => {
+  const first = new ActionStore().prefix;
+  const other = await import("../src/source.ts?r=prefix-generation" as string) as typeof import("../src/source.ts");
+  assert.notEqual(other.ActionStore, ActionStore);
+  const second = new other.ActionStore().prefix;
+  const third = new ActionStore().prefix;
+  const gen = (prefix: string) => Number(PREFIX_FORMAT.exec(prefix)![1]);
+  assert.ok(gen(first) < gen(second) && gen(second) < gen(third));
+});
+
+test("exhausted or corrupt generation state fails construction without reset", async () => {
+  const { spawnSync } = await import("node:child_process");
+  const run = (setup: string) => spawnSync(process.execPath, ["--import", "tsx", "--input-type=module", "-e", `
+    import { ActionStore } from ${JSON.stringify(new URL("../src/source.ts", import.meta.url).href)};
+    const key = Symbol.for("pi-copy-links:prefix-generation");
+    ${setup}
+    try { new ActionStore(); console.log("NO-THROW"); } catch (error) { console.log("THROW"); }
+    console.log(JSON.stringify(globalThis[key]));
+  `], { encoding: "utf8", cwd: new URL("..", import.meta.url) });
+  const exhausted = run("globalThis[key] = { next: Number.MAX_SAFE_INTEGER + 1 };");
+  assert.match(exhausted.stdout, /^THROW\n\{"next":9007199254740992\}/, exhausted.stderr);
+  const last = run("globalThis[key] = { next: Number.MAX_SAFE_INTEGER };");
+  assert.match(last.stdout, /^NO-THROW/, "MAX_SAFE_INTEGER itself is the last usable generation");
+  for (const bad of ["{ next: -1 }", "{ next: 1.5 }", "{ next: '1' }", "42", "{}"]) {
+    const out = run(`globalThis[key] = ${bad};`);
+    assert.match(out.stdout, /^THROW\n/, `${bad}: ${out.stderr}`);
+    assert.equal(out.stdout.split("\n")[1], JSON.stringify(eval(`(${bad})`)), `${bad} left untouched`);
+  }
+});

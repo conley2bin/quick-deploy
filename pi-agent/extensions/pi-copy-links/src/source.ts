@@ -5,18 +5,20 @@ import { unified } from "unified";
 import { commandLike, inlineCodePaths, nonPathTextRanges, plainTextPaths, plainTextWordSpans, type PathSpan } from "./paths.ts";
 
 const parser = unified().use(remarkParse);
-const PREFIX_REGISTRY = Symbol.for("pi-copy-links:reserved-prefixes");
-const prefixGlobal = globalThis as typeof globalThis & { [PREFIX_REGISTRY]?: Set<string> };
-const reservedPrefixes = prefixGlobal[PREFIX_REGISTRY] ??= new Set<string>();
+// Process-wide so every module-URL reimport draws from one monotonic sequence. The generation makes
+// namespaces unique; the fresh 96-bit nonce keeps them unguessable. The legacy Symbol.for(
+// "pi-copy-links:reserved-prefixes") Set is left to older module instances; "v2-" is non-hex, so
+// the formats are disjoint and no retired URI can be reactivated.
+const PREFIX_GENERATION = Symbol.for("pi-copy-links:prefix-generation");
+const prefixGlobal = globalThis as typeof globalThis & { [PREFIX_GENERATION]?: { next: number } };
 
 function createCopyPrefix(): string {
-  for (let attempt = 0; attempt < 16; attempt++) {
-    const prefix = `pi-copy://${randomBytes(12).toString("hex")}/`;
-    if (reservedPrefixes.has(prefix)) continue;
-    reservedPrefixes.add(prefix);
-    return prefix;
+  const state = prefixGlobal[PREFIX_GENERATION] ??= { next: 0 };
+  if (typeof state !== "object" || state === null || !Number.isSafeInteger(state.next) || state.next < 0) {
+    throw new Error("pi-copy prefix generation state is corrupt or exhausted");
   }
-  throw new Error("unable to allocate a unique pi-copy namespace");
+  const generation = state.next++;
+  return `pi-copy://v2-${generation}-${randomBytes(12).toString("hex")}/`;
 }
 
 export type CodeContainer = "blockquote" | "list";
