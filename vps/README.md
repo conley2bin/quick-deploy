@@ -204,7 +204,7 @@ bash vps/setup.sh dashboard --device phone --output-dir "$HOME/.local/state/quic
 ## 本机设备管理页（manage）
 
 ```bash
-bash vps/setup.sh manage --independent-carrier --ssh-proxy http://127.0.0.1:PORT   # 写操作需二者；否则只读
+bash vps/setup.sh manage --independent-carrier --ssh-proxy http://127.0.0.1:10809   # 写操作需二者；否则只读；10809仅示例，替换为已启动的独立监听端口
 ```
 
 保持终端运行，再打开生成的 `vps/index.html`（会话结束后该入口保留为不含令牌的“已结束”提示页，需重新运行 manage 才能进入） 并点击进入（不自动开浏览器；会话最长 45 分钟，期间可重新打开，F5 后需重新从 `vps/index.html` 进入）。
