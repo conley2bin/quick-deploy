@@ -64,7 +64,7 @@ class LauncherEntry(unittest.TestCase):
         self.assertEqual(self.index.stat().st_mode & 0o777, 0o600)
         self.assertNotIn(token.encode(), data)
         self.assertNotIn(b'http://', data)
-        self.assertIn('bash setup.sh manage'.encode(), data)
+        self.assertIn('bash manage.sh'.encode(), data)
         self.assertEqual(list(self.module.glob('.index-*')), [])
 
     def test_second_launch_overwrites_owned_stopped_entry(self):
@@ -344,7 +344,8 @@ class HTTPManagement(unittest.TestCase):
         real_popen = subprocess.Popen
         processes = []
         def fake_machine(argv, **kwargs):
-            self.assertEqual(argv[-1], 'manage-job')
+            self.assertEqual(argv[-1], '--job')
+            self.assertEqual(Path(argv[2]).name, 'manage.py')
             self.assertNotIn(self.manager.bearer, ' '.join(argv))
             process = real_popen([sys.executable, '-c',
                                   'import sys,time;sys.stdin.buffer.read();time.sleep(60)'], **kwargs)

@@ -15,10 +15,12 @@ import re
 import secrets
 import signal
 import stat
+import shutil
 import subprocess
 import sys
 import threading
 import time
+import vps as vps_module
 
 MAX_BODY = 8192
 JOB_SECONDS = 1200
@@ -39,7 +41,7 @@ CSP = ("default-src 'self'; connect-src 'self'; img-src 'self' blob:; script-src
 
 STOPPED_ENTRY = ('<!doctype html><!-- quick-deploy managed launcher -->'
                  '<meta charset="utf-8"><title>管理会话已结束</title>'
-                 '<p>管理会话已结束；在本目录运行 bash setup.sh manage，然后重新打开本页</p>\n').encode()
+                 '<p>管理会话已结束；在本目录运行 bash manage.sh，然后重新打开本页</p>\n').encode()
 
 
 class Refusal(Exception):
@@ -558,8 +560,8 @@ class ManagementServer:
         with open(stdout, 'xb') as output, open(stderr, 'xb') as diagnostic:
             os.chmod(stdout, 0o600)
             os.chmod(stderr, 0o600)
-            process = subprocess.Popen([sys.executable, '-B', str(self.vps.MODULE / 'lib/vps.py'),
-                                        '--state-dir', str(self.state), 'manage-job'],
+            process = subprocess.Popen([sys.executable, '-B', str(self.vps.MODULE / 'lib/manage.py'),
+                                        '--state-dir', str(self.state), '--job'],
                                        stdin=subprocess.PIPE, stdout=output, stderr=diagnostic,
                                        start_new_session=True, shell=False)
             with self.mutex:
@@ -695,6 +697,31 @@ class ManagementServer:
             self.session_lock = None
 
 
+def find_opener():
+    """Fixed platform openers only; never BROWSER or a shell string."""
+    if sys.platform == 'darwin':
+        return shutil.which('open')
+    if not (os.environ.get('DISPLAY') or os.environ.get('WAYLAND_DISPLAY')):
+        raise OSError('no DISPLAY/WAYLAND_DISPLAY desktop session')
+    return shutil.which('xdg-open')
+
+
+def open_launcher(launcher):
+    """Hand ONLY the private file URI to the opener. Returns None or a failure reason."""
+    try:
+        opener = find_opener()
+        if opener is None:
+            return 'no xdg-open/open on PATH'
+        result = subprocess.run([opener, Path(launcher).as_uri()], shell=False, stdin=subprocess.DEVNULL,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10,
+                                env={k: v for k, v in os.environ.items() if k != 'BROWSER'})
+    except subprocess.TimeoutExpired:
+        return 'opener timed out'
+    except OSError as exc:
+        return str(exc)
+    return None if result.returncode == 0 else 'opener exited with status %d' % result.returncode
+
+
 def run(vps, state, args):
     manager = ManagementServer(vps, state, independent_carrier=args.independent_carrier,
                                ssh_proxy=args.ssh_proxy, mihomo=args.mihomo)
@@ -710,6 +737,15 @@ def run(vps, state, args):
         manager._serving = True
         thread = threading.Thread(target=manager.serve_forever, name='vps-manage-http')
         thread.start()
+        if getattr(args, 'no_open', False):
+            print('Automatic open disabled (--no-open); open the launcher above manually.')
+        else:
+            reason = open_launcher(launcher)
+            if reason is None:
+                print('Requested the system opener for the launcher; if no page appears, open it manually.')
+            else:
+                print('Could not open a browser automatically (%s). Open this file manually; the local server keeps running: %s'
+                      % (reason, launcher))
         while not manager.stopping.wait(0.2):
             if time.monotonic() >= manager.expires:
                 break
@@ -721,3 +757,30 @@ def run(vps, state, args):
             signal.signal(sig, handler)
         if not manager.stopping.is_set():
             manager.close()
+
+
+def parser():
+    p = argparse.ArgumentParser(prog='manage.sh', description='session-scoped local browser credential management')
+    p.add_argument('--state-dir', type=Path, default=vps_module.DEFAULT_STATE)
+    p.add_argument('--ssh-proxy', type=vps_module.proxy_argument, help='startup-only independent loopback SSH carrier; default direct')
+    p.add_argument('--mihomo', help='native core executable, fixed for this session')
+    p.add_argument('--independent-carrier', action='store_true', help='acknowledge SSH route is independent of EVERY managed VPS account/entry')
+    p.add_argument('--no-open', action='store_true', help='do not open a browser; print the launcher path only')
+    p.add_argument('--job', action='store_true', help=argparse.SUPPRESS)
+    return p
+
+
+def main(argv=None):
+    args = parser().parse_args(argv)
+    vps_module.SSH_PROXY.set(args.ssh_proxy)
+    os.umask(0o077)
+    state = args.state_dir.expanduser().absolute()
+    try:
+        return machine_main(vps_module, state) if args.job else run(vps_module, state, args)
+    except (vps_module.host.Error, Refusal, OSError) as exc:
+        print('Error: %s' % exc, file=sys.stderr)
+        return 1
+
+
+if __name__ == '__main__':
+    sys.exit(main())

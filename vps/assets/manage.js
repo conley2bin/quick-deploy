@@ -577,7 +577,7 @@
     const launchToken = location.hash.slice(1);
     history.replaceState(null, '', location.pathname); // Clear capability before any network request.
     if (!launchToken || !/^http:\/\/127\.0\.0\.1:\d+$/.test(location.origin)) {
-      expire('请先运行 bash vps/setup.sh manage，再重新打开 vps/index.html 并点击进入。刷新此页不会自动恢复认证，也不是空设备列表。'); return;
+      expire('请先运行 bash vps/manage.sh，再重新打开 vps/index.html 并点击进入。刷新此页不会自动恢复认证，也不是空设备列表。'); return;
     }
     try {
       const session = await api('/api/session', {launch_token: launchToken});

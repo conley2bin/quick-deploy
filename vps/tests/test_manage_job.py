@@ -172,8 +172,8 @@ class MachineJobs(unittest.TestCase):
 
     def test_cli_bounded_stdin_and_single_json_stdout(self):
         for body in [b'x' * (manage.MAX_BODY + 1), b'{"action":"state","action":"add"}']:
-            result = subprocess.run([sys.executable, '-B', str(vps.MODULE / 'lib/vps.py'),
-                                     '--state-dir', str(self.state), 'manage-job'],
+            result = subprocess.run([sys.executable, '-B', str(vps.MODULE / 'lib/manage.py'),
+                                     '--state-dir', str(self.state), '--job'],
                                     input=body, capture_output=True, timeout=10)
             self.assertEqual(json.loads(result.stdout)['error']['code'], 'invalid_envelope')
 

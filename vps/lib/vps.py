@@ -1546,11 +1546,6 @@ def parser():
             a.add_argument('--device', help='show only this enabled committed device')
         if name == 'restore':
             a.set_defaults(backup_required=True)
-    a = sub.add_parser('manage', help='session-scoped local browser credential management')
-    a.add_argument('--ssh-proxy', type=proxy_argument, help='startup-only independent loopback SSH carrier; default direct')
-    a.add_argument('--mihomo', help='native core executable, fixed for this session')
-    a.add_argument('--independent-carrier', action='store_true', help='acknowledge SSH route is independent of EVERY managed VPS account/entry')
-    sub.add_parser('manage-job', help=argparse.SUPPRESS)
     a = sub.add_parser('cdn', help='add verified Cloudflare/XHTTP; retain REALITY on a separate TCP port and unchanged H2')
     a.add_argument('--domain', dest='cdn_domain', required=True, help='new CDN hostname; subscription domain remains unchanged')
     a.add_argument('--reality-port', type=int, default=9443, help='retained REALITY TCP port; default9443, no automatic fallback')
@@ -1575,6 +1570,12 @@ def parser():
 
 
 def main(argv=None):
+    tokens = list(sys.argv[1:] if argv is None else argv)
+    if '--state-dir' in tokens[:1]:
+        del tokens[:2]
+    if tokens[:1] in (['manage'], ['manage-job']):
+        print('Browser management moved: run bash vps/manage.sh (no longer a setup.sh command)', file=sys.stderr)
+        return 2
     args = parser().parse_args(argv)
     carrier = SSH_PROXY.set(getattr(args, 'ssh_proxy', None))
     os.umask(0o077)
@@ -1582,10 +1583,6 @@ def main(argv=None):
     try:
         # The long-lived HTTP session must never own the native state flock.
         # Each bounded machine request takes that same lock exactly once.
-        if args.command in ('manage', 'manage-job'):
-            import manage
-            return (manage.run(sys.modules[__name__], state, args) if args.command == 'manage'
-                    else manage.machine_main(sys.modules[__name__], state))
         with locked(state):
             if args.command == 'export':
                 if bool(args.device) != bool(args.bootstrap_dir):
