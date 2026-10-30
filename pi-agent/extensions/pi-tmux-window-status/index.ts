@@ -4,7 +4,7 @@ import { readFileSync, readdirSync, watch, type FSWatcher } from "node:fs";
 import * as os from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { aggregateLogicalState, HEARTBEAT_MS, publishLease, seedAttentionWatermarksFromSnapshot } from "./state.mjs";
+import { aggregateLogicalState, HEARTBEAT_MS, projectAsyncStatus, publishLease, seedAttentionWatermarksFromSnapshot } from "./state.mjs";
 export { RECOVERY_ARMED_OPTION } from "./state.mjs";
 import { requestAnimatorTick } from "./animator.mjs";
 import { RECOVERY_CANCEL_EVENT, installErrorRecovery, isAssistantError, recoveryTerminalInput, semanticAssistantOutput } from "./recovery.mjs";
@@ -59,12 +59,28 @@ export default function piTmuxWindowStatus(pi: ExtensionAPI) {
   let terminalInputUnsubscribe: (() => void) | undefined, activeRunSignal: AbortSignal | undefined;
   const cancelledRunSignals = new WeakSet<AbortSignal>();
   const owner = `${process.pid}:${tmux.paneId}`, children = new Map<string, Child>(), watchers = new Map<string, FSWatcher>(), routeWatchers = new Map<string, FSWatcher>(), attention = new Map<string, number>();
-  const snapshots = () => new Map([...children].map(([id, c]) => { const snapshot = mergedChildSnapshot(c, readStatus(c.asyncDir)); seedAttentionWatermarksFromSnapshot(snapshot, attention); return [id, snapshot]; }));
+  // Ownership outlives projection/Child replacement, but records only watermark-relevant IDs.
+  const attentionOwners = new Map<string, Set<string>>();
+  const ownAttention = (root: string, id: string) => { if (!attentionOwners.has(root)) attentionOwners.set(root, new Set()); attentionOwners.get(root)!.add(id); };
+  const snapshots = () => {
+    const current = new Map([...children].map(([id, c]) => [id, mergedChildSnapshot(c, readStatus(c.asyncDir))]));
+    // Seed every root first: a later root can introduce a watermark shared by an earlier one.
+    for (const snapshot of current.values()) seedAttentionWatermarksFromSnapshot(snapshot, attention);
+    for (const [root, snapshot] of current) for (const id of projectAsyncStatus(snapshot, attention).nodes.keys()) if (attention.has(id)) ownAttention(root, id);
+    return current;
+  };
   const logical = () => aggregateLogicalState({ mainActive, roots: new Set(children.keys()), snapshots: snapshots(), attentionWatermarks: attention });
   const diagnostic = () => { const state = logical(); return { parentSessionId: rootSessionId, activeRunIds: [...state.activeRoots].sort(), activeNodeIds: [...state.activeIds].sort() }; };
   const desiredLeaseState = () => assistantErrorLatched ? "error" : logical().active ? "active" : false;
   const kick = (force = false) => { if (!animatorSpawnNeeded(animator, Boolean(desiredLeaseState()), force)) return; animator = spawn(process.execPath, [ANIMATOR, tmux.socketPath], { detached: true, stdio: "ignore", env: process.env }); animator.unref(); };
-  const closeChild = (id: string) => { const child = children.get(id); if (!child) return; for (const key of [...attention.keys()]) if (containsRun(child.nestedProjection, key) || containsRun(readStatus(child.asyncDir), key)) attention.delete(key); children.delete(id); watchers.get(id)?.close(); watchers.delete(id); routeWatchers.get(id)?.close(); routeWatchers.delete(id); };
+  const closeChild = (id: string) => {
+    if (!children.delete(id)) return;
+    const owned = attentionOwners.get(id);
+    attentionOwners.delete(id);
+    // Retire history before fallible watcher cleanup; shared IDs belong to every remaining owner.
+    if (owned) for (const key of owned) if (![...attentionOwners.values()].some((ids) => ids.has(key))) attention.delete(key);
+    watchers.get(id)?.close(); watchers.delete(id); routeWatchers.get(id)?.close(); routeWatchers.delete(id);
+  };
   const watchNestedRoute = (id: string) => { const child = children.get(id); if (!child?.nestedRoute || routeWatchers.has(id)) return; try { const watcher = watch(child.nestedRoute.registryDir, (_event, name) => { if (!name || String(name) === "registry.json") { refreshNestedRegistry(id); sync(); } }); watcher.unref?.(); routeWatchers.set(id, watcher); } catch {} };
   const refreshNestedRegistry = (id: string) => { const child = children.get(id); if (!child?.nestedRoute) return; watchNestedRoute(id); const result = readNestedRegistryProjection(child.nestedRoute); if (!result.resolved) return; child.nestedProjection = result.projection; if (child.rootTerminal && !result.live) closeChild(id); };
   const refreshRetainedTerminalRoots = () => { for (const [id, child] of [...children]) if (child.rootTerminal && child.nestedRoute) refreshNestedRegistry(id); };
@@ -76,7 +92,7 @@ export default function piTmuxWindowStatus(pi: ExtensionAPI) {
   const started = (value: unknown) => { const p = object(value), id = typeof p?.id === "string" ? p.id : undefined, sessionId = typeof p?.sessionId === "string" ? p.sessionId : undefined; const child = childFromStartedPayload(value, rootSessionId); if (!child) { if (!id || typeof p?.asyncDir !== "string" || !sessionId) console.error("pi-tmux-window-status: malformed async-started payload (id, sessionId, and asyncDir required)"); else console.error(`pi-tmux-window-status: ignored foreign async-started '${id}'`); return; } children.set(child.id, { ...children.get(child.id), ...child }); watchChild(child.id); watchNestedRoute(child.id); sync(); };
   const complete = (value: unknown) => { const p = object(value), id = typeof p?.runId === "string" ? p.runId : typeof p?.id === "string" ? p.id : undefined, sessionId = typeof p?.sessionId === "string" ? p.sessionId : undefined; if (!id) { console.error("pi-tmux-window-status: malformed async-complete payload"); return; } if (sessionId && rootSessionId && sessionId !== rootSessionId) return; for (const [root, child] of [...children]) if (root === id || statusRoot(readStatus(child.asyncDir)) === id) { child.rootTerminal = true; if (Array.isArray(p?.nestedChildren)) { child.nestedProjection = nestedProjectionFromChildren(root, p.nestedChildren); if (child.nestedProjection && !child.nestedRoute) console.error(`pi-tmux-window-status: retaining terminal root '${root}' from completion nestedChildren without trusted nestedRoute; no authoritative sidecar can prove terminal, so it will remain failure-closed until session shutdown`); } if (child.nestedRoute) refreshNestedRegistry(root); if (children.has(root) && !child.nestedRoute && !child.nestedProjection) closeChild(root); } sync(); };
   function containsRun(node: unknown, id: string): boolean { const p = object(node); if (!p) return false; if (p.runId === id || p.id === id) return true; return (Array.isArray(p.steps) && p.steps.some((x) => containsRun(x, id))) || (Array.isArray(p.children) && p.children.some((x) => containsRun(x, id))); }
-  const control = (value: unknown) => { const event = object(object(value)?.event); if (event?.type !== "needs_attention" || typeof event.runId !== "string") return; const nested = event.runId; let attributed = false; for (const child of children.values()) { const snapshot = mergedChildSnapshot(child, readStatus(child.asyncDir)); if (snapshot && containsRun(snapshot, nested)) { attention.set(nested, Date.now()); attributed = true; } } if (!attributed) console.error(`pi-tmux-window-status: needs_attention '${nested}' was not attributable to a known async status`); sync(); };
+  const control = (value: unknown) => { const event = object(object(value)?.event); if (event?.type !== "needs_attention" || typeof event.runId !== "string") return; const nested = event.runId; let attributed = false; for (const child of children.values()) { const snapshot = mergedChildSnapshot(child, readStatus(child.asyncDir)); if (snapshot && containsRun(snapshot, nested)) { attention.set(nested, Date.now()); ownAttention(child.id, nested); attributed = true; } } if (!attributed) console.error(`pi-tmux-window-status: needs_attention '${nested}' was not attributable to a known async status`); sync(); };
   const restore = () => { if (!rootSessionId) return; for (const child of restoredChildren(defaultAsyncRoot(), rootSessionId)) { children.set(child.id, child); watchChild(child.id); watchNestedRoute(child.id); } sync(); };
   const captureSession = (ctx: { sessionManager?: SessionManager }) => { rootSessionId ||= sessionIdOf(ctx.sessionManager); if (!rootSessionId) console.error("pi-tmux-window-status: root Pi session identity is unavailable"); };
   const urgentAnimatorTick = () => { requestAnimatorTick(tmux); };
@@ -101,5 +117,5 @@ export default function piTmuxWindowStatus(pi: ExtensionAPI) {
   pi.on("message_update", (event, ctx) => { if (eventFromCancelledRun(ctx)) return; const msg = unwrapAssistantMessage(eventMessage([event])) || eventMessage([event]); updateAssistantError("message_update", msg); });
   pi.on("message_end", (event, ctx) => { if (eventFromCancelledRun(ctx)) return; updateAssistantError("message_end", eventMessage([event])); });
   pi.on("model_select", () => { updateAssistantError("model_select"); });
-  pi.on("session_shutdown", () => { const hadError = previousLeaseState === "error" || assistantErrorLatched; mainActive = false; assistantErrorLatched = false; terminalInputUnsubscribe?.(); terminalInputUnsubscribe = undefined; children.clear(); if (beat) clearInterval(beat); for (const watcher of watchers.values()) watcher.close(); watchers.clear(); for (const watcher of routeWatchers.values()) watcher.close(); routeWatchers.clear(); publishLease(tmux, owner, false); if (hadError) { kick(true); urgentAnimatorTick(); } for (const unsubscribe of unsub) if (typeof unsubscribe === "function") unsubscribe(); });
+  pi.on("session_shutdown", () => { const hadError = previousLeaseState === "error" || assistantErrorLatched; mainActive = false; assistantErrorLatched = false; terminalInputUnsubscribe?.(); terminalInputUnsubscribe = undefined; children.clear(); attention.clear(); attentionOwners.clear(); if (beat) clearInterval(beat); for (const watcher of watchers.values()) watcher.close(); watchers.clear(); for (const watcher of routeWatchers.values()) watcher.close(); routeWatchers.clear(); publishLease(tmux, owner, false); if (hadError) { kick(true); urgentAnimatorTick(); } for (const unsubscribe of unsub) if (typeof unsubscribe === "function") unsubscribe(); });
 }
