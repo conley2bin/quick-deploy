@@ -159,6 +159,32 @@ test("startup failure releases the guard and rejects instead of orphaning a boun
   assert.equal(lock.owner, true); await releaseAnimatorKernelLock(lock);
 });
 
+// Exception unwind: the child stays alive after the fault, so only explicit cleanup (not OS exit) can have released the guard.
+for (const [fault, expected] of [["now", /injected now/], ["subscribe", /injected subscribe/], ["unsubscribe", undefined], ["cancel", undefined]]) test(`injected ${fault} fault leaves no leaked kernel guard while the animator process stays alive`, async () => {
+  const d = temp(), socketPath = join(d, "s.sock");
+  const child = fork(join(HERE, "animator-fault-worker.mjs"), [], { env: { ...process.env, CFG: JSON.stringify({ socketPath, runtime: d, fault }) } });
+  children.add(child); pids.add(child.pid);
+  const next = () => once(child, "message", { signal: AbortSignal.timeout(8_000) }).then(([message]) => message);
+  await next();
+  child.send({ cmd: "run" });
+  const startup = await next();
+  if (expected) {
+    assert.match(startup.rejected, expected, "original startup error is preserved");
+    assert.equal(startup.servers, 0, "failed startup closed its bound Server");
+  } else {
+    assert.equal(startup.started, true);
+    child.send({ cmd: "stop" });
+    const stopped = await next();
+    assert.equal(stopped.calls.resets >= 1, true, "style reset was still attempted");
+    assert.equal(stopped.calls.cancel >= 1 && stopped.calls.unsubscribe >= 1, true, "every cleanup hook ran despite the throwing one");
+    assert.equal(stopped.servers, 0);
+  }
+  assert.equal(child.exitCode, null, "fixture is still alive: release was cleanup, not process exit");
+  const claim = await acquireAnimatorKernelLock({ socketPath, lockPath: join(d, "other", "animator.lock") });
+  assert.equal(claim.owner, true, "same-key kernel claim succeeds while the faulted child lives");
+  await releaseAnimatorKernelLock(claim);
+});
+
 // Mixed-generation module graphs must fail at ESM linking, before any lock, socket, metadata or tmux frame exists.
 function mixedGeneration(label, build) {
   test(`mixed-generation ${label} fails at linking with zero side effects`, () => {
