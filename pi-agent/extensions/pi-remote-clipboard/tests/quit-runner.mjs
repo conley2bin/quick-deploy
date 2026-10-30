@@ -45,10 +45,30 @@ async function untilStarted() {
   while (!started()) await turn();
 }
 
-if (mode === "timedout-exit") mock.timers.enable({ apis: ["setTimeout"] });
+const alive = (pid) => { try { process.kill(pid, 0); return true; } catch { return false; } };
+if (mode === "timedout-exit" || mode === "exited-timedout-exit") mock.timers.enable({ apis: ["setTimeout"] });
 const operation = shortcuts.get("ctrl+alt+v").handler(ctx);
 await untilStarted();
-if (mode === "timedout-exit") {
+if (mode === "exited-quit" || mode === "exited-timedout-exit") {
+  // The leader has already exited 0; a TERM-ignoring descendant still holds the pipe.
+  const leader = Number(readdirSync(temp).find((name) => name.startsWith("started-")).slice(8));
+  while (alive(leader)) await turn();
+  if (mode === "exited-timedout-exit") {
+    mock.timers.tick(8000); // deadline rejects the operation; the leader is already gone
+    await operation;
+  }
+  const shutdown = events.get("session_shutdown")({ type: "session_shutdown" }, ctx);
+  let done = false;
+  void shutdown.then(() => { done = true; });
+  // Grace time advances only while shutdown is still pending: a shutdown that already
+  // returned must not rely on a timer that process.exit would destroy.
+  for (let turns = 0; turns < 50 && !done; turns += 1) {
+    await turn();
+    if (!done && mode === "exited-timedout-exit") mock.timers.tick(1000);
+  }
+  await shutdown;
+  process.exit(0);
+} else if (mode === "timedout-exit") {
   mock.timers.tick(8000); // the operation promise has already settled (timed out) before quitting
   await operation;
   const shutdown = events.get("session_shutdown")({ type: "session_shutdown" }, ctx);

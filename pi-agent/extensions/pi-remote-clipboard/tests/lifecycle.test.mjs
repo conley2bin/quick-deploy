@@ -483,6 +483,22 @@ for (const runnerMode of ["inflight-exit", "timedout-exit"]) {
   });
 }
 
+for (const runnerMode of ["exited-quit", "exited-timedout-exit"]) {
+  test(`quit (${runnerMode}): leader already exited, TERM-ignoring pipe-holder remains; descendant is gone after shutdown + immediate exit, before any manual kill`, async () => {
+    writeHelper("ctrlv.py", holdingDescendant(""));
+    try {
+      const { code } = await runQuit(runnerMode);
+      assert.equal(code, 0);
+      assert.equal(startedPids().some(alive), false);
+      const survivors = grandchildren().filter(alive);
+      for (const pid of survivors) { try { process.kill(pid, "SIGKILL"); } catch { /* gone */ } }
+      assert.deepEqual(survivors, [], "descendant survived the runner's quit");
+    } finally {
+      writeHelper("ctrlv.py", helperSource);
+    }
+  });
+}
+
 test("quit (inflight-natural): no timer or pipe keeps the process alive after shutdown", async () => {
   writeFileSync(join(temp, "mode"), "ignoreterm grandchild");
   const { code, elapsed } = await runQuit("inflight-natural");

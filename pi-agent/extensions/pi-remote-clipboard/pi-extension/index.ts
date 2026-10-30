@@ -145,10 +145,11 @@ function runHelper(
       if (settled) return;
       settled = true;
       done();
-      maybeFinish();
+      // 不在此处 maybeFinish：结算原因（正常 close / 取消 / 超时 / 溢出）决定是否还要终止，
+      // 清理资格只能在各路径完成自己的状态转移（terminating 等）之后判定。
     };
     const terminate = (): void => {
-      if (terminating) return;
+      if (terminating || quiet) return;
       terminating = true;
       signal("SIGTERM");
       killTimer = setTimeout(() => {
