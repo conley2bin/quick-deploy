@@ -138,6 +138,7 @@
     qrDevice = device;
     byId('qr-device').textContent = device.name;
     byId('qr-title').textContent = link.label;
+    byId('qr-description').textContent = `在对应客户端中扫码导入。二维码与“复制链接”是同一条${link.kind === 'subscription' ? '订阅 URL' : ' URI'}，包含此设备的连接凭据。`;
     byId('qr-image').alt = `${device.name} · ${link.label} 的导入二维码`;
     byId('qr-error').hidden = true;
     byId('qr-image').hidden = false;
@@ -178,10 +179,19 @@
       if (transport === 'xhttp') parts.push('XHTTP');
       if (security === 'reality') parts.push('REALITY');
       else if (security === 'tls') parts.push('TLS');
-      return { name: parts.join(' / '), icon: transport === 'xhttp' ? 'X' : security === 'reality' ? 'R' : 'V', scheme };
+      const role = transport === 'xhttp' ? 'CF XHTTP · 外层 TCP（经 CDN）' : security === 'reality' ? 'REALITY 直连 · 外层 TCP' : '';
+      return { name: parts.join(' / '), icon: transport === 'xhttp' ? 'X' : security === 'reality' ? 'R' : 'V', scheme, role };
     }
-    if (/^(hy2|hysteria2|hysteria)$/i.test(protocol)) return { name: 'Hysteria2', icon: 'H2', scheme };
-    return { name: protocol, icon: 'URI', scheme };
+    if (/^(hy2|hysteria2|hysteria)$/i.test(protocol)) return { name: 'Hysteria2', icon: 'H2', scheme, role: 'H2 直连 · 外层 UDP' };
+    return { name: protocol, icon: 'URI', scheme, role: '' };
+  };
+  const clients = {mihomo: 'Clash Verge 等 Mihomo 客户端', shadowrocket: 'Shadowrocket 客户端'};
+  const cardDescription = (link, display) => {
+    if (link.kind === 'subscription') {
+      const client = clients[String(link.protocol).toLowerCase()] || '对应客户端';
+      return `${client}：在订阅功能中添加；二维码与复制的是同一个订阅 URL，包含本设备全部入口。`;
+    }
+    return `${display.role ? display.role + ' · ' : ''}只导入这一个入口；二维码与复制的是同一条 URI，凭据默认隐藏。`;
   };
   const renderCard = (link, device) => {
     const card = make('article', `connection-card ${link.kind}`);
@@ -192,7 +202,7 @@
     // Subscription names describe the target client, not the HTTPS transport.
     const name = isSubscription ? String(link.protocol || 'URI') : display.name;
     topline.append(make('span', 'protocol-tag', `${name}${display.scheme ? ` · ${display.scheme[1]}://` : ''}`));
-    card.append(topline, make('h3', '', link.label), make('p', 'card-description', isSubscription ? '使用对应客户端的订阅导入功能。' : '原生链接 · 连接凭据默认隐藏'));
+    card.append(topline, make('h3', '', link.label), make('p', 'card-description', cardDescription(link, display)));
     const actions = make('div', 'card-actions');
     const show = make('button', 'button primary', '显示二维码');
     show.type = 'button';
@@ -302,6 +312,23 @@
     byId('load-error').textContent = text;
     byId('load-error').hidden = !text;
   };
+  // Operation identity comes only from backend job fields or the payload this page
+  // submitted, bound by request_id/job_id; never from the selected device.
+  const submitted = new Map();
+  const jobContext = new Map();
+  const actions = ['add', 'rename', 'reset', 'remove', 'recover'];
+  const validContext = ctx => ctx && actions.includes(ctx.action) && Array.isArray(ctx.names) && ctx.names.length === (ctx.action === 'rename' ? 2 : ctx.action === 'recover' ? 0 : 1) && ctx.names.every(name => typeof name === 'string' && namePattern.test(name));
+  const noteJob = job => {
+    if (!job || typeof job.job_id !== 'string') return;
+    const ctx = validContext(job) ? {action: job.action, names: job.names} : submitted.get(job.request_id);
+    if (ctx) jobContext.set(job.job_id, ctx);
+  };
+  const operationText = (ctx, running) => {
+    if (!ctx) return '历史操作（未记录类型）';
+    const [a, b] = ctx.names;
+    return {add: `${running ? '正在' : ''}新增设备 ${a}`, rename: running ? `正在将 ${a} 改名为 ${b}…` : `将 ${a} 改名为 ${b}`, reset: `${running ? '正在' : ''}重置设备 ${a} 的凭据`, remove: `${running ? '正在' : ''}删除设备 ${a}`, recover: `${running ? '正在' : ''}恢复上次未完成操作`}[ctx.action];
+  };
+  const clock = ms => { const d = new Date(ms); return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`; };
   const jobMessage = text => {
     byId('job-panel').hidden = false;
     byId('job-status').textContent = text;
@@ -349,10 +376,13 @@
     byId('refresh-state').disabled = !token || submitting;
     byId('edit-submit').disabled = !allowed;
   };
+  const cutoffText = () => `已停止接收新操作，已提交任务继续执行；仍可查看/复制链接，至 ${clock(expiresAt)}。`;
+  const timeNote = () => `${expiresAt - Date.now() >= 1230000 ? `新增/改名/重置/删除可提交至 ${clock(expiresAt - 1230000)}；` : `${cutoffText()}`}管理页会话于 ${clock(expiresAt)} 结束。20 分钟是单项操作的超时上限，不代表需要等 20 分钟；会话结束不影响节点/已导入配置使用。此页不检测节点在线状态。`;
   const expire = text => {
     token = ''; synchronized = false; current = null; unresolved = null; activeJob = null;
     clearTimeout(expiryTimer); clearTimeout(stateTimer); clearTimeout(pollTimer);
     clearSecrets(); updateControls();
+    byId('time-note').textContent = '管理页会话已结束；节点/已导入配置不受影响。';
     byId('session-status').textContent = '会话不可用';
     byId('carrier-status').textContent = '管理会话已断开';
     byId('write-reason').textContent = '连接资料已清除；已有导出副本仍需自行保管。';
@@ -380,8 +410,8 @@
     current = state; synchronized = true;
     const pending = state.pending.present;
     byId('carrier-status').textContent = state.writable ? '独立管理通道 · 已由启动者确认' : '只读 / 写入受限';
-    const reasons = {independent_carrier_required: '只读：启动时未确认独立管理通道。请使用独立路线重新启动 manage --independent-carrier。', reconciliation_required: '上次操作结果需要核对，请检查终端并保留原操作记录。', busy: '模块正在执行原操作，暂时禁止新变更。', pending: '原操作待恢复；用下方恢复按钮核对原操作，不能开始新变更。', insufficient_session_time: '剩余会话时间不足以容纳 20 分钟任务及清理，请重新启动会话。'};
-    byId('write-reason').textContent = String(reasons[state.writable_reason] || state.writable_reason || (state.writable ? '管理路线在启动时选定，页面不能更改。独立性由操作者确认，不是自动探测。' : '未具备写入条件，请检查启动终端的独立 SSH 通道与会话剩余时间。'));
+    const reasons = {independent_carrier_required: '只读：启动时未确认独立管理通道。请使用独立路线重新启动 manage --independent-carrier。', reconciliation_required: '上次操作结果需要核对，请检查终端并保留原操作记录。', busy: '模块正在执行原操作，暂时禁止新变更。', pending: '原操作待恢复；用下方恢复按钮核对原操作，不能开始新变更。', insufficient_session_time: cutoffText()};
+    byId('write-reason').textContent = expiresAt - Date.now() < 1230000 ? cutoffText() : String(reasons[state.writable_reason] || state.writable_reason || (state.writable ? '管理路线在启动时选定，页面不能更改。独立性由操作者确认，不是自动探测。' : '未具备写入条件，请检查启动终端的独立 SSH 通道与会话剩余时间。'));
     if (pending) {
       jobMessage(`原操作尚待核对（${String(state.pending.mode || '未知类型')}）。凭据已隐藏。请用独立 SSH 通道显式恢复原操作，不要重新新增、重置或删除。`);
       byId('state-note').textContent = '存在 pending；不展示候选或旧凭据。';
@@ -414,7 +444,8 @@
       const state = await api('/api/state');
       if (!token) return;
       applyState(state); errorPanel('');
-      if (unresolved) jobMessage('上次提交的响应丢失，尚未找到匹配任务。禁止再次变更；请保持终端并核对原操作。此按钮只读取状态，不重发 POST。');
+      noteJob(state.last_job);
+      if (unresolved) jobMessage(`上次提交的“${operationText(submitted.get(unresolved.request_id))}”响应丢失，尚未找到匹配任务。禁止再次变更；请保持终端并核对该操作。此按钮只读取状态，不重发 POST。`);
       if (state.last_job && (state.last_job.state === 'running' || (activeJob && state.last_job.job_id === activeJob))) startPolling(state.last_job.job_id);
       return state;
     } catch (error) { handleReadError(error); }
@@ -422,10 +453,10 @@
   const outcomes = {
     committed: '原生变更已提交，正在读取新代次资料。',
     committed_export_failed: '原生变更已经提交；本地便利导出失败。请检查终端并修复导出，不要重做此操作。',
-    rolled_back: '原操作已回滚，正在核对已提交状态。',
-    recovery_required: '原操作结果需要恢复核对。不要重复提交变更。',
-    rejected: '原操作被拒绝；请核对当前状态和终端提示，不会自动重试。',
-    unchanged: '原操作未更改已提交状态。'
+    rolled_back: '已回滚，正在核对已提交状态。',
+    recovery_required: '结果需要恢复核对。不要重复提交变更。',
+    rejected: '被拒绝；请核对当前状态和终端提示，不会自动重试。',
+    unchanged: '未更改已提交状态。'
   };
   const pollJob = async () => {
     const id = activeJob;
@@ -437,19 +468,22 @@
     try {
       const job = await api(`/api/jobs/${encodeURIComponent(id)}`);
       if (!token || activeJob !== id) return;
+      noteJob({job_id: id, ...job});
+      const ctx = jobContext.get(id);
       if (job.state === 'running') {
-        jobMessage(`原操作执行中 · ${Math.floor(Number(job.elapsed_s) || 0)} 秒 / 最多 1200 秒。请勿关闭启动终端或重复提交。`);
+        jobMessage(`${operationText(ctx, true)} · 已用 ${Math.floor(Number(job.elapsed_s) || 0)} 秒（超时上限 20 分钟）。请勿关闭启动终端或重复提交。`);
         pollTimer = setTimeout(pollJob, 2000); return;
       }
       if (job.state !== 'finished' || !outcomes[job.outcome]) throw new Error('job');
       activeJob = null;
-      jobMessage(outcomes[job.outcome]);
+      const prefix = `${operationText(ctx, false)}：`;
+      jobMessage(prefix + outcomes[job.outcome]);
       const state = await refreshState();
-      if (state && !state.pending.present) jobMessage(outcomes[job.outcome] + (job.outcome === 'committed' ? ' 已读取最新已提交状态。' : ''));
+      if (state && !state.pending.present) jobMessage(prefix + outcomes[job.outcome] + (job.outcome === 'committed' ? ' 已读取最新已提交状态。' : ''));
       updateControls();
     } catch (error) {
       handleReadError(error);
-      if (token) jobMessage('任务状态读取中断。原操作可能仍在执行；点击核对状态查看原任务，禁止重复提交。');
+      if (token) jobMessage(`任务状态读取中断。“${operationText(jobContext.get(id))}”可能仍在执行；点击核对状态查看该任务，禁止重复提交。`);
     }
   };
   const startPolling = id => {
@@ -463,13 +497,14 @@
   const submit = async (path, payload) => {
     if (submitting || activeJob || !token) return;
     submitting = true; unresolved = payload; updateControls();
+    submitted.set(payload.request_id, payload.action ? {action: payload.action, names: payload.names} : {action: 'recover', names: []});
     if (byId('edit-dialog').open) byId('edit-dialog').close();
-    jobMessage('正在提交一次原操作；确认结果前不会重复发送。');
+    jobMessage(`正在提交一次“${operationText(submitted.get(payload.request_id), true)}”；确认结果前不会重复发送。`);
     try {
       const job = await api(path, payload);
       if (!token) return;
       if (!job || typeof job.job_id !== 'string') throw new Error('job');
-      unresolved = null; startPolling(job.job_id);
+      unresolved = null; noteJob({...job, request_id: payload.request_id}); startPolling(job.job_id);
     } catch (error) {
       // A failed HTTP status is an explicit rejection; a lost response is unknown.
       if (error.status) unresolved = null;
@@ -539,8 +574,9 @@
     const remaining = Math.max(0, Math.ceil((expiresAt - Date.now()) / 1000));
     if (!remaining) { expire(); return; }
     byId('session-status').textContent = `本机会话 · 剩余 ${Math.ceil(remaining / 60)} 分钟`;
+    byId('time-note').textContent = timeNote();
     updateControls();
-    if (remaining < 1230) byId('write-reason').textContent = '剩余会话不足 20 分钟 30 秒，不能再启动变更或恢复。请重新启动管理会话；正在执行的原任务不要重复提交。';
+    if (remaining < 1230) byId('write-reason').textContent = cutoffText();
     expiryTimer = setTimeout(tick, 1000);
   };
   const observeState = async () => {

@@ -1,5 +1,6 @@
 """Loopback-only HTTP acceptance, with no remote/native process."""
 import contextlib
+import datetime
 import hashlib
 import http.client
 import json
@@ -239,6 +240,67 @@ class HTTPManagement(unittest.TestCase):
         saved = self.state / 'manage-jobs' / (first['job_id'] + '.json')
         self.assertEqual(saved.stat().st_mode & 0o777, 0o600)
         self.assertNotIn(self.manager.bearer, saved.read_text())
+
+    def test_job_descriptor_persists_and_legacy_jobs_stay_unlabelled(self):
+        cases = [(dict(), 'add', ['reader']),
+                 (dict(action='rename', names=['tablet', 'phone']), 'rename', ['tablet', 'phone']),
+                 (dict(action='reset', names=['tablet'], confirm={'action': 'reset', 'name': 'tablet'}),
+                  'reset', ['tablet']),
+                 (dict(action='remove', names=['tablet'], confirm={'action': 'remove', 'name': 'tablet'}),
+                  'remove', ['tablet'])]
+        for index, (changes, action, names) in enumerate(cases):
+            request_id = '%032x' % (index + 10)
+            code, job, _ = self.request('POST', '/api/jobs', self.body(request_id, **changes))
+            self.assertEqual(code, 202)
+            self.release.set()
+            self.manager.worker.join(5)
+            public = self.request(path='/api/jobs/' + job['job_id'])[1]
+            self.assertEqual((public['action'], public['names']), (action, names))
+            saved = json.loads((self.state / 'manage-jobs' / (job['job_id'] + '.json')).read_text())
+            self.assertEqual((saved['job']['action'], saved['job']['names']), (action, names))
+            self.assertFalse(set(public) & {'_started', 'launch_token', 'token'})
+            self.assertEqual(self.request()[1]['last_job']['names'], names)
+        self.release.clear()
+        self.assertEqual(self.request('POST', '/api/recover', {})[0], 400)
+        self.source['pending'] = {'present': True, 'mode': 'devices', 'operation_id': 'c' * 32}
+        code, job, _ = self.request('POST', '/api/recover', {
+            'request_id': '2' * 32, 'expected_operation_id': 'c' * 32})
+        self.assertEqual(code, 202)
+        recovered = self.request(path='/api/jobs/' + job['job_id'])[1]
+        self.assertEqual((recovered['action'], recovered['names']), ('recover', []))
+        self.release.set()
+        self.manager.worker.join(5)
+        self.manager.close()
+        self.thread.join(5)
+        second = manage.ManagementServer(vps, self.state, independent_carrier=True,
+                                         mihomo=sys.executable, executor=self.manager.executor)
+        try:
+            self.assertEqual(sorted(tuple(v['names']) for v in second.jobs.values() if 'names' in v),
+                             [(), ('reader',), ('tablet',), ('tablet',), ('tablet', 'phone')])
+        finally:
+            second.close()
+
+    def test_legacy_job_without_descriptor_loads_unchanged(self):
+        legacy = {'job_id': '3' * 32, 'request_id': '4' * 32, 'state': 'finished', 'outcome': 'committed',
+                  'generation_before': A, 'started_at': 1.0, 'deadline_s': 1200}
+        vps.host.atomic(self.state / 'manage-jobs' / ('3' * 32 + '.json'), json.dumps({
+            'schema': 1, 'fingerprint': 'f' * 64, 'unknown': False, 'job': legacy}))
+        self.manager.close()
+        self.thread.join(5)
+        second = manage.ManagementServer(vps, self.state, independent_carrier=True,
+                                         mihomo=sys.executable, executor=self.manager.executor)
+        try:
+            self.assertEqual(second.public_job(second.jobs['3' * 32]), legacy)
+        finally:
+            second.close()
+
+    def test_optional_timing_fields_are_absolute_and_additive(self):
+        state = self.request()[1]
+        self.assertEqual((state['job_limit_s'], state['cleanup_margin_s']),
+                         (manage.JOB_SECONDS, manage.CLEANUP_MARGIN))
+        start = datetime.datetime.strptime(state['new_jobs_until'], '%Y-%m-%dT%H:%M:%SZ')
+        end = datetime.datetime.strptime(state['session_ends_at'], '%Y-%m-%dT%H:%M:%SZ')
+        self.assertAlmostEqual((end - start).total_seconds(), manage.JOB_SECONDS + manage.CLEANUP_MARGIN, delta=1)
 
     def test_restart_history_unknown_does_not_poison_current_state(self):
         job = {'job_id': '3' * 32, 'request_id': '4' * 32, 'state': 'running',

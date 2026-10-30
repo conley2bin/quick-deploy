@@ -38,7 +38,8 @@ async function harness(options={}) {
   const location={hash:options.noFragment?'':'#FAKE_LAUNCH',pathname:'/',origin:'http://127.0.0.1:43123'};
   let state={schema:1,session_id:'FAKE_SESSION',generation:'a'.repeat(64),pending:{present:false},busy:false,writable:true,writable_reason:null,last_job:null,model:structuredClone(fixture.model)};
   if(options.readonly)Object.assign(state,{writable:false,writable_reason:'independent_carrier_required'});
-  let mode='running', failPost=false, status=200;
+  let mode='running', failPost=false, status=200, jobExtra={};
+  const FakeDate=options.now?class extends Date{constructor(...a){a.length?super(...a):super(options.now);}static now(){return options.now;}}:Date;
   const fetch=async(path,request)=>{
     assert.equal(location.hash,'','fragment cleared before HTTP');
     requests.push({path,...request,body:request.body?JSON.parse(request.body):undefined});
@@ -47,15 +48,15 @@ async function harness(options={}) {
     if(path==='/api/state')return {ok:status===200,status,json:async()=>structuredClone(state)};
     if(request.method==='POST'){
       if(failPost)throw Error('lost response');
-      state.last_job={job_id:'FAKE_JOB',request_id:requests.at(-1).body.request_id,state:'running'};
+      state.last_job={job_id:'FAKE_JOB',request_id:requests.at(-1).body.request_id,state:'running',...jobExtra};
       return {ok:true,status:202,json:async()=>({job_id:'FAKE_JOB',state:'running'})};
     }
-    return {ok:true,json:async()=>({job_id:'FAKE_JOB',state:mode==='running'?'running':'finished',elapsed_s:4,outcome:mode==='running'?undefined:mode})};
+    return {ok:true,json:async()=>({job_id:'FAKE_JOB',state:mode==='running'?'running':'finished',elapsed_s:4,outcome:mode==='running'?undefined:mode,...jobExtra})};
   };
   class LocalURL extends URL {static createObjectURL(blob){const id='blob:fake-'+blobs.size;blobs.set(id,blob);return id;}static revokeObjectURL(id){blobs.delete(id);}}
-  const context={document:doc,navigator:{clipboard:{writeText:async value=>clipboard.push(value)}},URL:LocalURL,Blob,Uint8Array,Date,AbortController,crypto:webcrypto,location,history:{replaceState(a,b,path){assert.equal(path,'/');location.hash='';}},window:{addEventListener:(k,v)=>events.set(k,v)},fetch,atob:v=>Buffer.from(v,'base64').toString('binary'),setTimeout:(fn,delay)=>{timers.set(++timer,{fn,delay});return timer;},clearTimeout:id=>timers.delete(id)};
+  const context={document:doc,navigator:{clipboard:{writeText:async value=>clipboard.push(value)}},URL:LocalURL,Blob,Uint8Array,Date:FakeDate,AbortController,crypto:webcrypto,location,history:{replaceState(a,b,path){assert.equal(path,'/');location.hash='';}},window:{addEventListener:(k,v)=>events.set(k,v)},fetch,atob:v=>Buffer.from(v,'base64').toString('binary'),setTimeout:(fn,delay)=>{timers.set(++timer,{fn,delay});return timer;},clearTimeout:id=>timers.delete(id)};
   vm.runInNewContext(source,context,{filename:'manage.js'});await flush();
-  return {get,clipboard,downloads,blobs,requests,context,events,get state(){return state;},set state(v){state=v;},set mode(v){mode=v;},set failPost(v){failPost=v;},set status(v){status=v;},async poll(){const entry=[...timers].find(([,t])=>t.delay===0||t.delay===2000);assert.ok(entry,'job timer exists');timers.delete(entry[0]);await entry[1].fn();await flush();}};
+  return {get,clipboard,downloads,blobs,requests,context,events,get state(){return state;},set state(v){state=v;},set mode(v){mode=v;},set failPost(v){failPost=v;},set jobExtra(v){jobExtra=v;},set status(v){status=v;},async poll(){const entry=[...timers].find(([,t])=>t.delay===0||t.delay===2000);assert.ok(entry,'job timer exists');timers.delete(entry[0]);await entry[1].fn();await flush();}};
 }
 const h=await harness();
 assert.equal(h.get('node-links').children.length,3);assert.equal(h.get('subscription-links').children.length,2);
@@ -142,4 +143,48 @@ for(const mode of ['backup','future-mode']){ // pending identity is an opaque st
   const r=q.requests.filter(x=>x.path==='/api/recover');assert.equal(r.length,1);assert.equal(r[0].body.expected_operation_id,opaque);assert.match(r[0].body.request_id,/^[a-f0-9]{32}$/);
 }
 checks.push('recover echoes backend-provided opaque operation_id verbatim for any pending mode');
+
+{ // Job identity: bound by request_id to the submitted payload, never to the selected card.
+  const r=await harness();await r.get('rename-device').emit('click');r.get('edit-name').value='renamed';await r.get('edit-form').emit('submit');
+  await r.get('device-list').children[1].emit('click');assert.equal(r.get('device-name').textContent,'beta');
+  await r.poll();assert.match(r.get('job-status').textContent,/^正在将 alpha 改名为 renamed… · 已用 4 秒（超时上限 20 分钟）/);assert.doesNotMatch(r.get('job-status').textContent,/beta/);
+  r.mode='committed';r.state.last_job=null;await r.poll();assert.match(r.get('job-status').textContent,/^将 alpha 改名为 renamed：原生变更已提交/);
+  assert.equal(r.requests.filter(x=>x.method==='POST'&&x.path==='/api/jobs').length,1,'no re-POST');
+  const a=await harness();await a.get('add-device').emit('click');a.get('edit-name').value='test';await a.get('edit-form').emit('submit');await a.poll();
+  assert.equal(a.get('job-status').textContent,'正在新增设备 test · 已用 4 秒（超时上限 20 分钟）。请勿关闭启动终端或重复提交。');
+  // Failure to read state after submit never re-POSTs and keeps naming the operation.
+  a.mode='rejected';a.state.last_job=null;await a.poll();assert.match(a.get('job-status').textContent,/^新增设备 test：被拒绝/);
+  for(const [action,names,text] of [['reset',['beta'],'正在重置设备 beta 的凭据'],['remove',['beta'],'正在删除设备 beta'],['add',['x'],'正在新增设备 x'],['rename',['beta','b2'],'正在将 beta 改名为 b2…'],['recover',[],'正在恢复上次未完成操作']]){
+    // After a page restart the backend's flat fields name the job; the page never submitted it.
+    const q=await harness();q.state.last_job={job_id:'OLD_JOB',request_id:'f'.repeat(32),state:'running',action,names};q.jobExtra={action,names};
+    await q.get('refresh-state').emit('click');await q.poll();assert.ok(q.get('job-status').textContent.startsWith(text+' · 已用'),q.get('job-status').textContent);
+  }
+  const old=await harness();old.state.last_job={job_id:'OLD_JOB',request_id:'e'.repeat(32),state:'running'};await old.get('refresh-state').emit('click');await old.poll();
+  assert.ok(old.get('job-status').textContent.startsWith('历史操作（未记录类型）'));assert.doesNotMatch(old.get('job-status').textContent,/alpha|新增|改名|重置|删除/);
+  const bad=await harness();bad.state.last_job={job_id:'BAD',request_id:'d'.repeat(32),state:'running',action:'drop-all',names:['<b>']};bad.jobExtra={action:'drop-all',names:['<b>']};await bad.get('refresh-state').emit('click');await bad.poll();
+  assert.ok(bad.get('job-status').textContent.startsWith('历史操作（未记录类型）'),'invalid backend fields are not invented into a label');
+  checks.push('job status names action and target from request_id-bound payload or backend fields; legacy/invalid shows 历史操作（未记录类型）; no re-POST');
+}
+{ // Exact deadlines at a fixed clock; 1230 s admission boundary; node validity never claimed.
+  const hm=ms=>{const d=new Date(ms);return String(d.getHours()).padStart(2,'0')+':'+String(d.getMinutes()).padStart(2,'0');};
+  const now=Date.UTC(2026,9,30,9,0,0),t=await harness({now});
+  const text=t.get('time-note').textContent;
+  assert.ok(text.includes(`新增/改名/重置/删除可提交至 ${hm(now+1470000)}；管理页会话于 ${hm(now+2700000)} 结束`),text);
+  assert.ok(text.includes('20 分钟是单项操作的超时上限，不代表需要等 20 分钟'));assert.ok(text.includes('会话结束不影响节点/已导入配置使用'));
+  assert.doesNotMatch(text,/45 分钟|有效期|节点.*过期/);
+  const late=await harness({now,ttl:1200});const lt=late.get('time-note').textContent;
+  assert.ok(lt.startsWith(`已停止接收新操作，已提交任务继续执行；仍可查看/复制链接，至 ${hm(now+1200000)}。`),lt);
+  assert.equal(late.get('add-device').disabled,true);assert.equal(late.get('node-links').children.length,3,'links stay visible');
+  assert.equal(late.get('write-reason').textContent,`已停止接收新操作，已提交任务继续执行；仍可查看/复制链接，至 ${hm(now+1200000)}。`);
+  checks.push('time copy shows exact submit/session deadlines, timeout-cap explanation and post-cutoff read-only wording');
+}
+{ // Import-option copy; QR/copy payloads (checked above) remain the same URI/URL.
+  const c=await harness();
+  assert.match(html,/只导入一个入口/);assert.match(html,/一次导入本设备全部 3 入口，按客户端选一个，无需全部导入/);assert.match(html,/YAML 完整配置、base64 编码订阅、URI 节点清单、URL JSON 订阅地址列表/);assert.match(html,/不是额外账户或权限/);
+  const nodeText=[...c.get('node-links').children].map(x=>x.children[2].textContent),subText=[...c.get('subscription-links').children].map(x=>x.children[2].textContent);
+  assert.ok(nodeText.some(t=>t.startsWith('REALITY 直连 · 外层 TCP')));assert.ok(nodeText.some(t=>t.startsWith('H2 直连 · 外层 UDP')));assert.ok(nodeText.every(t=>t.includes('只导入这一个入口')&&t.includes('同一条 URI')));
+  assert.match(subText[0],/^Clash Verge 等 Mihomo 客户端/);assert.match(subText[1],/^Shadowrocket 客户端/);assert.ok(subText.every(t=>t.includes('同一个订阅 URL')));
+  await c.get('subscription-links').children[0].children[3].children[0].emit('click');assert.match(c.get('qr-description').textContent,/同一条订阅 URL/);
+  checks.push('import-option copy distinguishes one-entry nodes from whole-device subscriptions and file formats');
+}
 console.log(JSON.stringify({status:'passed',checks}));

@@ -29,7 +29,7 @@
         <section class="session-panel" aria-label="会话状态">
           <div class="session-line"><strong id="carrier-status">尚未连接</strong><button id="refresh-state" type="button" class="button secondary" disabled>核对已提交状态</button></div>
           <p id="write-reason" class="muted">等待本机会话认证。</p>
-          <p class="muted">会话最长 45 分钟；每项任务最多 20 分钟，剩余时间不足时不可启动。此页不检测节点在线状态。</p>
+          <p id="time-note" class="muted">等待本机会话时间。</p>
         </section>
         <section class="notice management-warning"><p>所有变更（包括改名）都可能重启共享核心，短暂中断<strong>全部设备</strong>。SSH 必须走独立于本 VPS 三个入口的管理通道；本 VPS 的 H2 不是独立通道。</p></section>
         <section id="load-error" class="error-panel" role="alert" hidden></section>
@@ -38,9 +38,9 @@
           <header class="device-heading"><div><p class="eyebrow">当前设备 / CONNECTIONS</p><h1 id="device-name"></h1><p class="muted">选择原生节点或客户端订阅；修改操作作用于整个设备账户。</p></div><span id="device-state" class="state-badge"></span></header>
           <div class="device-actions"><button id="rename-device" type="button" class="button secondary" disabled>修改名称</button><button id="reset-device" type="button" class="button secondary" disabled>重置凭据</button><button id="remove-device" type="button" class="button danger" disabled>删除整个设备</button></div>
           <p id="disabled-notice" class="notice disabled-notice" hidden>此设备在快照中已停用，不提供导入链接或配置。</p>
-          <section class="connection-section" aria-labelledby="nodes-heading"><div class="section-heading"><h2 id="nodes-heading">原生节点</h2><span class="muted">单节点 · 扫码或复制导入</span></div><div id="node-links" class="card-grid"></div></section>
-          <section class="connection-section" aria-labelledby="subscriptions-heading"><div class="section-heading"><h2 id="subscriptions-heading">客户端订阅</h2><span class="muted">在对应客户端内添加订阅</span></div><div id="subscription-links" class="card-grid"></div></section>
-          <section class="downloads-section" aria-labelledby="downloads-heading"><div><h2 id="downloads-heading">下载配置</h2><p class="muted">保留原生文件格式，供离线导入。</p></div><div id="config-downloads" class="download-list"></div></section>
+          <section class="connection-section" aria-labelledby="nodes-heading"><div class="section-heading"><h2 id="nodes-heading">原生节点</h2><span class="muted">只导入一个入口</span></div><div id="node-links" class="card-grid"></div></section>
+          <section class="connection-section" aria-labelledby="subscriptions-heading"><div class="section-heading"><h2 id="subscriptions-heading">客户端订阅</h2><span class="muted">一次导入本设备全部 3 入口，按客户端选一个，无需全部导入</span></div><div id="subscription-links" class="card-grid"></div></section>
+          <section class="downloads-section" aria-labelledby="downloads-heading"><div><h2 id="downloads-heading">下载配置</h2><p class="muted">同一设备的不同文件格式，不是额外账户或权限：YAML 完整配置、base64 编码订阅、URI 节点清单、URL JSON 订阅地址列表；无需全部导入。</p></div><div id="config-downloads" class="download-list"></div></section>
         </div>
         <section class="access-note"><h2>连接凭据就是访问能力</h2><p>三个入口已经要求有效 UUID / Auth。仅知道 IP、域名或端口不能代理。客户端导入后使用已保存的凭据，无需再打开原 URL；复制凭据也能共享访问，不能绑定为一台物理设备。</p><p>重置或删除会在原生服务端撤销旧凭据。旧二维码和导出副本不会自动擦除；恢复旧归档可能重新启用旧凭据，请保留最新撤销后的备份。</p></section>
         <footer class="snapshot-footer"><div class="snapshot-details"><span>资料生成 <time id="generated-at">—</time></span><span>已提交代次 <code id="backup-digest">—</code></span><span>端点 <span id="endpoint">—</span></span></div><p id="state-note" class="muted">等待读取已提交资料。</p></footer>

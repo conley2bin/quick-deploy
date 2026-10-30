@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import datetime
 import fcntl
 import hashlib
 import html
@@ -390,8 +391,9 @@ class ManagementServer:
                                     not isinstance(body['launch_token'], str) or manager.launch_token is None or
                                     not secrets.compare_digest(body['launch_token'], manager.launch_token)):
                                 raise Refusal('invalid_launch_token', 401)
-                            self._send(200, {'token': manager.bearer, 'session_id': manager.session_id,
-                                             'expires_in': max(0, int(manager.expires - time.monotonic()))})
+                            self._send(200, dict({'token': manager.bearer, 'session_id': manager.session_id,
+                                                  'expires_in': max(0, int(manager.expires - time.monotonic()))},
+                                                 **manager.timing()))
                     elif self.path in {'/api/jobs', '/api/recover'}:
                         job = manager.admit(body, recover=self.path == '/api/recover')
                         self._send(202, {'job_id': job['job_id'], 'state': job['state']})
@@ -432,6 +434,15 @@ class ManagementServer:
             self.unknown |= record.get('unknown', False)
             self.last_job = job['job_id']
 
+    def timing(self):
+        """Optional absolute deadlines from the monotonic session clock; wall time is display only."""
+        remaining = self.expires - time.monotonic()
+        iso = lambda seconds: datetime.datetime.fromtimestamp(
+            time.time() + seconds, datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+        return {'session_ends_at': iso(remaining),
+                'new_jobs_until': iso(remaining - JOB_SECONDS - CLEANUP_MARGIN),
+                'job_limit_s': JOB_SECONDS, 'cleanup_margin_s': CLEANUP_MARGIN}
+
     def public_job(self, job):
         public = {key: value for key, value in job.items() if not key.startswith('_')}
         if job['state'] == 'running':
@@ -458,6 +469,7 @@ class ManagementServer:
                       source.get('error', {}).get('code'))
             return {'schema': 1, 'session_id': self.session_id,
                     'generation': source.get('generation_after'), 'pending': pending,
+                    **self.timing(),
                     'busy': busy or source.get('error', {}).get('code') == 'busy',
                     'writable': reason is None, 'writable_reason': reason,
                     'last_job': self.public_job(self.jobs[self.last_job]) if self.last_job else None,
@@ -506,6 +518,8 @@ class ManagementServer:
             job = {'job_id': job_id, 'request_id': body['request_id'], 'state': 'running',
                    'started_at': time.time(), '_started': time.monotonic(), 'elapsed_s': 0,
                    'deadline_s': JOB_SECONDS, 'generation_before': snapshot['generation']}
+            job.update(action='recover' if recover else body['action'],
+                       names=[] if recover else list(body['names']))
             self._persist(job, fingerprint)
             self.jobs[job_id] = job
             self.requests[body['request_id']] = (fingerprint, job_id)
