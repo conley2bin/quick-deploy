@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -50,6 +50,68 @@ test("cancelled session switch preserves prepared image state through the instal
   } finally {
     for (const key of Object.keys(process.env)) if (!(key in prior)) delete process.env[key];
     Object.assign(process.env, prior);
+    rmSync(temporary, { recursive: true, force: true });
+  }
+});
+
+
+test("real SDK load-only invalidation and failed factories leave no stdout or bridge roots", async () => {
+  const temporary = mkdtempSync(resolve(tmpdir(), "pi-inline-factory-"));
+  const core = installedPiRoot();
+  const { loadExtensions } = await import(pathToFileURL(resolve(core, "dist/core/extensions/loader.js")).href);
+  const { createEventBus } = await import(pathToFileURL(resolve(core, "dist/core/event-bus.js")).href);
+  const { ExtensionRunner } = await import(pathToFileURL(resolve(core, "dist/core/extensions/runner.js")).href);
+  const request = "pi-inline-images:graphics-owner:request";
+  const reply = "pi-inline-images:graphics-owner:reply";
+  const eventBus = createEventBus();
+  // Observe exact tracked callback lifetimes, without retaining retired handles.
+  const callbacks = new Map<string, Set<unknown>>();
+  const bus = {
+    emit: eventBus.emit,
+    on(channel: string, callback: (value: unknown) => void) {
+      const set = callbacks.get(channel) ?? new Set();
+      callbacks.set(channel, set);
+      set.add(callback);
+      const remove = eventBus.on(channel, callback);
+      return () => { set.delete(callback); remove(); };
+    },
+  };
+  const baseline = [process.stdout.listenerCount("error"), process.stdout.listenerCount("close")];
+  let replies = 0;
+  const removeReply = bus.on(reply, () => { replies++; });
+  const failingPath = resolve(temporary, "failed.ts");
+  writeFileSync(failingPath, `import factory from ${JSON.stringify(resolve("index.ts"))};\nexport default (pi) => { factory(pi); throw new Error("after bridge registration"); };\n`);
+  try {
+    for (const kind of ["invalidate", "failed", "shutdown"]) {
+      for (let cycle = 0; cycle < 8; cycle++) {
+        const loaded = await loadExtensions([kind === "failed" ? failingPath : resolve("index.ts")], process.cwd(), bus);
+        try {
+          if (kind === "failed") {
+            assert.match(loaded.errors[0]?.error ?? "", /after bridge registration/u);
+            assert.equal(callbacks.get(request)?.size ?? 0, 0, "loader discard removes failed-factory bridge callback");
+          } else {
+            assert.deepEqual(loaded.errors, []);
+            assert.equal(callbacks.get(request)?.size, 1, "factory publishes one current backend before session_start");
+            const before = replies;
+            for (const owner of ["inline", "read"]) bus.emit(request, { version: 1, owner, requestId: `${kind}-${cycle}-${owner}` });
+            assert.equal(replies, before + 2, "both owner handles are available during load-only lifetime");
+            if (kind === "shutdown") {
+              const runner = new ExtensionRunner(loaded.extensions, loaded.runtime, process.cwd(), { getBranch: () => [] }, {});
+              await runner.emit({ type: "session_shutdown" });
+            }
+          }
+          assert.deepEqual([process.stdout.listenerCount("error"), process.stdout.listenerCount("close")], baseline,
+            `${kind} cycle ${cycle}: passive factory owns no stdout pair`);
+        } finally { loaded.runtime.invalidate(); }
+        assert.equal([...callbacks.entries()].filter(([channel]) => channel !== reply).reduce((sum, [, set]) => sum + set.size, 0), 0,
+          "runtime invalidation removes every extension event-bus root, including bridge handle closures");
+        const before = replies;
+        bus.emit(request, { version: 1, owner: "read", requestId: "retired" });
+        assert.equal(replies, before, "retired backend cannot reply");
+      }
+    }
+  } finally {
+    removeReply();
     rmSync(temporary, { recursive: true, force: true });
   }
 });

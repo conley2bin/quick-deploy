@@ -222,6 +222,18 @@ optional `writableNeedDrain` value. Accepted bytes cannot be retracted. Sink
 error, close, or slow drain rejects every unsent job and a fatal transport is not
 silently restarted.
 
+Factory construction and unused reset/cancel/ready/disposal are passive, even if
+another stdout writer is already awaiting drain. The transport acquires its one
+error/close listener pair only after the first transaction passes admission,
+before building or writing it. Registration failure rolls back both attempted
+exact callbacks and permanently fails that transport; synchronous delivered
+error/close notifications, disposal and generation cancellation are checked
+before insertion. The sink API has no history for a close emitted before its
+close callback is registered. Factory-time event-bus publication remains
+available to the structured renderer and Pi tracks those registrations across
+load-only invalidation and failed factories. Already-used transports still
+require ordinary shutdown/disposal; externally retained handles remain roots.
+
 Cleanup admits and drains one owned delete at a time, so it remains within the
 configured job/byte queue limits (including a one-job queue). Ownership and
 resident accounting are released only after that delete is accepted and drained;

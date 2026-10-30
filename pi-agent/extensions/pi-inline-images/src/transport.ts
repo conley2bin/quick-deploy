@@ -156,6 +156,9 @@ export class BoundedTransport {
   private drainedDuringWrite = false;
   private failure?: TransportError;
   private disposed = false;
+  private active = false;
+  private errorAttempted = false;
+  private closeAttempted = false;
 
   private readonly errorListener = (error: Error) => this.fail(new TransportError("sink", `graphics sink error: ${error.message}`, { cause: error }));
   private readonly closeListener = () => this.fail(new TransportError("closed", "graphics sink closed"));
@@ -167,8 +170,6 @@ export class BoundedTransport {
         throw new TransportError("invalid", `${name} must be a ${name === "minIntervalMs" ? "non-negative" : "positive"} safe integer`);
       }
     }
-    this.sink.on("error", this.errorListener);
-    this.sink.on("close", this.closeListener);
   }
 
   get generation(): number { return this.currentGeneration; }
@@ -223,6 +224,11 @@ export class BoundedTransport {
     if (this.queue.length >= this.limits.maxQueuedJobs) return Promise.reject(new TransportError("limit", `queued graphics job limit reached (${this.limits.maxQueuedJobs})`));
     if (this.queuedBytes + this.undrainedBytes + bytes > this.limits.maxQueuedBytes) return Promise.reject(new TransportError("limit", `graphics wire budget would exceed ${this.limits.maxQueuedBytes}`));
 
+    const activationFailure = this.activate();
+    if (activationFailure) return Promise.reject(activationFailure);
+    // Registration may synchronously invoke a lifecycle callback (including cancel).
+    if (generation !== this.currentGeneration) return Promise.reject(new TransportError("cancelled", `stale graphics generation ${generation}; current generation is ${this.currentGeneration}`));
+
     let resolve!: (result: TransportResult) => void;
     let reject!: (error: Error) => void;
     const promise = new Promise<TransportResult>((yes, no) => { resolve = yes; reject = no; });
@@ -233,7 +239,7 @@ export class BoundedTransport {
       coalesceKey: request.coalesceKey,
       owner: request.owner,
       resource: request.resource,
-      generation: this.currentGeneration,
+      generation,
       promise,
       resolve,
       reject,
@@ -274,6 +280,7 @@ export class BoundedTransport {
     this.rejectQueue(new TransportError("cancelled", reason));
     this.rejectReady(new TransportError("cancelled", reason));
     if (!options.retainAccepted) this.acceptedKeys.clear();
+    if (!this.active) return;
     if (this.sink.writableNeedDrain === true || this.undrainedBytes > 0) this.backpressured = true;
     if (this.backpressured) this.waitForDrain(); else this.clearDrainWait();
   }
@@ -290,8 +297,40 @@ export class BoundedTransport {
     this.acceptedKeys.clear();
     this.undrainedBytes = 0;
     this.backpressured = false;
-    this.sink.removeListener("error", this.errorListener);
-    this.sink.removeListener("close", this.closeListener);
+    this.detachSinkListeners();
+  }
+
+  /** Construction is passive; only admitted work may acquire external roots. */
+  private activate(): TransportError | undefined {
+    if (!this.active) {
+      try {
+        this.errorAttempted = true;
+        this.sink.on("error", this.errorListener);
+        if (!this.failure && !this.disposed) {
+          this.closeAttempted = true;
+          this.sink.on("close", this.closeListener);
+        }
+      } catch (error) {
+        this.fail(new TransportError("sink", "graphics sink subscription failed", { cause: error }));
+      }
+      if (this.failure || this.disposed) this.detachSinkListeners();
+      else this.active = true;
+    }
+    return this.failure ?? (this.disposed ? new TransportError("closed", "graphics transport disposed") : undefined);
+  }
+
+  private detachSinkListeners(): void {
+    this.active = false;
+    // Mark before .on: custom sinks may attach and then throw. Each exact
+    // removal is independent, so one throwing cleanup cannot skip the other.
+    if (this.errorAttempted) {
+      this.errorAttempted = false;
+      try { this.sink.removeListener("error", this.errorListener); } catch { /* preserve the original terminal failure */ }
+    }
+    if (this.closeAttempted) {
+      this.closeAttempted = false;
+      try { this.sink.removeListener("close", this.closeListener); } catch { /* still attempted both owned removals */ }
+    }
   }
 
   private cancelWhere(matches: (job: PendingJob) => boolean, reason: string): void {
@@ -385,7 +424,7 @@ export class BoundedTransport {
 
   private schedulePump(delayMs: number): void { if (this.pumpTimer === undefined) this.pumpTimer = this.scheduler.setTimeout(() => this.pump(), delayMs); }
   private observeDrain(): void {
-    if (this.drainListener || this.failure || this.disposed) return;
+    if (!this.active || this.drainListener || this.failure || this.disposed) return;
     const onDrain = () => {
       if (this.writing) { this.drainedDuringWrite = true; return; }
       this.undrainedBytes = 0;
@@ -398,7 +437,7 @@ export class BoundedTransport {
     this.drainListener = onDrain;
     this.sink.on("drain", onDrain);
   }
-  private waitForDrain(): void { if (!this.failure && !this.disposed && (this.backpressured || this.sink.writableNeedDrain === true || this.undrainedBytes > 0)) { this.observeDrain(); this.startDrainTimeout(); } }
+  private waitForDrain(): void { if (this.active && !this.failure && !this.disposed && (this.backpressured || this.sink.writableNeedDrain === true || this.undrainedBytes > 0)) { this.observeDrain(); this.startDrainTimeout(); } }
   private startDrainTimeout(): void {
     if (this.drainTimer !== undefined || !this.drainListener || this.failure || this.disposed) return;
     this.drainTimer = this.scheduler.setTimeout(() => { if (this.drainListener) this.fail(new TransportError("drain-timeout", `graphics sink did not drain within ${this.limits.drainTimeoutMs} ms`)); }, this.limits.drainTimeoutMs);

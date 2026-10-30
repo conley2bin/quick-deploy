@@ -49,3 +49,41 @@ test("read reset cancels only read work behind inline backpressure", async()=>{
  await read.reset(); await readPreparing; assert.equal(terminal.count("read"),0); assert.equal(terminal.count("inline"),1); assert.equal(sink.writes.length,1,"read reset cannot bypass or erase inline drain debt");
  sink.drain(); await inlinePreparing; assert.ok(inline.render("blocked",10).length>0); stop(); await terminal.clear(true);
 });
+
+
+test("unused TerminalImages reset and disposal stay passive on an already blocked shared sink", async () => {
+ const sink = new Sink(); sink.writableNeedDrain = true;
+ const foreign = () => {}; sink.on("error", foreign); sink.on("close", foreign); sink.on("drain", foreign);
+ const terminal = new TerminalImages(() => 1, () => ({widthPx:1,heightPx:1}), sink, {TERM_PROGRAM:"ghostty"}, true);
+ await terminal.resetOwner("read"); await terminal.clear(false); await terminal.clear(true);
+ assert.deepEqual([sink.listenerCount("error"), sink.listenerCount("close"), sink.listenerCount("drain"), sink.writes.length], [1,1,1,0]);
+});
+
+test("consumer factory/start requests bind the same backend in either publication and start order", async () => {
+ for (const inlineFirst of [false, true]) for (const inlineStartsFirst of [false, true]) {
+  const sink = new Sink(); let id = 500;
+  const terminal = new TerminalImages(() => id++, () => ({widthPx:1,heightPx:1}), sink, {TERM_PROGRAM:"ghostty"}, true, {transportLimits:{minIntervalMs:0}});
+  terminal.setViewerManaged(true);
+  const bus = new Bus(); let handle: GraphicsOwnerHandle | undefined; const received: GraphicsOwnerHandle[] = [];
+  let stop = () => {}; let stopReply = () => {};
+  const request = () => bus.emit(IMAGE_BRIDGE_REQUEST, {version:1, owner:"read", requestId:"consumer"});
+  const consumerFactory = () => {
+   stopReply = bus.on(IMAGE_BRIDGE_REPLY, value => { handle = (value as {handle:GraphicsOwnerHandle}).handle; received.push(handle); });
+   request();
+  };
+  const inlineFactory = () => { stop = installGraphicsBridge(bus as never, terminal); };
+  try {
+   if (inlineFirst) { inlineFactory(); consumerFactory(); assert.ok(handle, "factory-time publication is available"); }
+   else { consumerFactory(); assert.equal(handle, undefined); inlineFactory(); }
+   const startInline = () => terminal.setViewer(viewer);
+   if (inlineStartsFirst) { await startInline(); request(); } else { request(); await startInline(); }
+   assert.ok(handle);
+   assert.ok(received.every(value => value === handle), "start replaces with the same current owner handle, never a predecessor chain");
+   await handle.prepare("consumer", image("shared"));
+   await terminal.prepare("inline:direct", image("shared"));
+   assert.equal(terminal.count("read"), 1); assert.equal(terminal.count("inline"), 1);
+   assert.equal(sink.writes.filter(value => value.includes(Buffer.from("a=t,"))).length, 2, "distinct owner resources both reach the injected backend sink");
+   assert.deepEqual([sink.listenerCount("error"), sink.listenerCount("close")], [1, 1], "both owners use the same transport listener pair");
+  } finally { stopReply(); stop(); await terminal.clear(true); }
+ }
+});
