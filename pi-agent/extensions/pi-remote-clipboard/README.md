@@ -109,7 +109,7 @@ piox
 
 ## 测试
 
-会话关闭（`session_shutdown`）会取消本会话启动的全部剪贴板操作：终止其 tmux/Python 子进程（TERM，1 秒后 KILL），之后不再插入编辑器、不再发出 OSC 52/原生回退/通知；已退役的复制 sink 以 `AbortError` 拒绝。单个子进程另有独立的 8 秒结算期限。
+会话关闭（`session_shutdown`）会取消本会话启动的全部剪贴板操作，并在返回前等待清理完成：POSIX 下每个 tmux/Python 辅助进程自成进程组，取消或 8 秒超时时对整个进程组先 TERM、1 秒后 KILL（含已提前退出的领导进程遗留的、仍持有管道的后代；只向本扩展自己启动的进程组发信号），Windows 下只能终止直接子进程。操作的 promise 结算（超时/取消/溢出）与资源清理分离，shutdown 的 await 会等待已超时但仍在 TERM→KILL 宽限中的辅助进程，因此 Pi 在 shutdown 后退出进程不会遗留它们；重复 start 会取消并记录前任，随后的 shutdown 一并等待。之后不再插入编辑器、不再发出 OSC 52/原生回退/通知；已退役的复制 sink 以 `AbortError` 拒绝（取消发生在“非对端”判定之后同样如此）。输出预算与 `execFile` 的 `maxBuffer` 相同：stdout、stderr 各 1 MiB **字节**。
 
 ```bash
 python3 pi-agent/extensions/pi-remote-clipboard/tests/test_all.py

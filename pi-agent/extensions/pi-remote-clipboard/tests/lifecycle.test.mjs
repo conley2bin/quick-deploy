@@ -1,4 +1,4 @@
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { chmodSync, existsSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { registerHooks } from "node:module";
 import { tmpdir } from "node:os";
@@ -102,7 +102,7 @@ function loadExtension(mode = "tui") {
   const extension = {
     notices, pastes, inserts, ctx,
     start() { events.get("session_start")?.({ type: "session_start" }, ctx); },
-    shutdown() { state.ended = true; events.get("session_shutdown")?.({ type: "session_shutdown" }, ctx); },
+    shutdown() { state.ended = true; return events.get("session_shutdown")?.({ type: "session_shutdown" }, ctx); },
     explicitPaste: () => shortcuts.get("ctrl+alt+v").handler(ctx),
     push: (args = "") => commands.get("rpush").handler(args, ctx),
     automaticPaste: () => pasteOwner.handleClipboardPaste.call({
@@ -125,12 +125,12 @@ beforeEach(() => {
   Object.defineProperty(copyOwner, "copyTextToClipboard", { ...copyDescriptor, value: async () => { globalThis.nativeCopy += 1; return true; } });
 });
 
-afterEach(() => {
+afterEach(async () => {
   mock.timers.reset();
   for (const pid of [...startedPids(), ...names("grandchild-").map((name) => Number(name.slice(11)))]) {
     try { process.kill(pid, "SIGKILL"); } catch { /* already gone */ }
   }
-  for (const extension of fixtures) extension.shutdown();
+  await Promise.all(fixtures.map((extension) => extension.shutdown()));
   fixtures = [];
   process.stdout.write = stdoutWrite;
   if (ttyDescriptor) Object.defineProperty(process.stdout, "isTTY", ttyDescriptor); else delete process.stdout.isTTY;
@@ -313,4 +313,208 @@ test("cooperative remote and local controls keep working under an active owner",
   assert.equal(await copyOwner.copyTextToClipboard("t"), true);
   assert.equal(globalThis.nativeCopy, 1);
   await until(() => childHandles() === 0, "child handle release");
+});
+
+// --- closure: negative-result race -------------------------------------------------------------
+// copy-links runs `sink && (await sink(text))` and falls back to native copy on a falsy result.
+const coupledCopy = (sink) => async (text) => {
+  try {
+    if (await sink(text)) return;
+  } catch (error) {
+    if (error.name === "AbortError") return;
+    throw error;
+  }
+  globalThis.nativeCopy += 1;
+};
+
+test("shutdown between the awaited negative detection and its continuation cancels instead of returning false", async () => {
+  // Local session: no TMUX, no SSH. isRemoteClient resolves false before the owner dies.
+  const extension = loadExtension();
+  extension.start();
+  const sink = globalThis[sinkKey];
+  const call = sink("x").then((value) => ({ value }), (error) => ({ name: error.name }));
+  const coupled = coupledCopy(sink)("y");
+  const wrapper = copyOwner.copyTextToClipboard("z");
+  extension.shutdown();
+  assert.deepEqual(await call, { name: "AbortError" });
+  await coupled;
+  assert.equal(await wrapper, false);
+  assert.equal(globalThis.nativeCopy, 0, "no native fallback after cancel (coupled sink, wrapper)");
+});
+
+test("active owner controls: local sink resolves false and falls back, remote sink resolves true with feedback", async () => {
+  const extension = loadExtension();
+  extension.start();
+  const sink = globalThis[sinkKey];
+  assert.equal(await sink("x"), false);
+  await coupledCopy(sink)("y");
+  assert.equal(globalThis.nativeCopy, 1);
+  process.env.SSH_CONNECTION = "fixture";
+  Object.defineProperty(process.stdout, "isTTY", { value: true, configurable: true });
+  const writes = [];
+  process.stdout.write = (chunk) => { writes.push(String(chunk)); return true; };
+  const flashes = [];
+  assert.equal(await copyOwner.copyTextToClipboard.call({ flash: (m) => flashes.push(m) }, "hello"), true);
+  assert.equal(writes.length, 1);
+  assert.deepEqual(flashes, ["已复制到对端剪贴板"]);
+});
+
+test("shutdown landing on the OSC52 write itself (awaited true) skips stale feedback", async () => {
+  process.env.SSH_CONNECTION = "fixture";
+  Object.defineProperty(process.stdout, "isTTY", { value: true, configurable: true });
+  const extension = loadExtension();
+  extension.start();
+  process.stdout.write = (chunk) => {
+    if (String(chunk).includes("]52;")) extension.shutdown();
+    return true;
+  };
+  const flashes = [];
+  assert.equal(await copyOwner.copyTextToClipboard.call({ flash: (m) => flashes.push(m) }, "hello"), true);
+  assert.deepEqual(flashes, []);
+  assert.equal(globalThis.nativeCopy, 0);
+});
+
+// --- closure: process-group ownership ----------------------------------------------------------
+const holdingDescendant = (name) => `import os, pathlib, subprocess
+p = pathlib.Path(${JSON.stringify(temp)})
+g = subprocess.Popen(['sh', '-c', 'trap "" TERM; while :; do sleep 1; done'])
+(p / ('grandchild-' + str(g.pid))).write_text('x')
+(p / ('started-' + str(os.getpid()))).write_text('ready')
+${name}`;
+const grandchildren = () => names("grandchild-").map((name) => Number(name.slice(11)));
+
+test("a leader that exits early but leaves a TERM-ignoring pipe-holding descendant: the descendant is killed with its group at the deadline", async () => {
+  process.env.SSH_CONNECTION = "fixture";
+  writeHelper("ctrlv.py", holdingDescendant(""));
+  try {
+    const extension = loadExtension();
+    extension.start();
+    mock.timers.enable({ apis: ["setTimeout"] });
+    const operation = extension.explicitPaste();
+    await until(() => startedPids().length === 1 && grandchildren().length === 1, "leader and descendant");
+    await until(() => !alive(startedPids()[0]), "leader exit");
+    assert.equal(alive(grandchildren()[0]), true);
+    mock.timers.tick(8000);
+    await operation;
+    assert.match(extension.notices.at(-1).text, /对端剪贴板读取失败/);
+    mock.timers.tick(1000);
+    await until(() => !alive(grandchildren()[0]), "group KILL of the descendant");
+    await until(() => childHandles() === 0, "child handle release");
+  } finally {
+    writeHelper("ctrlv.py", helperSource);
+  }
+});
+
+test("a TERM-ignoring leader with a pipe-holding grandchild: shutdown joins group TERM→KILL; both are gone before fixture cleanup", async () => {
+  process.env.SSH_CONNECTION = "fixture";
+  writeFileSync(join(temp, "mode"), "ignoreterm grandchild");
+  const extension = loadExtension();
+  extension.start();
+  const operation = extension.explicitPaste();
+  await until(() => startedPids().length === 1 && grandchildren().length === 1, "leader and grandchild");
+  mock.timers.enable({ apis: ["setTimeout"] });
+  const shutdown = extension.shutdown();
+  await until(() => names("term-").length === 1, "TERM delivery");
+  assert.equal(alive(startedPids()[0]), true);
+  mock.timers.tick(1000);
+  await shutdown;
+  await operation;
+  assert.equal(alive(startedPids()[0]), false);
+  assert.equal(alive(grandchildren()[0]), false);
+  await until(() => childHandles() === 0, "libuv close callback of the child handle");
+});
+
+test("a second start retires the predecessor and the following shutdown joins both retirements", async () => {
+  process.env.SSH_CONNECTION = "fixture";
+  writeFileSync(join(temp, "mode"), "ignoreterm");
+  const extension = loadExtension();
+  extension.start();
+  const first = extension.explicitPaste();
+  await until(() => startedPids().length === 1, "first helper");
+  mock.timers.enable({ apis: ["setTimeout"] });
+  extension.start(); // replaces and cancels the first owner; its helper ignores TERM
+  await first;
+  const shutdown = extension.shutdown();
+  await until(() => names("term-").length === 1, "TERM delivery");
+  mock.timers.tick(1000);
+  await shutdown;
+  assert.equal(startedPids().filter(alive).length, 0);
+});
+
+test("shutdown still joins cleanup when hook restoration throws", async () => {
+  process.env.SSH_CONNECTION = "fixture";
+  writeFileSync(join(temp, "mode"), "ignoreterm");
+  const extension = loadExtension();
+  extension.start();
+  const operation = extension.explicitPaste();
+  await until(() => startedPids().length === 1, "helper");
+  Object.defineProperty(copyOwner, "copyTextToClipboard", { configurable: true, get() { throw new Error("restore boom"); }, set() { throw new Error("restore boom"); } });
+  mock.timers.enable({ apis: ["setTimeout"] });
+  const shutdown = extension.shutdown().then(() => "ok", (error) => error.message);
+  await until(() => names("term-").length === 1, "TERM delivery");
+  mock.timers.tick(1000);
+  assert.equal(await shutdown, "restore boom");
+  await operation;
+  assert.equal(startedPids().filter(alive).length, 0);
+});
+
+// --- closure: actual quit ---------------------------------------------------------------------
+function runQuit(runnerMode) {
+  return new Promise((resolve, reject) => {
+    const started = Date.now();
+    const runner = spawn(process.execPath, ["--experimental-strip-types", "--no-warnings", new URL("./quit-runner.mjs", import.meta.url).pathname], {
+      env: { ...process.env, RUNNER_TEMP: temp, RUNNER_MODE: runnerMode },
+      stdio: ["ignore", "inherit", "inherit"],
+    });
+    const guard = setTimeout(() => { runner.kill("SIGKILL"); reject(new Error("runner did not exit")); }, 20000);
+    runner.once("exit", (code) => { clearTimeout(guard); resolve({ code, elapsed: Date.now() - started }); });
+  });
+}
+
+for (const runnerMode of ["inflight-exit", "timedout-exit"]) {
+  test(`quit (${runnerMode}): after the awaited shutdown handler and an immediate process exit, no helper or descendant survives`, async () => {
+    writeFileSync(join(temp, "mode"), "ignoreterm grandchild");
+    const { code } = await runQuit(runnerMode);
+    assert.equal(code, 0);
+    const [pid] = startedPids();
+    assert.ok(pid, "runner started a helper");
+    assert.equal(alive(pid), false, "TERM-ignoring leader is gone");
+    assert.equal(grandchildren().some(alive), false, "descendant is gone");
+  });
+}
+
+test("quit (inflight-natural): no timer or pipe keeps the process alive after shutdown", async () => {
+  writeFileSync(join(temp, "mode"), "ignoreterm grandchild");
+  const { code, elapsed } = await runQuit("inflight-natural");
+  assert.equal(code, 0);
+  assert.ok(elapsed < 6000, `runner exited naturally in ${elapsed} ms (a leaked 8 s deadline would exceed this)`);
+  assert.equal(alive(startedPids()[0]), false);
+  assert.equal(grandchildren().some(alive), false);
+});
+
+// --- closure: byte budget ---------------------------------------------------------------------
+test("the 1 MiB budget counts bytes: multibyte output over 1 MiB is rejected while under-budget multibyte and exact-boundary output pass", async () => {
+  process.env.SSH_CONNECTION = "fixture";
+  const emit = (script) => writeHelper("ctrlv.py", `import sys\n${script}\n`);
+  try {
+    const extension = loadExtension();
+    extension.start();
+    emit("sys.stdout.write('€' * 340000)"); // 1,020,000 bytes
+    await extension.explicitPaste();
+    assert.equal(extension.pastes.length, 1);
+    emit("sys.stdout.buffer.write(b'a' * 1048576)"); // exactly the budget
+    await extension.explicitPaste();
+    assert.equal(extension.pastes.length, 2);
+    emit("sys.stdout.write('€' * 360000)"); // 1,080,000 bytes, 360,000 characters
+    await extension.explicitPaste();
+    assert.equal(extension.pastes.length, 2);
+    assert.match(extension.notices.at(-1).text, /exceeded/);
+    assert.equal(extension.notices.at(-1).level, "error");
+    emit("sys.stderr.write('e' * (2 * 1024 * 1024))\nsys.stderr.flush()\nimport time\ntime.sleep(30)"); // huge stderr
+    await extension.explicitPaste();
+    assert.match(extension.notices.at(-1).text, /exceeded/);
+    await until(() => childHandles() === 0, "child handle release after oversized stderr");
+  } finally {
+    writeHelper("ctrlv.py", helperSource);
+  }
 });

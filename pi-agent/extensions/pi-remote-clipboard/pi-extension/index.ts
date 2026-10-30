@@ -11,7 +11,8 @@ const PUSH_BIN = `${LIB_DIR}/push.py`;
 const TIMEOUT_MS = 8000;
 /** TERM 之后给子进程的退出宽限；到期仍存活则 KILL。 */
 const TERM_GRACE_MS = 1000;
-const MAX_OUTPUT_CHARS = 1024 * 1024;
+/** 与 execFile 的 maxBuffer 同为字节预算（非字符数）：UTF-8 多字节文本也不得超过 1 MiB。 */
+const MAX_OUTPUT_BYTES = 1024 * 1024;
 const MAX_OSC52_ENCODED = 100_000;
 /** pi-copy-links 等扩展查询的复制分流函数；返回 true 表示已写往对端剪贴板。 */
 const COPY_SINK_KEY = Symbol.for("pi-remote-clipboard:copy-sink");
@@ -31,35 +32,48 @@ const isCancelled = (error: unknown): boolean => error instanceof ClipboardCance
 /** 一次 session_start 到 session_shutdown 的生命周期：其间启动的所有异步操作归它所有。 */
 interface Owner {
   dead: boolean;
-  /** 进行中的子进程操作；cancel 时逐个拒绝并终止。 */
-  readonly aborts: Set<() => void>;
+  /** 仍占有资源（子进程组、定时器、管道）的辅助进程；直到清理完成才移出，与 promise 结算无关。 */
+  readonly helpers: Set<Helper>;
   sink?: CopySink;
 }
 
-function newOwner(): Owner {
-  return { dead: false, aborts: new Set() };
+interface Helper {
+  /** 结算为取消错误（若尚未结算）并终止进程组；幂等。 */
+  abort(): void;
+  /** 子进程组已退出或已被 KILL、管道已销毁、定时器已清除后 resolve；永不 reject。 */
+  readonly quiescent: Promise<void>;
 }
 
-function cancelOwner(owner: Owner): void {
+function newOwner(): Owner {
+  return { dead: false, helpers: new Set() };
+}
+
+/** 标记死亡并取消全部辅助进程；返回它们完成清理的时刻。幂等，可重复调用。 */
+function cancelOwner(owner: Owner): Promise<void> {
   owner.dead = true;
-  for (const abort of [...owner.aborts]) {
+  const pending = [...owner.helpers];
+  for (const helper of pending) {
     try {
-      abort();
+      helper.abort();
     } catch {
       // 单个子进程终止失败不阻止其余操作被取消
     }
   }
-  owner.aborts.clear();
+  return Promise.all(pending.map((helper) => helper.quiescent)).then(() => undefined);
 }
 
 function assertLive(owner: Owner): void {
   if (owner.dead) throw new ClipboardCancelled();
 }
 
+const POSIX = process.platform !== "win32";
+
 /**
- * 在 owner 名下运行子进程。独立于 execFile 的协作式 timeout：
- * 到期立即以超时错误结算，并 TERM→(TERM_GRACE_MS)→KILL；owner 取消时同样处理。
- * 结算后销毁管道、清除监听与定时器，不等待 close（被继承的管道可能永不关闭）。
+ * 在 owner 名下运行子进程，字节预算与 execFile 的 maxBuffer 相同（stdout、stderr 各 1 MiB）。
+ * POSIX 下子进程自成进程组，只向该组（经校验的正 PID）发信号，终止时连同其后代一起 TERM→KILL；
+ * Windows 下只能终止直接子进程。
+ * 到期 / 溢出 / 取消时 promise 立即结算，但 owner 仍持有该 helper，直到进程组被清理、
+ * 管道销毁、定时器清除（Helper.quiescent），所以结算后的 TERM 不服从者仍在 shutdown 的等待范围内。
  */
 function runHelper(
   owner: Owner, file: string, args: string[], timeoutMs: number,
@@ -69,68 +83,141 @@ function runHelper(
       reject(new ClipboardCancelled());
       return;
     }
-    const child = spawn(file, args, { stdio: ["ignore", "pipe", "pipe"] });
-    let stdout = "";
-    let stderr = "";
+    const child = spawn(file, args, { stdio: ["ignore", "pipe", "pipe"], detached: POSIX });
+    const pid = child.pid;
+    const groupId = POSIX && Number.isInteger(pid) && (pid as number) > 1 ? (pid as number) : undefined;
+    const out: Buffer[] = [];
+    const err: Buffer[] = [];
+    let outBytes = 0;
+    let errBytes = 0;
     let settled = false;
     let exited = false;
-    let termSent = false;
+    let groupGone = false;
+    let terminating = false;
+    let killSent = false;
+    let quiet = false;
     let killTimer: ReturnType<typeof setTimeout> | undefined;
+    let waitTimer: ReturnType<typeof setTimeout> | undefined;
     let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
+    let release!: () => void;
+    const quiescent = new Promise<void>((done) => { release = done; });
 
-    const terminate = (): void => {
-      if (exited || termSent) return;
-      termSent = true;
-      child.kill("SIGTERM");
-      killTimer = setTimeout(() => {
-        killTimer = undefined;
-        if (!exited) child.kill("SIGKILL");
-      }, TERM_GRACE_MS);
+    const signal = (sig: "SIGTERM" | "SIGKILL"): void => {
+      try {
+        if (groupId !== undefined) {
+          if (!groupGone) process.kill(-groupId, sig);
+        } else if (!exited) {
+          child.kill(sig);
+        }
+      } catch {
+        // ESRCH：进程组已不存在
+      }
     };
-    const settle = (finish: () => void): void => {
-      if (settled) return;
-      settled = true;
-      owner.aborts.delete(abort);
+    /** 进程组是否还有成员（领导进程退出之后用来判断后代）。 */
+    const probeGroup = (): void => {
+      if (groupId === undefined || groupGone) return;
+      try {
+        process.kill(-groupId, 0);
+      } catch {
+        groupGone = true;
+      }
+    };
+    const finish = (): void => {
+      if (quiet) return;
+      quiet = true;
+      if (killTimer) clearTimeout(killTimer);
+      if (waitTimer) clearTimeout(waitTimer);
       if (deadlineTimer) clearTimeout(deadlineTimer);
-      deadlineTimer = undefined;
+      killTimer = waitTimer = deadlineTimer = undefined;
       child.stdout?.removeAllListeners("data");
       child.stderr?.removeAllListeners("data");
       child.stdout?.destroy();
       child.stderr?.destroy();
-      finish();
+      owner.helpers.delete(helper);
+      release();
     };
-    const fail = (message: string, extra: object = {}): void =>
+    /** 清理完成的条件：已结算且领导进程已退出；终止中则还需进程组已空，或 KILL 已发出。 */
+    const maybeFinish = (): void => {
+      if (!settled || !exited) return;
+      if (!terminating || groupGone || killSent) finish();
+    };
+    const settle = (done: () => void): void => {
+      if (settled) return;
+      settled = true;
+      done();
+      maybeFinish();
+    };
+    const terminate = (): void => {
+      if (terminating) return;
+      terminating = true;
+      signal("SIGTERM");
+      killTimer = setTimeout(() => {
+        killTimer = undefined;
+        signal("SIGKILL");
+        killSent = true;
+        // KILL 之后最多再等一个宽限；领导进程处于不可中断状态时也不无限阻塞 shutdown。
+        waitTimer = setTimeout(finish, TERM_GRACE_MS);
+        maybeFinish();
+      }, TERM_GRACE_MS);
+      if (exited) {
+        probeGroup();
+        maybeFinish();
+      }
+    };
+    const fail = (message: string, extra: object = {}): void => {
+      const stderr = Buffer.concat(err).toString("utf8");
       settle(() => reject(Object.assign(new Error(message), { stderr }, extra)));
-    const abort = (): void => {
-      settle(() => reject(new ClipboardCancelled()));
+    };
+    const overflow = (): void => {
+      fail(`${file} output exceeded ${MAX_OUTPUT_BYTES} bytes`, { code: "ERR_MAXBUFFER" });
       terminate();
     };
-    owner.aborts.add(abort);
-
-    child.stdout?.setEncoding("utf8");
-    child.stderr?.setEncoding("utf8");
-    child.stdout?.on("data", (chunk: string) => {
-      stdout += chunk;
-      if (stdout.length > MAX_OUTPUT_CHARS) {
-        fail(`${file} output exceeded ${MAX_OUTPUT_CHARS} characters`, { code: "ERR_MAXBUFFER" });
+    const helper: Helper = {
+      quiescent,
+      abort() {
+        settle(() => reject(new ClipboardCancelled()));
         terminate();
-      }
+      },
+    };
+    owner.helpers.add(helper);
+
+    child.stdout?.on("data", (chunk: Buffer) => {
+      if (settled) return;
+      if (outBytes + chunk.length > MAX_OUTPUT_BYTES) { overflow(); return; }
+      outBytes += chunk.length;
+      out.push(chunk);
     });
-    child.stderr?.on("data", (chunk: string) => {
-      if (stderr.length < MAX_OUTPUT_CHARS) stderr += chunk;
+    child.stderr?.on("data", (chunk: Buffer) => {
+      if (settled) return;
+      if (errBytes + chunk.length > MAX_OUTPUT_BYTES) { overflow(); return; }
+      errBytes += chunk.length;
+      err.push(chunk);
     });
     child.once("exit", () => {
       exited = true;
-      if (killTimer) clearTimeout(killTimer);
-      killTimer = undefined;
+      probeGroup();
+      if (killTimer && groupGone) {
+        clearTimeout(killTimer);
+        killTimer = undefined;
+      }
+      maybeFinish();
     });
     child.once("error", (error: NodeJS.ErrnoException) => {
       exited = true;
+      groupGone = true;
       fail(error.message, { code: error.code });
+      finish();
     });
-    child.once("close", (code, signal) => {
-      if (code === 0) settle(() => resolve({ stdout, stderr }));
-      else fail(`${file} exited with ${code ?? signal}`, { code: code ?? undefined });
+    child.once("close", (code, signalName) => {
+      if (code === 0) {
+        settle(() => resolve({
+          stdout: Buffer.concat(out).toString("utf8"),
+          stderr: Buffer.concat(err).toString("utf8"),
+        }));
+      } else {
+        fail(`${file} exited with ${code ?? signalName}`, { code: code ?? undefined });
+      }
+      maybeFinish();
     });
     deadlineTimer = setTimeout(() => {
       deadlineTimer = undefined;
@@ -213,13 +300,22 @@ function emitOsc52(text: string): boolean {
 }
 
 async function copyToClientIfRemote(owner: Owner, text: string): Promise<boolean> {
-  if (!(await isRemoteClient(owner))) return false;
+  const remote = await isRemoteClient(owner);
+  // 取消必须先于任何返回值：false 会让 copy-links 走原生复制回退。
   assertLive(owner);
-  return emitOsc52(text);
+  return remote ? emitOsc52(text) : false;
 }
 
 export default function piRemoteClipboard(pi: ExtensionAPI): void {
   let current = newOwner();
+  /** 已取消但尚未完成清理的 owner；shutdown 一并等待，连续 start 不会丢失前任。 */
+  const retiring = new Set<Promise<void>>();
+  function retire(owner: Owner): Promise<void> {
+    const cleanup = cancelOwner(owner);
+    retiring.add(cleanup);
+    void cleanup.then(() => retiring.delete(cleanup));
+    return cleanup;
+  }
   let restoreCopy: (() => void) | undefined;
   let restorePaste: (() => void) | undefined;
 
@@ -299,7 +395,7 @@ export default function piRemoteClipboard(pi: ExtensionAPI): void {
 
   pi.on("session_start", (_event, ctx) => {
     // 每次启动都开启新的所有者；仍存活的前任（未经 shutdown 的重叠启动）在此被取消。
-    cancelOwner(current);
+    void retire(current);
     const owner = newOwner();
     current = owner;
     if (ctx.mode !== "tui") return;
@@ -316,6 +412,7 @@ export default function piRemoteClipboard(pi: ExtensionAPI): void {
       altProto.copyTextToClipboard = async function (text: string): Promise<boolean> {
         try {
           if (await copyToClientIfRemote(owner, text)) {
+            if (owner.dead) return true; // 写入已发生；会话已结束，不再提示
             try {
               this.flash?.("已复制到对端剪贴板");
             } catch {
@@ -383,10 +480,12 @@ export default function piRemoteClipboard(pi: ExtensionAPI): void {
     }
   });
 
-  pi.on("session_shutdown", () => {
-    // 先标记死亡并取消全部进行中的操作，再做可能抛错的钩子恢复。
+  pi.on("session_shutdown", async () => {
+    // 先标记死亡并取消全部进行中的操作，再做可能抛错的钩子恢复；
+    // 无论恢复是否抛错，都等待所有 owner（含已超时、已被替换的）的子进程组清理完毕，
+    // 因为 Pi 在 shutdown 返回后即退出进程，会销毁尚未触发的 KILL 定时器。
     const owner = current;
-    cancelOwner(owner);
+    retire(owner);
     try {
       restoreCopy?.();
     } finally {
@@ -399,6 +498,7 @@ export default function piRemoteClipboard(pi: ExtensionAPI): void {
         if (owner.sink && globals[COPY_SINK_KEY] === owner.sink) {
           delete globals[COPY_SINK_KEY];
         }
+        await Promise.all([...retiring]);
       }
     }
   });
