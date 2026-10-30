@@ -3,7 +3,7 @@ import { existsSync, readFileSync, readdirSync, realpathSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { execFileSync } from "node:child_process";
-import { RECOVERY_ARMED_OPTION, acquireAnimatorLock, readLease, releaseAnimatorLock, runtimeRoot, safeId, windowLeaseStates } from "./state.mjs";
+import { RECOVERY_ARMED_OPTION, acquireAnimatorKernelLock, readLease, releaseAnimatorKernelLock, runtimeRoot, safeId, windowLeaseStates } from "./state.mjs";
 
 export const FRAME_COUNT = 24;
 export const FRAME_MS = 42;
@@ -70,13 +70,13 @@ export function sweepWindows(tmux, socketPath, states = { active: new Set(), err
 
 export const MAX_CONSECUTIVE_FAILURES = 10;
 
-export function runAnimator({ socketPath, root = join(runtimeRoot(), safeId(socketPath)), tmux = "tmux", intervalMs = FRAME_MS, errorIntervalMs = ERROR_MS, now = () => performance.now(), wallNow = () => Date.now(), exec = execFileSync, clientTtlMs = 1_000, schedule = setTimeout, cancel = clearTimeout, subscribeUrgent = subscribeAnimatorUrgentTick }) {
-  const lockPath = join(root, "animator.lock"); const lock = acquireAnimatorLock(lockPath); if (!lock.owner) return { started: false };
-  let previous = new Set(), previousErrorPanes = new Set(), stopped = false, timer, clients = [], clientsAt = -Infinity, consecutiveFailures = 0, unsubscribeUrgent = () => {}; const startedAt = now();
+export async function runAnimator({ socketPath, root = join(runtimeRoot(), safeId(socketPath)), tmux = "tmux", intervalMs = FRAME_MS, errorIntervalMs = ERROR_MS, now = () => performance.now(), wallNow = () => Date.now(), exec = execFileSync, clientTtlMs = 1_000, schedule = setTimeout, cancel = clearTimeout, subscribeUrgent = subscribeAnimatorUrgentTick }) {
+  const lockPath = join(root, "animator.lock"); const lock = await acquireAnimatorKernelLock({ socketPath, lockPath }); if (!lock.owner) return { started: false };
+  let stopping, previous = new Set(), previousErrorPanes = new Set(), stopped = false, timer, clients = [], clientsAt = -Infinity, consecutiveFailures = 0, unsubscribeUrgent = () => {}; const startedAt = now();
   const scheduleNext = (delay) => { timer = schedule(tick, delay); };
   const refreshCache = () => { if (wallNow() - clientsAt >= clientTtlMs) { clients = listClients(tmux, socketPath, exec); clientsAt = wallNow(); } };
   const render = (states, reset, resetPanes, refreshClients = clients) => { const frame = frameAt(now() - startedAt); const args = [...windowOptionArgs(states.active, frame, reset, states.error), ...paneRecoveryOptionArgs(states.errorPanes, resetPanes), ...clientRefreshArgs(refreshClients)]; if (args.length) exec(tmux, ["-S", socketPath, ...args], { stdio: "ignore" }); };
-  const stop = () => { if (stopped) return; stopped = true; cancel(timer); unsubscribeUrgent(); const empty = { active: new Set(), error: new Set(), errorPanes: new Set() }; try { refreshCache(); render(empty, previous, previousErrorPanes); } catch { try { render(empty, previous, previousErrorPanes, []); } catch (retry) { console.error("pi-tmux-window-status cleanup failed:", retry); } } releaseAnimatorLock(lockPath, lock.token); };
+  const stop = () => { if (stopping) return stopping; stopped = true; cancel(timer); unsubscribeUrgent(); const empty = { active: new Set(), error: new Set(), errorPanes: new Set() }; try { refreshCache(); render(empty, previous, previousErrorPanes); } catch { try { render(empty, previous, previousErrorPanes, []); } catch (retry) { console.error("pi-tmux-window-status cleanup failed:", retry); } } stopping = releaseAnimatorKernelLock(lock).catch((error) => console.error("pi-tmux-window-status: animator guard release failed:", error)); return stopping; };
   // A frame that fails transiently is retried once per errorIntervalMs. But
   // when failures become persistent (tmux server unreachable, a lease window
   // that no longer exists, …) the retry loop must not run forever: it would
@@ -86,9 +86,10 @@ export function runAnimator({ socketPath, root = join(runtimeRoot(), safeId(sock
   // failed frames we give up, run the throw-safe cleanup, and release the
   // lock; the extension respawns a fresh animator within its heartbeat
   // interval, so recovery is automatic once the underlying failure clears.
-  const tick = () => { if (stopped) return; try { const current = windowLeaseStates(root, wallNow()); refreshCache(); const currentAll = new Set([...current.active, ...current.error]); const reset = new Set([...previous].filter((id) => !currentAll.has(id))); const resetPanes = new Set([...previousErrorPanes].filter((id) => !current.errorPanes.has(id))); previous = new Set([...previous, ...currentAll]); previousErrorPanes = new Set([...previousErrorPanes, ...current.errorPanes]); render(current, reset, resetPanes); previous = currentAll; previousErrorPanes = current.errorPanes; consecutiveFailures = 0; if (!currentAll.size) return stop(); scheduleNext(current.active.size ? intervalMs : errorIntervalMs); } catch (error) { console.error("pi-tmux-window-status frame failed; retrying:", error); clientsAt = -Infinity; consecutiveFailures += 1; if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) { console.error(`pi-tmux-window-status: giving up after ${consecutiveFailures} consecutive failed frames; releasing the animator lock so a fresh animator can retry`); return stop(); } scheduleNext(errorIntervalMs); } };
+  const tick = () => { if (stopped) return; try { const current = windowLeaseStates(root, wallNow()); refreshCache(); const currentAll = new Set([...current.active, ...current.error]); const reset = new Set([...previous].filter((id) => !currentAll.has(id))); const resetPanes = new Set([...previousErrorPanes].filter((id) => !current.errorPanes.has(id))); previous = new Set([...previous, ...currentAll]); previousErrorPanes = new Set([...previousErrorPanes, ...current.errorPanes]); render(current, reset, resetPanes); previous = currentAll; previousErrorPanes = current.errorPanes; consecutiveFailures = 0; if (!currentAll.size) return stop(); scheduleNext(current.active.size ? intervalMs : errorIntervalMs); } catch (error) { console.error("pi-tmux-window-status frame failed; retrying:", error); clientsAt = -Infinity; consecutiveFailures += 1; if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) { console.error(`pi-tmux-window-status: giving up after ${consecutiveFailures} consecutive failed frames; releasing the animator guard so a fresh animator can retry`); return stop(); } scheduleNext(errorIntervalMs); } };
   unsubscribeUrgent = subscribeUrgent(() => { if (stopped) return; cancel(timer); tick(); });
-  const initial = windowLeaseStates(root, wallNow()); previousErrorPanes = listRecoveryArmedPanes(tmux, socketPath, exec); sweepWindows(tmux, socketPath, initial, exec); tick(); return { started: true, stop, tick };
+  try { const initial = windowLeaseStates(root, wallNow()); previousErrorPanes = listRecoveryArmedPanes(tmux, socketPath, exec); sweepWindows(tmux, socketPath, initial, exec); tick(); } catch (error) { await stop(); throw error; }
+  return { started: true, stop, tick };
 }
 export function isDirectExecution(metaUrl = import.meta.url, argv1 = process.argv[1]) { if (!argv1 || !existsSync(argv1)) return false; try { return realpathSync(fileURLToPath(metaUrl)) === realpathSync(argv1); } catch { return false; } }
-if (isDirectExecution()) { const socket = process.argv[2]; if (!socket) { console.error("pi-tmux-window-status: missing socket"); process.exitCode = 2; } else runAnimator({ socketPath: socket }); }
+if (isDirectExecution()) { const socket = process.argv[2]; if (!socket) { console.error("pi-tmux-window-status: missing socket"); process.exitCode = 2; } else runAnimator({ socketPath: socket }).catch((error) => { console.error("pi-tmux-window-status animator failed:", error); process.exitCode = 1; }); }

@@ -1,7 +1,7 @@
-import { chmodSync, closeSync, mkdirSync, openSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
-import { linkSync } from "node:fs";
-import { dirname, join } from "node:path";
-import { randomUUID } from "node:crypto";
+import { chmodSync, closeSync, mkdirSync, openSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { createServer as netCreateServer } from "node:net";
+import { dirname, join, resolve } from "node:path";
+import { createHash, randomUUID } from "node:crypto";
 
 export const LEASE_TTL_MS = 6_000;
 export const HEARTBEAT_MS = 2_000;
@@ -171,28 +171,62 @@ function processAlive(pid, killFn = process.kill) {
   try { killFn(pid, 0); return true; } catch (error) { return error?.code === "EPERM"; }
 }
 
-export function acquireAnimatorLock(lockPath, token = randomUUID(), pid = process.pid, read = readFileSync, link = linkSync, writeFile = writeFileSync, unlink = rmSync, alive = processAlive) {
-  mkdirSync(dirname(lockPath), { recursive: true, mode: 0o700 });
-  const tryClaim = () => {
-    const temp = join(dirname(lockPath), `.${safeId(lockPath)}.${pid}.${randomUUID()}.tmp`);
-    let outcome;
-    try {
-      writeFile(temp, `${JSON.stringify({ pid, token })}\n`, { encoding: "utf8", mode: 0o600, flag: "wx" });
-      try { link(temp, lockPath); outcome = { token, owner: true }; }
-      catch (error) { outcome = error; }
-    } finally {
-      if (temp !== lockPath) { try { unlink(temp, { force: true }); } catch {} }
+/**
+ * Kernel lifetime guard: a Linux abstract AF_UNIX listener owned by the animator process itself.
+ * The name is stable across metadata-format changes and keyed by uid plus the canonical tmux socket,
+ * so a second live animator can only get EADDRINUSE; crash, SIGKILL or exit releases it with no stale file to reclaim.
+ */
+export function animatorKernelName(socketPath, uid = process.getuid()) {
+  let canonical; try { canonical = realpathSync(socketPath); } catch { canonical = resolve(socketPath); }
+  return `\0pi-tmux-window-status:v2:${uid}:${createHash("sha256").update(canonical).digest("hex").slice(0, 32)}`;
+}
+
+const closeServer = (server) => new Promise((done) => server.close(() => done()));
+
+/**
+ * Resolves {owner:true,...} for the one live animator per tmux socket, {owner:false,reason} for a loser; rejects when unsupported.
+ * The metadata file is diagnostic only ({v:2,pid,token}, written after the bind): it never decides exclusion among v2 animators,
+ * but a live pre-kernel (no `v`) pid is respected, without signalling it, because that animator holds no kernel guard.
+ */
+export async function acquireAnimatorKernelLock({ socketPath, lockPath, token = randomUUID(), pid = process.pid, platform = process.platform, alive = processAlive, read = readFileSync, write = writeFileSync, rename = renameSync }) {
+  if (platform !== "linux") throw new Error(`pi-tmux-window-status: animator exclusivity needs Linux abstract unix sockets (platform ${platform} is unsupported)`);
+  const name = animatorKernelName(socketPath);
+  const server = netCreateServer((connection) => connection.destroy());
+  try {
+    await new Promise((resolveListen, rejectListen) => { server.once("error", rejectListen); server.listen(name, () => { server.off("error", rejectListen); resolveListen(); }); });
+  } catch (error) {
+    server.removeAllListeners();
+    if (error?.code === "EADDRINUSE") return { owner: false, reason: "held" };
+    throw error;
+  }
+  server.on("error", (error) => console.error("pi-tmux-window-status: animator guard socket error:", error));
+  try {
+    let held; try { held = JSON.parse(read(lockPath, "utf8")); } catch {}
+    if (held && typeof held === "object" && held.v === undefined && Number.isInteger(held.pid) && held.pid !== pid && alive(held.pid)) {
+      await closeServer(server); server.removeAllListeners();
+      return { owner: false, reason: "legacy-live", pid: held.pid };
     }
-    return outcome;
-  };
-  const attempt = tryClaim();
-  if (!(attempt instanceof Error)) return attempt;
-  if (attempt.code !== "EEXIST") throw attempt;
-  const reclaim = () => { try { unlink(lockPath, { force: true }); } catch {} const next = tryClaim(); if (!(next instanceof Error)) return next; if (next.code === "EEXIST") return { owner: false }; throw next; };
-  let held; try { held = JSON.parse(read(lockPath, "utf8")); } catch { return reclaim(); }
-  if (!held || typeof held.token !== "string" || !Number.isInteger(held.pid)) return reclaim();
-  if (alive(held.pid)) return { owner: false };
-  return reclaim();
+    mkdirSync(dirname(lockPath), { recursive: true, mode: 0o700 });
+    const temp = join(dirname(lockPath), `.${safeId(lockPath)}.${pid}.${randomUUID()}.tmp`);
+    try { write(temp, `${JSON.stringify({ v: 2, pid, token })}\n`, { encoding: "utf8", mode: 0o600, flag: "wx" }); rename(temp, lockPath); }
+    finally { try { rmSync(temp, { force: true }); } catch {} }
+  } catch (error) {
+    await closeServer(server).catch(() => {}); server.removeAllListeners();
+    throw error;
+  }
+  return { owner: true, token, lockPath, server, closing: undefined };
+}
+
+/** Idempotent. Removes only this owner's metadata first, then closes the guard last, even if the metadata step fails. */
+export function releaseAnimatorKernelLock(lock, read = readFileSync, remove = rmSync) {
+  if (!lock?.owner) return Promise.resolve();
+  lock.closing ??= (async () => {
+    try {
+      let held; try { held = JSON.parse(read(lock.lockPath, "utf8")); } catch (error) { if (error?.code && error.code !== "ENOENT") throw error; }
+      if (held?.token === lock.token) remove(lock.lockPath, { force: true });
+    } finally { await closeServer(lock.server); lock.server.removeAllListeners(); }
+  })();
+  return lock.closing;
 }
 
 export function windowLeaseStates(root, now = Date.now()) {
@@ -209,11 +243,4 @@ export function windowLeaseStates(root, now = Date.now()) {
   } catch {}
   for (const id of error) active.delete(id);
   return { active, error, errorPanes };
-}
-
-export function releaseAnimatorLock(lockPath, token, read = readFileSync, remove = rmSync) {
-  try {
-    const held = JSON.parse(read(lockPath, "utf8"));
-    if (held.token === token) remove(lockPath, { force: true });
-  } catch {}
 }

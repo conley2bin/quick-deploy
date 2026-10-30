@@ -52,6 +52,8 @@ export default function piTmuxWindowStatus(pi: ExtensionAPI) {
   if (nestedPublisherDisabled()) return;
   // Recovery belongs to every root session; tmux identity gates presentation only.
   installErrorRecovery(pi);
+  // The animator guard is a Linux abstract unix socket; elsewhere presentation is disabled explicitly, never emulated by a file.
+  if (process.platform !== "linux") { console.error(`pi-tmux-window-status: animator exclusivity requires Linux (platform ${process.platform}); tmux presentation disabled; error recovery remains enabled`); return; }
   let tmux: Identity; try { tmux = identity(); } catch (error) { console.error(`${error instanceof Error ? error.message : String(error)}; tmux presentation disabled; error recovery remains enabled`); return; }
   let mainActive = false, assistantErrorLatched = false, rootSessionId: string | undefined, beat: ReturnType<typeof setInterval> | undefined, animator: ReturnType<typeof spawn> | undefined, previousLeaseState: false | "active" | "error" = false;
   let terminalInputUnsubscribe: (() => void) | undefined, activeRunSignal: AbortSignal | undefined;

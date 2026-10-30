@@ -88,6 +88,23 @@ test("standalone module install recovers without any suspend-guard source or ins
   h.tick(1); assert.deepEqual(h.sent, ["continue"]);
 });
 
+test("unsupported animator platform disables presentation only; recovery still registers before the guard and keeps 10-minute and 8-hour behavior", (t) => {
+  const descriptor = Object.getOwnPropertyDescriptor(process, "platform");
+  Object.defineProperty(process, "platform", { value: "darwin", configurable: true });
+  t.after(() => Object.defineProperty(process, "platform", descriptor));
+  const h = harness(t);
+  process.env.TMUX_PANE = "%1"; // a reachable tmux must not matter: the platform guard comes first and spawns nothing
+  assert.equal(h.handlers.get("message_end").length, 1, "recovery sender registered");
+  assert.equal(h.inputs.size, 1, "only the recovery listener exists; no presentation listeners");
+  assert.match(h.diagnostics[0][0], /requires Linux \(platform darwin\); tmux presentation disabled; error recovery remains enabled/);
+  h.start(); h.error(); h.settle();
+  h.tick(599_999); assert.deepEqual(h.sent, []);
+  h.tick(1); assert.deepEqual(h.sent, ["continue"]);
+  for (let n = 1; n < 10; n++) { h.tick(600_000); assert.equal(h.sent.length, n + 1); }
+  h.tick(600_000); assert.equal(h.sent.length, 10, "eleventh send waits for the eight-hour renewal");
+  h.tick(RESET_MS - 600_000); assert.equal(h.sent.length, 11, "eight-hour renewal still fires");
+});
+
 for (const [label, errorMessage] of [
   ["exact concurrent permission_error", PERMISSION_ERROR],
   ["arbitrary", "unfamiliar provider failure"],

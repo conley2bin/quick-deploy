@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { execFileSync, spawn, spawnSync } from "node:child_process";
-import { HEARTBEAT_MS, LEASE_TTL_MS, acquireAnimatorLock, aggregateLogicalState, leasePath, projectAsyncStatus, publishLease, readLease, releaseAnimatorLock, seedAttentionWatermarksFromSnapshot, windowLeaseStates } from "../state.mjs";
+import { HEARTBEAT_MS, LEASE_TTL_MS, acquireAnimatorKernelLock, aggregateLogicalState, leasePath, projectAsyncStatus, publishLease, readLease, releaseAnimatorKernelLock, seedAttentionWatermarksFromSnapshot, windowLeaseStates } from "../state.mjs";
 import { CANCEL_SENTINEL, RECOVERY_ARMED_OPTION, animatorSpawnNeeded, childFromStartedPayload, childStillRunning, defaultAsyncRoot, isAssistantError, isManualEscapePress, mergedChildSnapshot, monitorNeeded, nestedProjectionFromChildren, nestedPublisherDisabled, nextAssistantErrorState, readNestedRegistryProjection, recoveryTerminalInput, restoredChildren, sessionIdOf, validateNestedRoute } from "../index.ts";
 import { ANIMATOR_URGENT_SIGNAL, ERROR_BG, ERROR_FG, ERROR_MS, FRAME_BLUE, FRAME_COUNT, FRAME_MS, FRAMES, GRAY_RANGE, MAX_CONSECUTIVE_FAILURES, PERIOD_MS, activeWindows, frameAt, isDirectExecution, leaseWindowStates, listClients, listRecoveryArmedPanes, paneRecoveryOptionArgs, requestAnimatorTick, runAnimator, sweepWindows, windowOptionArgs } from "../animator.mjs";
 
@@ -517,49 +517,6 @@ test("nested registry projection treats rejected descendant as terminal and clea
   assert.equal(state.active, false, "rejected-only registry closes the root");
 });
 
-test("process-owned animator lock uses atomic hard-link, cleans up temp, and rejects concurrent claims", () => {
-  const d = temp(), lock = join(d, "animator.lock");
-  const held = acquireAnimatorLock(lock, "live", process.pid);
-  assert.ok(held.owner);
-  const live = JSON.parse(readFileSync(lock));
-  assert.equal(live.token, "live", "real lock file is complete JSON");
-  assert.equal(live.pid, process.pid, "lock records the claiming pid; using the test process pid keeps the liveness check deterministic (an arbitrary pid like 111 may not exist on the host)");
-  const dirEntries = readdirSync(d);
-  assert.equal(dirEntries.includes("animator.lock"), true, "lock file is published");
-  assert.equal(dirEntries.some((entry) => entry.endsWith(".tmp")), false, "no temp hard-link is left in the directory after successful claim");
-  assert.equal(acquireAnimatorLock(lock, "other", 222).owner, false, "second claim against an existing live lock is rejected");
-  releaseAnimatorLock(lock, "live");
-  assert.equal(existsSync(lock), false, "release removes lock file");
-  writeFileSync(lock, "");
-  const emptyHeld = acquireAnimatorLock(lock, "empty", 333);
-  assert.ok(emptyHeld.owner, "empty real lock is reclaimed");
-  assert.equal(readdirSync(d).some((entry) => entry.endsWith(".tmp")), false, "no temp hard-link left after reclaiming empty lock");
-  const reclaimed = JSON.parse(readFileSync(lock));
-  assert.equal(reclaimed.token, "empty");
-  assert.equal(reclaimed.pid, 333);
-  releaseAnimatorLock(lock, "empty");
-  writeFileSync(lock, "not json");
-  const corruptHeld = acquireAnimatorLock(lock, "corrupt", 444);
-  assert.ok(corruptHeld.owner, "unparseable real lock is reclaimed");
-  assert.equal(readdirSync(d).some((entry) => entry.endsWith(".tmp")), false, "no temp hard-link left after reclaiming corrupt lock");
-  const replaced = JSON.parse(readFileSync(lock));
-  assert.equal(replaced.token, "corrupt");
-  assert.equal(replaced.pid, 444);
-  releaseAnimatorLock(lock, "corrupt");
-  const eexDir = temp();
-  const eexLock = join(eexDir, "race.lock");
-  let linkCalls = 0;
-  const racingLink = () => { linkCalls++; throw Object.assign(new Error("link refused"), { code: "EEXIST" }); };
-  const eexAttempt = acquireAnimatorLock(eexLock, "racer", 999, undefined, racingLink, () => {}, () => {}, () => false);
-  assert.equal(eexAttempt.owner, false, "atomic EEXIST returns owner false without publishing partial lock");
-  assert.ok(linkCalls >= 1, "atomic EEXIST path invokes link at least once");
-  assert.equal(existsSync(eexLock), false, "no partial lock file is published when link fails");
-  const winner = acquireAnimatorLock(eexLock, "winner", 555);
-  assert.ok(winner.owner, "real subsequent claim wins after the racing EEXIST injection");
-  assert.equal(readdirSync(eexDir).some((entry) => entry.endsWith(".tmp")), false, "no temp hard-link left after successful real claim");
-  releaseAnimatorLock(eexLock, "winner");
-});
-
 test("urgent animator request targets the validated lock owner with safe SIGWINCH", () => {
   const runtime = temp(), env = { QUICK_DEPLOY_PI_TMUX_WINDOW_STATUS_RUNTIME: runtime }, i = ident("/tmp/urgent-socket"), root = join(runtime, "quick-deploy", "pi-tmux-status", Buffer.from(i.socketPath).toString("base64url"));
   mkdirSync(root, { recursive: true });
@@ -572,27 +529,29 @@ test("urgent animator request targets the validated lock owner with safe SIGWINC
   assert.equal(ANIMATOR_URGENT_SIGNAL, "SIGWINCH", "older animators ignore the urgent signal instead of being terminated");
 });
 
-test("animator gives up after consecutive failed frames and releases the lock", () => {
-  const runtime = temp(), env = { QUICK_DEPLOY_PI_TMUX_WINDOW_STATUS_RUNTIME: runtime }, i = ident("/tmp/socket"), root = join(runtime, "quick-deploy", "pi-tmux-status", Buffer.from(i.socketPath).toString("base64url"));
+test("animator gives up after consecutive failed frames and releases the lock", async () => {
+  const runtime = temp(), env = { QUICK_DEPLOY_PI_TMUX_WINDOW_STATUS_RUNTIME: runtime }, i = ident(join(temp(), "socket")), root = join(runtime, "quick-deploy", "pi-tmux-status", Buffer.from(i.socketPath).toString("base64url"));
   publishLease(i, "a", "active", 100, env);
   const exec = () => { const e = new Error("no server running"); e.status = 1; throw e; };
   const delays = [];
-  const a = runAnimator({ socketPath: i.socketPath, root, now: () => 0, wallNow: () => 100, intervalMs: FRAME_MS, errorIntervalMs: ERROR_MS, exec, schedule: (_fn, delay) => { delays.push(delay); return { unref() {} }; }, cancel: () => {}, subscribeUrgent: inertUrgent });
+  const a = await runAnimator({ socketPath: i.socketPath, root, now: () => 0, wallNow: () => 100, intervalMs: FRAME_MS, errorIntervalMs: ERROR_MS, exec, schedule: (_fn, delay) => { delays.push(delay); return { unref() {} }; }, cancel: () => {}, subscribeUrgent: inertUrgent });
   assert.ok(a.started);
-  assert.equal(acquireAnimatorLock(join(root, "animator.lock")).owner, false, "lock is held while retrying");
+  assert.equal((await acquireAnimatorKernelLock({ socketPath: i.socketPath, lockPath: join(root, "animator.lock") })).owner, false, "kernel guard is held while retrying");
   assert.equal(delays.at(-1), ERROR_MS, "failed frame retries at the slow reconciliation cadence");
   for (let n = 1; n < MAX_CONSECUTIVE_FAILURES; n++) a.tick();
   assert.equal(existsSync(join(root, "animator.lock")), false, "lock file is removed after MAX_CONSECUTIVE_FAILURES failed frames");
-  const recovered = runAnimator({ socketPath: i.socketPath, root, now: () => 0, wallNow: () => 100, intervalMs: FRAME_MS, errorIntervalMs: ERROR_MS, exec, schedule: (_fn, delay) => { delays.push(delay); return { unref() {} }; }, cancel: () => {}, subscribeUrgent: inertUrgent });
-  assert.ok(recovered.started, "a fresh animator can acquire the lock and retry right away");
+  await a.stop();
+  const recovered = await runAnimator({ socketPath: i.socketPath, root, now: () => 0, wallNow: () => 100, intervalMs: FRAME_MS, errorIntervalMs: ERROR_MS, exec, schedule: (_fn, delay) => { delays.push(delay); return { unref() {} }; }, cancel: () => {}, subscribeUrgent: inertUrgent });
+  assert.ok(recovered.started, "a fresh animator can acquire the guard and retry right away");
+  await recovered.stop();
 });
 
-test("animator counts only consecutive failures: one success resets the give-up counter", () => {
-  const runtime = temp(), env = { QUICK_DEPLOY_PI_TMUX_WINDOW_STATUS_RUNTIME: runtime }, i = ident("/tmp/socket"), root = join(runtime, "quick-deploy", "pi-tmux-status", Buffer.from(i.socketPath).toString("base64url"));
+test("animator counts only consecutive failures: one success resets the give-up counter", async () => {
+  const runtime = temp(), env = { QUICK_DEPLOY_PI_TMUX_WINDOW_STATUS_RUNTIME: runtime }, i = ident(join(temp(), "socket")), root = join(runtime, "quick-deploy", "pi-tmux-status", Buffer.from(i.socketPath).toString("base64url"));
   publishLease(i, "a", "active", 100, env);
   let failing = true;
   const exec = () => { if (failing) { const e = new Error("no server running"); e.status = 1; throw e; } return ""; };
-  const a = runAnimator({ socketPath: i.socketPath, root, now: () => 0, wallNow: () => 100, intervalMs: FRAME_MS, errorIntervalMs: ERROR_MS, exec, schedule: () => ({ unref() {} }), cancel: () => {}, subscribeUrgent: inertUrgent });
+  const a = await runAnimator({ socketPath: i.socketPath, root, now: () => 0, wallNow: () => 100, intervalMs: FRAME_MS, errorIntervalMs: ERROR_MS, exec, schedule: () => ({ unref() {} }), cancel: () => {}, subscribeUrgent: inertUrgent });
   assert.ok(a.started);
   failing = false; a.tick();
   failing = true;
@@ -602,13 +561,13 @@ test("animator counts only consecutive failures: one success resets the give-up 
   assert.equal(existsSync(join(root, "animator.lock")), false, "the give-up threshold applies to consecutive failures only");
 });
 
-test("animator batches active/error transitions, cadences, resets, and cached clients", () => {
-  const runtime = temp(), env = { QUICK_DEPLOY_PI_TMUX_WINDOW_STATUS_RUNTIME: runtime }, i = ident("/tmp/socket"), root = join(runtime, "quick-deploy", "pi-tmux-status", Buffer.from(i.socketPath).toString("base64url"));
+test("animator batches active/error transitions, cadences, resets, and cached clients", async () => {
+  const runtime = temp(), env = { QUICK_DEPLOY_PI_TMUX_WINDOW_STATUS_RUNTIME: runtime }, i = ident(join(temp(), "socket")), root = join(runtime, "quick-deploy", "pi-tmux-status", Buffer.from(i.socketPath).toString("base64url"));
   publishLease(i, "a", "active", 100, env);
   const calls = [], delays = [];
   let mono = 0, wall = 100, listCount = 0, urgentHandler, urgentUnsubscribed = 0;
   const exec = (_tmux, args) => { calls.push(args); if (args.includes("list-clients")) { listCount++; if (listCount === 2) { const e = new Error("stale"); e.status = 1; throw e; } return "c1\nc2\n"; } if (args.includes("list-windows")) return "@8\n@9\n"; return ""; };
-  const a = runAnimator({ socketPath: i.socketPath, root, now: () => mono, wallNow: () => wall, intervalMs: FRAME_MS, errorIntervalMs: ERROR_MS, exec, schedule: (_fn, delay) => { delays.push(delay); return { unref() {} }; }, cancel: () => {}, subscribeUrgent: (handler) => { urgentHandler = handler; return () => { urgentUnsubscribed += 1; }; } });
+  const a = await runAnimator({ socketPath: i.socketPath, root, now: () => mono, wallNow: () => wall, intervalMs: FRAME_MS, errorIntervalMs: ERROR_MS, exec, schedule: (_fn, delay) => { delays.push(delay); return { unref() {} }; }, cancel: () => {}, subscribeUrgent: (handler) => { urgentHandler = handler; return () => { urgentUnsubscribed += 1; }; } });
   assert.ok(a.started);
   let frameBatches = calls.filter((args) => args.includes("set-option"));
   assert.ok(frameBatches.at(-1).includes(FRAMES[0]));
@@ -638,7 +597,10 @@ test("animator batches active/error transitions, cadences, resets, and cached cl
   assert.ok(calls.some((args) => args.includes("-uw") && args.includes("@quick_deploy_pi_error")));
   assert.ok(calls.some((args) => args.includes("-upq") && args.includes(RECOVERY_ARMED_OPTION)), "same animator clears stale pane ownership");
   assert.equal(urgentUnsubscribed, 1, "stop removes the urgent signal listener");
-  assert.equal(acquireAnimatorLock(join(root, "animator.lock")).owner, true);
+  await a.stop();
+  const successor = await acquireAnimatorKernelLock({ socketPath: i.socketPath, lockPath: join(root, "animator.lock") });
+  assert.equal(successor.owner, true, "stop released the kernel guard");
+  await releaseAnimatorKernelLock(successor);
 });
 
 test("partial tmux batch failure retains attempted window and pane cleanup responsibility", async () => {
@@ -658,7 +620,7 @@ test("partial tmux batch failure retains attempted window and pane cleanup respo
     client = spawn("tmux", ["-C", "-S", socket, "attach-session", "-t", "partial-batch"], { env: tmuxEnv, stdio: ["pipe", "ignore", "ignore"] });
     await waitFor(() => { try { return tmux(["-S", socket, "list-clients", "-F", "#{client_name}"], { encoding: "utf8" }).trim() ? "attached" : ""; } catch { return ""; } }, "attached");
     const root = join(runtime, "quick-deploy", "pi-tmux-status", Buffer.from(socket).toString("base64url"));
-    animator = runAnimator({ socketPath: socket, root, wallNow: () => wall, schedule: () => ({ unref() {} }), cancel: () => {}, subscribeUrgent: inertUrgent });
+    animator = await runAnimator({ socketPath: socket, root, wallNow: () => wall, schedule: () => ({ unref() {} }), cancel: () => {}, subscribeUrgent: inertUrgent });
     assert.equal(animator.started, true);
     assert.equal(marker(paneB), "1");
 
@@ -688,7 +650,7 @@ test("partial tmux batch failure retains attempted window and pane cleanup respo
     assert.equal(red(windowB), "", "stop clears the remaining window responsibility set");
   } finally {
     if (client?.exitCode === null) client.kill("SIGKILL");
-    animator?.stop?.();
+    await animator?.stop?.();
     publishLease(first, "root-a", false, Date.now(), env);
     publishLease(second, "root-b", false, Date.now(), env);
     try { tmux(["-S", socket, "kill-server"]); } catch {}
@@ -937,7 +899,7 @@ test("urgent animator tick clears the last error without repaint and preserves a
   }
 });
 
-test("animator startup sweep clears stale pane markers and derives current owner from leases", () => {
+test("animator startup sweep clears stale pane markers and derives current owner from leases", async () => {
   const runtime = temp(), work = temp(), socket = join(work, "server.sock"), env = { QUICK_DEPLOY_PI_TMUX_WINDOW_STATUS_RUNTIME: runtime };
   const tmux = (args, options = {}) => isolatedTmux(args, options);
   tmux(["-S", socket, "-f", "/dev/null", "new-session", "-d", "-s", "pane-sweep"]);
@@ -953,7 +915,7 @@ test("animator startup sweep clears stale pane markers and derives current owner
   let animator;
   try {
     assert.deepEqual([...listRecoveryArmedPanes("tmux", socket)].sort(), [ownerPane, stalePane].sort());
-    animator = runAnimator({ socketPath: socket, root, schedule: () => ({ unref() {} }), cancel: () => {}, subscribeUrgent: inertUrgent });
+    animator = await runAnimator({ socketPath: socket, root, schedule: () => ({ unref() {} }), cancel: () => {}, subscribeUrgent: inertUrgent });
     assert.equal(animator.started, true);
     assert.equal(marker(ownerPane), "1", "live error lease retains marker");
     assert.equal(marker(stalePane), "", "startup sweep clears marker without a live error lease");
@@ -961,7 +923,7 @@ test("animator startup sweep clears stale pane markers and derives current owner
     animator.tick();
     assert.equal(marker(ownerPane), "", "lease removal clears prior owner marker");
   } finally {
-    animator?.stop?.();
+    await animator?.stop?.();
     tmux(["-S", socket, "kill-server"]);
   }
 });
