@@ -463,6 +463,19 @@ async function isRemoteClient(owner: Owner): Promise<boolean> {
   return Boolean(process.env.SSH_CONNECTION || process.env.SSH_CLIENT || process.env.MOSH_CONNECTION);
 }
 
+// ctx.ui.pasteToEditor wraps its argument in ESC[200~ ... ESC[201~ and feeds the editor, whose parser ends the
+// data frame at the first ESC[201~ and re-enters the rest as raw keystrokes (skipping the paste C0 filter).
+// Remove the native framing sequences so the whole payload stays inside the frame; removal repeats because
+// deleting one marker can join the halves of another.
+function stripPasteFraming(text: string): string {
+  let previous: string;
+  do {
+    previous = text;
+    text = text.replaceAll("\x1b[200~", "").replaceAll("\x1b[201~", "");
+  } while (text !== previous);
+  return text;
+}
+
 /** 向 pane 写 OSC 52；tmux set-clipboard=on 会转发给正在观看的客户端。 */
 function emitOsc52(text: string): boolean {
   if (process.stdout.isTTY !== true) return false;
@@ -536,11 +549,12 @@ export default function piRemoteClipboard(pi: ExtensionAPI): void {
     try {
       await pasteViaHelper(owner, (pasted, adopt) => {
         if (pasted.kind === "text") {
-          if (pasted.text.trim().length === 0) {
+          const text = stripPasteFraming(pasted.text);
+          if (text.trim().length === 0) {
             ctx.ui.notify("对端剪贴板为空", "info");
             return;
           }
-          ctx.ui.pasteToEditor(pasted.text);
+          ctx.ui.pasteToEditor(text);
         } else {
           ctx.ui.pasteToEditor(pasted.path);
           adopt();

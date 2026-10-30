@@ -108,6 +108,8 @@ piox
 
 扩展据回执而非内容区分图片与文本：文本即使形如路径或回执 JSON 也只当文本粘贴，从不据其删除任何文件。图片回执只接受固定名 `image.(png|jpg|webp|gif)`，并校验它是暂存目录内本用户、单链接、非组/其他可访问的普通文件（拒绝路径穿越、符号链接、硬链接、目录）；通过后以硬链接交付为暂存目录之外的唯一 0600 文件，随后删除暂存目录，插入编辑器成功的那一刻文件才归编辑器/历史所有，此后（包括渲染失败、session shutdown、reload）永不删除。插入前的任何失败或取消，会在助手进程组消失后删除暂存目录和尚未交付的文件。暂存目录的所有权保留到 `rm` 成功为止（主体里的删除失败后由收尾阶段重试），暂存目录与未交付文件的释放相互独立，失败会明确记录到 stderr，已交付（已接收）的文件不受影响；重复的不可恢复 I/O 失败只会留下一个 0700 的残留目录，不设重试循环或清扫器。自动 Ctrl+V 的所有真实失败（协议、I/O、超时）都经 Pi 的错误通道显示，不回退原生路径；失败若发生在 shutdown 之后则按取消处理，不再提示。整个操作登记在 Owner 上，`session_shutdown` 的 await 会等到清理结束；业务结果（含 8 秒超时）先于清理返回。缺失/过期回执是显式协议错误（Ctrl+V 通过 Pi 的错误通道显示，Ctrl+Alt+V 通过通知显示），没有退回纯文本的兼容路径。
 
+**文本粘贴帧**：`Ctrl+Alt+V` 的文本经公共 `ctx.ui.pasteToEditor`，Pi 会用原生括号粘贴定界符 `ESC[200~`/`ESC[201~` 包裹后交给编辑器；编辑器在第一个 `ESC[201~` 处结束数据帧，其后的内容被当作原始按键重新输入，绕过粘贴的 C0 过滤。因此扩展在调用前删除对端文本里的这两个原生定界符（反复删除直至稳定，防止拼接重组），其余内容（可见字符、换行、制表符、Unicode、字面反斜杠转义串）原样交给编辑器的常规粘贴过滤。自动 `Ctrl+V` 走 `insertTextAtCursor`，不经此解析器；图片路径不是剪贴板文本，不做改写。仅含定界符的文本按空剪贴板处理。
+
 不带参数的手动 CLI（`python3 ctrlv.py`）行为不变：stdout 为 `sys.stdout.write` 的原文（无额外换行），图片写为临时目录下的 0600 文件并打印路径；本地会话退出码 2。提供者 TCP 协议不变。
 
 ### 部署与激活
@@ -134,7 +136,7 @@ piox
 python3 pi-agent/extensions/pi-remote-clipboard/tests/test_all.py
 python3 pi-agent/extensions/pi-remote-clipboard/tests/test_installer.py
 python3 pi-agent/extensions/pi-remote-clipboard/tests/native_activation.py
-node --experimental-strip-types --test pi-agent/extensions/pi-remote-clipboard/tests/activation.test.mjs pi-agent/extensions/pi-remote-clipboard/tests/lifecycle.test.mjs
+node --experimental-strip-types --test pi-agent/extensions/pi-remote-clipboard/tests/activation.test.mjs pi-agent/extensions/pi-remote-clipboard/tests/lifecycle.test.mjs pi-agent/extensions/pi-remote-clipboard/tests/paste-framing.test.mjs
 cd pi-agent/extensions/pi-remote-clipboard/pi-extension && ../../pi-copy-links/node_modules/.bin/tsc -p tsconfig.json --noEmit
 ```
 
