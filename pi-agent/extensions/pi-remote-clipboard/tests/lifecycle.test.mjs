@@ -1,5 +1,5 @@
 import { execFileSync, spawn } from "node:child_process";
-import { chmodSync, existsSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { registerHooks } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -27,6 +27,9 @@ registerHooks({
 
 const temp = mkdtempSync(join(tmpdir(), "pi-remote-clipboard-lifecycle-"));
 process.env.PI_REMOTE_CLIPBOARD_DIR = temp;
+// Paste operations stage and deliver files under os.tmpdir(); keep them inside this fixture.
+mkdirSync(join(temp, "tmpdir"));
+process.env.TMPDIR = join(temp, "tmpdir");
 const { InteractiveMode } = await import(coreUrl);
 const { TuiAltScreen } = await import(tuiUrl);
 const { default: piRemoteClipboard } = await import("../pi-extension/index.ts");
@@ -73,6 +76,8 @@ while not (p / 'release').exists():
     time.sleep(.01)
 if 'fail' in mode:
     sys.exit(1)
+if '--artifact-staging' in sys.argv:
+    sys.stdout.write('{"protocol":"pi-remote-clipboard/artifact-1","kind":"text"}\\n')
 print('synthetic clipboard text')
 `;
 writeHelper("ctrlv.py", helperSource);
@@ -115,6 +120,8 @@ function loadExtension(mode = "tui") {
 }
 
 beforeEach(() => {
+  for (const name of readdirSync(join(temp, "tmpdir"))) rmSync(join(temp, "tmpdir", name), { recursive: true, force: true });
+  rmSync(join(temp, "victim"), { force: true });
   for (const key of envKeys) if (key !== "PATH") delete process.env[key];
   for (const name of readdirSync(temp)) if (/^(started|term|grandchild|release|tmux)/.test(name)) rmSync(join(temp, name), { force: true });
   writeFileSync(join(temp, "mode"), "");
@@ -126,14 +133,26 @@ beforeEach(() => {
 });
 
 afterEach(async () => {
-  mock.timers.reset();
+  // Restore stdout first: tests capture process.stdout.write, and the test runner's own reporter writes
+  // through it; any await while it is still patched would swallow reports of other tests.
+  process.stdout.write = stdoutWrite;
+  if (ttyDescriptor) Object.defineProperty(process.stdout, "isTTY", ttyDescriptor); else delete process.stdout.isTTY;
+  // Kill leftover fixtures, then join the owners' cleanup while the fake clock (if a test enabled it) is
+  // still installed: quiescence waits on the KILL/grace timers that clock owns, so it is advanced here
+  // until the join completes and only then replaced by the real one.
   for (const pid of [...startedPids(), ...names("grandchild-").map((name) => Number(name.slice(11)))]) {
     try { process.kill(pid, "SIGKILL"); } catch { /* already gone */ }
   }
-  await Promise.all(fixtures.map((extension) => extension.shutdown()));
+  const joined = Promise.all(fixtures.map((extension) => extension.shutdown()));
+  let finished = false;
+  joined.then(() => { finished = true; }, () => { finished = true; });
+  for (let turn = 0; turn < 200 && !finished; turn += 1) {
+    try { mock.timers.tick(1000); } catch { /* real timers are active */ }
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  mock.timers.reset();
+  await joined;
   fixtures = [];
-  process.stdout.write = stdoutWrite;
-  if (ttyDescriptor) Object.defineProperty(process.stdout, "isTTY", ttyDescriptor); else delete process.stdout.isTTY;
   Object.defineProperty(pasteOwner, "handleClipboardPaste", pasteDescriptor);
   Object.defineProperty(copyOwner, "copyTextToClipboard", copyDescriptor);
   if (sinkDescriptor) Object.defineProperty(globalThis, sinkKey, sinkDescriptor); else delete globalThis[sinkKey];
@@ -515,13 +534,14 @@ test("the 1 MiB budget counts bytes: multibyte output over 1 MiB is rejected whi
   try {
     const extension = loadExtension();
     extension.start();
-    emit("sys.stdout.write('€' * 340000)"); // 1,020,000 bytes
+    const receipt = `sys.stdout.write('{"protocol":"pi-remote-clipboard/artifact-1","kind":"text"}\\n'); `;
+    emit(`${receipt}sys.stdout.write('€' * 340000)`); // 1,020,000 body bytes
     await extension.explicitPaste();
     assert.equal(extension.pastes.length, 1);
-    emit("sys.stdout.buffer.write(b'a' * 1048576)"); // exactly the budget
+    emit(`${receipt}sys.stdout.flush(); sys.stdout.buffer.write(b'a' * 1048576)`); // exactly the budget
     await extension.explicitPaste();
     assert.equal(extension.pastes.length, 2);
-    emit("sys.stdout.write('€' * 360000)"); // 1,080,000 bytes, 360,000 characters
+    emit(`${receipt}sys.stdout.write('€' * 360000)`); // 1,080,000 bytes, 360,000 characters
     await extension.explicitPaste();
     assert.equal(extension.pastes.length, 2);
     assert.match(extension.notices.at(-1).text, /exceeded/);
@@ -533,4 +553,237 @@ test("the 1 MiB budget counts bytes: multibyte output over 1 MiB is rejected whi
   } finally {
     writeHelper("ctrlv.py", helperSource);
   }
+});
+
+// --- step 4: image artifact ownership ---------------------------------------------------------
+const tmpEntries = () => readdirSync(join(temp, "tmpdir"));
+const PNG = "b'\\x89PNG\\r\\n\\x1a\\n' + b'synthetic'";
+const RECEIPT = (extra) => `json.dumps({'protocol': 'pi-remote-clipboard/artifact-1', ${extra}}) + '\\n'`;
+// A staging-aware helper. `body` runs after the stage path is known and may write files / print.
+const stagedHelper = (body, { wait = false } = {}) => `import json, os, pathlib, sys, time
+p = pathlib.Path(${JSON.stringify(temp)})
+stage = sys.argv[sys.argv.index('--artifact-staging') + 1]
+def make(name, data=${PNG}):
+    fd = os.open(os.path.join(stage, name), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    os.write(fd, data); os.close(fd)
+(p / ('started-' + str(os.getpid()))).write_text('ready')
+${wait ? "while not (p / 'release').exists():\n    time.sleep(.01)" : ""}
+${body}
+`;
+const withHelper = async (source, run) => {
+  writeHelper("ctrlv.py", source);
+  try { await run(); } finally { writeHelper("ctrlv.py", helperSource); }
+};
+const imageReceipt = `make('image.png')\nsys.stdout.write(${RECEIPT("'kind': 'image', 'name': 'image.png'")})`;
+
+test("a delivered image is a private file outside staging, survives shutdown, and is not removed when rendering fails after insertion", async () => {
+  process.env.SSH_CONNECTION = "fixture";
+  await withHelper(stagedHelper(imageReceipt), async () => {
+    const extension = loadExtension();
+    extension.start();
+    const old = process.umask(0);
+    try { await extension.automaticPaste(); } finally { process.umask(old); }
+    assert.equal(extension.inserts.length, 1);
+    const path = extension.inserts[0].text;
+    assert.deepEqual(tmpEntries(), [path.split("/").at(-1)], "staging directory is gone, only the delivered file remains");
+    assert.equal(path.startsWith(join(temp, "tmpdir")), true);
+    assert.equal(statSync(path).mode & 0o777, 0o600);
+    await extension.shutdown();
+    assert.equal(existsSync(path), true, "editor/history own the file after shutdown");
+    // Insertion succeeded, then the render step fails: the file stays.
+    const second = loadExtension();
+    second.start();
+    const host = { editor: { insertTextAtCursor(text) { host.inserted = text; } }, ui: { requestRender() { throw new Error("render boom"); } } };
+    await pasteOwner.handleClipboardPaste.call(host);
+    assert.equal(existsSync(host.inserted), true, "render failure after insertion must not delete the inserted image");
+    // Explicit shortcut: image path is pasted and survives shutdown too.
+    await second.explicitPaste();
+    const explicit = second.pastes.at(-1).text;
+    await second.shutdown();
+    assert.equal(existsSync(explicit), true);
+    assert.equal(tmpEntries().length, 3);
+  });
+});
+
+test("an insertion that throws removes the undelivered image; an insertion that triggers shutdown keeps the inserted one", async () => {
+  process.env.SSH_CONNECTION = "fixture";
+  await withHelper(stagedHelper(imageReceipt), async () => {
+    const extension = loadExtension();
+    extension.start();
+    await pasteOwner.handleClipboardPaste.call({ editor: { insertTextAtCursor() { throw new Error("insert boom"); } }, ui: {}, showError() {} });
+    await until(() => tmpEntries().length === 0, "undelivered image cleanup");
+    let inserted;
+    await pasteOwner.handleClipboardPaste.call({
+      editor: { insertTextAtCursor(text) { inserted = text; extension.shutdown(); } }, ui: {},
+    });
+    assert.equal(existsSync(inserted), true);
+    assert.equal(tmpEntries().length, 1);
+  });
+});
+
+test("cancelling while the helper holds a written image removes the staging directory; no delivered file is left", async () => {
+  process.env.SSH_CONNECTION = "fixture";
+  await withHelper(stagedHelper(imageReceipt, { wait: true }), async () => {
+    const extension = loadExtension();
+    extension.start();
+    const operations = [extension.automaticPaste(), extension.explicitPaste()];
+    await until(() => startedPids().length === 2, "two helpers writing");
+    assert.equal(tmpEntries().length, 2, "private staging directories exist while the helpers run");
+    await extension.shutdown();
+    await Promise.all(operations);
+    assert.deepEqual(tmpEntries(), []);
+    assert.deepEqual(extension.inserts, []);
+    assert.deepEqual(extension.pastes, []);
+  });
+});
+
+test("cancelling before the staging directory exists or right after the helper finished leaves nothing", async () => {
+  process.env.SSH_CONNECTION = "fixture";
+  await withHelper(stagedHelper(imageReceipt), async () => {
+    for (const waitForHelper of [false, true]) {
+      const extension = loadExtension();
+      extension.start();
+      const operation = extension.explicitPaste();
+      if (waitForHelper) await until(() => startedPids().length > 0, "helper start");
+      await extension.shutdown(); // mkdtemp / helper may be in flight
+      await operation;
+      assert.deepEqual(tmpEntries(), []);
+      assert.deepEqual(extension.pastes, []);
+      rmSync(join(temp, "release"), { force: true });
+      for (const name of names("started-")) rmSync(join(temp, name), { force: true });
+    }
+  });
+});
+
+test("16 failed artifact operations leave zero undelivered files", async () => {
+  process.env.SSH_CONNECTION = "fixture";
+  await withHelper(stagedHelper(`make('image.png')\nsys.exit(1)`), async () => {
+    const extension = loadExtension();
+    extension.start();
+    for (let i = 0; i < 16; i += 1) await extension.explicitPaste();
+    assert.equal(extension.notices.filter((n) => n.level === "error").length, 16);
+    await extension.shutdown();
+    assert.deepEqual(tmpEntries(), []);
+  });
+});
+
+test("malformed or foreign receipts surface a protocol error and can never delete a user file", async () => {
+  process.env.SSH_CONNECTION = "fixture";
+  const victim = join(temp, "victim");
+  const cases = {
+    legacyPlainText: `print('/etc/hostname')`,
+    legacyPlainPath: `print(${JSON.stringify(victim)})`,
+    traversalName: `sys.stdout.write(${RECEIPT(`'kind': 'image', 'name': '../../victim'`)})`,
+    absoluteName: `sys.stdout.write(${RECEIPT(`'kind': 'image', 'name': ${JSON.stringify(victim)}`)})`,
+    unknownKind: `sys.stdout.write(${RECEIPT("'kind': 'file'")})`,
+    imageWithBody: `make('image.png')\nsys.stdout.write(${RECEIPT("'kind': 'image', 'name': 'image.png'")} + 'extra')`,
+    missingFile: `sys.stdout.write(${RECEIPT("'kind': 'image', 'name': 'image.png'")})`,
+    symlink: `os.symlink(${JSON.stringify(victim)}, os.path.join(stage, 'image.png'))\nsys.stdout.write(${RECEIPT("'kind': 'image', 'name': 'image.png'")})`,
+    hardlink: `os.link(${JSON.stringify(victim)}, os.path.join(stage, 'image.png'))\nsys.stdout.write(${RECEIPT("'kind': 'image', 'name': 'image.png'")})`,
+    directory: `os.mkdir(os.path.join(stage, 'image.png'))\nsys.stdout.write(${RECEIPT("'kind': 'image', 'name': 'image.png'")})`,
+    groupReadable: `make('image.png')\nos.chmod(os.path.join(stage, 'image.png'), 0o644)\nsys.stdout.write(${RECEIPT("'kind': 'image', 'name': 'image.png'")})`,
+  };
+  for (const [label, body] of Object.entries(cases)) {
+    writeFileSync(victim, "precious user data");
+    await withHelper(stagedHelper(body), async () => {
+      const extension = loadExtension();
+      extension.start();
+      await extension.explicitPaste();
+      assert.deepEqual(extension.pastes, [], label);
+      assert.match(extension.notices.at(-1).text, /对端剪贴板读取失败.*(artifact-1|回执)/s, label);
+      await pasteOwner.handleClipboardPaste.call({ editor: { insertTextAtCursor() { assert.fail(label); } }, ui: {}, showError(message) { extension.notices.push({ text: message, level: "error" }); } });
+      assert.match(extension.notices.at(-1).text, /artifact-1|回执/, label);
+      await extension.shutdown();
+      assert.equal(readFileSync(victim, "utf8"), "precious user data", label);
+      assert.deepEqual(tmpEntries(), [], label);
+    });
+    for (const name of names("started-")) rmSync(join(temp, name), { force: true });
+  }
+});
+
+test("clipboard text shaped like a path or an image receipt is pasted verbatim and nothing is deleted", async () => {
+  process.env.SSH_CONNECTION = "fixture";
+  const victim = join(temp, "victim");
+  writeFileSync(victim, "precious user data");
+  const shaped = [victim, JSON.stringify({ protocol: "pi-remote-clipboard/artifact-1", kind: "image", name: "image.png" })];
+  for (const text of shaped) {
+    await withHelper(stagedHelper(`sys.stdout.write(${RECEIPT("'kind': 'text'")} + ${JSON.stringify(text)})`), async () => {
+      const extension = loadExtension();
+      extension.start();
+      await extension.explicitPaste();
+      assert.deepEqual(extension.pastes.map((p) => p.text), [text]);
+      await extension.shutdown();
+      assert.equal(readFileSync(victim, "utf8"), "precious user data");
+    });
+    for (const name of names("started-")) rmSync(join(temp, name), { force: true });
+  }
+});
+
+test("empty, local (exit 2) and error outcomes are unchanged under the artifact protocol", async () => {
+  process.env.SSH_CONNECTION = "fixture";
+  const extension = loadExtension();
+  extension.start();
+  await withHelper(stagedHelper(`sys.stdout.write(${RECEIPT("'kind': 'text'")})`), async () => {
+    await extension.explicitPaste();
+    assert.equal(extension.notices.at(-1).text, "对端剪贴板为空");
+  });
+  await withHelper(`import sys\nsys.exit(2)\n`, async () => {
+    await extension.explicitPaste();
+    assert.match(extension.notices.at(-1).text, /本地会话/);
+    await extension.automaticPaste();
+    assert.equal(globalThis.nativePaste, 1);
+  });
+  await withHelper(`import sys\nsys.stderr.write('boom')\nsys.exit(1)\n`, async () => {
+    await extension.explicitPaste();
+    assert.equal(extension.notices.at(-1).level, "error");
+  });
+  await extension.shutdown();
+  assert.deepEqual(tmpEntries(), []);
+});
+
+// --- step 4: deployment — default helper comes from the checkout behind the managed link --------
+function runDefaultHelper(env) {
+  return new Promise((resolve, reject) => {
+    const runner = spawn(process.execPath, ["--experimental-strip-types", "--no-warnings", new URL("./default-helper-runner.mjs", import.meta.url).pathname], {
+      env: Object.fromEntries(Object.entries({ ...process.env, ...env }).filter(([, value]) => value !== undefined)),
+      stdio: ["ignore", "pipe", "inherit"],
+    });
+    let out = "";
+    runner.stdout.on("data", (chunk) => { out += chunk; });
+    const guard = setTimeout(() => { runner.kill("SIGKILL"); reject(new Error("runner did not exit")); }, 20000);
+    runner.once("exit", (code) => { clearTimeout(guard); resolve({ code, notices: out.trim().split("\n").filter(Boolean).map((line) => JSON.parse(line)) }); });
+  });
+}
+
+test("through a managed symlink, the default helper is the checkout's even when a stale installed copy exists; an explicit obsolete override fails visibly", async () => {
+  const home = join(temp, "fakehome");
+  const stale = join(home, ".local/lib/pi-remote-clipboard");
+  mkdirSync(stale, { recursive: true });
+  writeFileSync(join(stale, "ctrlv.py"), `import pathlib\npathlib.Path(${JSON.stringify(join(temp, "stale-ran"))}).write_text('x')\nprint('/tmp/stale-guess.png')\n`);
+  const managed = join(temp, "managed-extension");
+  rmSync(managed, { force: true });
+  symlinkSync(new URL("../pi-extension", import.meta.url).pathname, managed);
+  // A tmux that knows no clients makes the real ctrlv.py classify the session as local (exit 2) without
+  // consulting process ancestry, and the bridge port is pointed at nothing: no provider is ever contacted.
+  const fakeBin = join(temp, "fake-tmux-bin");
+  mkdirSync(fakeBin, { recursive: true });
+  writeFileSync(join(fakeBin, "tmux"), "#!/bin/sh\nexit 1\n");
+  chmodSync(join(fakeBin, "tmux"), 0o755);
+  const env = {
+    RUNNER_EXTENSION: join(managed, "index.ts"), HOME: home, PI_REMOTE_CLIPBOARD_DIR: undefined,
+    TMUX: "fixture", TMUX_PANE: "%0", PATH: `${fakeBin}:${savedEnv.PATH}`, PI_REMOTE_CLIPBOARD_REMOTE_PORT: "1",
+  };
+  const base = env;
+  // Checkout helper: real ctrlv.py, local session (no SSH) => exit 2 => "本地会话" notice, stale copy never executed.
+  const fromCheckout = await runDefaultHelper(base);
+  assert.equal(fromCheckout.code, 0);
+  assert.match(fromCheckout.notices.at(-1).text, /本地会话/);
+  assert.equal(existsSync(join(temp, "stale-ran")), false, "stale installed helper must not run by default");
+  // Explicit override to the obsolete copy keeps working as an override, and its protocol mismatch is explicit.
+  const overridden = await runDefaultHelper({ ...env, PI_REMOTE_CLIPBOARD_DIR: stale });
+  assert.equal(overridden.code, 0);
+  assert.equal(existsSync(join(temp, "stale-ran")), true);
+  assert.match(overridden.notices.at(-1).text, /artifact-1/);
+  assert.equal(overridden.notices.at(-1).level, "error");
+  assert.deepEqual(tmpEntries(), []);
 });

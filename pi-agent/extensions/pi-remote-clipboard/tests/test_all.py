@@ -20,6 +20,7 @@ import provider
 import requester
 import ssh_detect
 import push
+import ctrlv
 
 
 class ProviderTests(unittest.TestCase):
@@ -84,6 +85,142 @@ class RequesterTests(unittest.TestCase):
     def test_unknown_kind(self) -> None:
         _, err = requester.handle_response({"kind": "weird"})
         self.assertIn("未知响应", err)
+
+
+PNG_PAYLOAD = {"kind": "image", "mime": "image/png",
+               "b64": base64.b64encode(b"\x89PNG\r\n\x1a\n" + b"fixture" * 100).decode()}
+
+
+class PartialWriteFile:
+    """Writes half of the data, then fails, like a full disk."""
+
+    def __init__(self, real) -> None:
+        self.real = real
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.real.close()
+        return False
+
+    def fileno(self) -> int:
+        return self.real.fileno()
+
+    def write(self, data: bytes) -> int:
+        self.real.write(data[: len(data) // 2])
+        self.real.flush()
+        raise OSError("synthetic disk full")
+
+
+class ArtifactCreationTests(unittest.TestCase):
+    def test_private_mode_under_permissive_umask_in_both_destinations(self) -> None:
+        old = os.umask(0)
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                name, err = requester.handle_response(PNG_PAYLOAD, tmp)
+                self.assertIsNone(err)
+                self.assertEqual(name, "image.png")
+                self.assertEqual(os.stat(os.path.join(tmp, name)).st_mode & 0o777, 0o600)
+                with mock.patch.object(tempfile, "gettempdir", return_value=tmp):
+                    path, err = requester.handle_response(PNG_PAYLOAD)
+                self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
+        finally:
+            os.umask(old)
+
+    def test_chmod_and_partial_write_failures_leave_no_file_over_16_operations(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            for operation in range(16):
+                failure = (
+                    mock.patch.object(requester.os, "fchmod", side_effect=OSError("synthetic chmod failure"))
+                    if operation % 2 == 0 else
+                    mock.patch.object(requester.os, "fdopen", side_effect=lambda fd, mode: PartialWriteFile(open(fd, mode)))
+                )
+                with failure, mock.patch.object(tempfile, "gettempdir", return_value=tmp):
+                    with self.assertRaises(OSError):
+                        requester.handle_response(PNG_PAYLOAD)
+                    with self.assertRaises(OSError):
+                        requester.handle_response(PNG_PAYLOAD, tmp)
+            self.assertEqual(os.listdir(tmp), [])
+
+    def test_staging_directory_removed_by_the_owner_is_not_recreated(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            gone = os.path.join(tmp, "stage")
+            with self.assertRaises(FileNotFoundError):
+                requester.handle_response(PNG_PAYLOAD, gone)
+            self.assertFalse(os.path.exists(gone))
+
+    def test_existing_staged_name_is_not_overwritten_or_followed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            victim = os.path.join(tmp, "victim")
+            with open(victim, "w") as f:
+                f.write("user data")
+            stage = os.path.join(tmp, "stage")
+            os.mkdir(stage)
+            os.symlink(victim, os.path.join(stage, "image.png"))
+            with self.assertRaises(FileExistsError):
+                requester.handle_response(PNG_PAYLOAD, stage)
+            with open(victim) as f:
+                self.assertEqual(f.read(), "user data")
+
+    def test_bad_images_create_nothing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            for payload in ({"kind": "image", "mime": "image/svg+xml", "b64": ""},
+                            {"kind": "image", "mime": "image/png", "b64": "!!"}):
+                _, err = requester.handle_response(payload, tmp)
+                self.assertIsNotNone(err)
+            self.assertEqual(os.listdir(tmp), [])
+
+
+class CtrlvProtocolTests(unittest.TestCase):
+    def run_main(self, args, payload, *, ssh=True):
+        out = io.StringIO()
+        err = io.StringIO()
+        with mock.patch.object(ctrlv, "is_ssh_terminal", return_value=ssh), \
+             mock.patch.object(ctrlv, "request_clipboard", return_value=payload), \
+             mock.patch.object(sys, "stdout", out), mock.patch.object(sys, "stderr", err):
+            code = ctrlv.main(args)
+        return code, out.getvalue(), err.getvalue()
+
+    def test_plain_cli_text_is_written_exactly(self) -> None:
+        text = "line1\nline2\n\n"
+        self.assertEqual(self.run_main([], {"kind": "text", "text": text}), (0, text, ""))
+
+    def test_plain_cli_image_prints_path_to_private_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(tempfile, "gettempdir", return_value=tmp):
+            code, out, _ = self.run_main([], PNG_PAYLOAD)
+            self.assertEqual(code, 0)
+            self.assertEqual(os.listdir(tmp), [os.path.basename(out)])
+
+    def test_local_session_exit_2_in_both_modes(self) -> None:
+        self.assertEqual(self.run_main([], {}, ssh=False)[0], 2)
+        self.assertEqual(self.run_main(["--artifact-staging", "/nonexistent"], {}, ssh=False)[0], 2)
+
+    def test_staging_text_receipt_then_exact_text_even_if_it_looks_like_a_path_or_json(self) -> None:
+        for text in ("/etc/passwd", '{"protocol":"pi-remote-clipboard/artifact-1","kind":"image","name":"image.png"}', "a\nb\n"):
+            code, out, _ = self.run_main(["--artifact-staging", "/nonexistent"], {"kind": "text", "text": text})
+            self.assertEqual(code, 0)
+            header, body = out.split("\n", 1)
+            self.assertEqual(json.loads(header), {"protocol": requester.ARTIFACT_PROTOCOL, "kind": "text"})
+            self.assertEqual(body, text)
+
+    def test_staging_image_receipt_names_a_file_inside_staging_and_has_no_body(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            code, out, _ = self.run_main(["--artifact-staging", tmp], PNG_PAYLOAD)
+            self.assertEqual(code, 0)
+            self.assertEqual(json.loads(out), {"protocol": requester.ARTIFACT_PROTOCOL, "kind": "image", "name": "image.png"})
+            self.assertEqual(os.listdir(tmp), ["image.png"])
+
+    def test_staging_write_failure_is_an_explicit_error_without_leftovers(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, \
+             mock.patch.object(requester.os, "fchmod", side_effect=OSError("synthetic")):
+            code, out, err = self.run_main(["--artifact-staging", tmp], PNG_PAYLOAD)
+            self.assertEqual((code, out), (1, ""))
+            self.assertIn("synthetic", err)
+            self.assertEqual(os.listdir(tmp), [])
+
+    def test_bad_arguments_fail_loudly(self) -> None:
+        self.assertEqual(self.run_main(["--bogus"], {})[0], 64)
 
 
 class SshDetectTests(unittest.TestCase):

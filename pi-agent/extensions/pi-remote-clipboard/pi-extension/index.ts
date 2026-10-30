@@ -2,10 +2,25 @@ import * as PiAgent from "@earendil-works/pi-coding-agent";
 import * as PiTui from "@earendil-works/pi-tui";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { spawn } from "node:child_process";
-import { readFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import { existsSync, realpathSync } from "node:fs";
+import { link, lstat, mkdtemp, readFile, rm, unlink } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 
-const LIB_DIR = process.env.PI_REMOTE_CLIPBOARD_DIR
-  ?? `${process.env.HOME}/.local/lib/pi-remote-clipboard`;
+/**
+ * 助手脚本目录。显式 PI_REMOTE_CLIPBOARD_DIR 优先；默认取本扩展真实路径（经受管符号链接解析）
+ * 旁的 ../src，使协议两端永远来自同一份检出，不依赖 install.sh 复制到 ~/.local/lib 的旧副本。
+ * 仅当扩展被单独复制而没有同级 src 时才退回安装副本，其过期时由回执校验显式报错。
+ */
+function resolveLibDir(): string {
+  const override = process.env.PI_REMOTE_CLIPBOARD_DIR;
+  if (override !== undefined) return override;
+  const colocated = join(dirname(realpathSync(fileURLToPath(import.meta.url))), "..", "src");
+  return existsSync(join(colocated, "ctrlv.py")) ? colocated : `${process.env.HOME}/.local/lib/pi-remote-clipboard`;
+}
+const LIB_DIR = resolveLibDir();
 const CTRLV_BIN = `${LIB_DIR}/ctrlv.py`;
 const PUSH_BIN = `${LIB_DIR}/push.py`;
 const TIMEOUT_MS = 8000;
@@ -13,6 +28,11 @@ const TIMEOUT_MS = 8000;
 const TERM_GRACE_MS = 1000;
 /** 与 execFile 的 maxBuffer 同为字节预算（非字符数）：UTF-8 多字节文本也不得超过 1 MiB。 */
 const MAX_OUTPUT_BYTES = 1024 * 1024;
+/** 回执首行的预算：文本正文仍受 MAX_OUTPUT_BYTES 约束，回执不占用它。 */
+const RECEIPT_HEADER_BYTES = 256;
+/** ctrlv.py 的版本化回执协议；与 src/requester.py 的 ARTIFACT_PROTOCOL 同值。 */
+const ARTIFACT_PROTOCOL = "pi-remote-clipboard/artifact-1";
+const STAGING_PREFIX = "pi-remote-clipboard-stage-";
 const MAX_OSC52_ENCODED = 100_000;
 /** pi-copy-links 等扩展查询的复制分流函数；返回 true 表示已写往对端剪贴板。 */
 const COPY_SINK_KEY = Symbol.for("pi-remote-clipboard:copy-sink");
@@ -34,6 +54,8 @@ interface Owner {
   dead: boolean;
   /** 仍占有资源（子进程组、定时器、管道）的辅助进程；直到清理完成才移出，与 promise 结算无关。 */
   readonly helpers: Set<Helper>;
+  /** 进行中的制品操作（私有暂存目录、交付文件）；结算即其暂存与未交付文件已清理。永不 reject。 */
+  readonly operations: Set<Promise<void>>;
   sink?: CopySink;
 }
 
@@ -45,13 +67,14 @@ interface Helper {
 }
 
 function newOwner(): Owner {
-  return { dead: false, helpers: new Set() };
+  return { dead: false, helpers: new Set(), operations: new Set() };
 }
 
 /** 标记死亡并取消全部辅助进程；返回它们完成清理的时刻。幂等，可重复调用。 */
 function cancelOwner(owner: Owner): Promise<void> {
   owner.dead = true;
   const pending = [...owner.helpers];
+  const operations = [...owner.operations];
   for (const helper of pending) {
     try {
       helper.abort();
@@ -59,7 +82,7 @@ function cancelOwner(owner: Owner): Promise<void> {
       // 单个子进程终止失败不阻止其余操作被取消
     }
   }
-  return Promise.all(pending.map((helper) => helper.quiescent)).then(() => undefined);
+  return Promise.all([...pending.map((helper) => helper.quiescent), ...operations]).then(() => undefined);
 }
 
 function assertLive(owner: Owner): void {
@@ -75,10 +98,11 @@ const POSIX = process.platform !== "win32";
  * 到期 / 溢出 / 取消时 promise 立即结算，但 owner 仍持有该 helper，直到进程组被清理、
  * 管道销毁、定时器清除（Helper.quiescent），所以结算后的 TERM 不服从者仍在 shutdown 的等待范围内。
  */
-function runHelper(
-  owner: Owner, file: string, args: string[], timeoutMs: number,
-): Promise<{ stdout: string; stderr: string }> {
-  return new Promise((resolve, reject) => {
+function startHelper(
+  owner: Owner, file: string, args: string[], timeoutMs: number, stdoutBytes = MAX_OUTPUT_BYTES,
+): { result: Promise<{ stdout: string; stderr: string }>; quiescent: Promise<void> } {
+  let quiescent: Promise<void> = Promise.resolve();
+  const result = new Promise<{ stdout: string; stderr: string }>((resolve, reject) => {
     if (owner.dead) {
       reject(new ClipboardCancelled());
       return;
@@ -100,7 +124,7 @@ function runHelper(
     let waitTimer: ReturnType<typeof setTimeout> | undefined;
     let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
     let release!: () => void;
-    const quiescent = new Promise<void>((done) => { release = done; });
+    quiescent = new Promise<void>((done) => { release = done; });
 
     const signal = (sig: "SIGTERM" | "SIGKILL"): void => {
       try {
@@ -184,7 +208,7 @@ function runHelper(
 
     child.stdout?.on("data", (chunk: Buffer) => {
       if (settled) return;
-      if (outBytes + chunk.length > MAX_OUTPUT_BYTES) { overflow(); return; }
+      if (outBytes + chunk.length > stdoutBytes) { overflow(); return; }
       outBytes += chunk.length;
       out.push(chunk);
     });
@@ -226,6 +250,125 @@ function runHelper(
       terminate();
     }, timeoutMs);
   });
+  return { result, quiescent };
+}
+
+function runHelper(
+  owner: Owner, file: string, args: string[], timeoutMs: number,
+): Promise<{ stdout: string; stderr: string }> {
+  return startHelper(owner, file, args, timeoutMs).result;
+}
+
+/** 助手没有按 artifact-1 协议回应（过期的安装副本、自定义助手或损坏的输出）；绝不据内容猜测。 */
+class ClipboardProtocolError extends Error {
+  override name = "ClipboardProtocolError";
+}
+
+type Pasted = { kind: "text"; text: string } | { kind: "image"; path: string };
+
+function parseReceipt(stdout: string): { kind: "text"; text: string } | { kind: "image"; name: string } {
+  const fail = (why: string): never => {
+    throw new ClipboardProtocolError(
+      `${CTRLV_BIN} ${why}；需要 ${ARTIFACT_PROTOCOL} 助手（过期的安装副本或旧的 PI_REMOTE_CLIPBOARD_DIR 请更新为本检出的 src/）`,
+    );
+  };
+  const newline = stdout.indexOf("\n");
+  let header: { protocol?: unknown; kind?: unknown; name?: unknown } | undefined;
+  try {
+    header = newline < 0 ? undefined : JSON.parse(stdout.slice(0, newline));
+  } catch {
+    header = undefined;
+  }
+  if (typeof header !== "object" || header === null || header.protocol !== ARTIFACT_PROTOCOL) {
+    return fail("未返回回执");
+  }
+  const body = stdout.slice(newline + 1);
+  if (header.kind === "text") {
+    if (Buffer.byteLength(body, "utf8") > MAX_OUTPUT_BYTES) return fail(`文本超过 ${MAX_OUTPUT_BYTES} 字节`);
+    return { kind: "text", text: body };
+  }
+  if (header.kind === "image" && typeof header.name === "string" && body === "") {
+    return { kind: "image", name: header.name };
+  }
+  return fail("回执格式无效");
+}
+
+/** 暂存目录内必须是助手刚创建的、本用户独占的普通图片文件；名字取自固定集合，不含路径。 */
+async function validateStagedImage(staging: string, name: string): Promise<{ source: string; ext: string }> {
+  const match = /^image\.(png|jpg|webp|gif)$/.exec(name);
+  if (!match) throw new ClipboardProtocolError(`${CTRLV_BIN} 回执的图片名无效: ${JSON.stringify(name)}`);
+  const source = join(staging, name);
+  let stat;
+  try {
+    stat = await lstat(source);
+  } catch {
+    throw new ClipboardProtocolError(`${CTRLV_BIN} 回执指向未创建的图片: ${name}`);
+  }
+  const owned = typeof process.getuid !== "function" || stat.uid === process.getuid();
+  if (!stat.isFile() || stat.nlink !== 1 || stat.size === 0 || (stat.mode & 0o077) !== 0 || !owned) {
+    throw new ClipboardProtocolError(`${CTRLV_BIN} 回执的图片不是私有的普通文件: ${name}`);
+  }
+  return { source, ext: match[1] };
+}
+
+const noop = (): void => undefined;
+
+/**
+ * 一次“对端剪贴板 → 编辑器”的制品操作，整体归 owner 所有（shutdown 会等它结算）：
+ * 私有暂存目录（0700，由本进程创建，助手只往里写）→ 助手 → 回执 → 图片以唯一私有名硬链接到暂存目录之外
+ * → 删除暂存目录 → `consume` 同步插入并调用 adopt()。
+ * 只有 adopt() 之后交付文件才归编辑器/历史所有，永不再删除；在此之前的任何失败或取消都会删除它。
+ * 删除的只有本操作创建的暂存目录与本操作链接出的文件，路径绝不取自剪贴板文本。
+ */
+function pasteViaHelper<T>(owner: Owner, consume: (pasted: Pasted, adopt: () => void) => T): Promise<T> {
+  let staging: string | undefined;
+  let delivered: string | undefined;
+  let adopted = false;
+  let quiescent: Promise<void> = Promise.resolve();
+  const removeStaging = async (): Promise<void> => {
+    const directory = staging;
+    staging = undefined;
+    if (directory !== undefined) await rm(directory, { recursive: true, force: true });
+  };
+  const body = (async (): Promise<T> => {
+    assertLive(owner);
+    staging = await mkdtemp(join(tmpdir(), STAGING_PREFIX));
+    assertLive(owner);
+    const started = startHelper(
+      owner, "python3", [CTRLV_BIN, "--artifact-staging", staging], TIMEOUT_MS, MAX_OUTPUT_BYTES + RECEIPT_HEADER_BYTES,
+    );
+    quiescent = started.quiescent;
+    const { stdout } = await started.result;
+    assertLive(owner);
+    const receipt = parseReceipt(stdout);
+    let pasted: Pasted;
+    if (receipt.kind === "text") {
+      pasted = receipt;
+    } else {
+      const { source, ext } = await validateStagedImage(staging, receipt.name);
+      assertLive(owner);
+      const target = join(tmpdir(), `pi-remote-clipboard-${randomUUID()}.${ext}`);
+      await link(source, target); // 原子且不覆盖
+      delivered = target;
+      pasted = { kind: "image", path: target };
+    }
+    await removeStaging();
+    assertLive(owner);
+    return consume(pasted, () => { adopted = true; });
+  })();
+  // 清理与业务结果分离（同 Helper 的 result / quiescent）：业务结果（含 8 秒超时）立即返回给调用方，
+  // 清理在助手进程组消失后进行，由 owner.operations 持有，shutdown 会等待它。
+  // 只删除本操作创建的暂存目录与本操作链接出的、尚未被编辑器接收的文件；路径绝不取自剪贴板文本。
+  const cleanup = body.then(noop, noop).then(async () => {
+    await quiescent; // 写入者消失后才删目录：不与删除竞争，也不会在删除后重建
+    await removeStaging();
+    if (delivered !== undefined && !adopted) await unlink(delivered);
+  }).catch((error: NodeJS.ErrnoException) => {
+    if (error.code !== "ENOENT") console.error(`pi-remote-clipboard: 制品清理失败: ${error.message}`);
+  });
+  owner.operations.add(cleanup);
+  void cleanup.then(() => owner.operations.delete(cleanup));
+  return body;
 }
 
 /** tmux 场景按“当前 session 中最近活动的 client”的祖先链判定；非 tmux 用 SSH 环境变量。
@@ -323,22 +466,32 @@ export default function piRemoteClipboard(pi: ExtensionAPI): void {
   interface PasteHost {
     editor?: { insertTextAtCursor?: (text: string) => void };
     ui?: { requestRender?: () => void };
+    showError?: (message: string) => void;
   }
 
   /** 读取对端剪贴板并插入当前编辑器；"local" 表示应回退原生路径。 */
   async function pasteFromBridge(owner: Owner, host: PasteHost): Promise<"inserted" | "empty" | "local" | "error"> {
     try {
-      const { stdout } = await runHelper(owner, "python3", [CTRLV_BIN], TIMEOUT_MS);
-      assertLive(owner);
-      const text = stdout.trim();
-      if (text.length === 0) return "empty";
-      host.editor?.insertTextAtCursor?.(text);
-      host.ui?.requestRender?.();
-      return "inserted";
+      return await pasteViaHelper(owner, (pasted, adopt): "inserted" | "empty" => {
+        if (pasted.kind === "text") {
+          const text = pasted.text.trim();
+          if (text.length === 0) return "empty";
+          host.editor?.insertTextAtCursor?.(text);
+        } else {
+          const editor = host.editor;
+          if (typeof editor?.insertTextAtCursor !== "function") throw new Error("编辑器不支持插入图片路径");
+          editor.insertTextAtCursor(pasted.path);
+          adopt(); // 已插入：此后文件属于编辑器/历史，渲染失败也不得删除
+        }
+        host.ui?.requestRender?.();
+        return "inserted";
+      });
     } catch (error: unknown) {
       if (isCancelled(error)) throw error;
       const code = (error as { code?: number }).code;
       if (code === 2) return "local";
+      // 协议错误必须可见（与 Pi 原生粘贴失败同一通道），不能退化成静默的“无内容”。
+      if (error instanceof ClipboardProtocolError) host.showError?.(`Failed to paste from clipboard: ${error.message}`);
       return "error";
     }
   }
@@ -346,13 +499,18 @@ export default function piRemoteClipboard(pi: ExtensionAPI): void {
   const handleRemotePaste = async (ctx: ExtensionContext): Promise<void> => {
     const owner = current;
     try {
-      const { stdout } = await runHelper(owner, "python3", [CTRLV_BIN], TIMEOUT_MS);
-      assertLive(owner);
-      if (stdout.trim().length === 0) {
-        ctx.ui.notify("对端剪贴板为空", "info");
-        return;
-      }
-      ctx.ui.pasteToEditor(stdout);
+      await pasteViaHelper(owner, (pasted, adopt) => {
+        if (pasted.kind === "text") {
+          if (pasted.text.trim().length === 0) {
+            ctx.ui.notify("对端剪贴板为空", "info");
+            return;
+          }
+          ctx.ui.pasteToEditor(pasted.text);
+        } else {
+          ctx.ui.pasteToEditor(pasted.path);
+          adopt();
+        }
+      });
     } catch (error: unknown) {
       if (isCancelled(error) || owner.dead) return;
       const code = (error as { code?: number }).code;

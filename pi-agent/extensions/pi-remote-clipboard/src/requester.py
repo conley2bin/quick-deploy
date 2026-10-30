@@ -52,8 +52,52 @@ def push_image(data: bytes, mime: str, port: int = DEFAULT_PORT) -> dict[str, An
     )
 
 
-def handle_response(payload: dict[str, Any]) -> tuple[str | None, str | None]:
-    """返回 (插入文本, 错误消息)。"""
+ARTIFACT_PROTOCOL = "pi-remote-clipboard/artifact-1"
+ARTIFACT_NAME_FOR_EXT = {ext: f"image.{ext}" for ext in EXT_FOR_MIME.values()}
+
+
+def _create_private(directory: str, name: str, data: bytes) -> str:
+    """在已存在的 directory 中以 0600 独占创建 name 并写入 data；任何失败都回滚（删除半成品）。
+
+    不创建 directory：它若已被调用方取消并删除，这里直接失败而不是重建。
+    """
+    path = os.path.join(directory, name)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(path, flags, 0o600)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            os.fchmod(f.fileno(), 0o600)
+            f.write(data)
+    except BaseException:
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+        raise
+    return path
+
+
+def _decode_image(payload: dict[str, Any]) -> tuple[bytes | None, str | None, str | None]:
+    """返回 (图片字节, 扩展名, 错误消息)。"""
+    mime = payload.get("mime", "")
+    if mime not in EXT_FOR_MIME:
+        return None, None, f"不支持的图片类型: {mime}"
+    try:
+        data = base64.b64decode(payload.get("b64", ""), validate=True)
+    except Exception:  # noqa: BLE001
+        return None, None, "图片 base64 解码失败"
+    if len(data) > MAX_IMAGE_BYTES:
+        return None, None, f"图片超过 {MAX_IMAGE_BYTES} 字节上限"
+    return data, EXT_FOR_MIME[mime], None
+
+
+def handle_response(payload: dict[str, Any], staging: str | None = None) -> tuple[str | None, str | None]:
+    """返回 (插入文本, 错误消息)。
+
+    图片：不带 staging 时（手动 CLI）写到系统临时目录并返回路径，路径即交付物；
+    带 staging（Pi 扩展的单次操作私有目录）时写入其中固定名 image.<ext>，返回该文件名，
+    所有权由调用方的 staging 目录承担。两种情况下写入失败都不留文件。
+    """
     kind = payload.get("kind")
     if kind == "text":
         text = payload.get("text", "")
@@ -61,22 +105,13 @@ def handle_response(payload: dict[str, Any]) -> tuple[str | None, str | None]:
             return None, f"文本超过 {MAX_TEXT_BYTES} 字节上限"
         return text, None
     if kind == "image":
-        mime = payload.get("mime", "")
-        b64 = payload.get("b64", "")
-        if mime not in EXT_FOR_MIME:
-            return None, f"不支持的图片类型: {mime}"
-        try:
-            data = base64.b64decode(b64, validate=True)
-        except Exception:  # noqa: BLE001
-            return None, "图片 base64 解码失败"
-        if len(data) > MAX_IMAGE_BYTES:
-            return None, f"图片超过 {MAX_IMAGE_BYTES} 字节上限"
-        ext = EXT_FOR_MIME[mime]
-        path = os.path.join(tempfile.gettempdir(), f"pi-remote-clipboard-{uuid.uuid4()}.{ext}")
-        with open(path, "wb") as f:
-            f.write(data)
-        os.chmod(path, 0o600)
-        return path, None
+        data, ext, error = _decode_image(payload)
+        if error is not None:
+            return None, error
+        if staging is not None:
+            _create_private(staging, ARTIFACT_NAME_FOR_EXT[ext], data)
+            return ARTIFACT_NAME_FOR_EXT[ext], None
+        return _create_private(tempfile.gettempdir(), f"pi-remote-clipboard-{uuid.uuid4()}.{ext}", data), None
     if kind == "empty":
         return None, "剪贴板为空"
     if kind == "error":

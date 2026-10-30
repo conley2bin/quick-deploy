@@ -78,7 +78,8 @@ export default function(pi) {
             helper.write_text('''#!/bin/sh
 [ "$1" = "$PI_REMOTE_CLIPBOARD_DIR/ctrlv.py" ] || exit 111
 echo requested >> "$PROBE_HELPER_LOG"
-printf 'BRIDGE_FIXTURE\\n'
+[ "$2" = --artifact-staging ] || exit 112
+printf '{"protocol":"pi-remote-clipboard/artifact-1","kind":"text"}\\nBRIDGE_FIXTURE\\n'
 ''')
             helper.chmod(0o755)
             for name in ("xclip", "xsel", "wl-paste", "termux-clipboard-get"):
