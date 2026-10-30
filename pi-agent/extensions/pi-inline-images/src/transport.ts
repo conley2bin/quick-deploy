@@ -157,6 +157,7 @@ export class BoundedTransport {
   private failure?: TransportError;
   private disposed = false;
   private active = false;
+  private activating = false;
   private errorAttempted = false;
   private closeAttempted = false;
 
@@ -302,19 +303,32 @@ export class BoundedTransport {
 
   /** Construction is passive; only admitted work may acquire external roots. */
   private activate(): TransportError | undefined {
+    if (this.activating) return new TransportError("invalid", "graphics sink activation in progress");
     if (!this.active) {
+      this.activating = true;
+      let errorAttempted = false;
+      let closeAttempted = false;
       try {
+        errorAttempted = true;
         this.errorAttempted = true;
         this.sink.on("error", this.errorListener);
         if (!this.failure && !this.disposed) {
+          closeAttempted = true;
           this.closeAttempted = true;
           this.sink.on("close", this.closeListener);
         }
       } catch (error) {
         this.fail(new TransportError("sink", "graphics sink subscription failed", { cause: error }));
       }
-      if (this.failure || this.disposed) this.detachSinkListeners();
-      else this.active = true;
+      this.activating = false;
+      if (this.failure || this.disposed) {
+        // Reentrant dispose may remove and clear field ownership before .on
+        // actually attaches. Keep this transaction's attempts sticky until .on
+        // returns (or throws), then retry every exact attempted callback.
+        this.errorAttempted ||= errorAttempted;
+        this.closeAttempted ||= closeAttempted;
+        this.detachSinkListeners();
+      } else this.active = true;
     }
     return this.failure ?? (this.disposed ? new TransportError("closed", "graphics transport disposed") : undefined);
   }
@@ -325,11 +339,13 @@ export class BoundedTransport {
     // removal is independent, so one throwing cleanup cannot skip the other.
     if (this.errorAttempted) {
       this.errorAttempted = false;
-      try { this.sink.removeListener("error", this.errorListener); } catch { /* preserve the original terminal failure */ }
+      try { this.sink.removeListener("error", this.errorListener); }
+      catch { console.error("[pi-inline-images] graphics sink error listener removal failed; sink may retain transport"); }
     }
     if (this.closeAttempted) {
       this.closeAttempted = false;
-      try { this.sink.removeListener("close", this.closeListener); } catch { /* still attempted both owned removals */ }
+      try { this.sink.removeListener("close", this.closeListener); }
+      catch { console.error("[pi-inline-images] graphics sink close listener removal failed; sink may retain transport"); }
     }
   }
 

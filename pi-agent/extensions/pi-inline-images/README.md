@@ -228,7 +228,11 @@ error/close listener pair only after the first transaction passes admission,
 before building or writing it. Registration failure rolls back both attempted
 exact callbacks and permanently fails that transport; synchronous delivered
 error/close notifications, disposal and generation cancellation are checked
-before insertion. The sink API has no history for a close emitted before its
+before insertion. Attempts remain owned until registration returns, so disposal
+before a custom sink actually attaches still rolls back its completed attachment.
+Reentrant enqueue during activation rejects without subscribing or building;
+the outer transaction can still commit normally. Secondary listener-removal
+failures emit bounded diagnostics without replacing the primary transport error. The sink API has no history for a close emitted before its
 close callback is registered. Factory-time event-bus publication remains
 available to the structured renderer and Pi tracks those registrations across
 load-only invalidation and failed factories. Already-used transports still

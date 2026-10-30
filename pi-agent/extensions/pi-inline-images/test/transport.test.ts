@@ -528,7 +528,9 @@ test("EventEmitter has no history for close before close registration", () => {
   assert.equal(sink.emit("close"), false, "the sink interface cannot recover an undelivered event");
 });
 
-test("activation preserves delivered failure even if on then throws and both cleanup attempts throw", async () => {
+test("activation preserves delivered failure even if on then throws and both cleanup attempts throw", async (t) => {
+  const diagnostics: string[] = [];
+  t.mock.method(console, "error", (message: string) => diagnostics.push(message));
   const { owner, sink } = transport();
   const originalOn = sink.on;
   const originalRemove = sink.removeListener;
@@ -545,6 +547,8 @@ test("activation preserves delivered failure even if on then throws and both cle
   };
   await assert.rejects(owner.enqueue(0, { transaction: "x" }), /delivered first/u);
   assert.deepEqual(removed, ["error", "close"]);
+  assert.equal(diagnostics.length, 2, "both secondary cleanup failures are surfaced without replacing delivered failure");
+  assert.ok(diagnostics.every(message => message.length < 128 && message.includes("removal failed")));
   assert.deepEqual([sink.listenerCount("error"), sink.listenerCount("close"), owner.pendingBytes], [0, 0, 0]);
   owner.dispose();
 });
@@ -563,4 +567,84 @@ test("disposal during either registration rejects without building and rolls bac
     assert.deepEqual([builds, owner.pendingJobs, owner.pendingBytes, sink.writes.length, clock.count,
       sink.listenerCount("error"), sink.listenerCount("close")], [0, 0, 0, 0, 0, 0, 0]);
   }
+});
+
+for (const eventToDispose of ["error", "close"] as const) {
+  for (const timing of ["before", "after"] as const) {
+    for (const throwAfter of [false, true]) {
+      test(`activation disposal ${timing} ${eventToDispose} attachment, throw=${throwAfter}`, async () => {
+        const { owner, sink, clock } = transport();
+        const originalOn = sink.on;
+        sink.on = function(event: string, listener: (...args: any[]) => void) {
+          if (event === eventToDispose && timing === "before") owner.dispose();
+          originalOn.call(this, event, listener);
+          if (event === eventToDispose) {
+            if (timing === "after") owner.dispose();
+            if (throwAfter) throw new Error("registration threw after disposal");
+          }
+          return this;
+        };
+        let builds = 0;
+        await assert.rejects(owner.enqueue(0, { transaction: () => { builds++; return Buffer.from("x"); }, bytes: 1 }), /disposed/u);
+        owner.dispose("repeated disposal must not be needed to complete rollback");
+        assert.deepEqual([sink.listenerCount("error"), sink.listenerCount("close"), sink.listenerCount("drain"),
+          owner.pendingJobs, owner.pendingBytes, builds, sink.writes.length, clock.count], [0, 0, 0, 0, 0, 0, 0, 0]);
+      });
+    }
+  }
+}
+
+test("registration reentrant enqueue is rejected before subscription commit without disturbing outer work", async () => {
+  const { owner, sink, clock } = transport({ minIntervalMs: 0 });
+  const originalOn = sink.on;
+  let innerHandled: Promise<void> | undefined;
+  let entered = false;
+  let innerBuilds = 0;
+  let registrations = 0;
+  sink.on = function(event: string, listener: (...args: any[]) => void) {
+    if (event === "error" || event === "close") registrations++;
+    originalOn.call(this, event, listener);
+    if (event === "error" && !entered) {
+      entered = true;
+      innerHandled = assert.rejects(owner.enqueue(owner.generation, {
+        transaction: () => { innerBuilds++; return Buffer.from("inner"); }, bytes: 5,
+      }), /activation in progress/u);
+      assert.deepEqual([owner.pendingJobs, owner.pendingBytes, innerBuilds, sink.writes.length], [0, 0, 0, 0],
+        "no inner work may build, queue or write before activation commits");
+    }
+    return this;
+  };
+  try {
+    await owner.enqueue(0, { transaction: "outer" });
+    assert.ok(innerHandled);
+    await innerHandled;
+    assert.equal(owner.terminalFailure, undefined);
+    assert.deepEqual([registrations, sink.listenerCount("error"), sink.listenerCount("close"), innerBuilds], [2, 1, 1, 0]);
+    assert.deepEqual(sink.writes.map(({ value }) => value), ["outer"]);
+    assert.deepEqual([owner.pendingJobs, owner.pendingBytes, clock.count], [0, 0, 0]);
+  } finally { owner.dispose(); }
+  assert.deepEqual([sink.listenerCount("error"), sink.listenerCount("close")], [0, 0]);
+});
+
+test("sink refusing removal reports secondary failures and preserves the original terminal failure", async (t) => {
+  const diagnostics: string[] = [];
+  t.mock.method(console, "error", (message: string) => diagnostics.push(message));
+  const { owner, sink } = transport();
+  const originalOn = sink.on;
+  const attempted: string[] = [];
+  sink.on = function(event: string, listener: (...args: any[]) => void) {
+    originalOn.call(this, event, listener);
+    if (event === "close") this.emit("error", new Error("primary delivered failure"));
+    return this;
+  };
+  sink.removeListener = function(event: string) { attempted.push(event); throw new Error("sink refuses removal"); };
+  await assert.rejects(owner.enqueue(0, { transaction: "x" }), /primary delivered failure/u);
+  const failure = owner.terminalFailure;
+  await assert.rejects(owner.enqueue(owner.generation, { transaction: "retry" }), error => error === failure);
+  assert.deepEqual(attempted, ["error", "close"]);
+  assert.equal(diagnostics.length, 2);
+  assert.ok(diagnostics.every(message => message.length < 128 && message.includes("removal failed")));
+  assert.deepEqual([sink.listenerCount("error"), sink.listenerCount("close")], [1, 1], "custom sink refusal is visible, not a successful-cleanup claim");
+  assert.deepEqual([owner.pendingJobs, owner.pendingBytes, sink.writes.length], [0, 0, 0]);
+  owner.dispose();
 });
