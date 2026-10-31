@@ -158,12 +158,40 @@ def locked(state):
         os.close(fd)
 
 
+DOMAIN_FILE = MODULE / 'domain.txt'
+
+
+def base_domain(path=None):
+    path = DOMAIN_FILE if path is None else path
+    try:
+        raw = path.read_bytes().decode('ascii')
+    except (OSError, UnicodeDecodeError) as exc:
+        raise host.Error(f'Base domain file {path.name} is missing or unreadable; edit it or pass --domain explicitly') from exc
+    line = raw[:-2] if raw.endswith('\r\n') else raw[:-1] if raw.endswith('\n') else raw
+    # Exactly one bare hostname: no comments, spaces, extra lines, URL, port, or IP literal.
+    if not line or re.search(r'[\s:/@]', line) or re.fullmatch(r'[0-9.]+', line) or line.rsplit('.', 1)[-1].isdigit():
+        raise host.Error(f'{path.name} must contain exactly one base DNS domain such as example.com')
+    try:
+        return host.hostname(line)
+    except host.Error:
+        raise host.Error(f'{path.name} must contain exactly one base DNS domain such as example.com') from None
+
+
+def default_domain(label):
+    base = base_domain()
+    try:
+        return host.hostname(f'{label}.{base}')
+    except host.Error:
+        raise host.Error(f'{DOMAIN_FILE.name} base domain is too long for {label}.<base>') from None
+
+
 def configuration(args, saved=None):
     values = dict(saved or {})
     for key, prompt in [('domain', 'Grey DNS subscription hostname'), ('reality_target', 'Verified REALITY TLS1.3+h2 target hostname')]:
         provided = getattr(args, key, None)
         if saved and provided and provided != saved[key]:
-            raise host.Error('Configuration differs from stored deployment; no silent domain/target change')
+            raise host.Error(f'Configuration differs from stored deployment ({key}: current {saved[key]}, requested {provided}); '
+                             'migration is needed and is not automatic; no silent domain/target change')
         if provided:
             values[key] = provided
         if not values.get(key):
@@ -1547,7 +1575,7 @@ def parser():
         if name == 'restore':
             a.set_defaults(backup_required=True)
     a = sub.add_parser('cdn', help='add verified Cloudflare/XHTTP; retain REALITY on a separate TCP port and unchanged H2')
-    a.add_argument('--domain', dest='cdn_domain', required=True, help='new CDN hostname; subscription domain remains unchanged')
+    a.add_argument('--domain', dest='cdn_domain', help='new CDN hostname; default cdn.<base> from domain.txt; subscription domain remains unchanged')
     a.add_argument('--reality-port', type=int, default=9443, help='retained REALITY TCP port; default9443, no automatic fallback')
     a.add_argument('--interface', required=True, help='explicit local physical Linux interface for isolated direct-underlay probes')
     a.add_argument('--dns-server', required=True, help='independently verified zone-authoritative Cloudflare NS public IPv4; queries require AA and bypass recursive gray-answer caches')
@@ -1581,6 +1609,10 @@ def main(argv=None):
     os.umask(0o077)
     state = args.state_dir.expanduser().absolute()
     try:
+        if args.command in ('deploy', 'replace', 'preflight') and args.domain is None:
+            args.domain = default_domain('sub')
+        if args.command == 'cdn' and args.cdn_domain is None:
+            args.cdn_domain = default_domain('cdn')
         with locked(state):
             if args.command == 'export':
                 if bool(args.device) != bool(args.bootstrap_dir):
