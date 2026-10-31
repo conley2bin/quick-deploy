@@ -388,7 +388,9 @@ class Transport(unittest.TestCase):
                          mock.patch.object(vps, 'upload_bundle', return_value=io.BytesIO(b'ARCHIVE-SENTINEL')), \
                          mock.patch.object(vps, 'export_after_commit'), mock.patch.object(vps, 'retire_renamed_outputs'), \
                          mock.patch('sys.stdout', new_callable=io.StringIO):
-                        result = vps.main(['--state-dir', str(self.state), *command, '--ssh-proxy', url])
+                        # Deployed identity is explicit; the domain.txt default would require migration.
+                        explicit = ['--domain', self.config['domain']] if command[0] in ('preflight', 'deploy') else []
+                        result = vps.main(['--state-dir', str(self.state), *command, *explicit, '--ssh-proxy', url])
                     self.assertEqual(result, 0)
                     self.assert_carrier(url)
                     self.assertIsNone(vps.SSH_PROXY.get())
@@ -419,6 +421,9 @@ class Transport(unittest.TestCase):
                     return self.archive
                 args = ['--state-dir', str(self.state), command, '--ssh', 'verified-alias',
                         '--port', '2222', '--identity', '/fixture/nondefault key', '--ssh-proxy', 'http://127.0.0.1:10808']
+                if command != 'restore':
+                    # Deployed identity is explicit; the domain.txt default would require migration.
+                    args += ['--domain', self.config['domain']]
                 if command == 'restore':
                     args += ['--backup', str(self.archive)]
                 with mock.patch.object(vps.subprocess, 'run', side_effect=self.process), \
