@@ -2,4 +2,4 @@
 set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 umask 077
-exec python3 -B "$SCRIPT_DIR/lib/manage_service.py" "$@"
+exec python3 -B "$SCRIPT_DIR/lib/manage_cli.py" "$@"

@@ -166,8 +166,8 @@ bash vps/setup.sh --state-dir "$HOME/.local/state/quick-deploy-private/vps-secon
 
 ```bash
 VPS_STATE="$HOME/.local/state/quick-deploy-private/vps"
-bash vps/setup.sh export --device company --bootstrap-dir "$VPS_STATE/bootstrap/company"
-bash vps/setup.sh export --device phone --bootstrap-dir "$VPS_STATE/bootstrap/phone"
+bash vps/manage.sh export --device company --bootstrap-dir "$VPS_STATE/bootstrap/company"
+bash vps/manage.sh export --device phone --bootstrap-dir "$VPS_STATE/bootstrap/phone"
 ```
 
 得到该设备的原生 `.yaml` 完整 profile、原生 base64 `.txt` 订阅、解码后的 `.uris.txt` 和私有 `.urls.json`；
@@ -182,9 +182,9 @@ H2 是新订阅的默认首选，TCP/REALITY 仍可选；GUI 可能缓存旧选�
 ## 本地连接资料网页与二维码
 
 ```bash
-bash vps/setup.sh dashboard
+bash vps/manage.sh dashboard
 # 可选：只导出一个启用设备，或指定 Git 之外的私有目录
-bash vps/setup.sh dashboard --device phone --output-dir "$HOME/.local/state/quick-deploy-private/vps/dashboard-phone"
+bash vps/manage.sh dashboard --device phone --output-dir "$HOME/.local/state/quick-deploy-private/vps/dashboard-phone"
 ```
 
 默认打开 `~/.local/state/quick-deploy-private/vps/dashboard/index.html`；自选 `--state-dir` 时位于该状态的 `dashboard/`。
@@ -204,11 +204,19 @@ bash vps/setup.sh dashboard --device phone --output-dir "$HOME/.local/state/quic
 ## 本机设备管理页（manage）
 
 日常入口是点开私有文件 `vps/index.html`：它是自包含的管理应用（内嵌脚本与样式，不是跳转页），含**管理密钥，请勿分享、上传或提交**（0600、已被 Git 忽略）。
-本机后台服务（用户级 systemd，随登录常驻，端口固定）由 `bash vps/manage.sh` 安装/启动/打开（`install --no-open`、`status`、`restart`、`stop`、`uninstall`、`carrier set/clear` 由后端提供）；关闭终端或浏览器不会停止服务。
+先在 `vps/config.txt` 填 `VPS_SSH`、`DOMAIN`，`bash vps/setup.sh deploy` 部署（setup 只管部署），之后只需一条命令：
+
+```bash
+bash vps/manage.sh
+```
+
+它是**前台**程序：先自动 `connect` 读取 `config.txt` 里的 VPS 当前设备，再启动本机签名管理服务，并在终端打印可点击的 `管理页面: file:///…/vps/index.html`（OSC 8 链接，同时是纯文本地址，不含密钥；不会自动打开浏览器）。保持该窗口运行；页面在脚本运行期间可用、刷新有效、无固定时限；Ctrl+C（或关闭终端）停止服务，页面随之不可用。不安装 systemd 服务，也没有 install/start/stop。
+默认走直连 SSH（不会经过受管 VPS 自身，但目标是否可达由你负责）；如需代理，用 `--ssh-proxy URL`，并在确认其独立于所有受管 VPS 条目后加 `--independent-carrier`，否则页面只读。本地有未完成事务（pending）时不会连接 VPS，只提供恢复，需显式恢复。
+也可直接用命令行：`manage.sh devices list|add|rename|reset|remove NAME…`、`export`、`status`、`backup`、`recover`（除 recover 外都会先自动 connect）。
 
 - 刷新（F5）、重新打开文件和服务重启都无需再登录：页面从文件读取密钥，与服务做一次签名握手并**验证服务证明**后才发出任何 API 请求；没有 Cookie、sessionStorage、localStorage 或 URL 令牌，也没有 45 分钟到期。
 - 每个请求带 `X-QD-*` 签名，响应签名通过后才解析并显示。服务未运行或身份/签名无法验证时，页面写明“后台服务未运行或身份无法验证”，隐藏资料，**不会显示成空设备列表**；“重新连接并核对”只做新握手和 GET，绝不重发变更。变更 POST 只发一次，结果不明时只读取原任务/已提交状态核对。
-- 页面始终显示“本机后台服务已连接”以及独立 SSH 通道状态（未配置 / 已配置但监听未运行 / 可用）。未配置或不可用时两种订阅与资料仍可查看，新增、改名、重置、删除被禁用并说明原因。管理服务本身不是 SSH 通道，本 VPS 的 H2 也不是独立通道。
+- 页面始终显示“本机管理服务已连接”以及独立 SSH 通道状态（未配置 / 已配置但监听未运行 / 可用）。未配置或不可用时两种订阅与资料仍可查看，新增、改名、重置、删除被禁用并说明原因。管理服务本身不是 SSH 通道，本 VPS 的 H2 也不是独立通道。
 - 单项任务仍最长 20 分钟，原生事务、单写锁、幂等和 pending 恢复不变；任务状态写明动作与设备。页面不检测节点在线状态，也不暗示节点会过期。
 - 页面支持新增、改名、重置凭据、删除整个设备；任何变更都可能短暂中断全部设备，重置/删除需输入设备名确认。只显示 Mihomo / Shadowrocket 两种订阅（复制、二维码及下载，字节取自已提交资料不转换）；完整原生导出由命令行 `export` 提供。`pending` 时清空凭据，仅提供显式“恢复”；`committed_export_failed` 表示已提交，只核对状态，不要重做。
 - 密钥轮换后旧 HTML 无法通过握手，由服务重新渲染入口；`vps/lib/manage_entry.py` 的 `render_entry` 负责嵌入脚本并写入与字节一致的 CSP 哈希。
@@ -219,7 +227,7 @@ GUI/TUN 的规则可能把 VPS 地址、SSH22强制 DIRECT，普通 GUI7897监�
 选择实际**物理接口**，显式渲染独立、无TUN的管理配置；接口名不自动猜测：
 
 ```bash
-bash vps/setup.sh export --device company --bootstrap-dir "$VPS_STATE/bootstrap/management" \
+bash vps/manage.sh export --device company --bootstrap-dir "$VPS_STATE/bootstrap/management" \
   --management-interface eno1 --management-port 10808
 ```
 
@@ -264,23 +272,23 @@ reset 有意撤销旧 SubID，旧 URL无法经 FEED 或 DIRECT发现新秘密URL
 
 ## 设备与钥匙
 
-换了新电脑、克隆仓库后要管理**已有** VPS：先 connect（只读取服务器当前状态，不改服务器、密钥或账户，不需要旧电脑的任何文件；新机器须已有该 VPS 的 SSH 授权并已信任其主机密钥）：
+换了新电脑、克隆仓库后要管理**已有** VPS：不需要旧电脑的任何文件，也没有单独的 connect 步骤。`manage.sh` 的每个命令（`recover` 除外）都会先按 `vps/config.txt` 的 `VPS_SSH` 自动 connect：只读取服务器当前状态，不改服务器、密钥或账户（新机器须已有该 VPS 的 SSH 授权并已信任其主机密钥）：
 
 ```bash
-bash vps/setup.sh connect --ssh "$VPS_SSH"
+bash vps/manage.sh status
 ```
 
-可选参数：`--identity KEY`、`--port PORT`（仅 SSH 端口）、`--ssh-proxy URL`、`--mihomo BIN`。输出只含端点、设备数和私有路径。需要本机有原生 Mihomo；若服务器正在变更会干净地拒绝，重试即可。
-状态目录已属于另一个部署时拒绝，请改用 `--state-dir`。之后用下面的 devices 命令。connect 及以下 CLI 命令不会安装或启动 Web 管理；manage.sh 仍是可选网页启动器，纯 CLI 流程无需运行。
+可选调用级覆盖：`--ssh TARGET`（覆盖 `VPS_SSH`）、`--identity KEY`、`--port PORT`（仅 SSH 端口）、`--ssh-proxy URL`、`--mihomo BIN`。需要本机有原生 Mihomo；若服务器正在变更会干净地拒绝，重试即可。
+状态目录已属于另一个部署时拒绝，请改用 `--state-dir`。`setup.sh` 只做部署类命令，不接受 connect/devices/export/dashboard。以下 CLI 命令不会启动页面；不带命令的 `manage.sh` 才启动前台页面，纯 CLI 流程无需运行。
 
 以下是独立操作示例，按需选择，不要整块执行。名字以小写字母开头，仅含小写字母/数字/短横线，最长32字符：
 
 ```bash
-bash vps/setup.sh devices list
-bash vps/setup.sh devices add device4 device5
-bash vps/setup.sh devices rename device4 tablet
-bash vps/setup.sh devices reset tablet
-bash vps/setup.sh devices remove device5
+bash vps/manage.sh devices list
+bash vps/manage.sh devices add device4 device5
+bash vps/manage.sh devices rename device4 tablet
+bash vps/manage.sh devices reset tablet
+bash vps/manage.sh devices remove device5
 ```
 
 rename 保留 UUID、H2 Auth、SubID和URL；reset 同时轮换 UUID、H2 Auth、SubID，需要重新导入。
@@ -294,11 +302,11 @@ remove 撤销两种认证及两个公开订阅路径；核心重启关闭已建�
 bash vps/setup.sh status
 bash vps/setup.sh backup
 bash vps/setup.sh recover
-bash vps/setup.sh export
+bash vps/manage.sh export
 ```
 
 权威状态和完整备份位于 `~/.local/state/quick-deploy-private/vps`，不搬入仓库。
-成功提交/核对后自动更新忽略的0600 **[`vps/subscription-urls.json`](subscription-urls.json)**；普通 export 只读已提交本地备份、不联系 VPS。
+成功提交/核对后自动更新忽略的0600 **[`vps/subscription-urls.json`](subscription-urls.json)**；export 本身只读已提交本地备份、不改 VPS；经 `manage.sh` 调用时会先自动 connect 刷新（有 pending 时跳过）。
 备份为**明文 TAR**，另存加密离机副本；用最新撤销后备份，恢复旧档可能复活旧账户。
 `backup --mihomo /path/to/mihomo` 会保留所选路径供 recover 覆盖。完整归档不依赖 live feed 或本地核心：
 若离线配置捕获因 HWID/到期/缺核心等失败，仍保存已验证的当前节点备份、清除备份 pending，并非零返回

@@ -1,0 +1,2 @@
+VPS_SSH=root@136.0.5.229
+DOMAIN=conley2bin.com

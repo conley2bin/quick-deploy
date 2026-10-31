@@ -15,7 +15,7 @@ import unittest
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'lib'))
-import manage_service
+import manage_cli
 
 SETUP = Path(__file__).resolve().parents[1]
 
@@ -29,15 +29,18 @@ class ManageScript(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         for flag in ('--state-dir', '--ssh-proxy', '--independent-carrier', '--no-open'):
             self.assertIn(flag, result.stdout)
-        for command in ('install', 'status', 'rotate', 'carrier'):
+        for command in ('connect', 'devices', 'recover', 'backup'):
             self.assertIn(command, result.stdout)
+        for gone in ('install', 'rotate', 'systemd'):
+            self.assertNotIn(gone, result.stdout)
         self.assertNotIn('--job', result.stdout)
-        self.assertNotIn('--mihomo', result.stdout)
+        self.assertIn('--identity', result.stdout)
 
-    def test_manage_sh_targets_service_cli_with_private_umask(self):
+    def test_manage_sh_targets_foreground_cli_with_private_umask(self):
         text = (SETUP / 'manage.sh').read_text()
         self.assertIn('umask 077', text)
-        self.assertIn('lib/manage_service.py', text)
+        self.assertIn('lib/manage_cli.py', text)
+        self.assertNotIn('manage_service', text)
         self.assertIn('SCRIPT_DIR', text)
 
     def test_setup_has_no_manage_and_points_to_manage_sh(self):
@@ -49,11 +52,9 @@ class ManageScript(unittest.TestCase):
             self.assertEqual(result.returncode, 2)
             self.assertIn('manage.sh', result.stderr)
 
-    def test_parser_defaults_open(self):
-        args = manage_service.parser().parse_args([])
-        self.assertIsNone(args.command)
-        self.assertFalse(args.no_open)
-        self.assertTrue(manage_service.parser().parse_args(['--no-open']).no_open)
+    def test_parser_defaults_to_connect_and_ignores_no_open(self):
+        self.assertEqual(manage_cli.parser().parse_args([]).words, [])
+        self.assertTrue(manage_cli.parser().parse_args(['--no-open']).no_open)
 
 
 if __name__ == '__main__':

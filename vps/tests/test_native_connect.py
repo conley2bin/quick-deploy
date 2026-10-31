@@ -82,7 +82,7 @@ class NativeConnect(three.ThreeFixture, unittest.TestCase):
         self.real_module = vps.MODULE
         company_module = Path(os.environ.get('QD_NATIVE_REAL_MODULE', str(self.real_module)))
         real_state = Path.home() / '.local/state/quick-deploy-private/vps'
-        self.protected = [company_module / 'subscription-urls.json', company_module / 'index.html', company_module / 'domain.txt',
+        self.protected = [company_module / 'subscription-urls.json', company_module / 'index.html', company_module / 'config.txt',
                           real_state / 'state.json', real_state / 'outputs/subscription-urls.json']
         self.protected_hashes = self.hashes()
         self.addCleanup(self.assert_protected)

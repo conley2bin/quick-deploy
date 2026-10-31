@@ -283,6 +283,7 @@
   // storage, cookies, URLs, logs or the DOM.
   let current = null;
   let synchronized = false;
+  let foreground = true; // until state says service_mode persistent
   let stateTimer;
   let activeJob = null;
   let pollTimer;
@@ -369,7 +370,7 @@
     byId('session-status').textContent = '后台服务未连接';
     byId('carrier-status').textContent = '独立 SSH 通道状态未知';
     byId('write-reason').textContent = '无法核对后台服务，所有变更已禁用。';
-    byId('time-note').textContent = '本页是私有本地文件，可随时重新打开；后台服务启动后点击“重新连接并核对”。';
+    byId('time-note').textContent = foreground ? '本页是私有本地文件。重新运行 manage.sh，再刷新/重开页面。' : '本页是私有本地文件，可随时重新打开；后台服务启动后点击“重新连接并核对”。';
     errorPanel(text || offlineText);
     byId('state-note').textContent = '未读取设备名册，并非空设备列表。';
   };
@@ -455,16 +456,16 @@
     if (!state || state.schema !== 1 || !state.pending || typeof state.busy !== 'boolean' || typeof state.writable !== 'boolean') throw new Error('schema');
     const previousName = selectedDevice() && selectedDevice().name;
     clearSecrets();
-    current = state; synchronized = true;
+    current = state; synchronized = true; foreground = state.service_mode !== 'persistent';
     const pending = state.pending.present;
     const carrier = state.carrier;
     const reason = state.writable_reason;
     byId('session-status').textContent = '本机后台服务已连接';
-    byId('time-note').textContent = '后台服务常驻运行，关闭终端或页面不会停止它；刷新或重新打开此文件会自动重新认证。单项操作最长等待 20 分钟。此页不检测节点在线状态。';
+    byId('time-note').textContent = foreground ? '保持 manage.sh 终端运行；关闭页面不会停止脚本；关闭终端或 Ctrl+C 会停止管理页面，现有节点凭据不受影响；本页无固定到期，单项操作最长 20 分钟。此页不检测节点在线状态。' : '后台服务常驻运行，关闭终端或页面不会停止它；刷新或重新打开此文件会自动重新认证。单项操作最长等待 20 分钟。此页不检测节点在线状态。';
     const direct = carrier && carrier.configured && carrier.mode === 'direct';
     byId('carrier-status').textContent = reason === 'carrier_invalid' ? '独立 SSH 通道配置损坏或无法读取'
       : reason === 'carrier_not_configured' || (carrier && !carrier.configured) ? '独立 SSH 通道未配置'
-      : direct ? '直接SSH已配置（远端连接尚未验证）'
+      : direct ? (foreground ? '直接SSH已配置（远端连接尚未验证）；修改会重启核心，独立性由操作者负责' : '直接SSH已配置（远端连接尚未验证）')
       : reason === 'carrier_listener_down' || (carrier && carrier.configured && !carrier.listening) ? '独立 SSH 通道已配置，但当前不可用'
       : state.writable || (carrier && carrier.listening) ? '独立 SSH 通道已配置并可用' : '独立 SSH 通道：写入受其他状态限制';
     const reasons = {carrier_invalid: '只读：独立 SSH 通道配置损坏或无法读取（不是未配置）。资料仍可查看，修改已禁用；请修复或重新设置通道配置。', carrier_not_configured: '只读：尚未配置独立 SSH 通道。订阅和资料可查看，新增、改名、重置、删除已禁用。', carrier_listener_down: '只读：独立 SSH 通道已配置，但本机监听未运行。资料可查看，修改已禁用；通道恢复后点击“重新连接并核对”。', independent_carrier_required: '只读：尚未配置独立 SSH 通道。资料可查看，修改已禁用。', invalid_source: '已提交资料来源无效，修改已禁用。', reconciliation_required: '上次操作结果需要核对，请保留原操作记录并点击核对。', busy: '模块正在执行原操作，暂时禁止新变更。', pending: '原操作待恢复；用下方恢复按钮核对原操作，不能开始新变更。'};

@@ -119,7 +119,7 @@ class Connect(unittest.TestCase):
                        {'machine_id': current['machine_id']} if current and 'machine_id' in current else {}))),
                    mock.patch.object(host, 'run', side_effect=run), mock.patch.object(host, 'validate_feed_scope'),
                    # The base-domain file and its default must never be consulted.
-                   mock.patch.object(vps, 'base_domain', side_effect=AssertionError('domain.txt read')),
+                   mock.patch.object(vps, 'base_domain', side_effect=AssertionError('config.txt read')),
                    mock.patch.object(vps, 'default_domain', side_effect=AssertionError('default_domain called')),
                    mock.patch.object(vps.subprocess, 'run', side_effect=AssertionError('no real process'))]
         for patch in patches:

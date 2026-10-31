@@ -9,6 +9,7 @@ import unittest
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'lib'))
+import manage_cli
 import vps
 
 
@@ -32,6 +33,14 @@ class Quickstart(unittest.TestCase):
                         parsed.append(args)
                         if args.command in ('preflight', 'deploy') and args.domain:
                             vps.configuration(args)
+                    elif tokens[:2] == ['bash', 'vps/manage.sh']:
+                        # manage.sh's own front parser, then the real vps parser for the delegated command.
+                        front, extra = manage_cli.parser().parse_known_intermixed_args(tokens[2:])
+                        if not front.words:
+                            continue
+                        self.assertIn(front.words[0], ('connect', *manage_cli.DELEGATED))
+                        if front.words[0] != 'connect':
+                            parsed.append(vps.parser().parse_args(front.words + extra))
             if filename == 'README.md':
                 identity_flags = re.search(r'`(--port 2222 --identity .*?)`', text).group(1)
                 flags = shlex.split(string.Template(identity_flags).substitute(variables))

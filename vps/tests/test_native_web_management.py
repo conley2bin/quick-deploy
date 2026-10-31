@@ -289,12 +289,11 @@ class NativeThreeBridge(three.ThreeFixture, unittest.TestCase):
     def start_bridge(self):
         # Complete private state is created by the real constructor (master key,
         # config) in the isolated operator state. No product port or SSH carrier:
-        # an explicit acknowledged DIRECT carrier is the fixture's injected remote.
+        # an explicit acknowledged DIRECT runtime carrier is the fixture's injected remote.
         mihomo = vps.resolve_mihomo()
         self.manager = self.manage.ManagementServer(vps, self.state, port=0, executor=lambda envelope:
-            self.manage.machine_execute(vps, self.state, dict(envelope, mihomo=mihomo)))
-        vps.host.atomic(self.state / 'manage-service/carrier.json',
-                        json.dumps({'schema': 1, 'ssh_proxy': None, 'independent': True}))
+            self.manage.machine_execute(vps, self.state, dict(envelope, mihomo=mihomo)),
+            runtime_carrier={'ssh_proxy': None, 'independent': True})
         self.bridge_thread = threading.Thread(target=self.manager.serve_forever, daemon=True)
         self.bridge_thread.start()
         def stop():
@@ -321,6 +320,7 @@ class NativeThreeBridge(three.ThreeFixture, unittest.TestCase):
                         'HTTP generation differs from committed state (values withheld)')
         self.assertTrue(body['generation'] == host.digest(vps.load(self.state / 'state.json')['backup']))
         self.assertFalse(body['pending']['present'])
+        self.assertEqual((body['service_mode'], body['carrier']['mode']), ('foreground', 'direct'))
         return body
 
     def model_profile(self, state, name):

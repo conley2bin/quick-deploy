@@ -32,6 +32,7 @@ import zlib
 
 import bootstrap
 import cdn_probe
+import target_config
 import host
 import link_dashboard
 import ssh_proxy
@@ -158,23 +159,12 @@ def locked(state):
         os.close(fd)
 
 
-DOMAIN_FILE = MODULE / 'domain.txt'
+def base_domain(module=None):
+    return target_config.base_domain(MODULE if module is None else module)
 
 
-def base_domain(path=None):
-    path = DOMAIN_FILE if path is None else path
-    try:
-        raw = path.read_bytes().decode('ascii')
-    except (OSError, UnicodeDecodeError) as exc:
-        raise host.Error(f'Base domain file {path.name} is missing or unreadable; edit it or pass --domain explicitly') from exc
-    line = raw[:-2] if raw.endswith('\r\n') else raw[:-1] if raw.endswith('\n') else raw
-    # Exactly one bare hostname: no comments, spaces, extra lines, URL, port, or IP literal.
-    if not line or re.search(r'[\s:/@]', line) or re.fullmatch(r'[0-9.]+', line) or line.rsplit('.', 1)[-1].isdigit():
-        raise host.Error(f'{path.name} must contain exactly one base DNS domain such as example.com')
-    try:
-        return host.hostname(line)
-    except host.Error:
-        raise host.Error(f'{path.name} must contain exactly one base DNS domain such as example.com') from None
+def default_ssh(module=None):
+    return target_config.default_ssh(MODULE if module is None else module)
 
 
 def default_domain(label):
@@ -182,7 +172,7 @@ def default_domain(label):
     try:
         return host.hostname(f'{label}.{base}')
     except host.Error:
-        raise host.Error(f'{DOMAIN_FILE.name} base domain is too long for {label}.<base>') from None
+        raise host.Error(f'{target_config.FILE_NAME} DOMAIN is too long for {label}.<base>') from None
 
 
 def configuration(args, saved=None):
@@ -223,7 +213,7 @@ def state_document(state, args, create=False):
         configuration(args, document['config'])
         return document
     if not create:
-        raise host.Error('No 3x-ui state. Existing VPS: setup.sh connect --ssh root@IP. New VPS: setup.sh deploy --ssh root@IP')
+        raise host.Error('No 3x-ui state. Existing VPS: bash vps/manage.sh (reads VPS_SSH from config.txt). New VPS: setup.sh deploy --ssh root@IP')
     return {'format': host.FORMAT, 'owner': str(uuid.uuid4()), 'config': configuration(args), 'current': None,
             'previous': [], 'backup': None}
 
@@ -297,7 +287,7 @@ def target_record(args, current=None):
         if getattr(args, 'port', None) is None and getattr(args, 'identity', None) is None:
             return current
         target = current['target']
-    if not re.fullmatch(r'(?:[A-Za-z_][A-Za-z0-9_-]*@)?[A-Za-z0-9][A-Za-z0-9_.-]*', target):
+    if not target_config.SSH_TARGET.fullmatch(target):
         raise host.Error('--ssh is user@host or a verified alias, never a shell command')
     options = list(SSH_OPTIONS)
     same_target = current is not None and target == current['target']
@@ -876,7 +866,7 @@ def export_after_commit(state):
         path = export_urls(state)
     except (host.Error, OSError, ValueError) as exc:
         raise host.Error('Deployment already committed; local subscription export failed. '
-                         'Fix the local destination/Git exclusion and retry with setup.sh export; no redeploy needed') from exc
+                         'Fix the local destination/Git exclusion and retry with manage.sh export; no redeploy needed') from exc
     print('Private subscription URL copy: ' + str(path))
 
 
@@ -1317,6 +1307,10 @@ def _cdn(state, document, args):
           'Choose SELF-cdn explicitly when desired; no desktop selection was changed.')
 
 
+DIFFERENT_CONFIGURED_VPS = ('The target (config.txt VPS_SSH or --ssh) is a different host than this state directory\'s deployed node; '
+                            'fix VPS_SSH, use another --state-dir for a new VPS, or use replace; never silently retarget')
+
+
 def deploy_existing(state, document, record, args):
     request = request_for(document, record)
     checked = remote(record, 'status', request)
@@ -1389,7 +1383,7 @@ def deploy(state, document, args):
     record = target_record(args, document['current'])
     replacing = args.command in ('replace', 'restore')
     if args.command == 'deploy' and document['current'] and record['endpoint'] != document['current']['endpoint']:
-        raise host.Error('Different host: use replace; never silently take over')
+        raise host.Error(DIFFERENT_CONFIGURED_VPS)
     if args.command == 'deploy' and document['current']:
         return deploy_existing(state, document, record, args)
     backup = args.backup if replacing and args.backup else (Path(document['backup']) if replacing and document['backup'] else None)
@@ -1562,17 +1556,21 @@ def proxy_argument(value):
         raise argparse.ArgumentTypeError(str(exc)) from exc
 
 
-def parser():
+DEPLOYMENT_COMMANDS = ('deploy', 'replace', 'restore', 'preflight', 'status', 'backup', 'recover')
+MANAGEMENT_COMMANDS = ('connect', 'devices', 'export', 'dashboard')
+
+
+def parser(deployment_only=False):
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--state-dir', type=Path, default=DEFAULT_STATE)
     sub = p.add_subparsers(dest='command', required=True)
-    for name in ('deploy', 'replace', 'restore', 'preflight', 'status', 'backup', 'recover', 'export', 'dashboard'):
+    for name in DEPLOYMENT_COMMANDS + (() if deployment_only else ('export', 'dashboard')):
         a = sub.add_parser(name)
         if name not in ('export', 'dashboard'):
             a.add_argument('--ssh-proxy', type=proxy_argument,
                            help='invocation-only socks5://127.0.0.1:PORT or http://127.0.0.1:PORT; default direct')
         if name in ('deploy', 'replace', 'restore', 'preflight'):
-            a.add_argument('--ssh', required=name in ('replace', 'restore'), help='trusted SSH alias or user@public-IPv4; first setup requires it, otherwise use saved current')
+            a.add_argument('--ssh', required=name == 'restore', help='trusted SSH alias or user@public-IPv4; default VPS_SSH from config.txt (restore: always explicit); otherwise saved current')
             a.add_argument('--port', type=int, help='SSH port ONLY; otherwise use verified SSH config')
             a.add_argument('--proxy-port', type=int, help='first setup REALITY listener; default443, saved once')
             a.add_argument('--identity', type=Path)
@@ -1597,13 +1595,15 @@ def parser():
         if name == 'restore':
             a.set_defaults(backup_required=True)
     a = sub.add_parser('cdn', help='add verified Cloudflare/XHTTP; retain REALITY on a separate TCP port and unchanged H2')
-    a.add_argument('--domain', dest='cdn_domain', help='new CDN hostname; default cdn.<base> from domain.txt; subscription domain remains unchanged')
+    a.add_argument('--domain', dest='cdn_domain', help='new CDN hostname; default cdn.<base> from config.txt DOMAIN; subscription domain remains unchanged')
     a.add_argument('--reality-port', type=int, default=9443, help='retained REALITY TCP port; default9443, no automatic fallback')
     a.add_argument('--interface', required=True, help='explicit local physical Linux interface for isolated direct-underlay probes')
     a.add_argument('--dns-server', required=True, help='independently verified zone-authoritative Cloudflare NS public IPv4; queries require AA and bypass recursive gray-answer caches')
     a.add_argument('--edge-ip', help='invocation-only public IPv4 verification preference; must appear in every fresh authoritative CF answer; not a persistent profile pin')
     a.add_argument('--mihomo', help='supported native Mihomo v1.19.32 executable')
     a.add_argument('--ssh-proxy', type=proxy_argument, help='independent explicit loopback SSH carrier; default direct')
+    if deployment_only:
+        return p
     a = sub.add_parser('connect', help='attach this machine to an EXISTING managed VPS over SSH; reads the live server, changes nothing there')
     a.add_argument('--ssh', required=True, help='user@public-IPv4 or verified SSH alias; strict known_hosts, no key copying')
     a.add_argument('--identity', type=Path)
@@ -1625,20 +1625,42 @@ def parser():
     return p
 
 
+def command_token(tokens):
+    rest = list(tokens)
+    if rest[:1] == ['--state-dir']:
+        del rest[:2]
+    elif rest[:1] and rest[0].startswith('--state-dir='):
+        del rest[:1]
+    return rest[0] if rest else None
+
+
 def main(argv=None):
     tokens = list(sys.argv[1:] if argv is None else argv)
-    if '--state-dir' in tokens[:1]:
-        del tokens[:2]
-    if tokens[:1] in (['manage'], ['manage-job']):
+    # Hidden front-flag set only by setup.sh; any later occurrence is an ordinary unknown argument.
+    deployment_only = tokens[:1] == ['--deployment-only']
+    if deployment_only:
+        del tokens[:1]
+        argv = tokens
+    command = command_token(tokens)
+    if command in ('manage', 'manage-job'):
         print('Browser management moved: run bash vps/manage.sh (no longer a setup.sh command)', file=sys.stderr)
         return 2
-    args = parser().parse_args(argv)
+    if deployment_only and command in MANAGEMENT_COMMANDS:
+        print(f'vps: {command} is not a deployment command; use: bash vps/manage.sh {command} ...', file=sys.stderr)
+        return 2
+    args = parser(deployment_only).parse_args(tokens)
     carrier = SSH_PROXY.set(getattr(args, 'ssh_proxy', None))
     os.umask(0o077)
     state = args.state_dir.expanduser().absolute()
+    configured_ssh = False
     try:
-        if args.command in ('deploy', 'replace', 'preflight') and args.domain is None:
-            args.domain = default_domain('sub')
+        if args.command in ('deploy', 'replace', 'preflight'):
+            if args.domain is None:
+                args.domain = default_domain('sub')
+            # Omitted --ssh always means the configured VPS; a differently-deployed state is refused later, never retargeted.
+            if args.ssh is None:
+                args.ssh = default_ssh()
+                configured_ssh = True
         if args.command == 'cdn' and args.cdn_domain is None:
             args.cdn_domain = default_domain('cdn')
         with locked(state):
@@ -1670,6 +1692,8 @@ def main(argv=None):
                 cdn(state, document, args)
             elif args.command == 'preflight':
                 record = target_record(args, document['current'])
+                if configured_ssh and document['current'] and record['endpoint'] != document['current']['endpoint']:
+                    raise host.Error(DIFFERENT_CONFIGURED_VPS)
                 print(host.dumps(remote(record, 'preflight', request_for(document, record))), end='')
             elif args.command == 'recover':
                 recover_local(state, document, args.mihomo)

@@ -258,4 +258,22 @@ checks.push('recover echoes backend-provided opaque operation_id verbatim for an
   await c.get('subscription-links').children[0].children[3].children[0].emit('click');assert.match(c.get('qr-description').textContent,/同一条订阅 URL/);
   checks.push('subscription copy says all server entrances; no single-node or file-format controls');
 }
+{ // Foreground manage.sh: terminal lifetime copy, reconnect hint, direct-SSH truth, delete semantics unchanged.
+  const f=await harness();f.state={...f.state,service_mode:'foreground',carrier:{configured:true,mode:'direct',listening:null}};await f.get('refresh-state').emit('click');
+  const note=f.get('time-note').textContent;
+  assert.match(note,/保持 manage\.sh 终端运行；关闭页面不会停止脚本；关闭终端或 Ctrl\+C 会停止管理页面，现有节点凭据不受影响；本页无固定到期，单项操作最长 20 分钟/);assert.doesNotMatch(note,/常驻|后台服务常驻|关闭终端或页面不会停止它/);
+  assert.match(f.get('carrier-status').textContent,/修改会重启核心，独立性由操作者负责/);assert.doesNotMatch(f.get('carrier-status').textContent,/已通过SSH读取|已验证连接/);
+  assert.equal(f.get('subscription-links').children.length,2);
+  f.server.offline=true;await f.get('refresh-state').emit('click');
+  assert.match(f.get('time-note').textContent,/重新运行 manage\.sh，再刷新\/重开页面/);assert.doesNotMatch(f.get('time-note').textContent,/后台服务启动/);
+  f.server.offline=false;await f.get('refresh-state').emit('click');
+  const unknown=await harness();unknown.server.offline=true;await unknown.get('refresh-state').emit('click');assert.match(unknown.get('time-note').textContent,/后台服务启动后点击/,'persistent legacy backend keeps its hint');delete unknown.state.service_mode;unknown.server.offline=false;await unknown.get('refresh-state').emit('click');unknown.server.offline=true;await unknown.get('refresh-state').emit('click');assert.match(unknown.get('time-note').textContent,/重新运行 manage\.sh/,'no service_mode defaults to foreground');
+  for(const [action,id,label,desc,btn] of [['reset','reset-device','重置设备凭据',/轮换 UUID \/ Auth \/ SubID，旧导入配置和订阅将失效/,'确认撤销旧凭据并提交'],['remove','remove-device','删除整个设备',/撤销整个设备的全部入口和订阅，不是只隐藏卡片/,'确认撤销旧凭据并提交']]){
+    await f.get(id).emit('click');assert.equal(f.get('edit-title').textContent,label);assert.match(f.get('edit-description').textContent,desc);assert.equal(f.get('edit-submit').textContent,btn);assert.equal(f.get('edit-name').hidden,true);
+    f.get('edit-cancel').emit('click');await flush();
+  }
+  const n=f.requests.length;await f.get('remove-device').emit('click');f.get('confirm-impact').checked=true;f.get('confirm-name').value='alpha';await f.get('edit-form').emit('submit');
+  const tail=f.requests.slice(n).map(r=>r.path);assert.deepEqual(tail,['/api/hello','/api/state','/api/jobs']);assert.equal(f.requests.at(-1).body.action,'remove');assert.deepEqual(f.requests.at(-1).body.confirm,{action:'remove',name:'alpha'});
+  checks.push('foreground service_mode: terminal-lifetime copy, manage.sh restart hint (also before first connect), direct-SSH claim without read proof; reset/remove copy and hello→state→single POST unchanged; persistent legacy text kept');
+}
 console.log(JSON.stringify({status:'passed',checks}));

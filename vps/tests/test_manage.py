@@ -457,6 +457,17 @@ class HTTPManagement(unittest.TestCase):
         self.assertEqual((code, data['error']['code']), (409, 'carrier_invalid'))
         self.assertEqual(len(self.executed), 1)
 
+    def test_runtime_mihomo_is_frozen_into_job_envelope_and_default_stays_none(self):
+        self.assertEqual(self.request('POST', '/api/jobs', self.body())[0], 202)
+        self.manager.worker.join(0.2)
+        self.assertIsNone(self.executed[0]['mihomo'])
+        self.release.set()
+        self.manager.worker.join(5)
+        self.manager.runtime_mihomo = '/custom/bin/mihomo'
+        self.assertEqual(self.request('POST', '/api/jobs', self.body(request_id='9' * 32))[0], 202)
+        self.manager.worker.join(5)
+        self.assertEqual(self.executed[1]['mihomo'], '/custom/bin/mihomo')
+
     def test_restart_history_unknown_does_not_poison_current_state(self):
         job = {'job_id': '3' * 32, 'request_id': '4' * 32, 'state': 'running',
                'generation_before': A, 'started_at': time.time(), '_started': time.monotonic(),

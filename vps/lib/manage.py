@@ -24,6 +24,7 @@ import vps as vps_module
 
 MAX_BODY = 8192
 JOB_SECONDS = 1200
+STOP_GRACE = 20  # foreground stop: seconds an active native job may finish its receipt before the group is terminated
 CLEANUP_MARGIN = 30
 HEX32 = re.compile(r'[0-9a-f]{32}\Z')
 HEX64 = re.compile(r'[0-9a-f]{64}\Z')
@@ -260,7 +261,11 @@ def machine_main(vps, state):
 
 class ManagementServer:
     """Persistent signed API, one worker, no queue. executor is an in-process test seam."""
-    def __init__(self, vps, state, port=None, executor=None):
+    def __init__(self, vps, state, port=None, executor=None, runtime_carrier=None, runtime_mihomo=None):
+        self.runtime_mihomo = runtime_mihomo  # explicit native core path frozen into every job envelope; None = normal resolver
+        # runtime_carrier: foreground-only {'ssh_proxy': url|None, 'independent': bool}; None reads carrier.json.
+        self.runtime_carrier = runtime_carrier
+        self.stop_grace = 0 if runtime_carrier is None else STOP_GRACE
         self.vps, self.state = vps, Path(state).expanduser().absolute()
         vps.private_dir(self.state)
         self.jobs_dir = vps.private_dir(self.state / 'manage-jobs')
@@ -481,15 +486,20 @@ class ManagementServer:
         return {'job_limit_s': JOB_SECONDS, 'cleanup_margin_s': CLEANUP_MARGIN}
 
     def carrier(self):
-        """Read the operator-authored carrier at each snapshot/admission: (reason, ssh_proxy)."""
+        """The invocation carrier, else the operator-authored carrier.json, at each snapshot/admission: (reason, ssh_proxy)."""
         path = self.state / 'manage-service' / 'carrier.json'
-        if not os.path.lexists(path):
+        if self.runtime_carrier is None and not os.path.lexists(path):
             return 'carrier_not_configured', None
         try:
-            value = strict_json(self.vps.read_private(path))
-            if (not isinstance(value, dict) or set(value) != {'schema', 'ssh_proxy', 'independent'}
-                    or value['schema'] != 1 or value['independent'] is not True):
-                raise ValueError('carrier schema')
+            if self.runtime_carrier is not None:
+                value = self.runtime_carrier
+                if value['independent'] is not True:
+                    return 'independent_carrier_required', None
+            else:
+                value = strict_json(self.vps.read_private(path))
+                if (not isinstance(value, dict) or set(value) != {'schema', 'ssh_proxy', 'independent'}
+                        or value['schema'] != 1 or value['independent'] is not True):
+                    raise ValueError('carrier schema')
             # null is an explicitly acknowledged DIRECT route, never an absence fallback.
             proxy = (None if value['ssh_proxy'] is None
                      else self.vps.ssh_proxy.parse_proxy(value['ssh_proxy']))
@@ -526,7 +536,7 @@ class ManagementServer:
             carrier, route = self.carrier()
             reason = (carrier or 'busy' if carrier or busy else 'pending' if pending['present'] else
                       source.get('error', {}).get('code'))
-            return {'schema': 1, 'service_mode': 'persistent', 'epoch': self.epoch,
+            return {'schema': 1, 'service_mode': 'persistent' if self.runtime_carrier is None else 'foreground', 'epoch': self.epoch,
                     'carrier': {'configured': carrier != 'carrier_not_configured',
                                 'listening': carrier is None,
                                 'mode': 'direct' if carrier is None and route is None else
@@ -577,7 +587,7 @@ class ManagementServer:
                         (body['action'] == 'rename' and body['names'][1] in names)):
                     raise Refusal('device_conflict')
                 envelope = {key: body[key] for key in ('action', 'names', 'expected_generation')}
-            envelope.update(ssh_proxy=route, mihomo=None)
+            envelope.update(ssh_proxy=route, mihomo=self.runtime_mihomo)
             job_id = secrets.token_hex(16)
             job = {'job_id': job_id, 'request_id': body['request_id'], 'state': 'running',
                    'started_at': time.time(), '_started': time.monotonic(), 'elapsed_s': 0,
@@ -631,6 +641,13 @@ class ManagementServer:
             process.stdin.write(json.dumps(envelope).encode())
             process.stdin.close()
             while process.poll() is None:
+                if self.stopping.is_set() and self.stop_grace:
+                    try:
+                        process.wait(self.stop_grace)
+                    except subprocess.TimeoutExpired:
+                        pass
+                    if process.poll() is not None:
+                        break
                 if self.stopping.wait(0.1) or time.monotonic() - job['_started'] >= JOB_SECONDS:
                     self._terminate(process)
                     return {'outcome': 'recovery_required', 'error': error('interrupted_unknown'),
@@ -742,7 +759,7 @@ class ManagementServer:
             self.httpd.shutdown()
         self.httpd.server_close()
         if self.worker is not None:
-            self.worker.join(JOB_SECONDS + 15 if self.executor else 15)
+            self.worker.join(JOB_SECONDS + 15 if self.executor else self.stop_grace + 15)
             if self.worker.is_alive():
                 raise RuntimeError('test executor did not stop')
         if self.session_lock is not None:
@@ -806,6 +823,35 @@ def run_service(vps, state):
             signal.signal(sig, handler)
         if not manager.stopping.is_set():
             manager.close()
+
+
+def run_foreground(vps, state, runtime_carrier, ready, prepare=None, mihomo=None):
+    """Serve for this call's lifetime; SIGINT/SIGTERM stop it. prepare() runs once this process holds the session lock and port,
+    before anything is written or announced; ready(launcher_path, origin) runs once bound and written.
+
+    Everything is released in finally. An active native job gets STOP_GRACE to write its receipt, then its
+    process group is terminated; the retained job record is recovery_required and nothing is replayed.
+    """
+    manager = ManagementServer(vps, state, runtime_carrier=runtime_carrier, runtime_mihomo=mihomo)
+    old, thread = {}, None
+    try:
+        if prepare is not None:
+            prepare()
+        launcher = manager.write_launcher()
+        for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):  # HUP: terminal closed
+            old[sig] = signal.signal(sig, lambda *_: manager.stopping.set())
+        manager._serving = True
+        thread = threading.Thread(target=manager.serve_forever, name='vps-manage-http')
+        thread.start()
+        ready(launcher, manager.origin)
+        manager.stopping.wait()
+        return 0
+    finally:
+        for sig, handler in old.items():
+            signal.signal(sig, handler)
+        manager.close()
+        if thread is not None:
+            thread.join()
 
 
 def parser():
