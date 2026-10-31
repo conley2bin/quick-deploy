@@ -10,6 +10,7 @@ import argparse
 import base64
 import copy
 import hashlib
+import hmac
 import http.client
 import json
 import os
@@ -28,6 +29,71 @@ from urllib.parse import urlsplit
 import test_native_three_lifecycle as three
 
 host, vps, native = three.host, three.vps, three.native
+import manage_auth
+
+
+class SigningClient:
+    """Bounded persistent-API test client: verified hello, signed requests, verified responses.
+
+    The bootstrap key is read from the private manage-service state exactly as the
+    entry-file generator does; a wrong key can never pass the server proof.
+    """
+    def __init__(self, test, authority, origin, key):
+        self.test, self.authority, self.origin, self.key = test, authority, origin, key
+        self.hello_value = None
+
+    def raw(self, method, path, payload, headers):
+        host, _, port = self.authority.partition(':')
+        connection = http.client.HTTPConnection(host, int(port), timeout=10)
+        try:
+            connection.putrequest(method, path, skip_host=True, skip_accept_encoding=True)
+            for name, value in headers.items():
+                connection.putheader(name, value)
+            if method == 'POST':
+                connection.putheader('Content-Length', str(len(payload)))
+            connection.endheaders(payload if method == 'POST' else None)
+            response = connection.getresponse()
+            return response.status, response.read(), dict(response.getheaders())
+        finally:
+            connection.close()
+
+    def hello(self):
+        nonce = secrets.token_hex(16)
+        status, raw, _ = self.raw('POST', '/api/hello', json.dumps({'version': 1, 'client_nonce': nonce}).encode(),
+                                  {'Host': self.authority, 'Origin': 'null', 'Content-Type': 'application/json'})
+        self.test.assertEqual(status, 200, 'Real HTTP signed hello failed')
+        value = json.loads(raw)
+        # Verify BEFORE any key is used or any API request is sent.
+        self.test.assertTrue(value['version'] == 1 and value['origin'] == self.origin and
+                             value['client_nonce'] == nonce, 'Hello binding mismatch')
+        ctx = manage_auth.context(value['origin'], value['epoch'], value['session_id'], nonce, value['server_nonce'])
+        if not hmac.compare_digest(value['proof'], manage_auth.server_proof(self.key, ctx)):
+            raise AssertionError('Server proof rejected (impostor or wrong bootstrap key)')
+        self.hello_value = (value['session_id'], manage_auth.session_key(self.key, ctx), value['epoch'])
+        return self.hello_value
+
+    def request(self, method, path, body=None, *, sign=True, headers=None, tamper=None, nonce=None, session=None):
+        payload = b'' if body is None else json.dumps(body).encode()
+        session_id, ks, epoch = self.hello_value or self.hello()
+        nonce = nonce or secrets.token_hex(16)
+        base = {'Host': self.authority, 'Origin': 'null'}
+        if method == 'POST':
+            base['Content-Type'] = 'application/json'
+        if sign:
+            mac = manage_auth.request_mac(ks, epoch, nonce, method, path, payload)
+            base.update({'X-QD-Session': session or session_id, 'X-QD-Nonce': nonce,
+                         'X-QD-MAC': '0' * 64 if tamper == 'mac' else mac})
+        base.update(headers or {})
+        sent = payload + b' ' if tamper == 'body' else payload
+        status, raw, values = self.raw(method, path, sent, base)
+        self.test.assertEqual(values.get('Cache-Control'), 'no-store')
+        self.test.assertIn(values.get('Access-Control-Allow-Origin'), (None, 'null'))
+        self.test.assertFalse(any(key.lower() == 'access-control-allow-credentials' for key in values))
+        # A known-session answer must carry a valid response MAC before it is parsed.
+        if sign and not tamper and not session and status in (200, 202, 404, 409):
+            self.test.assertEqual(values.get('X-QD-MAC'), manage_auth.response_mac(ks, epoch, nonce, status, raw),
+                                  'Missing/invalid response MAC')
+        return status, raw, values, nonce
 
 
 def h2_users(raw):
@@ -118,6 +184,10 @@ class NativeThreeBridge(three.ThreeFixture, unittest.TestCase):
         shutil.copytree(self.real_module, root / 'vps', ignore=shutil.ignore_patterns(
             'subscription-urls.json', 'index.html', '.subscription-urls-*.tmp', '.index-*.tmp', '__pycache__'))
         shutil.copy2(self.real_module.parent / '.gitignore', root / '.gitignore')
+        # The qualification source is frozen read-only; the private worktree copy must be writable.
+        for path in [root, *root.rglob('*')]:
+            if path.is_dir() and not path.is_symlink():
+                path.chmod(0o700)
         # An isolated complete module in an actual Git worktree, not a no-op
         # export mock. Native output stays ignored just as in the real repo.
         made = subprocess.run(['git', 'init', '-q', str(root)], capture_output=True, timeout=10)
@@ -217,10 +287,14 @@ class NativeThreeBridge(three.ThreeFixture, unittest.TestCase):
             vps.export_after_commit(self.state)
 
     def start_bridge(self):
-        self.manager = self.manage.ManagementServer(vps, self.state, independent_carrier=True,
-            mihomo=vps.resolve_mihomo(), executor=lambda envelope:
-            self.manage.machine_execute(vps, self.state, envelope))
-        self.manager.write_launcher()
+        # Complete private state is created by the real constructor (master key,
+        # config) in the isolated operator state. No product port or SSH carrier:
+        # an explicit acknowledged DIRECT carrier is the fixture's injected remote.
+        mihomo = vps.resolve_mihomo()
+        self.manager = self.manage.ManagementServer(vps, self.state, port=0, executor=lambda envelope:
+            self.manage.machine_execute(vps, self.state, dict(envelope, mihomo=mihomo)))
+        vps.host.atomic(self.state / 'manage-service/carrier.json',
+                        json.dumps({'schema': 1, 'ssh_proxy': None, 'independent': True}))
         self.bridge_thread = threading.Thread(target=self.manager.serve_forever, daemon=True)
         self.bridge_thread.start()
         def stop():
@@ -229,28 +303,16 @@ class NativeThreeBridge(three.ThreeFixture, unittest.TestCase):
             self.bridge_thread.join(5)
         self.addCleanup(stop)
         self.assertEqual(self.manager.httpd.server_address[0], '127.0.0.1')
-        status, _, body = self.http('POST', '/api/session', {'launch_token': self.manager.launch_token}, auth=False)
-        self.assertEqual(status, 200, 'Real HTTP session exchange failed')
-        self.token = body['token']
+        self.assertNotEqual(self.manager.httpd.server_port, 47831, 'Product port must not be used')
+        _, master = manage_auth.load_state(self.state)
+        self.assertTrue(callable(self.client), 'Fixture client() must not be shadowed')
+        self.signed = SigningClient(self, self.manager.authority, self.manager.origin,
+                                    manage_auth.bootstrap_key(master))
+        self.signed.hello()
 
-    def http(self, method, path, body=None, *, auth=True, headers=None):
-        connection = http.client.HTTPConnection('127.0.0.1', self.manager.httpd.server_port, timeout=10)
-        base = {'Host': self.manager.authority}
-        if auth:
-            base['Authorization'] = 'Bearer ' + self.token
-        if method == 'POST':
-            base.update(Origin=self.manager.origin, **{'Content-Type': 'application/json'})
-        base.update(headers or {})
-        try:
-            connection.request(method, path, None if body is None else json.dumps(body).encode(), base)
-            response = connection.getresponse()
-            raw = response.read()
-            values = dict(response.getheaders())
-            self.assertEqual(values.get('Cache-Control'), 'no-store')
-            self.assertFalse(any(key.lower().startswith('access-control-allow') for key in values))
-            return response.status, raw, json.loads(raw)
-        finally:
-            connection.close()
+    def http(self, method, path, body=None, *, auth=True, headers=None, tamper=None):
+        status, raw, _, _ = self.signed.request(method, path, body, sign=auth, headers=headers, tamper=tamper)
+        return status, raw, json.loads(raw) if raw else None
 
     def snapshot(self):
         status, _, body = self.http('GET', '/api/state')
@@ -315,19 +377,34 @@ class NativeThreeBridge(three.ThreeFixture, unittest.TestCase):
         before = {table: self.fx.rows(table) for table in ('clients', 'client_inbounds')}
         calls = len(self.remote_actions)
         body = self.request('add', ['forbidden'], state['generation'])
-        cases = [('GET', '/api/state', None, True, {'Host': 'rebinding.invalid'}),
-                 ('GET', '/api/state', None, False, {}),
-                 ('POST', '/api/jobs', body, False, {}),
-                 ('POST', '/api/jobs', body, True, {'Origin': 'https://foreign.invalid'}),
-                 ('POST', '/api/jobs', body, True, {'Content-Type': 'application/x-www-form-urlencoded'}),
-                 ('OPTIONS', '/api/jobs', None, True, {'Origin': 'https://foreign.invalid'})]
-        for method, path, payload, auth, headers in cases:
-            status, _, _ = self.http(method, path, payload, auth=auth, headers=headers)
+        cases = [('GET', '/api/state', None, True, {'Host': 'rebinding.invalid'}, None),
+                 ('GET', '/api/state', None, False, {}, None),
+                 ('POST', '/api/jobs', body, False, {}, None),
+                 ('POST', '/api/jobs', body, True, {'Origin': 'https://foreign.invalid'}, None),
+                 ('POST', '/api/jobs', body, True, {'Content-Type': 'application/x-www-form-urlencoded'}, None),
+                 ('OPTIONS', '/api/jobs', None, True, {'Origin': 'https://foreign.invalid'}, None),
+                 ('GET', '/api/state', None, True, {'Origin': 'http://' + self.manager.authority}, None),
+                 ('GET', '/api/state', None, True, {'X-QD-Session': secrets.token_hex(16)}, None),
+                 ('GET', '/api/state', None, True, {}, 'mac'),
+                 ('POST', '/api/jobs', body, True, {}, 'mac'),
+                 ('POST', '/api/jobs', body, True, {}, 'body')]
+        for method, path, payload, auth, headers, tamper in cases:
+            status, _, _ = self.http(method, path, payload, auth=auth, headers=headers, tamper=tamper)
             self.assertIn(status, (400, 401, 403, 405, 415, 421))
             self.assertEqual(len(self.remote_actions), calls, 'Rejected HTTP reached real native carrier')
             self.assertTrue(before == {table: self.fx.rows(table) for table in before},
                             'Rejected HTTP changed native DB (values withheld)')
+        # Replay of a verified request (GET and POST) is rejected before admission.
         stale = self.request('add', ['forbidden'], '0' * 64)
+        for method, path, payload, first in (('GET', '/api/state', None, 200), ('POST', '/api/jobs', stale, 409)):
+            status, _, _, nonce = self.signed.request(method, path, payload)
+            self.assertEqual(status, first)
+            self.assertEqual(self.signed.request(method, path, payload, nonce=nonce)[0], 401, 'Replay accepted')
+        # A client using any other bootstrap key can neither pass the proof nor sign.
+        impostor = SigningClient(self, self.manager.authority, self.manager.origin, secrets.token_bytes(32))
+        with self.assertRaisesRegex(AssertionError, 'Server proof rejected'):
+            impostor.hello()
+        self.assertEqual(len(self.remote_actions), calls)
         self.assertEqual(self.http('POST', '/api/jobs', stale)[0], 409)
         with vps.locked(self.state):
             self.assertEqual(self.http('POST', '/api/jobs', body)[0], 409)

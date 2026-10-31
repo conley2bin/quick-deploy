@@ -12,8 +12,8 @@
   <a class="skip-link" href="#connection-content">跳至连接资料</a>
   <div class="app-shell" id="app-shell">
     <header class="topbar">
-      <div class="brand"><span class="brand-mark" aria-hidden="true">↗</span><div><strong>连接资料</strong><span class="brand-caption">VPS / 本机管理会话</span></div></div>
-      <span id="session-status" class="snapshot-badge">正在连接本机会话…</span>
+      <div class="brand"><span class="brand-mark" aria-hidden="true">↗</span><div><strong>连接资料</strong><span class="brand-caption">VPS / 本机后台服务</span></div></div>
+      <span id="session-status" class="snapshot-badge">正在连接本机后台服务…</span>
     </header>
     <div class="workspace">
       <aside class="sidebar" aria-label="选择设备">
@@ -23,13 +23,13 @@
         <button id="add-device" type="button" class="button primary add-device" disabled>＋ 新增设备</button>
         <nav id="device-list" class="device-list" aria-label="设备列表"></nav>
         <p id="search-empty" class="muted" hidden>没有匹配的设备，请换个名称。</p>
-        <div class="sidebar-note"><span class="eyebrow">仅保存在本地</span><p>按设备取用客户端订阅。链接和二维码来自已提交的资料。</p><p>本机桥接不会在 VPS 上添加管理服务。页面包含凭据，请私下使用。</p></div>
+        <div class="sidebar-note"><span class="eyebrow">仅保存在本地</span><p>按设备取用客户端订阅。链接和二维码来自已提交的资料。</p><p>本机桥接不会在 VPS 上添加管理服务。本文件含管理密钥，请勿分享。</p></div>
       </aside>
       <main id="connection-content" tabindex="-1">
-        <section class="session-panel" aria-label="会话状态">
-          <div class="session-line"><strong id="carrier-status">尚未连接</strong><button id="refresh-state" type="button" class="button secondary" disabled>核对已提交状态</button></div>
-          <p id="write-reason" class="muted">等待本机会话认证。</p>
-          <p id="time-note" class="muted">等待本机会话时间。</p>
+        <section class="session-panel" aria-label="后台服务状态">
+          <div class="session-line"><strong id="carrier-status">独立 SSH 通道状态待核对</strong><button id="refresh-state" type="button" class="button secondary">重新连接并核对</button></div>
+          <p id="write-reason" class="muted">等待验证本机后台服务。</p>
+          <p id="time-note" class="muted">私有本地入口文件含管理密钥，请勿分享。</p>
         </section>
         <section class="notice management-warning"><p>所有变更（包括改名）都可能重启共享核心，短暂中断<strong>全部设备</strong>。SSH 必须走独立于本 VPS 三个入口的管理通道；本 VPS 的 H2 不是独立通道。</p></section>
         <section id="load-error" class="error-panel" role="alert" hidden></section>

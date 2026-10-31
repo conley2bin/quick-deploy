@@ -2,11 +2,11 @@
 import assert from 'node:assert/strict';
 import {readFileSync} from 'node:fs';
 import vm from 'node:vm';
-import {webcrypto} from 'node:crypto';
+import {webcrypto, createHmac, createHash, randomBytes} from 'node:crypto';
 const fixture = JSON.parse(readFileSync(0, 'utf8'));
 const source = readFileSync(new URL('../assets/manage.js', import.meta.url), 'utf8');
 const html = readFileSync(new URL('../assets/manage.html', import.meta.url), 'utf8');
-const flush = async () => { for (let i=0; i<12; i++) await new Promise(resolve => setImmediate(resolve)); };
+const flush = async () => { for (let i=0; i<12; i++) { await new Promise(resolve => setTimeout(resolve, 2)); await new Promise(resolve => setImmediate(resolve)); } };
 const checks = [];
 async function harness(options={}) {
   const elements = new Map(), clipboard=[], downloads=[], blobs=new Map(), requests=[], timers=new Map(), events=new Map();
@@ -33,30 +33,58 @@ async function harness(options={}) {
     querySelectorAll(){return this.focusables||[];}
   }
   for(const match of html.matchAll(/<([a-z][a-z0-9]*)\b[^>]*\bid="([^"]+)"[^>]*>/g)){const e=new Element(match[1]);e.hidden=/\bhidden\b/.test(match[0]);elements.set(match[2],e);}
+  elements.set('manage-bootstrap',new Element('script'));
   const get=id=>{assert.ok(elements.has(id),'known HTML element '+id);return elements.get(id);};
   doc={body:new Element('body'),getElementById:get,createElement:tag=>new Element(tag),execCommand:()=>false,querySelector:()=>[...elements.values()].find(e=>e.open)};
-  const location={hash:options.noFragment?'':'#FAKE_LAUNCH',pathname:'/',origin:'http://127.0.0.1:43123'};
-  let state={schema:1,session_id:'FAKE_SESSION',generation:'a'.repeat(64),pending:{present:false},busy:false,writable:true,writable_reason:null,last_job:null,model:structuredClone(fixture.model)};
-  if(options.readonly)Object.assign(state,{writable:false,writable_reason:'independent_carrier_required'});
-  let mode='running', failPost=false, status=200, jobExtra={};
+  const ORIGIN='http://127.0.0.1:43123', BOOT_HEX='5a'.repeat(32), B=Buffer.from(BOOT_HEX,'hex');
+  const hm=(key,text)=>createHmac('sha256',key).update(text).digest();
+  const sha=raw=>createHash('sha256').update(raw).digest('hex');
+  const server={epoch:randomBytes(16).toString('hex'),sessions:new Map(),seen:new Set(),offline:false,badProof:false,tamper:false,impostor:false,fakeUnsigned:false,hellos:0};
+  const location={hash:'',pathname:'/',origin:'file://'};
+  let state={schema:1,service_mode:'persistent',carrier:{configured:true,listening:true},generation:'a'.repeat(64),pending:{present:false},busy:false,writable:true,writable_reason:null,last_job:null,model:structuredClone(fixture.model)};
+  if(options.readonly)Object.assign(state,{writable:false,writable_reason:options.readonly,carrier:{configured:options.readonly!=='carrier_not_configured',listening:false}});
+  let mode='running', failPost=false, jobExtra={};
   const FakeDate=options.now?class extends Date{constructor(...a){a.length?super(...a):super(options.now);}static now(){return options.now;}}:Date;
-  const fetch=async(path,request)=>{
-    assert.equal(location.hash,'','fragment cleared before HTTP');
-    requests.push({path,...request,body:request.body?JSON.parse(request.body):undefined});
-    if(path==='/api/session')return {ok:true,json:async()=>({token:'FAKE_BEARER',expires_in:options.ttl||2700,session_id:'FAKE_SESSION'})};
-    assert.equal(request.headers.Authorization,'Bearer FAKE_BEARER');
-    if(path==='/api/state')return {ok:status===200,status,json:async()=>structuredClone(state)};
-    if(request.method==='POST'){
-      if(failPost)throw Error('lost response');
-      state.last_job={job_id:'FAKE_JOB',request_id:requests.at(-1).body.request_id,state:'running',...jobExtra};
-      return {ok:true,status:202,json:async()=>({job_id:'FAKE_JOB',state:'running'})};
+  const answer=(status,bytes,headers={})=>({ok:status>=200&&status<300,status,headers:{get:k=>headers[k]??null},arrayBuffer:async()=>bytes.buffer.slice(bytes.byteOffset,bytes.byteOffset+bytes.length)});
+  const fetch=async(url,request)=>{
+    if(server.offline)throw Error('connection refused');
+    assert.ok(url.startsWith(ORIGIN),'only the exact bootstrap origin is contacted');const path=url.slice(ORIGIN.length);
+    assert.equal(request.credentials,'omit');assert.equal(request.headers['Content-Type'],'application/json','JSON content type forces preflight');
+    assert.ok(!Object.keys(request.headers).some(k=>/^(origin|authorization|cookie)$/i.test(k)),'no forbidden/ambient credential headers');
+    const rawBody=request.body??'';
+    if(path==='/api/hello'){
+      server.hellos++;requests.push({path,method:'POST',body:JSON.parse(rawBody)});
+      const hello=JSON.parse(rawBody);assert.deepEqual(Object.keys(hello).sort(),['client_nonce','version']);assert.match(hello.client_nonce,/^[0-9a-f]{32}$/);
+      const ns=randomBytes(16).toString('hex'),sid=randomBytes(16).toString('hex'),epoch=server.epoch;
+      const origin=server.impostor?'http://127.0.0.1:1':ORIGIN;
+      const ctx=['1',origin,epoch,sid,hello.client_nonce,ns].join('\n');
+      server.sessions.set(sid,hm(B,'qd-session-v1\n'+ctx));
+      const key=server.badProof?Buffer.alloc(32,1):B;
+      return answer(200,Buffer.from(JSON.stringify({version:1,origin,epoch,session_id:sid,client_nonce:hello.client_nonce,server_nonce:ns,proof:hm(key,'qd-server-v1\n'+ctx).toString('hex')})));
     }
-    return {ok:true,json:async()=>({job_id:'FAKE_JOB',state:mode==='running'?'running':'finished',elapsed_s:4,outcome:mode==='running'?undefined:mode,...jobExtra})};
+    if(request.method==='POST')server.postAttempts=(server.postAttempts||0)+1;
+    if(server.evictOnPost&&request.method==='POST')server.sessions.clear();
+    const sid=request.headers['X-QD-Session'],ks=server.sessions.get(sid),nonce=request.headers['X-QD-Nonce'];
+    if(!ks||server.fakeUnsigned)return answer(401,Buffer.from('{"error":"fake: all fine, state is []"}'));
+    const want=hm(ks,['qd-request-v1',server.epoch,nonce,request.method,path,sha(Buffer.from(rawBody))].join('\n')).toString('hex');
+    assert.equal(request.headers['X-QD-MAC'],want,'request MAC covers exact method/path/raw body');
+    assert.ok(!server.seen.has(sid+nonce),'nonce never reused');server.seen.add(sid+nonce);
+    const parsed=rawBody?JSON.parse(rawBody):undefined;requests.push({path,method:request.method,body:parsed,raw:rawBody});
+    let status=200,reply;
+    if(path==='/api/state')reply=structuredClone(state);
+    else if(request.method==='POST'){
+      if(failPost){server.sent=(server.sent||0)+1;throw Error('lost response');}
+      state.last_job={job_id:'FAKE_JOB',request_id:parsed.request_id,state:'running',...jobExtra};status=202;reply={job_id:'FAKE_JOB',state:'running'};
+    }else reply={job_id:'FAKE_JOB',state:mode==='running'?'running':'finished',elapsed_s:4,outcome:mode==='running'?undefined:mode,...jobExtra};
+    const bytes=Buffer.from(JSON.stringify(reply));
+    const mac=hm(ks,['qd-response-v1',server.epoch,nonce,String(status),sha(bytes)].join('\n')).toString('hex');
+    return answer(status,(server.tamper||(server.tamperPost&&request.method==='POST'))?Buffer.from(JSON.stringify({...reply,model:{devices:[]}})):bytes,{'X-QD-MAC':mac});
   };
+  elements.get('manage-bootstrap').text=JSON.stringify({version:1,origin:ORIGIN,bootstrap_key:BOOT_HEX});
   class LocalURL extends URL {static createObjectURL(blob){const id='blob:fake-'+blobs.size;blobs.set(id,blob);return id;}static revokeObjectURL(id){blobs.delete(id);}}
-  const context={document:doc,navigator:{clipboard:{writeText:async value=>clipboard.push(value)}},URL:LocalURL,Blob,Uint8Array,Date:FakeDate,AbortController,crypto:webcrypto,location,history:{replaceState(a,b,path){assert.equal(path,'/');location.hash='';}},window:{addEventListener:(k,v)=>events.set(k,v)},fetch,atob:v=>Buffer.from(v,'base64').toString('binary'),setTimeout:(fn,delay)=>{timers.set(++timer,{fn,delay});return timer;},clearTimeout:id=>timers.delete(id)};
+  const context={document:doc,navigator:{clipboard:{writeText:async value=>clipboard.push(value)}},URL:LocalURL,Blob,Uint8Array,Date:FakeDate,AbortController,TextEncoder,TextDecoder,crypto:webcrypto,location,window:{addEventListener:(k,v)=>events.set(k,v)},fetch,atob:v=>Buffer.from(v,'base64').toString('binary'),setTimeout:(fn,delay)=>{timers.set(++timer,{fn,delay});return timer;},clearTimeout:id=>timers.delete(id)};
   vm.runInNewContext(source,context,{filename:'manage.js'});await flush();
-  return {get,clipboard,downloads,blobs,requests,context,events,get state(){return state;},set state(v){state=v;},set mode(v){mode=v;},set failPost(v){failPost=v;},set jobExtra(v){jobExtra=v;},set status(v){status=v;},async poll(){const entry=[...timers].find(([,t])=>t.delay===0||t.delay===2000);assert.ok(entry,'job timer exists');timers.delete(entry[0]);await entry[1].fn();await flush();}};
+  return {get,clipboard,downloads,blobs,requests,context,events,server,get state(){return state;},set state(v){state=v;},set mode(v){mode=v;},set failPost(v){failPost=v;},set jobExtra(v){jobExtra=v;},async poll(){const entry=[...timers].find(([,t])=>t.delay===0||t.delay===2000);assert.ok(entry,'job timer exists');timers.delete(entry[0]);await entry[1].fn();await flush();}};
 }
 const h=await harness();
 assert.equal(fixture.model.devices[0].links.filter(l=>l.kind==='node').length,3);assert.ok(fixture.model.devices[0].downloads.length>0,'input model still carries nodes and downloads');
@@ -64,10 +92,10 @@ for(const id of ['node-links','config-downloads','nodes-heading','downloads-head
 assert.throws(()=>h.get('node-links'));assert.throws(()=>h.get('config-downloads'));
 assert.doesNotMatch(html,/下载配置|原生节点|\.download-link/);assert.doesNotMatch(readFileSync(new URL('../assets/manage.js',import.meta.url),'utf8'),/node-links|config-downloads/);
 assert.equal(h.get('subscription-links').children.length,2);
-assert.equal(h.requests.filter(r=>r.path==='/api/session').length,1);
-assert.equal(h.requests[0].body.launch_token,'FAKE_LAUNCH');
+assert.equal(h.requests.filter(r=>r.path==='/api/hello').length,1);
+assert.equal(h.requests[0].path,'/api/hello');assert.equal(h.requests[1].path,'/api/state','no API request before a verified hello');
 assert.equal(h.get('add-device').disabled,false);
-checks.push('fragment cleared before exchange; bearer-only authenticated reads; three nodes and two subscriptions');
+checks.push('hello proof verified before signed reads; MAC-bound requests; three nodes and two subscriptions');
 {
   const links=fixture.model.devices[0].links.filter(l=>l.kind==='subscription');
   for(const [i,card] of h.get('subscription-links').children.entries()){
@@ -110,12 +138,14 @@ checks.push('pending wipes credential DOM and QR; explicit recovery references o
 const l=await harness();l.failPost=true;await l.get('add-device').emit('click');l.get('edit-name').value='gamma';await l.get('edit-form').emit('submit');await l.get('refresh-state').emit('click');assert.equal(l.requests.filter(r=>r.path==='/api/jobs').length,1);assert.equal(l.get('add-device').disabled,true);assert.match(l.get('job-status').textContent,/响应丢失/);
 checks.push('lost POST response is never retried and blocks new mutations until original job reconciliation');
 const e=await harness();await e.get('add-device').emit('click');e.get('edit-name').value='gamma';await e.get('edit-form').emit('submit');e.mode='committed_export_failed';e.state.last_job=null;await e.poll();assert.match(e.get('job-status').textContent,/已经提交/);assert.equal(e.requests.filter(r=>r.path==='/api/jobs').length,1);
-e.status=401;await e.get('refresh-state').emit('click');assert.equal(e.get('subscription-links').childElementCount,0);assert.equal(e.get('device-count').textContent,'—');assert.match(e.get('load-error').textContent,/会话/);
-checks.push('postcommit export failure remains committed; expired session wipes secrets without fake empty roster');
-const ro=await harness({readonly:true});assert.equal(ro.get('add-device').disabled,true);assert.equal(ro.get('subscription-links').children.length,2);
-const short=await harness({ttl:1200});assert.equal(short.get('add-device').disabled,true);
-const missing=await harness({noFragment:true});assert.equal(missing.requests.length,0);assert.match(missing.get('load-error').textContent,/vps\/index.html/);
-checks.push('read-only preserves committed materials; short TTL prevents admission; F5 without fragment explains entry');
+e.server.sessions.clear();e.server.epoch='f'.repeat(32);await e.get('refresh-state').emit('click');assert.equal(e.get('subscription-links').childElementCount,2,'silent re-hello after service restart restores view');assert.equal(e.server.hellos,2);assert.equal(e.requests.filter(r=>r.path==='/api/jobs').length,1);
+checks.push('postcommit export failure remains committed; service restart silently re-authenticates with a fresh hello');
+const ro=await harness({readonly:'carrier_not_configured'});assert.match(ro.get('write-reason').textContent,/尚未配置独立 SSH 通道/);assert.equal(ro.get('carrier-status').textContent,'独立 SSH 通道未配置');assert.equal(ro.get('session-status').textContent,'本机后台服务已连接');assert.equal(ro.get('add-device').disabled,true);assert.equal(ro.get('subscription-links').children.length,2);
+const inv=await harness({readonly:'carrier_invalid'});assert.match(inv.get('carrier-status').textContent,/损坏或无法读取/);assert.doesNotMatch(inv.get('carrier-status').textContent,/未配置/);assert.equal(inv.get('subscription-links').children.length,2);assert.equal(inv.get('add-device').disabled,true);
+const dir=await harness();dir.state={...dir.state,carrier:{configured:true,mode:'direct',listening:null}};await dir.get('refresh-state').emit('click');assert.equal(dir.get('carrier-status').textContent,'直接SSH已配置（远端连接尚未验证）');
+const down=await harness({readonly:'carrier_listener_down'});assert.equal(down.get('carrier-status').textContent,'独立 SSH 通道已配置，但当前不可用');assert.equal(down.get('add-device').disabled,true);assert.equal(down.get('subscription-links').children.length,2);
+checks.push('no carrier / listener down: service shown connected, subscriptions viewable, writes disabled with explicit reason');
+checks.push('');
 
 { // Add: new generation's device appears only after refresh; export-failed is a commit, refreshed, never re-POSTed.
   const a=await harness();const before=a.get('device-list').children.length;
@@ -152,7 +182,7 @@ checks.push('recover echoes backend-provided opaque operation_id verbatim for an
   r.mode='committed';r.state.last_job=null;await r.poll();assert.match(r.get('job-status').textContent,/^将 alpha 改名为 renamed：原生变更已提交/);
   assert.equal(r.requests.filter(x=>x.method==='POST'&&x.path==='/api/jobs').length,1,'no re-POST');
   const a=await harness();await a.get('add-device').emit('click');a.get('edit-name').value='test';await a.get('edit-form').emit('submit');await a.poll();
-  assert.equal(a.get('job-status').textContent,'正在新增设备 test · 已用 4 秒（超时上限 20 分钟）。请勿关闭启动终端或重复提交。');
+  assert.equal(a.get('job-status').textContent,'正在新增设备 test · 已用 4 秒（超时上限 20 分钟）。请勿重复提交，可随时查看任务状态。');
   // Failure to read state after submit never re-POSTs and keeps naming the operation.
   a.mode='rejected';a.state.last_job=null;await a.poll();assert.match(a.get('job-status').textContent,/^新增设备 test：被拒绝/);
   for(const [action,names,text] of [['reset',['beta'],'正在重置设备 beta 的凭据'],['remove',['beta'],'正在删除设备 beta'],['add',['x'],'正在新增设备 x'],['rename',['beta','b2'],'正在将 beta 改名为 b2…'],['recover',[],'正在恢复上次未完成操作']]){
@@ -166,18 +196,52 @@ checks.push('recover echoes backend-provided opaque operation_id verbatim for an
   assert.ok(bad.get('job-status').textContent.startsWith('历史操作（未记录类型）'),'invalid backend fields are not invented into a label');
   checks.push('job status names action and target from request_id-bound payload or backend fields; legacy/invalid shows 历史操作（未记录类型）; no re-POST');
 }
-{ // Exact deadlines at a fixed clock; 1230 s admission boundary; node validity never claimed.
-  const hm=ms=>{const d=new Date(ms);return String(d.getHours()).padStart(2,'0')+':'+String(d.getMinutes()).padStart(2,'0');};
-  const now=Date.UTC(2026,9,30,9,0,0),t=await harness({now});
-  const text=t.get('time-note').textContent;
-  assert.ok(text.includes(`新增/改名/重置/删除可提交至 ${hm(now+1470000)}；管理页会话于 ${hm(now+2700000)} 结束`),text);
-  assert.ok(text.includes('20 分钟是单项操作的超时上限，不代表需要等 20 分钟'));assert.ok(text.includes('会话结束不影响节点/已导入配置使用'));
-  assert.doesNotMatch(text,/45 分钟|有效期|节点.*过期/);
-  const late=await harness({now,ttl:1200});const lt=late.get('time-note').textContent;
-  assert.ok(lt.startsWith(`已停止接收新操作，已提交任务继续执行；仍可查看/复制链接，至 ${hm(now+1200000)}。`),lt);
-  assert.equal(late.get('add-device').disabled,true);assert.equal(late.get('subscription-links').children.length,2,'links stay visible');
-  assert.equal(late.get('write-reason').textContent,`已停止接收新操作，已提交任务继续执行；仍可查看/复制链接，至 ${hm(now+1200000)}。`);
-  checks.push('time copy shows exact submit/session deadlines, timeout-cap explanation and post-cutoff read-only wording');
+{ // Stale session at submit time: signed GET preflight re-hellos, then the POST is sent exactly once.
+  const x=await harness();await x.get('reset-device').emit('click');x.get('confirm-impact').checked=true;x.get('confirm-name').value='alpha';
+  x.server.sessions.clear();x.server.epoch='e'.repeat(32);const hellos=x.server.hellos;
+  await x.get('edit-form').emit('submit');
+  assert.equal(x.server.hellos,hellos+1,'preflight reauthenticated');
+  assert.equal(x.requests.filter(r=>r.path==='/api/jobs').length,1,'POST exactly once');
+  const idx=x.requests.findLastIndex(r=>r.path==='/api/jobs');assert.equal(x.requests[idx-1].path,'/api/state','signed GET precedes the POST');
+  assert.equal(x.get('edit-dialog').open,false);assert.match(x.get('job-status').textContent,/重置设备 alpha/);
+  await x.poll();x.mode='committed';x.state.last_job=null;await x.poll();assert.equal(x.get('add-device').disabled,false,'not stuck unresolved');
+  // Offline preflight keeps the form, sends nothing, leaves nothing unresolved; later retry succeeds.
+  const o=await harness();await o.get('add-device').emit('click');o.get('edit-name').value='gamma';o.server.offline=true;await o.get('edit-form').emit('submit');
+  assert.equal(o.get('edit-dialog').open,true);assert.equal(o.get('edit-name').value,'gamma');assert.match(o.get('edit-error').textContent,/未发送/);assert.equal(o.requests.filter(r=>r.path==='/api/jobs').length,0);
+  o.server.offline=false;await o.get('edit-form').emit('submit');assert.equal(o.requests.filter(r=>r.path==='/api/jobs').length,1);
+  // Stale generation found by preflight: no POST, dialog retained.
+  const g=await harness();await g.get('add-device').emit('click');g.get('edit-name').value='gamma';g.state.generation='9'.repeat(64);
+  await g.get('edit-form').emit('submit');assert.equal(g.get('edit-dialog').open,true);assert.match(g.get('edit-error').textContent,/已变化/);assert.equal(g.requests.filter(r=>r.path==='/api/jobs').length,0);
+  checks.push('submit preflights with a signed GET (re-hello on stale session), POSTs once; offline/stale/busy preflight keeps the form and sends nothing');
+}
+{ // Persistent service: no page expiry, no admission cutoff, no countdown text.
+  const now=Date.UTC(2026,9,30,9,0,0)+3*3600e3,t=await harness({now});
+  assert.equal(t.get('add-device').disabled,false,'writes admitted regardless of page age');
+  const text=t.get('time-note').textContent;assert.doesNotMatch(text+html+source,/45 分钟|1230|剩余|expires_in|pagehide|sessionStorage|localStorage|document\.cookie|launch_token|请保持终端|关闭启动终端|\.hash\b/);
+  assert.match(text,/常驻运行/);
+  checks.push('no 45-minute/1230 s gate, countdown, fragment, pagehide or storage in the source; writes admitted');
+}
+{ // Identity failures never become an empty roster; mutations are sent once.
+  const o=await harness();o.server.offline=true;await o.get('refresh-state').emit('click');
+  assert.match(o.get('load-error').textContent,/后台服务未运行或身份无法验证/);assert.equal(o.get('device-count').textContent,'—');assert.equal(o.get('subscription-links').childElementCount,0);assert.equal(o.get('add-device').disabled,true);
+  o.server.offline=false;await o.get('refresh-state').emit('click');assert.equal(o.get('load-error').hidden,true);assert.equal(o.get('subscription-links').children.length,2);
+  const p=await harness({});p.server.badProof=true;p.server.sessions.clear();await p.get('refresh-state').emit('click');
+  assert.match(p.get('load-error').textContent,/身份/);assert.equal(p.get('subscription-links').childElementCount,0);assert.equal(p.requests.at(-1).path,'/api/hello','nothing signed is sent to an impostor');
+  const imp=await harness();imp.server.impostor=true;await imp.get('refresh-state').emit('click');assert.match(imp.get('load-error').textContent,/身份/);assert.ok(!imp.requests.slice(2).some(r=>r.path==='/api/state'),'wrong origin in hello rejected before API');
+  const u=await harness();u.server.fakeUnsigned=true;u.server.sessions.clear();await u.get('refresh-state').emit('click');
+  assert.ok(!u.get('load-error').textContent.includes('state is []'));assert.equal(u.get('subscription-links').childElementCount,0);
+  const t=await harness();t.server.tamper=true;await t.get('refresh-state').emit('click');
+  assert.equal(t.get('subscription-links').childElementCount,0,'response with invalid MAC is never shown');assert.match(t.get('load-error').textContent,/身份/);
+  // Mutation with tampered response: not committed, no replay, original request awaits reconciliation.
+  const m=await harness();m.server.tamperPost=true;await m.get('add-device').emit('click');m.get('edit-name').value='gamma';await m.get('edit-form').emit('submit');
+  assert.equal(m.requests.filter(r=>r.path==='/api/jobs').length,1);assert.doesNotMatch(m.get('job-status').textContent,/原生变更已提交/);assert.equal(m.get('add-device').disabled,true);
+  // Session lost between preflight and POST: exactly one attempt, never replayed, left unresolved.
+  const r=await harness();r.server.evictOnPost=true;await r.get('add-device').emit('click');r.get('edit-name').value='gamma';await r.get('edit-form').emit('submit');
+  assert.equal(r.server.postAttempts,1,'unknown-session POST never replayed');assert.equal(r.get('add-device').disabled,true,'blocked until original request is reconciled');
+  // Preflight itself rejects a tampered state response: nothing is sent and the form stays.
+  const f=await harness();f.server.tamper=true;await f.get('add-device').emit('click');f.get('edit-name').value='gamma';await f.get('edit-form').emit('submit');
+  assert.equal(f.server.postAttempts||0,0);assert.equal(f.get('edit-dialog').open,true);
+  checks.push('offline/impostor/unsigned/tampered responses show service-or-identity error, never an empty roster; mutations are never replayed; reconnect = fresh hello + GET');
 }
 { // Import-option copy; QR/copy payloads (checked above) remain the same URI/URL.
   const c=await harness();

@@ -609,3 +609,15 @@ triple validation reads both actual HandlerService registries on127.0.0.1:62789
 before client/auth probes. Read-only status and exact rollback/old archives do
 not repair historical ordering. This control-plane dependency fix makes no
 statistics/counter accuracy claim.
+
+## Persistent local manager UI
+
+`vps/index.html` is a private generated file (0600, ignored) rendered by `lib/manage_entry.py::render_entry`:
+manager JS/CSS are inlined and covered by exact SHA-256 CSP hashes (no `unsafe-inline`), `connect-src` is the
+single loopback origin, and the only secret is the bootstrap key in an inert `application/json` block. A server
+cannot supply script to it, so a local impostor on the fixed port gains nothing without the key.
+The page performs hello (Origin is `null` for `file://`, set by the browser), verifies the server proof, derives the
+session key, signs each request over method/path/body hash and verifies each response MAC before parsing.
+GETs re-hello once on an unknown session; mutating POSTs are sent once and reconciled by reading.
+Persistence is a property of the service, so the page has no session deadline. Carrier status is shown separately:
+no configuration or a down listener leaves committed subscriptions visible and disables writes with the reason.

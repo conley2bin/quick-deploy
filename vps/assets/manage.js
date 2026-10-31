@@ -110,7 +110,7 @@
     const epoch = viewEpoch;
     anchor.onclick = event => {
       event.preventDefault();
-      if (epoch !== viewEpoch || !token) return;
+      if (epoch !== viewEpoch) return;
       let url;
       try {
         const bytes = Uint8Array.from(atob(encoded), character => character.charCodeAt(0));
@@ -278,13 +278,11 @@
     }
     if (!subscriptions.childElementCount) subscriptions.append(make('p', 'empty-state', device.enabled ? '此快照没有客户端订阅。' : '设备已停用，不提供订阅。'));
   };
-  // A session bearer exists only in this closure. No storage, query token,
-  // location reload, automatic POST retry, or client-side credential conversion.
-  let token = '';
+  // The only secret is the private bootstrap key embedded in this local file. Each
+  // service run is a fresh hello; session keys live in this closure, never in
+  // storage, cookies, URLs, logs or the DOM.
   let current = null;
   let synchronized = false;
-  let expiresAt = 0;
-  let expiryTimer;
   let stateTimer;
   let activeJob = null;
   let pollTimer;
@@ -316,7 +314,6 @@
     const [a, b] = ctx.names;
     return {add: `${running ? '正在' : ''}新增设备 ${a}`, rename: running ? `正在将 ${a} 改名为 ${b}…` : `将 ${a} 改名为 ${b}`, reset: `${running ? '正在' : ''}重置设备 ${a} 的凭据`, remove: `${running ? '正在' : ''}删除设备 ${a}`, recover: `${running ? '正在' : ''}恢复上次未完成操作`}[ctx.action];
   };
-  const clock = ms => { const d = new Date(ms); return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`; };
   const jobMessage = text => {
     byId('job-panel').hidden = false;
     byId('job-status').textContent = text;
@@ -350,7 +347,7 @@
     byId('backup-digest').title = '';
     byId('generated-at').textContent = '—';
   };
-  const canWrite = () => Boolean(token && expiresAt - Date.now() >= 1230000 && synchronized && current && current.writable && !current.busy && !current.pending.present && !activeJob && !submitting && !unresolved && digestPattern.test(current.generation || ''));
+  const canWrite = () => Boolean(synchronized && current && current.writable && !current.busy && !current.pending.present && !activeJob && !submitting && !unresolved && digestPattern.test(current.generation || ''));
   const updateControls = () => {
     const allowed = canWrite();
     byId('add-device').disabled = !allowed;
@@ -360,36 +357,99 @@
     byId('recover-operation').hidden = !(pending && pending.present);
     // Writable is false for pending on some adapters; only the specific carrier
     // read-only reason must also disable recovery (backend independently checks).
-    byId('recover-operation').disabled = !token || !synchronized || !pending || !pending.present || !pending.operation_id || current.busy || Boolean(activeJob) || submitting || expiresAt - Date.now() < 1230000 || !(current.writable || current.writable_reason === 'pending');
-    byId('refresh-state').disabled = !token || submitting;
+    byId('recover-operation').disabled = !synchronized || !pending || !pending.present || !pending.operation_id || current.busy || Boolean(activeJob) || submitting || !(current.writable || current.writable_reason === 'pending');
+    byId('refresh-state').disabled = submitting;
     byId('edit-submit').disabled = !allowed;
   };
-  const cutoffText = () => `已停止接收新操作，已提交任务继续执行；仍可查看/复制链接，至 ${clock(expiresAt)}。`;
-  const timeNote = () => `${expiresAt - Date.now() >= 1230000 ? `新增/改名/重置/删除可提交至 ${clock(expiresAt - 1230000)}；` : `${cutoffText()}`}管理页会话于 ${clock(expiresAt)} 结束。20 分钟是单项操作的超时上限，不代表需要等 20 分钟；会话结束不影响节点/已导入配置使用。此页不检测节点在线状态。`;
-  const expire = text => {
-    token = ''; synchronized = false; current = null; unresolved = null; activeJob = null;
-    clearTimeout(expiryTimer); clearTimeout(stateTimer); clearTimeout(pollTimer);
+  const offlineText = '后台服务未运行或身份无法验证。连接资料已隐藏，这不是空设备列表。';
+  const disconnect = text => {
+    synchronized = false; current = null;
+    clearTimeout(pollTimer);
     clearSecrets(); updateControls();
-    byId('time-note').textContent = '管理页会话已结束；节点/已导入配置不受影响。';
-    byId('session-status').textContent = '会话不可用';
-    byId('carrier-status').textContent = '管理会话已断开';
-    byId('write-reason').textContent = '连接资料已清除；已有导出副本仍需自行保管。';
-    errorPanel(text || '会话已过期。请重新启动管理命令并打开 vps/index.html。');
+    byId('session-status').textContent = '后台服务未连接';
+    byId('carrier-status').textContent = '独立 SSH 通道状态未知';
+    byId('write-reason').textContent = '无法核对后台服务，所有变更已禁用。';
+    byId('time-note').textContent = '本页是私有本地文件，可随时重新打开；后台服务启动后点击“重新连接并核对”。';
+    errorPanel(text || offlineText);
     byId('state-note').textContent = '未读取设备名册，并非空设备列表。';
   };
-  const api = async (path, body) => {
+  // ---- Signed local protocol v1 (see contract): hello proof, per-request MAC,
+  // response MAC verified before any body is parsed.
+  const encoder = new TextEncoder();
+  const decoder = new TextDecoder();
+  const subtle = crypto.subtle;
+  const hex = bytes => [...new Uint8Array(bytes)].map(byte => byte.toString(16).padStart(2, '0')).join('');
+  const fromHex = text => Uint8Array.from(text.match(/../g), pair => parseInt(pair, 16));
+  const randomHex = () => hex(crypto.getRandomValues(new Uint8Array(16)));
+  const sha256 = async bytes => hex(await subtle.digest('SHA-256', bytes));
+  const hmacKey = raw => subtle.importKey('raw', raw, {name: 'HMAC', hash: 'SHA-256'}, false, ['sign']);
+  const hmac = async (key, text) => new Uint8Array(await subtle.sign('HMAC', key, encoder.encode(text)));
+  const hex32 = /^[0-9a-f]{32}$/;
+  const boot = (() => {
+    try {
+      const value = JSON.parse(byId('manage-bootstrap').textContent);
+      if (value.version !== 1 || !/^http:\/\/127\.0\.0\.1:\d+$/.test(value.origin) || !/^[0-9a-f]{64}$/.test(value.bootstrap_key)) return null;
+      return value;
+    } catch (_) { return null; }
+  })();
+  let bootKey = null;
+  let session = null;
+  let helloPending = null;
+  const identityError = () => Object.assign(new Error('identity'), {identity: true});
+  const hello = async () => {
+    if (!boot) throw identityError();
+    bootKey = bootKey || await hmacKey(fromHex(boot.bootstrap_key));
+    const nc = randomHex();
+    const body = JSON.stringify({version: 1, client_nonce: nc});
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 10000);
+    let reply;
+    try {
+      const response = await fetch(boot.origin + '/api/hello', {method: 'POST', headers: {'Content-Type': 'application/json', 'Accept': 'application/json'}, body, cache: 'no-store', credentials: 'omit', referrerPolicy: 'no-referrer', signal: controller.signal});
+      if (!response.ok) throw identityError();
+      reply = JSON.parse(decoder.decode(await response.arrayBuffer()));
+    } catch (error) { throw error.identity ? error : Object.assign(new Error('offline'), {offline: true}); } finally { clearTimeout(timer); }
+    if (!reply || reply.version !== 1 || reply.origin !== boot.origin || reply.client_nonce !== nc || !hex32.test(reply.epoch) || !hex32.test(reply.session_id) || !hex32.test(reply.server_nonce) || typeof reply.proof !== 'string') throw identityError();
+    const context = ['1', reply.origin, reply.epoch, reply.session_id, nc, reply.server_nonce].join('\n');
+    if (hex(await hmac(bootKey, 'qd-server-v1\n' + context)) !== reply.proof) throw identityError();
+    return {id: reply.session_id, epoch: reply.epoch, key: await hmacKey(await hmac(bootKey, 'qd-session-v1\n' + context))};
+  };
+  const ensureSession = async () => {
+    if (session) return session;
+    helloPending = helloPending || hello().finally(() => { helloPending = null; });
+    session = await helloPending;
+    return session;
+  };
+  const signedFetch = async (method, path, text) => {
+    const used = await ensureSession();
+    const nonce = randomHex();
+    const raw = encoder.encode(text);
+    const mac = hex(await hmac(used.key, ['qd-request-v1', used.epoch, nonce, method, path, await sha256(raw)].join('\n')));
+    const headers = {'Accept': 'application/json', 'Content-Type': 'application/json', 'X-QD-Session': used.id, 'X-QD-Nonce': nonce, 'X-QD-MAC': mac};
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 10000);
     try {
-      const headers = {'Accept': 'application/json'};
-      if (token) headers.Authorization = `Bearer ${token}`;
-      if (body !== undefined) headers['Content-Type'] = 'application/json';
-      const response = await fetch(path, {method: body === undefined ? 'GET' : 'POST', headers, body: body === undefined ? undefined : JSON.stringify(body), cache: 'no-store', credentials: 'omit', referrerPolicy: 'no-referrer', signal: controller.signal});
-      if (!response.ok) {
-        const error = new Error('request'); error.status = response.status; throw error;
-      }
-      return await response.json();
-    } finally { clearTimeout(timer); }
+      const response = await fetch(boot.origin + path, {method, headers, body: method === 'POST' ? text : undefined, cache: 'no-store', credentials: 'omit', referrerPolicy: 'no-referrer', signal: controller.signal});
+      const bytes = new Uint8Array(await response.arrayBuffer());
+      const expected = hex(await hmac(used.key, ['qd-response-v1', used.epoch, nonce, String(response.status), await sha256(bytes)].join('\n')));
+      const verified = response.headers.get('X-QD-MAC') === expected;
+      return {used, status: response.status, ok: response.ok, verified, bytes};
+    } catch (_) { throw Object.assign(new Error('offline'), {offline: true}); } finally { clearTimeout(timer); }
+  };
+  // GET may transparently re-hello once after a restart or evicted session. A POST
+  // is sent once; any uncertain outcome is reconciled by reading, never replayed.
+  const api = async (path, body) => {
+    const method = body === undefined ? 'GET' : 'POST';
+    const text = body === undefined ? '' : JSON.stringify(body);
+    for (let attempt = 0; ; attempt++) {
+      const reply = await signedFetch(method, path, text);
+      if (reply.verified && reply.ok) return JSON.parse(decoder.decode(reply.bytes));
+      // The message of an unverified response is never trusted; 401 only means reset the session.
+      if (reply.status === 401 || !reply.verified) { if (session === reply.used) session = null; }
+      if (reply.verified) throw Object.assign(new Error('request'), {status: reply.status});
+      if (method === 'GET' && reply.status === 401 && attempt === 0) continue;
+      throw identityError();
+    }
   };
   const applyState = state => {
     if (!state || state.schema !== 1 || !state.pending || typeof state.busy !== 'boolean' || typeof state.writable !== 'boolean') throw new Error('schema');
@@ -397,9 +457,18 @@
     clearSecrets();
     current = state; synchronized = true;
     const pending = state.pending.present;
-    byId('carrier-status').textContent = state.writable ? '独立管理通道 · 已由启动者确认' : '只读 / 写入受限';
-    const reasons = {independent_carrier_required: '只读：启动时未确认独立管理通道。请使用独立路线重新启动 manage --independent-carrier。', reconciliation_required: '上次操作结果需要核对，请检查终端并保留原操作记录。', busy: '模块正在执行原操作，暂时禁止新变更。', pending: '原操作待恢复；用下方恢复按钮核对原操作，不能开始新变更。', insufficient_session_time: cutoffText()};
-    byId('write-reason').textContent = expiresAt - Date.now() < 1230000 ? cutoffText() : String(reasons[state.writable_reason] || state.writable_reason || (state.writable ? '管理路线在启动时选定，页面不能更改。独立性由操作者确认，不是自动探测。' : '未具备写入条件，请检查启动终端的独立 SSH 通道与会话剩余时间。'));
+    const carrier = state.carrier;
+    const reason = state.writable_reason;
+    byId('session-status').textContent = '本机后台服务已连接';
+    byId('time-note').textContent = '后台服务常驻运行，关闭终端或页面不会停止它；刷新或重新打开此文件会自动重新认证。单项操作最长等待 20 分钟。此页不检测节点在线状态。';
+    const direct = carrier && carrier.configured && carrier.mode === 'direct';
+    byId('carrier-status').textContent = reason === 'carrier_invalid' ? '独立 SSH 通道配置损坏或无法读取'
+      : reason === 'carrier_not_configured' || (carrier && !carrier.configured) ? '独立 SSH 通道未配置'
+      : direct ? '直接SSH已配置（远端连接尚未验证）'
+      : reason === 'carrier_listener_down' || (carrier && carrier.configured && !carrier.listening) ? '独立 SSH 通道已配置，但当前不可用'
+      : state.writable || (carrier && carrier.listening) ? '独立 SSH 通道已配置并可用' : '独立 SSH 通道：写入受其他状态限制';
+    const reasons = {carrier_invalid: '只读：独立 SSH 通道配置损坏或无法读取（不是未配置）。资料仍可查看，修改已禁用；请修复或重新设置通道配置。', carrier_not_configured: '只读：尚未配置独立 SSH 通道。订阅和资料可查看，新增、改名、重置、删除已禁用。', carrier_listener_down: '只读：独立 SSH 通道已配置，但本机监听未运行。资料可查看，修改已禁用；通道恢复后点击“重新连接并核对”。', independent_carrier_required: '只读：尚未配置独立 SSH 通道。资料可查看，修改已禁用。', invalid_source: '已提交资料来源无效，修改已禁用。', reconciliation_required: '上次操作结果需要核对，请保留原操作记录并点击核对。', busy: '模块正在执行原操作，暂时禁止新变更。', pending: '原操作待恢复；用下方恢复按钮核对原操作，不能开始新变更。'};
+    byId('write-reason').textContent = String(reasons[reason] || reason || (state.writable ? '可提交变更；独立通道由操作者配置，页面不能更改。' : '未具备写入条件。'));
     if (pending) {
       jobMessage(`原操作尚待核对（${String(state.pending.mode || '未知类型')}）。凭据已隐藏。请用独立 SSH 通道显式恢复原操作，不要重新新增、重置或删除。`);
       byId('state-note').textContent = '存在 pending；不展示候选或旧凭据。';
@@ -416,50 +485,48 @@
       byId('endpoint').textContent = String(meta.endpoint || '未记录');
       byId('state-note').textContent = devices.length ? '已提交的原生资料；不是实时连通性判断。' : '权威已提交名册为空。';
     } else {
-      byId('state-note').textContent = state.busy ? '模块忙，暂未提供资料。请稍后核对；不是空名册。' : '已提交资料不可用。请检查管理终端与备份，不会显示候选凭据。';
+      byId('state-note').textContent = state.busy ? '模块忙，暂未提供资料。请稍后核对；不是空名册。' : '已提交资料不可用。请检查后台服务与备份，不会显示候选凭据。';
     }
     if (unresolved && state.last_job && state.last_job.request_id === unresolved.request_id) unresolved = null;
     updateControls();
   };
   const handleReadError = error => {
-    if (error.status === 401 || error.status === 403 || error.status === 410) { expire(); return; }
+    if (error.identity || error.offline) { disconnect(error.identity ? '无法验证后台服务身份（密钥或响应签名不符）。连接资料已隐藏，这不是空设备列表。' : offlineText); return; }
     synchronized = false; clearSecrets(); updateControls();
-    errorPanel('无法核对管理状态，连接资料已隐藏。点击“核对已提交状态”读取原任务/状态；不会自动重发变更。');
+    errorPanel('无法核对管理状态，连接资料已隐藏。点击“重新连接并核对”读取原任务/状态；不会自动重发变更。');
   };
   const refreshState = async () => {
-    if (!token) return;
     try {
       const state = await api('/api/state');
-      if (!token) return;
       applyState(state); errorPanel('');
       noteJob(state.last_job);
-      if (unresolved) jobMessage(`上次提交的“${operationText(submitted.get(unresolved.request_id))}”响应丢失，尚未找到匹配任务。禁止再次变更；请保持终端并核对该操作。此按钮只读取状态，不重发 POST。`);
+      if (unresolved) jobMessage(`上次提交的“${operationText(submitted.get(unresolved.request_id))}”响应丢失，尚未找到匹配任务。禁止再次变更；请核对该操作。此按钮只读取状态，不重发 POST。`);
       if (state.last_job && (state.last_job.state === 'running' || (activeJob && state.last_job.job_id === activeJob))) startPolling(state.last_job.job_id);
       return state;
     } catch (error) { handleReadError(error); }
   };
   const outcomes = {
     committed: '原生变更已提交，正在读取新代次资料。',
-    committed_export_failed: '原生变更已经提交；本地便利导出失败。请检查终端并修复导出，不要重做此操作。',
+    committed_export_failed: '原生变更已经提交；本地便利导出失败。请检查后台服务日志并修复导出，不要重做此操作。',
     rolled_back: '已回滚，正在核对已提交状态。',
     recovery_required: '结果需要恢复核对。不要重复提交变更。',
-    rejected: '被拒绝；请核对当前状态和终端提示，不会自动重试。',
+    rejected: '被拒绝；请核对当前状态和任务结果，不会自动重试。',
     unchanged: '未更改已提交状态。'
   };
   const pollJob = async () => {
     const id = activeJob;
-    if (!token || !id) return;
+    if (!id) return;
     if (++pollCount > 610 || Date.now() - pollStarted > 1220000) {
-      jobMessage('已达到 20 分钟观察上限。任务未被重复提交，请核对原任务/终端。');
+      jobMessage('已达到 20 分钟观察上限。任务未被重复提交，请核对原任务状态。');
       synchronized = false; clearSecrets(); updateControls(); return;
     }
     try {
       const job = await api(`/api/jobs/${encodeURIComponent(id)}`);
-      if (!token || activeJob !== id) return;
+      if (activeJob !== id) return;
       noteJob({job_id: id, ...job});
       const ctx = jobContext.get(id);
       if (job.state === 'running') {
-        jobMessage(`${operationText(ctx, true)} · 已用 ${Math.floor(Number(job.elapsed_s) || 0)} 秒（超时上限 20 分钟）。请勿关闭启动终端或重复提交。`);
+        jobMessage(`${operationText(ctx, true)} · 已用 ${Math.floor(Number(job.elapsed_s) || 0)} 秒（超时上限 20 分钟）。请勿重复提交，可随时查看任务状态。`);
         pollTimer = setTimeout(pollJob, 2000); return;
       }
       if (job.state !== 'finished' || !outcomes[job.outcome]) throw new Error('job');
@@ -471,7 +538,7 @@
       updateControls();
     } catch (error) {
       handleReadError(error);
-      if (token) jobMessage(`任务状态读取中断。“${operationText(jobContext.get(id))}”可能仍在执行；点击核对状态查看该任务，禁止重复提交。`);
+      jobMessage(`任务状态读取中断。“${operationText(jobContext.get(id))}”可能仍在执行；点击核对状态查看该任务，禁止重复提交。`);
     }
   };
   const startPolling = id => {
@@ -483,20 +550,35 @@
   };
   const requestID = () => [...crypto.getRandomValues(new Uint8Array(16))].map(byte => byte.toString(16).padStart(2, '0')).join('');
   const submit = async (path, payload) => {
-    if (submitting || activeJob || !token) return;
-    submitting = true; unresolved = payload; updateControls();
+    if (submitting || activeJob) return;
+    submitting = true; updateControls();
+    // A signed GET first: it may silently re-hello (stale/evicted session) and proves the
+    // payload still applies. Nothing has been sent as a mutation yet, so a failure here
+    // keeps the form and leaves no unresolved request.
+    const refuse = text => {
+      if (byId('edit-dialog').open) byId('edit-error').textContent = text; else jobMessage(text);
+      submitting = false; updateControls();
+    };
+    try {
+      const fresh = await api('/api/state');
+      const pending = fresh && fresh.pending;
+      if (!fresh || fresh.schema !== 1 || !pending || fresh.busy || !(fresh.writable || (payload.expected_operation_id && fresh.writable_reason === 'pending'))) { refuse('后台服务当前不允许提交（忙、只读或待核对）。操作未发送；请点击“重新连接并核对”。'); return; }
+      if (payload.expected_operation_id ? !pending.present || pending.operation_id !== payload.expected_operation_id : pending.present || fresh.generation !== payload.expected_generation) { refuse('已提交状态已变化。操作未发送；请取消后核对最新状态。'); return; }
+    } catch (error) {
+      refuse(error.identity ? '无法验证后台服务身份。操作未发送。' : error.offline ? '后台服务未运行。操作未发送，表单已保留，服务恢复后可再次提交。' : '无法核对当前状态。操作未发送。');
+      return;
+    }
+    unresolved = payload;
     submitted.set(payload.request_id, payload.action ? {action: payload.action, names: payload.names} : {action: 'recover', names: []});
     if (byId('edit-dialog').open) byId('edit-dialog').close();
     jobMessage(`正在提交一次“${operationText(submitted.get(payload.request_id), true)}”；确认结果前不会重复发送。`);
     try {
       const job = await api(path, payload);
-      if (!token) return;
       if (!job || typeof job.job_id !== 'string') throw new Error('job');
       unresolved = null; noteJob({...job, request_id: payload.request_id}); startPolling(job.job_id);
     } catch (error) {
       // A failed HTTP status is an explicit rejection; a lost response is unknown.
       if (error.status) unresolved = null;
-      if ([401, 403, 410].includes(error.status)) { expire(); return; }
       synchronized = false;
       jobMessage(error.status === 409 ? '状态已变化、忙或写入被拒绝。请核对最新代次；不会自动重试。' : '提交结果尚未确认。只读取原任务/已提交状态，不会再次 POST。');
       await refreshState();
@@ -556,36 +638,15 @@
   });
   byId('device-search').addEventListener('input', renderDevices);
   byId('device-list').addEventListener('click', updateControls);
-  byId('refresh-state').addEventListener('click', refreshState);
-  const tick = () => {
-    if (!token) return;
-    const remaining = Math.max(0, Math.ceil((expiresAt - Date.now()) / 1000));
-    if (!remaining) { expire(); return; }
-    byId('session-status').textContent = `本机会话 · 剩余 ${Math.ceil(remaining / 60)} 分钟`;
-    byId('time-note').textContent = timeNote();
-    updateControls();
-    if (remaining < 1230) byId('write-reason').textContent = cutoffText();
-    expiryTimer = setTimeout(tick, 1000);
-  };
+  // Periodic verified reads notice a restarted or recovered service; the page itself never expires.
   const observeState = async () => {
-    if (!token) return;
     if (!activeJob && !submitting && !byId('edit-dialog').open) await refreshState();
-    if (token) stateTimer = setTimeout(observeState, 30000);
+    stateTimer = setTimeout(observeState, 30000);
   };
-  window.addEventListener('pagehide', () => expire('请重新打开 vps/index.html 进入本机会话。'));
+  byId('refresh-state').addEventListener('click', () => { session = null; refreshState(); });
   const connect = async () => {
-    const launchToken = location.hash.slice(1);
-    history.replaceState(null, '', location.pathname); // Clear capability before any network request.
-    if (!launchToken || !/^http:\/\/127\.0\.0\.1:\d+$/.test(location.origin)) {
-      expire('请先运行 bash vps/manage.sh，再重新打开 vps/index.html 并点击进入。刷新此页不会自动恢复认证，也不是空设备列表。'); return;
-    }
-    try {
-      const session = await api('/api/session', {launch_token: launchToken});
-      if (typeof session.token !== 'string' || !session.token || !Number.isFinite(session.expires_in) || session.expires_in <= 0) throw new Error('session');
-      token = session.token; expiresAt = Date.now() + Math.min(session.expires_in, 2700) * 1000;
-      tick(); await refreshState();
-      if (token) stateTimer = setTimeout(observeState, 30000);
-    } catch (_) { expire('无法进入本机会话。请检查启动终端，重新打开 vps/index.html；会话过期时需重新启动 manage。'); }
+    await refreshState();
+    stateTimer = setTimeout(observeState, 30000);
   };
   connect();
 })();
