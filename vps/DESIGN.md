@@ -325,6 +325,15 @@ queued/pending响应（即使committed为true）也不会清本地pending或导�
 replace继续轮换该归档名册全部UUID及Reality、保留其SubID/策略；restore保留该归档全部身份，
 两者都不访问或撤销旧节点。设备管理没有另建PKI或自动清理历史凭据。
 
+## 在新电脑连接已有节点（connect）
+
+`connect --ssh` 以服务器为唯一事实来源：先 `connect-info` 取 owner/machine_id/node_id/endpoint/config，再 `connect-pull`
+拉取一份当前的标准完整归档（不调用 `backup`，不停前端），本地用不变的 `inspect_backup`、`validate_outputs`
+（含 Mihomo 格式门）和 `remember_commit` 提交，因此 `state.json` 是最后一步。两个远程动作只在这两个精确 action 下
+把 host.py 原字节与公开的 `connect_read.py` 作为非 main 模块执行，传输仍是 `vps.remote`（严格 known_hosts、不复制密钥）。
+不读 `domain.txt`、不生成随机 owner；已有绑定仅在 owner/config/endpoint/machine_id/node_id 一致时刷新，
+旧记录无 node_id 时若旧归档仍可用才核对，缺失不阻止恢复。读取是乐观的：并发变更导致拒绝重试，而非停机。
+
 ## 备份、冷替换与恢复边界
 
 每次部署公开前及 `backup` 都把恢复集取回管理PC：一致、关闭且独立于 WAL/SHM 的

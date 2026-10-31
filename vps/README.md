@@ -58,7 +58,7 @@ bash vps/setup.sh deploy --ssh "$VPS_SSH" \
 
 SSH 默认直连。任一远程命令末尾可显式追加
 `--ssh-proxy socks5://127.0.0.1:10808` 或 `--ssh-proxy http://127.0.0.1:10808`（本地 HTTP CONNECT）；
-支持 deploy/preflight/replace/restore、status/backup/recover 及所有 devices 子命令，export 仅本地、不接受此参数。
+支持 connect、deploy/preflight/replace/restore、status/backup/recover 及所有 devices 子命令，export 仅本地、不接受此参数。
 使用随仓库附带的 Python 标准库助手，无需 nc；仅接受字面量127.0.0.1和端口1..65535，拒绝密码、其他 URL 部分和任意命令。
 参数仅本次有效，不保存中转端口、不采用环境变量/GUI/SSH配置中的代理，失败不退回直连；原 VPS 地址、SSH端口及严格主机密钥校验不变。
 已有 current 可省略 --ssh；恢复只使用原 pending 目标与操作ID，换中转不改变事务身份。
@@ -263,6 +263,15 @@ Clash/self-proxy 导入原 `.urls.json` 中自己的远程URL，确认保存为 
 reset 有意撤销旧 SubID，旧 URL无法经 FEED 或 DIRECT发现新秘密URL，必须重新导入；rename保留URL，replace保留SubID但仍依赖新端点/DNS可达。
 
 ## 设备与钥匙
+
+换了新电脑、克隆仓库后要管理**已有** VPS：先 connect（只读取服务器当前状态，不改服务器、密钥或账户，不需要旧电脑的任何文件；新机器须已有该 VPS 的 SSH 授权并已信任其主机密钥）：
+
+```bash
+bash vps/setup.sh connect --ssh "$VPS_SSH"
+```
+
+可选参数：`--identity KEY`、`--port PORT`（仅 SSH 端口）、`--ssh-proxy URL`、`--mihomo BIN`。输出只含端点、设备数和私有路径。需要本机有原生 Mihomo；若服务器正在变更会干净地拒绝，重试即可。
+状态目录已属于另一个部署时拒绝，请改用 `--state-dir`。之后用下面的 devices 命令。Web 管理页是可选项，不会被任何命令自动安装。
 
 以下是独立操作示例，按需选择，不要整块执行。名字以小写字母开头，仅含小写字母/数字/短横线，最长32字符：
 

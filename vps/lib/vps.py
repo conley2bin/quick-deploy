@@ -223,7 +223,7 @@ def state_document(state, args, create=False):
         configuration(args, document['config'])
         return document
     if not create:
-        raise host.Error('No 3x-ui state; deploy first, or restore with --backup and explicit --ssh')
+        raise host.Error('No 3x-ui state. Existing VPS: setup.sh connect --ssh root@IP. New VPS: setup.sh deploy --ssh root@IP')
     return {'format': host.FORMAT, 'owner': str(uuid.uuid4()), 'config': configuration(args), 'current': None,
             'previous': [], 'backup': None}
 
@@ -332,12 +332,34 @@ def target_record(args, current=None):
     return record
 
 
+CONNECT_ACTIONS = ('connect-info', 'connect-pull')
+# Original host bytes and the public reader run as non-main modules; the reader
+# receives the host module and owns the action. No host.py main() is entered.
+CONNECT_BOOTSTRAP = """import base64,sys,types,zlib
+def load(name,packed):
+    m=types.ModuleType(name);sys.modules[name]=m
+    exec(compile(zlib.decompress(base64.b64decode(packed)),"<string>","exec"),m.__dict__)
+    return m
+h=load("qd_host",%s);r=load("qd_connect_read",%s)
+try:
+    r.main(h,sys.argv[1],sys.stdin.buffer,sys.stdout.buffer)
+except h.Error as e:
+    sys.exit(str(e))
+except Exception as e:
+    sys.exit("connect reader failed: "+type(e).__name__)"""
+
+
+def packed_source(name):
+    return base64.b64encode(zlib.compress((MODULE / 'lib' / name).read_bytes(), 9)).decode('ascii')
+
+
 def remote_command(record, action):
     # Pack PUBLIC adapter bytes only. Linux limits each argv string to roughly
     # 128KiB even when total ARG_MAX is larger. Private payloads stay on stdin.
-    source = (MODULE / 'lib/host.py').read_bytes()
-    packed = base64.b64encode(zlib.compress(source, 9)).decode('ascii')
-    bootstrap = 'import base64,zlib;exec(compile(zlib.decompress(base64.b64decode(' + repr(packed) + ')),"<string>","exec"))'
+    if action in CONNECT_ACTIONS:
+        bootstrap = CONNECT_BOOTSTRAP % (repr(packed_source('host.py')), repr(packed_source('connect_read.py')))
+    else:
+        bootstrap = 'import base64,zlib;exec(compile(zlib.decompress(base64.b64decode(' + repr(packed_source('host.py')) + ')),"<string>","exec"))'
     prefix = '' if record['user'] == 'root' else 'sudo -n '
     command = prefix + 'env QD_SSH_CONNECTION="$SSH_CONNECTION" python3 -c ' + shlex.quote(bootstrap) + ' ' + shlex.quote(action)
     if len(command.encode()) >= 120 * 1024:
@@ -1582,6 +1604,12 @@ def parser():
     a.add_argument('--edge-ip', help='invocation-only public IPv4 verification preference; must appear in every fresh authoritative CF answer; not a persistent profile pin')
     a.add_argument('--mihomo', help='supported native Mihomo v1.19.32 executable')
     a.add_argument('--ssh-proxy', type=proxy_argument, help='independent explicit loopback SSH carrier; default direct')
+    a = sub.add_parser('connect', help='attach this machine to an EXISTING managed VPS over SSH; reads the live server, changes nothing there')
+    a.add_argument('--ssh', required=True, help='user@public-IPv4 or verified SSH alias; strict known_hosts, no key copying')
+    a.add_argument('--identity', type=Path)
+    a.add_argument('--port', type=int, help='SSH port ONLY')
+    a.add_argument('--ssh-proxy', type=proxy_argument, help='invocation-only socks5://127.0.0.1:PORT or http://127.0.0.1:PORT; default direct')
+    a.add_argument('--mihomo', help='native core executable for profile validation')
     a = sub.add_parser('devices', help='manage manifest-owned device credentials')
     operations = a.add_subparsers(dest='device_action', required=True)
     listing = operations.add_parser('list', help='names/enabled status only, no credentials')
@@ -1621,6 +1649,10 @@ def main(argv=None):
                     raise host.Error('Management options require --device and --bootstrap-dir')
                 if args.management_port is not None and (not args.management_interface or not 1 <= args.management_port <= 65535):
                     raise host.Error('--management-port requires --management-interface and port1..65535')
+            if args.command == 'connect':
+                import connect  # lazy: connect works on this module, not a second import of it
+                connect.run(sys.modules[__name__], state, args)
+                return 0
             if args.command == 'restore' and not args.backup:
                 raise host.Error('Controlled restore requires an explicit --backup and --ssh')
             if args.command == 'restore' and not (state / 'state.json').exists():
