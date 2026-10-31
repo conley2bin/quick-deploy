@@ -560,6 +560,9 @@
       submitting = false; updateControls();
     };
     try {
+      // A brand-new session per mutation: a long-lived page may hold a session near the server's
+      // per-session nonce cap, which would drop it between the preflight GET and the POST.
+      session = await hello();
       const fresh = await api('/api/state');
       const pending = fresh && fresh.pending;
       if (!fresh || fresh.schema !== 1 || !pending || fresh.busy || !(fresh.writable || (payload.expected_operation_id && fresh.writable_reason === 'pending'))) { refuse('后台服务当前不允许提交（忙、只读或待核对）。操作未发送；请点击“重新连接并核对”。'); return; }

@@ -69,7 +69,7 @@ async function harness(options={}) {
     const want=hm(ks,['qd-request-v1',server.epoch,nonce,request.method,path,sha(Buffer.from(rawBody))].join('\n')).toString('hex');
     assert.equal(request.headers['X-QD-MAC'],want,'request MAC covers exact method/path/raw body');
     assert.ok(!server.seen.has(sid+nonce),'nonce never reused');server.seen.add(sid+nonce);
-    const parsed=rawBody?JSON.parse(rawBody):undefined;requests.push({path,method:request.method,body:parsed,raw:rawBody});
+    const parsed=rawBody?JSON.parse(rawBody):undefined;requests.push({path,method:request.method,body:parsed,raw:rawBody,sid});
     let status=200,reply;
     if(path==='/api/state')reply=structuredClone(state);
     else if(request.method==='POST'){
@@ -138,7 +138,7 @@ checks.push('pending wipes credential DOM and QR; explicit recovery references o
 const l=await harness();l.failPost=true;await l.get('add-device').emit('click');l.get('edit-name').value='gamma';await l.get('edit-form').emit('submit');await l.get('refresh-state').emit('click');assert.equal(l.requests.filter(r=>r.path==='/api/jobs').length,1);assert.equal(l.get('add-device').disabled,true);assert.match(l.get('job-status').textContent,/响应丢失/);
 checks.push('lost POST response is never retried and blocks new mutations until original job reconciliation');
 const e=await harness();await e.get('add-device').emit('click');e.get('edit-name').value='gamma';await e.get('edit-form').emit('submit');e.mode='committed_export_failed';e.state.last_job=null;await e.poll();assert.match(e.get('job-status').textContent,/已经提交/);assert.equal(e.requests.filter(r=>r.path==='/api/jobs').length,1);
-e.server.sessions.clear();e.server.epoch='f'.repeat(32);await e.get('refresh-state').emit('click');assert.equal(e.get('subscription-links').childElementCount,2,'silent re-hello after service restart restores view');assert.equal(e.server.hellos,2);assert.equal(e.requests.filter(r=>r.path==='/api/jobs').length,1);
+e.server.sessions.clear();e.server.epoch='f'.repeat(32);await e.get('refresh-state').emit('click');assert.equal(e.get('subscription-links').childElementCount,2,'silent re-hello after service restart restores view');assert.equal(e.server.hellos,3,'initial, per-mutation, and post-restart hello');assert.equal(e.requests.filter(r=>r.path==='/api/jobs').length,1);
 checks.push('postcommit export failure remains committed; service restart silently re-authenticates with a fresh hello');
 const ro=await harness({readonly:'carrier_not_configured'});assert.match(ro.get('write-reason').textContent,/尚未配置独立 SSH 通道/);assert.equal(ro.get('carrier-status').textContent,'独立 SSH 通道未配置');assert.equal(ro.get('session-status').textContent,'本机后台服务已连接');assert.equal(ro.get('add-device').disabled,true);assert.equal(ro.get('subscription-links').children.length,2);
 const inv=await harness({readonly:'carrier_invalid'});assert.match(inv.get('carrier-status').textContent,/损坏或无法读取/);assert.doesNotMatch(inv.get('carrier-status').textContent,/未配置/);assert.equal(inv.get('subscription-links').children.length,2);assert.equal(inv.get('add-device').disabled,true);
@@ -205,6 +205,13 @@ checks.push('recover echoes backend-provided opaque operation_id verbatim for an
   const idx=x.requests.findLastIndex(r=>r.path==='/api/jobs');assert.equal(x.requests[idx-1].path,'/api/state','signed GET precedes the POST');
   assert.equal(x.get('edit-dialog').open,false);assert.match(x.get('job-status').textContent,/重置设备 alpha/);
   await x.poll();x.mode='committed';x.state.last_job=null;await x.poll();assert.equal(x.get('add-device').disabled,false,'not stuck unresolved');
+  // Every mutation POST is preceded by a fresh hello (new SID) and a signed state GET, even if the old SID is still valid.
+  const w=await harness();const oldSid=[...w.server.sessions.keys()][0];await w.get('rename-device').emit('click');w.get('edit-name').value='renamed';await w.get('edit-form').emit('submit');
+  const trace=w.requests.map(r=>r.path),pi=trace.lastIndexOf('/api/jobs');
+  assert.deepEqual(trace.slice(pi-2,pi+1),['/api/hello','/api/state','/api/jobs']);assert.equal(w.server.hellos,2);assert.ok(w.server.sessions.has(oldSid),'old SID still valid');
+  assert.notEqual(w.requests[pi].sid,oldSid);
+  const pr=await harness();pr.state={...pr.state,pending:{present:true,mode:'devices',operation_id:'OP'},model:null,writable:false,writable_reason:'pending'};await pr.get('refresh-state').emit('click');
+  await pr.get('recover-operation').emit('click');const tr=pr.requests.map(r=>r.path),ri=tr.lastIndexOf('/api/recover');assert.deepEqual(tr.slice(ri-2,ri+1),['/api/hello','/api/state','/api/recover']);
   // Offline preflight keeps the form, sends nothing, leaves nothing unresolved; later retry succeeds.
   const o=await harness();await o.get('add-device').emit('click');o.get('edit-name').value='gamma';o.server.offline=true;await o.get('edit-form').emit('submit');
   assert.equal(o.get('edit-dialog').open,true);assert.equal(o.get('edit-name').value,'gamma');assert.match(o.get('edit-error').textContent,/未发送/);assert.equal(o.requests.filter(r=>r.path==='/api/jobs').length,0);
