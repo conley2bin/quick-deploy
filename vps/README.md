@@ -271,7 +271,7 @@ bash vps/setup.sh connect --ssh "$VPS_SSH"
 ```
 
 可选参数：`--identity KEY`、`--port PORT`（仅 SSH 端口）、`--ssh-proxy URL`、`--mihomo BIN`。输出只含端点、设备数和私有路径。需要本机有原生 Mihomo；若服务器正在变更会干净地拒绝，重试即可。
-状态目录已属于另一个部署时拒绝，请改用 `--state-dir`。之后用下面的 devices 命令。Web 管理页是可选项，不会被任何命令自动安装。
+状态目录已属于另一个部署时拒绝，请改用 `--state-dir`。之后用下面的 devices 命令。connect 及以下 CLI 命令不会安装或启动 Web 管理；manage.sh 仍是可选网页启动器，纯 CLI 流程无需运行。
 
 以下是独立操作示例，按需选择，不要整块执行。名字以小写字母开头，仅含小写字母/数字/短横线，最长32字符：
 
