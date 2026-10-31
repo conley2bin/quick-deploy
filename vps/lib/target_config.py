@@ -1,4 +1,4 @@
-"""Plain, editable VPS target + base domain file (MODULE/config.txt).
+"""Plain, editable VPS target + base domain file (MODULE/config).
 
 Two ASCII `KEY=value` lines (VPS_SSH, DOMAIN). Nothing is sourced, expanded, resolved or connected to.
 Blank lines and whole-line `#` comments are tolerated. No secrets belong in this public file.
@@ -7,7 +7,7 @@ import re
 
 import host
 
-FILE_NAME = 'config.txt'
+FILE_NAME = 'config'
 KEYS = ('VPS_SSH', 'DOMAIN')
 MAX_BYTES = 4096
 # user@host or a verified OpenSSH alias / public IPv4 literal; never a command, port, URL or option.

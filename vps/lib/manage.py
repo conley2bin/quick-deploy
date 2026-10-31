@@ -283,6 +283,7 @@ class ManagementServer:
         self.last_job = None
         self.unknown = False
         self.launcher = None
+        self.target = None  # public startup binding {target, endpoint, ssh_port}; frozen by bind_target(), None when unknown
         self.session_lock = os.open(self.jobs_dir / '.session.lock',
                                     os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
         try:
@@ -482,6 +483,20 @@ class ManagementServer:
             self.unknown |= record.get('unknown', False)
             self.last_job = job['job_id']
 
+    def bind_target(self):
+        """Freeze the committed node this manager was started for (after the startup connect). Public fields only:
+        never machine_id/owner/keys, and later state changes cannot move it. A truly absent state.json (old/test paths)
+        leaves target None; an unreadable or recordless one is an error, not a silent 'legacy' manager."""
+        path = self.state / 'state.json'
+        if not os.path.lexists(path):
+            return
+        current = self.vps.load(path).get('current')
+        if not (isinstance(current, dict) and isinstance(current.get('target'), str) and isinstance(current.get('endpoint'), str)
+                and isinstance(current.get('user'), str) and type(current.get('port')) is int):
+            raise self.vps.host.Error('state.json has no valid committed node record; refusing to start a manager without a target binding')
+        self.target = {'target': current['target'], 'endpoint': current['endpoint'], 'ssh_user': current['user'],
+                       'ssh_port': current['port']}
+
     def timing(self):
         return {'job_limit_s': JOB_SECONDS, 'cleanup_margin_s': CLEANUP_MARGIN}
 
@@ -541,6 +556,7 @@ class ManagementServer:
                                 'listening': carrier is None,
                                 'mode': 'direct' if carrier is None and route is None else
                                 'proxy' if route else None},
+                    'target': self.target,
                     'generation': source.get('generation_after'), 'pending': pending,
                     **self.timing(),
                     'busy': busy or source.get('error', {}).get('code') == 'busy',
@@ -837,6 +853,7 @@ def run_foreground(vps, state, runtime_carrier, ready, prepare=None, mihomo=None
     try:
         if prepare is not None:
             prepare()
+        manager.bind_target()
         launcher = manager.write_launcher()
         for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):  # HUP: terminal closed
             old[sig] = signal.signal(sig, lambda *_: manager.stopping.set())

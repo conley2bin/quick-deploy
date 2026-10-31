@@ -54,7 +54,7 @@ class Local(unittest.TestCase):
                     argv += ['--domain', self.config['domain'], '--reality-target', self.config['reality_target'],
                              '--acme-email', self.config['acme_email']]
                 elif case[0] == 'replace':
-                    # Existing deployment: saved domain stated explicitly; the config.txt DOMAIN default would require migration.
+                    # Existing deployment: saved domain stated explicitly; the config DOMAIN default would require migration.
                     argv += ['--domain', self.config['domain']]
                 elif case[0] == 'restore':
                     # Fresh local restore gets its configuration from the archive.

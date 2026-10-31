@@ -187,7 +187,7 @@ class SourceUpdate(unittest.TestCase):
 
     def test_digest_tracks_code_not_private_files(self):
         base = ms.code_digest(self.module)
-        for name in ('index.html', 'config.txt', 'subscription-urls.json'):
+        for name in ('index.html', 'config', 'subscription-urls.json'):
             (self.module / name).write_text('x')
         self.assertEqual(ms.code_digest(self.module), base)
         asset = self.module / 'assets/manage.js'

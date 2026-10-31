@@ -213,7 +213,7 @@ def state_document(state, args, create=False):
         configuration(args, document['config'])
         return document
     if not create:
-        raise host.Error('No 3x-ui state. Existing VPS: bash vps/manage.sh (reads VPS_SSH from config.txt). New VPS: setup.sh deploy --ssh root@IP')
+        raise host.Error('No 3x-ui state. Existing VPS: bash vps/manage.sh (reads VPS_SSH from config). New VPS: setup.sh deploy --ssh root@IP')
     return {'format': host.FORMAT, 'owner': str(uuid.uuid4()), 'config': configuration(args), 'current': None,
             'previous': [], 'backup': None}
 
@@ -1307,7 +1307,7 @@ def _cdn(state, document, args):
           'Choose SELF-cdn explicitly when desired; no desktop selection was changed.')
 
 
-DIFFERENT_CONFIGURED_VPS = ('The target (config.txt VPS_SSH or --ssh) is a different host than this state directory\'s deployed node; '
+DIFFERENT_CONFIGURED_VPS = ('The target (config VPS_SSH or --ssh) is a different host than this state directory\'s deployed node; '
                             'fix VPS_SSH, use another --state-dir for a new VPS, or use replace; never silently retarget')
 
 
@@ -1570,7 +1570,7 @@ def parser(deployment_only=False):
             a.add_argument('--ssh-proxy', type=proxy_argument,
                            help='invocation-only socks5://127.0.0.1:PORT or http://127.0.0.1:PORT; default direct')
         if name in ('deploy', 'replace', 'restore', 'preflight'):
-            a.add_argument('--ssh', required=name == 'restore', help='trusted SSH alias or user@public-IPv4; default VPS_SSH from config.txt (restore: always explicit); otherwise saved current')
+            a.add_argument('--ssh', required=name == 'restore', help='trusted SSH alias or user@public-IPv4; default VPS_SSH from config (restore: always explicit); otherwise saved current')
             a.add_argument('--port', type=int, help='SSH port ONLY; otherwise use verified SSH config')
             a.add_argument('--proxy-port', type=int, help='first setup REALITY listener; default443, saved once')
             a.add_argument('--identity', type=Path)
@@ -1595,7 +1595,7 @@ def parser(deployment_only=False):
         if name == 'restore':
             a.set_defaults(backup_required=True)
     a = sub.add_parser('cdn', help='add verified Cloudflare/XHTTP; retain REALITY on a separate TCP port and unchanged H2')
-    a.add_argument('--domain', dest='cdn_domain', help='new CDN hostname; default cdn.<base> from config.txt DOMAIN; subscription domain remains unchanged')
+    a.add_argument('--domain', dest='cdn_domain', help='new CDN hostname; default cdn.<base> from config DOMAIN; subscription domain remains unchanged')
     a.add_argument('--reality-port', type=int, default=9443, help='retained REALITY TCP port; default9443, no automatic fallback')
     a.add_argument('--interface', required=True, help='explicit local physical Linux interface for isolated direct-underlay probes')
     a.add_argument('--dns-server', required=True, help='independently verified zone-authoritative Cloudflare NS public IPv4; queries require AA and bypass recursive gray-answer caches')

@@ -1,6 +1,6 @@
-# Deployment config (`vps/config.txt`)
+# Deployment config (`vps/config`)
 
-`vps/config.txt` is the one plain, editable file for the VPS target and the public base domain. It replaces the
+`vps/config` is the one plain, editable file for the VPS target and the public base domain. It replaces the
 former one-line `vps/domain.txt` (removed; there is no fallback to it):
 
 ```

@@ -204,13 +204,13 @@ bash vps/manage.sh dashboard --device phone --output-dir "$HOME/.local/state/qui
 ## 本机设备管理页（manage）
 
 日常先运行 `manage.sh`，再点击终端打印的私有页面链接（即私有文件 `vps/index.html`）：它是自包含的管理应用（内嵌脚本与样式，不是跳转页），含**管理密钥，请勿分享、上传或提交**（0600、已被 Git 忽略）。
-先在 `vps/config.txt` 填 `VPS_SSH`、`DOMAIN`，`bash vps/setup.sh deploy` 部署（setup 只管部署），之后只需一条命令：
+先在 `vps/config` 填 `VPS_SSH`、`DOMAIN`，`bash vps/setup.sh deploy` 部署（setup 只管部署），之后只需一条命令：
 
 ```bash
 bash vps/manage.sh
 ```
 
-它是**前台**程序：先自动 `connect` 读取 `config.txt` 里的 VPS 当前设备，再启动本机签名管理服务，并在终端打印可点击的 `管理页面: file:///…/vps/index.html`（OSC 8 链接，同时是纯文本地址，不含密钥；不会自动打开浏览器）。保持该窗口运行；页面在脚本运行期间可用、刷新有效、无固定时限；Ctrl+C（或关闭终端）停止服务，页面随之不可用。不安装 systemd 服务，也没有 install/start/stop。
+它是**前台**程序：先自动 `connect` 读取 `config` 里的 VPS 当前设备，再启动本机签名管理服务，并在终端打印可点击的 `管理页面: file:///…/vps/index.html`（OSC 8 链接，同时是纯文本地址，不含密钥；不会自动打开浏览器）。保持该窗口运行；页面在脚本运行期间可用、刷新有效、无固定时限；Ctrl+C（或关闭终端）停止服务，页面随之不可用。不安装 systemd 服务，也没有 install/start/stop。重复启动会验证已有同目标前台会话并重新显示原页面链接；原窗口负责生命周期，不会再次连接/重复执行任务；不同目标/旧后台服务会明确提示。
 默认不指定 SSH 代理；这不证明系统 TUN 实际走向，管理路径应独立于受管核心，目标是否可达由你负责；如需代理，用 `--ssh-proxy URL`，并在确认其独立于所有受管 VPS 条目后加 `--independent-carrier`，否则页面只读。本地有未完成事务（pending）时不会连接 VPS，只提供恢复，需显式恢复。
 也可直接用命令行：`manage.sh devices list|add|rename|reset|remove NAME…`、`export`、`status`、`backup`、`recover`（除 recover 外都会先自动 connect）。
 
@@ -272,7 +272,7 @@ reset 有意撤销旧 SubID，旧 URL无法经 FEED 或 DIRECT发现新秘密URL
 
 ## 设备与钥匙
 
-换了新电脑、克隆仓库后要管理**已有** VPS：不需要旧电脑的任何文件，也没有单独的 connect 步骤。`manage.sh` 的每个命令（`recover` 除外）都会先按 `vps/config.txt` 的 `VPS_SSH` 自动 connect：只读取服务器当前状态，不改服务器、密钥或账户（新机器须已有该 VPS 的 SSH 授权并已信任其主机密钥）：
+换了新电脑、克隆仓库后要管理**已有** VPS：不需要旧电脑的任何文件，也没有单独的 connect 步骤。`manage.sh` 的每个命令（`recover` 除外）都会先按 `vps/config` 的 `VPS_SSH` 自动 connect：只读取服务器当前状态，不改服务器、密钥或账户（新机器须已有该 VPS 的 SSH 授权并已信任其主机密钥）：
 
 ```bash
 bash vps/manage.sh status
@@ -306,7 +306,7 @@ bash vps/manage.sh export
 ```
 
 权威状态和完整备份位于 `~/.local/state/quick-deploy-private/vps`，不搬入仓库。
-成功提交/核对后自动更新忽略的0600 **[`vps/subscription-urls.json`](subscription-urls.json)**；export 本身只读已提交本地备份、不改 VPS；经 `manage.sh` 调用时会先自动 connect 刷新（有 pending 时跳过）。
+成功提交/核对后自动更新忽略的0600 **[`vps/subscription-urls.json`](subscription-urls.json)**；export 本身只读已提交本地备份、不改 VPS；经 `manage.sh` 调用时会先自动 connect 刷新（有 pending 时跳过）。subscription-urls.json仅可再生成导出副本，管理页/工作器不依赖；可删除，不撤销VPS账号或现有订阅；后续导出/设备变更可重建。
 备份为**明文 TAR**，另存加密离机副本；用最新撤销后备份，恢复旧档可能复活旧账户。
 `backup --mihomo /path/to/mihomo` 会保留所选路径供 recover 覆盖。完整归档不依赖 live feed 或本地核心：
 若离线配置捕获因 HWID/到期/缺核心等失败，仍保存已验证的当前节点备份、清除备份 pending，并非零返回

@@ -5,7 +5,7 @@ Its lifetime is the lifetime of the page.
 
 ## What it does
 1. Constructs `ManagementServer` on the fixed private port/key of `STATE/manage-service`: this takes the session flock and binds the port, so a second manager is refused before anything else happens.
-2. Then, via the `prepare` callback, reads `VPS_SSH` from `vps/config.txt` (or `--ssh TARGET`, which overrides it) and runs `vps.main --state-dir STATE connect --ssh TARGET [--identity] [--port] [--ssh-proxy] [--mihomo]`, which pulls the VPS's current native accounts. Skipped when `STATE/pending.json` exists: then it only serves the existing binding for explicit recovery. A failed connect aborts before anything is announced.
+2. Then, via the `prepare` callback, reads `VPS_SSH` from `vps/config` (or `--ssh TARGET`, which overrides it) and runs `vps.main --state-dir STATE connect --ssh TARGET [--identity] [--port] [--ssh-proxy] [--mihomo]`, which pulls the VPS's current native accounts. Skipped when `STATE/pending.json` exists: then it only serves the existing binding for explicit recovery. A failed connect aborts before anything is announced.
 3. After bind, entry file written and a signed hello+state succeeded, prints `管理页面: file:///…/vps/index.html` (OSC 8 hyperlink on a TTY, plain URI otherwise; no key, query or fragment).
 4. Waits. SIGINT, SIGTERM and SIGHUP (terminal closed) stop the API at once and release port and lock in `finally`.
 

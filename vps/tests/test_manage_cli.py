@@ -9,6 +9,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from unittest import mock
@@ -181,19 +182,364 @@ class ActiveJobStop(unittest.TestCase):
             self.assertFalse(ms.legacy_manager_active(child.state))
 
 
+TRIPLE = {'endpoint': '136.0.5.229', 'user': 'root', 'port': 22}
+REUSED_TEXT = '已在运行，复用现有管理页面'
+TARGET, ENDPOINT = 'root@136.0.5.229', '136.0.5.229'
+SECRET = 'machine-uuid-must-not-leak'
+
+
+def write_binding(state, target=TARGET, endpoint=ENDPOINT, port=22):
+    vps.host.atomic(state / 'state.json', json.dumps({'current': {
+        'target': target, 'endpoint': endpoint, 'port': port, 'machine_id': SECRET, 'user': 'root'}, 'owner': SECRET}))
+
+
 class SecondManager(unittest.TestCase):
-    def test_second_default_start_refuses_without_connecting(self):
+    def test_second_start_without_declared_target_refuses_without_connecting(self):
         with tempfile.TemporaryDirectory() as root:
-            first = Child(self, root)
+            first = Child(self, root)  # fake connect writes no state.json: nothing to bind
             first.wait_line('管理页面: ')
             out, err = io.StringIO(), io.StringIO()
-            with mock.patch.object(manage_cli.vps, 'main', return_value=0) as fake:
+            with mock.patch.object(manage_cli.vps, 'main', return_value=0) as fake, \
+                    mock.patch.object(manage_cli.vps, 'MODULE', first.repo / 'vps'):
                 code = manage_cli.main(['--state-dir', str(first.state)], out, err)
             self.assertEqual(code, 1)
             fake.assert_not_called()
             self.assertEqual(out.getvalue(), '')
             self.assertIn('manager_active', err.getvalue())
             self.assertIs(ms.query_state(first.state)['busy'], False)
+
+
+class Live(unittest.TestCase):
+    """A real foreground-mode ManagementServer (bound to the startup record, page written) plus repeat starts via manage_cli.main."""
+    def setUp(self, bind=True):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.root = Path(temp.name)
+        self.repo = private_repo(self.root)
+        self.state = self.root / 'state'
+        self.state.mkdir(mode=0o700)
+        manage_auth.ensure_state(self.state, self.repo, port=free_port())
+        write_binding(self.state)
+        patch = mock.patch.object(vps, 'MODULE', self.repo / 'vps')
+        patch.start()
+        self.addCleanup(patch.stop)
+        resolve = mock.patch.object(vps, 'target_record', return_value=TRIPLE)
+        self.resolve = resolve.start()
+        self.addCleanup(resolve.stop)
+        self.server = manage.ManagementServer(vps, self.state, runtime_carrier={'ssh_proxy': None, 'independent': True})
+        self.addCleanup(self.server.close)
+        if bind:
+            self.server.bind_target()
+        self.entry = self.server.write_launcher()
+        self.server._serving = True
+        thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(thread.join, 10)
+        self.addCleanup(self.server.httpd.shutdown)
+
+    def repeat(self, *argv):
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(manage_cli.vps, 'main', return_value=0) as fake, \
+                mock.patch.object(manage.ManagementServer, 'write_launcher', side_effect=AssertionError('launcher write')):
+            code = manage_cli.main(['--state-dir', str(self.state), *argv], out, err)
+        return code, fake, out.getvalue(), err.getvalue()
+
+
+class RepeatStart(Live):
+    def test_same_vps_reuses_link_without_connect_post_or_page_rewrite(self):
+        before = self.entry.read_bytes()
+        stat_before = os.stat(self.entry)
+        code, fake, out, err = self.repeat()
+        self.assertEqual((code, err), (0, ''))
+        fake.assert_not_called()
+        self.assertIn('管理页面: ' + self.entry.as_uri(), out)
+        self.assertIn('已在运行，复用现有管理页面；原终端负责生命周期', out)
+        self.assertIn('直连', out)
+        self.assertEqual(self.entry.read_bytes(), before)
+        self.assertEqual(os.stat(self.entry).st_mtime_ns, stat_before.st_mtime_ns)
+        self.assertEqual((self.server.jobs, self.server.worker), ({}, None))  # no admitted job
+        self.assertIs(ms.query_state(self.state)['busy'], False)  # owner unchanged and serving
+        self.assertFalse((self.state / 'manage-service/carrier.json').exists())
+
+    def test_explicit_ssh_equal_to_running_target_reuses(self):
+        code, fake, out, _ = self.repeat('--ssh', TARGET)
+        self.assertEqual(code, 0)
+        fake.assert_not_called()
+
+    def test_busy_manager_page_is_reused_but_nothing_is_refreshed(self):
+        gate = threading.Event()
+        job = {'job_id': 'a' * 32, 'request_id': 'b' * 32, 'state': 'running', 'started_at': time.time(),
+               '_started': time.monotonic(), 'elapsed_s': 0, 'deadline_s': 1200, 'generation_before': None,
+               'action': 'add', 'names': ['x']}
+        self.server.jobs[job['job_id']] = job
+        self.server.last_job = job['job_id']
+        self.server.worker = threading.Thread(target=gate.wait)
+        self.server.worker.start()
+        self.addCleanup(self.server.worker.join, 5)
+        self.addCleanup(gate.set)
+        snap = ms.query_state(self.state)
+        self.assertTrue(snap['busy'] and snap['model'] is None)
+        self.assertEqual(snap['target'], {'target': TARGET, 'endpoint': ENDPOINT, 'ssh_user': 'root', 'ssh_port': 22})  # binding survives busy
+        code, fake, out, _ = self.repeat()
+        self.assertEqual(code, 0)
+        fake.assert_not_called()
+        self.assertIn('管理页面: ' + self.entry.as_uri(), out)
+        self.assertIn('正在执行任务', out)
+        self.assertEqual(self.server.requests, {})
+
+    def test_signed_state_target_is_public_only(self):
+        snap = ms.query_state(self.state)
+        self.assertEqual(snap['target'], {'target': TARGET, 'endpoint': ENDPOINT, 'ssh_user': 'root', 'ssh_port': 22})
+        self.assertNotIn(SECRET, json.dumps(snap))
+
+    def test_different_vps_is_refused_with_both_targets_and_no_link(self):
+        self.resolve.return_value = dict(TRIPLE, endpoint='203.0.113.50')
+        code, fake, out, err = self.repeat('--ssh', 'ops@other-host')
+        self.assertEqual((code, out), (1, ''))
+        fake.assert_not_called()
+        for text in ('manager_active', TARGET, 'ops@other-host', '203.0.113.50', '新参数未应用', '不会替你关闭'):
+            self.assertIn(text, err)
+        self.assertIs(ms.query_state(self.state)['busy'], False)
+
+    def test_alias_resolving_to_the_same_triple_is_the_same_vps(self):
+        code, fake, out, err = self.repeat('--ssh', 'company-vps')  # different raw string, same endpoint/user/port
+        self.assertEqual((code, err), (0, ''))
+        fake.assert_not_called()
+        self.assertIn(self.entry.as_uri(), out)
+
+    def test_unresolvable_different_string_is_not_called_a_different_vps(self):
+        self.resolve.side_effect = vps.host.Error('no ssh')
+        code, _, out, err = self.repeat('--ssh', 'company-vps')
+        self.assertEqual((code, out), (1, ''))
+        self.assertIn('未确认同机', err)
+        self.assertNotIn('不是同一台', err)
+
+    def test_implicit_user_or_port_drift_and_explicit_port_are_refused(self):
+        self.resolve.return_value = dict(TRIPLE, port=2222)  # ~/.ssh/config now says Port 2222
+        code, _, out, err = self.repeat()
+        self.assertEqual((code, out), (1, ''))
+        self.assertIn('SSH 用户/端口', err)
+        self.resolve.return_value = dict(TRIPLE, user='ops')
+        code, _, out, err = self.repeat()
+        self.assertEqual((code, out), (1, ''))
+        self.assertIn('ops@', err)
+        self.resolve.return_value = dict(TRIPLE, port=2200)
+        code, _, out, err = self.repeat('--port', '2200')
+        self.assertEqual((code, out), (1, ''))
+        self.assertIn('2200', err)
+
+    def test_explicit_route_identity_or_mihomo_is_never_claimed_applied(self):
+        for argv in (['--ssh-proxy', 'socks5://127.0.0.1:1080'], ['--ssh-proxy', 'socks5://127.0.0.1:1080', '--independent-carrier'],
+                     ['--identity', '/tmp/id'], ['--mihomo', '/tmp/mihomo']):
+            with mock.patch.object(vps, 'resolve_mihomo', return_value='/abs/mihomo'):
+                code, fake, out, err = self.repeat(*argv)
+            self.assertEqual((code, out), (1, ''), argv)
+            fake.assert_not_called()
+            self.assertIn(argv[0], err)
+            self.assertIn('不能声称已生效', err)
+
+    def test_missing_or_foreign_page_file_is_rejected_without_a_dead_link(self):
+        original = self.entry.read_bytes()
+        self.entry.write_bytes(original.replace(self.server.bootstrap.hex().encode(), b'0' * 64))
+        os.chmod(self.entry, 0o600)
+        code, _, out, err = self.repeat()
+        self.assertEqual((code, out), (1, ''))
+        self.assertIn('缺失、损坏或不属于它', err)
+        self.entry.unlink()
+        code, _, out, err = self.repeat()
+        self.assertEqual((code, out), (1, ''))
+        self.assertIn('缺失、损坏或不属于它', err)
+        self.assertFalse(self.entry.exists())  # not regenerated
+
+    def test_wrong_key_fails_signature_check_and_sends_no_job_or_link(self):
+        key = self.state / 'manage-service/master.key'
+        key.write_bytes(b'\x01' * 32)  # the running server still holds the original master
+        code, fake, out, err = self.repeat()
+        self.assertEqual((code, out), (1, ''))
+        fake.assert_not_called()
+        self.assertIn('没有通过签名状态验证', err)
+        self.assertEqual(self.server.requests, {})
+
+    def test_config_error_surfaces_before_the_active_check(self):
+        (self.repo / 'vps/config').write_text('VPS_SSH=bad value\nDOMAIN=example.com\n')
+        code, _, out, err = self.repeat()
+        self.assertEqual((code, out), (1, ''))
+        self.assertIn('config', err)
+        self.assertNotIn('config.txt', err)
+
+
+class BindTarget(unittest.TestCase):
+    def server(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        state = Path(temp.name) / 'state'
+        state.mkdir(mode=0o700)
+        manage_auth.ensure_state(state, Path(temp.name), port=free_port())
+        server = manage.ManagementServer(vps, state, runtime_carrier={'ssh_proxy': None, 'independent': True})
+        self.addCleanup(server.close)
+        return server
+
+    def test_absent_state_is_an_unbound_legacy_path_not_an_error(self):
+        server = self.server()
+        server.bind_target()
+        self.assertIsNone(server.target)
+
+    def test_corrupt_or_recordless_state_fails_instead_of_pretending_legacy(self):
+        server = self.server()
+        (server.state / 'state.json').write_text('{not json')
+        os.chmod(server.state / 'state.json', 0o600)
+        with self.assertRaises(vps.host.Error):
+            server.bind_target()
+        vps.host.atomic(server.state / 'state.json', json.dumps({'current': None}))
+        with self.assertRaises(vps.host.Error):
+            server.bind_target()
+        write_binding(server.state)
+        server.bind_target()
+        self.assertEqual(server.target, {'target': TARGET, 'endpoint': ENDPOINT, 'ssh_user': 'root', 'ssh_port': 22})
+
+
+class LegacyOwner(Live):
+    """Managers that predate the signed `target` binding."""
+    def setUp(self):
+        super().setUp(bind=False)
+
+    def test_old_foreground_idle_is_reused_only_when_signed_endpoint_matches_the_state_record(self):
+        snap = ms.query_state(self.state)
+        self.assertIsNone(snap['target'])
+        self.assertEqual(snap['model']['snapshot']['endpoint'], ENDPOINT) if snap['model'] else None
+
+    def test_old_foreground_busy_has_no_endpoint_and_gets_actionable_old_version_error(self):
+        gate = threading.Event()
+        job = {'job_id': 'a' * 32, 'request_id': 'b' * 32, 'state': 'running', 'started_at': time.time(),
+               '_started': time.monotonic(), 'elapsed_s': 0, 'deadline_s': 1200, 'generation_before': None,
+               'action': 'add', 'names': ['x']}
+        self.server.jobs[job['job_id']] = job
+        self.server.last_job = job['job_id']
+        self.server.worker = threading.Thread(target=gate.wait)
+        self.server.worker.start()
+        self.addCleanup(self.server.worker.join, 5)
+        self.addCleanup(gate.set)
+        code, fake, out, err = self.repeat()
+        self.assertEqual((code, out), (1, ''))
+        fake.assert_not_called()
+        self.assertIn('旧版前台管理器', err)
+        self.assertIn('无法证明', err)
+
+    def test_old_foreground_idle_with_matching_signed_endpoint_and_record_reuses(self):
+        fake_model = {'snapshot': {'endpoint': ENDPOINT}, 'devices': []}
+        with mock.patch.object(manage, 'machine_execute', return_value={'pending': {'present': False}, 'model': fake_model,
+                                                                         'generation_after': None}):
+            code, fake, out, err = self.repeat()
+            self.assertEqual((code, err), (0, ''))
+            fake.assert_not_called()
+            self.assertIn('旧版管理器', out)
+            self.assertIn(self.entry.as_uri(), out)
+            write_binding(self.state, endpoint='203.0.113.9')  # record disagrees with the signed live endpoint
+            code, _, out, err = self.repeat()
+            self.assertEqual((code, out), (1, ''))
+            self.assertIn('无法证明', err)
+
+    def test_persistent_service_is_a_legacy_conflict_not_a_foreground_owner(self):
+        self.server.runtime_carrier = None  # persistent-mode service reports service_mode=persistent
+        code, fake, out, err = self.repeat()
+        self.assertEqual(code, 1)
+        fake.assert_not_called()
+        self.assertIn('legacy_service_conflict', err)
+        self.assertIn('没有“原终端”', err)
+        self.assertNotIn(REUSED_TEXT, out)
+        self.assertIn('旧版常驻服务页面', out)
+
+
+class UnverifiedHolder(unittest.TestCase):
+    """The lock is held but nothing signed answers: explicit diagnostic, no HTTP mutation, nothing killed/stolen/deleted."""
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.root = Path(temp.name)
+        self.repo = private_repo(self.root)
+        self.state = self.root / 'state'
+        self.state.mkdir(mode=0o700)
+        self.port = free_port()
+        manage_auth.ensure_state(self.state, self.repo, port=self.port)
+        jobs = self.state / 'manage-jobs'
+        jobs.mkdir(mode=0o700)
+        self.lock = os.open(jobs / '.session.lock', os.O_CREAT | os.O_RDWR, 0o600)
+        import fcntl
+        fcntl.flock(self.lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        self.addCleanup(os.close, self.lock)
+        patch = mock.patch.object(vps, 'MODULE', self.repo / 'vps')
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def listener(self, handler):
+        sock = socket.socket()
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind(('127.0.0.1', self.port))
+        sock.listen(4)
+        seen = []
+
+        def run():
+            sock.settimeout(8)
+            try:
+                while True:
+                    conn, _ = sock.accept()
+                    conn.settimeout(1)
+                    try:
+                        seen.append(conn.recv(4096).split(b' ', 2)[:2])
+                    except OSError:
+                        pass
+                    handler(conn)
+            except OSError:
+                pass
+        thread = threading.Thread(target=run, daemon=True)
+        thread.start()
+        self.addCleanup(thread.join, 10)
+        self.addCleanup(sock.close)
+        return seen
+
+    def check(self, phrase, seen=None):
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(manage_cli.vps, 'main', return_value=0) as fake:
+            code = manage_cli.main(['--state-dir', str(self.state)], out, err)
+        self.assertEqual((code, out.getvalue()), (1, ''))
+        fake.assert_not_called()
+        self.assertIn(phrase, err.getvalue())
+        self.assertIn('未终止进程、未接管锁、未删除文件', err.getvalue())
+        self.assertTrue((self.state / 'manage-jobs/.session.lock').exists())
+        if seen is not None:
+            self.assertTrue(all(item[0] == b'POST' and item[1] == b'/api/hello' or item[0] == b'GET' for item in seen), seen)  # read-only protocol
+
+    def test_nothing_listening(self):
+        self.check('管理端口未监听')
+
+    def test_unsigned_json_impostor_on_the_port(self):
+        def junk(conn):
+            conn.sendall(b'HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\n{}')
+            conn.close()
+        self.check('没有通过签名状态验证', self.listener(junk))
+
+    def test_hung_listener_times_out(self):
+        held = []
+        self.check('可能正在连接/启动（原终端尚未 ready），请稍后重试', self.listener(held.append))
+        for conn in held:
+            conn.close()
+
+
+class PendingBinding(unittest.TestCase):
+    def test_pending_skip_refuses_a_different_configured_target_but_serves_the_original(self):
+        with tempfile.TemporaryDirectory() as root:
+            state = Path(root)
+            write_binding(state)
+            (state / 'pending.json').write_text('{}')
+            args = manage_cli.parser().parse_args(['--ssh', 'ops@other-host'])
+            with mock.patch.object(manage_cli.vps, 'main') as fake, self.assertRaises(manage_cli.host.Error) as caught:
+                manage_cli.refresh(args, state, io.StringIO())
+            fake.assert_not_called()
+            self.assertIn(TARGET, str(caught.exception))
+            self.assertIn('ops@other-host', str(caught.exception))
+            err = io.StringIO()
+            self.assertFalse(manage_cli.refresh(manage_cli.parser().parse_args(['--ssh', TARGET]), state, err))
+            self.assertIn('显式恢复', err.getvalue())
 
 
 class Carrier(unittest.TestCase):
@@ -330,6 +676,12 @@ class Cli(unittest.TestCase):
         self.assertEqual(manage_cli.hyperlink(uri, False), uri)
         linked = manage_cli.hyperlink(uri, True)
         self.assertTrue(linked.startswith('\x1b]8;;' + uri + '\x1b\\') and uri + '\x1b]8;;\x1b\\' in linked)
+
+    def test_help_names_config_not_config_txt(self):
+        text = manage_cli.parser().format_help()
+        self.assertIn('config', text)
+        self.assertNotIn('config.txt', text)
+        self.assertNotIn('config.txt', (LIB / 'manage_cli.py').read_text())
 
     def test_no_open_is_ignored_and_no_service_or_opener_code(self):
         self.assertTrue(manage_cli.parser().parse_args(['--no-open']).no_open)

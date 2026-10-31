@@ -331,7 +331,7 @@ replace继续轮换该归档名册全部UUID及Reality、保留其SubID/策略�
 拉取一份当前的标准完整归档（不调用 `backup`，不停前端），本地用不变的 `inspect_backup`、`validate_outputs`
 （含 Mihomo 格式门）和 `remember_commit` 提交，因此 `state.json` 是最后一步。两个远程动作只在这两个精确 action 下
 把 host.py 原字节与公开的 `connect_read.py` 作为非 main 模块执行，传输仍是 `vps.remote`（严格 known_hosts、不复制密钥）。
-不读 `config.txt`（目标由 manage.sh 传入 `--ssh`）、不生成随机 owner；已有绑定仅在 owner/config/endpoint/machine_id/node_id 一致时刷新，
+不读 `config`（目标由 manage.sh 传入 `--ssh`）、不生成随机 owner；已有绑定仅在 owner/config/endpoint/machine_id/node_id 一致时刷新，
 旧记录无 node_id 时若旧归档仍可用才核对，缺失不阻止恢复。读取是乐观的：并发变更导致拒绝重试，而非停机。
 
 ## 备份、冷替换与恢复边界
@@ -633,4 +633,4 @@ no configuration or a down listener leaves committed subscriptions visible and d
 
 ## 前台管理（manage.sh）
 
-`manage.sh` 是前台程序：自动 `connect` 到 `config.txt` 的 `VPS_SSH`（pending 时跳过），启动同一套签名 ManagementServer，打印 `file://` 管理页面地址；运行期间可用，Ctrl+C/SIGTERM/SIGHUP 关闭。SSH 路径是调用期 `runtime_carrier`（默认直连并视为独立；代理须 `--independent-carrier`，否则只读），不读写 `carrier.json`。关闭时先停 API，活动原生任务有 20 秒完成回执，之后终止进程组并记为 `interrupted_unknown`，不重放。无 systemd 单元、无自动打开浏览器。详见 PERSISTENT-MANAGEMENT.md。
+`manage.sh` 是前台程序：自动 `connect` 到 `config` 的 `VPS_SSH`（pending 时跳过），启动同一套签名 ManagementServer，打印 `file://` 管理页面地址；运行期间可用，Ctrl+C/SIGTERM/SIGHUP 关闭。SSH 路径是调用期 `runtime_carrier`（默认直连并视为独立；代理须 `--independent-carrier`，否则只读），不读写 `carrier.json`。关闭时先停 API，活动原生任务有 20 秒完成回执，之后终止进程组并记为 `interrupted_unknown`，不重放。无 systemd 单元、无自动打开浏览器。详见 PERSISTENT-MANAGEMENT.md。

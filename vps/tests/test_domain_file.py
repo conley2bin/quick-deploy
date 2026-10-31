@@ -14,19 +14,19 @@ import vps
 
 class DomainFile(unittest.TestCase):
     def write(self, domain, ssh=b'root@136.0.5.229'):
-        """Temp module whose config.txt carries this DOMAIN (raw bytes, no newline added)."""
+        """Temp module whose config carries this DOMAIN (raw bytes, no newline added)."""
         module = Path(tempfile.mkdtemp())
-        (module / 'config.txt').write_bytes(b'VPS_SSH=' + ssh + b'\nDOMAIN=' + domain)
+        (module / 'config').write_bytes(b'VPS_SSH=' + ssh + b'\nDOMAIN=' + domain)
         return mock.patch.object(vps, 'MODULE', module)
 
     def write_raw(self, data):
         module = Path(tempfile.mkdtemp())
         if data is not None:
-            (module / 'config.txt').write_bytes(data)
+            (module / 'config').write_bytes(data)
         return mock.patch.object(vps, 'MODULE', module)
 
     def test_shipped_file_is_single_public_base(self):
-        self.assertEqual((vps.MODULE / 'config.txt').read_bytes(), b'VPS_SSH=root@136.0.5.229\nDOMAIN=conley2bin.com\n')
+        self.assertEqual((vps.MODULE / 'config').read_bytes(), b'VPS_SSH=root@136.0.5.229\nDOMAIN=conley2bin.com\n')
         self.assertFalse((vps.MODULE / 'domain.txt').exists())
         self.assertEqual(vps.default_ssh(), 'root@136.0.5.229')
         self.assertEqual(vps.default_domain('sub'), 'sub.conley2bin.com')
@@ -86,24 +86,24 @@ class DomainFile(unittest.TestCase):
     def test_default_ssh_ignores_domain_value_but_domain_ignores_ssh_value(self):
         import target_config
         module = Path(tempfile.mkdtemp())
-        (module / 'config.txt').write_bytes(b'VPS_SSH=root@1.2.3.4\nDOMAIN=https://bad\n')
+        (module / 'config').write_bytes(b'VPS_SSH=root@1.2.3.4\nDOMAIN=https://bad\n')
         self.assertEqual(target_config.default_ssh(module), 'root@1.2.3.4')
         self.assertEqual(vps.default_ssh(module), 'root@1.2.3.4')
         with self.assertRaises(host.Error):
             target_config.base_domain(module)
         with self.assertRaises(host.Error):
             target_config.read_config(module)
-        (module / 'config.txt').write_bytes(b'VPS_SSH=root@h:22\nDOMAIN=example.org\n')
+        (module / 'config').write_bytes(b'VPS_SSH=root@h:22\nDOMAIN=example.org\n')
         self.assertEqual(vps.base_domain(module), 'example.org')
         # a missing key or malformed line still fails either accessor
-        (module / 'config.txt').write_bytes(b'VPS_SSH=h\n')
+        (module / 'config').write_bytes(b'VPS_SSH=h\n')
         with self.assertRaises(host.Error):
             target_config.default_ssh(module)
 
     def test_target_config_contract(self):
         import target_config
         module = Path(tempfile.mkdtemp())
-        (module / 'config.txt').write_bytes(b'VPS_SSH=alias\nDOMAIN=Example.org\n')
+        (module / 'config').write_bytes(b'VPS_SSH=alias\nDOMAIN=Example.org\n')
         self.assertEqual(target_config.read_config(module), {'VPS_SSH': 'alias', 'DOMAIN': 'example.org'})
         self.assertEqual(target_config.default_ssh(module), 'alias')
         self.assertEqual(target_config.base_domain(module), 'example.org')
@@ -149,7 +149,7 @@ class DomainFile(unittest.TestCase):
                     self.assertEqual(vps.main(['--state-dir', tempfile.mkdtemp(), *command]), 1)
                     message = ''.join(c.args[0] for c in err.write.call_args_list)
                     self.assertNotIn('too long', message)
-                    self.assertIn('config.txt', message)
+                    self.assertIn('config', message)
 
     def test_too_long_derived_host_reports_length(self):
         base = '.'.join(['a' * 61] * 3 + ['b' * 60, 'org'])  # 250 chars, valid alone; sub.<base> exceeds 253
