@@ -26,8 +26,9 @@ DOMAIN=conley2bin.com
 | `restore` | never defaulted: `--ssh` is always explicit (a fresh host is dangerous) |
 
 - `--ssh` and `--domain` override independently, bypass the file (it may be missing or invalid) and never change it.
-- If the omitted-`--ssh` default resolves to a different endpoint than the deployed node, the command refuses before any SSH
-  (fix `VPS_SSH`, or use another `--state-dir` for a new VPS); it never silently retargets the old node.
+- For `deploy` and `preflight`, if the omitted-`--ssh` default resolves to a different endpoint than the deployed node, the command refuses before any SSH
+  (fix `VPS_SSH`, or use another `--state-dir` for a new VPS); it never silently retargets the old node. `replace` is the
+  command designed to move to a new node, so it is not subject to this refusal.
 - The REALITY target is separate (`--reality-target`) and not derived from this file.
 - A deployed node's saved config remains the authority. `status`, `export`, `devices`, `recover`, `backup` do not read
   `DOMAIN`, so editing it cannot change live links, certificates or accounts.

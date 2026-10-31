@@ -203,7 +203,7 @@ bash vps/manage.sh dashboard --device phone --output-dir "$HOME/.local/state/qui
 
 ## 本机设备管理页（manage）
 
-日常入口是点开私有文件 `vps/index.html`：它是自包含的管理应用（内嵌脚本与样式，不是跳转页），含**管理密钥，请勿分享、上传或提交**（0600、已被 Git 忽略）。
+日常先运行 `manage.sh`，再点击终端打印的私有页面链接（即私有文件 `vps/index.html`）：它是自包含的管理应用（内嵌脚本与样式，不是跳转页），含**管理密钥，请勿分享、上传或提交**（0600、已被 Git 忽略）。
 先在 `vps/config.txt` 填 `VPS_SSH`、`DOMAIN`，`bash vps/setup.sh deploy` 部署（setup 只管部署），之后只需一条命令：
 
 ```bash
@@ -211,7 +211,7 @@ bash vps/manage.sh
 ```
 
 它是**前台**程序：先自动 `connect` 读取 `config.txt` 里的 VPS 当前设备，再启动本机签名管理服务，并在终端打印可点击的 `管理页面: file:///…/vps/index.html`（OSC 8 链接，同时是纯文本地址，不含密钥；不会自动打开浏览器）。保持该窗口运行；页面在脚本运行期间可用、刷新有效、无固定时限；Ctrl+C（或关闭终端）停止服务，页面随之不可用。不安装 systemd 服务，也没有 install/start/stop。
-默认走直连 SSH（不会经过受管 VPS 自身，但目标是否可达由你负责）；如需代理，用 `--ssh-proxy URL`，并在确认其独立于所有受管 VPS 条目后加 `--independent-carrier`，否则页面只读。本地有未完成事务（pending）时不会连接 VPS，只提供恢复，需显式恢复。
+默认不指定 SSH 代理；这不证明系统 TUN 实际走向，管理路径应独立于受管核心，目标是否可达由你负责；如需代理，用 `--ssh-proxy URL`，并在确认其独立于所有受管 VPS 条目后加 `--independent-carrier`，否则页面只读。本地有未完成事务（pending）时不会连接 VPS，只提供恢复，需显式恢复。
 也可直接用命令行：`manage.sh devices list|add|rename|reset|remove NAME…`、`export`、`status`、`backup`、`recover`（除 recover 外都会先自动 connect）。
 
 - 刷新（F5）、重新打开文件和服务重启都无需再登录：页面从文件读取密钥，与服务做一次签名握手并**验证服务证明**后才发出任何 API 请求；没有 Cookie、sessionStorage、localStorage 或 URL 令牌，也没有 45 分钟到期。

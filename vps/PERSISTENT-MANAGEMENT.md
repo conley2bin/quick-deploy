@@ -11,7 +11,7 @@ Its lifetime is the lifetime of the page.
 
 ## SSH route
 The route is an invocation runtime parameter (`ManagementServer(runtime_carrier=…)`); `carrier.json` is not read or written and a historical one is not reused.
-- default: direct, acknowledged independent (it is not tunnelled through a managed entry; reachability of long jobs stays your responsibility);
+- default: no SSH proxy is specified. This does not prove where a system TUN actually routes it; the management path should be independent of the managed core, and reachability of long jobs stays your responsibility;
 - `--ssh-proxy URL`: used for connect and every job; the page is read-only (`independent_carrier_required`) unless `--independent-carrier` is also given. Proxy credentials are never persisted.
 `snapshot.service_mode` is `foreground` in this mode.
 
