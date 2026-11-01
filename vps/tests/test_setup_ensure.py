@@ -415,6 +415,18 @@ class Ensure(unittest.TestCase):
         self.assertEqual(self.calls, ['ensure-probe'])
         self.assertEqual(self.mutators['recover_local'].call_count, 1)
 
+    def test_unpublished_after_local_recovery_is_also_a_refusal(self):
+        self.save(self.document())
+        self.pend()
+        self.recover_effect = lambda state, document, mihomo: (state / 'pending.json').unlink()
+        self.probe_value = probe(kind='pending', health={'ok': False, 'failed_check': 'unpublished', 'error': None})
+        code, _, err = self.run_ensure()
+        self.assertEqual((code, self.calls, self.mutators['recover_local'].call_count), (1, ['ensure-probe'], 1))
+        self.assertIn('未发布但缺事务记录', err)
+        self.probe_value = probe(kind='pending', health={'ok': False, 'failed_check': 'busy', 'error': None})
+        self.pend()
+        self.assertEqual(self.run_ensure()[0], 75)
+
     def test_queued_local_recovery_returns_75_without_probe(self):
         self.save(self.document())
         self.pend()
@@ -439,6 +451,18 @@ class Ensure(unittest.TestCase):
                 code, _, err = self.run_ensure()
                 self.assertEqual((code, self.calls), (75, ['ensure-probe']))
                 self.assertIn(check, err)
+                self.assertNoMutation()
+
+    def test_unpublished_without_intent_is_a_refusal_not_a_retry(self):
+        for local in (False, True):
+            with self.subTest(local_state=local):
+                self.calls.clear()
+                if local:
+                    self.save(self.document())
+                self.probe_value = probe(kind='pending', health={'ok': False, 'failed_check': 'unpublished', 'error': None})
+                code, _, err = self.run_ensure()
+                self.assertEqual((code, self.calls), (1, ['ensure-probe']))
+                self.assertIn('未发布但缺事务记录，无法自动恢复，需检查原部署/备份', err)
                 self.assertNoMutation()
 
     def test_pending_without_state_document_is_refused(self):
@@ -509,14 +533,14 @@ class RealRepair(unittest.TestCase):
         (self.module / 'lib').symlink_to(REAL_MODULE / 'lib')
         (self.module / 'release-lock.json').symlink_to(REAL_MODULE / 'release-lock.json')
         (self.module / 'config').write_bytes(b'VPS_SSH=root@1.1.1.1\nDOMAIN=example.net\nREALITY_TARGET=www.python.org\n')
-        self.calls, self.repaired, self.fail_at = [], False, None
+        self.calls, self.repaired, self.fail_at, self.artifacts_dirs = [], False, None, []
         self.probe_value = probe(front_drift=True, transports=TRIPLE, tcp_cdn={'domain': 'cdn.example.net'},
                                  health={'ok': False, 'failed_check': 'front', 'error': 'Caddyfile drift'})
         self.manifest = dict(MANIFEST, endpoint='1.1.1.1', tcp_cdn={'schema': 1, 'domain': 'cdn.example.net', 'reality_port': 8443})
         stack = contextlib.ExitStack()
         self.addCleanup(stack.close)
         for name, value in (('MODULE', self.module), ('remote', self.remote), ('resolve_mihomo', lambda b=None: b or '/bin/mihomo'),
-                            ('artifacts', lambda *a, **k: self.tmp), ('upload_bundle', self.upload),
+                            ('artifacts', self.artifacts), ('upload_bundle', self.upload),
                             ('inspect_backup', self.inspect), ('checked_backup', lambda *a: self.manifest),
                             ('validate_outputs', self.validate), ('read_generation', lambda *a: {}), ('sync_outputs', lambda *a: None), ('export_after_commit', lambda state: None),
                             ('target_record', Ensure.target_record.__get__(self))):
@@ -524,6 +548,10 @@ class RealRepair(unittest.TestCase):
         stack.enter_context(mock.patch.object(host, 'cdn_enabled', return_value=True))
         stack.enter_context(mock.patch.object(setup_ensure, 'roster_digest', fake_digest))
         stack.enter_context(mock.patch.object(connect, 'run', side_effect=lambda *a: self.calls.append('attach')))
+
+    def artifacts(self, state, lock, directory=None):
+        self.artifacts_dirs.append(directory)
+        return self.tmp
 
     @contextlib.contextmanager
     def upload(self, request, folder=None, backup=None):
@@ -558,9 +586,9 @@ class RealRepair(unittest.TestCase):
             return None
         raise AssertionError('unexpected action ' + action)
 
-    def ensure(self):
+    def ensure(self, artifacts_dir=None):
         args = argparse.Namespace(ssh='root@1.1.1.1', domain='sub.example.net', reality_target='www.python.org',
-                                  mihomo=None, ssh_proxy=None, command='ensure', artifacts_dir=None, acme_email='',
+                                  mihomo=None, ssh_proxy=None, command='ensure', artifacts_dir=artifacts_dir, acme_email='',
                                   proxy_port=443)
         with mock.patch('sys.stdout', io.StringIO()), mock.patch('sys.stderr', io.StringIO()):
             return setup_ensure.run(vps, self.state, args)
@@ -573,6 +601,11 @@ class RealRepair(unittest.TestCase):
                          ('o1', 'm1', 'cdn.example.net'))
         self.assertTrue(Path(document['backup']).exists())
         self.assertFalse((self.state / 'pending.json').exists())
+
+    def test_artifacts_dir_reaches_the_pinned_file_verification_of_the_repair(self):
+        directory = self.tmp / 'releases'
+        self.assertEqual(self.ensure(directory), 0)
+        self.assertEqual(self.artifacts_dirs, [directory])
 
     def test_backup_failure_before_state_clears_only_its_own_tracking_and_reprobes_as_pending(self):
         self.fail_at = 'backup'
@@ -672,6 +705,18 @@ class SetupSurface(unittest.TestCase):
                     self.assertEqual(seen['state'], Path(state))
         code, seen = self.capture(['--ssh-proxy', 'socks5://127.0.0.1:1080'])
         self.assertIsNotNone(seen['args'].ssh_proxy)
+
+    def test_artifacts_dir_is_forwarded_and_bare_usage_is_unchanged(self):
+        code, seen = self.capture([])
+        self.assertIsNone(seen['args'].artifacts_dir)
+        for argv in (['--artifacts-dir', '/r/rel'], ['--mihomo', 'M', '--artifacts-dir=/r/rel'], ['ensure', '--artifacts-dir', '/r/rel']):
+            with self.subTest(argv):
+                code, seen = self.capture(argv)
+                self.assertEqual((code, seen['args'].command, seen['args'].artifacts_dir), (0, 'ensure', Path('/r/rel')))
+        self.assertEqual(setup_ensure.deploy_args(seen['args']).artifacts_dir, Path('/r/rel'))
+        with mock.patch('sys.stdout', io.StringIO()) as out:
+            vps.main(['--deployment-only', '--help'])
+        self.assertEqual(out.getvalue().count('--artifacts-dir'), 1)
 
     def test_explicit_old_verbs_keep_their_parsers(self):
         for verb in ('deploy', 'replace', 'restore', 'preflight', 'status', 'backup', 'recover', 'cdn'):

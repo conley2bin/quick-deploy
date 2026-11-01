@@ -1612,8 +1612,9 @@ def parser(deployment_only=False):
     a.add_argument('--state-dir', type=Path, default=argparse.SUPPRESS, help='same as the global option; either position works')
     a.add_argument('--mihomo', help='native core executable for profile validation')
     a.add_argument('--ssh-proxy', type=proxy_argument, help='invocation-only socks5://127.0.0.1:PORT or http://127.0.0.1:PORT; default direct')
+    a.add_argument('--artifacts-dir', type=Path, help='explicit directory containing all three original SHA-pinned release files')
     a.set_defaults(ssh=None, port=None, identity=None, domain=None, reality_target=None, acme_email=None, proxy_port=None,
-                   artifacts_dir=None, backup=None)
+                   backup=None)
     if deployment_only:
         return p
     a = sub.add_parser('connect', help='attach this machine to an EXISTING managed VPS over SSH; reads the live server, changes nothing there')
@@ -1648,6 +1649,7 @@ options:
   --mihomo PATH      native Mihomo executable used to validate profiles (default: verge-mihomo or mihomo on PATH)
   --ssh-proxy URL    invocation-only socks5://127.0.0.1:PORT or http://127.0.0.1:PORT; default direct
   --state-dir DIR    private local state (default ~/.local/state/quick-deploy-private/vps)
+  --artifacts-dir DIR  advanced: directory with the original SHA-pinned release files, when a pinned download is unavailable
 
 Advanced maintenance (not part of normal setup): bash vps/setup.sh {cdn,recover,status,replace,restore,backup,preflight,deploy} --help
 """

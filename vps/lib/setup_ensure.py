@@ -88,6 +88,13 @@ def why(probe):
     return ': '.join(part for part in (health.get('failed_check'), health.get('error')) if part) or '无详细原因'
 
 
+def refuse_unpublished(probe):
+    """The classifier reports `unpublished` only after finding no transaction intent marker: there is no timer or
+    transaction to wait for, so a rerun can never converge."""
+    if probe['kind'] == 'pending' and probe['health']['failed_check'] == 'unpublished':
+        raise host.Error('服务器节点未发布但缺事务记录，无法自动恢复，需检查原部署/备份；未做任何改动')
+
+
 def waiting(message):
     print('vps: ' + message, file=sys.stderr)
     return WAITING
@@ -297,6 +304,7 @@ def ensure(vps, state, args):
         document, recovered = load_document(vps, state), True
         record = vps.target_record(args, document['current'] if document else None)
     probe = checked_probe(vps.remote(record, 'ensure-probe', probe_request(vps, document, record)))
+    refuse_unpublished(probe)
     if recovered and probe['kind'] == 'pending':
         return waiting(f'恢复后服务器仍有事务进行中（{why(probe)}）；稍后重跑 setup.sh')
     return decide(vps, state, args, document, probe, record)

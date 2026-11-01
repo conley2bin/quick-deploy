@@ -35,11 +35,15 @@ server over SSH, read-only (the configured target is compared with the saved end
 - **nothing deployed (fresh machine)**: the existing full deployment (needs `REALITY_TARGET`).
 - **pending or busy**: a local pending transaction is recovered by the original recovery; a remote one is only reported
   (exit 75, retry later). Nothing is replayed or rolled back on your behalf.
-- **foreign owner/machine/node/config, or a broken runtime**: refuses with the concrete reason (exit 1).
+- **foreign owner/machine/node/config, or a broken runtime**: refuses with the concrete reason (exit 1). So does a server
+  node that is unpublished with no transaction record: there is nothing to wait for, inspect the original deployment/backup.
 
 It also refuses while a foreground `manage.sh` holds the same state directory. CDN is optional and is not added
 automatically; the run prints the `cdn` command to use. The explicit verbs below remain for advanced maintenance
 and cold recovery.
+
+One advanced exception: `bash vps/setup.sh --artifacts-dir DIR` passes a directory holding the original SHA-pinned release
+files (verified exactly as for `deploy --artifacts-dir`) when a pinned download is unavailable. No mirror or version fallback.
 
 ## Where it is used (explicit verbs)
 
