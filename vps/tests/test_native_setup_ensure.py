@@ -139,7 +139,7 @@ class NativeSetupEnsure(three.ThreeFixture, unittest.TestCase):
             'config': 'fixture public fake IP/DOMAIN/REALITY_TARGET; company config untouched'})
 
     def source_names(self):
-        return ['lib/' + n for n in ('host.py', 'vps.py', 'connect.py', 'connect_read.py', 'target_config.py')] + ['setup.sh']
+        return ['lib/' + n for n in ('host.py', 'vps.py', 'connect.py', 'connect_read.py', 'target_config.py', 'setup_ensure.py')] + ['setup.sh']
 
     def source_hashes(self):
         return {n: hashlib.sha256((self.real_module / n).read_bytes()).hexdigest() for n in self.source_names()}

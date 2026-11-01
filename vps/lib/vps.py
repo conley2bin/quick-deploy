@@ -168,8 +168,8 @@ def default_ssh(module=None):
     return target_config.default_ssh(MODULE if module is None else module)
 
 
-def default_domain(label):
-    base = base_domain()
+def default_domain(label, base=None):
+    base = base_domain() if base is None else base
     try:
         return host.hostname(f'{label}.{base}')
     except host.Error:
@@ -1706,7 +1706,7 @@ def main(argv=None):
                 configured_ssh = True
         if args.command == 'ensure':
             setup = target_config.read_setup(MODULE)  # fully validated before any directory, lock or remote work
-            args.ssh, args.domain, args.reality_target = setup['VPS_SSH'], default_domain('sub'), setup['REALITY_TARGET']
+            args.ssh, args.domain, args.reality_target = setup['VPS_SSH'], default_domain('sub', setup['DOMAIN']), setup['REALITY_TARGET']
         if args.command == 'cdn' and args.cdn_domain is None:
             args.cdn_domain = default_domain('cdn')
         with locked(state):

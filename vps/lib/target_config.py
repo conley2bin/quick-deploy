@@ -82,7 +82,7 @@ def base_domain(module):
 def read_setup(module):
     """Ensure's view: required fields plus REALITY_TARGET (None when absent), all fully validated."""
     values = _parse(module)
-    result = read_config(module)
+    result = {'VPS_SSH': ssh_target(values['VPS_SSH']), 'DOMAIN': domain_value(values['DOMAIN'])}
     target = values.get('REALITY_TARGET')
     if target is not None:
         try:

@@ -19,7 +19,21 @@ REALITY 迁移到选定的独立 TCP 端口并完整保留，H2 不受影响。
   两种传输可共用数字443；脚本不添加/清空防火墙规则，不修改 sshd/authorized_keys。
 - 自行验证支持 TLS1.3+h2 的 REALITY 目标域名；Hysteria2 使用订阅域名的正常受信任 TLS 证书，不跳过校验。
 
-## 1. 新 VPS 检查和部署
+## 0. 一条命令（默认）
+
+在 `vps/config` 填 `VPS_SSH`、`DOMAIN`（新机器另填已核验的 `REALITY_TARGET`，见 [CONFIG](CONFIG.md)），然后在仓库根目录运行：
+
+```bash
+bash vps/setup.sh
+```
+
+不需要选子命令。它先**只读**检查服务器，已有部分按状态处理：健康则 SKIP（不备份、不重启、不换密钥）；
+本地快照缺失/过期仅只读刷新；只有前端漂移或旧单传输节点才走原有受保护事务修复；全新机器走完整部署；
+pending/忙碌时恢复本地原事务或报告并退出码75（不重放、不回滚）；不属于本工具、配置不一致或运行异常则给出具体原因并拒绝。
+CDN 入口可选，不自动添加。以下具名命令（deploy/replace/restore/preflight/status/backup/recover/cdn）保留给高级维护和冷恢复，
+不是普通部署所需。
+
+## 1. 新 VPS 检查和部署（显式命令）
 
 以下命令在**仓库根目录**运行，把地址、域名换成自己的：
 
@@ -204,7 +218,7 @@ bash vps/manage.sh dashboard --device phone --output-dir "$HOME/.local/state/qui
 ## 本机设备管理页（manage）
 
 日常先运行 `manage.sh`，再点击终端打印的私有页面链接（即私有文件 `vps/index.html`）：它是自包含的管理应用（内嵌脚本与样式，不是跳转页），含**管理密钥，请勿分享、上传或提交**（0600、已被 Git 忽略）。
-先在 `vps/config` 填 `VPS_SSH`、`DOMAIN`，`bash vps/setup.sh deploy` 部署（setup 只管部署），之后只需一条命令：
+先在 `vps/config` 填 `VPS_SSH`、`DOMAIN`，`bash vps/setup.sh` 部署/检查（setup 只管部署），之后只需一条命令：
 
 ```bash
 bash vps/manage.sh

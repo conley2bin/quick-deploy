@@ -497,6 +497,14 @@ class SetupSurface(unittest.TestCase):
             with self.subTest(bad), self.assertRaises(host.Error):
                 target_config.read_setup(self.module(base + bad))
 
+    def test_ensure_reads_the_config_exactly_once(self):
+        module = self.module(b'VPS_SSH=root@h.example\nDOMAIN=example.org\nREALITY_TARGET=www.python.org\n')
+        with mock.patch.object(vps, 'MODULE', module), mock.patch.object(setup_ensure, 'run', lambda *a: 0), \
+             mock.patch.object(target_config, '_parse', wraps=target_config._parse) as parse, \
+             mock.patch('sys.stdout', io.StringIO()):
+            self.assertEqual(vps.main(['--deployment-only']), 0)
+        parse.assert_called_once()
+
     def test_existing_accessors_ignore_the_unused_target_value_but_not_structure(self):
         data = b'VPS_SSH=root@1.2.3.4\nDOMAIN=example.org\nREALITY_TARGET=not a host\n'
         module = self.module(data.replace(b'not a host', b'1.2.3.4'))

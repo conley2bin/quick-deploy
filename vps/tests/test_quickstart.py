@@ -29,6 +29,9 @@ class Quickstart(unittest.TestCase):
                         key, value = tokens[0].split('=', 1)
                         variables[key] = value
                     elif tokens[:2] == ['bash', 'vps/setup.sh']:
+                        if not tokens[2:]:  # bare setup.sh is the default ensure (public main maps it)
+                            self.assertTrue(filename == 'README.md')
+                            continue
                         args = vps.parser().parse_args(tokens[2:])
                         parsed.append(args)
                         if args.command in ('preflight', 'deploy') and args.domain:

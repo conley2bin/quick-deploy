@@ -162,6 +162,17 @@ FragmentPath/DropInPaths/SourcePath/运行时配置均检查；悬空/链接依�
 执行服务操作前再次核验，发现外来或未重载配置就拒绝，不删除override或依赖边来绕过。
 云防火墙由操作者审阅并开放所选入口。
 
+## 默认 setup：期望状态 ensure
+
+`setup.sh` 不带命令（或只带全局选项）= `ensure`，不是 `deploy` 的别名。顺序：配置目标与已提交绑定比较 →
+本地 pending 按原 `recover_local` 恢复 → 一次只读 `connect ensure-probe`（同一 SSH 固定/严格 known_hosts，
+请求不含秘密）→ 恰好一种结果：SKIP、只读刷新本地快照、既有 `deploy_existing`/`deploy`、拒绝。
+探针 `kind` 为 absent/owned_empty/pending/foreign/owned，owned 带原生名册 `roster_digest`（`connect_read` 中唯一共享算法）、
+版本及分阶段 health；仅 `front_drift` 可由既有事务修复，其余运行故障 rc1 并报告首个失败阶段，本轮不自动重启。
+健康时不 prepare/backup/commit/ctl/写 adapter。ensure 期间持有本地原生锁及 `manage-jobs/.session.lock`（非阻塞，不抢锁）。
+退出码：0 收敛、1 拒绝/不健康、75 等待。`REALITY_TARGET` 仅新装需要，已有节点以服务器为准，不一致则拒绝。
+具名命令保留用于高级维护/冷恢复。
+
 ## 其他运维命令
 
 首次检查/部署/换机的完整配方见 [README](README.md)。以下仍从仓库根目录运行：
