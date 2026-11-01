@@ -38,7 +38,8 @@ class Stream(io.BytesIO):
     pass
 
 
-class ConnectRead(unittest.TestCase):
+class Fixture:
+    """Synthetic owned host shared with test_ensure_probe."""
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(prefix='qd-connect-read-')
         self.addCleanup(self.tmp.cleanup)
@@ -137,6 +138,8 @@ class ConnectRead(unittest.TestCase):
             self.assertEqual((tree(self.root), tree(self.units)), before)
         self.assertEqual(os.listdir(self.scratch), [], 'scratch must be removed')
 
+
+class ConnectRead(Fixture, unittest.TestCase):
     # --- success -------------------------------------------------------------
     def test_info_fields_from_live_authority(self):
         self.out = Stream()

@@ -17,6 +17,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import sqlite3
 import ssl
@@ -28,6 +29,11 @@ SKIP_NAMES = ('logs', 'x-ui.db')
 SKIP_SUFFIXES = ('.db-wal', '.db-shm')
 # Native traffic/liveness counters move on every connection; nothing else may.
 COUNTERS = frozenset({'up', 'down', 'all_time', 'last_online', 'allTime', 'lastOnline'})
+# Same legacy/foreign proxy locations host.preflight refuses on a fresh server.
+LEGACY_PATHS = ('/var/lib/quick-deploy-vps', '/etc/x-ui', '/usr/local/x-ui', '/opt/3x-ui', '/etc/sing-box/config.json')
+# In-flight operation markers under ROOT: (relative path, failed_check).
+INTENTS = (('pending.json', 'pending'), ('backup-stop.json', 'backup_stop'), ('device-rollback/intent.json', 'device_intent'))
+SECRET_TEXT = re.compile(r'[A-Za-z][A-Za-z0-9+.-]*://\S+|[A-Za-z0-9_-]{16,}')
 TOP_FILES = ('manifest.json', 'release-lock.json', 'binary-hashes.json', 'Caddyfile')
 
 
@@ -272,11 +278,205 @@ def connect_pull(h, request, stdout):
         shutil.rmtree(scratch, ignore_errors=True)
 
 
+def roster_digest(accounts):
+    """Shared by the host probe and the client: credentials never leave the host."""
+    canonical = json.dumps(accounts, sort_keys=True, separators=(',', ':'), ensure_ascii=False)
+    return hashlib.sha256(canonical.encode('utf-8')).hexdigest()
+
+
+def safe_text(error):
+    """Host messages are curated, but native/API causes can quote ids, auth or feed URIs."""
+    return SECRET_TEXT.sub('<redacted>', str(error))[:240]
+
+
+def present(path):
+    try:
+        os.lstat(path)
+    except (FileNotFoundError, NotADirectoryError):
+        return False
+    return True
+
+
+class Classified(Exception):
+    def __init__(self, kind, check, error, **facts):
+        super().__init__(error)
+        self.kind, self.check, self.error, self.facts = kind, check, error, facts
+
+
+def probe_reply(kind, check=None, error=None, **facts):
+    reply = {'kind': kind, 'owner': None, 'machine_id': None, 'node_id': None, 'config': None, 'transports': [],
+             'tcp_cdn': None, 'versions': None, 'lock_match': False, 'adapter_sha256': None,
+             'health': {'ok': check is None, 'failed_check': check, 'error': error},
+             'front_drift': False, 'roster_digest': None}
+    reply.update(facts)
+    return reply
+
+
+def pending_intent(h, **facts):
+    for name, check in INTENTS:
+        if present(h.ROOT / name):
+            raise Classified('pending', check, 'Operation in flight or interrupted on host (' + name + ')', **facts)
+
+
+def absent_check(h):
+    """Genuinely undeployed means no owned root, legacy tree, unit name or listener on a required port."""
+    for path in LEGACY_PATHS:
+        if present(path):
+            raise Classified('foreign', 'legacy_path', 'Legacy/foreign proxy state detected at ' + path)
+    for name in h.UNIT_NAMES:
+        if present(h.UNITS / name):
+            raise Classified('foreign', 'unit_conflict', 'Foreign unit name present: ' + name)
+    ports = {str(p) for p in h.required_ports({'proxy_port': h.DEFAULT_PROXY_PORT})}
+    for flag in ('-ltn', '-lun'):
+        for line in h.run(['ss', '-H', flag], timeout=10).stdout.decode().splitlines():
+            columns = line.split()
+            if len(columns) < 4:
+                raise h.Error('Cannot parse listener inventory')
+            if columns[3].rsplit(':', 1)[-1] in ports:
+                raise Classified('foreign', 'listener', 'Required port ' + columns[3].rsplit(':', 1)[-1] + ' is already in use')
+
+
+def classify(h, request):
+    """Under the lock. Read-only; the only owned-storage reads are marker/manifest/health."""
+    root, active = h.ROOT, h.ROOT / 'active'
+    port = ssh_port(h, request)
+    if root.is_symlink():
+        raise Classified('foreign', 'root_link', 'Owned root is a symlink')
+    if not present(root):
+        absent_check(h)
+        return probe_reply('absent')
+    if not root.is_dir():
+        raise Classified('foreign', 'root_not_directory', 'State root is not a directory')
+    if not present(root / 'owner.json'):
+        raise Classified('foreign', 'unmarked_root', 'Unmarked state tree; never adopted implicitly')
+    try:
+        marker = h.read_json(root / 'owner.json')
+    except h.Error as exc:
+        raise Classified('foreign', 'marker', 'Owner marker unreadable') from exc
+    if (not isinstance(marker, dict) or set(marker) != {'format', 'owner', 'machine_id'} or marker['format'] != h.FORMAT or
+            not isinstance(marker['owner'], str) or not isinstance(marker['machine_id'], str)):
+        raise Classified('foreign', 'marker', 'Owner marker is not a recognized quick-deploy marker')
+    facts = {'owner': marker['owner'], 'machine_id': marker['machine_id']}
+    if marker['machine_id'] != h.machine_id():
+        raise Classified('foreign', 'machine', 'Owner marker belongs to a different machine', **facts)
+    pending_intent(h, **facts)
+    if not present(active):
+        return probe_reply('owned_empty', **facts)
+    if not present(active / 'manifest.json'):
+        raise Classified('foreign', 'active_tree', 'Active tree has no manifest', **facts)
+    try:
+        h.reject_symlinks(active)
+        manifest = h.read_json(active / 'manifest.json')
+        if manifest.get('format') != h.FORMAT or marker['owner'] != manifest.get('owner'):
+            raise Classified('foreign', 'owner_mismatch', 'Host owner marker disagrees with active manifest', **facts)
+        if manifest['endpoint'] != h.public_ip(request['endpoint']):
+            raise Classified('foreign', 'endpoint', 'Requested endpoint differs from deployment endpoint', **facts)
+        h.validate_config(manifest['config'])
+        if 'management' in manifest and manifest['management'] != {'ssh_port': port}:
+            raise Classified('foreign', 'management_port', 'Management SSH port differs from owned deployment', **facts)
+        facts.update(node_id=manifest['node_id'], config=manifest['config'], transports=h.transports(manifest),
+                     tcp_cdn={'schema': 1, 'domain': manifest['tcp_cdn']['domain']} if h.cdn_enabled(manifest) else None)
+        h.device_names(manifest)
+    except h.Error as exc:
+        raise Classified('foreign', 'manifest', safe_text(exc), **facts) from exc
+    try:
+        installed = h.regular_adapter_bytes(root / 'host.py')
+    except (OSError, h.Error) as exc:
+        raise Classified('foreign', 'adapter', 'Recovery adapter unreadable or not a regular file', **facts) from exc
+    installed_sha = hashlib.sha256(installed).hexdigest()
+    facts['adapter_sha256'] = installed_sha
+    if request.get('adapter_sha256') is not None and not h.accepted_adapter_digest(installed_sha, request['adapter_sha256']):
+        raise Classified('foreign', 'adapter', 'Unsupported installed adapter', **facts)
+    if not manifest['published']:
+        raise Classified('pending', 'unpublished', 'Deployment is not published', **facts)
+    return owned_health(h, request, active, manifest, facts)
+
+
+def owned_health(h, request, active, manifest, facts):
+    """Run the existing host checks in order; the first expected failure names the failed stage."""
+    state = {}
+
+    def release():
+        lock = h.read_json(active / 'release-lock.json')
+        try:
+            facts['versions'] = {k: lock[k]['version'] for k in ('panel', 'core', 'front')}
+        except (KeyError, TypeError) as exc:
+            raise h.Error('Malformed installed release lock') from exc
+        facts['lock_match'] = request.get('lock') is None or lock == request['lock']
+        state['lock'] = lock
+        if not facts['lock_match']:
+            raise h.Error('Installed release differs from the pinned release; explicit upgrade required')
+
+    def units():
+        for name, text in h.unit_texts().items():
+            path = h.UNITS / name
+            if path.is_symlink() or not path.is_file() or path.read_text() != text:
+                raise h.Error('Foreign, missing or modified owned unit; manual review required')
+
+    def native():
+        h.backend_health(active, manifest)  # feeds are validated and dropped, never returned
+        state['native'] = True
+
+    stages = (('release', release), ('artifacts', lambda: h.verify_artifacts(active / 'artifacts', state['lock'])),
+              ('binary', lambda: h.binary_health(active)), ('units', units), ('native', native),
+              ('tls', lambda: h.tls_probe(manifest)), ('process', h.process_health))
+    failed = error = None
+    for name, stage in stages:
+        try:
+            stage()
+        except (h.Error, OSError, sqlite3.Error) as exc:
+            # Expected runtime failures: host.Error plus raw TLS (ssl.SSLError is an
+            # OSError), socket, /proc and SQLite errors. Malformed data stays a crash.
+            failed = name
+            error = safe_text(exc) if isinstance(exc, h.Error) else type(exc).__name__ + ': ' + safe_text(getattr(exc, 'strerror', None) or exc.args)
+            break
+    accounts = manifest.get('accounts') if state.get('native') else None
+    if accounts is None:
+        try:
+            accounts = h.snapshot_accounts(active / 'db/x-ui.db', manifest)
+        except (h.Error, sqlite3.Error, OSError):
+            accounts = None
+    drift = False
+    if state.get('native'):
+        try:
+            drift = (active / 'Caddyfile').read_text() != h.caddyfile(manifest, manifest['published'])
+        except (OSError, UnicodeDecodeError):
+            if failed is None:
+                failed, error = 'front', 'Active Caddyfile unreadable'
+    return probe_reply('owned', failed, error, front_drift=drift,
+                       roster_digest=None if accounts is None else roster_digest(accounts), **facts)
+
+
+def ensure_probe(h, request):
+    """Read-only classification of the host for `setup.sh`; see the probe wire contract."""
+    os.umask(0o077)
+    stack = contextlib.ExitStack()
+    try:
+        try:
+            stack.enter_context(locked(h))
+        except h.Error as exc:
+            if not isinstance(exc.__cause__, BlockingIOError):
+                raise
+            try:
+                pending_intent(h)
+            except Classified as busy:
+                return probe_reply('pending', busy.check, busy.error)
+            return probe_reply('pending', 'busy', 'Managed host is busy with another operation')
+        with stack:
+            return classify(h, request)
+    except Classified as result:
+        return probe_reply(result.kind, result.check, result.error, **result.facts)
+    finally:
+        stack.close()
+
+
 def main(h, action, stdin, stdout):
     request = json.load(stdin)
     if action == 'connect-info':
         stdout.write(h.dumps(connect_info(h, request)).encode())
     elif action == 'connect-pull':
         connect_pull(h, request, stdout)
+    elif action == 'ensure-probe':
+        stdout.write(h.dumps(ensure_probe(h, request)).encode())
     else:
         raise h.Error('Unknown connect operation')
