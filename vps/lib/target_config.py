@@ -1,6 +1,7 @@
 """Plain, editable VPS target + base domain file (MODULE/config).
 
-Two ASCII `KEY=value` lines (VPS_SSH, DOMAIN). Nothing is sourced, expanded, resolved or connected to.
+Two required ASCII `KEY=value` lines (VPS_SSH, DOMAIN) and one optional REALITY_TARGET, read only by setup ensure.
+Nothing is sourced, expanded, resolved or connected to.
 Blank lines and whole-line `#` comments are tolerated. No secrets belong in this public file.
 """
 import re
@@ -9,6 +10,7 @@ import host
 
 FILE_NAME = 'config'
 KEYS = ('VPS_SSH', 'DOMAIN')
+OPTIONAL_KEYS = ('REALITY_TARGET',)
 MAX_BYTES = 4096
 # user@host or a verified OpenSSH alias / public IPv4 literal; never a command, port, URL or option.
 SSH_TARGET = re.compile(r'(?:[A-Za-z_][A-Za-z0-9_-]*@)?[A-Za-z0-9][A-Za-z0-9_.-]*')
@@ -49,7 +51,7 @@ def _parse(module):
         if not line or line.startswith('#'):
             continue
         key, sep, value = line.partition('=')
-        if not sep or key not in KEYS:
+        if not sep or key not in KEYS + OPTIONAL_KEYS:
             raise _fail(f'line {number} is not a known KEY=value')
         if key in values:
             raise _fail(f'duplicate {key}')
@@ -63,7 +65,7 @@ def _parse(module):
 
 
 def read_config(module):
-    """Both fields fully validated."""
+    """Both required fields fully validated; an optional REALITY_TARGET line is structurally checked but never judged here."""
     values = _parse(module)
     return {'VPS_SSH': ssh_target(values['VPS_SSH']), 'DOMAIN': domain_value(values['DOMAIN'])}
 
@@ -75,3 +77,18 @@ def default_ssh(module):
 
 def base_domain(module):
     return domain_value(_parse(module)['DOMAIN'])
+
+
+def read_setup(module):
+    """Ensure's view: required fields plus REALITY_TARGET (None when absent), all fully validated."""
+    values = _parse(module)
+    result = read_config(module)
+    target = values.get('REALITY_TARGET')
+    if target is not None:
+        try:
+            if target.rsplit('.', 1)[-1].isdigit():
+                raise host.Error('IP literal')
+            target = host.hostname(target)
+        except host.Error:
+            raise _fail('REALITY_TARGET must be a plain DNS hostname such as www.python.org') from None
+    return dict(result, REALITY_TARGET=target)

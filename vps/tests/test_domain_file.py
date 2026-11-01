@@ -232,13 +232,18 @@ class DomainFile(unittest.TestCase):
             vps.main(['--deployment-only', '--deployment-only', 'status'])
         with mock.patch('sys.stderr'), self.assertRaises(SystemExit):
             vps.main(['--state-dir', 'S', '--deployment-only', 'status'])
-        out = io.StringIO()
-        with mock.patch('sys.stdout', out), self.assertRaises(SystemExit):
-            vps.main(['--deployment-only', '--help'])
         for name in ('deploy', 'cdn', 'status', 'recover', 'restore', 'replace', 'backup', 'preflight'):
-            self.assertIn(name, out.getvalue())
+            out = io.StringIO()  # every explicit verb keeps its own help; the bare --help is the one-command help
+            with mock.patch('sys.stdout', out), self.assertRaises(SystemExit):
+                vps.main(['--deployment-only', name, '--help'])
+            self.assertIn('usage', out.getvalue())
+        out = io.StringIO()
+        with mock.patch('sys.stdout', out):
+            self.assertEqual(vps.main(['--deployment-only', '--help']), 0)
         for name in ('connect', 'devices', 'export', 'dashboard'):
             self.assertNotIn(name, out.getvalue())
+        for name in ('deploy', 'cdn', 'status', 'recover', 'restore', 'replace'):
+            self.assertIn(name, vps.parser(True).format_help())
         self.assertEqual(vps.parser(True).parse_args(['status']).command, 'status')
         self.assertEqual(vps.parser().parse_args(['devices', 'list']).command, 'devices')
         self.assertEqual(vps.parser().parse_args(['connect', '--ssh', 'x']).command, 'connect')

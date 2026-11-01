@@ -467,7 +467,7 @@ class Transport(unittest.TestCase):
             self.assertIn(vps.packed_source('connect_read.py'), command)
             self.assertLess(len(command.encode()), 120 * 1024)
         self.assertTrue(vps.remote_command(dict(self.record, user='ops'), 'connect-info').startswith('sudo -n env QD_SSH_CONNECTION='))
-        self.assertEqual(vps.CONNECT_ACTIONS, ('connect-info', 'connect-pull'))
+        self.assertEqual(vps.CONNECT_ACTIONS, ('connect-info', 'connect-pull', 'ensure-probe'))
 
     def test_oversized_sources_are_refused_for_both_actions(self):
         with tempfile.TemporaryDirectory(prefix='qd-module-') as tmp:

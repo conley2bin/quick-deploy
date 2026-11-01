@@ -35,6 +35,7 @@ import cdn_probe
 import target_config
 import host
 import link_dashboard
+import setup_ensure
 import ssh_proxy
 
 # Carrier selection never enters saved target records or operation fingerprints.
@@ -322,7 +323,7 @@ def target_record(args, current=None):
     return record
 
 
-CONNECT_ACTIONS = ('connect-info', 'connect-pull')
+CONNECT_ACTIONS = ('connect-info', 'connect-pull', 'ensure-probe')
 # Original host bytes and the public reader run as non-main modules; the reader
 # receives the host module and owns the action. No host.py main() is entered.
 CONNECT_BOOTSTRAP = """import base64,sys,types,zlib
@@ -403,6 +404,11 @@ def request_for(document, record):
     if record.get('machine_id'):
         result['machine_id'] = record['machine_id']
     return result
+
+
+def local_roster_digest(manifest):
+    """Digest of a verified local archive's accounts, same algorithm as the server's ensure-probe roster_digest."""
+    return setup_ensure.roster_digest(manifest['accounts'])
 
 
 def release_lock():
@@ -1602,6 +1608,12 @@ def parser(deployment_only=False):
     a.add_argument('--edge-ip', help='invocation-only public IPv4 verification preference; must appear in every fresh authoritative CF answer; not a persistent profile pin')
     a.add_argument('--mihomo', help='supported native Mihomo v1.19.32 executable')
     a.add_argument('--ssh-proxy', type=proxy_argument, help='independent explicit loopback SSH carrier; default direct')
+    a = sub.add_parser('ensure', help='default setup: check the configured VPS and install/repair/refresh only what is missing')
+    a.add_argument('--state-dir', type=Path, default=argparse.SUPPRESS, help='same as the global option; either position works')
+    a.add_argument('--mihomo', help='native core executable for profile validation')
+    a.add_argument('--ssh-proxy', type=proxy_argument, help='invocation-only socks5://127.0.0.1:PORT or http://127.0.0.1:PORT; default direct')
+    a.set_defaults(ssh=None, port=None, identity=None, domain=None, reality_target=None, acme_email=None, proxy_port=None,
+                   artifacts_dir=None, backup=None)
     if deployment_only:
         return p
     a = sub.add_parser('connect', help='attach this machine to an EXISTING managed VPS over SSH; reads the live server, changes nothing there')
@@ -1625,6 +1637,31 @@ def parser(deployment_only=False):
     return p
 
 
+PUBLIC_HELP = """usage: bash vps/setup.sh [--mihomo PATH] [--ssh-proxy URL] [--state-dir DIR]
+
+Reads vps/config (VPS_SSH, DOMAIN, optional REALITY_TARGET) and makes that VPS a managed node:
+checks what exists, skips what is healthy, and only installs or repairs what is missing.
+A healthy node is not restarted, backed up, re-keyed or re-certified.
+Fresh installs need REALITY_TARGET in vps/config. Exit codes: 0 done, 1 refused/unhealthy, 75 retry later.
+
+options:
+  --mihomo PATH      native Mihomo executable used to validate profiles (default: verge-mihomo or mihomo on PATH)
+  --ssh-proxy URL    invocation-only socks5://127.0.0.1:PORT or http://127.0.0.1:PORT; default direct
+  --state-dir DIR    private local state (default ~/.local/state/quick-deploy-private/vps)
+
+Advanced maintenance (not part of normal setup): bash vps/setup.sh {cdn,recover,status,replace,restore,backup,preflight,deploy} --help
+"""
+
+
+def split_state_dir(tokens):
+    """(leading --state-dir tokens, remainder)."""
+    if tokens[:1] == ['--state-dir']:
+        return tokens[:2], tokens[2:]
+    if tokens[:1] and tokens[0].startswith('--state-dir='):
+        return tokens[:1], tokens[1:]
+    return [], tokens
+
+
 def command_token(tokens):
     rest = list(tokens)
     if rest[:1] == ['--state-dir']:
@@ -1640,6 +1677,12 @@ def main(argv=None):
     deployment_only = tokens[:1] == ['--deployment-only']
     if deployment_only:
         del tokens[:1]
+        head, rest = split_state_dir(tokens)
+        if not rest or rest[0].startswith('-'):  # bare setup.sh and its option-first forms mean `ensure`
+            if rest[:1] in (['-h'], ['--help']):
+                print(PUBLIC_HELP, end='')
+                return 0
+            tokens = head + ['ensure'] + rest
         argv = tokens
     command = command_token(tokens)
     if command in ('manage', 'manage-job'):
@@ -1661,6 +1704,9 @@ def main(argv=None):
             if args.ssh is None:
                 args.ssh = default_ssh()
                 configured_ssh = True
+        if args.command == 'ensure':
+            setup = target_config.read_setup(MODULE)  # fully validated before any directory, lock or remote work
+            args.ssh, args.domain, args.reality_target = setup['VPS_SSH'], default_domain('sub'), setup['REALITY_TARGET']
         if args.command == 'cdn' and args.cdn_domain is None:
             args.cdn_domain = default_domain('cdn')
         with locked(state):
@@ -1671,6 +1717,8 @@ def main(argv=None):
                     raise host.Error('Management options require --device and --bootstrap-dir')
                 if args.management_port is not None and (not args.management_interface or not 1 <= args.management_port <= 65535):
                     raise host.Error('--management-port requires --management-interface and port1..65535')
+            if args.command == 'ensure':
+                return setup_ensure.run(sys.modules[__name__], state, args)
             if args.command == 'connect':
                 import connect  # lazy: connect works on this module, not a second import of it
                 connect.run(sys.modules[__name__], state, args)
