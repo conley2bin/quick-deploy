@@ -3,6 +3,7 @@
 The remote is a dispatcher that knows only `ensure-probe`; any other remote action, backup, prepare or commit from a
 skip path raises AssertionError, so a healthy repeat that touches the server beyond the read-only probe fails here.
 """
+import argparse
 import contextlib
 import fcntl
 import io
@@ -162,7 +163,7 @@ class Ensure(unittest.TestCase):
 
     def test_triple_topology_is_kept_and_skipped(self):
         self.save(self.document())
-        self.probe_value = probe(transports=TRIPLE, tcp_cdn={'schema': 1, 'domain': 'cdn.example.net'})
+        self.probe_value = probe(transports=TRIPLE, endpoint='1.1.1.1', tcp_cdn={'schema': 1, 'domain': 'cdn.example.net'})
         self.transports.return_value = TRIPLE
         code, out, _ = self.run_ensure()
         self.assertEqual((code, self.calls), (0, ['ensure-probe']))
@@ -170,7 +171,7 @@ class Ensure(unittest.TestCase):
 
     def test_triple_cdn_domain_change_makes_cache_stale(self):
         self.save(self.document())
-        self.probe_value = probe(transports=TRIPLE, tcp_cdn={'schema': 1, 'domain': 'cdn.example.net'})
+        self.probe_value = probe(transports=TRIPLE, endpoint='1.1.1.1', tcp_cdn={'schema': 1, 'domain': 'cdn.example.net'})
         self.transports.return_value = TRIPLE
         with mock.patch.object(vps, 'checked_backup', lambda *a: dict(MANIFEST, tcp_cdn={'domain': 'cdn.old.net'})):
             code, _, _ = self.run_ensure()
@@ -235,8 +236,24 @@ class Ensure(unittest.TestCase):
         document, record, args = self.mutators['deploy_existing'].call_args.args[1:]
         self.assertEqual((document['owner'], record['endpoint'], args.command), ('o1', '1.1.1.1', 'deploy'))
 
-    def test_front_drift_without_local_state_attaches_first(self):
+    def test_front_drift_without_local_state_repairs_from_probe_document_without_attach(self):
+        self.probe_value = probe(front_drift=True, transports=TRIPLE)
+        code, _, _ = self.run_ensure()
+        self.assertEqual((code, self.calls), (0, ['ensure-probe', 'deploy_existing']))
+        document, record, args = self.mutators['deploy_existing'].call_args.args[1:]
+        self.assertEqual((document['owner'], document['config'], document['previous'], document['backup']),
+                         ('o1', CONFIG, [], None))
+        self.assertEqual(document['current'], dict(record, machine_id='m1', node_id='n1'))
+        self.assertEqual(vps.request_for(document, record)['machine_id'], 'm1')
+
+    def test_front_drift_without_local_state_needs_a_real_core_before_any_repair(self):
+        self.mihomo = None
         self.probe_value = probe(front_drift=True)
+        self.assertEqual(self.run_ensure()[0], 1)
+        self.assertEqual(self.calls, ['ensure-probe'])
+
+    def test_legacy_single_without_state_still_attaches_first(self):
+        self.probe_value = probe(transports=SINGLE)
         code, _, _ = self.run_ensure()
         self.assertEqual((code, self.calls), (0, ['ensure-probe', 'attach', 'deploy_existing']))
 
@@ -479,6 +496,115 @@ class Ensure(unittest.TestCase):
         self.probe_value = RuntimeError('bug')
         with self.assertRaises(RuntimeError):
             self.run_ensure()
+
+
+class RealRepair(unittest.TestCase):
+    """Fresh computer + pure front drift through the REAL deploy_existing / backup_remote / remember_commit.
+    Fakes: the SSH `remote`, artifact upload and the archive/native-output validators (no download, no Mihomo)."""
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.state = self.tmp / 'state'
+        self.module = self.tmp / 'module'
+        self.module.mkdir()
+        (self.module / 'lib').symlink_to(REAL_MODULE / 'lib')
+        (self.module / 'release-lock.json').symlink_to(REAL_MODULE / 'release-lock.json')
+        (self.module / 'config').write_bytes(b'VPS_SSH=root@1.1.1.1\nDOMAIN=example.net\nREALITY_TARGET=www.python.org\n')
+        self.calls, self.repaired, self.fail_at = [], False, None
+        self.probe_value = probe(front_drift=True, transports=TRIPLE, tcp_cdn={'domain': 'cdn.example.net'},
+                                 health={'ok': False, 'failed_check': 'front', 'error': 'Caddyfile drift'})
+        self.manifest = dict(MANIFEST, endpoint='1.1.1.1', tcp_cdn={'schema': 1, 'domain': 'cdn.example.net', 'reality_port': 8443})
+        stack = contextlib.ExitStack()
+        self.addCleanup(stack.close)
+        for name, value in (('MODULE', self.module), ('remote', self.remote), ('resolve_mihomo', lambda b=None: b or '/bin/mihomo'),
+                            ('artifacts', lambda *a, **k: self.tmp), ('upload_bundle', self.upload),
+                            ('inspect_backup', self.inspect), ('checked_backup', lambda *a: self.manifest),
+                            ('validate_outputs', self.validate), ('read_generation', lambda *a: {}), ('sync_outputs', lambda *a: None), ('export_after_commit', lambda state: None),
+                            ('target_record', Ensure.target_record.__get__(self))):
+            stack.enter_context(mock.patch.object(vps, name, value))
+        stack.enter_context(mock.patch.object(host, 'cdn_enabled', return_value=True))
+        stack.enter_context(mock.patch.object(setup_ensure, 'roster_digest', fake_digest))
+        stack.enter_context(mock.patch.object(connect, 'run', side_effect=lambda *a: self.calls.append('attach')))
+
+    @contextlib.contextmanager
+    def upload(self, request, folder=None, backup=None):
+        yield io.BytesIO(b'bundle')
+
+    def inspect(self, path, lock):
+        """The pre-repair archive carries the Caddyfile drift and is rejected, exactly like verify_backup."""
+        if not self.repaired:
+            raise host.Error('Caddyfile drift')
+        return self.manifest
+
+    def validate(self, state, document, record, binary=None, backup=None):
+        self.calls.append('outputs')
+        (self.state / 'generations' / host.digest(backup)).mkdir(parents=True)  # what store_generation leaves
+
+    def remote(self, record, action, request=None, stdin=None, stdout=None, **kw):
+        self.calls.append(action)
+        if action == 'ensure-probe':
+            return self.probe_value
+        if action == 'connect-pull':
+            raise AssertionError('connect-pull of the drifted archive')
+        if action == self.fail_at:
+            raise host.Error('boom ' + action)
+        if action == 'status':
+            return {'adapter_sha256': host.digest(REAL_MODULE / 'lib/host.py'), 'needs_transport_upgrade': False,
+                    'transports': TRIPLE, 'machine_id': 'm1', 'node_id': 'n1'}
+        if action == 'prepare':
+            self.repaired = True
+            return {'unchanged': True}
+        if action == 'backup':
+            stdout.write(b'archive')
+            return None
+        raise AssertionError('unexpected action ' + action)
+
+    def ensure(self):
+        args = argparse.Namespace(ssh='root@1.1.1.1', domain='sub.example.net', reality_target='www.python.org',
+                                  mihomo=None, ssh_proxy=None, command='ensure', artifacts_dir=None, acme_email='',
+                                  proxy_port=443)
+        with mock.patch('sys.stdout', io.StringIO()), mock.patch('sys.stderr', io.StringIO()):
+            return setup_ensure.run(vps, self.state, args)
+
+    def test_pure_front_drift_repairs_directly_and_publishes_the_post_repair_archive(self):
+        self.assertEqual(self.ensure(), 0)
+        self.assertEqual(self.calls, ['ensure-probe', 'status', 'prepare', 'backup', 'outputs', 'status'])
+        document = json.loads((self.state / 'state.json').read_text())
+        self.assertEqual((document['owner'], document['current']['machine_id'], document['tcp_cdn']['domain']),
+                         ('o1', 'm1', 'cdn.example.net'))
+        self.assertTrue(Path(document['backup']).exists())
+        self.assertFalse((self.state / 'pending.json').exists())
+
+    def test_backup_failure_before_state_clears_only_its_own_tracking_and_reprobes_as_pending(self):
+        self.fail_at = 'backup'
+        with self.assertRaises(host.Error):
+            self.ensure()
+        self.assertFalse((self.state / 'state.json').exists())
+        self.assertFalse((self.state / 'pending.json').exists())
+        self.assertTrue(list((self.state / 'backups').glob('*.incomplete')))
+        self.calls.clear()
+        self.fail_at = None
+        self.probe_value = probe(kind='pending', health={'ok': False, 'failed_check': 'backup-stop', 'error': 'x'})
+        with mock.patch.object(vps, 'recover_local', side_effect=AssertionError('recover(None)')):
+            self.assertEqual(self.ensure(), setup_ensure.WAITING)
+        self.assertEqual(self.calls, ['ensure-probe'])
+
+    def test_foreign_or_committed_pending_is_never_removed(self):
+        record = Ensure.target_record(self, argparse.Namespace(ssh='root@1.1.1.1'))
+        other = dict(record, endpoint='9.9.9.9')
+        for pending, committed in (({'record': other, 'mode': 'backup'}, False),
+                                   ({'record': record, 'mode': 'backup', 'request': {'x': 1}}, False),
+                                   ({'record': record, 'mode': 'transport-upgrade'}, False),
+                                   ({'record': record, 'mode': 'backup'}, True)):
+            state = Path(tempfile.mkdtemp())
+            host.atomic(state / 'pending.json', host.dumps(pending))
+            if committed:
+                host.atomic(state / 'state.json', b'{}')
+            setup_ensure.discard_untracked_backup_pending(vps, state, record)
+            self.assertTrue((state / 'pending.json').exists(), pending)
+        state = Path(tempfile.mkdtemp())
+        host.atomic(state / 'pending.json', host.dumps({'record': record, 'mode': 'backup'}))
+        setup_ensure.discard_untracked_backup_pending(vps, state, record)
+        self.assertFalse((state / 'pending.json').exists())
 
 
 class SetupSurface(unittest.TestCase):

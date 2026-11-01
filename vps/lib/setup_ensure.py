@@ -194,6 +194,34 @@ def optional_mihomo(vps, args):
         return None
 
 
+def repair_without_state(vps, state, args, probe, record):
+    """Front drift on a computer with no local state. connect-pull's archive check rejects exact Caddyfile drift, so
+    attach cannot work here; the probe's identity facts drive the existing deploy_existing, and only its verified
+    post-repair snapshot is published as local state (remember_commit)."""
+    vps.resolve_mihomo(args.mihomo)  # real core before the first remote mutation
+    document = {'format': host.FORMAT, 'owner': probe['owner'], 'config': probe['config'],
+                'current': dict(record, machine_id=probe['machine_id'], node_id=probe['node_id']),
+                'previous': [], 'backup': None}
+    record = vps.target_record(args, document['current'])  # carries machine_id, as after a normal attach
+    try:
+        vps.deploy_existing(state, document, record, deploy_args(args))
+    except BaseException:
+        discard_untracked_backup_pending(vps, state, record)
+        raise
+
+
+def discard_untracked_backup_pending(vps, state, record):
+    """backup_remote writes a backup-only pending.json before state.json exists. Without a state document nothing can
+    recover it, and it carries no transaction intent: drop exactly that record. The server's backup-stop stays owned
+    by the host recovery timer; the next ensure probe reports it pending (75)."""
+    path = state / 'pending.json'
+    if (state / 'state.json').exists() or not path.exists():
+        return
+    pending = vps.load(path)
+    if pending.get('mode') == 'backup' and 'request' not in pending and pending.get('record') == record:
+        path.unlink()
+
+
 def owned(vps, state, args, document, probe, record):
     matches_config(args, probe)
     if document:
@@ -214,14 +242,17 @@ def owned(vps, state, args, document, probe, record):
         raise host.Error(f'服务器节点运行时不健康，未做任何改动（没有重启或修复）：{why(probe)}')
     legacy = probe['transports'] == SINGLE
     if drift or legacy:
-        if not document:
+        if not document and legacy:
             binary = vps.resolve_mihomo(args.mihomo)
             say('刷新', '本机尚无状态：先只读附着服务器的当前快照（不停服务）')
             attach(vps, state, args, binary)
             document = load_document(vps, state)
             record = vps.target_record(args, document['current'])
         say('修复', ('旧单传输节点升级为 REALITY+Hysteria2' if legacy else '订阅前端配置漂移') + '：使用既有事务路径')
-        vps.deploy_existing(state, document, record, deploy_args(args))
+        if document:
+            vps.deploy_existing(state, document, record, deploy_args(args))
+        else:
+            repair_without_state(vps, state, args, probe, record)
         return 0
     say('检查', '运行时健康：原生账号/投影、TLS、监听进程、前端均通过')
     if cache_is_current(vps, state, document, probe):
