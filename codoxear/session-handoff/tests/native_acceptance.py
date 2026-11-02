@@ -20,6 +20,7 @@ import signal
 import sys
 import time
 from types import SimpleNamespace
+from urllib.parse import quote
 import uuid
 
 import aiohttp
@@ -94,6 +95,17 @@ class FileEvents:
 def private_json(path, value):
     path.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n")
     path.chmod(0o600)
+
+
+def assert_handoff_mutations(calls, operation):
+    """Current protocol: one bound-target rename between create and both sends."""
+    source = quote(operation["source_session_id"], safe="")
+    target = quote(operation["target_session_id"], safe="")
+    expected = ["/api/sessions", f"/api/sessions/{target}/rename",
+                f"/api/sessions/{source}/send", f"/api/sessions/{target}/send"]
+    assert [call["path"] for call in calls] == expected, (
+        "expected create, bound successor rename, predecessor review, successor continuation exactly once")
+    assert calls[1]["body"] == {"name": operation["target_display_name"]}, "successor name differs from frozen intent"
 
 
 def load_host():
@@ -265,7 +277,7 @@ httpd.serve_forever()
             except AssertionError:
                 return False
         await watcher.until(action_done, 120)
-        assert len(mutation_calls) == 3, "expected create, predecessor review, successor continuation exactly once"
+        assert_handoff_mutations(mutation_calls, operation)
         # Publication is via link/rename; capture an event for the final filename,
         # not merely a temporary draft or an HTTP response.
         resolution_events = [x for x in watcher.observations if x["path"] == str(directory / "resolution.json")]

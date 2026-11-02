@@ -9,10 +9,26 @@ import time
 import unittest
 from unittest.mock import patch
 
-from native_acceptance import FileEvents, check_isolation
+from native_acceptance import FileEvents, assert_handoff_mutations, check_isolation
 
 
 class NativeHarnessTests(unittest.IsolatedAsyncioTestCase):
+    def test_current_mutation_chain_includes_one_bound_successor_rename(self):
+        operation = {"source_session_id": "source/opaque", "target_session_id": "target/opaque",
+                     "target_display_name": "原名_02"}
+        calls = [{"path": path, "body": body} for path, body in [
+            ("/api/sessions", {}),
+            ("/api/sessions/target%2Fopaque/rename", {"name": "原名_02"}),
+            ("/api/sessions/source%2Fopaque/send", {}),
+            ("/api/sessions/target%2Fopaque/send", {}),
+        ]]
+        assert_handoff_mutations(calls, operation)
+        for invalid in [calls[:1] + calls[2:], calls[:2] + calls[1:],
+                        [calls[0], {"path": "/api/sessions/source%2Fopaque/rename", "body": calls[1]["body"]}, *calls[2:]],
+                        [calls[0], {"path": calls[1]["path"], "body": {"name": "原名_03"}}, *calls[2:]]]:
+            with self.subTest(calls=invalid), self.assertRaises(AssertionError):
+                assert_handoff_mutations(invalid, operation)
+
     async def test_file_notifications_observe_resolution_before_task_change(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

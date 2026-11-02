@@ -142,6 +142,13 @@ No sleep/poll loops and no automatic resend/recreate after ambiguous mutations.
 Record failure at the original stage rather than making a retry look like the
 same run. The native application may use its own bounded readiness mechanisms.
 
+The current runner requires exactly four handoff mutations in order: successor
+create, identity-bound successor rename to the frozen `_NN` name, predecessor
+review send, successor continuation send. Alias readback verifies display state;
+actual tmux convergence is separately checked by the private fake-Pi naming
+probe (`test_native_naming.py`), not inferred from HTTP 200. The historical run
+recorded below predates naming and retains its original three-mutation evidence.
+
 ## Evidence and reporting
 
 Private evidence includes exact launch argv (no secrets), real transcript IDs,
