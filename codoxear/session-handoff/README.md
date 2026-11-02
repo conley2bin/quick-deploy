@@ -42,11 +42,13 @@
 
 ## 验证边界
 
+从仓库根目录使用共享虚拟环境运行：
+
 ```sh
-python -m unittest discover -s codoxear/session-handoff/tests -p 'test_engine.py' -v
-python -m unittest discover -s codoxear/session-handoff/tests -p 'test_feature.py' -v
+codoxear/web-host/.venv/bin/python -m unittest discover -s codoxear/session-handoff/tests -p 'test_engine.py' -v
+codoxear/web-host/.venv/bin/python -m unittest discover -s codoxear/session-handoff/tests -p 'test_feature.py' -v
 ```
 
 原生 `/send` 没有 expected-header/nonce 条件参数：扩展会在发送前重新查验身份，但无法把“列表核验”和“原生接受输入”合并成原子事务。不要在这段时间手动重绑同一路由；真实原生联调需核验其路由生命周期。
 
-测试使用临时 Pi JSONL、假原生创建/发送响应、真实 Context 产物验证和应用内 aiohttp HTTP 服务；不会启动真实 Pi/tmux、访问用户数据或切换线上服务。它们验证身份、哈希、截止边界、状态和一次性副作用机制，不能证明模型真实理解了目标。部署前仍需专用隔离 Pi 完整验证首消息→理解→旧审阅→核对回执，并用真实页面核验共享宿主与分组功能共存。Workflow 分支没有合并或上线权限。
+上述单元命令是机制测试：使用临时 Pi JSONL、假原生创建/发送响应、真实 Context 产物验证和应用内 aiohttp HTTP 服务；不会启动真实 Pi/tmux、访问用户数据或切换线上服务。它们验证身份、哈希、截止边界、状态和一次性副作用机制，不能证明模型真实理解了目标。需显式启用的专用隔离真实 Pi fixture 及已记录结果见 [真实 Pi 验收](tests/REAL_PI_ACCEPTANCE.md)，其语义证据来自实际理解报告、审阅、核对回执和任务文件结果。原生 UI 配合合成 API 的浏览器验证只覆盖界面交互与共享宿主、分组功能共存，不替代真实 Pi 的语义证据。
