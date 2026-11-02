@@ -40,8 +40,15 @@ function harness(initialTab, options = {}) {
   const vscode = {
     TabInputText, TabInputCustom, workspace,
     window: {
-      createOutputChannel() {
-        return { info(message) { log.push(['info', message]); }, error(message) { log.push(['error', message]); }, dispose() {} };
+      createOutputChannel(...args) {
+        if (args.length !== 1) throw new Error('plain OutputChannel host accepts only a name');
+        return {
+          appendLine(line) {
+            const [, level, message] = /^\[(info|error)\] ([\s\S]*)$/.exec(line);
+            log.push([level, message]);
+          },
+          dispose() {}
+        };
       },
       tabGroups: {
         activeTabGroup: group,
@@ -246,4 +253,92 @@ test('missing/failed media provider and rejected openWith surface an error once'
     assert.match(h.errors[0], /MP4 video preview repair failed:/);
     assert.equal(h.disposed, true);
   }
+});
+
+const missingCases = {
+  'window.tabGroups': h => { delete h.vscode.window.tabGroups; },
+  'window.tabGroups.onDidChangeTabs': h => { delete h.vscode.window.tabGroups.onDidChangeTabs; },
+  'window.tabGroups.close': h => { delete h.vscode.window.tabGroups.close; },
+  'window.createOutputChannel': h => { delete h.vscode.window.createOutputChannel; },
+  'window.showErrorMessage': h => { delete h.vscode.window.showErrorMessage; },
+  'extensions.getExtension': h => { delete h.vscode.extensions.getExtension; },
+  'commands.executeCommand': h => { delete h.vscode.commands.executeCommand; },
+  TabInputText: h => { delete h.vscode.TabInputText; },
+  TabInputCustom: h => { delete h.vscode.TabInputCustom; },
+  workspace: h => { delete h.vscode.workspace; }
+};
+
+for (const [name, remove] of Object.entries(missingCases)) {
+  test(`missing ${name} is diagnosed before any listener or editor side effect`, async () => {
+    const h = harness(video());
+    remove(h);
+    const messages = [];
+    const original = console.error;
+    console.error = message => messages.push(message);
+    try {
+      assert.doesNotThrow(() => h.start());
+      await settled();
+    } finally {
+      console.error = original;
+    }
+    assert.equal(messages.length, 1);
+    assert.match(messages[0], new RegExp(`lacks .*${name.replaceAll('.', '\\.')}`));
+    assert.deepEqual(h.calls, []);
+    assert.deepEqual(h.closeCalls, []);
+    assert.equal(h.context.subscriptions.length, 0);
+    assert.equal(h.disposed, false);
+    if (name !== 'window.showErrorMessage') {
+      assert.equal(h.errors.length, 1);
+      assert.match(h.errors[0], /lacks /);
+    }
+  });
+}
+
+test('absent activeTabGroup at startup is allowed and the first tab event still repairs', async () => {
+  const h = harness(undefined);
+  h.vscode.window.tabGroups.activeTabGroup = undefined;
+  h.start();
+  assert.equal(h.disposed, false);
+  h.vscode.window.tabGroups.activeTabGroup = h.group;
+  h.group.activeTab = video();
+  h.emit();
+  await settled();
+  assert.equal(commands(h).length, 1);
+});
+
+function plainChannel(h) {
+  const lines = [];
+  const calls = [];
+  h.vscode.window.createOutputChannel = (...args) => {
+    calls.push(args);
+    if (args.length !== 1) throw new Error('plain OutputChannel host accepts only a name');
+    return { appendLine: line => lines.push(line), dispose() {} };
+  };
+  return { lines, calls };
+}
+
+test('logs through a plain OutputChannel created with the name argument only', async () => {
+  const h = harness(video());
+  const { lines, calls } = plainChannel(h);
+  h.start();
+  await settled();
+  assert.deepEqual(calls, [['Pi MP4 Video Preview Repair']]);
+  assert.equal(commands(h).length, 1);
+  assert.match(lines[0], /^\[info\] First active tab is TabInputText/);
+  assert.match(lines.at(-1), /Closed original inactive text tab/);
+});
+
+test('failure on a plain OutputChannel is reported without a second TypeError', async () => {
+  const h = harness(video(), { commandError: new Error('boom') });
+  const { lines, calls } = plainChannel(h);
+  h.start();
+  await settled();
+  assert.equal(calls.length, 1);
+  assert.match(lines.at(-1), /^\[error\] boom/);
+  assert.match(h.errors[0], /boom/);
+});
+
+test('manifest declares only the mandatory platform placeholder for engines.vscode', () => {
+  const manifest = require('../package.json');
+  assert.equal(manifest.engines.vscode, '>=0.0.0');
 });

@@ -7,7 +7,7 @@
   "private": true,
   "license": "UNLICENSED",
   "engines": {
-    "vscode": "^1.135.0"
+    "vscode": ">=0.0.0"
   },
   "categories": ["Other"],
   "extensionKind": ["ui"],
