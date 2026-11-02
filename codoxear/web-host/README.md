@@ -38,8 +38,10 @@ legacy clients. Editing source files cannot change an already running host's
 script bytes; an approved Web restart is required to load new assets.
 
 Only recognized bounded native entry HTML is buffered. Unsupported HTML/CSP is
-passed through unchanged; the host never relaxes CSP. Uploads, downloads and SSE
-stream. Duplicate Set-Cookie, opaque encoded routes, native prefix/auth and
+passed through unchanged; the host never relaxes CSP. This includes
+strict-dynamic scripts, nonce/hash-only styles and script-disabled sandboxing;
+CSP duplicate directives follow the browser's first-directive rule. Uploads,
+downloads and SSE stream. Duplicate Set-Cookie, opaque encoded routes, native prefix/auth and
 IPv6 dual-stack front behavior are preserved. WebSocket upgrades fail explicitly
 with 501 because this host only supports the observed HTTP/SSE native protocol.
 

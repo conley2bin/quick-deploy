@@ -156,6 +156,9 @@ class HostTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all(path == '/phone/api/echo' for _, path, _ in self.calls))
         status, payload = await self.context.upstream_json('GET', '/api/missing', cookie='caller=c')
         self.assertEqual((status, payload), (404, {'native': '/phone/api/missing'}))
+        opaque = '/api/sessions/pi%2Fopaque%3Akey/send?value=a%2Fb'
+        status, payload = await self.context.upstream_json('POST', opaque, cookie='', body={'text': 'synthetic'})
+        self.assertEqual(payload['native'], '/phone' + opaque)
 
     async def test_json_transport_rejects_targets_redirects_and_invalid_responses(self):
         for path in ('https://evil.invalid/api/x', '//127.0.0.1/api/x', '/elsewhere',
@@ -220,7 +223,8 @@ class ConstructionTests(unittest.TestCase):
 
     def test_loopback_prefix_and_script_namespace_validation(self):
         for origin in ('http://evil.invalid:1234', 'https://127.0.0.1:1234', 'http://127.0.0.1:1234/path',
-                       'http://user@127.0.0.1:1234', 'http://127.0.0.1', 'http://127.0.0.1:1234?x=1'):
+                       'http://user@127.0.0.1:1234', 'http://:password@127.0.0.1:1234',
+                       'http://127.0.0.1', 'http://127.0.0.1:1234?x=1'):
             with self.subTest(origin=origin), self.assertRaises(ValueError):
                 host.create_app(origin, features=())
         host.create_app('http://[::1]:1234', '/phone', features=())
@@ -240,6 +244,55 @@ class ConstructionTests(unittest.TestCase):
                                ('Content-Security-Policy', "script-src 'none'")])
         self.assertEqual(host.inject(HTML, headers, '', {'__one__': (b'', 'hash')}),
                          (HTML, 'unsupported-html-or-csp'))
+        for policy in ("script-src 'none'; script-src 'self'", "script-src 'self' 'strict-dynamic' 'nonce-abc'",
+                       "style-src 'unsafe-inline' 'nonce-abc'", "style-src 'unsafe-inline' 'sha256-abc'", 'sandbox'):
+            with self.subTest(policy=policy):
+                self.assertFalse(host.allows_injection(policy))
+
+
+class LifecycleTests(unittest.IsolatedAsyncioTestCase):
+    async def test_unexpected_private_backend_exit_stops_front_without_signalling_other_processes(self):
+        import os
+        import signal
+        exit_code = asyncio.get_running_loop().create_future()
+        signalled = asyncio.Event()
+        class Child:
+            returncode = None
+            async def wait(self):
+                self.returncode = await asyncio.shield(exit_code)
+                return self.returncode
+            def terminate(self):
+                raise AssertionError('Already exited child must not be terminated')
+        child = Child()
+        async def spawn(*args, **kwargs):
+            return child
+        signals = []
+        def kill(pid, sig):
+            signals.append((pid, sig)); signalled.set()
+        source = SimpleNamespace(validate_env=lambda: None,
+            runtime_env=lambda: {'CODEX_WEB_HOST': '127.0.0.1', 'CODEX_WEB_PORT': '8743'},
+            access_path=lambda env: '/', VENV_BIN=Path('/synthetic/bin'), HELPER_DIR=Path('/synthetic'))
+        with patch.object(host.asyncio, 'create_subprocess_exec', spawn), patch.object(os, 'kill', kill):
+            app, _, _ = host.managed_app(features=(), source=source)
+            context = app.cleanup_ctx[-1](app)
+            await context.__anext__()
+            exit_code.set_result(17)
+            await asyncio.wait_for(signalled.wait(), 1)
+            self.assertEqual(signals, [(os.getpid(), signal.SIGTERM)])
+            with self.assertRaises(StopAsyncIteration):
+                await context.__anext__()
+
+    async def test_feature_install_failure_never_spawns_private_backend(self):
+        from unittest.mock import AsyncMock
+        def fail(app, context):
+            raise FileNotFoundError('Missing required feature asset')
+        source = SimpleNamespace(validate_env=lambda: None,
+            runtime_env=lambda: {}, access_path=lambda env: '/',
+            VENV_BIN=Path('/synthetic/bin'), HELPER_DIR=Path('/synthetic'))
+        with patch.object(host.asyncio, 'create_subprocess_exec', new_callable=AsyncMock) as spawn:
+            with self.assertRaises(FileNotFoundError):
+                host.managed_app(features=(SimpleNamespace(install=fail),), source=source)
+            spawn.assert_not_called()
 
 
 if __name__ == '__main__':

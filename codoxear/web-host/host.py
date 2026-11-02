@@ -63,8 +63,11 @@ class HostContext:
     def html_status(self):
         return self._app[CONFIG]['html_status']
 
-    same_origin = staticmethod(lambda request: same_origin(request))
-    json_response = staticmethod(lambda data, status=200: json_response(data, status))
+    def same_origin(self, request):
+        return same_origin(request)
+
+    def json_response(self, data, status=200):
+        return json_response(data, status)
 
     def add_script(self, namespace, body):
         if self._frozen:
@@ -152,7 +155,12 @@ def allows_injection(policy):
     scripts = directives.get('script-src-elem', directives.get('script-src', directives.get('default-src')))
     styles = directives.get('style-src-elem', directives.get('style-src', directives.get('default-src')))
     # Do not weaken upstream CSP or invent nonces. Inline shadow styles need the existing allowance.
-    return (scripts is None or "'self'" in scripts) and (styles is None or "'unsafe-inline'" in styles)
+    scripts_ok = scripts is None or ("'self'" in scripts and "'strict-dynamic'" not in scripts)
+    # A nonce/hash disables unsafe-inline in modern CSP; our styles carry neither.
+    styles_ok = styles is None or ("'unsafe-inline'" in styles and not any(
+        token.startswith(("'nonce-", "'sha256-", "'sha384-", "'sha512-")) for token in styles))
+    sandbox = directives.get('sandbox')
+    return scripts_ok and styles_ok and (sandbox is None or 'allow-scripts' in sandbox)
 
 
 def inject(body, headers, prefix, scripts):
@@ -264,7 +272,7 @@ async def proxy(request):
 
 def create_app(upstream, prefix='', *, features=None):
     parsed = urlsplit(upstream)
-    if parsed.scheme != 'http' or parsed.hostname not in ('127.0.0.1', '::1') or not parsed.port or parsed.path not in ('', '/') or parsed.query or parsed.fragment or parsed.username:
+    if parsed.scheme != 'http' or parsed.hostname not in ('127.0.0.1', '::1') or not parsed.port or parsed.path not in ('', '/') or parsed.query or parsed.fragment or parsed.username is not None:
         raise ValueError('upstream must be a fixed loopback HTTP origin')
     if prefix and (not prefix.startswith('/') or prefix.endswith('/') or '//' in prefix or any(c not in '/abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-' for c in prefix)):
         raise ValueError('unsupported URL prefix')
