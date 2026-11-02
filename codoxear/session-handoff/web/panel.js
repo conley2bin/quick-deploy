@@ -6,7 +6,29 @@
   function mount(win, src, onLogout = () => {}) {
     const doc = win.document, base = namespace(src, win.location.origin);
     const key = 'codoxear:session-handoff:' + new URL(base).pathname;
-    let controller, ui, timer, panelAbort, disposed = false, shell = null, main = null, actions = null;
+    let controller, ui, timer, selectionTimer, panelAbort, disposed = false, shell = null, main = null, actions = null;
+    let currentSource;
+    const drafts = new Map();
+    const draft = () => {
+      if (!drafts.has(currentSource)) drafts.set(currentSource, { open: false, note: '', confirmedSource: null, reconfirm: false });
+      return drafts.get(currentSource);
+    };
+    function syncSelection() {
+      const next = selected(win.location.hash);
+      if (next === currentSource) return false;
+      currentSource = next;
+      controller.select(next);
+      if (!doc.hidden && controller.view().reference?.operation_id && !controller.view().op) controller.poll();
+      return true;
+    }
+    function monitorSelection() {
+      win.clearTimeout(selectionTimer);
+      if (disposed || doc.hidden) return;
+      syncSelection();
+      // Native replaceState has no event, including async transcript navigation.
+      // Compare only the URL while visible; never inspect native cards/transcripts.
+      selectionTimer = win.setTimeout(monitorSelection, 250);
+    }
     const abort = new AbortController(), requests = new Set();
     const style = doc.createElement('style'); style.id = 'session-handoff-style';
     style.textContent = `#handoffButton svg{display:block;width:20px;height:20px;pointer-events:none}
@@ -29,16 +51,22 @@
       win.clearTimeout(timer);
       const s = controller.view();
       if (disposed || doc.hidden || !s.reference?.operation_id || s.busy || (s.op && !active.has(s.op.status)) || s.error) return;
-      timer = win.setTimeout(() => controller.poll(), 1800);
+      timer = win.setTimeout(() => { syncSelection(); if (!doc.hidden) controller.poll(); }, 1800);
     }
     function render(s) {
-      if (!ui) return;
-      const has = Boolean(s.reference || s.error);
+      if (disposed || !ui) return;
+      if (s.source !== selected(win.location.hash)) { syncSelection(); return; }
+      const d = draft();
+      ui.form.hidden = !d.open || Boolean(s.reference);
+      ui.note.value = d.note;
+      ui.source.textContent = d.reconfirm ? '来源已切换，请再次确认：' + (currentSource || '未选择会话')
+        : currentSource ? '来源会话：' + currentSource : '请先在原生页面选择一个会话。';
+      const has = Boolean(s.reference || s.error || s.legacyError);
       ui.panel.hidden = !has && ui.form.hidden;
       ui.status.textContent = s.op ? `${labels[s.op.status]} · 来源：${s.op.source_session_id}${s.op.message ? ' · ' + s.op.message : ''}`
         : s.reference ? (s.busy ? '正在核对接力请求…' : '请求结果未确认。请核对原请求；刷新后补充说明不会保留。') : '';
-      ui.error.textContent = s.error || (s.uncertainContinue ? '继续请求结果尚未确认；仅查询状态，不会重发。' : '');
-      ui.start.disabled = s.busy || Boolean(s.reference);
+      ui.error.textContent = [s.error || (s.uncertainContinue ? '继续请求结果尚未确认；仅查询状态，不会重发。' : ''), s.legacyError].filter(Boolean).join('；');
+      ui.start.disabled = !currentSource || s.busy || Boolean(s.reference);
       ui.button.disabled = s.busy;
       ui.retry.hidden = !s.reference || s.busy || (!s.error && s.op && active.has(s.op.status));
       ui.retry.textContent = s.reference?.operation_id ? '刷新接力状态' : '核对原请求';
@@ -68,13 +96,14 @@
     }
     function dispose(clear = false) {
       if (disposed) return; disposed = true;
-      controller.stop(clear); win.clearTimeout(timer); abort.abort(); panelAbort?.abort();
+      controller.stop(clear); drafts.clear(); win.clearTimeout(timer); win.clearTimeout(selectionTimer); abort.abort(); panelAbort?.abort();
       for (const ac of requests) ac.abort(); requests.clear();
       rootObserver.disconnect(); shellObserver.disconnect(); mainObserver.disconnect(); actionsObserver.disconnect();
       ui?.button.remove(); ui?.panel.remove(); doc.getElementById('handoffCompatibility')?.remove(); style.remove();
       if (clear) onLogout();
     }
     controller = createController({ post, storage: {
+      get length() { return win.localStorage.length; }, key: i => win.localStorage.key(i),
       getItem: k => win.localStorage.getItem(k), setItem: (k, v) => win.localStorage.setItem(k, v), removeItem: k => win.localStorage.removeItem(k),
     }, key, uuid: () => Core.requestUUID(win.crypto),
       changed: render, authLost: () => {
@@ -132,29 +161,30 @@
       const link = el('a', '打开新会话'), done = el('button', '收起记录', { type: 'button' });
       const row = el('div', '', { class: 'handoffRow' }); row.append(retry, bypass, link, done); panel.append(form, status, error, row);
       ui = { button, panel, form, source, note, start, status, error, retry, bypass, link, done };
-      let confirmedSource;
       onUI(button, 'click', () => {
-        const s = controller.view();
-        if (s.reference) { panel.hidden = false; render(s); return; }
-        confirmedSource = selected(win.location.hash); // fresh even after native replaceState
-        source.textContent = confirmedSource ? '来源会话：' + confirmedSource : '请先在原生页面选择一个会话。';
-        form.hidden = false; panel.hidden = false; start.disabled = !confirmedSource;
-        button.setAttribute('aria-expanded', 'true'); note.focus();
+        syncSelection();
+        const s = controller.view(), d = draft();
+        if (!s.reference) { d.open = true; d.confirmedSource = currentSource; d.reconfirm = false; }
+        render(s);
+        if (!s.reference) note.focus();
       });
+      onUI(note, 'input', () => { draft().note = note.value; });
       onUI(form, 'submit', e => {
         e.preventDefault();
-        const now = selected(win.location.hash);
-        if (now !== confirmedSource) {
-          confirmedSource = now; source.textContent = '来源已切换，请再次确认：' + (now || '未选择会话'); start.disabled = !now; return;
+        const confirmed = draft().confirmedSource;
+        syncSelection();
+        const d = draft(), now = currentSource;
+        if (now !== confirmed || now !== d.confirmedSource) {
+          d.open = true; d.confirmedSource = now; d.reconfirm = true; render(controller.view()); return;
         }
-        controller.start(now, note.value);
+        controller.start(now, d.note);
       });
-      onUI(cancel, 'click', () => { form.hidden = true; panel.hidden = true; note.value = ''; button.setAttribute('aria-expanded', 'false'); button.focus(); });
+      onUI(cancel, 'click', () => { const d = draft(); d.open = false; d.note = ''; render(controller.view()); button.focus(); });
       onUI(form, 'keydown', e => { if (e.key === 'Escape') { e.preventDefault(); cancel.click(); } });
-      onUI(retry, 'click', () => controller.recover());
-      onUI(bypass, 'click', () => controller.continueUnreviewed());
-      onUI(link, 'click', e => { e.preventDefault(); const id = controller.view().op?.target_session_id; if (id) win.location.replace(targetURL(win.location.href, id)); });
-      onUI(done, 'click', () => { controller.forget(); note.value = ''; button.focus(); });
+      onUI(retry, 'click', () => { syncSelection(); controller.recover(); });
+      onUI(bypass, 'click', () => { syncSelection(); controller.continueUnreviewed(); });
+      onUI(link, 'click', e => { e.preventDefault(); syncSelection(); const id = controller.view().op?.target_session_id; if (id) win.location.replace(targetURL(win.location.href, id)); });
+      onUI(done, 'click', () => { syncSelection(); controller.forget(); draft().note = ''; render(controller.view()); button.focus(); });
       render(controller.view());
       if (controller.view().reference?.operation_id && !controller.view().op && !doc.hidden) controller.poll();
     }
@@ -164,8 +194,21 @@
     if (root) rootObserver.observe(root, { childList: true }); // only shell replacements, never the transcript tree
     on(doc, 'click', e => { if (e.target.closest?.('#logoutBtnSide')) dispose(true); });
     on(win, 'pagehide', () => dispose());
-    on(doc, 'visibilitychange', () => { win.clearTimeout(timer); if (!doc.hidden && !disposed && controller.view().reference?.operation_id) controller.poll(); });
-    install();
+    on(doc, 'visibilitychange', () => {
+      win.clearTimeout(timer); win.clearTimeout(selectionTimer);
+      if (!doc.hidden && !disposed) { monitorSelection(); if (controller.view().reference?.operation_id) controller.poll(); }
+    });
+    const selectionEvent = () => win.queueMicrotask(() => { if (!disposed && !doc.hidden) syncSelection(); });
+    for (const type of ['click', 'keyup', 'pointerup']) on(doc, type, selectionEvent);
+    for (const type of ['hashchange', 'popstate', 'focus']) on(win, type, selectionEvent);
+    on(win, 'storage', e => {
+      if (e.key === key || e.key === null) controller.migrateLegacy();
+      if (e.key === null || e.key === key + ':source:' + encodeURIComponent(currentSource)) {
+        controller.select(currentSource);
+        if (!doc.hidden && controller.view().reference?.operation_id && !controller.view().op) controller.poll();
+      }
+    });
+    syncSelection(); install(); monitorSelection(); controller.migrateLegacy();
     return { controller, dispose };
   }
   const api = { mount };
