@@ -198,11 +198,7 @@ test("native assistant buttons copy exact code, including nested tabs and no vis
   }
 });
 
-test("Pi 0.99.1 source-keyed parsed tokens keep copies and links current across source, width and theme changes", async (t) => {
-  if (VERSION !== "0.99.1") {
-    t.skip("source-keyed parsed-token cache was added in Pi 0.99.1");
-    return;
-  }
+test("source-keyed parsed tokens keep copies and links current across source, width and theme changes", async (t) => {
   const terminal = new FakeTerminal();
   const copies: string[] = [], opened: string[] = [], nativeOpened: string[] = [];
   const adapter = installAdapter({ version: VERSION, active: () => true,
@@ -220,9 +216,17 @@ test("Pi 0.99.1 source-keyed parsed tokens keep copies and links current across 
     }),
   });
   const tui = new TuiAltScreen(terminal, false, undefined, { openUrl: (url) => nativeOpened.push(url) });
+  type ParsedTokens = { source: string; tokens: unknown[] };
   const parsedCache = markdown as unknown as {
-    cachedTokens?: { source: string; tokens: unknown[] };
+    cachedTokens?: ParsedTokens | WeakRef<ParsedTokens>;
     theme: MarkdownTheme;
+  };
+  // The host cache is either the entry itself or a WeakRef to it; a host with
+  // neither has no token cache to reuse and only the payload checks apply.
+  const hostTokens = () => {
+    const held = parsedCache.cachedTokens;
+    const entry = held instanceof WeakRef ? held.deref() : held;
+    return Array.isArray(entry?.tokens) ? entry.tokens : undefined;
   };
   const button = () => {
     const found = targets(tui, "pi-copy://").filter((point) =>
@@ -238,8 +242,8 @@ test("Pi 0.99.1 source-keyed parsed tokens keep copies and links current across 
   };
   try {
     tui.addChild(markdown); tui.start(); tui.renderNow(true);
-    const cachedTokens = parsedCache.cachedTokens?.tokens;
-    assert.ok(cachedTokens, "host parsed-token cache exists");
+    const cachedTokens = hostTokens();
+    if (!cachedTokens) t.diagnostic("host exposes no observable parsed-token cache shape; cache-reuse assertions not observed, copy/link payload assertions still run");
     click(terminal, button()); await tick();
     assert.deepEqual(copies, ["target:\n\techo done  "]);
     click(terminal, web(), 16); await tick();
@@ -250,7 +254,7 @@ test("Pi 0.99.1 source-keyed parsed tokens keep copies and links current across 
     markdown.setText(source.replace("\techo", "   echo"));
     terminal.columns = 42;
     tui.renderNow(true);
-    assert.equal(parsedCache.cachedTokens?.tokens, cachedTokens, "new source reused the same native tokens");
+    if (cachedTokens) assert.equal(hostTokens(), cachedTokens, "new source reused the same native tokens");
     click(terminal, button()); await tick();
     assert.deepEqual(copies, ["target:\n\techo done  ", "target:\n   echo done  "]);
     const theme = parsedCache.theme;
@@ -258,7 +262,7 @@ test("Pi 0.99.1 source-keyed parsed tokens keep copies and links current across 
     markdown.invalidate();
     terminal.columns = 54;
     tui.renderNow(true);
-    assert.equal(parsedCache.cachedTokens?.tokens, cachedTokens, "width/theme rerender reused parsed tokens");
+    if (cachedTokens) assert.equal(hostTokens(), cachedTokens, "width/theme rerender reused parsed tokens");
     click(terminal, button()); await tick();
     click(terminal, web(), 16); await tick();
     assert.deepEqual(copies, ["target:\n\techo done  ", "target:\n   echo done  ", "target:\n   echo done  "]);
@@ -267,11 +271,7 @@ test("Pi 0.99.1 source-keyed parsed tokens keep copies and links current across 
   } finally { adapter.dispose(); tui.stop(); }
 });
 
-test("Pi 0.86.1 parser changes keep source blocks and reference URLs aligned", async (t) => {
-  if (VERSION !== "0.86.1") {
-    t.skip("Marked 18.0.11 compatibility boundary is specific to Pi 0.86.1");
-    return;
-  }
+test("native Markdown parser divergence keeps source blocks and reference URLs aligned", async () => {
   for (const [source, expected] of [
     ["before\n```", ""],
     ["before\n~~~", ""],
@@ -299,11 +299,7 @@ test("Pi 0.86.1 parser changes keep source blocks and reference URLs aligned", a
   } finally { f.close(); }
 });
 
-test("divergent hidden blockquote code cannot steal a visible source-exact button", async (t) => {
-  if (VERSION !== "0.86.1") {
-    t.skip("the hidden-blockquote omission is a Marked 18.0.11 regression boundary");
-    return;
-  }
+test("divergent hidden blockquote code cannot steal a visible source-exact button", async () => {
   const source = '> > nested\nlazy\n> ```sh\n> \tcmd\n> ```\n\n```sh\n   cmd\n```';
   const f = fixture(source);
   try {

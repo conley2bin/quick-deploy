@@ -262,9 +262,9 @@ test("assistant error state latches every failure and clears only on assistant/m
   assert.equal(nextAssistantErrorState(false, "message_end", { role: "toolResult", isError: true }), false);
 });
 
-test("0.56 async-started ownership filters on root Pi session file identity", () => {
+test("async-started ownership filters on root Pi session file identity", () => {
   const sessionFile = "/home/tester/.pi/agent/sessions/sanitized/session.jsonl", uuid = "01a03c1f-ae52-7704-9158-f7e095fb736d";
-  assert.equal(sessionIdOf({ getSessionFile: () => sessionFile, getSessionId: () => uuid }), sessionFile, "installed pi-subagents 0.56 uses session file before UUID");
+  assert.equal(sessionIdOf({ getSessionFile: () => sessionFile, getSessionId: () => uuid }), sessionFile, "root session identity prefers session file over UUID");
   assert.equal(sessionIdOf({ getSessionFile: () => "", getSessionId: () => uuid }), uuid);
   assert.deepEqual(childFromStartedPayload({ id: "r1", asyncDir: "/tmp/a", sessionId: sessionFile }, sessionFile), { id: "r1", asyncDir: "/tmp/a" });
   const routed = childFromStartedPayload({ id: "r1", asyncDir: "/tmp/a", sessionId: sessionFile, nestedRoute: { rootRunId: "r1", eventSink: "/tmp/sidecar/events.jsonl", controlInbox: "/tmp/sidecar/control.jsonl", capabilityToken: "cap" } }, sessionFile);
@@ -310,7 +310,7 @@ test("active-index restoration uses configured root and filters real session fil
   assert.deepEqual([...state.activeIds], ["restored-live"]);
 });
 
-test("pi-subagents 0.56 snapshots project activity, attention recovery, and siblings", () => {
+test("pi-subagents async snapshots project activity, attention recovery, and siblings", () => {
   const waiting = { id: "wait", kind: "subagent", label: "child", state: "running", updatedAt: 100, activity: { state: "needs_attention", lastActivityAt: 100 } };
   const executing = { id: "go", kind: "subagent", label: "child", state: "running", updatedAt: 101, activity: { state: "active_long_running", lastActivityAt: 101, currentToolStartedAt: 101 } };
   const snapshot = { kind: "pi-subagents.async-status-snapshot", version: 1, generatedAt: 102, caps: {}, omitted: {}, runs: [{ id: "root", kind: "workflow", label: "wf", state: "running", children: [waiting, executing] }] };

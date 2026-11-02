@@ -8,7 +8,7 @@ import { createInterface } from "node:readline";
 import { nestedPublisherDisabled } from "../index.ts";
 import * as recovery from "../recovery.mjs";
 
-// Root-only identity. pi-subagents 0.75 hosts async children in runner processes:
+// Root-only identity. A child host runs async children in runner processes:
 // the exec environment inherits TMUX/TMUX_PANE and carries PARENT_SESSION, and
 // subagent-runner.js sets PI_SUBAGENT_CHILD=1 at module load, after exec and
 // before any child session loads ambient extensions. Without that marker in the
@@ -127,7 +127,7 @@ test("identity: the pi-subagents child-host marker or legacy depth marks a neste
   }
 });
 
-test("AC1: a live 0.75 child host holding a terminal 429 in the parent's pane is silent, so the healthy root's window never turns red", async (t) => {
+test("AC1: a live child host (PI_SUBAGENT_CHILD=1) holding a terminal 429 in the parent's pane is silent, so the healthy root's window never turns red", async (t) => {
   const f = await paneFixture(t, "runner-429");
   assert.equal(f.registrations.filter((name) => name === "on:message_end").length, 2, "root installs recovery and presentation");
   assert.ok(f.tmuxCallsFrom(process.pid).length > 0, "root resolves its tmux identity");

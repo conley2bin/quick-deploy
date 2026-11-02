@@ -9,7 +9,7 @@ ownership_upgrade="$patch_dir/stage-c-ownership-fixes.patch"
 notice_upgrade="$patch_dir/stage-c-notice-removal.patch"
 
 [ "$mode" = check ] || [ "$mode" = apply ] || { echo "unknown mode: $mode" >&2; exit 2; }
-[ "$(node -p "require('$root/package.json').version")" = "0.2.0" ] || { echo 'expected pi-tmux-images 0.2.0' >&2; exit 1; }
+# Applicability is decided only by the exact source hashes below, never by package.json version.
 [ "$(sha256sum "$patch_file" | awk '{print $1}')" = f233b9eb57668791eb3159e80f68c6e26dc84816d4793fe910fa9e371a263dff ] || { echo 'unexpected replay patch digest' >&2; exit 1; }
 [ "$(sha256sum "$review_upgrade" | awk '{print $1}')" = 4898db2958ee9c4541e468fc388dd663b9b1633df97de1abfe42cdabd787d46b ] || { echo 'unexpected review upgrade patch digest' >&2; exit 1; }
 [ "$(sha256sum "$ownership_upgrade" | awk '{print $1}')" = 61b262f43893e8c8ac48b1ff9b23e44c095c5edc4ef769fe10375c33d159135d ] || { echo 'unexpected ownership upgrade patch digest' >&2; exit 1; }

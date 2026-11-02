@@ -2,7 +2,7 @@
 
 ## Active scope
 
-This directory carries the capability repair and guarded Stage C read-preview upgrade for `pi-tmux-images@0.2.0`. `pane-passthrough-policy.patch` changes only `src/capabilities.ts`. The earlier unconditional placement replay is retired. `retire-placement-replay.patch` is a one-way removal patch for installations that received it; it is not an installation patch for pristine packages.
+This directory carries the capability repair and guarded Stage C read-preview upgrade for `pi-tmux-images` sources whose files match the exact hashes below. Admission is by source hash only; `0.2.0`, the directory name, and the registry/hash records under Provenance describe where those sources came from and are not an applicability condition. `pane-passthrough-policy.patch` changes only `src/capabilities.ts`. The earlier unconditional placement replay is retired. `retire-placement-replay.patch` is a one-way removal patch for installations that received it; it is not an installation patch for pristine packages.
 
 `stage-c-recent-cache.patch` is the cumulative exact-source Stage C replay. It retains the newest 16 read resources, evicts the oldest resource before later admission, restores newest entries incrementally within the 64 MiB decoded-PNG budget, and leaves older custom history visible as wrapped expired notices. Suitable PNGs are fully decoded for validity and then retain their exact encoded bytes and bit depth. Automatic failures persist as wrapped entries instead of disappearing; encoded-input overflow records bounded origin/length metadata without payload hashing, decoding, or copying. All graphics use the public versioned `pi-inline-images` bridge; the old runtime retains no terminal IDs, placement/upload maps, native `Image` branch, or writer fallback.
 
@@ -66,7 +66,6 @@ Kitty commands still use `q=2`, so the runtime receives no upload or placement a
 Run from the root of the installed `pi-tmux-images` package. Set `PATCH_DIR` to this directory. Every hash check must succeed; stop and inspect rather than overwrite if it does not.
 
 ```bash
-test "$(node -p "require('./package.json').version")" = 0.2.0
 test "$(sha256sum src/runtime.ts | cut -d' ' -f1)" = \
   7db69da01c21617b6ceed3f6f67ef7cc5d9428ee850008accd6dbcbcfa2bca25
 patch --dry-run -p1 < "$PATCH_DIR/retire-placement-replay.patch"
@@ -89,10 +88,9 @@ A running Pi process must reload or restart before it uses changed package sourc
 
 ## Pristine installation: capability repair only
 
-Run from an unmodified `pi-tmux-images@0.2.0` package. Do not apply a placement patch.
+Run from a package whose sources match the pristine hashes checked below (originally the unmodified `pi-tmux-images@0.2.0`; the version label is provenance, not a check). Do not apply a placement patch.
 
 ```bash
-test "$(node -p "require('./package.json').version")" = 0.2.0
 test "$(sha256sum src/runtime.ts | cut -d' ' -f1)" = \
   4d9aadc3b5f6fd76f3a90cadb071a6b49c66a3e86063285a863e01c0bbd4580d
 test "$(sha256sum src/capabilities.ts | cut -d' ' -f1)" = \
@@ -105,7 +103,7 @@ test "$(sha256sum src/capabilities.ts | cut -d' ' -f1)" = \
   c7272ee59ebc5f78c96c1740fcbcdf57cdc2480475241292cb91d3e158e0625a
 ```
 
-An npm reinstall/update can overwrite the local capability repair. Re-verify the exact package version and pristine hashes before replaying it.
+An npm reinstall/update can overwrite the local capability repair. Re-verify the exact source hashes (not the package version) before replaying it.
 
 ## Captured-output regression tests
 

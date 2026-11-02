@@ -9,10 +9,11 @@ export const RECOVERY_CANCEL_EVENT = "pi-tmux-window-status:cancel";
 export const CANCEL_SENTINEL = "\x1b[997;1~";
 const RETRY_EXHAUSTED_ABORT = /^aborted after \d+ retry attempts?$/i;
 
-// Root-only identity shared with tmux presentation. pi-subagents >= 0.75 hosts
-// child sessions in runner processes that set PI_SUBAGENT_CHILD=1 before any
-// ambient extension loads (after exec, so /proc/<pid>/environ omits it); 0.56
-// marked nested Pi with PI_SUBAGENT_DEPTH > 0. PI_SUBAGENT_PARENT_SESSION is
+// Root-only identity shared with tmux presentation. A child-session host
+// process sets the child-host marker PI_SUBAGENT_CHILD=1 before any ambient
+// extension loads (after exec, so /proc/<pid>/environ omits it); the legacy
+// depth marker PI_SUBAGENT_DEPTH > 0 is honored the same way. No version is
+// consulted. PI_SUBAGENT_PARENT_SESSION is
 // routing data that root hosts may inherit, and PI_SUBAGENT_MAX_DEPTH is a
 // spawn limit: neither identifies a child. Callers evaluate at registration.
 export function isNestedSubagentProcess(env = process.env) {

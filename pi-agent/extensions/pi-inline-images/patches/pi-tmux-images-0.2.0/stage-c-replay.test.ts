@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { appendFileSync, cpSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { appendFileSync, cpSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 import test from "node:test";
@@ -86,5 +86,61 @@ test("Stage C replay is exact-source guarded and idempotent before or after depl
     assert.throws(() => run("apply", copy), /unknown\/partial pi-tmux-images source state/u);
   } finally {
     rmSync(copy, { recursive: true, force: true });
+  }
+});
+
+// Replay applicability is a property of the exact source bytes. The package.json
+// version label is not part of the decision in either direction.
+function reverseTo(copy: string, patches: string[]): void {
+  for (const file of patches) execFileSync("patch", ["-R", "-d", copy, "-p1"], { input: readFileSync(file), stdio: ["pipe", "pipe", "pipe"] });
+}
+function relabel(root: string, version: string): void {
+  const file = resolve(root, "package.json");
+  writeFileSync(file, JSON.stringify({ ...JSON.parse(readFileSync(file, "utf8")), version }, null, 2));
+}
+function tree(root: string): string[] {
+  return [...files, "package.json"].map((file) => {
+    try { return readFileSync(resolve(root, file)).toString("base64"); } catch { return "absent"; }
+  });
+}
+function fail(mode: "check" | "apply", root: string): string {
+  try { run(mode, root); } catch (error) { return String((error as { stderr?: unknown }).stderr); }
+  return "";
+}
+
+test("Stage C replay outcome is independent of package.json version but rejects unknown source bytes", () => {
+  const base = mkdtempSync(resolve(tmpdir(), "pi-tmux-images-stage-c-version-"));
+  try {
+    const original = resolve(base, "original");
+    const relabeled = resolve(base, "relabeled");
+    cpSync(installed, original, { recursive: true });
+    // Reach the previously deployed legacy-patched source from whatever known state is installed,
+    // so the version-independent result includes real patch application, not just the digest check.
+    if (run("check", original) === "pristine") run("apply", original);
+    if (run("check", original) === "patched") reverseTo(original, [noticeUpgrade]);
+    reverseTo(original, [ownershipUpgrade, reviewUpgrade]);
+    assert.equal(run("check", original), "legacy-patched");
+    cpSync(original, relabeled, { recursive: true });
+    for (const version of ["0.2.1", "9.9.9", "0.0.0-local"]) {
+      relabel(relabeled, version);
+      assert.equal(run("check", relabeled), "legacy-patched", `check is the same under version ${version}`);
+    }
+    assert.equal(run("apply", original), "patched");
+    assert.equal(run("apply", relabeled), "patched");
+    assert.deepEqual(tree(relabeled).slice(0, files.length), tree(original).slice(0, files.length), "relabeled package ends byte-identical in every patched source");
+    assert.equal(JSON.parse(readFileSync(resolve(relabeled, "package.json"), "utf8")).version, "0.0.0-local", "replay never rewrites the version label");
+
+    // An unknown source stays rejected under both the historical and a different label, leaving the target untouched.
+    appendFileSync(resolve(relabeled, "src/runtime.ts"), "\n// unknown edit\n");
+    for (const version of ["0.2.0", "9.9.9"]) {
+      relabel(relabeled, version);
+      const before = tree(relabeled);
+      for (const mode of ["check", "apply"] as const) {
+        assert.match(fail(mode, relabeled), /unknown\/partial pi-tmux-images source state/u, `${mode} rejects unknown bytes under version ${version}`);
+      }
+      assert.deepEqual(tree(relabeled), before, "rejected replay leaves the target byte-identical");
+    }
+  } finally {
+    rmSync(base, { recursive: true, force: true });
   }
 });

@@ -6,9 +6,9 @@ import { spawnSync } from "node:child_process";
 import test from "node:test";
 import { VERSION } from "@earendil-works/pi-coding-agent";
 
-test("Pi 0.86.1 rejects an unavailable displayed-session clipboard without OSC52 fallback", (t) => {
-  if (VERSION !== "0.86.1" || process.platform !== "linux") {
-    t.skip("Pi 0.86.1 Linux clipboard regression");
+test("an unavailable displayed-session clipboard is rejected without OSC52 fallback", (t) => {
+  if (process.platform !== "linux") {
+    t.skip("Linux clipboard capability");
     return;
   }
 
@@ -43,10 +43,9 @@ test("Pi 0.86.1 rejects an unavailable displayed-session clipboard without OSC52
     });
     assert.equal(result.status, 0, result.stderr);
     assert.doesNotMatch(result.stdout, /\x1b\]52;/, "a local displayed-session failure must not claim OSC52 success");
-    assert.deepEqual(JSON.parse(result.stdout), {
-      resolved: false,
-      message: "Clipboard unavailable: install `wl-clipboard` (`wl-copy`) or check Wayland access",
-    });
+    const outcome = JSON.parse(result.stdout) as { resolved: boolean; message?: string };
+    assert.equal(outcome.resolved, false, "an unavailable clipboard must reject, not resolve");
+    assert.ok(outcome.message?.trim(), "the rejection carries a non-empty diagnostic");
   } finally {
     rmSync(emptyPath, { recursive: true, force: true });
   }

@@ -133,7 +133,7 @@ function nodeIsActive(node, attentionWatermarks) {
   return true;
 }
 
-/** Projects pi-subagents 0.56 AsyncStatus roots, snapshot nodes, and nested workflow steps. */
+/** Projects pi-subagents AsyncStatus roots, snapshot nodes, and nested workflow steps. */
 export function seedAttentionWatermarksFromSnapshot(status, attentionWatermarks) {
   const nodes = new Map();
   if (!status || typeof status !== "object") return attentionWatermarks;

@@ -32,8 +32,10 @@ const runTmux: TmuxRun = async (args) => {
 };
 
 /** Send the event-context client PID before tmux's original mouse event. Only
- * the exact tmux 3.4 stock down binding may be adopted: its select-pane runs
- * first in both branches, and an unowned pane still runs stock send-keys -M.
+ * the exact stock down binding may be adopted, whatever tmux version printed
+ * it: its select-pane runs first in both branches, an unowned pane still runs
+ * stock send-keys -M, and the installed command is verified canonically. The
+ * injected `run-shell -C` is required from list-commands before any change.
  * Older extension bindings are upgraded only with their exact stored receipt.
  * Shared guarded keys remain inert after the last pane owner unloads.
  */
@@ -55,6 +57,13 @@ export async function enableTmuxMouse(
     if (result.code !== 0) throw new Error(`tmux ${args[0]}: ${result.stderr.trim() || result.code}`);
     return result.stdout.trim();
   };
+  // Every injected binding runs `run-shell -C`; without it the true branch would
+  // fail and drop the original send-keys -M. Probe the command's own usage line
+  // (read-only) instead of inferring capability from a version string.
+  const usage = await checked(["list-commands", "run-shell"]);
+  if (!/^run-shell\b[^\[]*\[-[A-Za-z]*C[A-Za-z]*\]/mu.test(usage)) {
+    throw new Error("tmux run-shell lacks -C; mouse bindings left untouched");
+  }
   const warnings: string[] = [];
   for (const key of MOUSE_KEYS) {
     const current = await call(["list-keys", "-T", "root", key]);
@@ -64,8 +73,6 @@ export async function enableTmuxMouse(
     const stockDown = key === "MouseDown1Pane" && current.code === 0 && current.stdout.trim() === STOCK_DOWN;
     const priorKey = "@pi-copy-links-prior-MouseDown1Pane";
     if (stockDown) {
-      const version = await checked(["-V"]);
-      if (version !== "tmux 3.4") { warnings.push(key); continue; }
       const prior = await checked(["show-options", "-sqv", priorKey]);
       if (prior && prior !== STOCK_DOWN) { warnings.push(key); continue; }
       await checked(["set-option", "-s", priorKey, STOCK_DOWN]);

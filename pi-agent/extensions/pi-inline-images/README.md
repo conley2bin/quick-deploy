@@ -7,13 +7,16 @@ model context retain the original Markdown bytes.
 
 ## Requirements
 
-- Pi `>=0.85.1` (`@earendil-works/pi-coding-agent` / `pi-tui` host peers). `0.85.1` is the
-  fully verified reference release. Other releases are admitted through a runtime capability
-  probe: the adapter tries to adapt, and only an observed contract failure (missing or
+- A Pi host that exposes the TUI/session contract the adapter probes (`@earendil-works/pi-coding-agent` / `pi-tui`
+  host peers are unconstrained). Compatibility is decided by observed capability, not by a
+  version range: the adapter tries to adapt, and only an observed contract failure (missing or
   throwing entry projector, ambiguous component contract, irreversible method override,
   failed suppression postcondition) degrades the affected preview to a notice naming the
-  concrete reason and the Pi version.
-- Node `>=22.19`
+  concrete reason and the Pi version. Pi `0.85.1` is the release the contract was first
+  verified against (historical record, not a requirement).
+- A Node runtime providing the APIs the extension and its `sharp` dependency use. Missing
+  APIs surface as load-time errors rather than a declared Node range; the Node version
+  this was developed against (`22.19`) is a historical record, not a requirement.
 - Ghostty, Kitty, or WezTerm with Kitty graphics support
 - Under tmux, the originating pane's effective `allow-passthrough` must be `on`
   or `all`. The viewer monitor never uploads while that pane is not visibly

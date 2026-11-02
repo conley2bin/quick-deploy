@@ -20,7 +20,9 @@ const direct: InputTopology = Object.freeze({
   kind: "local", basis: "terminal", hops: Object.freeze([{ ...hop, role: "terminal" as const }]),
 });
 
-function server(version = "tmux 3.4") {
+// tmux -V is never needed: any version query throws, so no-V admission is asserted.
+const RUN_SHELL_USAGE = "run-shell (run) [-bC] [-c start-directory] [-d delay] [-t target-pane] [shell-command]";
+function server(runShellUsage = RUN_SHELL_USAGE) {
   const keys = new Map<string, string>([["MouseDown1Pane", STOCK_DOWN]]);
   const options = new Map<string, string>();
   const calls: string[][] = [];
@@ -28,7 +30,8 @@ function server(version = "tmux 3.4") {
     calls.push(all);
     assert.deepEqual(all.slice(0, 2), ["-S", "/fixture/socket,with-comma"]);
     const args = all.slice(2), command = args[0];
-    if (command === "-V") return { code: 0, stdout: version, stderr: "" };
+    if (command === "-V") throw new Error("tmux -V must not gate adoption");
+    if (command === "list-commands") return { code: 0, stdout: runShellUsage + "\n", stderr: "" };
     if (command === "list-keys") return keys.has(args[3]!) ?
       { code: 0, stdout: keys.get(args[3]!)! + "\n", stderr: "" } :
       { code: 1, stdout: "", stderr: "unknown key" };
@@ -48,7 +51,7 @@ function bindingCall(calls: string[][], key: string) {
   return calls.find((args) => args[2] === "bind-key" && args[5] === key);
 }
 
-test("tmux 3.4 stock down is adopted after exact match; mouse marker follows selection", async () => {
+test("exact stock down is adopted without querying tmux -V; mouse marker follows selection", async () => {
   const f = server();
   const first = await enableTmuxMouse(topology, env, f.run);
   assert.equal(first.enabled, true); assert.deepEqual(first.warnings, []);
@@ -87,15 +90,35 @@ test("receipt-owned legacy Ctrl bindings upgrade; forged and foreign bindings st
   await result.dispose();
 });
 
-test("non-stock mouse down and non-3.4 stock stay untouched and warn", async () => {
-  for (const [version, value] of [["tmux 3.3", STOCK_DOWN], ["tmux 3.4", "foreign pane binding"]]) {
-    const f = server(version);
-    f.keys.set("MouseDown1Pane", value!);
-    const result = await enableTmuxMouse(topology, env, f.run);
-    assert.deepEqual(result.warnings, ["MouseDown1Pane"]);
-    assert.equal(f.keys.get("MouseDown1Pane"), value);
-    await result.dispose();
+test("recognized stock down is adopted regardless of tmux version; unrecognized stays untouched", async () => {
+  const f = server();
+  const result = await enableTmuxMouse(topology, env, f.run);
+  assert.deepEqual(result.warnings, []);
+  assert.equal(f.keys.get("MouseDown1Pane"), STOCK_TAGGED);
+  assert.ok(f.calls.every((args) => !args.includes("-V")), "version is never queried");
+  await result.dispose();
+  for (const value of ["foreign pane binding", STOCK_DOWN.replace("select-pane", "select-pane -Z")]) {
+    const g = server();
+    g.keys.set("MouseDown1Pane", value);
+    const rejected = await enableTmuxMouse(topology, env, g.run);
+    assert.deepEqual(rejected.warnings, ["MouseDown1Pane"]);
+    assert.equal(g.keys.get("MouseDown1Pane"), value);
+    await rejected.dispose();
   }
+});
+
+test("run-shell without -C is refused before any key, receipt or pane marker is written", async () => {
+  const f = server("run-shell (run) [-b] [-c start-directory] [-d delay] [-t target-pane] [shell-command]");
+  await assert.rejects(() => enableTmuxMouse(topology, env, f.run), /run-shell lacks -C/);
+  assert.equal(f.keys.get("MouseDown1Pane"), STOCK_DOWN);
+  assert.equal(f.keys.size, 1);
+  assert.equal(f.options.size, 0);
+  assert.deepEqual(f.calls.map((args) => args[2]), ["list-commands"], "only the capability probe ran");
+  const present = server();
+  const ok = await enableTmuxMouse(topology, env, present.run);
+  assert.deepEqual(ok.warnings, []);
+  assert.deepEqual(present.calls[0]!.slice(2), ["list-commands", "run-shell"]);
+  await ok.dispose();
 });
 
 test("pane marker cleanup restores prior ownership but never removes a later owner", async () => {
