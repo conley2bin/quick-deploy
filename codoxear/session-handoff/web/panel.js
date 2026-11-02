@@ -184,7 +184,11 @@
       onUI(retry, 'click', () => { syncSelection(); controller.recover(); });
       onUI(bypass, 'click', () => { syncSelection(); controller.continueUnreviewed(); });
       onUI(link, 'click', e => { e.preventDefault(); syncSelection(); const id = controller.view().op?.target_session_id; if (id) win.location.replace(targetURL(win.location.href, id)); });
-      onUI(done, 'click', () => { syncSelection(); controller.forget(); draft().note = ''; render(controller.view()); button.focus(); });
+      onUI(done, 'click', () => {
+        syncSelection(); controller.forget();
+        if (!controller.view().reference) { draft().note = ''; draft().open = false; }
+        render(controller.view()); button.focus();
+      });
       render(controller.view());
       if (controller.view().reference?.operation_id && !controller.view().op && !doc.hidden) controller.poll();
     }

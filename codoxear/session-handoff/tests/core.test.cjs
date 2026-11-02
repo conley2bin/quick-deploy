@@ -31,6 +31,15 @@ test('A pending start never blocks B; late A cannot render or replace B', async 
   r.c.select('source'); assert.equal(r.c.view().op.id, oid);
   assert.equal(r.values.size, 2); assert(![...r.values.values()].join('').includes('private'));
 });
+test('late A success cannot clear B unknown-start error or recovery UUID', async () => {
+  let resolveA;
+  const r = rig((route, body) => body.source_session_id === 'source' ? new Promise(resolve => resolveA = resolve) : Promise.reject(Error('B offline')));
+  const a = r.c.start('source'); r.c.select('other'); await r.c.start('other');
+  const before = r.c.view(), persisted = r.values.get(sourceKey('other'));
+  resolveA({ operation: op() }); await a;
+  assert.equal(r.c.view().error, before.error); assert.match(r.c.view().error, /结果未知/);
+  assert.equal(r.values.get(sourceKey('other')), persisted); await r.c.start('other'); assert.equal(r.calls.length, 2);
+});
 test('prefix is from own namespace script and rejects cross origin', () => {
   assert.equal(Core.namespace('https://x/nested/__session_handoff__/a.hash.js', 'https://x'), 'https://x/nested/__session_handoff__/');
   assert.throws(() => Core.namespace('https://evil/__session_handoff__/asset.js', 'https://x'));
@@ -105,6 +114,15 @@ test('unknown A holds same-source lease but allows B; forget only terminal selec
 test('request UUID works without secure-context randomUUID and is version 4', () => {
   assert.equal(Core.requestUUID({ getRandomValues: a => a.fill(255) }), 'ffffffff-ffff-4fff-bfff-ffffffffffff');
 });
+test('in-flight status cannot erase a same-operation continuation persisted by another tab', async () => {
+  let resolveStatus;
+  const r = rig(route => route === 'status' ? new Promise(resolve => resolveStatus = resolve) : { operation: op('unreviewed', { can_continue_unreviewed: true }) });
+  await r.c.start('source'); const polling = r.c.poll();
+  r.values.set(sourceKey('source'), JSON.stringify({ operation_id: oid, source_session_id: 'source', pending_action: 'continue' }));
+  resolveStatus({ operation: op('unreviewed', { can_continue_unreviewed: true }) }); await polling;
+  await r.c.continueUnreviewed(); assert.equal(r.calls.filter(c=>c.route==='continue').length,0);
+  assert.equal(JSON.parse(r.values.get(sourceKey('source'))).pending_action,'continue');
+});
 test('accepted continuation without state advancement cannot be sent twice', async () => {
   const r = rig(() => ({ operation: op('unreviewed', { can_continue_unreviewed: true }) }));
   await r.c.start('source'); await r.c.continueUnreviewed(); await r.c.continueUnreviewed();
@@ -128,8 +146,9 @@ test('legacy pending source moves after successful write, never replays automati
   const raw = JSON.stringify({ request_id: rid, source_session_id: 'source' }), r = rig(() => ({ operation: op() }), raw);
   await r.c.migrateLegacy(); assert.equal(r.calls.length, 0); assert(!r.values.has('key')); assert(r.values.has(sourceKey('source')));
   const failed = rig(() => ({ operation: op() }), raw); failed.storage.setItem = () => { throw Error('quota'); };
-  // Reinsert legacy to exercise a later retry as well as initial migration.
-  failed.values.set('key', raw); await failed.c.migrateLegacy(); assert.equal(failed.values.get('key'), raw);
+  await failed.c.migrateLegacy(); assert.equal(failed.values.get('key'), raw);
+  await failed.c.start('source'); assert.equal(failed.calls.length, 0); // Same A remains locked on failed migration.
+  assert.equal(failed.values.get('key'), raw);
 });
 test('unsourced legacy operation asynchronously adopts returned A while B selected', async () => {
   let resolve; const raw = JSON.stringify({ operation_id: oid, pending_action: 'continue' });

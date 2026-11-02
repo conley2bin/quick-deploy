@@ -124,6 +124,10 @@
         const next = operation((await post(kind, body)).operation);
         if (stopped) return;
         if (next.source_session_id !== s.source || (kind !== 'start' && next.id !== body.operation_id)) throw Error('接力响应身份不匹配');
+        // A status already in flight must not erase a continuation saved by
+        // another tab (or still in the legacy key) for this same operation.
+        const saved = read(s.source), legacy = retained(storage.getItem(key));
+        if ([saved, legacy].some(r => r?.operation_id === next.id && r.pending_action === 'continue')) s.uncertainContinue = true;
         // Same-source server coalescing may legitimately return a different UUID.
         s.op = next;
         s.uncertainContinue = s.uncertainContinue && next.status === 'unreviewed';
