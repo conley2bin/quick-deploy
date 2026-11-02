@@ -9,6 +9,18 @@ export const RECOVERY_CANCEL_EVENT = "pi-tmux-window-status:cancel";
 export const CANCEL_SENTINEL = "\x1b[997;1~";
 const RETRY_EXHAUSTED_ABORT = /^aborted after \d+ retry attempts?$/i;
 
+// Root-only identity shared with tmux presentation. pi-subagents >= 0.75 hosts
+// child sessions in runner processes that set PI_SUBAGENT_CHILD=1 before any
+// ambient extension loads (after exec, so /proc/<pid>/environ omits it); 0.56
+// marked nested Pi with PI_SUBAGENT_DEPTH > 0. PI_SUBAGENT_PARENT_SESSION is
+// routing data that root hosts may inherit, and PI_SUBAGENT_MAX_DEPTH is a
+// spawn limit: neither identifies a child. Callers evaluate at registration.
+export function isNestedSubagentProcess(env = process.env) {
+  if (env.PI_SUBAGENT_CHILD === "1") return true;
+  const depth = Number(env.PI_SUBAGENT_DEPTH);
+  return Number.isFinite(depth) && depth > 0;
+}
+
 export function isManualEscapePress(data) {
   if (data === "\x1b") return true;
   const kitty = data.match(/^\x1b\[27(?::(\d*))?(?::(\d+))?(?:;(\d+))?(?::(\d+))?u$/);
@@ -47,7 +59,7 @@ export function semanticAssistantOutput(message) {
 
 export function installErrorRecovery(pi) {
   // Child failures belong to their supervisor, as in the previous recovery policy.
-  if (Number(process.env.PI_SUBAGENT_DEPTH || 0) > 0) return;
+  if (isNestedSubagentProcess()) return;
   let timer, lastCtx, activeRunSignal, errorAt, terminalUnsubscribe, cancelUnsubscribe;
   let sessionActive = false, settled = false, sends = 0;
   let lastSentAt = -Infinity, inputNotBefore = -Infinity;

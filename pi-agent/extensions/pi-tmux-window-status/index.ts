@@ -7,7 +7,7 @@ import { fileURLToPath } from "node:url";
 import { aggregateLogicalState, HEARTBEAT_MS, projectAsyncStatus, publishLease, seedAttentionWatermarksFromSnapshot } from "./state.mjs";
 export { RECOVERY_ARMED_OPTION } from "./state.mjs";
 import { requestAnimatorTick } from "./animator.mjs";
-import { RECOVERY_CANCEL_EVENT, installErrorRecovery, isAssistantError, recoveryTerminalInput, semanticAssistantOutput } from "./recovery.mjs";
+import { RECOVERY_CANCEL_EVENT, installErrorRecovery, isAssistantError, isNestedSubagentProcess, recoveryTerminalInput, semanticAssistantOutput } from "./recovery.mjs";
 export { CANCEL_SENTINEL, isAssistantError, isManualEscapePress, recoveryTerminalInput } from "./recovery.mjs";
 const STARTED = "subagent:async-started", COMPLETE = "subagent:async-complete", CONTROL = "subagent:control-event";
 const HERE = dirname(fileURLToPath(import.meta.url)), ANIMATOR = join(HERE, "animator.mjs");
@@ -28,7 +28,7 @@ function statusTerminal(status: unknown) { return terminal(object(status)?.state
 function stateOf(node: unknown) { const p = object(node); return typeof p?.state === "string" ? p.state : typeof p?.status === "string" ? p.status : undefined; }
 function idOf(node: unknown, fallback?: string) { const p = object(node); return typeof p?.id === "string" ? p.id : typeof p?.runId === "string" ? p.runId : fallback; }
 function isNestedLiveState(state: unknown) { return typeof state === "string" && !NESTED_TERMINAL.has(state); }
-export function nestedPublisherDisabled(env = process.env) { return Number(env.PI_SUBAGENT_DEPTH || 0) > 0; }
+export function nestedPublisherDisabled(env = process.env) { return isNestedSubagentProcess(env); }
 export function childStillRunning(child: { exitCode: number | null; signalCode: string | null } | null | undefined) { return Boolean(child) && child!.exitCode === null && child!.signalCode === null; }
 export function animatorSpawnNeeded(child: { exitCode: number | null; signalCode: string | null } | null | undefined, desired: boolean, force = false) { return Boolean(force || desired) && !childStillRunning(child); }
 /** Mirrors pi-subagents 0.56 resolveTempScopeId: configured root, then uid, then user/home fallback. */

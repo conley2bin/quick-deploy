@@ -10,7 +10,8 @@ import { pathToFileURL } from "node:url";
 async function harness(t) {
   const work = mkdtempSync(join(tmpdir(), "pi-attn-"));
   const previous = { ...process.env };
-  delete process.env.PI_SUBAGENT_DEPTH;
+  // Run as a root even when the suite itself runs inside a pi-subagents runner.
+  for (const key of ["PI_SUBAGENT_CHILD", "PI_SUBAGENT_DEPTH", "PI_SUBAGENT_PARENT_SESSION", "PI_SUBAGENT_MAX_DEPTH"]) delete process.env[key];
   process.env.QUICK_DEPLOY_PI_TMUX_WINDOW_STATUS_RUNTIME = join(work, "rt");
   process.env.PI_SUBAGENTS_TEMP_ROOT = join(work, "async");
   const moduleRoot = new URL("../", import.meta.url);

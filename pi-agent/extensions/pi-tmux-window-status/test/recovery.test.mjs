@@ -18,10 +18,13 @@ import {
 const RESET_MS = 28_800_000;
 const PERMISSION_ERROR = JSON.stringify({ type: "error", error: { type: "permission_error", message: "You've reached your concurrent request limit. Please wait for your ongoing requests to finish and try again." } });
 const failure = (errorMessage) => ({ role: "assistant", content: [], stopReason: "error", ...(errorMessage === undefined ? {} : { errorMessage }) });
+// The suite may itself run inside a pi-subagents runner (PI_SUBAGENT_CHILD=1).
+// Each harness starts as a root and restores the caller's markers afterwards.
+const SUBAGENT_IDENTITY_ENV = ["PI_SUBAGENT_CHILD", "PI_SUBAGENT_DEPTH", "PI_SUBAGENT_PARENT_SESSION", "PI_SUBAGENT_MAX_DEPTH"];
 
 function harness(t, { mode = "tui", depth, send, entry = extension } = {}) {
   const previous = { ...process.env };
-  for (const key of Object.keys(process.env)) if (key === "TMUX" || key.startsWith("TMUX_") || key === "PI_SUBAGENT_DEPTH") delete process.env[key];
+  for (const key of Object.keys(process.env)) if (key === "TMUX" || key.startsWith("TMUX_") || SUBAGENT_IDENTITY_ENV.includes(key)) delete process.env[key];
   if (depth !== undefined) process.env.PI_SUBAGENT_DEPTH = String(depth);
   t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 1_000_000 });
   const handlers = new Map(), channels = new Map(), inputs = new Set(), sent = [], sentAt = [], diagnostics = [];

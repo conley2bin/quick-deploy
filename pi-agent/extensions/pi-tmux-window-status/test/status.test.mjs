@@ -11,6 +11,10 @@ import { ANIMATOR_URGENT_SIGNAL, ERROR_BG, ERROR_FG, ERROR_MS, FRAME_BLUE, FRAME
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT = resolve(HERE, "../../../..");
+// node --test runs this file in its own process. Simulate a root Pi for every
+// in-process factory and spawned fixture, even when the suite itself runs
+// inside a pi-subagents runner that set PI_SUBAGENT_CHILD=1.
+for (const key of ["PI_SUBAGENT_CHILD", "PI_SUBAGENT_DEPTH", "PI_SUBAGENT_PARENT_SESSION", "PI_SUBAGENT_MAX_DEPTH"]) delete process.env[key];
 const trash = [];
 const temp = () => { const d = mkdtempSync(join(tmpdir(), "pi-tmux-status-")); trash.push(d); return d; };
 afterEach(() => { while (trash.length) rmSync(trash.pop(), { recursive: true, force: true }); });
