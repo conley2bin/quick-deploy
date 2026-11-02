@@ -1,0 +1,481 @@
+"""One-shot Pi handoff, with durable intent and app-owned (not request-owned) work."""
+from __future__ import annotations
+
+import asyncio
+import json
+import math
+import os
+from pathlib import Path
+import stat
+import tempfile
+import time
+from urllib.parse import quote
+from uuid import UUID, uuid4
+
+from .context import ContextError, create_source_snapshot, prepare_artifacts, read_artifact
+from .prompts import build_recovery_prompt, build_review_prompt, build_continuation_prompt
+
+PUBLIC = ("id", "request_id", "source_session_id", "target_session_id", "status",
+          "message", "reviewed", "can_continue_unreviewed", "updated_at", "error_code")
+MESSAGES = {
+    "creating": "正在保存交接边界", "launching": "正在创建新的 Pi 会话",
+    "recovering": "新会话正在独立恢复并整理理解报告", "waiting_source": "等待原会话空闲后审阅",
+    "reviewing": "原会话正在审阅；原会话仅担任审阅者", "revising": "新会话正在核对审阅意见",
+    "ready": "新会话已提交接续回执并继续工作", "unreviewed": "原会话未完成校对，可明确选择未经校对继续",
+    "conflict": "目标存在分歧，需要用户确认", "creation_unknown": "创建结果不确定，未自动重建",
+    "delivery_unknown": "消息投递结果不确定，未自动重发", "interrupted": "服务中断，未重放任何创建或发送",
+    "failed": "接力未完成；请检查会话与交接产物",
+}
+FINISHED = {"ready", "conflict", "failed", "creation_unknown", "delivery_unknown", "interrupted"}
+# Unknown mutations remain source-locked: a new UUID must not disguise a retry.
+RELEASE_SOURCE = {"ready", "conflict", "failed"}
+
+
+class HandoffError(Exception):
+    def __init__(self, code: str, message: str, status: int = 409):
+        super().__init__(code)
+        self.code, self.message, self.status = code, message, status
+
+
+def uuid_text(value):
+    if not isinstance(value, str) or len(value) != 36:
+        raise HandoffError("invalid_input", "需要有效的 UUID", 400)
+    try:
+        parsed = str(UUID(value))
+    except ValueError:
+        raise HandoffError("invalid_input", "需要有效的 UUID", 400) from None
+    if parsed != value.lower():
+        raise HandoffError("invalid_input", "需要有效的 UUID", 400)
+    return parsed
+
+
+def private_dir(path: Path):
+    path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    info = path.lstat()
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
+        raise HandoffError("unsafe_state", "接力私有目录不可用", 500)
+    path.chmod(0o700)
+
+
+def atomic_state(path: Path, data: dict):
+    payload = json.dumps(data, ensure_ascii=False, separators=(",", ":")).encode()
+    if len(payload) > 128 * 1024:
+        raise HandoffError("state_too_large", "接力状态超过限制", 500)
+    fd, name = tempfile.mkstemp(prefix=".state-", dir=path.parent)
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            os.fchmod(stream.fileno(), 0o600)
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(name, path)
+        directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    finally:
+        if os.path.exists(name):
+            os.unlink(name)
+
+
+def read_private_json(path: Path):
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(fd, "rb") as stream:
+        info = os.fstat(stream.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+            raise HandoffError("unsafe_state", "接力私有状态不可用", 500)
+        data = stream.read(128 * 1024 + 1)
+        if len(data) > 128 * 1024:
+            raise HandoffError("unsafe_state", "接力私有状态不可用", 500)
+        return json.loads(data)
+
+
+def header_identity(row: dict):
+    """Only the authenticated row's bound file is evidence, never alias/cwd/newest."""
+    path = row.get("log_path")
+    if not isinstance(path, str) or not Path(path).is_absolute():
+        raise HandoffError("identity_missing", "会话的真实 Pi 日志身份尚未就绪")
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(fd, "rb") as stream:
+            info = os.fstat(stream.fileno())
+            if not stat.S_ISREG(info.st_mode):
+                raise ValueError("not regular")
+            line = stream.readline(64 * 1024 + 1)
+        if not line.endswith(b"\n") or len(line) > 64 * 1024:
+            raise ValueError("incomplete header")
+        header = json.loads(line)
+        ident = header.get("id")
+        if header.get("type") != "session" or not isinstance(ident, str) or not ident:
+            raise ValueError("not Pi")
+    except (OSError, ValueError, TypeError, AttributeError):
+        raise HandoffError("identity_changed", "会话绑定与真实 Pi 日志身份不一致") from None
+    return {"pi_session_id": ident, "log_path": path, "device": info.st_dev, "inode": info.st_ino}
+
+
+def binding(row):
+    return {key: row.get(key) for key in ("session_id", "broker_pid", "launch_id", "spawn_nonce")}
+
+
+def idle(row):
+    # Missing busy is not positive evidence of idle; queued/autonomous work is not idle.
+    return (row.get("busy") is False and not any(row.get(key) for key in
+            ("queue_len", "broker_queue_len", "commit_unknown_send", "pending_attachment",
+             "unattended_enabled", "lost")))
+
+
+class Engine:
+    def __init__(self, upstream_json, *, state_root=None, timeouts=None,
+                 clock=time.monotonic, sleep=asyncio.sleep):
+        self.upstream_json = upstream_json
+        self.root = Path(state_root or (Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state"))
+                                       / "codoxear/session-handoff")).absolute()
+        self.timeouts = {"native": 30.0, "launch": 120.0, "understanding": 900.0,
+                         "source_idle": 300.0, "review": 600.0, "resolution": 900.0, "poll": 0.5}
+        self.timeouts.update(timeouts or {})
+        if any(not isinstance(v, (int, float)) or not math.isfinite(v) or v <= 0 for v in self.timeouts.values()):
+            raise ValueError("deadlines must be finite and positive")
+        self.clock, self.sleep = clock, sleep
+        self.operations, self.requests, self.tasks, self.manifests = {}, {}, {}, {}
+        self.closed = False
+
+    def open(self):
+        private_dir(self.root)
+        for directory in self.root.iterdir():
+            if directory.is_symlink() or not directory.is_dir():
+                continue
+            try:
+                uuid_text(directory.name)
+            except HandoffError:
+                continue
+            private_dir(directory)
+            state_path = directory / "state.json"
+            if not state_path.exists():
+                continue
+            op = read_private_json(state_path)
+            if op.get("id") != directory.name or op.get("status") not in MESSAGES:
+                raise HandoffError("unsafe_state", "接力状态损坏，不能自动恢复", 500)
+            self.operations[op["id"]] = op
+            for request_id in op["request_ids"]:
+                self.requests[request_id] = op["id"]
+            if op["status"] not in FINISHED:
+                self._set(op, "interrupted", error_code="restart")
+        return self
+
+    def _persist(self, op):
+        atomic_state(self.root / op["id"] / "state.json", op)
+
+    def _set(self, op, status, **fields):
+        op.update(fields, status=status, message=MESSAGES[status], updated_at=time.time(),
+                  can_continue_unreviewed=status == "unreviewed")
+        self._persist(op)
+
+    def public(self, operation_id):
+        op = self.operations.get(uuid_text(operation_id))
+        if op is None:
+            raise HandoffError("not_found", "未找到接力操作", 404)
+        return {key: op[key] for key in PUBLIC if key in op}
+
+    async def sessions(self, cookie):
+        try:
+            status, data = await asyncio.wait_for(self.upstream_json(
+                "GET", "/api/sessions", cookie=cookie, timeout=self.timeouts["native"]), self.timeouts["native"])
+        except Exception:
+            raise HandoffError("native_unavailable", "原生会话服务暂不可用", 503) from None
+        if status in (401, 403):
+            raise HandoffError("authentication_required", "请重新登录原生页面", 401)
+        if status != 200 or not isinstance(data, dict) or not isinstance(data.get("sessions"), list):
+            raise HandoffError("native_unavailable", "无法验证原生会话列表", 503)
+        if any(not isinstance(row, dict) for row in data["sessions"]):
+            raise HandoffError("native_unavailable", "无法验证原生会话列表", 503)
+        return data["sessions"]
+
+    @staticmethod
+    def _row(rows, route):
+        matches = [r for r in rows if r.get("session_id") == route]
+        if len(matches) != 1:
+            raise HandoffError("identity_changed", "会话不存在或原生路由绑定已改变")
+        return matches[0]
+
+    def start(self, source_session_id, request_id, note, *, rows, cookie):
+        """No await between deduplication, intent storage, and task ownership."""
+        if self.closed:
+            raise HandoffError("shutting_down", "服务正在关闭", 503)
+        request_id = uuid_text(request_id)
+        if request_id in self.requests:
+            op = self.operations[self.requests[request_id]]
+            if op["source_session_id"] != source_session_id:
+                raise HandoffError("request_conflict", "同一请求标识不能用于不同会话")
+            return self.public(op["id"])
+        for op in self.operations.values():
+            if op["source_session_id"] == source_session_id and op["status"] not in RELEASE_SOURCE:
+                if len(op["request_ids"]) >= 256:
+                    raise HandoffError("request_limit", "此操作的重复请求过多，请使用原操作标识")
+                op["request_ids"].append(request_id)
+                self.requests[request_id] = op["id"]
+                self._persist(op)
+                return self.public(op["id"])
+        row = self._row(rows, source_session_id)
+        if row.get("agent_backend") != "pi":
+            raise HandoffError("unsupported_backend", "当前仅支持 Pi 会话接力", 422)
+        source_header = header_identity(row)
+        if not all(isinstance(row.get(k), str) and row[k] for k in ("cwd", "model_provider", "model", "reasoning_effort")):
+            raise HandoffError("settings_missing", "源会话的模型、提供商或推理设置尚未明确")
+        operation_id = str(uuid4())
+        directory = self.root / operation_id
+        private_dir(directory)
+        op = {"id": operation_id, "request_id": request_id, "request_ids": [request_id],
+              "source_session_id": source_session_id, "target_session_id": None, "reviewed": False,
+              "source_binding": binding(row), "source_header": source_header, "intents": {}}
+        self._set(op, "creating")
+        self.operations[operation_id], self.requests[request_id] = op, operation_id
+        self._schedule(op, lambda: self._run(op, cookie, dict(row), note))
+        return self.public(operation_id)
+
+    def _prepare(self, op, row, note):
+        # Run bounded transcript IO/projection outside the shared HTTP event loop.
+        snapshot = create_source_snapshot(Path(op["source_header"]["log_path"]))
+        if snapshot["session_id"] != op["source_header"]["pi_session_id"] or header_identity(row) != op["source_header"]:
+            raise HandoffError("identity_changed", "源会话在截取交接边界时发生变化")
+        directory = self.root / op["id"]
+        manifest = {"version": 1, "operation_id": op["id"],
+                    "source": {"session_id": op["source_session_id"], "pi_session_id": snapshot["session_id"],
+                               "cwd": row["cwd"], "snapshot": snapshot},
+                    "source_sha256": snapshot["sha256"], "note": note,
+                    "paths": {"operation_dir": str(directory), "source_context": str(directory / "source-context.md"),
+                              **{kind: str(directory / (kind + ".json")) for kind in ("understanding", "review", "resolution")}}}
+        prepare_artifacts(directory, manifest)
+        # Keep the bounded published manifest, not transient raw transcript entries.
+        return read_private_json(directory / "manifest.json")
+
+    def _schedule(self, op, factory):
+        task = asyncio.create_task(self._guard(op, factory), name="handoff-" + op["id"])
+        self.tasks[op["id"]] = task
+        task.add_done_callback(lambda done: self.tasks.pop(op["id"], None) if self.tasks.get(op["id"]) is done else None)
+
+    async def _guard(self, op, factory):
+        try:
+            await factory()
+        except asyncio.CancelledError:
+            if op["status"] not in FINISHED:
+                self._set(op, "interrupted", error_code="shutdown")
+            raise
+        except (ContextError, HandoffError) as exc:
+            self._set(op, "failed", error_code=exc.code if isinstance(exc, HandoffError) else "invalid_artifact")
+        except Exception:
+            self._set(op, "failed", error_code="workflow_error")
+
+    async def _mutation(self, op, cookie, stage, path, body):
+        if stage in op["intents"]:
+            raise HandoffError("duplicate_intent", "该阶段已发起，不会自动重试")
+        # Intent is fsynced before the first byte can reach native transport.
+        op["intents"][stage] = {"id": str(uuid4()), "result": "unknown"}
+        if stage != "create":
+            body = {**body, "send_id": op["intents"][stage]["id"]}
+        self._persist(op)
+        try:
+            status, data = await asyncio.wait_for(self.upstream_json(
+                "POST", path, cookie=cookie, body=body, timeout=self.timeouts["native"]), self.timeouts["native"])
+        except Exception:
+            status, data = None, None
+        if status != 200 or not isinstance(data, dict) or data.get("ok") is False or data.get("error") or data.get("commit_unknown"):
+            self._set(op, "creation_unknown" if stage == "create" else "delivery_unknown", error_code="native_mutation_unknown")
+            return None
+        op["intents"][stage]["result"] = "accepted"
+        self._persist(op)
+        return data
+
+    def _verify(self, op, rows, who):
+        row = self._row(rows, op[who + "_session_id"])
+        if row.get("agent_backend") != "pi" or binding(row) != op[who + "_binding"]:
+            raise HandoffError("identity_changed", "会话路由或启动身份已改变，未继续发送")
+        if header_identity(row) != op[who + "_header"]:
+            raise HandoffError("identity_changed", "会话真实日志身份已改变，未继续发送")
+        return row
+
+    async def _poll(self, seconds, check):
+        deadline = self.clock() + seconds
+        while True:
+            remaining = deadline - self.clock()
+            if remaining <= 0:
+                return None
+            try:
+                result = await asyncio.wait_for(check(), remaining)
+            except asyncio.TimeoutError:
+                return None
+            if result is not None:
+                return result
+            await self.sleep(min(self.timeouts["poll"], max(0, deadline - self.clock())))
+
+    async def _bind_target(self, op, cookie, created):
+        launch_id, pid = created.get("launch_id"), created.get("broker_pid")
+        if not ((isinstance(launch_id, str) and launch_id) or (type(pid) is int and pid > 0)):
+            self._set(op, "creation_unknown", error_code="launch_identity_missing")
+            return False
+        op["launch"] = {k: created[k] for k in ("launch_id", "broker_pid", "spawn_nonce") if created.get(k) is not None}
+        self._persist(op)
+
+        async def check():
+            rows = await self.sessions(cookie)
+            candidates = [r for r in rows if all(r.get(k) == v for k, v in op["launch"].items())]
+            if len(candidates) > 1:
+                raise HandoffError("identity_ambiguous", "原生启动身份匹配多个会话")
+            if not candidates:
+                return None
+            row = candidates[0]
+            if row.get("agent_backend") != "pi" or row.get("session_id") == op["source_session_id"]:
+                raise HandoffError("identity_changed", "新会话身份与原会话冲突")
+            if op["target_session_id"] is None:
+                op["target_session_id"], op["target_binding"] = row["session_id"], binding(row)
+                self._persist(op)
+            elif binding(row) != op["target_binding"]:
+                raise HandoffError("identity_changed", "新会话启动身份在恢复前改变")
+            # Initial input already traveled in create.args. Lazy log is only a receipt gate.
+            if not row.get("log_path"):
+                return None
+            op["target_header"] = header_identity(row)
+            if op["target_header"]["pi_session_id"] == op["source_header"]["pi_session_id"]:
+                raise HandoffError("identity_changed", "新会话复用了原 Pi 日志身份")
+            self._persist(op)
+            return row
+
+        result = await self._poll(self.timeouts["launch"], check)
+        if result is None:
+            self._set(op, "creation_unknown", error_code="launch_timeout")
+        return result is not None
+
+    def _artifact(self, op, kind):
+        result = read_artifact(self.root / op["id"], kind, operation_id=op["id"],
+                               source_sha256=op["source_sha256"],
+                               understanding_sha256=op.get("understanding_sha256"),
+                               review_sha256=op.get("review_sha256"))
+        pinned = op.get(kind + "_sha256")
+        if result is not None and pinned and result["_sha256"] != pinned:
+            raise HandoffError("artifact_changed", "已提交的交接产物被替换")
+        return result
+
+    def _check_chain(self, op):
+        for kind in ("understanding", "review"):
+            if op.get(kind + "_sha256") not in (None, "unreviewed") and self._artifact(op, kind) is None:
+                raise HandoffError("artifact_changed", "已提交的交接产物缺失")
+
+    async def _wait_artifact(self, op, cookie, kind, timeout):
+        async def check():
+            rows = await self.sessions(cookie)
+            self._verify(op, rows, "target")
+            if kind == "review":
+                self._verify(op, rows, "source")
+            self._check_chain(op)
+            return self._artifact(op, kind)
+        return await self._poll(self.timeouts[timeout], check)
+
+    async def _run(self, op, cookie, row, note):
+        preparation = asyncio.create_task(asyncio.to_thread(self._prepare, op, row, note))
+        try:
+            manifest = await asyncio.shield(preparation)
+        except asyncio.CancelledError:
+            # A thread cannot be cancelled: join our owned preparation before
+            # shutdown returns, so no manifest writes outlive the app lifecycle.
+            await asyncio.gather(preparation, return_exceptions=True)
+            raise
+        self.manifests[op["id"]] = manifest
+        op["source_sha256"] = manifest["source_sha256"]
+        launch = {key: row[key] for key in ("cwd", "model_provider", "model", "reasoning_effort")}
+        launch.update(agent_backend="pi", create_in_tmux=True,
+                      args=[build_recovery_prompt(manifest, self.root / op["id"])])
+        self._set(op, "launching")
+        self._verify(op, await self.sessions(cookie), "source")
+        created = await self._mutation(op, cookie, "create", "/api/sessions", launch)
+        if created is None or not await self._bind_target(op, cookie, created):
+            return
+        self._set(op, "recovering")
+        understanding = await self._wait_artifact(op, cookie, "understanding", "understanding")
+        if understanding is None:
+            self._set(op, "failed", error_code="understanding_timeout")
+            return
+        op["understanding_sha256"] = understanding["_sha256"]
+        self._set(op, "waiting_source")
+
+        async def source_idle():
+            rows = await self.sessions(cookie)
+            self._verify(op, rows, "target")
+            row = self._verify(op, rows, "source")
+            self._check_chain(op)
+            return row if idle(row) else None
+
+        row = await self._poll(self.timeouts["source_idle"], source_idle)
+        if row is None:
+            self._set(op, "unreviewed", error_code="source_idle_timeout")
+            return
+        self._set(op, "reviewing")
+        text = build_review_prompt(self.manifests[op["id"]], self.root / op["id"], op["understanding_sha256"])
+        text += "\n[handoff:" + op["id"] + ":review]"
+        sent = await self._mutation(op, cookie, "review", "/api/sessions/" + quote(row["session_id"], safe="") + "/send", {"text": text})
+        if sent is None:
+            return
+        review = await self._wait_artifact(op, cookie, "review", "review")
+        if review is None:
+            self._set(op, "unreviewed", error_code="review_timeout")
+            return
+        await self._continue(op, cookie, review)
+
+    def continue_unreviewed(self, operation_id, *, rows, cookie):
+        op = self.operations.get(uuid_text(operation_id))
+        if op is None:
+            raise HandoffError("not_found", "未找到接力操作", 404)
+        if self.closed:
+            raise HandoffError("shutting_down", "服务正在关闭", 503)
+        if op["status"] != "unreviewed" or op["id"] in self.tasks:
+            raise HandoffError("not_unreviewed", "仅未校对操作可明确选择继续")
+        self._verify(op, rows, "target")
+        self._check_chain(op)
+        # Do not hide a review which arrived just after the deadline.
+        review = self._artifact(op, "review") if "review" in op["intents"] else None
+        op["explicit_unreviewed"] = review is None
+        self._set(op, "revising")
+        self._schedule(op, lambda: self._continue(op, cookie, review))
+        return self.public(op["id"])
+
+    async def _continue(self, op, cookie, review):
+        if review:
+            op.update(review_sha256=review["_sha256"], reviewed=True, review_verdict=review["verdict"])
+        else:
+            if not op.get("explicit_unreviewed"):
+                raise HandoffError("bypass_not_authorized", "未经校对继续需要用户明确选择")
+            op["review_sha256"] = "unreviewed"
+        self._set(op, "revising")
+        text = build_continuation_prompt(self.manifests[op["id"]], self.root / op["id"],
+                                         op["review_sha256"], unreviewed=review is None)
+        text += "\n[handoff:" + op["id"] + ":continuation]"
+        # Wait for the successor to finish its recovery turn, not a fixed settle sleep.
+        async def target_idle():
+            rows = await self.sessions(cookie)
+            target = self._verify(op, rows, "target")
+            self._check_chain(op)
+            return target if idle(target) else None
+        target = await self._poll(self.timeouts["source_idle"], target_idle)
+        if target is None:
+            self._set(op, "failed", error_code="target_idle_timeout")
+            return
+        sent = await self._mutation(op, cookie, "continuation", "/api/sessions/" + quote(target["session_id"], safe="") + "/send", {"text": text})
+        if sent is None:
+            return
+        resolution = await self._wait_artifact(op, cookie, "resolution", "resolution")
+        if resolution is None:
+            self._set(op, "failed", error_code="resolution_timeout")
+            return
+        op["resolution_sha256"] = resolution["_sha256"]
+        self._set(op, "conflict" if resolution["verdict"] == "conflict" else "ready")
+
+    async def close(self):
+        self.closed = True
+        tasks = list(self.tasks.values())
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        for op in self.operations.values():
+            if op["status"] not in FINISHED:
+                self._set(op, "interrupted", error_code="shutdown")
+        self.tasks.clear()
+        self.manifests.clear()
