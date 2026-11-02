@@ -112,6 +112,24 @@ class ProxyTests(unittest.IsolatedAsyncioTestCase):
         async with self.client.get(self.url('__owner_groups__/app.js')) as response:
             self.assertEqual(response.status, 200); self.assertIn('javascript', response.content_type)
 
+    async def test_installed_owner_asset_is_frozen_and_status_header_stays_compatible(self):
+        body, digest = proxy.asset()
+        with patch.object(proxy.Path, 'read_text', side_effect=AssertionError('No live asset reads')):
+            async with self.client.get(self.url('')) as response:
+                self.assertIn(('app.js?v=' + digest).encode(), await response.read())
+                self.assertEqual(response.headers['X-Owner-Groups'], 'injected')
+            async with self.client.get(self.url('__owner_groups__/app.js?v=' + digest)) as response:
+                self.assertEqual(await response.read(), body)
+            async with self.client.get(self.url('__owner_groups__/app.js?v=wrong')) as response:
+                self.assertEqual(response.status, 404)
+            async with self.client.get(self.url('__owner_groups__/status')) as response:
+                data = await response.json()
+                self.assertEqual(data['adapter'], 'quick-deploy owner-groups/v1')
+                self.assertEqual(data['html_compatibility'], 'injected')
+        self.front.app[proxy.CONFIG]['demo'] = True
+        async with self.client.post(self.url('__owner_groups__/snapshot'), headers={'Cookie': 'synthetic=valid'}) as response:
+            self.assertTrue((await response.json())['demo'])
+
     async def test_upload_redirect_duplicate_cookies_and_compression(self):
         data = b'\x00binary synthetic upload' * 1000
         async with self.client.post(self.url('upload'), data=data) as response:
