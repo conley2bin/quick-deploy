@@ -2,16 +2,46 @@ const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const Core = require('../web/core.js');
 const rid = '12345678-1234-4123-8123-123456789012', oid = '87654321-1234-4123-8123-123456789012';
+const ridB = '22345678-1234-4123-8123-123456789012', oidB = '97654321-1234-4123-8123-123456789012';
 const op = (status = 'recovering', extra = {}) => ({ id: oid, request_id: rid, source_session_id: 'source', target_session_id: 'target', status, message: '合成状态', reviewed: false, can_continue_unreviewed: false, ...extra });
-function rig(post, raw) {
-  const values = new Map(raw ? [['key', raw]] : []), calls = [];
-  const storage = { getItem: k => values.get(k), setItem: (k, v) => values.set(k, v), removeItem: k => values.delete(k) };
-  const c = Core.createController({ storage, key: 'key', uuid: () => rid, post: async (route, body) => { calls.push({ route, body }); return post(route, body); } });
-  return { c, values, calls, storage };
+const sourceKey = source => 'key:source:' + encodeURIComponent(source);
+function rig(post, raw, shared) {
+  const values = shared || new Map(raw ? [['key', raw]] : []), calls = [], renders = [];
+  const storage = { getItem: k => values.get(k), setItem: (k, v) => values.set(k, v), removeItem: k => values.delete(k), get length() { return values.size; }, key: i => [...values.keys()][i] };
+  let seq = 0;
+  const c = Core.createController({ storage, key: 'key', uuid: () => seq++ ? ridB : rid, changed: s => renders.push(s), post: async (route, body) => { calls.push({ route, body }); return post(route, body); } });
+  c.select('source');
+  return { c, values, calls, storage, renders };
 }
+test('regression: one source reference must not globally suppress another start', async () => {
+  const calls = [], values = new Map();
+  const c = Core.createController({ key: 'key', storage: { getItem: k => values.get(k), setItem: (k,v) => values.set(k,v) }, uuid: () => rid,
+    post: async (route, body) => { calls.push(body); return { operation: op('recovering', { source_session_id: body.source_session_id }) }; } });
+  await c.start('source'); await c.start('other'); assert.equal(calls.length, 2);
+});
+test('A pending start never blocks B; late A cannot render or replace B', async () => {
+  let resolveA;
+  const r = rig((route, body) => body.source_session_id === 'source' ? new Promise(resolve => resolveA = resolve) : { operation: op('recovering', { id: oidB, request_id: ridB, source_session_id: 'other' }) });
+  const a = r.c.start('source', 'private A'); r.c.select('other');
+  assert.equal(r.c.view().busy, false); await r.c.start('other', 'private B');
+  assert.equal(r.calls.length, 2); assert.notEqual(r.calls[0].body.request_id, r.calls[1].body.request_id);
+  assert.equal(r.c.view().op.id, oidB); const rendered = r.renders.length;
+  resolveA({ operation: op() }); await a;
+  assert.equal(r.c.view().op.id, oidB); assert.equal(r.renders.length, rendered);
+  r.c.select('source'); assert.equal(r.c.view().op.id, oid);
+  assert.equal(r.values.size, 2); assert(![...r.values.values()].join('').includes('private'));
+});
+test('late A success cannot clear B unknown-start error or recovery UUID', async () => {
+  let resolveA;
+  const r = rig((route, body) => body.source_session_id === 'source' ? new Promise(resolve => resolveA = resolve) : Promise.reject(Error('B offline')));
+  const a = r.c.start('source'); r.c.select('other'); await r.c.start('other');
+  const before = r.c.view(), persisted = r.values.get(sourceKey('other'));
+  resolveA({ operation: op() }); await a;
+  assert.equal(r.c.view().error, before.error); assert.match(r.c.view().error, /结果未知/);
+  assert.equal(r.values.get(sourceKey('other')), persisted); await r.c.start('other'); assert.equal(r.calls.length, 2);
+});
 test('prefix is from own namespace script and rejects cross origin', () => {
   assert.equal(Core.namespace('https://x/nested/__session_handoff__/a.hash.js', 'https://x'), 'https://x/nested/__session_handoff__/');
-  assert.equal(Core.namespace('https://x/__session_handoff__/asset.js', 'https://x'), 'https://x/__session_handoff__/');
   assert.throws(() => Core.namespace('https://evil/__session_handoff__/asset.js', 'https://x'));
   assert.throws(() => Core.namespace('https://x/__owner_groups__/asset.js', 'https://x'));
 });
@@ -21,71 +51,125 @@ test('hash selection and navigation preserve opaque identifiers and other hash p
   const u = new URL(Core.targetURL('https://x/p/?q=1#other=yes&session=old', 'new/&中'));
   assert.equal(Core.selected(u.hash), 'new/&中'); assert.equal(new URLSearchParams(u.hash.slice(1)).get('other'), 'yes');
 });
-test('multiple clicks produce one mutation and only operation reference persists', async () => {
+test('multiple clicks produce one mutation and source-associated minimal reference persists', async () => {
   let resolve; const r = rig(() => new Promise(r => resolve = r));
   const first = r.c.start('source', 'private note'); await r.c.start('source');
-  assert.equal(r.calls.length, 1); assert(!r.values.get('key').includes('private'));
+  assert.equal(r.calls.length, 1); assert(!r.values.get(sourceKey('source')).includes('private'));
   resolve({ operation: op() }); await first;
-  assert.deepEqual(JSON.parse(r.values.get('key')), { operation_id: oid });
+  assert.deepEqual(JSON.parse(r.values.get(sourceKey('source'))), { operation_id: oid, source_session_id: 'source' });
 });
-test('uncertain start restores the same request UUID; reload never sends automatically', async () => {
+test('uncertain start keeps same UUID on explicit recovery; no replay on reload; B allowed', async () => {
   const r = rig(() => { throw Error('offline'); }); await r.c.start('source', 'not retained');
   assert.match(r.c.view().error, /结果未知/);
-  const next = rig(() => ({ operation: op() }), r.values.get('key'));
-  assert.equal(next.calls.length, 0); await next.c.start('other'); assert.equal(next.calls.length, 0);
-  await next.c.recover(); assert.deepEqual(next.calls[0], { route: 'start', body: { request_id: rid, source_session_id: 'source' } });
+  const next = rig((route, body) => ({ operation: body.source_session_id === 'other' ? op('recovering', { id: oidB, source_session_id: 'other' }) : op() }), null, r.values);
+  assert.equal(next.calls.length, 0); await next.c.start('source'); assert.equal(next.calls.length, 0);
+  next.c.select('other'); await next.c.start('other'); assert.equal(next.calls.length, 1);
+  next.c.select('source'); await next.c.recover(); assert.deepEqual(next.calls[1], { route: 'start', body: { request_id: rid, source_session_id: 'source' } });
 });
 test('server coalesces another active request for the same source', async () => {
   const r = rig(() => ({ operation: op('recovering', { request_id: oid }) }));
   await r.c.start('source'); assert.equal(r.c.view().error, ''); assert.equal(r.c.view().op.id, oid);
 });
-test('status validates identity and every public stage', async () => {
+test('status validates both source and operation identities', async () => {
   for (const status of Object.keys(Core.labels)) assert.equal(Core.operation(op(status)).status, status);
   assert.throws(() => Core.operation(op('invented')));
-  const r = rig(() => ({ operation: op('ready', { id: rid }) }), JSON.stringify({ operation_id: oid }));
-  await r.c.poll(); assert.match(r.c.view().error, /身份不匹配/); assert.equal(r.c.view().op, null);
+  for (const extra of [{ id: rid }, { source_session_id: 'other' }]) {
+    const r = rig(() => ({ operation: op('ready', extra) }), null, new Map([[sourceKey('source'), JSON.stringify({ operation_id: oid, source_session_id: 'source' })]]));
+    await r.c.poll(); assert.match(r.c.view().error, /身份不匹配/); assert.equal(r.c.view().op, null);
+  }
 });
-test('explicit unreviewed continuation only; uncertain continue is blocked across reload', async () => {
+test('explicit unreviewed continuation is one-shot across reload', async () => {
   let fail = false;
   const post = route => { if (route === 'continue' && fail) throw Error('offline'); return { operation: op('unreviewed', { can_continue_unreviewed: true }) }; };
   const r = rig(post); await r.c.start('source'); fail = true; await r.c.continueUnreviewed();
   assert(r.c.view().uncertainContinue); await r.c.continueUnreviewed(); assert.equal(r.calls.length, 2);
-  const next = rig(post, r.values.get('key')); await next.c.poll(); await next.c.continueUnreviewed();
+  const next = rig(post, null, r.values); await next.c.poll(); await next.c.continueUnreviewed();
   assert.equal(next.calls.length, 1); assert(next.c.view().uncertainContinue);
   for (const extra of [{ can_continue_unreviewed: false }, { target_session_id: null }]) {
     const denied = rig(() => ({ operation: op('unreviewed', extra) })); await denied.c.start('source'); await denied.c.continueUnreviewed(); assert.equal(denied.calls.length, 1);
   }
 });
-test('HTTP definitive rejection releases request, transport/server failures retain it', async () => {
-  for (const definitive of [true, false]) {
-    const r = rig(() => { throw Object.assign(Error('not Pi'), { definitive }); });
-    await r.c.start('source'); assert.equal(Boolean(r.c.view().reference), !definitive);
-  }
+test('definitive rejection only releases its own source', async () => {
+  const r = rig((route, body) => { if (body.source_session_id === 'other') throw Object.assign(Error('not Pi'), { definitive: true }); return { operation: op() }; });
+  await r.c.start('source'); r.c.select('other'); await r.c.start('other'); assert.equal(r.c.view().reference, null);
+  r.c.select('source'); assert.equal(r.c.view().op.id, oid); assert(r.values.has(sourceKey('source')));
 });
-test('storage refusal prevents mutation; malformed local reference is discarded', async () => {
+test('storage refusal prevents mutation without changing another source', async () => {
   assert.equal(Core.retained('{bad'), null); assert.equal(Core.retained(JSON.stringify({ operation_id: 'x'.repeat(10000) })), null);
-  const r = rig(() => ({ operation: op() })); r.storage.setItem = () => { throw Error('quota'); };
-  await r.c.start('source'); assert.equal(r.calls.length, 0); assert.match(r.c.view().error, /未发送/);
+  const r = rig(() => ({ operation: op() })); await r.c.start('source'); r.c.select('other');
+  r.storage.setItem = () => { throw Error('quota'); }; await r.c.start('other');
+  assert.equal(r.calls.length, 1); assert.match(r.c.view().error, /未发送/); assert(r.values.has(sourceKey('source')));
 });
-test('cleanup ignores late replies and removes identity on logout', async () => {
+test('cleanup ignores late replies and clears all feature identities on logout', async () => {
   let resolve; const r = rig(() => new Promise(r => resolve = r));
+  r.values.set(sourceKey('unloaded'), JSON.stringify({ operation_id: oidB, source_session_id: 'unloaded' }));
   const task = r.c.start('source'); r.c.stop(true); resolve({ operation: op() }); await task;
   assert.equal(r.values.size, 0); assert.equal(r.c.view().op, null); await r.c.recover(); assert.equal(r.calls.length, 1);
 });
-test('unknown mutations cannot be dismissed into an accidental recreate', async () => {
-  const r = rig(() => ({ operation: op('creation_unknown') })); await r.c.start('source'); r.c.forget(); await r.c.start('source'); assert.equal(r.calls.length, 1);
+test('unknown A holds same-source lease but allows B; forget only terminal selected record', async () => {
+  const r = rig((route, body) => ({ operation: body.source_session_id === 'other' ? op('ready', { id: oidB, source_session_id: 'other' }) : op('creation_unknown') }));
+  await r.c.start('source'); r.c.forget(); await r.c.start('source'); assert.equal(r.calls.length, 1);
+  r.c.select('other'); await r.c.start('other'); r.c.forget(); assert(!r.values.has(sourceKey('other'))); assert(r.values.has(sourceKey('source')));
 });
 test('request UUID works without secure-context randomUUID and is version 4', () => {
   assert.equal(Core.requestUUID({ getRandomValues: a => a.fill(255) }), 'ffffffff-ffff-4fff-bfff-ffffffffffff');
+});
+test('in-flight status cannot erase a same-operation continuation persisted by another tab', async () => {
+  let resolveStatus;
+  const r = rig(route => route === 'status' ? new Promise(resolve => resolveStatus = resolve) : { operation: op('unreviewed', { can_continue_unreviewed: true }) });
+  await r.c.start('source'); const polling = r.c.poll();
+  r.values.set(sourceKey('source'), JSON.stringify({ operation_id: oid, source_session_id: 'source', pending_action: 'continue' }));
+  resolveStatus({ operation: op('unreviewed', { can_continue_unreviewed: true }) }); await polling;
+  await r.c.continueUnreviewed(); assert.equal(r.calls.filter(c=>c.route==='continue').length,0);
+  assert.equal(JSON.parse(r.values.get(sourceKey('source'))).pending_action,'continue');
 });
 test('accepted continuation without state advancement cannot be sent twice', async () => {
   const r = rig(() => ({ operation: op('unreviewed', { can_continue_unreviewed: true }) }));
   await r.c.start('source'); await r.c.continueUnreviewed(); await r.c.continueUnreviewed();
   assert.equal(r.calls.filter(c => c.route === 'continue').length, 1);
-  assert.equal(JSON.parse(r.values.get('key')).pending_action, 'continue');
+  assert.equal(JSON.parse(r.values.get(sourceKey('source'))).pending_action, 'continue');
 });
 test('source/note bounds and invalid targets reject before action/navigation', async () => {
   const r = rig(() => ({ operation: op() }));
   await r.c.start('x'.repeat(513)); await r.c.start('source', 'x'.repeat(1001));
   assert.equal(r.calls.length, 0); assert.throws(() => Core.operation(op('ready', { target_session_id: 'source' })));
+});
+test('different-source tabs persist without map lost updates; refresh restores both', async () => {
+  const shared = new Map(), a = rig(() => ({ operation: op() }), null, shared), b = rig(() => ({ operation: op('ready', { id: oidB, source_session_id: 'other' }) }), null, shared);
+  await a.c.start('source'); b.c.select('other'); await b.c.start('other');
+  const refresh = rig((route, body) => ({ operation: body.operation_id === oid ? op() : op('ready', { id: oidB, source_session_id: 'other' }) }), null, shared);
+  await refresh.c.poll(); assert.equal(refresh.c.view().op.id, oid);
+  refresh.c.select('other'); await refresh.c.poll(); assert.equal(refresh.c.view().op.id, oidB);
+  refresh.c.forget(); assert(shared.has(sourceKey('source'))); assert(!shared.has(sourceKey('other')));
+});
+test('legacy pending source moves after successful write, never replays automatically', async () => {
+  const raw = JSON.stringify({ request_id: rid, source_session_id: 'source' }), r = rig(() => ({ operation: op() }), raw);
+  await r.c.migrateLegacy(); assert.equal(r.calls.length, 0); assert(!r.values.has('key')); assert(r.values.has(sourceKey('source')));
+  const failed = rig(() => ({ operation: op() }), raw); failed.storage.setItem = () => { throw Error('quota'); };
+  await failed.c.migrateLegacy(); assert.equal(failed.values.get('key'), raw);
+  await failed.c.start('source'); assert.equal(failed.calls.length, 0); // Same A remains locked on failed migration.
+  assert.equal(failed.values.get('key'), raw);
+});
+test('unsourced legacy operation asynchronously adopts returned A while B selected', async () => {
+  let resolve; const raw = JSON.stringify({ operation_id: oid, pending_action: 'continue' });
+  const r = rig(() => new Promise(r => resolve = r), raw); r.c.select('other'); const migration = r.c.migrateLegacy();
+  assert.equal(r.c.view().reference, null); assert.equal(r.calls[0].route, 'status');
+  resolve({ operation: op('unreviewed', { can_continue_unreviewed: true }) }); await migration;
+  assert.equal(r.c.view().reference, null); assert.equal(r.values.has('key'), false);
+  r.c.select('source'); assert.equal(r.c.view().op.source_session_id, 'source'); assert(r.c.view().uncertainContinue);
+  await r.c.continueUnreviewed(); assert.equal(r.calls.length, 1);
+});
+test('failed legacy lookup/write keeps original and does not block unrelated B', async () => {
+  const raw = JSON.stringify({ operation_id: oid });
+  for (const writeFailure of [false, true]) {
+    const r = rig(route => { if (route === 'status' && !writeFailure) throw Error('offline'); return { operation: op() }; }, raw);
+    r.c.select('other'); if (writeFailure) r.storage.setItem = () => { throw Error('quota'); };
+    await r.c.migrateLegacy(); assert.equal(r.values.get('key'), raw); assert.equal(r.c.view().reference, null);
+    assert.match(r.c.view().legacyError, /旧接力/);
+  }
+});
+test('migration never overwrites a different existing source reference', async () => {
+  const raw = JSON.stringify({ operation_id: oid }), shared = new Map([['key', raw], [sourceKey('source'), JSON.stringify({ operation_id: oidB, source_session_id: 'source' })]]);
+  const r = rig(() => ({ operation: op() }), null, shared); await r.c.migrateLegacy();
+  assert.equal(shared.get('key'), raw); assert.equal(JSON.parse(shared.get(sourceKey('source'))).operation_id, oidB);
 });

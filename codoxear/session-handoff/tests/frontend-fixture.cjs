@@ -6,6 +6,7 @@ const { randomUUID } = require('node:crypto');
 const staticDir = fs.realpathSync(process.env.CODOXEAR_STATIC_DIR || (() => { throw Error('Set CODOXEAR_STATIC_DIR to read-only upstream/installed static assets'); })());
 const base = '/demo', owners = path.resolve(__dirname, '../../owner-groups/web');
 const assets = path.resolve(__dirname, '../web');
+const operations = new Map(), settings = new Map(), held = [];
 let actions = [], operation = null, fault = '', status = 'recovering', allow = false, auth = true, message = 'DEMO 合成状态，不会创建真实 Pi';
 const rows = ['source', 'other', 'target'].map((id, i) => ({ session_id: id, thread_id: 'pi-demo-' + id, agent_backend: 'pi',
   alias: 'DEMO · ' + ({ source: '当前项目', other: '另一个会话', target: '接力新会话' }[id]), cwd: '/DEMO/project',
@@ -20,27 +21,38 @@ const server = http.createServer(async (req, res) => {
     if (p === '/__fixture__/state') {
       if (req.method === 'POST') {
         const b = await body(req);
-        if (b.reset) { actions = []; operation = null; fault = ''; status = 'recovering'; allow = false; auth = true; message = 'DEMO 合成状态，不会创建真实 Pi'; rows.splice(3); }
-        if (b.status) status = b.status; if ('message' in b) message = b.message; if ('allow' in b) allow = b.allow; if ('fault' in b) fault = b.fault; if ('auth' in b) auth = b.auth;
+        if (b.release) { for (const item of held.filter(item => item.source === b.release)) { json(item.res, { operation: item.operation }); held.splice(held.indexOf(item), 1); } }
+        if (b.reset) { for (const item of held.splice(0)) item.res.destroy(); operations.clear(); settings.clear(); actions = []; operation = null; fault = ''; status = 'recovering'; allow = false; auth = true; message = 'DEMO 合成状态，不会创建真实 Pi'; rows.splice(3); }
+        if (b.source) settings.set(b.source, { ...settings.get(b.source), ...Object.fromEntries(['status', 'message', 'allow', 'fault'].filter(k => k in b).map(k => [k, b[k]])) });
+        else { if (b.status) status = b.status; if ('message' in b) message = b.message; if ('allow' in b) allow = b.allow; if ('fault' in b) fault = b.fault; }
+        if ('auth' in b) auth = b.auth;
       }
-      return json(res, { actions, operation, fault, status, auth });
+      return json(res, { actions, operation, operations: [...operations.values()], held: held.map(({ source, kind }) => ({ source, kind })), fault, status, auth });
     }
     if (p.startsWith('/__session_handoff__/') && !p.endsWith('.js')) {
       if (req.method !== 'POST') return json(res, { error: 'post_required' }, 405);
       if (!auth || !req.headers.cookie?.includes('fixture=demo')) return json(res, { error: 'login', message: 'DEMO 登录已过期' }, 401);
       const b = await body(req), kind = p.split('/').pop(); actions.push({ kind, body: b });
+      operation = kind === 'start' ? operations.get(b.source_session_id) : [...operations.values()].find(op => op.id === b.operation_id);
+      const source = kind === 'start' ? b.source_session_id : operation?.source_session_id;
+      const config = { fault, status, allow, message, ...settings.get(source) };
       if (kind === 'start') {
-        if (fault === 'unsupported') return json(res, { error: 'unsupported_backend', message: '仅支持 Pi；DEMO Codex 不受支持' }, 422);
-        if (!operation) operation = { id: randomUUID(), request_id: b.request_id, source_session_id: b.source_session_id,
-          target_session_id: 'target', status, message: 'DEMO 合成状态，不会创建真实 Pi', reviewed: false, can_continue_unreviewed: allow, updated_at: new Date().toISOString() };
-        if (fault === 'drop-start') { req.socket.destroy(); return; }
+        if (config.fault === 'unsupported') return json(res, { error: 'unsupported_backend', message: '仅支持 Pi；DEMO Codex 不受支持' }, 422);
+        if (!operation) operation = { id: randomUUID(), request_id: b.request_id, source_session_id: source,
+          target_session_id: 'target', status: config.status, message: config.message, reviewed: false, can_continue_unreviewed: config.allow, updated_at: new Date().toISOString() };
+        operations.set(source, operation);
+        if (config.fault === 'drop-start') { req.socket.destroy(); return; }
       } else if (kind === 'continue') {
-        if (!operation || status !== 'unreviewed' || !allow) return json(res, { error: 'not_allowed', message: 'DEMO 不允许继续' }, 409);
-        status = 'revising'; allow = false;
+        if (!operation || config.status !== 'unreviewed' || !config.allow) return json(res, { error: 'not_allowed', message: 'DEMO 不允许继续' }, 409);
+        config.status = 'revising'; config.allow = false;
+        if (settings.has(source)) settings.set(source, { ...settings.get(source), status: 'revising', allow: false });
+        else { status = 'revising'; allow = false; }
       } else if (kind !== 'status') return json(res, { error: 'not_found' }, 404);
-      if (!operation || (kind !== 'start' && b.operation_id !== operation.id)) return json(res, { error: 'not_found', message: 'DEMO 无此接力' }, 404);
-      if (fault === 'status-error' && kind === 'status') return json(res, { error: 'unavailable', message: 'DEMO 暂时无法查询' }, 503);
-      operation = { ...operation, status, message, can_continue_unreviewed: allow, reviewed: status === 'ready', updated_at: new Date().toISOString() };
+      if (!operation) return json(res, { error: 'not_found', message: 'DEMO 无此接力' }, 404);
+      if (config.fault === 'status-error' && kind === 'status') return json(res, { error: 'unavailable', message: 'DEMO 暂时无法查询' }, 503);
+      operation = { ...operation, status: config.status, message: config.message, can_continue_unreviewed: config.allow, reviewed: config.status === 'ready', updated_at: new Date().toISOString() };
+      operations.set(source, operation);
+      if (config.fault === 'hold-' + kind) { held.push({ source, kind, res, operation }); return; }
       return json(res, { operation });
     }
     if (p === '/__owner_groups__/snapshot') return json(res, { demo: true,
