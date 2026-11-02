@@ -14,7 +14,7 @@ Do not put this root under the live project or reuse an earlier fixture.
 | Purpose | Location within the new root |
 |---|---|
 | Fake task and stale memory | `project/` (from `prepare_fixture`) |
-| Synthetic predecessor history | `source/<unrelated-uuid>.jsonl` |
+| Synthetic predecessor history | `home/.pi/agent/sessions/demo/<unrelated-uuid>.jsonl` |
 | Independent expected outcome | `ground-truth.json` |
 | Home directory | `home/` |
 | Pi agent directory and sessions | `home/.pi/agent/` |
@@ -36,11 +36,17 @@ cookie only in the test client memory. Never output env/auth/header dumps.
 The approved model is exactly `openai/gpt-6-astra`. Read the installed model
 catalog without changing it. If isolated credentials cannot authenticate this
 route, stop and report that failure; no alternate provider/model. Only after
-approval, copy the existing **openai entry only** from installed auth to the
-private auth file, without printing it, creating a symlink, or refreshing the
-original. Do not copy settings, prompts, extensions, packages, skills, registry,
-MCP configuration, or other providers. OAuth refresh may affect the private
-copy only. Bound provider retries and total runtime in the private settings.
+approval, construct an **access-only openai entry** with the existing valid
+access token, original real expiry and required account/client metadata. The
+installed schema requires a string `refresh`; use an explicitly invalid test
+sentinel, never the real refresh secret. Do not print credentials, create a
+symlink, or extend expiry. Require remaining TTL to cover the bounded run plus
+SDK refresh margin before spawning. If insufficient, only the parent's
+separately approved native ModelRuntime.getAuth coordinated refresh may update
+canonical auth; a failed refresh stops this attempt. The test copy must never
+rotate account credentials. Do not copy settings, prompts, extensions,
+packages, skills, registry, MCP configuration, or other providers. Bound provider
+retries and total runtime in the private settings.
 
 Use installed Pi and installed native Python read-only, never `run_server.sh`
 or setup/update wrappers. No shared venv install, upstream fetch or global
@@ -74,14 +80,19 @@ tmux server/session or signal production brokers/agents.
    repository in `project/` if required for native cwd validation. Record
    `project_fingerprint` before launch. The fixture has goal X → Y, off-branch
    Z, rejected vendor delegation, stale memory X, an absent claimed edit, and
-   an unverified worker claim. Only `main.py` may change.
+   an unverified worker claim. The latest long user message places goal Y and
+   the vendor constraint at its tail, beyond the old prefix-only excerpt.
+   Only `main.py` may change. Keep the seed log inside the private native Pi
+   sessions namespace; never weaken native resume validation.
 2. Start installed native Web under the clean home and private tmux route,
    plus the integrated shared host with a test state root. Use both actual
    features, without reading a real owner registry. Empty/missing test registry
    is acceptable for this semantic run; grouping is a separate browser fixture.
 3. Create the predecessor via native API with the synthetic history as its
-   explicitly selected session and a fixture-only instruction to acknowledge
-   the history and remain idle without changing task files. Bind it by returned
+   explicitly selected session and a fixture-only instruction to answer READY
+   and remain idle without changing task files. Scope that instruction to this
+   predecessor only: the successor retains authorization to do Y after review.
+   The predecessor must not supply an answer-key summary. Bind it by returned
    launch ID/broker PID, then real header ID. Preserve the synthetic origin of
    historical records in the evidence; this is not a production session.
 4. POST handoff start for that opaque source route. Record the exact native

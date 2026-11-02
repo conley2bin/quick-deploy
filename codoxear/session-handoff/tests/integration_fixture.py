@@ -44,10 +44,15 @@ def _write(path: Path, text: str) -> None:
 
 
 def _message(entry_id: str, parent: str | None, text: str, role="user") -> dict:
+    message = {"role": role, "content": [{"type": "text", "text": text}],
+               "timestamp": 1767225600000}
+    if role == "assistant":
+        message.update(api="openai-responses", provider="openai", model="gpt-6-astra", stopReason="stop",
+                       usage={"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0,
+                              "totalTokens": 0, "cost": {"input": 0, "output": 0,
+                              "cacheRead": 0, "cacheWrite": 0, "total": 0}})
     return {"type": "message", "id": entry_id, "parentId": parent,
-            "timestamp": "2026-01-01T00:00:00.000Z",
-            "message": {"role": role, "content": [{"type": "text", "text": text}],
-                        "timestamp": 1767225600000}}
+            "timestamp": "2026-01-01T00:00:00.000Z", "message": message}
 
 
 def prepare_fixture(root: Path) -> dict:
@@ -67,20 +72,20 @@ def prepare_fixture(root: Path) -> dict:
     _write(project / ".memory/project/goal.md", "Stale project memory: goal X; main.py should return X.\n")
     header_id = str(uuid.uuid4())
     # Deliberately unrelated filename UUID; binding must use the real header.
-    source = root / "source" / (str(uuid.uuid4()) + ".jsonl")
+    source = root / "home/.pi/agent/sessions/demo" / (str(uuid.uuid4()) + ".jsonl")
     rows = [
         {"type": "session", "version": 3, "id": header_id,
          "timestamp": "2026-01-01T00:00:00.000Z", "cwd": str(project)},
         _message("goal-x", None, "Goal X: main.py result() should return X."),
         _message("reject", "goal-x", "Reject delegation to vendor.result(); keep result() self-contained."),
         _message("side-z", "goal-x", "Unrelated side branch Z: build a dashboard."),
-        _message("goal-y", "reject", "Change the goal from X to Y. main.py result() must return Y. "
-                 "After review, change only main.py and verify result(). Do not edit vendor.py."),
-        _message("claim", "goal-y", "I changed main.py to return Y and started a worker; this is an "
-                 "unverified historical statement, not current process evidence.", "assistant"),
-        _message("latest", "claim", "Independently check the current files. Keep the no-vendor-edit "
-                 "constraint and rejected-delegation decision. An absent edit remains pending. "
-                 "Do not infer a running worker without current evidence."),
+        _message("claim", "reject", "I changed main.py and started a worker.", "assistant"),
+        _message("latest", "claim", "Historical context follows; the final paragraph contains the current request.\n"
+                 + "Archive detail: the earlier plan was goal X; these notes are superseded.\n" * 500
+                 + "\nChange the goal from X to Y. main.py result() must return Y. "
+                 "After review, change only main.py and verify result(). Do not edit vendor.py. "
+                 "Independently check current files and the rejected-delegation decision. "
+                 "An absent edit remains pending. Do not infer a running worker without current evidence."),
     ]
     _write(source, "".join(json.dumps(row) + "\n" for row in rows))
     snapshot = context.create_source_snapshot(source)
