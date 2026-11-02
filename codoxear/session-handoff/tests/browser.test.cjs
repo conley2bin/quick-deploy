@@ -100,6 +100,34 @@ function crossTabAndStorage() {
   control({auth:true}); run('reload'); run('wait','#handoffButton'); reset(); source();
   console.log('PASS cross-tab independent writes, storage no-send and auth-loss cleanup');
 }
+function staleDisplayedContinue(label) {
+  reset(); source();
+  control({ source: 'source', status: 'unreviewed', allow: true });
+  control({ source: 'other', status: 'unreviewed', allow: true });
+  for (const id of ['source', 'other']) {
+    nativeSelect(id); click('#handoffButton'); click('#handoffPanel button[type=submit]');
+    wait(`document.querySelector('#handoffPanel [role=status]').textContent.includes(${JSON.stringify('来源：'+id)})`);
+  }
+  nativeSelect('source'); wait('document.querySelector("#handoffPanel [role=status]").textContent.includes("来源：source")');
+  const b = refs()[storageBase+':source:other'].operation_id;
+  // One JS task: native replaceState, then click the still-painted A button.
+  // No timer/microtask/monitor is allowed to repaint B before this click.
+  const painted = evaluate(`(()=>{const p=document.querySelector('#handoffPanel'),b=[...p.querySelectorAll('button')].find(b=>b.textContent==='未校对，仍继续');
+    if(b.hidden)throw Error('A Continue must be visible');const before=p.querySelector('[role=status]').textContent;
+    history.replaceState(null,'','#session=other');b.click();return {before,after:p.querySelector('[role=status]').textContent};})()`);
+  assert(painted.before.includes('来源：source')); assert(painted.after.includes('来源：other'));
+  assert.equal(actions().filter(a=>a.kind==='continue').length, 0);
+  screenshot(label+'-stale-A-continue-repainted-B');
+  // The URL-only probe leaves native internal selection at A; its next refresh
+  // may restore A. Make the second intent a real native B selection, not a
+  // later click after that unrelated URL restoration.
+  nativeSelect('other'); wait('document.querySelector("#handoffPanel [role=status]").textContent.includes("来源：other")');
+  run('find','role','button','click','--name','未校对，仍继续','--exact');
+  wait('document.querySelector("#handoffPanel [role=status]").textContent.includes("新会话核对并修正中")');
+  assert.deepEqual(actions().filter(a=>a.kind==='continue').map(a=>a.body), [{operation_id:b}]);
+  console.log('PASS '+label+' exact replaceState→visible A click: zero Continue; deliberate B click: one B Continue');
+  reset(); source();
+}
 function assertIcon(size) {
   const icon = evaluate(`(()=>{const b=document.querySelector('#handoffButton'),s=b.querySelector('svg');
     return {label:b.textContent,title:b.title,aria:b.getAttribute('aria-label'),type:b.type,controls:b.getAttribute('aria-controls'),
@@ -179,7 +207,7 @@ try {
   assert.equal(evaluate('document.querySelectorAll("#handoffButton").length'), 1);
   assert.equal(evaluate('document.querySelectorAll(".owner-root-star").length'), 1);
   assertIcon(20); assertToolbar(1440); keyboardCancel(); screenshot('desktop-icon-focus');
-  concurrentSources('desktop'); crossTabAndStorage();
+  concurrentSources('desktop'); crossTabAndStorage(); staleDisplayedContinue('desktop');
   // One external icon child mutation must not cause a remount or observer feedback loop.
   assert.equal(evaluate(`new Promise(resolve=>{const b=document.querySelector('#handoffButton');let changes=0;
     const observer=new MutationObserver(records=>changes+=records.length);observer.observe(b,{childList:true,subtree:true});
@@ -281,7 +309,7 @@ try {
   run('--executable-path', chrome, 'open', url); run('set', 'viewport', '390', '844'); login(); reset(); source();
   assert.equal(evaluate('document.querySelectorAll("#sessions .session.desktop").length'), 0);
   assertIcon(18); assertToolbar(390); keyboardCancel(); screenshot('mobile-icon-focus');
-  concurrentSources('mobile');
+  concurrentSources('mobile'); staleDisplayedContinue('mobile');
   openSidebar(); swipe('source', 'left');
   click('[data-session-id=source] button[aria-label="Edit conversation"]'); run('wait', '#editViewer[open]');
   click('#editCloseBtn'); wait('!document.querySelector("#editViewer").open');

@@ -173,3 +173,73 @@ test('migration never overwrites a different existing source reference', async (
   const r = rig(() => ({ operation: op() }), null, shared); await r.c.migrateLegacy();
   assert.equal(shared.get('key'), raw); assert.equal(JSON.parse(shared.get(sourceKey('source'))).operation_id, oidB);
 });
+
+for (const stale of ['recovering', 'ready']) test('old ' + stale + ' observation cannot release another tab unknown Continue; fresh ready can', async () => {
+  const shared = new Map([[sourceKey('source'), JSON.stringify({ operation_id: oid, source_session_id: 'source' })]]);
+  let release;
+  const old = rig(() => new Promise(resolve => release = resolve), null, shared);
+  const held = old.c.poll();
+  const post = route => { if (route === 'continue') throw Error('lost Continue response'); return { operation: op('unreviewed', { can_continue_unreviewed: true }) }; };
+  const actor = rig(post, null, shared); await actor.c.poll(); await actor.c.continueUnreviewed();
+  assert.equal(JSON.parse(shared.get(sourceKey('source'))).pending_action, 'continue');
+  release({ operation: op(stale) }); await held;
+  assert.equal(JSON.parse(shared.get(sourceKey('source'))).pending_action, 'continue');
+  assert(old.c.view().uncertainContinue);
+  const reload = rig(post, null, shared); await reload.c.poll(); await reload.c.continueUnreviewed();
+  assert.equal([...actor.calls, ...reload.calls].filter(c => c.route === 'continue').length, 1);
+  assert(reload.c.view().uncertainContinue);
+  const confirmed = rig(() => ({ operation: op('ready') }), null, shared); await confirmed.c.poll();
+  assert.equal(confirmed.c.view().uncertainContinue, false); confirmed.c.forget();
+  assert(!shared.has(sourceKey('source')));
+});
+
+test('old responses and definitive errors cannot replace or resurrect current same-source ownership', async () => {
+  for (const outcome of ['ready', 'definitive-status', 'definitive-start']) {
+    for (const replace of [false, true]) {
+      const initial = outcome === 'definitive-start' ? {} : { operation_id: oid, source_session_id: 'source' };
+      const shared = new Map(Object.keys(initial).length ? [[sourceKey('source'), JSON.stringify(initial)]] : []);
+      let release, reject;
+      const old = rig(() => new Promise((yes, no) => { release = yes; reject = no; }), null, shared);
+      const held = outcome === 'definitive-start' ? old.c.start('source') : old.c.poll();
+      const actor = rig(route => ({ operation: route === 'start' ? op('recovering', { id: oidB, request_id: ridB }) : op('ready') }), null, shared);
+      if (outcome === 'definitive-start') shared.delete(sourceKey('source')); // A later tab explicitly retired its failed start.
+      else { await actor.c.poll(); actor.c.forget(); }
+      if (replace) await actor.c.start('source');
+      const expected = shared.get(sourceKey('source'));
+      if (outcome === 'ready') release({ operation: op('ready') });
+      else reject(Object.assign(Error('rejected old request'), { definitive: true }));
+      await held;
+      assert.equal(shared.get(sourceKey('source')), expected, outcome + ', replacement=' + replace);
+      assert.equal(old.c.view().reference?.operation_id, replace ? oidB : undefined);
+      assert.equal(old.c.view().op, null); assert.equal(old.c.view().busy, false);
+      assert.equal(old.c.view().error, '');
+    }
+  }
+});
+
+test('a renewed Continue marker cannot be resolved by an observation of the previous marker', async () => {
+  for (const kind of ['status', 'continue']) {
+    const shared = new Map([[sourceKey('source'), JSON.stringify({ operation_id: oid, source_session_id: 'source',
+      ...(kind === 'status' ? { pending_action: 'continue', pending_id: rid } : {}) })]]);
+    let release, reject;
+    const old = rig(route => route === 'status' && kind === 'continue'
+      ? { operation: op('unreviewed', { can_continue_unreviewed: true }) }
+      : new Promise((yes, no) => { release = yes; reject = no; }), null, shared);
+    if (kind === 'continue') await old.c.poll();
+    const held = kind === 'status' ? old.c.poll() : old.c.continueUnreviewed();
+    // Another tab definitively retires the old intent and persists a new one.
+    shared.set(sourceKey('source'), JSON.stringify({ operation_id: oid, source_session_id: 'source', pending_action: 'continue', pending_id: ridB }));
+    if (kind === 'status') release({ operation: op('ready') });
+    else reject(Object.assign(Error('old Continue rejected'), { definitive: true }));
+    await held;
+    const saved = JSON.parse(shared.get(sourceKey('source')));
+    assert.equal(saved.pending_action, 'continue'); assert.equal(saved.pending_id, ridB);
+  }
+});
+test('fresh unknown delivery status retains explicit Continue uncertainty', async () => {
+  for (const status of ['unreviewed', 'creation_unknown', 'delivery_unknown', 'interrupted']) {
+    const shared = new Map([[sourceKey('source'), JSON.stringify({ operation_id: oid, source_session_id: 'source', pending_action: 'continue' })]]);
+    const r = rig(() => ({ operation: op(status) }), null, shared); await r.c.poll(); r.c.forget();
+    assert(r.c.view().uncertainContinue); assert.equal(JSON.parse(shared.get(sourceKey('source'))).pending_action, 'continue');
+  }
+});

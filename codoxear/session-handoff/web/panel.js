@@ -53,9 +53,20 @@
       if (disposed || doc.hidden || !s.reference?.operation_id || s.busy || (s.op && !active.has(s.op.status)) || s.error) return;
       timer = win.setTimeout(() => { syncSelection(); if (!doc.hidden) controller.poll(); }, 1800);
     }
+    const identity = s => JSON.stringify([s.source, s.reference?.operation_id, s.reference?.request_id,
+      s.reference?.pending_action, s.reference?.pending_id, s.op?.id, s.op?.target_session_id]);
+    function actionCurrent() {
+      // Own the action by what was painted before synchronizing native URL or
+      // cross-tab storage. A stale A button may repaint B, never act on B.
+      const displayed = ui.identity;
+      syncSelection();
+      const readable = controller.select(currentSource);
+      return readable && displayed === identity(controller.view());
+    }
     function render(s) {
       if (disposed || !ui) return;
       if (s.source !== selected(win.location.hash)) { syncSelection(); return; }
+      ui.identity = identity(s);
       const d = draft();
       ui.form.hidden = !d.open || Boolean(s.reference);
       ui.note.value = d.note;
@@ -162,30 +173,40 @@
       const row = el('div', '', { class: 'handoffRow' }); row.append(retry, bypass, link, done); panel.append(form, status, error, row);
       ui = { button, panel, form, source, note, start, status, error, retry, bypass, link, done };
       onUI(button, 'click', () => {
-        syncSelection();
+        if (!actionCurrent()) return;
         const s = controller.view(), d = draft();
         if (!s.reference) { d.open = true; d.confirmedSource = currentSource; d.reconfirm = false; }
         render(s);
         if (!s.reference) note.focus();
       });
-      onUI(note, 'input', () => { draft().note = note.value; });
+      onUI(note, 'input', () => {
+        const value = note.value;
+        if (actionCurrent()) { draft().note = value; note.value = value; }
+      });
       onUI(form, 'submit', e => {
         e.preventDefault();
         const confirmed = draft().confirmedSource;
-        syncSelection();
+        const fresh = actionCurrent();
         const d = draft(), now = currentSource;
-        if (now !== confirmed || now !== d.confirmedSource) {
+        if (!fresh || now !== confirmed || now !== d.confirmedSource) {
           d.open = true; d.confirmedSource = now; d.reconfirm = true; render(controller.view()); return;
         }
         controller.start(now, d.note);
       });
-      onUI(cancel, 'click', () => { const d = draft(); d.open = false; d.note = ''; render(controller.view()); button.focus(); });
+      onUI(cancel, 'click', () => {
+        if (!actionCurrent()) return;
+        const d = draft(); d.open = false; d.note = ''; render(controller.view()); button.focus();
+      });
       onUI(form, 'keydown', e => { if (e.key === 'Escape') { e.preventDefault(); cancel.click(); } });
-      onUI(retry, 'click', () => { syncSelection(); controller.recover(); });
-      onUI(bypass, 'click', () => { syncSelection(); controller.continueUnreviewed(); });
-      onUI(link, 'click', e => { e.preventDefault(); syncSelection(); const id = controller.view().op?.target_session_id; if (id) win.location.replace(targetURL(win.location.href, id)); });
+      onUI(retry, 'click', () => { if (actionCurrent()) controller.recover(); });
+      onUI(bypass, 'click', () => { if (actionCurrent()) controller.continueUnreviewed(); });
+      onUI(link, 'click', e => {
+        e.preventDefault(); if (!actionCurrent()) return;
+        const id = controller.view().op?.target_session_id; if (id) win.location.replace(targetURL(win.location.href, id));
+      });
       onUI(done, 'click', () => {
-        syncSelection(); controller.forget();
+        if (!actionCurrent()) return;
+        controller.forget();
         if (!controller.view().reference) { draft().note = ''; draft().open = false; }
         render(controller.view()); button.focus();
       });

@@ -44,7 +44,7 @@
       const r = JSON.parse(raw);
       if (r && UUID.test(r.operation_id)) return { operation_id: r.operation_id,
         ...(bounded(r.source_session_id, 512) ? { source_session_id: r.source_session_id } : {}),
-        ...(r.pending_action === 'continue' ? { pending_action: 'continue' } : {}) };
+        ...(r.pending_action === 'continue' ? { pending_action: 'continue', ...(UUID.test(r.pending_id) ? { pending_id: r.pending_id } : {}) } : {}) };
       if (r && UUID.test(r.request_id) && bounded(r.source_session_id, 512))
         return { request_id: r.request_id, source_session_id: r.source_session_id };
     } catch (_) { /* Invalid local reference is not a request. */ }
@@ -77,9 +77,10 @@
       if (next) storage.setItem(sourceKey(s.source), JSON.stringify(next)); else storage.removeItem(sourceKey(s.source));
       s.reference = next;
     }
+    const sameOwner = (a, b) => ['operation_id', 'request_id', 'source_session_id'].every(k => a?.[k] === b?.[k]);
     function sync(s) {
       const next = read(s.source);
-      if (['operation_id', 'request_id', 'source_session_id', 'pending_action'].some(k => next?.[k] !== s.reference?.[k])) {
+      if (['operation_id', 'request_id', 'source_session_id', 'pending_action', 'pending_id'].some(k => next?.[k] !== s.reference?.[k])) {
         s.reference = next; s.op = null; s.pendingBody = null;
         s.uncertainContinue = next?.pending_action === 'continue'; s.error = '';
       }
@@ -103,7 +104,7 @@
         if (s.busy || (existing && !(existing.operation_id === next.operation_id && next.operation_id)
           && !(existing.request_id && existing.request_id === (recovered?.request_id || next.request_id)))) throw Error('来源已有另一条恢复记录，保留旧记录待核对');
         // A pending continuation is never weakened by a migrated older reference.
-        if (existing?.pending_action === 'continue') next = { ...next, pending_action: 'continue' };
+        if (existing?.pending_action === 'continue') next = { ...next, pending_action: 'continue', ...(existing.pending_id ? { pending_id: existing.pending_id } : {}) };
         persist(s, next);
         s.uncertainContinue = next.pending_action === 'continue';
         if (recovered) s.op = recovered;
@@ -119,22 +120,46 @@
     }
     async function request(s, kind, body) {
       if (s.busy || stopped) return;
+      const observed = s.reference;
+      // Storage is the current owner, not the reference retained by this tab.
+      // Check again on completion; localStorage is not an atomic cross-tab lock.
+      function stillOwned() {
+        if (sameOwner(observed, read(s.source))) return true;
+        sync(s); return false;
+      }
       s.busy = true; s.error = ''; notify(s);
       try {
+        if (!stillOwned()) return;
         const next = operation((await post(kind, body)).operation);
-        if (stopped) return;
+        if (stopped || !stillOwned()) return;
         if (next.source_session_id !== s.source || (kind !== 'start' && next.id !== body.operation_id)) throw Error('接力响应身份不匹配');
-        // A status already in flight must not erase a continuation saved by
-        // another tab (or still in the legacy key) for this same operation.
         const saved = read(s.source), legacy = retained(storage.getItem(key));
-        if ([saved, legacy].some(r => r?.operation_id === next.id && r.pending_action === 'continue')) s.uncertainContinue = true;
+        const pending = r => r?.operation_id === next.id && r.pending_action === 'continue';
+        const pendingNow = pending(saved) || pending(legacy);
+        // Only a correlated Continue response, or a status begun after the
+        // persisted intent, can resolve it. An older recovering/ready body is
+        // not evidence about a newer Continue, regardless of arrival order.
+        const observedPending = pending(observed) && pending(saved) && observed.pending_id === saved.pending_id;
+        const resolves = (kind === 'continue' || kind === 'status') && observedPending
+          && !['unreviewed', 'creation_unknown', 'delivery_unknown', 'interrupted'].includes(next.status);
         // Same-source server coalescing may legitimately return a different UUID.
         s.op = next;
-        s.uncertainContinue = s.uncertainContinue && next.status === 'unreviewed';
-        persist(s, { operation_id: next.id, source_session_id: s.source, ...(s.uncertainContinue ? { pending_action: 'continue' } : {}) });
+        s.uncertainContinue = Boolean(pendingNow && !resolves);
+        const intent = pending(saved) ? saved : legacy;
+        persist(s, { operation_id: next.id, source_session_id: s.source,
+          ...(s.uncertainContinue ? { pending_action: 'continue', ...(intent?.pending_id ? { pending_id: intent.pending_id } : {}) } : {}) });
         s.pendingBody = null;
       } catch (e) {
         if (stopped) return;
+        // Late failures must not clear a replacement operation either. A failed
+        // storage read leaves ownership unproven, so never write through it.
+        try {
+          if (!stillOwned()) return;
+          if (kind === 'continue') {
+            const saved = read(s.source);
+            if (saved?.pending_action !== observed?.pending_action || saved?.pending_id !== observed?.pending_id) { sync(s); return; }
+          }
+        } catch (_) { s.error = '无法核对当前恢复记录，请刷新查询'; return; }
         s.error = String(e.message || '网络异常').slice(0, 1000);
         if (e.status === 401 || e.status === 403) { authLost(); return; }
         if (kind === 'start' && e.definitive) {
@@ -152,10 +177,11 @@
       view, migrateLegacy,
       select(source) {
         current = bounded(source, 512) ? source : null;
-        if (current && !state(current).busy) {
-          try { sync(state(current)); } catch (e) { state(current).error = String(e.message || '无法读取接力恢复记录'); }
+        if (current) {
+          try { sync(state(current)); }
+          catch (e) { state(current).error = String(e.message || '无法读取接力恢复记录'); notify(); return false; }
         }
-        notify();
+        notify(); return true;
       },
       async start(source, note = '') {
         if (stopped || !bounded(source, 512)) return;
@@ -196,7 +222,11 @@
         if (s.busy) return;
         try { sync(s); } catch (_) { s.error = '无法读取恢复标识，未发送继续请求'; notify(s); return; }
         if (s.op?.status !== 'unreviewed' || !s.op.can_continue_unreviewed || !s.op.target_session_id || s.uncertainContinue) return;
-        try { persist(s, { operation_id: s.op.id, source_session_id: s.source, pending_action: 'continue' }); }
+        try {
+          const pending_id = uuid();
+          if (!UUID.test(pending_id)) throw Error('无法生成继续请求标识');
+          persist(s, { operation_id: s.op.id, source_session_id: s.source, pending_action: 'continue', pending_id });
+        }
         catch (_) { s.error = '无法保存恢复标识，未发送继续请求'; notify(s); return; }
         s.uncertainContinue = true;
         await request(s, 'continue', { operation_id: s.op.id });
