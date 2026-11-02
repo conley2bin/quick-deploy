@@ -1,6 +1,7 @@
 # Isolated native Pi acceptance
 
-This is the **prepared plan**, not a record of a completed real-agent test.
+The procedure below is the approved isolated plan. A bounded execution outcome
+is recorded at the end; it does not imply production deployment.
 `test_integration_fixture.py` checks the evidence helpers without spawning Pi.
 The normal unit suite must never start agents, copy credentials, or contact a
 model provider. A parent-approved dedicated run is required for the steps below.
@@ -151,3 +152,43 @@ Sanitize published summaries; do not commit raw transcripts or auth state.
 Report separately: fixture/helper tests, deterministic workflow actors, native
 Pi startup and report chain, actual toy action, browser coexistence, and live
 rollout. None implies another. This plan authorizes no production deployment.
+
+## Recorded isolated execution — 2026-11-02
+
+The integrated shared host and installed native runtime completed one real
+`openai/gpt-6-astra` run with dedicated predecessor and successor actors. The
+resource-bounded driver exited 0 after about four minutes. No canonical auth
+refresh was needed; the private credential used its true expiry and an invalid
+refresh sentinel, and was removed after cleanup.
+
+Manual inspection of all three report bodies against the independent fixture
+confirmed the following:
+
+- The successor selected Y from the long latest-user tail despite repeated X
+  history and stale X memory. It inspected actual files and correctly identified
+  the historical claimed edit as absent and the worker claim as unestablished.
+- It retained the self-contained implementation constraint and main-only edit
+  scope. Its first persisted user entry exactly matched native creation argv;
+  the successor had a new Pi header identity. No manual initial send occurred.
+- Project fingerprints were unchanged before both review and continuation
+  delivery. The predecessor only read evidence and wrote its operation-local
+  review; its actual verdict was `clear`, without manufactured corrections.
+- One successor resolution accepted the evidence-backed review and was
+  successfully submitted before the first `main.py` edit. The transcript's
+  successful submit result precedes the edit call and result. The actor then
+  actually invoked Python with `-B` and verified `main.result() == "Y"`.
+  `vendor.py`, memory and AGENTS remained byte-identical to their baseline.
+- The observed handoff mutations were exactly one successor create, one source
+  review send and one successor continuation send. No second approval loop,
+  delegation or production operation occurred. All owned actors, broker/Web
+  processes and dedicated tmux panes were cleaned up.
+
+Evidence limitation: the running observer logged transient-directory ENOENT
+callbacks during early native lock-file activity. Its event list and complete
+transcript still establish resolution-before-edit for this run; a later harness
+fix retains subsequent events after that race and has a regression test, but
+that observer fix has not had a second real-agent execution. The real run covered
+clear review; deliberately incomplete understanding/correction remains a
+separately labelled deterministic test. Browser coexistence was independently
+validated with synthetic APIs, not inferred from this native run. Private raw
+transcripts, credentials and environment records are never committed.
