@@ -143,7 +143,7 @@ class FeatureTests(unittest.IsolatedAsyncioTestCase):
         ids = {data["operation"]["id"] for _, data in results}
         self.assertEqual(len(ids), 1)
         await self.finish()
-        self.assertEqual(len(self.native.mutations()), 3)
+        self.assertEqual(len(self.native.mutations()), 4)
         _, retry = await self.post("start", bodies[-1])
         self.assertIn(retry["operation"]["id"], ids)
 
@@ -177,7 +177,7 @@ class FeatureTests(unittest.IsolatedAsyncioTestCase):
         await self.finish()
         response, data = await self.post("status", {"operation_id": operation_id})
         self.assertEqual(data["operation"]["status"], "unreviewed")
-        self.assertEqual(len(self.native.mutations()), 2)
+        self.assertEqual(len(self.native.mutations()), 3)
         response, _ = await self.post("continue", {"operation_id": operation_id, "unreviewed": True})
         self.assertEqual(response.status, 400)
         response, _ = await self.post("continue", {"operation_id": operation_id})
@@ -206,8 +206,16 @@ class FeatureTests(unittest.IsolatedAsyncioTestCase):
         response, data = await self.post("status", {"operation_id": operation_id})
         self.assertEqual(response.status, 200)
         self.assertEqual(data["operation"]["status"], "ready")
-        self.assertEqual(len(self.native.mutations()), 3)
+        self.assertEqual(len(self.native.mutations()), 4)
         self.assertFalse(self.engine.tasks)
+
+    async def test_sequence_limit_is_4xx_before_any_creation(self):
+        self.native.source["display_name"] = "接力_99"
+        response, data = await self.post("start", self.start_body())
+        self.assertEqual(response.status, 409)
+        self.assertEqual(data["error"], "sequence_limit")
+        self.assertEqual(self.native.mutations(), [])
+        self.assertEqual(self.engine.operations, {})
 
     async def test_non_pi_returns_clear_4xx(self):
         self.native.source["agent_backend"] = "codex"

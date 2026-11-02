@@ -126,6 +126,13 @@ class Native:
                 raise OSError("request accepted but response lost /private/credentials")
             return 200, {"ok": True, **({"launch_id": "launch-pending-string", "pending": True}
                                      if self.pending else {"broker_pid": 200})}
+        if path.endswith("/rename"):
+            if path != "/api/sessions/opaque%2Ftarget/rename" or set(body) != {"name"}:
+                raise AssertionError("rename must address only the bound target with an exact name body")
+            self.target.update(alias=body["name"], display_name=body["name"])
+            if self.lost == "rename":
+                raise TimeoutError("alias saved but rename response lost")
+            return 200, {"ok": True, "alias": body["name"]}
         if self.on_send:
             self.on_send(path, body)
         stage = "review" if path.endswith("opaque%2Fsource/send") else "continuation"
@@ -175,7 +182,7 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["status"], "ready")
         self.assertTrue(result["reviewed"])
         mutations = self.native.mutations()
-        self.assertEqual(len(mutations), 3)
+        self.assertEqual(len(mutations), 4)
         body = mutations[0][2]
         self.assertEqual(set(body), {"cwd", "model_provider", "model", "reasoning_effort", "agent_backend", "create_in_tmux", "args"})
         self.assertTrue(body["create_in_tmux"])
@@ -183,9 +190,11 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(body["args"][0][0], "-@")
         self.assertEqual(body["model_provider"], "test-provider")
         self.assertEqual(self.native.op["source_header"]["pi_session_id"], "source-header")
-        self.assertNotEqual(mutations[1][2]["send_id"], mutations[2][2]["send_id"])
-        self.assertIn(":review]", mutations[1][2]["text"])
-        self.assertIn(":continuation]", mutations[2][2]["text"])
+        self.assertEqual(mutations[1][1], "/api/sessions/opaque%2Ftarget/rename")
+        self.assertEqual(mutations[1][2], {"name": self.root.name + "_01"})
+        self.assertNotEqual(mutations[2][2]["send_id"], mutations[3][2]["send_id"])
+        self.assertIn(":review]", mutations[2][2]["text"])
+        self.assertIn(":continuation]", mutations[3][2]["text"])
 
     async def test_advertised_log_path_can_materialize_after_initial_input(self):
         previous = self.native.__call__
@@ -208,14 +217,14 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
         self.native.on_list = materialize
         await self.start()
         self.assertEqual((await self.finish())["status"], "ready")
-        self.assertEqual(len(self.native.mutations()), 3)
+        self.assertEqual(len(self.native.mutations()), 4)
 
     async def test_numeric_broker_pid_and_corrections_single_round(self):
         self.native.pending = False
         self.native.verdict = "corrections"
         await self.start()
         self.assertEqual((await self.finish())["status"], "ready")
-        self.assertEqual(len(self.native.mutations()), 3)
+        self.assertEqual(len(self.native.mutations()), 4)
         self.assertEqual(self.native.op["launch"], {"broker_pid": 200})
 
     async def test_goal_conflict_requires_target_receipt(self):
@@ -225,7 +234,7 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
         result = await self.finish()
         self.assertEqual(result["status"], "conflict")
         self.assertTrue(result["reviewed"])
-        self.assertEqual(len(self.native.mutations()), 3)
+        self.assertEqual(len(self.native.mutations()), 4)
 
     async def test_http_200_without_resolution_is_not_ready(self):
         self.native.emit_resolution = False
@@ -269,7 +278,7 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
         self.native.artifact("resolution")
         self.assertEqual(self.engine.status(first, rows=rows)["status"], "ready")
         self.assertEqual(self.engine.status(first, rows=rows)["status"], "ready")
-        self.assertEqual(len(before), 3)  # One create, one review, one continuation.
+        self.assertEqual(len(before), 4)  # One create, one rename, one review, one continuation.
         self.assertEqual(self.native.mutations(), before)
 
     async def test_late_conflict_after_lost_continuation_response(self):
@@ -281,7 +290,7 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
         self.native.artifact("resolution")
         result = self.engine.status(first, rows=await self.engine.sessions("fresh"))
         self.assertEqual(result["status"], "conflict")
-        self.assertEqual(len(self.native.mutations()), 3)
+        self.assertEqual(len(self.native.mutations()), 4)
 
     async def test_late_wrong_hash_keeps_unknown_and_source_locked(self):
         self.native.emit_resolution = False
@@ -293,7 +302,7 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["status"], "delivery_unknown")
         self.assertEqual(result["error_code"], "invalid_artifact")
         self.assertEqual(await self.start(), first)
-        self.assertEqual(len(self.native.mutations()), 3)
+        self.assertEqual(len(self.native.mutations()), 4)
 
     async def test_late_exact_receipt_rejects_rebound_target(self):
         self.native.emit_resolution = False
@@ -305,7 +314,7 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["status"], "delivery_unknown")
         self.assertEqual(result["error_code"], "identity_changed")
         self.assertEqual(await self.start(), first)
-        self.assertEqual(len(self.native.mutations()), 3)
+        self.assertEqual(len(self.native.mutations()), 4)
 
     async def test_restart_unknown_reconciles_late_receipt_without_replay(self):
         self.native.emit_resolution = False
@@ -320,7 +329,7 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
         self.native.artifact("resolution")
         result = self.engine.status(first, rows=await self.engine.sessions("fresh"))
         self.assertEqual(result["status"], "ready")
-        self.assertEqual(len(self.native.mutations()), 3)
+        self.assertEqual(len(self.native.mutations()), 4)
 
     async def test_legacy_failed_with_effect_is_locked_on_restart(self):
         self.native.emit_resolution = False
@@ -334,7 +343,7 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
         self.native.engine = self.engine
         self.assertEqual(self.engine.public(first)["status"], "delivery_unknown")
         self.assertEqual(await self.start(), first)
-        self.assertEqual(len(self.native.mutations()), 3)
+        self.assertEqual(len(self.native.mutations()), 4)
 
     async def test_interrupted_continuation_can_observe_late_receipt(self):
         self.native.emit_resolution = False
@@ -347,7 +356,7 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(second.public(first)["status"], "interrupted")
             self.native.artifact("resolution")
             self.assertEqual(second.status(first, rows=await second.sessions("fresh"))["status"], "ready")
-            self.assertEqual(len(self.native.mutations()), 3)
+            self.assertEqual(len(self.native.mutations()), 4)
         finally:
             await second.close()
 
@@ -394,7 +403,7 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
         await self.start()
         result = await self.finish()
         self.assertEqual(result["error_code"], "identity_changed")
-        self.assertEqual(len(self.native.mutations()), 1)
+        self.assertEqual(len(self.native.mutations()), 2)
 
     async def test_source_header_replacement_blocks_review(self):
         def rebind():
@@ -404,7 +413,7 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
         await self.start()
         result = await self.finish()
         self.assertEqual(result["error_code"], "identity_changed")
-        self.assertEqual(len(self.native.mutations()), 1)
+        self.assertEqual(len(self.native.mutations()), 2)
 
     async def test_target_replaced_after_review_blocks_continuation(self):
         def rebind(path, body):
@@ -414,7 +423,7 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
         await self.start()
         result = await self.finish()
         self.assertEqual(result["error_code"], "identity_changed")
-        self.assertEqual(len(self.native.mutations()), 2)
+        self.assertEqual(len(self.native.mutations()), 3)
 
     async def test_target_header_replaced_blocks_continuation(self):
         def rebind(path, body):
@@ -424,7 +433,7 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
         await self.start()
         result = await self.finish()
         self.assertEqual(result["error_code"], "identity_changed")
-        self.assertEqual(len(self.native.mutations()), 2)
+        self.assertEqual(len(self.native.mutations()), 3)
 
     async def test_launch_without_native_identity_is_unknown(self):
         previous = self.native.__call__
@@ -446,7 +455,7 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
                 result = await self.finish()
                 self.assertEqual(result["status"], "delivery_unknown")
                 self.assertEqual(result["error_code"], "invalid_artifact")
-                self.assertEqual(len(self.native.mutations()), 1)
+                self.assertEqual(len(self.native.mutations()), 2)
                 # Each case has an independent engine/state root/native, no side-effect retry.
                 await self.engine.close()
                 newroot = self.root / str(uuid4())
@@ -461,7 +470,7 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
         await self.start()
         result = await self.finish()
         self.assertEqual(result["error_code"], "invalid_artifact")
-        self.assertEqual(len(self.native.mutations()), 2)
+        self.assertEqual(len(self.native.mutations()), 3)
 
     async def test_wrong_resolution_review_hash_never_ready(self):
         self.native.report_transform = lambda kind, data: {**data, "review_sha256": "0" * 64} if kind == "resolution" else data
@@ -469,7 +478,7 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
         result = await self.finish()
         self.assertEqual(result["status"], "delivery_unknown")
         self.assertEqual(result["error_code"], "invalid_artifact")
-        self.assertEqual(len(self.native.mutations()), 3)
+        self.assertEqual(len(self.native.mutations()), 4)
 
     async def test_forged_unreviewed_resolution_without_action_rejected(self):
         self.native.report_transform = lambda kind, data: {**data, "review_sha256": "unreviewed"} if kind == "resolution" else data
@@ -488,7 +497,7 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
         await self.start()
         result = await self.finish()
         self.assertIn(result["error_code"], ("artifact_changed", "invalid_artifact"))
-        self.assertEqual(len(self.native.mutations()), 2)
+        self.assertEqual(len(self.native.mutations()), 3)
 
     async def test_review_timeout_explicit_bypass_only(self):
         self.native.emit_review = False
@@ -497,7 +506,7 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["status"], "unreviewed")
         self.assertFalse(result["reviewed"])
         self.assertTrue(result["can_continue_unreviewed"])
-        self.assertEqual(len(self.native.mutations()), 2)
+        self.assertEqual(len(self.native.mutations()), 3)
         rows = await self.engine.sessions("fresh-cookie")
         self.engine.continue_unreviewed(operation_id, rows=rows, cookie="fresh-cookie")
         result = await self.finish()
@@ -505,7 +514,7 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result["reviewed"])
         self.assertEqual(self.native.op["review_sha256"], "unreviewed")
         self.assertNotIn("error_code", result)
-        self.assertEqual(len(self.native.mutations()), 3)
+        self.assertEqual(len(self.native.mutations()), 4)
         with self.assertRaises(HandoffError):
             self.engine.continue_unreviewed(operation_id, rows=rows, cookie="fresh-cookie")
 
@@ -516,7 +525,7 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
         self.native.target["spawn_nonce"] = "other-target"
         with self.assertRaises(HandoffError):
             self.engine.continue_unreviewed(operation_id, rows=await self.engine.sessions("fresh"), cookie="fresh")
-        self.assertEqual(len(self.native.mutations()), 2)
+        self.assertEqual(len(self.native.mutations()), 3)
 
     async def test_busy_source_times_out_without_review_send(self):
         self.native.busy_lists = 100
@@ -524,7 +533,7 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
         result = await self.finish()
         self.assertEqual(result["status"], "unreviewed")
         self.assertEqual(result["error_code"], "source_idle_timeout")
-        self.assertEqual(len(self.native.mutations()), 1)
+        self.assertEqual(len(self.native.mutations()), 2)
 
     async def test_disappeared_source_becomes_unreviewed_and_can_bypass(self):
         def disappear():
@@ -534,10 +543,10 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
         operation_id = await self.start()
         result = await self.finish()
         self.assertEqual(result["status"], "unreviewed")
-        self.assertEqual(len(self.native.mutations()), 1)
+        self.assertEqual(len(self.native.mutations()), 2)
         self.engine.continue_unreviewed(operation_id, rows=await self.engine.sessions("fresh"), cookie="fresh")
         self.assertEqual((await self.finish())["status"], "ready")
-        self.assertEqual(len(self.native.mutations()), 2)
+        self.assertEqual(len(self.native.mutations()), 3)
 
     async def test_reviewer_disappears_after_send_times_out_unreviewed(self):
         self.native.emit_review = False
@@ -548,7 +557,7 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
         result = await self.finish()
         self.assertEqual(result["status"], "unreviewed")
         self.assertEqual(result["error_code"], "review_timeout")
-        self.assertEqual(len(self.native.mutations()), 2)
+        self.assertEqual(len(self.native.mutations()), 3)
 
     async def test_late_review_is_used_instead_of_claiming_unreviewed(self):
         self.native.emit_review = False
@@ -576,14 +585,14 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
         result = await self.finish()
         self.assertEqual(result["status"], "delivery_unknown")
         self.assertEqual(await self.start(), first)
-        self.assertEqual(len(self.native.mutations()), 2)
+        self.assertEqual(len(self.native.mutations()), 3)
 
     async def test_lost_continuation_is_unknown_without_retry(self):
         self.native.lost = "continuation"
         await self.start()
         result = await self.finish()
         self.assertEqual(result["status"], "delivery_unknown")
-        self.assertEqual(len(self.native.mutations()), 3)
+        self.assertEqual(len(self.native.mutations()), 4)
 
     async def test_intent_on_disk_before_native_mutation(self):
         previous = self.native.__call__
@@ -591,7 +600,8 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
             if method == "POST":
                 op = self.native.op
                 disk = json.loads((self.engine.root / op["id"] / "state.json").read_text())
-                stage = "create" if path == "/api/sessions" else "review" if "source" in path else "continuation"
+                stage = ("create" if path == "/api/sessions" else "rename" if path.endswith("/rename")
+                         else "review" if "source" in path else "continuation")
                 self.assertEqual(disk["intents"][stage]["result"], "unknown")
             return await previous(method, path, **kwargs)
         self.engine.upstream_json = inspect
@@ -604,7 +614,7 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(set(ids)), 1)
         self.assertEqual(await self.start(requests[0]), ids[0])
         await self.finish()
-        self.assertEqual(len(self.native.mutations()), 3)
+        self.assertEqual(len(self.native.mutations()), 4)
         second = Engine(self.native, state_root=self.engine.root).open()
         self.assertEqual(second.requests[requests[-1]], ids[0])
         await second.close()

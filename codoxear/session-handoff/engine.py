@@ -5,7 +5,8 @@ import asyncio
 import json
 import math
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
+import re
 import stat
 import tempfile
 import time
@@ -23,7 +24,7 @@ MESSAGES = {
     "reviewing": "原会话正在审阅；原会话仅担任审阅者", "revising": "新会话正在核对审阅意见",
     "ready": "新会话已提交接续回执并继续工作", "unreviewed": "原会话未完成校对，可明确选择未经校对继续",
     "conflict": "目标存在分歧，需要用户确认", "creation_unknown": "创建结果不确定，未自动重建",
-    "delivery_unknown": "消息投递结果不确定，未自动重发", "interrupted": "服务中断，未重放任何创建或发送",
+    "delivery_unknown": "命名或消息投递结果不确定，未自动重试", "interrupted": "服务中断，未重放任何创建、命名或发送",
     "failed": "接力未完成；请检查会话与交接产物",
 }
 FINISHED = {"ready", "conflict", "failed", "creation_unknown", "delivery_unknown", "interrupted"}
@@ -44,6 +45,28 @@ class HandoffError(Exception):
     def __init__(self, code: str, message: str, status: int = 409):
         super().__init__(code)
         self.code, self.message, self.status = code, message, status
+
+
+def handoff_names(row):
+    """Freeze native display state, never use a display label as identity."""
+    source = row.get("display_name")
+    if not isinstance(source, str):
+        alias, cwd = row.get("alias"), row.get("cwd")
+        source = alias.strip() if isinstance(alias, str) and alias.strip() else (
+            PurePosixPath(cwd.rstrip("/")).name if isinstance(cwd, str) and cwd.strip() else "")
+    if not source:
+        raise HandoffError("invalid_name", "原会话没有可用名称，请先设置名称再接力", 422)
+    suffix = re.search(r"_([0-9]{2})\Z", source)
+    number = int(suffix[1]) if suffix else 0
+    if number == 99:
+        raise HandoffError("sequence_limit", "已达到接力序号 99 上限，不能创建新会话", 409)
+    target = (source[:suffix.start()] if suffix else source) + f"_{number + 1:02d}"
+    # Native clean_alias folds whitespace/truncates at 80; tmux mirror rejects
+    # control characters/leading dash. Refuse rather than silently change names.
+    if (len(target) > 80 or " ".join(target.split()).strip() != target
+            or target.startswith("-") or any(ord(ch) < 32 or ord(ch) == 127 for ch in target)):
+        raise HandoffError("invalid_name", "新名称无法原样保存或映射到窗口；请先缩短或调整原会话名称（最多 80 字符、单空格、无控制字符且不以 - 开头）", 422)
+    return source, target
 
 
 def uuid_text(value):
@@ -260,6 +283,7 @@ class Engine:
         row = self._row(rows, source_session_id)
         if row.get("agent_backend") != "pi":
             raise HandoffError("unsupported_backend", "当前仅支持 Pi 会话接力", 422)
+        source_name, target_name = handoff_names(row)
         source_header = header_identity(row)
         if not all(isinstance(row.get(k), str) and row[k] for k in ("cwd", "model_provider", "model", "reasoning_effort")):
             raise HandoffError("settings_missing", "源会话的模型、提供商或推理设置尚未明确")
@@ -268,7 +292,8 @@ class Engine:
         private_dir(directory)
         op = {"id": operation_id, "request_id": request_id, "request_ids": [request_id],
               "source_session_id": source_session_id, "target_session_id": None, "reviewed": False,
-              "source_binding": binding(row), "source_header": source_header, "intents": {}}
+              "source_binding": binding(row), "source_header": source_header, "intents": {},
+              "source_display_name": source_name, "target_display_name": target_name}
         self._set(op, "creating")
         self.operations[operation_id], self.requests[request_id] = op, operation_id
         self._schedule(op, lambda: self._run(op, cookie, dict(row), note))
@@ -312,7 +337,7 @@ class Engine:
             raise HandoffError("duplicate_intent", "该阶段已发起，不会自动重试")
         # Intent is fsynced before the first byte can reach native transport.
         op["intents"][stage] = {"id": str(uuid4()), "result": "unknown"}
-        if stage != "create":
+        if stage in {"review", "continuation"}:
             body = {**body, "send_id": op["intents"][stage]["id"]}
         self._persist(op)
         try:
@@ -400,6 +425,25 @@ class Engine:
             self._set(op, "creation_unknown", error_code="launch_timeout")
         return result is not None
 
+    async def _name_target(self, op, cookie):
+        # Rename has no atomic expected-header precondition, just like send.
+        target = self._verify(op, await self.sessions(cookie), "target")
+        expected = op["target_display_name"]
+        renamed = await self._mutation(op, cookie, "rename",
+            "/api/sessions/" + quote(target["session_id"], safe="") + "/rename", {"name": expected})
+        if renamed is None:
+            return False
+        if renamed.get("alias") != expected:
+            raise HandoffError("name_mismatch", "原生服务未原样保存新名称，未继续接力")
+        # Listing also triggers native's asynchronous nonce-bound tmux mirror;
+        # this proves durable display state, not completion of that mirror.
+        observed = self._verify(op, await self.sessions(cookie), "target")
+        if observed.get("alias") != expected or observed.get("display_name") != expected:
+            raise HandoffError("name_mismatch", "无法核实新会话的准确名称，未继续接力")
+        op["intents"]["rename"]["verified"] = True
+        self._persist(op)
+        return True
+
     def _artifact(self, op, kind):
         result = read_artifact(self.root / op["id"], kind, operation_id=op["id"],
                                source_sha256=op["source_sha256"],
@@ -445,6 +489,8 @@ class Engine:
         self._verify(op, await self.sessions(cookie), "source")
         created = await self._mutation(op, cookie, "create", "/api/sessions", launch)
         if created is None or not await self._bind_target(op, cookie, created):
+            return
+        if not await self._name_target(op, cookie):
             return
         self._set(op, "recovering")
         understanding = await self._wait_artifact(op, cookie, "understanding", "understanding")
