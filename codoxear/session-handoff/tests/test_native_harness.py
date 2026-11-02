@@ -33,6 +33,21 @@ class NativeHarnessTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 watcher.close()
 
+    async def test_removed_directory_does_not_abort_event_processing(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            watcher = FileEvents(root)
+            try:
+                # Registration after a transient native lock directory vanished.
+                watcher._add_tree(root / "already-removed-lock")
+                (root / "receipt.json").write_text("{}")
+                async def receipt_seen():
+                    return any(item["path"] == str(root / "receipt.json")
+                               for item in watcher.observations)
+                await watcher.until(receipt_seen, 1)
+            finally:
+                watcher.close()
+
     async def test_notification_wait_has_a_finite_deadline(self):
         with tempfile.TemporaryDirectory() as temp:
             watcher = FileEvents(Path(temp))

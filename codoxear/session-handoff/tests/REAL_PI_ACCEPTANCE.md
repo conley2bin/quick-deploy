@@ -128,7 +128,15 @@ tmux server/session or signal production brokers/agents.
     Never alter a real model report to manufacture a correction. If the real
     run itself needs correction, preserve and inspect the actual evidence.
 
+Run the bounded acceptance driver through the resource-limited `job` service
+with a completion notification. Its native Web child runs in the test socket's
+`acceptance` tmux session; the runner records its pane, PID and start ticks and
+terminates only that verified Web PID. The operator still owns exact cleanup
+of the dedicated predecessor/successor broker windows and anchor.
+
 Use finite stage deadlines and event-driven local file/process notifications.
+Transient native/Pi lock directories may vanish before inotify registration;
+ignore only ENOENT there so later receipt events in the same buffer are retained.
 No sleep/poll loops and no automatic resend/recreate after ambiguous mutations.
 Record failure at the original stage rather than making a retry look like the
 same run. The native application may use its own bounded readiness mechanisms.

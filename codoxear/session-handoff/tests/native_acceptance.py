@@ -9,11 +9,14 @@ from __future__ import annotations
 import argparse
 import asyncio
 import ctypes
+import errno
 import importlib.util
 import json
 import os
 from pathlib import Path
 import struct
+import shlex
+import signal
 import sys
 import time
 from types import SimpleNamespace
@@ -46,7 +49,12 @@ class FileEvents:
         for directory in [path, *(p for p in path.rglob("*") if p.is_dir())]:
             wd = self.lib.inotify_add_watch(self.fd, os.fsencode(directory), 0x0000010A | 0x00000080)
             if wd < 0:
-                raise OSError(ctypes.get_errno(), "inotify_add_watch")
+                error = ctypes.get_errno()
+                # Native/Pi lock directories can disappear between enumeration
+                # and watch registration. Keep processing the event buffer.
+                if error == errno.ENOENT:
+                    continue
+                raise OSError(error, "inotify_add_watch")
             self.paths[wd] = directory
 
     def _read(self):
@@ -130,24 +138,45 @@ async def run(args):
     host = load_host()
     owner, handoff = host.default_features()  # actual committed assets; no fake script
     native = front = client = None
+    native_identity = None
     engine = None
     report = {"level": "isolated-native", "status": "running", "model": "openai/gpt-6-astra"}
     mutation_calls = []
     source = None
     stderr = (evidence / "native-stderr.txt").open("wb")
     try:
-        script = """from codoxear import server
+        ready_path = evidence / "native-ready.json"
+        script = """import json, os
+from pathlib import Path
+from codoxear import server
 server._init_runtime()
 server._require_password()
 httpd = server.ThreadingHTTPServer(('127.0.0.1', 0), server.Handler)
-print(httpd.server_address[1], flush=True)
+pid = os.getpid()
+ready = {'port': httpd.server_address[1], 'pid': pid,
+         'start_ticks': Path(f'/proc/{pid}/stat').read_text().rsplit(')', 1)[1].split()[19]}
+Path(%r).write_text(json.dumps(ready))
 httpd.serve_forever()
-"""
-        native = await asyncio.create_subprocess_exec(args.native_python, "-c", script,
+""" % str(ready_path)
+        server_path = evidence / "native-server.py"
+        server_path.write_text(script)
+        command = shlex.join([args.native_python, str(server_path)]) + " 2>" + shlex.quote(str(evidence / "native-stderr.txt"))
+        native = await asyncio.create_subprocess_exec("tmux", "new-window", "-d", "-P", "-F", "#{pane_id}",
+                    "-t", "acceptance", "-n", "native-web", command,
                     cwd=root, env=dict(os.environ), stdout=asyncio.subprocess.PIPE, stderr=stderr)
-        port = int(await asyncio.wait_for(native.stdout.readline(), 30))
-        report["native_pid"] = native.pid
-        report["native_start_ticks"] = Path(f"/proc/{native.pid}/stat").read_text().rsplit(")", 1)[1].split()[19]
+        stdout, _ = await native.communicate()
+        if native.returncode:
+            raise RuntimeError("private tmux native Web launch failed")
+        report["native_pane"] = stdout.decode().strip()
+        async def native_ready():
+            try:
+                return json.loads(ready_path.read_text())
+            except (FileNotFoundError, json.JSONDecodeError):
+                return False
+        native_identity = await watcher.until(native_ready, 30)
+        port = native_identity["port"]
+        report["native_pid"] = native_identity["pid"]
+        report["native_start_ticks"] = native_identity["start_ticks"]
 
         def install(app, ctx):
             nonlocal engine
@@ -257,9 +286,11 @@ httpd.serve_forever()
             await client.close()
         if front:
             await front.close()
-        if native and native.returncode is None:
-            native.terminate()
-            await asyncio.wait_for(native.wait(), 15)
+        if native_identity:
+            pid = native_identity["pid"]
+            stat = Path(f"/proc/{pid}/stat")
+            if stat.exists() and stat.read_text().rsplit(")", 1)[1].split()[19] == native_identity["start_ticks"]:
+                os.kill(pid, signal.SIGTERM)
         stderr.close()
         # Pi/broker windows are retained for identity/tool-behavior inspection.
         # The approved operator must stop only those exact recorded windows.
