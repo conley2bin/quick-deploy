@@ -105,10 +105,10 @@ function staleDisplayedContinue(label) {
   control({ source: 'source', status: 'unreviewed', allow: true });
   control({ source: 'other', status: 'unreviewed', allow: true });
   for (const id of ['source', 'other']) {
-    nativeSelect(id); click('#handoffButton'); click('#handoffPanel button[type=submit]');
+    source(id); click('#handoffButton'); click('#handoffPanel button[type=submit]');
     wait(`document.querySelector('#handoffPanel [role=status]').textContent.includes(${JSON.stringify('来源：'+id)})`);
   }
-  nativeSelect('source'); wait('document.querySelector("#handoffPanel [role=status]").textContent.includes("来源：source")');
+  source('source'); wait('document.querySelector("#handoffPanel [role=status]").textContent.includes("来源：source")');
   const b = refs()[storageBase+':source:other'].operation_id;
   // One JS task: native replaceState, then click the still-painted A button.
   // No timer/microtask/monitor is allowed to repaint B before this click.
@@ -120,8 +120,10 @@ function staleDisplayedContinue(label) {
   screenshot(label+'-stale-A-continue-repainted-B');
   // The URL-only probe leaves native internal selection at A; its next refresh
   // may restore A. Make the second intent a real native B selection, not a
-  // later click after that unrelated URL restoration.
-  nativeSelect('other'); wait('document.querySelector("#handoffPanel [role=status]").textContent.includes("来源：other")');
+  // later click after that unrelated URL restoration. Use native hashchange
+  // navigation here; trusted sidebar selection is covered in concurrentSources.
+  source('source'); source('other');
+  wait('document.querySelector("#handoffPanel [role=status]").textContent.includes("来源：other")');
   run('find','role','button','click','--name','未校对，仍继续','--exact');
   wait('document.querySelector("#handoffPanel [role=status]").textContent.includes("新会话核对并修正中")');
   assert.deepEqual(actions().filter(a=>a.kind==='continue').map(a=>a.body), [{operation_id:b}]);
