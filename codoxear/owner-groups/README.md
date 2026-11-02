@@ -1,6 +1,6 @@
-# 负责人分组（默认启用的独立服务端适配器）
+# 负责人分组（共享 Web 宿主的默认扩展）
 
-给**电脑和手机使用同一 Codoxear 地址**增加原生会话分组。源码和依赖归 quick-deploy；不修改、复制覆盖或固定上游 checkout / site-packages。无参数 `../run_server.sh` 默认启用，旧 `--owner-groups` 命令保持兼容；`--no-owner-groups` 显式回退原生入口。
+给**电脑和手机使用同一 Codoxear 地址**增加原生会话分组。源码和依赖归 quick-deploy；不修改、复制覆盖或固定上游 checkout / site-packages。无参数 `../run_server.sh` 通过 `web-host/host.py` 同时启用负责人分组和会话接力，旧 `--owner-groups` 命令行为相同；`--no-owner-groups`（或 `--no-extensions`）显式关闭两项扩展并回退原生入口。
 
 ## 看见什么
 
@@ -20,7 +20,7 @@
 ./setup.sh
 ```
 
-普通 setup 在既有远程 main 同步/安装后自动调用 `owner-groups/setup.sh`，无需额外选择 flag 或独立 setup 步骤。该子脚本只在 `owner-groups/.venv/` 安装锁定的 aiohttp 依赖，优先使用 uv，没有 uv 则使用 Python venv/pip；需要 Python 3.10+（无 uv 时系统需提供 venv/pip）。如仅修复适配器依赖，也可单独运行 `./owner-groups/setup.sh`，不更新上游。两种 setup 都**不启动或重启任何服务**；独立子脚本也不写 shell rc、浏览器配置、全局 prompts/settings 或登记簿。
+普通 setup 在既有远程 main 同步/安装后自动调用 `web-host/setup.sh`，在 `web-host/.venv/` 安装锁定的 aiohttp 依赖，优先使用 uv，没有 uv 则使用 Python venv/pip；需要 Python 3.10+。如仅准备共享宿主依赖，可单独运行 `./web-host/setup.sh`，不更新上游。两种 setup 都**不启动或重启任何服务**；独立子脚本不写 shell rc、浏览器配置、全局 prompts/settings 或登记簿。旧 `owner-groups/setup.sh` / `.venv/` 仍保留用于兼容与已部署旧入口的回滚，但不再是默认启动依赖。
 
 完成独立测试并获准切换后，确认实际启动者/停止方式，在计划维护窗口停止原 Web server，再运行：
 
@@ -35,9 +35,11 @@
 2. 适配器占用原前端地址；上游同一可执行文件在临时私有 `127.0.0.1` 端口启动，HOME/状态/认证 secret/前缀不变。公网反代仍指向原地址；不新增 TLS、密码或公开端口。IPv6 wildcard 继续采用上游的 dual-stack socket 行为。
 3. Ctrl-C 停止适配器和它自己启动的后台 Web server；上游提前退出也会停止这个入口，不无限重启。端口已占用则在启动后端前失败，不停止现有进程。后端刚启动时若还未就绪，请稍后重新加载；不会用其他服务兜底。
 
+维护现有上游版本的 Web-only 切换不要调用上述会同步/安装上游的入口：在获准且核验控制归属后，单独准备共享依赖，并使用 `web-host/.venv/bin/python web-host/host.py --managed-upstream`，保留原有效环境、地址和认证。回滚需保留旧入口代码及其原始路径语义、旧 venv 和资源；新版 `proxy.py` CLI 不是旧版本回滚器。
+
 **本功能不会替你切换当前运行服务。** 需要记录实际启动者/停止方式再安排切换，不要对未知进程执行 kill。既有反代若只放行固定路径，需一并允许前缀下 `__owner_groups__/`；应由反代负责人确认，不在此自动修改。
 
-回退：停止该入口，再运行 `./run_server.sh --no-owner-groups`。原生入口不依赖适配器，仍执行既有 env 校验、远程 main 同步/安装和启动说明。默认入口的依赖或启动失败会明确报错，**不会自动启动原生服务兜底**。停用后可删除**本功能自己的** `owner-groups/.venv/`；保留 quick-deploy 源码以便维护。没有浏览器插件、native host 或系统服务需要卸载。上游 service worker 可能在离线时显示旧的缓存 HTML；联网重新加载原生入口恢复。已加载的增强页面在快照失败时恢复原生列表，不等于服务端自动切换入口。不自动清除用户浏览器缓存。
+回退：停止该入口，再运行 `./run_server.sh --no-extensions`（旧 `--no-owner-groups` 等价）。原生入口不依赖适配器，仍执行既有 env 校验、远程 main 同步/安装和启动说明。默认入口的依赖或启动失败会明确报错，**不会自动启动原生服务兜底**。共享 `web-host/.venv/` 同时供两项扩展使用，不能只为停用分组而删除；旧 `owner-groups/.venv/` 在旧入口仍运行或仍需回滚时也必须保留。没有浏览器插件、native host 或系统服务需要卸载。上游 service worker 可能在离线时显示旧的缓存 HTML；联网重新加载原生入口恢复。已加载的增强页面在快照失败时恢复原生列表，不等于服务端自动切换入口。不自动清除用户浏览器缓存。
 
 ## 身份和数据边界
 
@@ -64,6 +66,8 @@ has_bound_log (仅对可信上游返回的非空绝对 log_path 做只读 regula
 
 当前探测的上游：`2b14d7092d5e41038361f6bd4026a89e391f7293`。这是测试边界，不是版本固定。依赖原生 `#root`/`dist/app.bundle.js` HTML、`.sidebar > #sessions.sessions`、完整 `.session[data-session-id]` 外层卡片（含 desktop inline / touch swipe DOM）和 `.sessionGroupHeader` 约定。
 
+- `proxy.py` 是兼容 facade：导入的 `create_app` / `managed_app` 保留 owner-only 测试接口，CLI 则启用两项扩展；传输、进程生命周期及依赖由共享宿主管理。
+- 脚本内容和 content hash 在启动时冻结；改源码后需获准重启 Web，运行中不会热读新脚本。
 - 只有受识别的 UTF-8 entry HTML、兼容 CSP 才注入同源外部脚本；脚本带源码 content hash 版本，不覆盖上游 service worker。上游 CSP 不被放宽；最小包装框/星号样式需要既有 inline-style allowance；不覆盖原生行样式。
 - 修改 HTML 后重算 Content-Length，去掉原 ETag/Last-Modified/内容摘要并设 no-store。未知 HTML/CSP/压缩或过大 entry 原样通过，响应 `X-Owner-Groups` 明确报告状态。
 - `GET <prefix>/__owner_groups__/status` 是不含私有数据的兼容性诊断（`injected` / `unsupported-*` / `not-observed`）。已注入页面若侧栏锚点/行结构变化，恢复捕获的原生卡片及原有标题/计数，在可用侧栏显示简短兼容提示；原 app 仍可用。服务端无法向未注入的未知 HTML 再插入警告，需查看 status/header。
@@ -79,11 +83,11 @@ python3 -m unittest discover -s tests -p 'test_entrypoints.py' -v
 
 测试只运行临时副本，使用临时 HOME/.env、受限 PATH 和 updater/installer/启动器 stub，验证默认入口、显式回退、失败顺序和普通 setup，不更新真实上游、安装依赖或启动服务。
 
-适配器测试需先安装本功能依赖：
+适配器测试使用共享宿主依赖：
 
 ```bash
 CODOXEAR_TEST_PYTHON="$PWD/.runtime/venv/bin/python" \
-  owner-groups/.venv/bin/python -m unittest discover -s owner-groups/tests -p 'test_*.py' -v
+  web-host/.venv/bin/python -m unittest discover -s owner-groups/tests -p 'test_*.py' -v
 node --test owner-groups/tests/core.test.cjs
 ```
 
@@ -93,7 +97,7 @@ node --test owner-groups/tests/core.test.cjs
 
 ```bash
 STATIC_DIR="$(.runtime/venv/bin/python -c 'from pathlib import Path; import codoxear; print(Path(codoxear.__file__).parent / "static")')"
-owner-groups/.venv/bin/python owner-groups/tests/demo_server.py --static-dir "$STATIC_DIR" --port 8875
+web-host/.venv/bin/python owner-groups/tests/demo_server.py --static-dir "$STATIC_DIR" --port 8875
 # 独立地址 http://127.0.0.1:8875/demo/；输入 demo 即可。不是生产账号。
 ```
 
