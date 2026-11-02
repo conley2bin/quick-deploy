@@ -52,6 +52,15 @@ class PromptTests(unittest.TestCase):
         self.assertIn("用户已显式选择", bypass)
         self.assertIn(" --unreviewed", bypass)
 
+    def test_conflict_review_requires_verification_not_blind_obedience(self):
+        prompt = prompts.build_continuation_prompt(self.manifest, self.directory, "b" * 64)
+        self.assertIn("review.verdict=conflict", prompt)
+        self.assertIn("verification-only", prompt)
+        self.assertIn("尚不授权执行任务", prompt)
+        self.assertIn("只有最新明确用户指令或当前直接证据", prompt)
+        self.assertIn("无法消除则写 conflict 并停止", prompt)
+        self.assertIn("旧意见也不能授予任意新任务或新任命权限", prompt)
+
     def test_shared_evidence_authority_and_safe_argv(self):
         values = [prompts.build_recovery_prompt(self.manifest, self.directory),
                   prompts.build_review_prompt(self.manifest, self.directory, "a" * 64),

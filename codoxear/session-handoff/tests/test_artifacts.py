@@ -132,11 +132,28 @@ class ArtifactTests(unittest.TestCase):
         self.assertIsNotNone(context.read_artifact(self.directory, "resolution", **self.identity,
                                                  understanding_sha256=u["_sha256"], review_sha256="unreviewed"))
 
-    def test_cannot_bypass_existing_review(self):
-        self.submit("understanding")
+    def test_late_review_before_bypass_does_not_change_explicit_route(self):
+        understanding = self.submit("understanding")
         self.submit("review", verdict="conflict")
-        with self.assertRaises(context.ContextError):
-            self.submit("resolution", verdict="ready", unreviewed=True)
+        review_path = self.directory / "review.json"
+        original_review = review_path.read_bytes()
+        resolution = self.submit("resolution", verdict="ready", unreviewed=True)
+        self.assertEqual(resolution["review_sha256"], "unreviewed")
+        self.assertEqual(review_path.read_bytes(), original_review)
+        self.assertIsNotNone(context.read_artifact(self.directory, "resolution", **self.identity,
+                                                 understanding_sha256=understanding["_sha256"],
+                                                 review_sha256="unreviewed"))
+
+    def test_late_review_after_bypass_does_not_rewrite_resolution(self):
+        understanding = self.submit("understanding")
+        resolution = self.submit("resolution", verdict="ready", unreviewed=True)
+        original_resolution = (self.directory / "resolution.json").read_bytes()
+        self.submit("review", verdict="corrections")
+        self.assertEqual((self.directory / "resolution.json").read_bytes(), original_resolution)
+        result = context.read_artifact(self.directory, "resolution", **self.identity,
+                                       understanding_sha256=understanding["_sha256"],
+                                       review_sha256="unreviewed")
+        self.assertEqual(result, resolution)
 
     def test_invalid_verdict_and_missing_understanding(self):
         with self.assertRaises(context.ContextError):

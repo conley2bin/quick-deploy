@@ -79,12 +79,12 @@ def submit(manifest_path: Path, kind: str, body_file: Path, *, verdict=None,
         elif verdict is not None:
             raise context.ContextError("understanding does not take --verdict")
         if kind == "resolution":
-            review = context.read_artifact(operation_dir, "review", **identity, **previous)
             if unreviewed:
-                if review is not None:
-                    raise context.ContextError("cannot bypass an already submitted review")
+                # The authenticated workflow selected this route explicitly. A late
+                # review is retained for audit, but must not change that selection.
                 previous["review_sha256"] = "unreviewed"
             else:
+                review = context.read_artifact(operation_dir, "review", **identity, **previous)
                 if review is None:
                     raise context.ContextError("review missing; explicit bypass requires --unreviewed")
                 previous["review_sha256"] = review["_sha256"]
