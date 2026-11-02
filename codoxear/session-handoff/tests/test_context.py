@@ -52,6 +52,36 @@ class ContextTests(unittest.TestCase):
         self.assertIn("unpersisted active cursor is UNKNOWN", rendered)
         self.assertIn("Current files/evidence outrank stale memory", rendered)
 
+    def test_long_user_excerpt_keeps_goal_change_within_snapshot(self):
+        head = "Background for historical goalX: "
+        tail = "current goalY, X canceled"
+        raw = self.log([
+            message("a", None, "historical goalX"),
+            {"type": "compaction", "id": "c", "parentId": "a",
+             "summary": "historical goalX", "firstKeptEntryId": "c"},
+            message("z", "c", "inactivebranchZ"),
+            message("y", "c", head + "background " * 400 + tail),
+        ])
+        snapshot = context.create_source_snapshot(self.path)
+        initial = context.render_source_context(snapshot)
+        with self.path.open("ab") as stream:
+            stream.write((json.dumps(message("w", "y", "later goalW")) + "\n").encode())
+        self.assertEqual(context.render_source_context(snapshot), initial)
+        self.assertEqual(snapshot["cutoff_bytes"], len(raw))
+        self.assertEqual(snapshot["sha256"], hashlib.sha256(raw).hexdigest())
+        for budget in (24000, 4000):
+            with self.subTest(budget=budget):
+                rendered = context.render_source_context(snapshot, max_chars=budget)
+                self.assertLessEqual(len(rendered), budget)
+                self.assertIn("historical goalX", rendered)
+                self.assertIn(head, rendered)
+                self.assertIn(tail, rendered)
+                self.assertIn("[middle truncated; inspect full entry y within cutoff_bytes]", rendered)
+                excerpt = rendered.split("\n[y] user\n", 1)[1].rstrip("\n")
+                self.assertLessEqual(len(excerpt), 3000)
+                self.assertNotIn("inactivebranchZ", rendered)
+                self.assertNotIn("later goalW", rendered)
+
     def test_partial_tail_and_post_snapshot_appends_are_excluded(self):
         raw = self.log([message("a", None, "committed")], b'{"type":"message"')
         before = self.path.read_bytes()

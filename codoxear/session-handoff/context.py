@@ -236,7 +236,14 @@ def render_source_context(snapshot: dict, *, max_chars=24000) -> str:
             text = _text(content)
             limit = 6000 if role == "compaction" else 3000
             if len(text) > limit:
-                text = text[:limit] + "\n[entry text truncated; inspect evidence selectively]"
+                if role == "user":
+                    marker = f"\n[middle truncated; inspect full entry {entry['id']} within cutoff_bytes]\n"
+                    retained = max(0, limit - len(marker))
+                    head = (retained + 1) // 2
+                    tail = retained - head
+                    text = text[:head] + marker + (text[-tail:] if tail else "")
+                else:
+                    text = text[:limit] + "\n[entry text truncated; inspect evidence selectively]"
         chunks.append(f"\n[{entry['id']}] {role}" + (" (context_edit applied)" if edited else "") + "\n" + text + "\n")
     budget = max_chars - len(header) - 150
     kept = []

@@ -31,7 +31,8 @@ def build_recovery_prompt(manifest, operation_dir):
     note = json.dumps(manifest.get("note", ""), ensure_ascii=False)
     return common + (
         "你是新接续会话。当前阶段仅独立恢复与报告，不推进任务，不修改项目文件、不运行任务变更命令。\n"
-        "先读 manifest 与固定源上下文，再按明确项目/任务关联阅读现有项目指令、memory、当前文件与必要证据；"
+        "先读 manifest 与固定源上下文；若最新用户条目被截断，必须按 entry ID 在 cutoff_bytes 内读取完整条目，"
+        "不得仅凭旧摘要判断当前目标。再按明确项目/任务关联阅读现有项目指令、memory、当前文件与必要证据；"
         "不得按最新 mtime 猜任务。核对目标变更、被否决的方案、已完成/未完成工作、约束与不确定性。"
         "侧分支不是当前目标；有实际分支疑点在报告中交给旧会话核对。\n"
         "理解报告应写：当前目标、成功标准、已验证状态（具体文件/entry ID）、未证实声明、"

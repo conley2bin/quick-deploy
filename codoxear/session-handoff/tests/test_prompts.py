@@ -31,6 +31,8 @@ class PromptTests(unittest.TestCase):
         self.assertNotIn("--kind review", prompt)
         self.assertIn("不得按最新 mtime 猜任务", prompt)
         self.assertIn("侧分支不是当前目标", prompt)
+        self.assertIn("若最新用户条目被截断，必须按 entry ID 在 cutoff_bytes 内读取完整条目", prompt)
+        self.assertIn("不得仅凭旧摘要判断当前目标", prompt)
 
     def test_old_session_stays_reviewer(self):
         prompt = prompts.build_review_prompt(self.manifest, self.directory, "a" * 64)
