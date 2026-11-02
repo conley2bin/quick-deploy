@@ -80,7 +80,7 @@ def install(app, host, *, state_root=None, timeouts=None):
                 if set(data) != {"operation_id"}:
                     raise HandoffError("invalid_input", "请求仅接受操作标识", 400)
                 operation = (engine.continue_unreviewed(data["operation_id"], rows=rows, cookie=cookie)
-                             if action == "continue" else engine.public(data["operation_id"]))
+                             if action == "continue" else engine.status(data["operation_id"], rows=rows))
             return host.json_response({"operation": operation})
         except HandoffError as exc:
             return host.json_response({"error": exc.code, "message": exc.message}, status=exc.status)

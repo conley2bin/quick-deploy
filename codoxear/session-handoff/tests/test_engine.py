@@ -231,8 +231,160 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
         self.native.emit_resolution = False
         await self.start()
         result = await self.finish()
-        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["status"], "delivery_unknown")
         self.assertEqual(result["error_code"], "resolution_timeout")
+
+    async def test_accepted_create_then_binding_get_503_keeps_source_lease(self):
+        previous = self.native.__call__
+        failed = False
+        async def transient(method, path, **kwargs):
+            nonlocal failed
+            if method == "GET" and self.native.target and not failed:
+                failed = True
+                return 503, {"error": "temporary listing failure"}
+            return await previous(method, path, **kwargs)
+        self.engine.upstream_json = transient
+        first = await self.start()
+        result = await self.finish()
+        self.assertEqual(result["status"], "creation_unknown")
+        self.assertEqual(result["error_code"], "native_unavailable")
+        self.assertEqual(await self.start(), first)
+        self.assertEqual(len(self.native.mutations()), 1)
+        await self.engine.close()
+        self.engine = Engine(self.native, state_root=self.engine.root).open()
+        self.native.engine = self.engine
+        self.assertEqual(self.engine.public(first)["status"], "creation_unknown")
+        self.assertEqual(await self.start(), first)
+        self.assertEqual(len(self.native.mutations()), 1)
+        self.assertFalse(self.engine.tasks)
+
+    async def test_late_resolution_reconciles_without_any_new_mutation(self):
+        self.native.emit_resolution = False
+        first = await self.start()
+        self.assertEqual((await self.finish())["status"], "delivery_unknown")
+        self.assertEqual(await self.start(), first)
+        rows = await self.engine.sessions("fresh-cookie")
+        self.assertEqual(self.engine.status(first, rows=rows)["status"], "delivery_unknown")
+        before = list(self.native.mutations())
+        self.native.artifact("resolution")
+        self.assertEqual(self.engine.status(first, rows=rows)["status"], "ready")
+        self.assertEqual(self.engine.status(first, rows=rows)["status"], "ready")
+        self.assertEqual(len(before), 3)  # One create, one review, one continuation.
+        self.assertEqual(self.native.mutations(), before)
+
+    async def test_late_conflict_after_lost_continuation_response(self):
+        self.native.lost = "continuation"
+        first = await self.start()
+        self.assertEqual((await self.finish())["status"], "delivery_unknown")
+        self.assertEqual(await self.start(), first)
+        self.native.resolution_verdict = "conflict"
+        self.native.artifact("resolution")
+        result = self.engine.status(first, rows=await self.engine.sessions("fresh"))
+        self.assertEqual(result["status"], "conflict")
+        self.assertEqual(len(self.native.mutations()), 3)
+
+    async def test_late_wrong_hash_keeps_unknown_and_source_locked(self):
+        self.native.emit_resolution = False
+        first = await self.start()
+        await self.finish()
+        self.native.report_transform = lambda kind, data: {**data, "review_sha256": "0" * 64}
+        self.native.artifact("resolution")
+        result = self.engine.status(first, rows=await self.engine.sessions("fresh"))
+        self.assertEqual(result["status"], "delivery_unknown")
+        self.assertEqual(result["error_code"], "invalid_artifact")
+        self.assertEqual(await self.start(), first)
+        self.assertEqual(len(self.native.mutations()), 3)
+
+    async def test_late_exact_receipt_rejects_rebound_target(self):
+        self.native.emit_resolution = False
+        first = await self.start()
+        await self.finish()
+        self.native.artifact("resolution")
+        self.native.target["spawn_nonce"] = "rebound"
+        result = self.engine.status(first, rows=await self.engine.sessions("fresh"))
+        self.assertEqual(result["status"], "delivery_unknown")
+        self.assertEqual(result["error_code"], "identity_changed")
+        self.assertEqual(await self.start(), first)
+        self.assertEqual(len(self.native.mutations()), 3)
+
+    async def test_restart_unknown_reconciles_late_receipt_without_replay(self):
+        self.native.emit_resolution = False
+        first = await self.start()
+        await self.finish()
+        await self.engine.close()
+        self.engine = Engine(self.native, state_root=self.engine.root).open()
+        self.native.engine = self.engine
+        self.assertEqual(self.engine.public(first)["status"], "delivery_unknown")
+        self.assertEqual(await self.start(), first)
+        self.assertFalse(self.engine.tasks)
+        self.native.artifact("resolution")
+        result = self.engine.status(first, rows=await self.engine.sessions("fresh"))
+        self.assertEqual(result["status"], "ready")
+        self.assertEqual(len(self.native.mutations()), 3)
+
+    async def test_legacy_failed_with_effect_is_locked_on_restart(self):
+        self.native.emit_resolution = False
+        first = await self.start()
+        await self.finish()
+        # State written by the previous implementation after receipt timeout.
+        self.native.op["status"] = "failed"
+        self.engine._persist(self.native.op)
+        await self.engine.close()
+        self.engine = Engine(self.native, state_root=self.engine.root).open()
+        self.native.engine = self.engine
+        self.assertEqual(self.engine.public(first)["status"], "delivery_unknown")
+        self.assertEqual(await self.start(), first)
+        self.assertEqual(len(self.native.mutations()), 3)
+
+    async def test_interrupted_continuation_can_observe_late_receipt(self):
+        self.native.emit_resolution = False
+        first = await self.start()
+        await self.finish()
+        self.native.op["status"] = "revising"
+        self.engine._persist(self.native.op)
+        second = Engine(self.native, state_root=self.engine.root).open()
+        try:
+            self.assertEqual(second.public(first)["status"], "interrupted")
+            self.native.artifact("resolution")
+            self.assertEqual(second.status(first, rows=await second.sessions("fresh"))["status"], "ready")
+            self.assertEqual(len(self.native.mutations()), 3)
+        finally:
+            await second.close()
+
+    async def test_definite_create_400_releases_source_for_new_request(self):
+        previous = self.native.__call__
+        async def rejected(method, path, **kwargs):
+            if method == "POST" and path == "/api/sessions":
+                self.native.calls.append((method, path, kwargs["body"]))
+                return 400, {"error": "cwd is unavailable", "field": "cwd"}
+            return await previous(method, path, **kwargs)
+        self.engine.upstream_json = rejected
+        first = await self.start()
+        result = await self.finish()
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["error_code"], "native_create_rejected")
+        self.assertEqual(self.native.op["intents"]["create"]["result"], "rejected")
+        second = await self.start()
+        self.assertNotEqual(second, first)
+        await self.finish()
+        self.assertEqual(self.engine.public(second)["status"], "failed")
+        self.assertIsNone(self.native.target)
+        self.assertEqual(len(self.native.mutations()), 2)  # Two rejected requests, zero launches/sends.
+
+    async def test_pre_creation_observation_failure_releases_source(self):
+        previous = self.native.__call__
+        async def unavailable(method, path, **kwargs):
+            if method == "GET" and self.engine.operations:
+                return 503, {"error": "unavailable before create"}
+            return await previous(method, path, **kwargs)
+        self.engine.upstream_json = unavailable
+        first = await self.start()
+        self.assertEqual((await self.finish())["status"], "failed")
+        self.assertEqual(self.native.mutations(), [])
+        self.engine.upstream_json = previous
+        second = await self.start()
+        self.assertNotEqual(second, first)
+        self.assertIn(second, self.engine.tasks)
 
     async def test_source_route_rebound_blocks_review(self):
         def rebind():
@@ -292,7 +444,7 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
                 self.native.report_transform = lambda kind, data: {**data, field: value} if kind == "understanding" else data
                 await self.start()
                 result = await self.finish()
-                self.assertEqual(result["status"], "failed")
+                self.assertEqual(result["status"], "delivery_unknown")
                 self.assertEqual(result["error_code"], "invalid_artifact")
                 self.assertEqual(len(self.native.mutations()), 1)
                 # Each case has an independent engine/state root/native, no side-effect retry.
@@ -315,7 +467,7 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
         self.native.report_transform = lambda kind, data: {**data, "review_sha256": "0" * 64} if kind == "resolution" else data
         await self.start()
         result = await self.finish()
-        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["status"], "delivery_unknown")
         self.assertEqual(result["error_code"], "invalid_artifact")
         self.assertEqual(len(self.native.mutations()), 3)
 

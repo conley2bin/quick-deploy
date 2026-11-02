@@ -188,6 +188,27 @@ class FeatureTests(unittest.IsolatedAsyncioTestCase):
         response, _ = await self.post("continue", {"operation_id": operation_id})
         self.assertEqual(response.status, 409)
 
+    async def test_status_reconciles_late_receipt_only_after_fresh_auth(self):
+        self.native.emit_resolution = False
+        _, data = await self.post("start", self.start_body())
+        operation_id = data["operation"]["id"]
+        await self.finish()
+        _, data = await self.post("status", {"operation_id": operation_id})
+        self.assertEqual(data["operation"]["status"], "delivery_unknown")
+        _, duplicate = await self.post("start", self.start_body())
+        self.assertEqual(duplicate["operation"]["id"], operation_id)
+        self.native.artifact("resolution")
+        self.native.auth = False
+        response, _ = await self.post("status", {"operation_id": operation_id})
+        self.assertEqual(response.status, 401)
+        self.assertEqual(self.engine.public(operation_id)["status"], "delivery_unknown")
+        self.native.auth = True
+        response, data = await self.post("status", {"operation_id": operation_id})
+        self.assertEqual(response.status, 200)
+        self.assertEqual(data["operation"]["status"], "ready")
+        self.assertEqual(len(self.native.mutations()), 3)
+        self.assertFalse(self.engine.tasks)
+
     async def test_non_pi_returns_clear_4xx(self):
         self.native.source["agent_backend"] = "codex"
         response, data = await self.post("start", self.start_body())

@@ -28,7 +28,16 @@ MESSAGES = {
 }
 FINISHED = {"ready", "conflict", "failed", "creation_unknown", "delivery_unknown", "interrupted"}
 # Unknown mutations remain source-locked: a new UUID must not disguise a retry.
-RELEASE_SOURCE = {"ready", "conflict", "failed"}
+def failure_status(op):
+    create = op.get("intents", {}).get("create")
+    if create is None or create.get("result") == "rejected":
+        return "failed"  # No successor can have received the startup prompt.
+    return "delivery_unknown" if op.get("target_header") else "creation_unknown"
+
+
+def releases_source(op):
+    return op["status"] in {"ready", "conflict"} or (
+        op["status"] == "failed" and failure_status(op) == "failed")
 
 
 class HandoffError(Exception):
@@ -163,7 +172,10 @@ class Engine:
             self.operations[op["id"]] = op
             for request_id in op["request_ids"]:
                 self.requests[request_id] = op["id"]
-            if op["status"] not in FINISHED:
+            if op["status"] == "failed":
+                # Upgrade old persisted failures whose accepted effects never ended.
+                self._set(op, "failed", error_code=op.get("error_code", "workflow_error"))
+            elif op["status"] not in FINISHED:
                 self._set(op, "interrupted", error_code="restart")
         return self
 
@@ -171,6 +183,8 @@ class Engine:
         atomic_state(self.root / op["id"] / "state.json", op)
 
     def _set(self, op, status, **fields):
+        if status == "failed":
+            status = failure_status(op)
         if "error_code" not in fields:
             op.pop("error_code", None)
         op.update(fields, status=status, message=MESSAGES[status], updated_at=time.time(),
@@ -182,6 +196,27 @@ class Engine:
         if op is None:
             raise HandoffError("not_found", "未找到接力操作", 404)
         return {key: op[key] for key in PUBLIC if key in op}
+
+    def status(self, operation_id, *, rows):
+        """Reconcile a late receipt using fresh authenticated rows; never send."""
+        self.public(operation_id)  # Validate the identifier and existence first.
+        op = self.operations[uuid_text(operation_id)]
+        continuation = op.get("intents", {}).get("continuation", {})
+        if (op["status"] not in {"delivery_unknown", "interrupted"}
+                or continuation.get("result") not in {"accepted", "unknown"}):
+            return self.public(op["id"])
+        try:
+            self._verify(op, rows, "target")
+            self._check_chain(op)
+            resolution = self._artifact(op, "resolution")
+        except (ContextError, HandoffError, OSError) as exc:
+            self._set(op, op["status"], error_code=(
+                exc.code if isinstance(exc, HandoffError) else "invalid_artifact"))
+        else:
+            if resolution is not None:
+                op["resolution_sha256"] = resolution["_sha256"]
+                self._set(op, "conflict" if resolution["verdict"] == "conflict" else "ready")
+        return self.public(op["id"])
 
     async def sessions(self, cookie):
         try:
@@ -215,7 +250,7 @@ class Engine:
                 raise HandoffError("request_conflict", "同一请求标识不能用于不同会话")
             return self.public(op["id"])
         for op in self.operations.values():
-            if op["source_session_id"] == source_session_id and op["status"] not in RELEASE_SOURCE:
+            if op["source_session_id"] == source_session_id and not releases_source(op):
                 if len(op["request_ids"]) >= 256:
                     raise HandoffError("request_limit", "此操作的重复请求过多，请使用原操作标识")
                 op["request_ids"].append(request_id)
@@ -285,6 +320,14 @@ class Engine:
                 "POST", path, cookie=cookie, body=body, timeout=self.timeouts["native"]), self.timeouts["native"])
         except Exception:
             status, data = None, None
+        # Native create's 400 is a pre-launch rejection. Other errors (including
+        # 500 with a launch attempt) do not establish that no process was started.
+        if (stage == "create" and status == 400 and isinstance(data, dict)
+                and data.get("error") and not data.get("commit_unknown")
+                and not any(data.get(k) for k in ("launch_id", "broker_pid", "launch_attempt"))):
+            op["intents"][stage]["result"] = "rejected"
+            self._set(op, "failed", error_code="native_create_rejected")
+            return None
         if status != 200 or not isinstance(data, dict) or data.get("ok") is False or data.get("error") or data.get("commit_unknown"):
             self._set(op, "creation_unknown" if stage == "create" else "delivery_unknown", error_code="native_mutation_unknown")
             return None
