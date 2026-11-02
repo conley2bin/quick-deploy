@@ -14,7 +14,8 @@ DOCUMENT = Path.home() / '.pi/agent/skills/responsibility-registry/RESPONSIBILIT
 CODEC = DOCUMENT.parent / 'scripts/registry_document.py'
 FORMAT = 'responsibility-registry/v2'
 SCHEMA = 'codoxear-owner-groups/v1'
-MAX_BYTES = 8 * 1024 * 1024
+# Raw Markdown includes audit history; projected owner/depth limits are separate.
+MAX_DOCUMENT_BYTES = 64 * 1024 * 1024
 MAX_OWNERS = 500
 MAX_DEPTH = 64
 
@@ -36,7 +37,8 @@ def display(value):
 def failure(code):
     messages = {
         'unavailable': 'Owner registry unavailable or not initialized.',
-        'invalid': 'Owner registry is invalid or exceeds supported size/depth; no partial tree shown.',
+        'invalid': 'Owner registry is invalid or exceeds supported owner/depth limits; no partial tree shown.',
+        'document-too-large': 'Owner registry document exceeds the supported byte limit; no partial tree shown.',
     }
     return {'schema': SCHEMA, 'ok': False, 'error': messages[code], 'owners': []}
 
@@ -122,8 +124,9 @@ def read_registry(root=ROOT, document=DOCUMENT, codec_path=CODEC):
             fcntl.flock(lock, fcntl.LOCK_SH)
             require(not document.is_symlink())
             with document.open('rb') as source:
-                raw = source.read(MAX_BYTES + 1)
-            require(len(raw) <= MAX_BYTES)
+                raw = source.read(MAX_DOCUMENT_BYTES + 1)
+            if len(raw) > MAX_DOCUMENT_BYTES:
+                return failure('document-too-large')
             try:
                 state, era = codec.parse_document(raw.decode('utf-8'))
             except codec.RegistryError as exc:

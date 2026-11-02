@@ -83,6 +83,7 @@ class ProjectionTests(unittest.TestCase):
         state = copy.deepcopy(self.state); state['owners']['office']['identity']['source'] = 'intercom-status'; variants.append(state)
         state = copy.deepcopy(self.state); state['owners']['office']['parent'] = 'owner: ops'; variants.append(state)
         state = copy.deepcopy(self.state); state['assignments']['office-scope']['owner'] = 'no-such-owner'; variants.append(state)
+        state = copy.deepcopy(self.state); state['history'][0]['revision'] = 99; variants.append(state)
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp); (root / 'registry.lock').touch()
             for state in variants:
@@ -98,6 +99,104 @@ class ProjectionTests(unittest.TestCase):
             for raw in ('{', '{"version":1,"version":1}', '{"version":NaN}'):
                 (root / 'RESPONSIBILITIES.md').write_text(raw)
                 self.assertFalse(p.read_registry(root, root / 'RESPONSIBILITIES.md', fixture.CODEC)['ok'])
+
+    def test_valid_history_above_old_document_limit_stays_private(self):
+        state = copy.deepcopy(self.state)
+        snapshot = {kind: copy.deepcopy(state[kind]) for kind in ('owners', 'assignments', 'coordination')}
+        state['history'] = []
+        # Legal full-state audit snapshots model history growth, not whitespace padding.
+        for revision in range(1, 257):
+            after = copy.deepcopy(snapshot)
+            after['owners']['ops']['role'] = f'PRIVATE archived coordination role {revision}'
+            after['owners']['ops']['identity']['pi_session_id'] = f'HISTORY-ONLY-ID-{revision}'
+            state['history'].append({'revision': revision, 'at': '2026-01-01T00:00:00+00:00',
+                'actor': 'ops', 'action': 'update-owner', 'reason': f'Archived role review {revision}',
+                'before': snapshot, 'after': after})
+            snapshot = after
+        state['revision'] = len(state['history'])
+        raw = fixture.registry_document.serialize_document(state, '00000000-0000-0000-0000-000000000001').encode('utf-8')
+        self.assertGreater(len(raw), 8 * 1024 * 1024)
+        self.assertLess(len(raw), 64 * 1024 * 1024)
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp); (root / 'registry.lock').touch()
+            document = root / 'RESPONSIBILITIES.md'; document.write_bytes(raw)
+            result = p.read_registry(root, document, fixture.CODEC)
+        self.assertTrue(result['ok'], result.get('error'))
+        self.assertEqual(result['revision'], 256)
+        self.assertEqual(result['owners'], p.project(self.state)['owners'])
+        self.assertLess(len(json.dumps(result).encode('utf-8')), 16 * 1024)
+        for forbidden in ('PRIVATE', 'HISTORY-ONLY-ID', 'history', 'recovery'):
+            self.assertNotIn(forbidden, json.dumps(result))
+
+    def test_document_byte_boundary_is_bounded_before_codec_parse(self):
+        self.assertEqual(p.MAX_DOCUMENT_BYTES, 64 * 1024 * 1024)
+        raw = (self.root / 'RESPONSIBILITIES.md').read_bytes()
+        self.assertGreater(len(raw), len(raw.decode('utf-8')))
+        codec = fixture.registry_document
+        real_parse = codec.parse_document
+        reads = []
+        original_open = Path.open
+        class BoundedRead:
+            def __init__(self, source): self.source = source
+            def __enter__(self): return self
+            def __exit__(self, *args): self.source.close()
+            def read(self, size):
+                reads.append(size)
+                return self.source.read(size)
+        def opened(path, *args, **kwargs):
+            source = original_open(path, *args, **kwargs)
+            return BoundedRead(source) if path.name == 'RESPONSIBILITIES.md' and args == ('rb',) else source
+        with patch.object(p, 'load_codec', return_value=codec), patch.object(Path, 'open', opened):
+            for limit in (len(raw) + 1, len(raw)):
+                with self.subTest(limit=limit), patch.object(p, 'MAX_DOCUMENT_BYTES', limit), \
+                        patch.object(codec, 'parse_document', wraps=real_parse) as parse:
+                    self.assertTrue(p.read_registry(self.root, self.root / 'RESPONSIBILITIES.md', fixture.CODEC)['ok'])
+                    parse.assert_called_once_with(raw.decode('utf-8'))
+                    self.assertEqual(reads[-1], limit + 1)
+            limit = len(raw) - 1
+            with patch.object(p, 'MAX_DOCUMENT_BYTES', limit), patch.object(codec, 'parse_document') as parse:
+                result = p.read_registry(self.root, self.root / 'RESPONSIBILITIES.md', fixture.CODEC)
+                self.assertEqual(result, p.failure('document-too-large'))
+                parse.assert_not_called()
+                self.assertEqual(reads[-1], limit + 1)
+
+    def test_owner_count_boundary_is_independent_of_document_size(self):
+        state = copy.deepcopy(self.state)
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp); (root / 'registry.lock').touch()
+            document = root / 'RESPONSIBILITIES.md'
+            for count in (500, 501):
+                state['owners'] = {f'owner-{i}': {**self.state['owners']['ops'], 'id': f'owner-{i}', 'parent': 'user'}
+                                   for i in range(count)}
+                state['assignments'] = {}
+                raw = fixture.registry_document.serialize_document(state, '00000000-0000-0000-0000-000000000001').encode('utf-8')
+                self.assertLess(len(raw), p.MAX_DOCUMENT_BYTES)
+                document.write_bytes(raw)
+                result = p.read_registry(root, document, fixture.CODEC)
+                with self.subTest(count=count):
+                    self.assertEqual(result['ok'], count == 500)
+                    self.assertEqual(len(result['owners']), 500 if count == 500 else 0)
+                    if count > 500:
+                        self.assertEqual(result, p.failure('invalid'))
+
+    def test_depth_boundary_is_independent_of_document_size(self):
+        state = copy.deepcopy(self.state)
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp); (root / 'registry.lock').touch()
+            document = root / 'RESPONSIBILITIES.md'
+            for depth in (64, 65):
+                state['owners'] = {f'owner-{i}': {**self.state['owners']['ops'], 'id': f'owner-{i}',
+                    'parent': 'user' if i == 0 else f'owner:owner-{i - 1}'} for i in range(depth)}
+                state['assignments'] = {}
+                raw = fixture.registry_document.serialize_document(state, '00000000-0000-0000-0000-000000000001').encode('utf-8')
+                self.assertLess(len(raw), p.MAX_DOCUMENT_BYTES)
+                document.write_bytes(raw)
+                result = p.read_registry(root, document, fixture.CODEC)
+                with self.subTest(depth=depth):
+                    self.assertEqual(result['ok'], depth == 64)
+                    self.assertEqual(len(result['owners']), 64 if depth == 64 else 0)
+                    if depth > 64:
+                        self.assertEqual(result, p.failure('invalid'))
 
     def test_missing_store_does_not_create_anything(self):
         with tempfile.TemporaryDirectory() as temp:

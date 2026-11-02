@@ -45,7 +45,7 @@
 
 固定唯一当前来源：`~/.pi/agent/skills/responsibility-registry/RESPONSIBILITIES.md`。受控加载同安装目录的纯 `scripts/registry_document.py`（要求 responsibility-registry/v2），只读打开私有目录已存在的 `registry.lock` 并取共享锁，再严格解析 Markdown；无 Store/CLI 调用、JSON fallback 或路径发现，HTTP 调用者不能指定路径。codec 不存在/不兼容、MD 缺失/损坏只报不可用并恢复原生列表，不显示最后成功图。首次部署须同时部署已安装 codec 与适配器；一次显式迁移和适配器激活后，后续 MD 修改/模板复制无需服务刷新。见 [迁移及不复活旧数据的回退](../../pi-agent/skills/responsibility-registry/references/migration.md)。
 
-只导出当前文档 era/revision 与 owner 的 id/name/role/parent、登记插入序号 registration_order（canonical CLI 保存对象插入顺序，无活动时间/历史）、**source=current-session 已核验 Pi ID**、身份缺失说明、简短 project/task/status。历史、recovery、联系别名、任命证据、目标/验收正文、目录路径、transcript 均不导出。500 owner / 64 层 / 8 MiB 原始快照上限，超限整树拒绝，不截断祖先。重复 Pi 身份不绑定、不挑一个；对应原生行保持在框外。
+只导出当前文档 era/revision 与 owner 的 id/name/role/parent、登记插入序号 registration_order（canonical CLI 保存对象插入顺序，无活动时间/历史）、**source=current-session 已核验 Pi ID**、身份缺失说明、简短 project/task/status。历史、recovery、联系别名、任命证据、目标/验收正文、目录路径、transcript 均不导出。包含完整审计历史的原始 Markdown 文档预算为 **64 MiB**（最多读取上限加 1 字节判定超限），与最小公开投影的 **500 owner / 64 层**限制独立；历史增长不增加公开字段，但仍须完整通过严格 codec 校验。原始字节超限与文档无效/owner 或层数超限分别报告不含私密数据的错误，均整树拒绝，不截断历史或祖先。64 MiB 为历史增长提供余量，并非无界读取；未来超过上限仍会停用分组。重复 Pi 身份不绑定、不挑一个；对应原生行保持在框外。
 
 数据路由为前缀下 **`POST __owner_groups__/snapshot`，空 body、无 query 参数、只读**。GET 返回 405。选择 POST 是必要的兼容措施：当前上游 service worker 会手动缓存 no-store GET、可能用旧 GET 会话记录兜底；它不拦截 POST。适配器用调用浏览器的 cookie 对固定 loopback 上游 **重新 GET `/api/sessions`**，禁止重定向和缓存、要求 200 JSON 及预期结构，再读取目录，返回最小会话关联：
 
