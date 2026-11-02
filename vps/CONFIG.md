@@ -6,7 +6,7 @@ former one-line `vps/domain.txt` (removed; there is no fallback to it):
 ```
 VPS_SSH=root@136.0.5.229
 DOMAIN=conley2bin.com
-REALITY_TARGET=www.python.org
+REALITY_TARGET=www.apple.com
 ```
 
 Then run `bash vps/setup.sh` with no command (see below).

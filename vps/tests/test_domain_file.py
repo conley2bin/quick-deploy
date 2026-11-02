@@ -26,7 +26,7 @@ class DomainFile(unittest.TestCase):
         return mock.patch.object(vps, 'MODULE', module)
 
     def test_shipped_file_is_single_public_base(self):
-        self.assertEqual((vps.MODULE / 'config').read_bytes(), b'VPS_SSH=root@136.0.5.229\nDOMAIN=conley2bin.com\nREALITY_TARGET=www.python.org\n')
+        self.assertEqual((vps.MODULE / 'config').read_bytes(), b'VPS_SSH=root@136.0.5.229\nDOMAIN=conley2bin.com\nREALITY_TARGET=www.apple.com\n')
         self.assertFalse((vps.MODULE / 'domain.txt').exists())
         self.assertEqual(vps.default_ssh(), 'root@136.0.5.229')
         self.assertEqual(vps.default_domain('sub'), 'sub.conley2bin.com')
