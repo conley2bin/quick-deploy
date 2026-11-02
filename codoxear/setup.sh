@@ -9,7 +9,7 @@ usage() {
 usage: ./setup.sh [--repo-url URL]
 
 首次同步远程 main、从上游 .env.example 创建本地 .env、安装 Codoxear
-和默认负责人分组适配器的独立依赖，并向当前 shell rc 写入 codox/piox 函数。
+和默认扩展（负责人分组、会话接力）共享宿主的独立依赖，并向当前 shell rc 写入 codox/piox 函数。
 不启动或重启服务；已有在线服务需安排重启才启用新默认。
 EOF
 }
@@ -40,7 +40,7 @@ main() {
   revision="$(sync_remote_main)"
   ensure_env_file
   install_remote_main_if_needed "${revision}"
-  "${SCRIPT_DIR}/owner-groups/setup.sh"
+  "${SCRIPT_DIR}/web-host/setup.sh"
 
   local rc_file python
   case "$(basename "${SHELL:-}")" in

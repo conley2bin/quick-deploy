@@ -41,15 +41,15 @@ class EntrypointTests(unittest.TestCase):
         self.root = Path(temporary.name) / 'fixture with spaces'
         self.internal = self.root / '.internal'
         self.internal.mkdir(parents=True)
-        self.owner = self.root / 'owner-groups'
-        self.owner.mkdir()
+        self.host = self.root / 'web-host'
+        self.host.mkdir()
         self.home = self.root / 'home'
         self.home.mkdir()
         self.bin = self.root / 'bin'
         self.bin.mkdir()
         self.log = self.root / 'calls'
-        self.adapter = self.owner / '.venv/bin/python'
-        for script in ('run_server.sh', 'setup.sh', 'owner-groups/setup.sh', 'owner-groups/requirements.txt'):
+        self.adapter = self.host / '.venv/bin/python'
+        for script in ('run_server.sh', 'setup.sh', 'web-host/setup.sh', 'web-host/requirements.txt'):
             shutil.copy2(SOURCE / script, self.root / script)
         # Restricted PATH cannot discover the real uv, pip, git or server.
         self.bash = shutil.which('bash')
@@ -85,7 +85,7 @@ with open(os.environ['FIXTURE_LOG'], 'a') as log:
 with open(os.environ['FIXTURE_LOG'], 'a') as log:
     log.write('shell-rc:' + json.dumps(sys.argv[1:]) + '\\n')
 ''')
-        # Used only by the real, copied owner setup's no-uv branch.
+        # Used only by the real, copied host setup's no-uv branch.
         self.write_installer('python3')
 
     def write_executable(self, path, content):
@@ -139,24 +139,25 @@ else:
                 result = self.run_script('run_server.sh', *args)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(self.calls(), ['adapter-check:import aiohttp', *self.update_calls(),
-                    f'adapter:{self.owner}/proxy.py --managed-upstream'])
+                    f'adapter:{self.host}/host.py --managed-upstream'])
 
     def test_native_rollback_has_no_adapter_dependency_or_probe(self):
         for installed in (False, True):
-            with self.subTest(adapter_installed=installed):
-                if installed:
-                    self.install_adapter()
-                self.clear_calls()
-                result = self.run_script('run_server.sh', '--no-owner-groups', FIXTURE_IMPORT_STATUS='9')
-                self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertEqual(self.calls(), [*self.update_calls(), 'native:server'])
+            for flag in ('--no-owner-groups', '--no-extensions'):
+                with self.subTest(adapter_installed=installed, flag=flag):
+                    if installed:
+                        self.install_adapter()
+                    self.clear_calls()
+                    result = self.run_script('run_server.sh', flag, FIXTURE_IMPORT_STATUS='9')
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(self.calls(), [*self.update_calls(), 'native:server'])
 
     def test_missing_adapter_fails_before_any_updater_effect(self):
         for args in ((), ('--owner-groups',)):
             with self.subTest(args=args):
                 result = self.run_script('run_server.sh', *args)
                 self.assertEqual(result.returncode, 1)
-                self.assertIn('负责人分组依赖未安装', result.stderr)
+                self.assertIn('共享宿主依赖未安装', result.stderr)
                 self.assertIn(str(self.root / 'setup.sh'), result.stderr)
                 self.assertEqual(self.calls(), [])
 
@@ -167,7 +168,7 @@ else:
                 self.clear_calls()
                 result = self.run_script('run_server.sh', *args, FIXTURE_IMPORT_STATUS='9')
                 self.assertEqual(result.returncode, 1)
-                self.assertIn('负责人分组依赖不可用', result.stderr)
+                self.assertIn('共享宿主依赖不可用', result.stderr)
                 self.assertIn(str(self.root / 'setup.sh'), result.stderr)
                 self.assertEqual(self.calls(), ['adapter-check:import aiohttp'])
 
@@ -177,7 +178,7 @@ else:
         self.assertEqual(result.returncode, 23)
         self.assertIn('adapter startup failed', result.stderr)
         self.assertEqual(self.calls(), ['adapter-check:import aiohttp', *self.update_calls(),
-            f'adapter:{self.owner}/proxy.py --managed-upstream'])
+            f'adapter:{self.host}/host.py --managed-upstream'])
 
     def test_missing_env_fails_without_updater_in_both_modes(self):
         self.install_adapter()
@@ -210,10 +211,11 @@ else:
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn('默认启用', result.stdout)
             self.assertIn('--no-owner-groups', result.stdout)
+            self.assertIn('--no-extensions', result.stdout)
             self.assertEqual(self.calls(), [])
         for args in (('--unknown',), ('--owner-groups', '--no-owner-groups'),
                      ('--no-owner-groups', '--owner-groups'), ('--owner-groups', 'extra'),
-                     ('--help', 'extra'), ('',)):
+                     ('--help', 'extra'), ('--no-extensions', '--owner-groups'), ('',)):
             with self.subTest(args=args):
                 result = self.run_script('run_server.sh', *args)
                 self.assertEqual(result.returncode, 2)
@@ -227,12 +229,12 @@ else:
         self.assertTrue(self.adapter.is_file())
         self.assertEqual(self.calls(), [
             'need:git', 'need:python3', 'sync:fixture-default', 'ensure-env', 'install:fixture-revision',
-            'uv:' + json.dumps(['venv', '--allow-existing', '--python', 'python3', str(self.owner / '.venv')]),
-            'uv:' + json.dumps(['pip', 'install', '--python', str(self.adapter), '-r', str(self.owner / 'requirements.txt')]),
+            'uv:' + json.dumps(['venv', '--allow-existing', '--python', 'python3', str(self.host / '.venv')]),
+            'uv:' + json.dumps(['pip', 'install', '--python', str(self.adapter), '-r', str(self.host / 'requirements.txt')]),
             'shell-rc:' + json.dumps([str(self.home / '.bashrc'), sys.executable, str(self.internal / 'launch.py')]),
         ])
-        self.assertIn(f'{self.owner}/../run_server.sh\n', result.stdout)
-        self.assertIn('run_server.sh --no-owner-groups', result.stdout)
+        self.assertIn(f'{self.host}/../run_server.sh\n', result.stdout)
+        self.assertIn('run_server.sh --no-extensions', result.stdout)
         self.assertIn('No service was started or restarted', result.stdout)
         self.assertFalse((self.home / '.bashrc').exists())  # rc updater was stubbed, too.
 
@@ -241,8 +243,8 @@ else:
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.calls(), [
             'need:git', 'need:python3', 'sync:https://fixture.invalid/upstream.git', 'ensure-env', 'install:fixture-revision',
-            'python3:' + json.dumps(['-m', 'venv', str(self.owner / '.venv')]),
-            f'adapter-pip:-m pip install -r {self.owner}/requirements.txt',
+            'python3:' + json.dumps(['-m', 'venv', str(self.host / '.venv')]),
+            f'adapter-pip:-m pip install -r {self.host}/requirements.txt',
             'shell-rc:' + json.dumps([str(self.home / '.zshrc'), sys.executable, str(self.internal / 'launch.py')]),
         ])
 
@@ -260,7 +262,7 @@ else:
         for flag in ('--help', '-h'):
             result = self.run_script('setup.sh', flag)
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertIn('默认负责人分组', result.stdout)
+            self.assertIn('默认扩展', result.stdout)
             self.assertEqual(self.calls(), [])
         for args in (('--unknown',), ('--repo-url',)):
             with self.subTest(args=args):
