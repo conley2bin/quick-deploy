@@ -9,13 +9,14 @@
     let controller, ui, timer, panelAbort, disposed = false, shell = null, main = null, actions = null;
     const abort = new AbortController(), requests = new Set();
     const style = doc.createElement('style'); style.id = 'session-handoff-style';
-    style.textContent = `#handoffButton{font:inherit;white-space:nowrap;min-width:44px;padding:0 9px}
+    style.textContent = `#handoffButton svg{display:block;width:20px;height:20px;pointer-events:none}
+@media(max-width:420px){#handoffButton svg{width:18px;height:18px}}
 #handoffPanel{flex:none;font:inherit;background:var(--panel);color:var(--text);border-bottom:1px solid var(--border);padding:8px 12px;overflow-wrap:anywhere}
 #handoffPanel[hidden]{display:none} #handoffPanel .handoffRow{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
 #handoffPanel button,#handoffPanel a{font:inherit;min-height:36px} #handoffPanel a{color:var(--accent)}
 #handoffPanel textarea{display:block;box-sizing:border-box;width:100%;max-width:560px;font:inherit;color:inherit;background:var(--bg);border:1px solid var(--border);border-radius:6px;margin:6px 0;padding:6px}
 #handoffPanel p{margin:4px 0} #handoffPanel .handoffHint{font-size:12px;color:var(--muted)}
-@media(max-width:600px){#handoffPanel{padding:6px 10px;max-height:40dvh;overflow:auto}#handoffButton{padding:0 6px}#handoffPanel button,#handoffPanel a{min-height:44px}}`;
+@media(max-width:600px){#handoffPanel{padding:6px 10px;max-height:40dvh;overflow:auto}#handoffPanel button,#handoffPanel a{min-height:44px}}`;
     doc.head.append(style);
     const el = (tag, text, attrs = {}) => {
       const n = doc.createElement(tag); if (text) n.textContent = text;
@@ -103,7 +104,20 @@
       doc.getElementById('handoffCompatibility')?.remove();
       if (ui?.button.isConnected && ui.button.parentNode === details.parentNode) return;
       panelAbort?.abort(); ui?.button.remove(); ui?.panel.remove(); panelAbort = new AbortController();
-      const button = el('button', '接力', { id: 'handoffButton', class: 'icon-btn', type: 'button', 'aria-label': '会话接力', 'aria-controls': 'handoffPanel', 'aria-expanded': 'false' });
+      const button = el('button', '', { id: 'handoffButton', class: 'icon-btn', type: 'button', title: '会话接力', 'aria-label': '会话接力', 'aria-controls': 'handoffPanel', 'aria-expanded': 'false' });
+      // Static Opus design: context in the old node flows into a fresh node.
+      const svg = doc.createElementNS('http://www.w3.org/2000/svg', 'svg');
+      for (const [name, value] of Object.entries({ viewBox: '0 0 24 24', width: '20', height: '20', fill: 'none', stroke: 'currentColor', 'stroke-width': '1.8', 'stroke-linecap': 'round', 'stroke-linejoin': 'round', 'aria-hidden': 'true', focusable: 'false' })) svg.setAttribute(name, value);
+      for (const [tag, attrs] of [
+        ['rect', { x: '2.5', y: '3', width: '9', height: '7', rx: '2' }],
+        ['rect', { x: '12.5', y: '14.5', width: '9', height: '6.5', rx: '2' }],
+        ['path', { d: 'M5.5 6.5h3M11.5 6.5h3a2.5 2.5 0 0 1 2.5 2.5v3.6M14.9 10.5 17 12.6l2.1-2.1' }],
+      ]) {
+        const node = doc.createElementNS('http://www.w3.org/2000/svg', tag);
+        for (const [name, value] of Object.entries(attrs)) node.setAttribute(name, value);
+        svg.append(node);
+      }
+      button.append(svg);
       details.after(button);
       const panel = el('section', '', { id: 'handoffPanel', 'aria-label': '会话接力' }); panel.hidden = true; bar.after(panel);
       const form = el('form'), source = el('p'); form.hidden = true;

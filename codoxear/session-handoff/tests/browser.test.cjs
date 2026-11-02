@@ -27,8 +27,44 @@ function login() { run('wait', '#loginForm'); run('fill', 'input[type=password]'
 function source(id = 'source') { evaluate(`location.replace('#session=${id}')`); wait(`document.querySelector('#sessions .session.active')?.dataset.sessionId===${JSON.stringify(id)}`); }
 function reset() { control({ reset: true }); evaluate(`localStorage.removeItem('codoxear:session-handoff:/demo/__session_handoff__/')`); run('reload'); run('wait', '#handoffButton'); }
 function screenshot(name) { run('screenshot', join(output, name + '.png')); }
-function geometry() {
-  return evaluate(`(()=>{const ids=['diagBtn','handoffButton','unattendedBtn'];return ids.map(id=>{const r=document.getElementById(id).getBoundingClientRect();return {id,x:r.x,right:r.right,width:r.width,top:r.top,bottom:r.bottom};})})()`);
+function assertIcon(size) {
+  const icon = evaluate(`(()=>{const b=document.querySelector('#handoffButton'),s=b.querySelector('svg');
+    return {label:b.textContent,title:b.title,aria:b.getAttribute('aria-label'),type:b.type,controls:b.getAttribute('aria-controls'),
+      native:b.classList.contains('icon-btn'),namespace:s?.namespaceURI,attrs:s&&Object.fromEntries([...s.attributes].map(a=>[a.name,a.value])),
+      children:s&&[...s.children].map(n=>[n.localName,Object.fromEntries([...n.attributes].map(a=>[a.name,a.value]))]),
+      width:s&&getComputedStyle(s).width,height:s&&getComputedStyle(s).height,display:s&&getComputedStyle(s).display,pointer:s&&getComputedStyle(s).pointerEvents};})()`);
+  assert.equal(icon.label, ''); assert.equal(icon.title, '会话接力'); assert.equal(icon.aria, '会话接力');
+  assert.equal(icon.type, 'button'); assert.equal(icon.controls, 'handoffPanel'); assert(icon.native);
+  assert.equal(icon.namespace, 'http://www.w3.org/2000/svg');
+  assert.deepEqual(icon.attrs, { viewBox:'0 0 24 24',width:'20',height:'20',fill:'none',stroke:'currentColor','stroke-width':'1.8','stroke-linecap':'round','stroke-linejoin':'round','aria-hidden':'true',focusable:'false' });
+  assert.deepEqual(icon.children, [
+    ['rect',{x:'2.5',y:'3',width:'9',height:'7',rx:'2'}],
+    ['rect',{x:'12.5',y:'14.5',width:'9',height:'6.5',rx:'2'}],
+    ['path',{d:'M5.5 6.5h3M11.5 6.5h3a2.5 2.5 0 0 1 2.5 2.5v3.6M14.9 10.5 17 12.6l2.1-2.1'}],
+  ]);
+  assert.equal(icon.width, size+'px'); assert.equal(icon.height, size+'px');
+  assert.equal(icon.display, 'block'); assert.equal(icon.pointer, 'none');
+}
+function assertToolbar(width) {
+  const g = evaluate(`(()=>{const ids=['diagBtn','handoffButton','unattendedBtn'];return ids.map(id=>{
+    const b=document.getElementById(id),r=b.getBoundingClientRect(),s=getComputedStyle(b);
+    return {id,x:r.x,right:r.right,width:r.width,height:r.height,padding:s.padding,
+      hit:[[.25,.25],[.5,.5],[.75,.75]].every(([x,y])=>b.contains(document.elementFromPoint(r.x+r.width*x,r.y+r.height*y))),
+      hitInset:getComputedStyle(b,'::after').inset};});})()`);
+  assert(g.every(r => r.x >= 0 && r.right <= width && r.width >= 30 && r.hit), JSON.stringify(g));
+  assert(g[0].right <= g[1].x + 1 && g[1].right <= g[2].x + 1, JSON.stringify(g));
+  for (const key of ['width','height','padding','hitInset']) assert.equal(g[1][key], g[0][key], key+' must inherit native hit area');
+  assert(evaluate('document.documentElement.scrollWidth <= innerWidth'));
+  console.log('Toolbar '+width+': '+JSON.stringify(g));
+}
+function keyboardCancel() {
+  evaluate('document.querySelector("#diagBtn").focus()'); run('press', 'Tab');
+  assert(evaluate('document.activeElement.id === "handoffButton"'));
+  assert(evaluate('getComputedStyle(document.activeElement).outlineStyle !== "none" && parseFloat(getComputedStyle(document.activeElement).outlineWidth) > 0'), 'Visible native keyboard focus');
+  run('press', 'Enter'); wait('document.activeElement.id === "handoffNote"');
+  assert.equal(evaluate('document.querySelector("#handoffButton").getAttribute("aria-expanded")'), 'true');
+  run('press', 'Escape'); assert(evaluate('document.querySelector("#handoffPanel").hidden && document.activeElement.id === "handoffButton"'));
+  assert.equal(evaluate('document.querySelector("#handoffButton").getAttribute("aria-expanded")'), 'false');
 }
 const row = id => `[data-session-id="${id}"]`;
 function openSidebar() {
@@ -69,6 +105,12 @@ try {
   assert.equal(evaluate('document.querySelector("#diagBtn").nextElementSibling.id'), 'handoffButton');
   assert.equal(evaluate('document.querySelectorAll("#handoffButton").length'), 1);
   assert.equal(evaluate('document.querySelectorAll(".owner-root-star").length'), 1);
+  assertIcon(20); assertToolbar(1440); keyboardCancel(); screenshot('desktop-icon-focus');
+  // One external icon child mutation must not cause a remount or observer feedback loop.
+  assert.equal(evaluate(`new Promise(resolve=>{const b=document.querySelector('#handoffButton');let changes=0;
+    const observer=new MutationObserver(records=>changes+=records.length);observer.observe(b,{childList:true,subtree:true});
+    b.querySelector('svg').append(document.createComment('observer probe'));
+    setTimeout(()=>{observer.disconnect();resolve(b===document.querySelector('#handoffButton')&&changes===1);},100);})`), true);
   run('hover', '[data-session-id=source]'); click('[data-session-id=source] button[aria-label="Edit conversation"]');
   run('wait', '#editViewer[open]'); assert(evaluate('document.querySelector("#editNameInput").value.includes("当前项目")'));
   // Native dialogs deliberately do not close on Escape. Use their real close controls;
@@ -130,7 +172,7 @@ try {
   assert.equal(actions().filter(a => a.kind === 'continue').length, 1);
   // Topbar remount: narrowly observed native actions are not duplicated; operation remains.
   evaluate(`const old=document.querySelector('.topbar'),next=old.cloneNode(true);next.querySelector('#handoffButton').remove();old.replaceWith(next)`);
-  wait('document.querySelectorAll("#handoffButton").length===1'); assert(text().includes('新会话核对并修正中'));
+  wait('document.querySelectorAll("#handoffButton").length===1'); assert(text().includes('新会话核对并修正中')); assertIcon(20);
   // Dynamic public text is always text, never interpreted as markup.
   control({ message: '<img src=x onerror="window.demoXSS=true">' });
   evaluate('document.dispatchEvent(new Event("visibilitychange"))');
@@ -159,6 +201,7 @@ try {
   session = 'handoff-native-mobile-' + process.pid;
   run('--executable-path', chrome, 'open', url); run('set', 'viewport', '390', '844'); login(); reset(); source();
   assert.equal(evaluate('document.querySelectorAll("#sessions .session.desktop").length'), 0);
+  assertIcon(18); assertToolbar(390); keyboardCancel(); screenshot('mobile-icon-focus');
   openSidebar(); swipe('source', 'left');
   click('[data-session-id=source] button[aria-label="Edit conversation"]'); run('wait', '#editViewer[open]');
   click('#editCloseBtn'); wait('!document.querySelector("#editViewer").open');
@@ -174,9 +217,7 @@ try {
   openSidebar(); click('[data-session-id=source]'); wait('!document.body.classList.contains("sidebar-open")');
   // Actual native compact branch and trusted CDP touch gestures above, not CSS-only mocks.
   click('#handoffButton'); wait('document.querySelector("#handoffNote").getBoundingClientRect().height > 0'); screenshot('mobile-confirm');
-  const g = geometry(); assert(g.every(r => r.x >= 0 && r.right <= 390 && r.width >= 30), JSON.stringify(g));
-  assert(g[0].right <= g[1].x + 1 && g[1].right <= g[2].x + 1, JSON.stringify(g));
-  assert(evaluate('document.documentElement.scrollWidth <= innerWidth'));
+  assertIcon(18); assertToolbar(390);
   click('#handoffPanel button[type=submit]'); wait('document.querySelector("#handoffPanel").textContent.includes("新会话独立恢复中")');
   status('unreviewed'); control({ allow: true }); evaluate('document.dispatchEvent(new Event("visibilitychange"))');
   wait('[...document.querySelectorAll("#handoffPanel button")].some(b=>b.textContent==="未校对，仍继续"&&!b.hidden)'); screenshot('mobile-unreviewed');
