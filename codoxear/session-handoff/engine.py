@@ -103,12 +103,16 @@ def header_identity(row: dict):
             if not stat.S_ISREG(info.st_mode):
                 raise ValueError("not regular")
             line = stream.readline(64 * 1024 + 1)
-        if not line.endswith(b"\n") or len(line) > 64 * 1024:
-            raise ValueError("incomplete header")
+        if len(line) > 64 * 1024:
+            raise ValueError("oversized header")
+        if not line.endswith(b"\n"):
+            raise HandoffError("identity_missing", "会话的真实 Pi 日志头尚未完整写入")
         header = json.loads(line)
         ident = header.get("id")
         if header.get("type") != "session" or not isinstance(ident, str) or not ident:
             raise ValueError("not Pi")
+    except FileNotFoundError:
+        raise HandoffError("identity_missing", "会话的真实 Pi 日志尚未生成") from None
     except (OSError, ValueError, TypeError, AttributeError):
         raise HandoffError("identity_changed", "会话绑定与真实 Pi 日志身份不一致") from None
     return {"pi_session_id": ident, "log_path": path, "device": info.st_dev, "inode": info.st_ino}
@@ -122,7 +126,7 @@ def idle(row):
     # Missing busy is not positive evidence of idle; queued/autonomous work is not idle.
     return (row.get("busy") is False and not any(row.get(key) for key in
             ("queue_len", "broker_queue_len", "commit_unknown_send", "pending_attachment",
-             "unattended_enabled", "lost")))
+             "unattended_enabled", "subagents_running", "lost")))
 
 
 class Engine:
@@ -167,6 +171,8 @@ class Engine:
         atomic_state(self.root / op["id"] / "state.json", op)
 
     def _set(self, op, status, **fields):
+        if "error_code" not in fields:
+            op.pop("error_code", None)
         op.update(fields, status=status, message=MESSAGES[status], updated_at=time.time(),
                   can_continue_unreviewed=status == "unreviewed")
         self._persist(op)
@@ -334,7 +340,13 @@ class Engine:
             # Initial input already traveled in create.args. Lazy log is only a receipt gate.
             if not row.get("log_path"):
                 return None
-            op["target_header"] = header_identity(row)
+            try:
+                identity = header_identity(row)
+            except HandoffError as exc:
+                if exc.code == "identity_missing":
+                    return None
+                raise
+            op["target_header"] = identity
             if op["target_header"]["pi_session_id"] == op["source_header"]["pi_session_id"]:
                 raise HandoffError("identity_changed", "新会话复用了原 Pi 日志身份")
             self._persist(op)
@@ -365,6 +377,8 @@ class Engine:
             rows = await self.sessions(cookie)
             self._verify(op, rows, "target")
             if kind == "review":
+                if not any(row.get("session_id") == op["source_session_id"] for row in rows):
+                    return None  # Disappeared reviewer may return before the deadline.
                 self._verify(op, rows, "source")
             self._check_chain(op)
             return self._artifact(op, kind)
@@ -400,8 +414,10 @@ class Engine:
         async def source_idle():
             rows = await self.sessions(cookie)
             self._verify(op, rows, "target")
-            row = self._verify(op, rows, "source")
             self._check_chain(op)
+            if not any(row.get("session_id") == op["source_session_id"] for row in rows):
+                return None  # Unavailable is unreviewed; a rebound identity still fails.
+            row = self._verify(op, rows, "source")
             return row if idle(row) else None
 
         row = await self._poll(self.timeouts["source_idle"], source_idle)

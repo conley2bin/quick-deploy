@@ -54,6 +54,7 @@ class Native:
                        "log_path": str(source_path), "cwd": str(root), "busy": False,
                        "model_provider": "test-provider", "model": "test-model", "reasoning_effort": "high"}
         self.target = None
+        self.include_source = True
         self.calls = []
         self.engine = None
         self.pending = True
@@ -114,7 +115,7 @@ class Native:
                 self.source["busy"] = False
             if self.on_list:
                 self.on_list()
-            return 200, {"sessions": [dict(self.source)] + ([dict(self.target)] if self.target else [])}
+            return 200, {"sessions": ([dict(self.source)] if self.include_source else []) + ([dict(self.target)] if self.target else [])}
         if path == "/api/sessions":
             if self.create_gate:
                 await self.create_gate.wait()
@@ -185,6 +186,29 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotEqual(mutations[1][2]["send_id"], mutations[2][2]["send_id"])
         self.assertIn(":review]", mutations[1][2]["text"])
         self.assertIn(":continuation]", mutations[2][2]["text"])
+
+    async def test_advertised_log_path_can_materialize_after_initial_input(self):
+        previous = self.native.__call__
+        pending_path = self.root / "anticipated-target.jsonl"
+        async def advertised(method, path, **kwargs):
+            result = await previous(method, path, **kwargs)
+            if method == "POST" and path == "/api/sessions":
+                self.native.target["log_path"] = str(pending_path)
+            return result
+        self.engine.upstream_json = advertised
+        polls = 0
+        def materialize():
+            nonlocal polls
+            if self.native.target:
+                polls += 1
+                if polls == 2:
+                    pending_path.write_text('{"type":"session"')
+                if polls == 3:
+                    log(pending_path, "target-header")
+        self.native.on_list = materialize
+        await self.start()
+        self.assertEqual((await self.finish())["status"], "ready")
+        self.assertEqual(len(self.native.mutations()), 3)
 
     async def test_numeric_broker_pid_and_corrections_single_round(self):
         self.native.pending = False
@@ -328,6 +352,7 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["status"], "ready")
         self.assertFalse(result["reviewed"])
         self.assertEqual(self.native.op["review_sha256"], "unreviewed")
+        self.assertNotIn("error_code", result)
         self.assertEqual(len(self.native.mutations()), 3)
         with self.assertRaises(HandoffError):
             self.engine.continue_unreviewed(operation_id, rows=rows, cookie="fresh-cookie")
@@ -348,6 +373,30 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["status"], "unreviewed")
         self.assertEqual(result["error_code"], "source_idle_timeout")
         self.assertEqual(len(self.native.mutations()), 1)
+
+    async def test_disappeared_source_becomes_unreviewed_and_can_bypass(self):
+        def disappear():
+            if self.native.target and self.native.target["log_path"]:
+                self.native.include_source = False
+        self.native.on_list = disappear
+        operation_id = await self.start()
+        result = await self.finish()
+        self.assertEqual(result["status"], "unreviewed")
+        self.assertEqual(len(self.native.mutations()), 1)
+        self.engine.continue_unreviewed(operation_id, rows=await self.engine.sessions("fresh"), cookie="fresh")
+        self.assertEqual((await self.finish())["status"], "ready")
+        self.assertEqual(len(self.native.mutations()), 2)
+
+    async def test_reviewer_disappears_after_send_times_out_unreviewed(self):
+        self.native.emit_review = False
+        def disappear(path, body):
+            self.native.include_source = False
+        self.native.on_send = disappear
+        await self.start()
+        result = await self.finish()
+        self.assertEqual(result["status"], "unreviewed")
+        self.assertEqual(result["error_code"], "review_timeout")
+        self.assertEqual(len(self.native.mutations()), 2)
 
     async def test_late_review_is_used_instead_of_claiming_unreviewed(self):
         self.native.emit_review = False
