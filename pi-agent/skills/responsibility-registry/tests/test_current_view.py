@@ -1,7 +1,8 @@
-"""Pure current-view/audit boundary tests; only synthetic, in-memory documents."""
+"""Pure current-view/audit boundary tests; synthetic input and caller-owned streams."""
 import copy
 import io
 import json
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -100,6 +101,81 @@ class CurrentViewTests(unittest.TestCase):
         bad_prefix = raw.replace(b'| Example alpha |', b'| \xff |')
         with self.assertRaises(UnicodeDecodeError):
             codec.parse_current_document(decoded_lines(io.BytesIO(bad_prefix)))
+
+    def test_real_binary_caller_iterator_leaves_bad_utf8_history_unrequested(self):
+        split = codec.serialize_current_document(current(self.state), ERA)
+        for document in (self.document, split):
+            prefix = document.split(codec.HISTORY + '\n', 1)[0] + codec.HISTORY + '\n'
+            # Actual temporary binary file: no text wrapper, eager read, or whole-text decode.
+            with self.subTest(format=document.splitlines()[2]), tempfile.TemporaryFile('w+b') as binary:
+                binary.write(prefix.encode('utf-8') + b'\xff\xfe invalid UTF-8 History\n')
+                binary.seek(0)
+                consumed = []
+                def decoded_lines():
+                    for line in binary:
+                        consumed.append(line)
+                        yield line.decode('utf-8')
+                lines = decoded_lines()
+                self.assertEqual(codec.parse_current_document(lines), (current(self.state), ERA))
+                self.assertEqual(consumed[-1], (codec.HISTORY + '\n').encode())
+                self.assertEqual(binary.tell(), len(prefix.encode('utf-8')))
+                self.assertEqual(len(consumed), len(prefix.splitlines()))
+                # The very next caller request reaches invalid audit bytes; the codec did not.
+                with self.assertRaises(UnicodeDecodeError):
+                    next(lines)
+
+    def test_v3_exact_heading_next_guard_and_metadata_is_not_exposed(self):
+        head = 'abcdef01-2345-4678-9abc-0123456789ab'
+        split = codec.serialize_current_document(current(self.state), ERA, head)
+        for document in (split, split.replace('Audit-Head: ' + head + '\n', '')):
+            prefix = document.split(codec.HISTORY + '\n', 1)[0] + codec.HISTORY + '\n'
+            consumed = []
+            def guarded_lines():
+                for line in prefix.splitlines(keepends=True):
+                    consumed.append(line)
+                    yield line
+                raise AssertionError('v3 History body was requested')
+            with self.subTest(audit_head_present='Audit-Head:' in document):
+                state, era = codec.parse_current_document(guarded_lines())
+                self.assertEqual((state, era), (current(self.state), ERA))
+                self.assertEqual(set(state), CURRENT_KEYS)
+                self.assertEqual(consumed[-1], codec.HISTORY + '\n')
+
+    def test_v3_template_and_current_metadata_rules(self):
+        empty = dict(version=1, revision=0, owners={}, assignments={}, coordination={})
+        split = codec.serialize_current_document(empty, 'template')
+        self.assertEqual(codec.parse_current_document(io.StringIO(split)), (empty, 'template'))
+        head = 'abcdef01-2345-4678-9abc-0123456789ab'
+        for bad in (split.replace('Revision: 0', 'Revision: 1'),
+                    split.replace('Audit-Head: none', 'Audit-Head: ' + head),
+                    split.replace('Audit-Head: none', 'Audit-Head: ' + head.upper()),
+                    split.replace('Audit-Head: none', 'Audit-Head: /private/audit/head.json'),
+                    split.replace('Audit-Head: none', 'Audit-Head: none\nAudit-Head: none')):
+            with self.subTest(document=bad[:160]), self.assertRaises(codec.RegistryError):
+                codec.parse_current_document(io.StringIO(bad))
+        for extra in ({'audit_head': None}, {'format': codec.SPLIT_FORMAT}, {'history': []}):
+            with self.subTest(extra=extra), self.assertRaises(codec.RegistryError):
+                codec.validate_current({**empty, **extra})
+
+    def test_v3_current_invariants_match_legacy_current_checks(self):
+        split = codec.serialize_current_document(current(self.state), ERA)
+        row = next(line for line in split.splitlines() if line.startswith('| alpha |'))
+        variants = [split.replace(codec.HISTORY, codec.HISTORY + ' '),
+                    split.replace('## Owners', 'Unknown prose\n## Owners'),
+                    split.replace('Revision: 2', 'Revision: 02'), split.replace(ERA, ERA.upper()),
+                    split.replace(row, row + '\n' + row),
+                    split.replace('| Example alpha |', '| broken\\|pipe |'),
+                    split.replace('| Example alpha |', '| &unknown; |'),
+                    split.replace('identity&quot;:', 'identity&quot;:null,&quot;identity&quot;:'),
+                    split.replace('identity&quot;:', 'identity&quot;:NaN,&quot;x&quot;:'),
+                    split.replace('identity&quot;:', 'identity&quot;:1e999,&quot;x&quot;:'),
+                    split.replace('identity&quot;:', 'id&quot;:&quot;shadow&quot;,&quot;identity&quot;:')]
+        for document in variants:
+            with self.subTest(document=document[:160]):
+                with self.assertRaises(codec.RegistryError):
+                    codec.parse_current_document(io.StringIO(document))
+                with self.assertRaises(codec.RegistryError):
+                    codec.parse_store_document(document)
 
     def test_normal_full_and_current_fields_match_for_line_sources(self):
         full, era = codec.parse_document(self.document)
@@ -225,6 +301,8 @@ class CurrentViewTests(unittest.TestCase):
             # Produce invalid input without weakening either parser under test.
             with patch.object(codec, 'validate_envelope'):
                 document = codec.serialize_document(state, ERA)
+            with patch.object(codec, 'validate_current_envelope'):
+                split = codec.serialize_current_document(current(state), ERA)
             with self.subTest(invariant=mutate.__name__):
                 for validator, value in ((codec.validate_current, current(state)), (codec.validate, state)):
                     with self.assertRaises(codec.RegistryError):
@@ -233,6 +311,10 @@ class CurrentViewTests(unittest.TestCase):
                     codec.parse_current_document(io.StringIO(document))
                 with self.assertRaises(codec.RegistryError):
                     codec.parse_document(document)
+                with self.assertRaises(codec.RegistryError):
+                    codec.parse_current_document(io.StringIO(split))
+                with self.assertRaises(codec.RegistryError):
+                    codec.parse_store_document(split)
 
     def test_current_schema_has_exact_fields_and_integer_revision_without_audit_claim(self):
         state = current(self.state)
@@ -253,6 +335,9 @@ class CurrentViewTests(unittest.TestCase):
         view, era = codec.parse_current_document(io.StringIO(document))
         self.assertEqual((view, era), (current(state), ERA))
         self.assertEqual(current(codec.parse_document(document)[0]), view)
+        split = codec.serialize_current_document(current(state), ERA).replace('\n', '\r\n')
+        self.assertEqual(codec.parse_current_document(io.StringIO(split)), (view, ERA))
+        self.assertEqual(codec.parse_store_document(split)[0], view)
 
 
 if __name__ == '__main__':
