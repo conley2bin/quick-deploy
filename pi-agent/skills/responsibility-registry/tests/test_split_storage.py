@@ -196,6 +196,39 @@ class SplitStoreTests(unittest.TestCase):
                 self.assertEqual(store.transact_current('op', 'digest', {}, store.current_snapshot()['document_token'],
                     self.change, action='register', actor='alpha', reason='test', authority='test')['outcome']['status'], 'COMMITTED')
 
+    def test_initialize_never_recreates_current_or_lock_over_runtime_evidence(self):
+        for lost in ('current-and-control', 'lock', 'lock-and-control', 'lock-and-audit'):
+            with self.subTest(lost=lost), tempfile.TemporaryDirectory() as directory:
+                import shutil
+                store = registry.Store(directory, Path(directory) / 'current.md')
+                store.initialize()
+                lock = store.root / 'registry.lock'
+                control = store.root / 'document-control.json'
+                if lost == 'current-and-control':
+                    store.document.unlink()
+                    control.unlink()
+                    head, inode = store.audit.head_path.read_bytes(), lock.stat().st_ino
+                    with self.assertRaises(registry.RegistryError):
+                        store.initialize()
+                    self.assertFalse(store.document.exists())
+                    self.assertFalse(control.exists())
+                    self.assertEqual(store.audit.head_path.read_bytes(), head)
+                    self.assertEqual(lock.stat().st_ino, inode)
+                else:
+                    lock.unlink()
+                    if lost == 'lock-and-control':
+                        control.unlink()
+                    if lost == 'lock-and-audit':
+                        shutil.rmtree(store.audit.path)
+                    raw = store.document.read_bytes()
+                    for call in (store.initialize, store.migrate):
+                        with self.assertRaises(registry.RegistryTransactionError) as failure:
+                            call()
+                        self.assertEqual(failure.exception.code, 'registry_unavailable')
+                        self.assertEqual(failure.exception.commit_state, 'not_committed')
+                        self.assertFalse(lock.exists())
+                        self.assertEqual(store.document.read_bytes(), raw)
+
     def test_pending_recovery_refuses_missing_head_without_changing_any_evidence(self):
         def fail(phase):
             if phase == 'current_replaced':

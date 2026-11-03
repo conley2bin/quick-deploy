@@ -14,9 +14,9 @@ import tempfile
 import uuid
 
 if __package__:
-    from .registry_document import RegistryError, parse_json, require, keys, text, validate_event, validate_time
+    from .registry_document import RegistryError, parse_json, require, keys, text, validate_event, validate_time, TEMPLATE_ERA
 else:
-    from registry_document import RegistryError, parse_json, require, keys, text, validate_event, validate_time
+    from registry_document import RegistryError, parse_json, require, keys, text, validate_event, validate_time, TEMPLATE_ERA
 
 
 class AuditDamaged(RegistryError):
@@ -203,7 +203,17 @@ class AuditStorage:
         if value['disposition'] == 'noop':
             require(value['event'] is None and value['after'] == {key: field for key, field in value['base'].items() if key != 'document_token'}, 'noop cannot change current')
         else:
-            require(value['after']['audit_head'] == value['op_id'], 'publication must carry operation metadata')
+            if value['after']['audit_head'] is None:
+                blank = dict(version=1, revision=0, owners={}, assignments={}, coordination={})
+                require(value['action'] == 'migrate-storage' and value['event'] is None and
+                        value['base']['era'] == value['after']['era'] == TEMPLATE_ERA and
+                        value['base']['revision'] == value['after']['revision'] == 0 and
+                        value['base']['audit_head'] is None and
+                        value['references'].get('template_empty_current') == blank and
+                        'legacy_archive' in value['references'], 'only empty-template migration may omit publication head')
+                identifier(value['references']['legacy_archive'])
+            else:
+                require(value['after']['audit_head'] == value['op_id'], 'publication must carry operation metadata')
         require(isinstance(value.get('result'), dict), 'invalid business result')
         return value
 

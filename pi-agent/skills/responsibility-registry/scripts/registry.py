@@ -341,7 +341,11 @@ class Store:
                 self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
             require(not self.root.is_symlink() and self.root.is_dir(), 'private root cannot be symlink/non-directory')
             require(self.root.stat().st_mode & 0o777 == 0o700, 'private root permissions must be 0700')
-            flags = os.O_RDWR | (os.O_CREAT if create else 0)
+            evidence = create and any(path.exists() or path.is_symlink() for path in
+                                      (self.audit.path, self.root / 'document-control.json'))
+            # A prior runtime must keep its stable lock inode. Bootstrap creation
+            # is allowed only before any audit/control initialization evidence.
+            flags = os.O_RDWR | (os.O_CREAT if create and not evidence else 0)
             fd = os.open(self.root / 'registry.lock', flags | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
             info = os.fstat(fd)
             require(stat_module.S_ISREG(info.st_mode) and info.st_mode & 0o777 == 0o600, 'registry lock must be a private regular file')
@@ -471,15 +475,24 @@ class Store:
         op = self._transaction_id(operation_id)
         last = head['last_committed'] if head else None
         prior_sha = last['after_sha256'] if last else None
+        references = copy.deepcopy(references or {})
+        after_head = envelope['audit_head'] if noop else op
+        blank = current_fields(empty())
+        if (not noop and action == 'migrate-storage' and event is None and
+                envelope['era'] == after_era == TEMPLATE_ERA and current_fields(state) == after_state == blank):
+            # Format-only empty-template migration preserves era/revision and the
+            # codec's no-head template invariant; the private receipt still commits.
+            references['template_empty_current'] = blank
+            after_head = None
         return dict(schema=1, op_id=op, operation_id=operation_id, intent_digest=intent_digest,
             intent=copy.deepcopy(intent), previous={k: head[k] for k in ('op_id', 'prepare_sha256', 'outcome_sha256')} if head else None,
             at=now(), actor=actor, authority=authority, action=action, reason=reason, disposition='noop' if noop else 'publication',
             base=dict(era=envelope['era'], revision=state['revision'], document_token=envelope['document_token'],
                       document_sha256=sha(raw), audit_head=envelope['audit_head']),
             after=dict(era=after_era, revision=after_state['revision'], document_sha256=sha(content.encode('utf-8')),
-                       audit_head=envelope['audit_head'] if noop else op), event=event,
+                       audit_head=after_head), event=event,
             continuity=dict(kind=('managed_match' if sha(raw) == prior_sha else 'unmanaged_change_observed') if last else 'unanchored',
-                            previous_committed_sha256=prior_sha), references=references or {}, result=copy.deepcopy(result))
+                            previous_committed_sha256=prior_sha), references=references, result=copy.deepcopy(result))
 
     def _observed_raw(self):
         try:
@@ -624,7 +637,7 @@ class Store:
                     exact = exact and current['era'] == prepare['after']['era'] and current['state']['revision'] == prepare['after']['revision']
                     if prepare['disposition'] == 'noop' and exact:
                         status, basis = 'NOT_APPLICABLE', 'recovered_exact_noop_observation'
-                    elif exact and current['audit_head'] == prepare['op_id']:
+                    elif exact and current['audit_head'] == prepare['after']['audit_head']:
                         sync_directory(self.document.parent)
                         status, basis = 'COMMITTED', 'recovered_exact_after'
                     else:
@@ -768,7 +781,8 @@ class Store:
                             revision=state['revision'], format=FORMAT, document=str(self.document))
             self.audit.archive(op, raw, manifest)
             desired = current_fields(state)
-            content = document_codec.serialize_current_document(desired, envelope['era'], op)
+            content = document_codec.serialize_current_document(desired, envelope['era'],
+                                                                None if envelope['era'] == TEMPLATE_ERA else op)
             prepare = self._prepare_transaction(operation_id, digest, intent, dict(migrated=True, legacy_archive=op),
                 desired, envelope, raw, desired, envelope['era'], content, None, 'migrate-storage', actor, reason, authority,
                 references=dict(legacy_archive=op), head=head)

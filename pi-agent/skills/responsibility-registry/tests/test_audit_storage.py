@@ -65,6 +65,28 @@ class AuditTests(unittest.TestCase):
         with self.assertRaises(AuditDamaged):
             self.audit.head()
 
+    def test_only_empty_template_migration_may_publish_without_operation_head(self):
+        prepare = self.prepare()
+        prepare['after']['audit_head'] = None
+        with self.assertRaises(RegistryError):
+            self.audit.validate_prepare(prepare)
+        prepare['action'] = 'migrate-storage'
+        prepare['base'].update(era='template', revision=0)
+        prepare['after'].update(era='template', revision=0)
+        with self.assertRaises(RegistryError):
+            self.audit.validate_prepare(prepare)
+        blank = dict(version=1, revision=0, owners={}, assignments={}, coordination={})
+        prepare['references'] = dict(template_empty_current=blank, legacy_archive=self.op)
+        self.audit.validate_prepare(prepare)
+        for side, field, invalid in (('base', 'revision', 1), ('after', 'era', 'other-era')):
+            value = copy.deepcopy(prepare)
+            value[side][field] = invalid
+            with self.assertRaises(RegistryError):
+                self.audit.validate_prepare(value)
+        prepare['references']['template_empty_current']['owners']['fake'] = {}
+        with self.assertRaises(RegistryError):
+            self.audit.validate_prepare(prepare)
+
     def test_complete_immutable_finals_and_idempotent_finish(self):
         prepare = self.prepare()
         self.audit.begin(prepare)

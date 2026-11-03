@@ -370,6 +370,53 @@ class MigrationTests(DocumentFixture):
         self.assertEqual(hydrated['history'][:-1], state['history'])
         self.assertEqual(hydrated['history'][-1]['before']['owners']['fixture-0'], state['owners']['fixture-0'])
 
+    def test_empty_template_v2_migration_preserves_era_and_recovers_without_current_head(self):
+        for cut in (None, 'pending_synced', 'current_replaced', 'outcome_published'):
+            with self.subTest(cut=cut), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory) / 'private'
+                root.mkdir(mode=0o700)
+                document = Path(directory) / 'current.md'
+                document.write_text(codec.serialize_document(registry.empty(), codec.TEMPLATE_ERA))
+                (root / 'registry.lock').touch(mode=0o600)
+                store = registry.Store(root, document)
+                raw = document.read_bytes()
+                before = store.current_snapshot()
+                def fail(phase):
+                    if phase == cut:
+                        raise OSError('synthetic empty-template migration interruption')
+                store.audit.checkpoint = store.transaction_checkpoint = fail
+                if cut is None:
+                    result = store.migrate_storage(before['document_token'], 'user', 'explicit migration', 'synthetic authority', 'empty-migration')
+                else:
+                    with self.assertRaises(registry.RegistryTransactionError):
+                        store.migrate_storage(before['document_token'], 'user', 'explicit migration', 'synthetic authority', 'empty-migration')
+                    observed = document.read_bytes()
+                    store.audit.checkpoint = store.transaction_checkpoint = lambda _: None
+                    result = store.recover_transaction('user', 'explicit recover', 'synthetic authority')
+                    self.assertEqual(document.read_bytes(), observed)
+                expected = 'PUBLICATION_UNKNOWN' if cut == 'pending_synced' else 'COMMITTED'
+                self.assertEqual(result['outcome']['status'], expected)
+                self.assertEqual(result['current']['state'], before['state'])
+                self.assertEqual(result['current']['era'], codec.TEMPLATE_ERA)
+                self.assertIsNone(result['prepare']['after']['audit_head'])
+                self.assertEqual(result['prepare']['references']['template_empty_current'], before['state'])
+                archive = result['prepare']['references']['legacy_archive']
+                self.assertEqual((store.audit.legacy / (archive + '.md')).read_bytes(), raw)
+                self.assertEqual(store.history_snapshot()['history'], [])
+                retry = store.migrate_storage(before['document_token'], 'user', 'explicit migration', 'synthetic authority', 'empty-migration')
+                self.assertEqual(retry['outcome'], result['outcome'])
+
+    def test_legacy_json_first_bootstrap_may_create_its_initial_lock(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / 'private'
+            root.mkdir(mode=0o700)
+            (root / 'registry.json').write_text(json.dumps(registry.empty()))
+            store = registry.Store(root, Path(directory) / 'current.md')
+            self.assertFalse((root / 'registry.lock').exists())
+            self.assertTrue(store.migrate()['migrated'])
+            self.assertTrue((root / 'registry.lock').is_file())
+            self.assertEqual(store.current_snapshot()['format'], codec.FORMAT)
+
     def test_split_migration_does_not_provision_before_legacy_cas_and_pending_checks(self):
         self.register()
         shutil.rmtree(self.store.audit.path)

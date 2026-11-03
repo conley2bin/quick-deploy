@@ -1,6 +1,6 @@
 # Markdown cutover / recovery runbook
 
-This is an **explicit operator action**. Installing source does not authorize migration, resets, service refreshes, or appointments. Obtain the owner's approval for the exact cutover and coordinate current registry CLI writers first. Preserve the existing `registry.lock` inode. Real documents, JSON, backups and migration markers stay private and out of Git.
+This is an **explicit operator action**. Installing source does not authorize migration, resets, service refreshes, or appointments. Obtain the owner's approval for the exact cutover and coordinate current registry CLI writers first. Preserve the existing `registry.lock` inode. Bootstrap init/legacy JSON migration may create the first lock only without audit/control runtime evidence; missing lock with such evidence is an error, never an automatic new inode. Retained audit also prevents empty initialization when both current and control were deleted. Real documents, JSON, backups and migration markers stay private and out of Git.
 
 ## v2 Markdown → v3 split storage
 
@@ -8,7 +8,7 @@ This is a separate explicit maintenance operation from the older JSON → Markdo
 
 1. Coordinate registry writers and obtain actual direct user authorization. Query the exact current document and accept its fresh token; do not use a cached web projection as a mutation envelope.
 2. `migrate-storage` locks the existing stable lock, fully validates v2 once, and preserves **the exact complete original raw Markdown bytes** in private `audit/legacy/<transaction UUID>.md` with a canonical immutable manifest (actual byte hash/length, format, era, revision). It never substitutes a reserialized export for raw evidence.
-3. The transaction publishes v3 current with the same owners, parents, identity/recovery, assignments, lifecycle/goals/dependencies/coordination, era, and revision. This format-only publication has event=null and a legacy archive reference. It does not appoint, transfer, reset, or create a padding event.
+3. The transaction publishes v3 current with the same owners, parents, identity/recovery, assignments, lifecycle/goals/dependencies/coordination, era, and revision. This format-only publication has event=null and a legacy archive reference. An empty v2 template retains template era/revision0 and current Audit-Head none, as required by the codec; its administrative migration receipt remains in private audit. That narrow exception binds the complete empty five-field graph in PREPARE. Exact-after recovery checks the prepared head (normally the operation UUID), never relaxes ordinary publication proof, and never replays current. It does not appoint, transfer, reset, or create a padding event.
 4. Query current and explicit history separately. Compare all five current fields and era to the accepted v2 source, the complete legacy history to its archive, archive raw bytes/hash, and current web projection. Do not use counts as preservation evidence.
 
 ```bash
