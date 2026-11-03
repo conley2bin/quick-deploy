@@ -492,11 +492,11 @@ def assert_actor_tools(rows, calls, results, *, target, identity=None):
     if not target:
         _, custody = find('--kind custody')
         _, review = find('--kind review')
-        assert custody == {'kind': 'custody', 'accepted': True}
+        assert custody == {'kind': 'custody', 'artifact': {'kind': 'custody', 'accepted': True}}
         assert review['kind'] == 'review'
         return
     _, identity_result = find('--kind identity')
-    assert identity_result == {'kind': 'identity', 'accepted': True}
+    assert identity_result == {'kind': 'identity', 'artifact': {'kind': 'identity', 'accepted': True}}
     _, understanding = find('--kind understanding')
     assert understanding['kind'] == 'understanding'
     ready_call, ready = find('--kind resolution')
