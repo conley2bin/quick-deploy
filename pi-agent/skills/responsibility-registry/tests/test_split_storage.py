@@ -100,6 +100,123 @@ class SplitStoreTests(unittest.TestCase):
                 else:
                     self.assertFalse((root / 'registry.lock').exists())
 
+    def test_fresh_v3_initialization_persists_explicit_empty_audit_head(self):
+        self.assertTrue(self.store.audit.head_path.is_file())
+        marker = self.store.audit.read(self.store.audit.head_path)
+        self.assertEqual(marker, dict(schema=1, op_id=None, prepare_sha256=None,
+                                      outcome_sha256=None, last_committed=None))
+        self.assertIsNone(self.store.audit.head())
+        self.assertIsNone(self.store.current_snapshot()['audit_head'])
+        self.assertIsNone(self.store.operation_status('absent', 'digest')['prepare'])
+
+    def test_lost_audit_root_or_head_never_reprovisions_even_after_no_owner_noop(self):
+        import shutil
+        from types import SimpleNamespace
+        for prior in ('commit', 'no-owner-noop', 'fresh'):
+            for lost in ('audit-root', 'head', 'ops', 'legacy', 'checkpoints'):
+                with self.subTest(prior=prior, lost=lost), tempfile.TemporaryDirectory() as directory:
+                    store = registry.Store(directory, Path(directory) / 'current.md')
+                    store.initialize()
+                    if prior != 'fresh':
+                        result = store.transact_current('original', 'digest', {}, store.current_snapshot()['document_token'],
+                            self.change if prior == 'commit' else lambda *_: {'no_owner': True},
+                            action='register', actor='alpha', reason='synthetic authority', authority='synthetic',
+                            persist_noop=prior == 'no-owner-noop')
+                        self.assertEqual(result['outcome']['status'], 'COMMITTED' if prior == 'commit' else 'NOT_APPLICABLE')
+                    before = store.current_snapshot()
+                    if prior != 'commit':
+                        self.assertIsNone(before['audit_head'])
+                    path = {'audit-root': store.audit.path, 'head': store.audit.head_path,
+                            'ops': store.audit.ops, 'legacy': store.audit.legacy, 'checkpoints': store.audit.checkpoints}[lost]
+                    if path.is_dir():
+                        shutil.rmtree(path)
+                    else:
+                        path.unlink()
+                    raw, inode = store.document.read_bytes(), store.document.stat().st_ino
+                    self.assertEqual(store.current_snapshot(), before)
+                    query = store.query_current(SimpleNamespace(owner=None, project=None, task=None, repo=None, active=True))
+                    self.assertFalse(query['history_loaded'])
+                    for same_op in (False, True):
+                        operation = 'original' if same_op else 'new'
+                        with self.assertRaises(registry.RegistryTransactionError) as failure:
+                            store.transact_current(operation, 'digest', {}, before['document_token'],
+                                lambda *_: self.fail('callback ran after audit loss'), action='test', actor='user',
+                                reason='test', authority='test', persist_noop=True)
+                        self.assertIn(failure.exception.code, ('audit_unavailable', 'audit_damaged'))
+                        self.assertEqual(failure.exception.commit_state, 'unknown')
+                        with self.assertRaises(registry.RegistryTransactionError) as status_failure:
+                            store.operation_status(operation, 'digest')
+                        self.assertEqual(status_failure.exception.commit_state, 'unknown')
+                    with self.assertRaises((OSError, registry.RegistryError)):
+                        store.history_snapshot()  # Explicit history cannot report lost evidence as empty.
+                    self.assertFalse(path.exists())
+                    self.assertEqual(store.document.read_bytes(), raw)
+                    self.assertEqual(store.document.stat().st_ino, inode)
+
+    def test_real_crlf_v3_file_uses_split_store_without_relaxing_full_v2(self):
+        before = self.store.current_snapshot()
+        raw = self.document.read_bytes().replace(b'\n', b'\r\n')
+        self.document.write_bytes(raw)
+        with self.assertRaises(registry.RegistryError):
+            codec.parse_document(raw.decode('utf-8'))
+        with patch('registry.parse_document', side_effect=AssertionError('v3 dispatched to full v2')):
+            current = self.store.current_snapshot()
+            self.assertEqual(current['state'], before['state'])
+            self.assertEqual(current['format'], codec.SPLIT_FORMAT)
+            noop = self.commit(change=lambda *_: {'no_owner': True}, persist_noop=True)
+            self.assertEqual(noop['outcome']['status'], 'NOT_APPLICABLE')
+            self.assertEqual(self.document.read_bytes(), raw)
+            self.assertEqual(self.commit(operation='register-crlf', digest='register-crlf')['outcome']['status'], 'COMMITTED')
+
+    def test_explicit_initialization_recovers_provisioning_but_never_repairs_existing_v3(self):
+        import shutil
+        # An existing current file is never permission to initialize lost audit.
+        shutil.rmtree(self.store.audit.path)
+        before = self.document.read_bytes(), self.document.stat().st_ino
+        self.assertFalse(self.store.initialize()['initialized'])
+        self.assertFalse(self.store.audit.exists())
+        self.assertEqual((self.document.read_bytes(), self.document.stat().st_ino), before)
+        # Only a genuine pending fresh initialization can resume provisioning.
+        for cut in ('provision_head_temp_synced', 'provision_head_published', 'provision_head_synced'):
+            with self.subTest(cut=cut), tempfile.TemporaryDirectory() as directory:
+                store = registry.Store(directory, Path(directory) / 'current.md')
+                def fail(phase):
+                    if phase == cut:
+                        raise OSError('synthetic fresh provision interruption')
+                store.audit.checkpoint = fail
+                with self.assertRaises(OSError):
+                    store.initialize()
+                self.assertEqual(store.control()['status'], 'pending')
+                self.assertFalse(store.document.exists())
+                store.audit.checkpoint = lambda _: None
+                store.recover_initialization()
+                self.assertEqual(store.control()['status'], 'completed')
+                self.assertIsNone(store.audit.head())
+                self.assertEqual(store.current_snapshot()['format'], codec.SPLIT_FORMAT)
+                self.assertEqual(store.transact_current('op', 'digest', {}, store.current_snapshot()['document_token'],
+                    self.change, action='register', actor='alpha', reason='test', authority='test')['outcome']['status'], 'COMMITTED')
+
+    def test_pending_recovery_refuses_missing_head_without_changing_any_evidence(self):
+        def fail(phase):
+            if phase == 'current_replaced':
+                raise OSError('synthetic pending transaction')
+        self.store.audit.checkpoint = self.store.transaction_checkpoint = fail
+        with self.assertRaises(registry.RegistryTransactionError):
+            self.commit()
+        self.store.audit.checkpoint = self.store.transaction_checkpoint = lambda _: None
+        self.store.audit.head_path.unlink()
+        pending, raw = self.store.audit.pending_path.read_bytes(), self.document.read_bytes()
+        outcome_path = self.store.audit.outcome_path(self.store._transaction_id('synthetic-operation'))
+        self.assertFalse(outcome_path.exists())
+        with self.assertRaises(registry.RegistryTransactionError) as failure:
+            self.recover()
+        self.assertEqual(failure.exception.code, 'audit_damaged')
+        self.assertEqual(failure.exception.commit_state, 'unknown')
+        self.assertFalse(self.store.audit.head_path.exists())
+        self.assertFalse(outcome_path.exists())
+        self.assertEqual(self.store.audit.pending_path.read_bytes(), pending)
+        self.assertEqual(self.document.read_bytes(), raw)
+
     def test_concurrent_same_operation_executes_callback_once(self):
         from concurrent.futures import ThreadPoolExecutor
         from threading import Barrier
@@ -117,13 +234,15 @@ class SplitStoreTests(unittest.TestCase):
 
     def test_callback_cannot_tamper_revision(self):
         before = self.document.read_bytes()
+        head = self.store.audit.head_path.read_bytes()
         def bad(state, era):
             state['revision'] = 100
             return {}
         with self.assertRaisesRegex(registry.RegistryError, 'revision'):
             self.commit(change=bad)
         self.assertEqual(self.document.read_bytes(), before)
-        self.assertFalse(self.store.audit.exists())
+        self.assertEqual(self.store.audit.head_path.read_bytes(), head)
+        self.assertIsNone(self.store.audit.pending())
 
     def test_all_fault_boundaries_recover_without_replaying_current(self):
         phases = ('pending_temp_synced', 'pending_published', 'pending_synced',
@@ -176,8 +295,7 @@ class SplitStoreTests(unittest.TestCase):
         import os
         original_sync = os.fsync
         sync_count = []
-        # Establish the exact real syscall count with directories already durable.
-        self.store.audit.directories(create=True)
+        # Explicit init already made directories and the empty head durable.
         def trace(fd):
             sync_count.append(True)
             return original_sync(fd)
@@ -188,7 +306,6 @@ class SplitStoreTests(unittest.TestCase):
             with self.subTest(fsync_call=cut), tempfile.TemporaryDirectory() as directory:
                 store = registry.Store(directory, Path(directory) / 'current.md')
                 store.initialize()
-                store.audit.directories(create=True)
                 before = store.document.read_bytes()
                 counter = []
                 def failing_sync(fd):

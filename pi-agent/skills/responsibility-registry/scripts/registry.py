@@ -409,8 +409,10 @@ class Store:
     def _status(self, operation_id, intent_digest):
         op = self._transaction_id(operation_id)
         prepare = outcome = pending = None
+        current = self._safe_snapshot()
         if self.audit.exists():
             self.audit.directories()
+            self.audit.head()
             pending = self.audit.pending()
             prepare, outcome = self.audit.lookup(op)
             if pending and pending['op_id'] == op:
@@ -419,10 +421,13 @@ class Store:
                 prepare = pending['prepare']
             require(prepare is None or outcome is not None or (pending and pending['op_id'] == op),
                     'orphan prepare without journal; preserve evidence')
+        elif current is not None and current['format'] == document_codec.SPLIT_FORMAT:
+            raise RegistryTransactionError('audit_unavailable', 'v3 audit storage missing; preserve current and reconcile explicitly',
+                                           commit_state='unknown', operation_id=operation_id)
         if prepare and (prepare['intent_digest'] != intent_digest or prepare['operation_id'] != operation_id):
             raise RegistryTransactionError('operation_intent_mismatch', 'operation already bound to another intent', operation_id=operation_id)
         return dict(transaction_id=op, prepare=prepare, outcome=outcome,
-                    result=prepare['result'] if prepare else None, current=self._safe_snapshot(),
+                    result=prepare['result'] if prepare else None, current=current,
                     pending=bool(pending and pending['op_id'] == op))
 
     def operation_status(self, operation_id, intent_digest):
@@ -444,22 +449,21 @@ class Store:
             raise
 
     def _transaction_ready(self):
-        if self.switch_journal.exists():
-            raise RegistryTransactionError('transaction_pending', 'pending legacy switch; run recover-switch', commit_state='unknown')
-        control = self.control()
-        require(not control or control['status'] == 'completed', 'pending initialization/cutover')
-        if self.audit.exists():
+        try:
+            if self.switch_journal.exists():
+                raise RegistryTransactionError('transaction_pending', 'pending legacy switch; run recover-switch', commit_state='unknown')
+            control = self.control()
+            require(not control or control['status'] == 'completed', 'pending initialization/cutover')
+            # v3 managing paths only verify already-provisioned evidence. Legacy
+            # callers skip this method until explicit migrate-storage provisions it.
             self.audit.directories()
             if self.audit.pending() is not None:
                 raise RegistryTransactionError('transaction_pending', 'pending audit transaction; explicit recover-transaction required', commit_state='unknown')
-            head = self.audit.head()
-            if head is None:
-                current = self._safe_snapshot()
-                if current and current['audit_head']:
-                    prepare, outcome = self.audit.lookup(current['audit_head'])
-                    require(prepare is None and outcome is None, 'missing audit head for retained managed evidence')
-            return head
-        return None
+            return self.audit.head()
+        except RegistryTransactionError:
+            raise
+        except (RegistryError, OSError, ValueError, KeyError, TypeError) as exc:
+            raise RegistryTransactionError('audit_damaged', str(exc)) from exc
 
     def _prepare_transaction(self, operation_id, intent_digest, intent, result, state, envelope, raw,
                              after_state, after_era, content, event, action, actor, reason, authority,
@@ -553,17 +557,18 @@ class Store:
                 status = self._status(operation_id, intent_digest)
                 if status['prepare'] is not None:
                     return status  # lookup precedes stale CAS and callback/domain conditions
-                head = self._transaction_ready()
             except RegistryTransactionError:
                 raise
             except (RegistryError, OSError, ValueError, KeyError, TypeError) as exc:
-                raise RegistryTransactionError('audit_damaged', str(exc), operation_id=operation_id) from exc
+                # Damaged lookup cannot attest whether this operation committed.
+                raise RegistryTransactionError('audit_damaged', str(exc), commit_state='unknown', operation_id=operation_id) from exc
             try:
                 state, envelope, raw, stat = self.read_document()
             except (RegistryError, OSError, UnicodeError) as exc:
                 raise RegistryTransactionError('registry_invalid' if self.document.exists() else 'registry_unavailable', str(exc), operation_id=operation_id) from exc
             if envelope['storage_format'] != document_codec.SPLIT_FORMAT:
                 raise RegistryTransactionError('storage_not_migrated', 'explicit migrate-storage required before current transactions', operation_id=operation_id)
+            head = self._transaction_ready()
             if expected_document != envelope['document_token']:
                 raise RegistryTransactionError('document_conflict', 'stale expected document; query and decide deliberately', retryable=True, operation_id=operation_id)
             before = state  # fresh owned read; callback receives only its independent copy
@@ -602,6 +607,7 @@ class Store:
             require(not self.switch_journal.exists(), 'legacy switch pending; recover-switch first')
             try:
                 self.audit.directories()
+                self.audit.head()  # Recovery never provisions a lost head or directory.
                 pending = self.audit.pending()
                 require(pending is not None, 'no pending transaction')
                 prepare = pending['prepare']
@@ -653,6 +659,8 @@ class Store:
 
     def _history_at(self, op):
         """Hydrate the explicitly requested logical history, never current authority."""
+        self.audit.directories()
+        self.audit.head()  # Audit-Head none cannot conceal lost private attempts.
         events, seen = [], set()
         while op is not None:
             require(op not in seen, 'cyclic current audit ancestry')
@@ -741,11 +749,19 @@ class Store:
             status = self._status(operation_id, digest)
             if status['prepare'] is not None:
                 return status
-            head = self._transaction_ready()
             state, envelope, raw, stat = self.read_document()
             require(envelope['storage_format'] == FORMAT, 'migrate-storage requires legacy v2; no implicit remigration')
             if expected_document != envelope['document_token']:
                 raise RegistryTransactionError('document_conflict', 'stale expected document before storage migration', retryable=True, operation_id=operation_id)
+            # Only validated, explicitly authorized legacy migration may create a
+            # new audit store. Existing audit damage is never re-provisioned.
+            if not self.audit.exists():
+                if self.switch_journal.exists():
+                    raise RegistryTransactionError('transaction_pending', 'pending legacy switch; run recover-switch', commit_state='unknown')
+                control = self.control()
+                require(not control or control['status'] == 'completed', 'pending initialization/cutover')
+                self.audit.provision()
+            head = self._transaction_ready()
             op = self._transaction_id(operation_id)
             # Exact original bytes, not a reconstructed v2 serialization.
             manifest = dict(schema=1, archive_id=op, sha256=sha(raw), bytes=len(raw), era=envelope['era'],
@@ -837,9 +853,11 @@ class Store:
             require(self.control() is None, 'document missing after prior initialization/cutover; explicit recovery required')
             require(not any((self.root / f).exists() for f in ('registry.json', 'dashboard.md')),
                     'legacy evidence exists; explicit migrate required, no empty initialization')
+            require(not self.audit.exists(), 'audit evidence exists; explicit reconciliation required, no empty initialization')
             self.document.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
             control = dict(kind='initialization', status='pending', document=str(self.document))
             atomic_write(self.root / 'document-control.json', json.dumps(control) + '\n')
+            self.audit.provision()
             exclusive_file(self.document, document_codec.serialize_current_document(current_fields(empty()), TEMPLATE_ERA))
             control['status'] = 'completed'
             atomic_write(self.root / 'document-control.json', json.dumps(control) + '\n')
@@ -854,8 +872,12 @@ class Store:
             require(control['document'] == str(self.document), 'initialization document mismatch')
             content = document_codec.serialize_current_document(current_fields(empty()), TEMPLATE_ERA).encode()
             if self.document.exists():
-                require(self.document.read_bytes() in [content, serialize_document(empty(), TEMPLATE_ERA).encode()], 'pending initialization diverged; preserve and reconcile explicitly')
+                raw = self.document.read_bytes()
+                require(raw in [content, serialize_document(empty(), TEMPLATE_ERA).encode()], 'pending initialization diverged; preserve and reconcile explicitly')
+                if raw == content:
+                    self.audit.provision()
             else:
+                self.audit.provision()
                 exclusive_file(self.document, content)
             control['status'] = 'completed'
             atomic_write(self.root / 'document-control.json', json.dumps(control) + '\n')
@@ -1118,7 +1140,7 @@ class Store:
         return checkpoint
 
     def _write_checkpoint(self, checkpoint_id, raw, state, envelope, history=None):
-        self.audit.directories(create=True)
+        self.audit.directories()
         attempts = self.audit.history()
         archives = {}
         for attempt in attempts:
@@ -1633,7 +1655,11 @@ def main(argv=None):
                 require(args.intent_digest is not None, 'operation audit requires --intent-digest')
                 result = store.operation_status(args.operation_id, args.intent_digest)
             else:
-                result = store.locked(lambda: dict(attempts=store.audit.history() if store.audit.exists() else []))
+                def audit_all():
+                    current = store._safe_snapshot()
+                    split = current is not None and current['format'] == document_codec.SPLIT_FORMAT
+                    return dict(attempts=store.audit.history() if split or store.audit.exists() else [])
+                result = store.locked(audit_all)
         elif args.command == 'backup-list':
             result = store.locked(lambda: dict(backups=store.backup_candidates()))
         elif args.command in ['clear', 'restore']:

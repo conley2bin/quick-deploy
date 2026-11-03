@@ -19,7 +19,7 @@ class AuditTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
         self.audit = AuditStorage(self.root)
-        self.audit.directories(create=True)
+        self.audit.provision()
         self.op = str(uuid.uuid4())
 
     def prepare(self):
@@ -34,6 +34,36 @@ class AuditTests(unittest.TestCase):
                     status='COMMITTED', basis='test', recorded_at='2026-01-01T00:00:00+00:00',
                     observed=dict(document_sha256='b' * 64, era='era', revision=1, current_valid=True),
                     document_token_after='observed-token', commit=dict(era='era', revision=1, after_sha256='b' * 64))
+
+    def test_begin_never_creates_missing_audit_directories_or_head(self):
+        import shutil
+        for missing in ('root', 'head', 'ops'):
+            with self.subTest(missing=missing), tempfile.TemporaryDirectory() as directory:
+                audit = AuditStorage(directory)
+                audit.provision()
+                path = {'root': audit.path, 'head': audit.head_path, 'ops': audit.ops}[missing]
+                if path.is_dir():
+                    shutil.rmtree(path)
+                else:
+                    path.unlink()
+                with self.assertRaises((OSError, RegistryError)):
+                    audit.begin(self.prepare())
+                self.assertFalse(path.exists())
+                self.assertFalse(audit.pending_path.exists())
+
+    def test_only_complete_empty_marker_means_no_prior_attempt(self):
+        self.assertIsNone(self.audit.head())
+        empty = self.audit.read(self.audit.head_path)
+        for field, invalid in (('prepare_sha256', 'a' * 64), ('outcome_sha256', 'b' * 64),
+                               ('last_committed', {}), ('schema', 2)):
+            with self.subTest(field=field):
+                value = dict(empty, **{field: invalid})
+                self.audit.head_path.write_bytes(encoded(value))
+                with self.assertRaises(RegistryError):
+                    self.audit.head()
+        self.audit.head_path.unlink()
+        with self.assertRaises(AuditDamaged):
+            self.audit.head()
 
     def test_complete_immutable_finals_and_idempotent_finish(self):
         prepare = self.prepare()
@@ -100,7 +130,7 @@ class AuditTests(unittest.TestCase):
         for phase in phases:
             with self.subTest(phase=phase), tempfile.TemporaryDirectory() as directory:
                 audit = AuditStorage(directory)
-                audit.directories(create=True)
+                audit.provision()
                 def crash(actual):
                     if actual == phase:
                         raise RuntimeError(actual)

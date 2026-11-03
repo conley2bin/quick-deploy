@@ -83,6 +83,20 @@ class AuditStorage:
         for path in (self.path, self.ops, self.legacy, self.checkpoints):
             private_directory(path, create)
 
+    def provision(self):
+        """Explicit fresh init/migration only; absence is never a runtime default.
+
+        A pending initialization may resume partial directory/head publication.
+        The Store caller establishes that provenance, never a directory scan.
+        """
+        self.directories(create=True)
+        require(self.pending() is None, 'cannot provision over pending audit evidence')
+        empty = dict(schema=1, op_id=None, prepare_sha256=None, outcome_sha256=None, last_committed=None)
+        if self.read(self.head_path, optional=True) is None:
+            self.write(self.head_path, empty, immutable=True, phase='provision_head')
+        else:
+            require(self.head() is None, 'cannot provision over terminal audit evidence')
+
     def exists(self):
         if self.path.is_symlink():
             raise AuditDamaged('audit directory cannot be symlink')
@@ -233,11 +247,13 @@ class AuditStorage:
         return prepare, outcome
 
     def head(self):
-        head = self.read(self.head_path, optional=True)
-        if head is None:
-            return None
+        head = self.read(self.head_path)
         keys(head, ['schema', 'op_id', 'prepare_sha256', 'outcome_sha256', 'last_committed'])
         require(head.get('schema') == 1, 'invalid head schema')
+        if head['op_id'] is None:
+            require(head == dict(schema=1, op_id=None, prepare_sha256=None, outcome_sha256=None,
+                                 last_committed=None), 'invalid empty audit head')
+            return None
         prepare, outcome = self.lookup(identifier(head.get('op_id')))
         require(prepare is not None and outcome is not None, 'head references incomplete attempt')
         require(head.get('prepare_sha256') == sha(encoded(prepare)) and head.get('outcome_sha256') == sha(encoded(outcome)), 'head object hash mismatch')
@@ -256,7 +272,8 @@ class AuditStorage:
         return head
 
     def begin(self, prepare):
-        self.directories(create=True)
+        self.directories()
+        self.head()  # A missing head is damage, including after a private noop.
         require(self.pending() is None, 'pending transaction; explicit recovery required')
         self.validate_prepare(prepare)
         journal = dict(schema=1, op_id=prepare['op_id'], prepare_sha256=sha(encoded(prepare)), prepare=prepare)
@@ -286,7 +303,8 @@ class AuditStorage:
 
     def archive(self, op, raw, manifest):
         identifier(op)
-        self.directories(create=True)
+        self.directories()
+        self.head()
         self.publish(self.legacy / (op + '.md'), raw, immutable=True, phase='archive')
         self.write(self.legacy / (op + '.manifest.json'), manifest, immutable=True, phase='archive_manifest')
 

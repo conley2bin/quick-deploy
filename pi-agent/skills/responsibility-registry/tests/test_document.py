@@ -324,6 +324,7 @@ class DocumentTests(DocumentFixture):
 
 class MigrationTests(DocumentFixture):
     def test_split_migration_preserves_exact_raw_graph_era_revision_and_history(self):
+        shutil.rmtree(self.store.audit.path)  # Dedicated true pre-split v2 fixture.
         state = self.legacy_state()
         # legacy_state adds rich synthetic audit/coordination in memory; publish
         # that explicit full-v2 fixture before testing the physical split.
@@ -369,8 +370,30 @@ class MigrationTests(DocumentFixture):
         self.assertEqual(hydrated['history'][:-1], state['history'])
         self.assertEqual(hydrated['history'][-1]['before']['owners']['fixture-0'], state['owners']['fixture-0'])
 
+    def test_split_migration_does_not_provision_before_legacy_cas_and_pending_checks(self):
+        self.register()
+        shutil.rmtree(self.store.audit.path)
+        self.assertFalse(self.store.audit.exists())
+        before = self.store.current_snapshot()
+        with self.assertRaises(registry.RegistryTransactionError) as failure:
+            self.store.migrate_storage('stale', 'user', 'synthetic migration', 'synthetic authority')
+        self.assertEqual(failure.exception.code, 'document_conflict')
+        self.assertFalse(self.store.audit.exists())
+        self.store.switch_journal.write_bytes(b'pending legacy evidence')
+        with self.assertRaises(registry.RegistryTransactionError) as failure:
+            self.store.migrate_storage(before['document_token'], 'user', 'synthetic migration', 'synthetic authority')
+        self.assertEqual(failure.exception.code, 'transaction_pending')
+        self.assertEqual(self.store.switch_journal.read_bytes(), b'pending legacy evidence')
+        self.assertFalse(self.store.audit.exists())
+        self.assertEqual(self.store.current_snapshot(), before)
+        self.store.switch_journal.unlink()
+        result = self.store.migrate_storage(before['document_token'], 'user', 'synthetic migration', 'synthetic authority')
+        self.assertEqual(result['outcome']['status'], 'COMMITTED')
+        self.assertEqual(self.store.current_snapshot()['state'], before['state'])
+
     def test_split_migration_is_explicit_and_recovery_preserves_exact_before(self):
         self.register()
+        shutil.rmtree(self.store.audit.path)
         raw = self.document.read_bytes()
         snapshot = self.store.current_snapshot()
         with self.assertRaises(registry.RegistryTransactionError) as failure:
