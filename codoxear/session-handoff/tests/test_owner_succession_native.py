@@ -15,6 +15,7 @@ from unittest.mock import AsyncMock, patch
 import uuid
 
 import owner_succession_native as native
+from owner_observer_fixtures import IDENTITY, source_trace, target_trace
 
 
 class OwnerSuccessionNativeTests(unittest.TestCase):
@@ -188,40 +189,24 @@ class OwnerSuccessionNativeTests(unittest.TestCase):
             native.assert_graph(before, after, ids['alpha'], source, 'target-unit-Pi')
 
     def trace(self):
-        rows, calls, results = [], [], {}
-        commands = ['cat "$CODEX_WEB_PI_ACTIVE_SESSION_FILE"',
-                    'python handoff_io.py attest --kind identity',
-                    'python handoff_io.py submit --kind understanding',
-                    'python handoff_io.py submit --kind resolution --verdict ready',
-                    'python handoff_io.py check-owner']
-        outputs = [{'sessionId': 'actual-target-Pi', 'sessionFile': '/temporary/session.jsonl', 'bridgeVersion': 2, 'pid': 1234},
-                   {'kind': 'identity', 'artifact': {'kind': 'identity', 'accepted': True}}, {'kind': 'understanding'},
-                   {'kind': 'resolution', 'artifact': {'verdict': 'ready'}}, {'current_binding_valid': True}]
-        for index, (command, output) in enumerate(zip(commands, outputs)):
-            call = dict(id=str(index), type='toolCall', name='bash', arguments={'command': command})
-            result = dict(role='toolResult', toolCallId=str(index), content=[dict(type='text', text=json.dumps(output))])
-            calls.append(call)
-            results[str(index)] = result
-            rows.extend([{'message': {'role': 'assistant', 'content': [call]}}, {'message': result}])
-        edit = dict(id='edit', type='toolCall', name='edit', arguments={'path': '/temporary/project/main.py'})
-        calls.append(edit)
-        rows.append({'message': {'role': 'assistant', 'content': [edit]}})
-        return rows, calls, results
+        return target_trace().tuple()
 
     def test_actor_trace_requires_real_helper_outputs_before_separate_edit(self):
         rows, calls, results = self.trace()
-        native.assert_actor_tools(rows, calls, results, target=True, identity=dict(pi_session_id='actual-target-Pi', session_file='/temporary/session.jsonl'))
+        native.assert_actor_tools(rows, calls, results, target=True, identity=IDENTITY)
         results['3']['isError'] = True
         with self.assertRaisesRegex(AssertionError, 'returned an error'):
-            native.assert_actor_tools(rows, calls, results, target=True, identity=dict(pi_session_id='actual-target-Pi', session_file='/temporary/session.jsonl'))
+            native.assert_actor_tools(rows, calls, results, target=True, identity=IDENTITY)
 
     def test_forged_files_without_actor_calls_and_check_after_edit_fail(self):
         rows, calls, results = self.trace()
         with self.assertRaisesRegex(AssertionError, 'missing/duplicate'):
-            native.assert_actor_tools(rows, calls[2:], results, target=True, identity=dict(pi_session_id='actual-target-Pi', session_file='/temporary/session.jsonl'))
-        rows[-1], rows[-2] = rows[-2], rows[-1]
+            native.assert_actor_tools(rows, calls[2:], results, target=True, identity=IDENTITY)
+        checked = next(i for i, row in enumerate(rows) if row.get('message', {}).get('toolCallId') == '4')
+        edited = next(i for i, row in enumerate(rows) if row.get('id') == 'call-edit')
+        rows[checked], rows[edited] = rows[edited], rows[checked]
         with self.assertRaisesRegex(AssertionError, 'preceded current-owner'):
-            native.assert_actor_tools(rows, calls, results, target=True, identity=dict(pi_session_id='actual-target-Pi', session_file='/temporary/session.jsonl'))
+            native.assert_actor_tools(rows, calls, results, target=True, identity=IDENTITY)
 
     def test_identity_attestation_requires_exact_cli_envelope(self):
         for output in (
@@ -235,7 +220,7 @@ class OwnerSuccessionNativeTests(unittest.TestCase):
                 results['1']['content'][0]['text'] = json.dumps(output)
                 with self.assertRaises(AssertionError):
                     native.assert_actor_tools(rows, calls, results, target=True,
-                        identity=dict(pi_session_id='actual-target-Pi', session_file='/temporary/session.jsonl'))
+                        identity=IDENTITY)
 
     def test_native_bridge_crosschecks_actual_manager_pid_and_explicit_extension(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -279,20 +264,12 @@ class OwnerSuccessionNativeTests(unittest.TestCase):
             with self.assertRaises(json.JSONDecodeError):
                 native.transcript_calls(path)
 
-    def source_trace(self):
-        calls, results = [], {}
-        for kind, output in [('custody', {'kind': 'custody', 'artifact': {'kind': 'custody', 'accepted': True}}),
-                             ('review', {'kind': 'review'})]:
-            calls.append(dict(id=kind, name='bash', arguments={'command': 'python handoff_io.py ' + ('attest' if kind == 'custody' else 'submit') + ' --kind ' + kind}))
-            results[kind] = dict(content=[dict(type='text', text=json.dumps(output))])
-        return calls, results
-
     def test_source_custody_and_review_must_be_actor_produced(self):
-        calls, results = self.source_trace()
-        native.assert_actor_tools([], calls, results, target=False)
+        rows, calls, results = source_trace().tuple()
+        native.assert_actor_tools(rows, calls, results, target=False)
         del results['custody']
         with self.assertRaisesRegex(AssertionError, 'no actual tool result'):
-            native.assert_actor_tools([], calls, results, target=False)
+            native.assert_actor_tools(rows, calls, results, target=False)
 
     def test_custody_attestation_requires_exact_cli_envelope(self):
         for output in (
@@ -302,10 +279,10 @@ class OwnerSuccessionNativeTests(unittest.TestCase):
             {'kind': 'custody', 'artifact': {'kind': 'custody', 'accepted': False}},
         ):
             with self.subTest(output=output):
-                calls, results = self.source_trace()
+                rows, calls, results = source_trace().tuple()
                 results['custody']['content'][0]['text'] = json.dumps(output)
                 with self.assertRaises(AssertionError):
-                    native.assert_actor_tools([], calls, results, target=False)
+                    native.assert_actor_tools(rows, calls, results, target=False)
 
 
 class DexGemOfflineTests(unittest.TestCase):

@@ -160,6 +160,51 @@ Report separately: fixture/helper tests, deterministic workflow actors, native
 Pi startup and report chain, actual toy action, browser coexistence, and live
 rollout. None implies another. This plan authorizes no production deployment.
 
+## Owner-gate observer contracts (offline)
+
+Run these from the repository root with the existing component Python environment:
+
+```sh
+codoxear/web-host/.venv/bin/python -B -m unittest discover \
+  -s codoxear/session-handoff/tests -p 'test_*.py' -v
+```
+
+Keep the native naming opt-in (`HANDOFF_NATIVE_PYTHON`) unset for the offline suite.
+The preparation and Store unit cases use synthetic credentials, `/usr/bin/true`,
+and private temporary paths; they do not authorize real preparation or actors.
+
+The owner acceptance harness waits for the last user turn's normal assistant
+`stop` before checking the goal. A stopped turn without the intended file action
+fails immediately. An `error`, `length`, or `aborted` row stays unresolved until a
+later matching retry `context_edit`, a normal turn end, or the existing deadline;
+`result.json` retains `target_turn` on failure. An error row alone cannot distinguish
+a terminal error from Pi's pending retry and must not trigger early cleanup.
+
+Helper evidence requires an executed Python script at the exact path named in the
+engine's user prompt, followed by canonical CLI JSON records. Diagnostic prefixes
+are allowed; malformed, missing, duplicate/ambiguous, or rejected records fail.
+Fresh check-owner calls after ready must all succeed, and at least one must finish
+before the first main.py edit call. Source helper help output is not attestation.
+
+A successful edit tool result must precede both the verification call and its
+result. Recognized verification is top-level Python `-B` code (no optimization):
+a propagated `assert result() == 'Y'`, or an observed full print line whose bounded
+AST rendering proves Y. Imports/aliases must refer to main, not vendor. Quoted
+mentions, heredoc data, pre-edit checks, parallel/delayed calls, masked assertion
+exits, shell control/function blocks, relative helper paths, and unsupported code
+forms cannot supply success. Unsupported legitimate forms require manual review;
+the observer is a bounded recognizer, not a general Bash/Python analyzer. Print
+rendering retains the cooperative-agent boundary: a contrived unrelated print of
+the same line can imitate that evidence.
+
+`test_owner_observer.py` includes sanitized captured command structures and real
+`handoff_io.main()` serialization under unit mocks. Its captured target skeleton
+fails exactly at missing post-edit verification; adding genuine proof before the
+final stop passes. These are observer contracts, not a new native acceptance run.
+The original failed owner run remains failed; no post-edit evidence is invented.
+The existing JSONL U+2028 `splitlines` limitation and `source_ready` error handling
+remain outside this observer change.
+
 ## Recorded isolated execution — 2026-11-02
 
 The integrated shared host and installed native runtime completed one real

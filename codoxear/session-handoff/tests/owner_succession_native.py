@@ -8,6 +8,7 @@ Raw evidence stays in the private temporary root. No production URL is accepted.
 from __future__ import annotations
 
 import argparse
+import ast
 import asyncio
 import copy
 import hashlib
@@ -42,6 +43,7 @@ BUDGET = 900
 MARGIN = 300
 REPO = Path(__file__).resolve().parents[3]
 SCRIPTS = REPO / 'pi-agent/skills/responsibility-registry/scripts'
+HELPER = Path(__file__).resolve().parents[1] / 'handoff_io.py'
 
 
 def within(path, root):
@@ -470,53 +472,400 @@ def assert_graph(before, after, owner, source, target):
     assert not any(row['identity']['pi_session_id'] == source for row in after['owners'].values())
 
 
-def helper_output(result):
-    if result.get('isError'):
-        raise AssertionError('actor helper tool returned an error')
-    text = '\n'.join(block.get('text', '') for block in result.get('content', []) if block.get('type') == 'text')
+def shell_segments(command):
+    """Recognize a bounded top-level shell form; never interpret heredoc bodies."""
+    segments, pending, declarations = [], [], []
+    text, quote, depth, before, i = '', '', 0, '', 0
+
+    def emit(after):
+        nonlocal text, declarations, before
+        if text.strip():
+            try:
+                words = shlex.split(text)
+            except ValueError:
+                words = None
+            assigns, argv = {}, [] if words is not None else None
+            skip = False
+            for word in words or []:
+                if skip:
+                    skip = False
+                    continue
+                redirection = re.fullmatch(r'(?:\d*)?(?:<<<|<<-?|&>>?|>&|<&|<>|>>?)(.*)', word)
+                if redirection:
+                    skip = not redirection[1]
+                elif not argv and re.match(r'^[A-Za-z_][A-Za-z_0-9]*=', word):
+                    name, value = word.split('=', 1)
+                    assigns[name] = value
+                else:
+                    argv.append(word)
+            segment = SimpleNamespace(argv=argv, assigns=assigns, before=before, after=after, heredoc=None)
+            segments.append(segment)
+            pending.extend((segment, delimiter, tabs) for delimiter, tabs in declarations)
+        text, declarations, before = '', [], after
+
+    while i < len(command):
+        char = command[i]
+        if char == '\\' and quote != "'" and i + 1 < len(command):
+            text += '' if command[i + 1] == '\n' else command[i:i + 2]
+            i += 2
+            continue
+        if quote:
+            text += char
+            if char == quote:
+                quote = ''
+            i += 1
+            continue
+        if char in "'\"":
+            quote = char
+        elif char == '#' and (not text or text[-1].isspace()):
+            end = command.find('\n', i)
+            i = len(command) if end < 0 else end
+            continue
+        elif command.startswith('<<', i) and not command.startswith('<<<', i) and (not i or command[i - 1] != '<'):
+            match = re.match(r'''<<(-?)[ \t]*('[^']*'|"[^"]*"|[^\s;&|<>]+)''', command[i:])
+            if match:
+                declarations.append((shlex.split(match[2])[0], bool(match[1])))
+                text += match[0]
+                i += len(match[0])
+                continue
+        elif char == '(':
+            depth += 1
+        elif char == ')':
+            depth = max(0, depth - 1)
+        separator = next((sep for sep in ('&&', '||', '|&', ';;', ';', '|', '&', '\n')
+                          if command.startswith(sep, i)), '') if not quote and depth == 0 else ''
+        if separator == '&' and ((i and command[i - 1] in '<>') or command[i:i + 2] == '&>'):
+            separator = ''
+        if separator:
+            emit(separator)
+            i += len(separator)
+            if separator == '\n':
+                owners = {}
+                for segment, delimiter, tabs in pending:
+                    body, found = '', False
+                    while i < len(command):
+                        end = command.find('\n', i)
+                        end = len(command) if end < 0 else end + 1
+                        line = command[i:end]
+                        i = end
+                        if (line.rstrip('\n').lstrip('\t') if tabs else line.rstrip('\n')) == delimiter:
+                            found = True
+                            break
+                        body += line.lstrip('\t') if tabs else line
+                    owners.setdefault(id(segment), []).append(body if found else None)
+                    segment.heredoc = owners[id(segment)][0] if len(owners[id(segment)]) == 1 else None
+                pending.clear()
+            continue
+        text += char
+        i += 1
+    emit('')
+    # A final newline/semicolon (including a heredoc's delimiter) is command end.
+    if segments and segments[-1].after in ('\n', ';'):
+        segments[-1].after = ''
+    # Control/function blocks are outside this top-level grammar, including their
+    # newline-separated bodies. Fail closed rather than treating a skipped body as executed.
+    controls = {'if', 'then', 'elif', 'else', 'fi', 'for', 'while', 'until', 'do', 'done', 'case', 'esac', 'function', '{', '}'}
+    if any(item.argv and (item.argv[0] in controls or re.fullmatch(r'[A-Za-z_][A-Za-z_0-9]*\(\)', item.argv[0]))
+           for item in segments):
+        for item in segments:
+            item.argv = None
+    return segments
+
+
+def python_invocation(segment):
+    argv = segment.argv
+    if not argv or not re.fullmatch(r'python(?:\d+(?:\.\d+)*)?', Path(argv[0]).name):
+        return None
+    flags, i = set(), 1
+    while i < len(argv):
+        word = argv[i]
+        if word in ('-W', '-X'):
+            i += 2
+        elif word == '-m':
+            return None
+        elif word == '-c':
+            return SimpleNamespace(flags=flags, mode='c', code=argv[i + 1] if i + 1 < len(argv) else None,
+                                   script=None, rest=[])
+        elif word == '-':
+            return SimpleNamespace(flags=flags, mode='stdin', code=segment.heredoc, script=None, rest=[])
+        elif re.fullmatch(r'-[a-zA-Z]+', word):
+            flags.update(word[1:])
+            i += 1
+        else:
+            return SimpleNamespace(flags=flags, mode='script', code=None, script=word, rest=argv[i + 1:])
+    return SimpleNamespace(flags=flags, mode='stdin', code=segment.heredoc, script=None, rest=[])
+
+
+def tool_positions(rows):
+    results = {row['message']['toolCallId']: index for index, row in enumerate(rows)
+               if row.get('message', {}).get('role') == 'toolResult'}
+    calls = {block['id']: index for index, row in enumerate(rows)
+             if row.get('message', {}).get('role') == 'assistant'
+             for block in row['message'].get('content', []) if block.get('type') == 'toolCall'}
+    return calls, results
+
+
+def tool_text(result):
+    return '\n'.join(block.get('text', '') for block in result.get('content', []) if block.get('type') == 'text')
+
+
+def cli_record_ok(sub, kind, verdict, record):
+    if sub == 'check-owner':
+        return record == {'current_binding_valid': True} and record['current_binding_valid'] is True
+    if sub == 'attest':
+        return (kind in ('identity', 'custody') and
+                record == {'kind': kind, 'artifact': {'kind': kind, 'accepted': True}} and
+                record['artifact']['accepted'] is True)
+    artifact = record.get('artifact')
+    return (sub == 'submit' and kind in ('understanding', 'review', 'resolution') and
+            set(record) == {'kind', 'artifact'} and record['kind'] == kind and isinstance(artifact, dict) and
+            artifact.get('version') == 1 and
+            {'operation_id', 'source_sha256', 'body', '_sha256'} <= artifact.keys() and
+            isinstance(artifact['_sha256'], str) and re.fullmatch(r'[0-9a-fA-F]{64}', artifact['_sha256']) is not None and
+            (kind == 'understanding' or ('verdict' in artifact and artifact['verdict'] == verdict)))
+
+
+def helper_executions(rows, calls, results, helper):
+    call_rows, result_rows = tool_positions(rows)
+    executions, mentions = [], 0
+    for call in calls:
+        if call.get('name') != 'bash':
+            continue
+        command = call.get('arguments', {}).get('command', '')
+        found, recognized = [], False
+        for segment in shell_segments(command):
+            invocation = python_invocation(segment)
+            if (not invocation or invocation.script is None or
+                    os.path.normpath(invocation.script) != str(helper) or not invocation.rest or
+                    invocation.rest[0] not in ('attest', 'submit', 'check-owner')):
+                continue
+            recognized = True
+            args, options = invocation.rest, {}
+            for index, word in enumerate(args[1:], 1):
+                name, equals, value = word.partition('=')
+                if name in ('-h', '--help'):
+                    options['help'] = True
+                elif name in ('--kind', '--verdict'):
+                    options[name] = value if equals else (args[index + 1] if index + 1 < len(args) else None)
+            if options.get('help'):
+                continue
+            found.append(dict(call=call, sub=args[0], kind=options.get('--kind'), verdict=options.get('--verdict'),
+                              call_row=call_rows.get(call['id'], -1), result_row=result_rows.get(call['id'], -1),
+                              status='ok', record=None))
+        mentions += int('handoff_io.py' in command and not recognized)
+        if not found:
+            continue
+        result, records, status = results.get(call['id']), [], 'ok'
+        if result is None:
+            status = 'no actual tool result'
+        elif result.get('isError'):
+            status = 'returned an error'
+        else:
+            for line in tool_text(result).split('\n'):
+                line = line.rstrip('\r')
+                if '{"' not in line:
+                    continue
+                try:
+                    record = json.loads(line)
+                    if (not isinstance(record, dict) or set(record) not in
+                            ({'kind', 'artifact'}, {'current_binding_valid'}, {'error', 'message'}) or
+                            line != json.dumps(record, ensure_ascii=False, sort_keys=True)):
+                        raise ValueError('noncanonical CLI record')
+                    records.append(record)
+                except ValueError:
+                    status = 'malformed record'
+            if status == 'ok' and len(records) != len(found):
+                status = 'absent/ambiguous record'
+        for index, execution in enumerate(found):
+            execution['status'] = status
+            if status == 'ok':
+                record = execution['record'] = records[index]
+                execution['status'] = ('unclassified' if execution['sub'] != 'check-owner' and execution['kind'] is None
+                    else 'rejected' if 'error' in record else 'ok' if cli_record_ok(
+                        execution['sub'], execution['kind'], execution['verdict'], record) else 'malformed record')
+        executions.extend(found)
+    return executions, mentions
+
+
+def assert_helper_pinned(rows, helper):
+    assert any(shlex.quote(str(helper)) in (content if isinstance(content, str) else
+               '\n'.join(block.get('text', '') for block in content if block.get('type') == 'text'))
+               for row in rows if row.get('message', {}).get('role') == 'user'
+               for content in [row['message'].get('content', '')]), 'observer helper pin differs from the product prompt'
+
+
+def python_goal_evidence(code):
+    """Top-level result bindings only; return assert evidence and expected print lines."""
     try:
-        return json.loads(text)
-    except ValueError as exc:
-        raise AssertionError('helper success is not independently visible in tool output') from exc
+        statements = ast.parse(code).body
+    except (SyntaxError, ValueError):
+        return False, []
+    modules, functions, values = set(), set(), set()
+    asserted, printed = False, []
+
+    def result(node):
+        return ((isinstance(node, ast.Name) and node.id in values) or
+                (isinstance(node, ast.Call) and not node.args and not node.keywords and
+                 ((isinstance(node.func, ast.Name) and node.func.id in functions) or
+                  (isinstance(node.func, ast.Attribute) and node.func.attr == 'result' and
+                   isinstance(node.func.value, ast.Name) and node.func.value.id in modules))))
+
+    def equality(node):
+        return (isinstance(node, ast.Compare) and len(node.ops) == 1 and isinstance(node.ops[0], ast.Eq) and
+                ((result(node.left) and isinstance(node.comparators[0], ast.Constant) and node.comparators[0].value == 'Y') or
+                 (result(node.comparators[0]) and isinstance(node.left, ast.Constant) and node.left.value == 'Y')))
+
+    def render(node):
+        if result(node):
+            return 'Y', True
+        if equality(node):
+            return True, True
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            return node.value, False
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in ('repr', 'str') and
+                len(node.args) == 1 and not node.keywords and result(node.args[0])):
+            return (repr('Y') if node.func.id == 'repr' else 'Y'), True
+        if isinstance(node, ast.JoinedStr):
+            parts, used = [], False
+            for part in node.values:
+                if isinstance(part, ast.FormattedValue):
+                    value = render(part.value)
+                    if value is None or not value[1] or part.format_spec or part.conversion not in (-1, 114, 115):
+                        return None
+                    parts.append(repr(value[0]) if part.conversion == 114 else str(value[0]))
+                    used = True
+                elif isinstance(part, ast.Constant) and isinstance(part.value, str):
+                    parts.append(part.value)
+                else:
+                    return None
+            return ''.join(parts), used
+        return None
+
+    for statement in statements:
+        if isinstance(statement, ast.Assert) and equality(statement.test):
+            asserted = True
+        if (isinstance(statement, ast.Expr) and isinstance(statement.value, ast.Call) and
+                isinstance(statement.value.func, ast.Name) and statement.value.func.id == 'print' and not statement.value.keywords):
+            args = [render(arg) for arg in statement.value.args]
+            if args and all(arg is not None for arg in args) and any(arg[1] for arg in args):
+                printed.append(' '.join(str(arg[0]) for arg in args))
+        binding = (statement.targets[0].id if isinstance(statement, ast.Assign) and len(statement.targets) == 1
+                   and isinstance(statement.targets[0], ast.Name) and result(statement.value) else None)
+        names = {node.id for node in ast.walk(statement) if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store)}
+        if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            names.add(statement.name)
+        if isinstance(statement, (ast.Import, ast.ImportFrom)):
+            names.update(alias.asname or alias.name.split('.')[0] for alias in statement.names)
+        for bindings in (modules, functions, values):
+            bindings.difference_update(names)
+        if binding:
+            values.add(binding)
+        if isinstance(statement, ast.Import):
+            modules.update(alias.asname or alias.name for alias in statement.names if alias.name == 'main')
+        if isinstance(statement, ast.ImportFrom) and statement.module == 'main' and statement.level == 0:
+            functions.update(alias.asname or alias.name for alias in statement.names if alias.name == 'result')
+    return asserted, printed
 
 
-def assert_actor_tools(rows, calls, results, *, target, identity=None):
-    """Require actor calls/results, never accept harness-authored attestation files."""
-    helper = [call for call in calls if call.get('name') == 'bash' and 'handoff_io.py' in call.get('arguments', {}).get('command', '')]
-    def find(fragment):
-        matches = [call for call in helper if fragment in call['arguments']['command']]
-        assert len(matches) == 1, 'missing/duplicate actual actor helper call: ' + fragment
-        call = matches[0]
-        assert call['id'] in results, 'helper call has no actual tool result'
-        return call, helper_output(results[call['id']])
+def post_edit_verifications(rows, calls, results, edit_done_row):
+    call_rows, result_rows = tool_positions(rows)
+    verified = []
+    for call in calls:
+        if (call.get('name') != 'bash' or not (edit_done_row < call_rows.get(call['id'], -1) < result_rows.get(call['id'], -1))
+                or call['id'] not in results or results[call['id']].get('isError')):
+            continue
+        segments = shell_segments(call.get('arguments', {}).get('command', ''))
+        errexit = False
+        for index, segment in enumerate(segments):
+            if segment.argv and segment.argv[0] == 'set':
+                for position, word in enumerate(segment.argv[1:], 1):
+                    if word in ('-o', '+o') and segment.argv[position + 1:position + 2] == ['errexit']:
+                        errexit = word == '-o'
+                    elif word.startswith(('-', '+')) and 'e' in word[1:] and word not in ('-o', '+o'):
+                        errexit = word[0] == '-'
+            invocation = python_invocation(segment)
+            if (not invocation or invocation.code is None or 'B' not in invocation.flags or 'O' in invocation.flags or
+                    'PYTHONOPTIMIZE' in segment.assigns):
+                continue
+            asserted, printed = python_goal_evidence(invocation.code)
+            propagates = (segment.before not in ('|', '||', '|&', '&') and
+                (all(item.after in ('&&', '') for item in segments[index:]) or
+                 (errexit and segment.after in ('\n', ';', ''))))
+            lines = [line.rstrip('\r') for line in tool_text(results[call['id']]).split('\n')]
+            if (asserted and propagates) or any(line in lines for line in printed):
+                verified.append(call)
+                break
+    return verified
+
+
+def target_turn_state(rows):
+    last_user = max((index for index, row in enumerate(rows) if row.get('message', {}).get('role') == 'user'), default=-1)
+    assistants = [(index, row) for index, row in enumerate(rows) if index > last_user and
+                  row.get('message', {}).get('role') == 'assistant']
+    if not assistants:
+        return dict(state='running', stopReason=None, errorMessage=None, row_id=None)
+    index, row = assistants[-1]
+    message = row['message']
+    reason = message.get('stopReason')
+    state = 'ended' if reason == 'stop' else 'running' if reason == 'toolUse' else 'unresolved'
+    if state == 'unresolved' and any(entry.get('type') == 'context_edit' and entry.get('targetId') == row.get('id')
+                                     for entry in rows[index + 1:]):
+        state = 'running'
+    return dict(state=state, stopReason=reason, errorMessage=str(message.get('errorMessage', ''))[:200], row_id=row.get('id'))
+
+
+def assert_turn_goal(project, baseline):
+    try:
+        assert_intended_action(project, baseline)
+    except AssertionError as exc:
+        raise AssertionError('target ended its turn without the intended main.py action: ' + str(exc)) from exc
+
+
+def assert_actor_tools(rows, calls, results, *, target, helper=HELPER, identity=None):
+    """Require pinned executions, canonical CLI records and post-edit actor proof."""
+    executions, mentions = helper_executions(rows, calls, results, helper)
+
+    def accepted(execution):
+        assert execution['status'] == 'ok', 'actor helper execution not accepted: ' + execution['status']
+        return execution
+
+    def one(sub, kind):
+        matches = [item for item in executions if (item['sub'], item['kind']) == (sub, kind)]
+        assert len(matches) == 1, f'missing/duplicate actual actor helper execution: {sub}/{kind} (unrecognized mentions: {mentions})'
+        return accepted(matches[0])
+
+    allowed = ({('attest', 'identity'), ('submit', 'understanding'), ('submit', 'resolution'), ('check-owner', None)}
+               if target else {('attest', 'custody'), ('submit', 'review')})
+    assert all((item['sub'], item['kind']) in allowed for item in executions), 'unexpected helper execution'
     if not target:
-        _, custody = find('--kind custody')
-        _, review = find('--kind review')
-        assert custody == {'kind': 'custody', 'artifact': {'kind': 'custody', 'accepted': True}}
-        assert review['kind'] == 'review'
-        return
-    _, identity_result = find('--kind identity')
-    assert identity_result == {'kind': 'identity', 'artifact': {'kind': 'identity', 'accepted': True}}
-    _, understanding = find('--kind understanding')
-    assert understanding['kind'] == 'understanding'
-    ready_call, ready = find('--kind resolution')
-    check_call, check = find('check-owner')
-    assert ready['kind'] == 'resolution' and ready['artifact']['verdict'] == 'ready'
-    assert check == {'current_binding_valid': True}
-    result_position = {row['message']['toolCallId']: index for index, row in enumerate(rows)
-        if row.get('message', {}).get('role') == 'toolResult'}
-    call_position = {block['id']: index for index, row in enumerate(rows)
-        if row.get('message', {}).get('role') == 'assistant' for block in row['message'].get('content', [])
-        if block.get('type') == 'toolCall'}
-    assert result_position[ready_call['id']] < call_position[check_call['id']], 'check-owner must follow actual ready helper success'
-    edits = [call for call in calls if call.get('name') in ('edit', 'write')
-        and Path(call.get('arguments', {}).get('path', '')).name == 'main.py']
+        one('attest', 'custody')
+        review = one('submit', 'review')
+        assert review['record']['artifact']['verdict'] in ('clear', 'corrections', 'conflict')
+        return []
+    one('attest', 'identity')
+    one('submit', 'understanding')
+    ready = one('submit', 'resolution')
+    assert ready['record']['artifact']['verdict'] == 'ready'
+    checks = [item for item in executions if item['sub'] == 'check-owner' and item['call_row'] > ready['result_row']]
+    assert checks, ('check-owner must follow actual ready helper success '
+                    f'(missing post-ready actual actor helper execution; unrecognized mentions: {mentions})')
+    for item in checks:
+        accepted(item)
+    call_rows, result_rows = tool_positions(rows)
+    edits = [call for call in calls if call.get('name') in ('edit', 'write') and
+             Path(call.get('arguments', {}).get('path', '')).name == 'main.py']
     assert edits, 'no separately observed actor main.py edit; manual inspection required'
-    assert result_position[check_call['id']] < min(call_position[call['id']] for call in edits), 'toy edit preceded current-owner check'
+    assert any(item['result_row'] < min(call_rows[call['id']] for call in edits) for item in checks), 'toy edit preceded current-owner check'
+    completed = [result_rows[call['id']] for call in edits if call['id'] in results and call['id'] in result_rows and
+                 not results[call['id']].get('isError')]
+    assert completed, 'no successful separately observed actor main.py edit; manual inspection required'
     assert identity is not None, 'actual challenged identity is required for bridge crosscheck'
     marker_outputs = [result for result in results.values() if all(key in json.dumps(result.get('content', []))
         for key in ('sessionId', 'sessionFile', 'bridgeVersion', 'pid', identity['pi_session_id'], identity['session_file']))]
     assert marker_outputs, 'actor did not inspect actual native SessionManager bridge output'
+    verified = post_edit_verifications(rows, calls, results, max(completed))
+    assert verified, 'no recognized successful post-edit Python -B verification of result() == "Y"; manual inspection required'
+    return verified
 
 
 def transcript_calls(path):
@@ -626,6 +975,7 @@ async def _run(root, config, total, engine_options):
     engine = None
     report = dict(status='running', model=provider + '/' + MODEL + ':xhigh', candidate=config['candidate'])
     mutations, milestones = [], []
+    turn = None
     def mark(stage, **details):
         milestones.append(dict(stage=stage, time_ns=time.monotonic_ns(), **details))
         private_json(evidence / 'milestones.json', milestones)
@@ -755,17 +1105,12 @@ async def _run(root, config, total, engine_options):
         manifest = json.loads((directory / 'manifest.json').read_text())
         chain = read_correlated_chain(dict(manifest=manifest, operation=directory))
         async def action_done():
-            try:
-                assert_intended_action(project, baseline)
-                _, calls, results = transcript_calls(operation['target_header']['log_path'])
-                successful = [call for call in calls if call.get('name') == 'bash'
-                    and re.search(r'\bpython[0-9.]*\s+-B\b', call.get('arguments', {}).get('command', ''))
-                    and all(token in call['arguments']['command'] for token in ('assert', 'result', 'Y'))
-                    and call['id'] in results and not results[call['id']].get('isError')]
-                return successful
-            except AssertionError:
-                return False
-        python_checks = await watcher.until(action_done, 120 if provider == 'openai' else total)
+            nonlocal turn
+            rows, _, _ = transcript_calls(operation['target_header']['log_path'])
+            turn = target_turn_state(rows)
+            return turn['state'] == 'ended'
+        await watcher.until(action_done, 120 if provider == 'openai' else total)
+        assert_turn_goal(project, baseline)
         after = store.current_snapshot()['state']
         target_id = operation['target_header']['pi_session_id']
         assert_graph(before, after, ids['alpha'], source_id, target_id)
@@ -795,12 +1140,14 @@ async def _run(root, config, total, engine_options):
                  first(directory / 'succession-receipt.json'), first(directory / 'resolution.json'), first(project / 'main.py')]
         assert order == sorted(order), 'registry/receipt/ready/task file chronology failed'
         target_rows, target_calls, target_results = transcript_calls(operation['target_header']['log_path'])
-        assert_actor_tools(target_rows, target_calls, target_results, target=True, identity=identity)
+        private_json(evidence / 'target-tool-trace.json', dict(calls=target_calls, results=target_results))
+        assert_helper_pinned(target_rows, HELPER)
+        python_checks = assert_actor_tools(target_rows, target_calls, target_results, target=True, helper=HELPER, identity=identity)
         private_json(evidence / 'graph-after.json', after)
         private_json(evidence / 'fresh-receipt.json', receipt)
-        private_json(evidence / 'target-tool-trace.json', dict(calls=target_calls, results=target_results))
         source_rows, source_calls, source_results = transcript_calls(source_file)
-        assert_actor_tools(source_rows, source_calls, source_results, target=False)
+        assert_helper_pinned(source_rows, HELPER)
+        assert_actor_tools(source_rows, source_calls, source_results, target=False, helper=HELPER)
         private_json(evidence / 'source-tool-trace.json', dict(calls=source_calls, results=source_results))
         report.update(status='native-owner-succession-and-toy-passed', source_pi=source_id, target_pi=target_id,
             owner_id=ids['alpha'], event_delta=1, current_binding_valid=True, identity_contact=None,
@@ -809,6 +1156,8 @@ async def _run(root, config, total, engine_options):
             semantic_manual_review='required', chronology_ns=order)
     except BaseException as exc:
         report.update(status='failed', error_type=type(exc).__name__, error=str(exc)[:500])
+        if turn is not None:
+            report['target_turn'] = turn
         raise
     finally:
         private_json(evidence / 'result.json', report)
