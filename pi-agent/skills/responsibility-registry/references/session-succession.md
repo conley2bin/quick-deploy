@@ -85,6 +85,11 @@ privilege. Custody explicitly distinguishes verified no runs, known active runs
 and unknown/partially known custody. Unknown is not evidence of empty children;
 no receipt reassigns native supervisors, transfers processes or fabricates ACKs.
 
+Injected temporary Stores may be loaded in another module namespace. Service
+compatibility uses the documented methods and typed error attributes
+(`code`, `commit_state`, `retryable`), rather than Python class identity or error
+message parsing. Unknown exceptions still propagate.
+
 ## Receipt recovery and the ready gate
 
 Store receipts are checked before stale document/source preconditions. Same
@@ -137,8 +142,14 @@ confirmed succession. Arbitrary old processes/tools are not revoked by this API.
 `tests/test_session_succession.py` uses synthetic owners only. Its in-memory
 `ProtocolStore` tests schema/digest, policy, patch preservation, errors, receipt
 ordering and read-only behavior; those tests alone do not attest to lock, fsync,
-crash recovery or transaction durability. Actual temporary Store integration must
-also validate same-operation one-event behavior, latest graph preservation,
-reset/supersession and same-source/different-source concurrency against the core
-transaction implementation. No real owner handoff, live registry read, install
-or deployment is part of these tests.
+crash recovery or transaction durability.
+
+A separate `ActualStoreSuccessionTests` group exercises the real Store against
+only temporary registry files: same-operation one-event behavior, latest graph
+preservation/CAS, private no-owner receipts, clear/restore-era supersession,
+same-operation and different-source concurrent writers, cross-module injected
+Store errors, and publication failure followed by read-only status and explicit
+metadata-only recovery. Valid manual reversion after uncertain publication stays
+unknown and is never replayed. These tests explicitly skip if the current Store
+dependency is absent; a skip is not transaction acceptance. No real owner handoff,
+live registry read, install or deployment is part of these tests.

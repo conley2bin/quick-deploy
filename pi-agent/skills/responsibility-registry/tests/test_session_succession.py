@@ -1,5 +1,6 @@
 """Synthetic service policy tests; ProtocolStore is NOT transaction durability evidence."""
 import copy
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import importlib.util
 import json
@@ -10,6 +11,8 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
+import types
 import unittest
 import uuid
 
@@ -205,7 +208,7 @@ class SuccessionPolicyTests(unittest.TestCase):
         for op in (str(uuid.uuid1()), str(uuid.uuid4()), str(uuid.uuid5(uuid.NAMESPACE_URL, 'synthetic'))):
             result = self.envelope(api.prepare_owner_session_succession(op, 'Pi:opaque/non-uuid', store=self.store), 'prepared')
             self.assertIsNone(result['plan']['owner_id'])
-        for pi in ('', '  ', None, 42):
+        for pi in ('', '  ', None, 42, '\ud800'):
             self.envelope(api.prepare_owner_session_succession(OP, pi, store=self.store), 'invalid_request')
 
     def test_frozen_digest_matches_exact_canonical_json_and_excludes_freshness(self):
@@ -237,6 +240,10 @@ class SuccessionPolicyTests(unittest.TestCase):
             ('target', lambda t: t['evidence'].update(operation_id=str(uuid.uuid4())), 'invalid_target'),
             ('target', lambda t: t['recovery'].update(cwd='relative'), 'invalid_target'),
             ('target', lambda t: t['recovery'].update(summary=float('nan')), 'invalid_target'),
+            ('target', lambda t: t['recovery'].update(summary=float('inf')), 'invalid_target'),
+            ('target', lambda t: t['recovery'].update(summary='\ud800'), 'invalid_target'),
+            ('target', lambda t: t['recovery'].update(context_refs=('not-a-JSON-array',)), 'invalid_target'),
+            ('target', lambda t: t['recovery']['context_refs'].append(t['recovery']['context_refs']), 'invalid_target'),
             ('target', lambda t: t['identity'].update(source='intercom-status'), 'invalid_target'),
             ('authority', lambda a: a.update(issuer='owner:superior'), 'invalid_authority'),
             ('authority', lambda a: a.update(issuer='owner:child'), 'invalid_authority'),
@@ -364,6 +371,25 @@ class SuccessionPolicyTests(unittest.TestCase):
         self.store.store_id = self.plan['store_id']
         self.target['identity']['pi_session_id'] = 'opaque-source-Pi'
         self.assertEqual(self.envelope(self.commit(), 'conflict')['error']['code'], 'source_identity_conflict')
+
+    def test_missing_owner_and_rebound_source_are_distinct_conflicts(self):
+        def remove_owner(s):
+            del s['owners']['alpha']
+            s['assignments'] = {aid: a for aid, a in s['assignments'].items() if a['owner'] != 'alpha'}
+            s['coordination'] = {}
+        self.store.edit(remove_owner)
+        self.plan['document_token'] = self.store.current_snapshot()['document_token']
+        result = self.envelope(self.commit(), 'conflict')
+        self.assertEqual(result['error']['code'], 'source_owner_missing')
+        self.store = ProtocolStore()
+        def rebind_source(s):
+            s['owners']['alpha']['identity'] = identity('another-Pi')
+            s['owners']['child']['identity'] = identity('opaque-source-Pi')
+        self.store.edit(rebind_source)
+        self.plan['document_token'] = self.store.current_snapshot()['document_token']
+        result = self.envelope(self.commit(), 'conflict')
+        self.assertEqual(result['error']['code'], 'source_owner_changed')
+        self.assertFalse(self.store.events)
 
     def test_same_op_receipt_precedes_stale_cas_and_changed_source(self):
         first = self.envelope(self.commit(), 'committed')
@@ -511,6 +537,292 @@ print('absolute loader and private sibling Store verified')
                                     text=True, capture_output=True, timeout=15)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('private sibling Store verified', result.stdout)
+
+
+class ActualStoreSuccessionTests(unittest.TestCase):
+    """Temporary real Store, real lock/journal/publication; no live runtime paths."""
+    def setUp(self):
+        self.core = api._sibling('registry')
+        if not callable(getattr(self.core.Store, 'transact_current', None)):
+            self.skipTest('Real current transaction Store dependency is not installed in this checkout.')
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.directory = Path(self.temp.name)
+        self.root = self.directory / 'private'
+        self.document = self.directory / 'current.md'
+        self.store = self.new_store()
+        self.store.initialize()
+        # A synthetic manually authored v3 graph is current authority. It does not
+        # invent old events for its observation revision or read any real owner.
+        self.document.write_text(api._codec.serialize_current_document(state(), ERA), encoding='utf-8')
+        self.plan = self.prepare(OP, 'opaque-source-Pi')
+        self.target, self.authority, self.custody = target(), authority(), custody()
+
+    def new_store(self):
+        return self.core.Store(self.root, self.document)
+
+    def prepare(self, op, source):
+        result = api.prepare_owner_session_succession(op, source, store=self.new_store())
+        self.assertEqual(result['status'], 'prepared', result)
+        return result['plan']
+
+    def commit(self, **updates):
+        arguments = dict(plan=self.plan, target=self.target, expected_document=self.plan['document_token'],
+                         authority=self.authority, custody=self.custody, store=self.new_store())
+        arguments.update(updates)
+        result = api.commit_owner_session_succession(**arguments)
+        self.assertEqual(set(result), ENVELOPE)
+        return result
+
+    def digest(self):
+        return api.build_intent_digest(self.plan, self.target, self.authority, self.custody)
+
+    def get(self, op=None, digest=None):
+        return api.get_owner_session_succession(op or OP, digest or self.digest(), store=self.new_store())
+
+    def manual(self, fn, *, era=None):
+        snapshot = self.store.current_snapshot()
+        fn(snapshot['state'])
+        self.document.write_text(api._codec.serialize_current_document(snapshot['state'], era or snapshot['era'], snapshot['audit_head']), encoding='utf-8')
+
+    def files(self):
+        return {str(path.relative_to(self.directory)): (path.read_bytes(), path.stat().st_mtime_ns)
+                for path in self.directory.rglob('*') if path.is_file()}
+
+    def prepares(self):
+        return [json.loads(path.read_text()) for path in self.store.audit.ops.glob('*.prepare.json')]
+
+    def test_real_same_op_one_event_fresh_store_receipt_and_get_read_only(self):
+        before = self.store.current_snapshot()
+        first = self.commit()
+        self.assertEqual(first['status'], 'committed', first)
+        self.assertTrue(first['current_binding_valid'])
+        self.assertEqual(first['receipt']['document_token_after'], self.store.current_snapshot()['document_token'])
+        self.assertEqual(set(first['receipt']), RECEIPT)
+        after = self.files()
+        repeated = self.commit(expected_document='intentionally-stale')
+        self.assertEqual(repeated['status'], 'already_committed', repeated)
+        self.assertEqual(repeated['receipt'], first['receipt'])
+        self.assertEqual(self.get()['status'], 'already_committed')
+        self.assertEqual(self.files(), after)
+        prepares = self.prepares()
+        self.assertEqual(len(prepares), 1)
+        event = prepares[0]['event']
+        self.assertEqual(event['action'], 'session-succession')
+        self.assertEqual(event['actor'], 'alpha')
+        self.assertEqual(event['revision'], before['state']['revision'] + 1)
+        self.assertEqual(set(event['before']['owners']), {'alpha'})
+        self.assertEqual(event['before']['owners']['alpha']['identity']['pi_session_id'], 'opaque-source-Pi')
+        self.assertEqual(event['after']['owners']['alpha']['identity'], self.target['identity'])
+        self.assertEqual(event['before']['assignments'], {})
+        self.assertEqual(event['after']['coordination'], {})
+        changed = copy.deepcopy(self.target)
+        changed['recovery']['summary'] += ' changed intent'
+        conflict = self.commit(target=changed)
+        self.assertEqual(conflict['error']['code'], 'operation_intent_mismatch')
+        self.assertEqual(self.files(), after)
+
+    def test_real_latest_graph_cas_and_all_noncarrier_fields_preserved(self):
+        digest = self.digest()
+        def changes(s):
+            s['owners']['alpha']['parent'] = 'user'
+            s['assignments']['active']['objective'] = 'Newest authorized synthetic objective.'
+            s['assignments']['active']['depends_on'].append({'kind': 'project', 'project': 'new-dependency'})
+            s['assignments']['completed']['end_reason'] = 'Newest completion evidence.'
+            s['coordination']['agreement']['sequencing'] = 'Newest confirmed sequencing.'
+        self.manual(changes)
+        before_bytes = self.document.read_bytes()
+        stale = self.commit()
+        self.assertEqual(stale['status'], 'conflict', stale)
+        self.assertEqual(stale['error']['code'], 'document_conflict')
+        self.assertEqual(self.document.read_bytes(), before_bytes)
+        self.assertFalse(self.store.audit.exists())
+        self.plan = self.prepare(OP, 'opaque-source-Pi')
+        self.assertEqual(self.digest(), digest)
+        before = self.store.current_snapshot()['state']
+        result = self.commit()
+        self.assertEqual(result['status'], 'committed', result)
+        after = self.store.current_snapshot()['state']
+        after['revision'] = before['revision']
+        for field in ('identity', 'recovery', 'updated_at'):
+            after['owners']['alpha'][field] = before['owners']['alpha'][field]
+        self.assertEqual(after, before)
+
+    def test_real_store_in_another_module_namespace_uses_structured_errors(self):
+        package_name = '_synthetic_foreign_registry_' + uuid.uuid4().hex
+        package = types.ModuleType(package_name)
+        package.__path__ = [str(SCRIPT.parent)]
+        sys.modules[package_name] = package
+        def cleanup():
+            for name in list(sys.modules):
+                if name == package_name or name.startswith(package_name + '.'):
+                    sys.modules.pop(name, None)
+        self.addCleanup(cleanup)
+        spec = importlib.util.spec_from_file_location(package_name + '.registry', SCRIPT.parent / 'registry.py')
+        foreign = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = foreign
+        spec.loader.exec_module(foreign)
+        self.assertIsNot(foreign.RegistryTransactionError, self.core.RegistryTransactionError)
+        foreign_store = foreign.Store(self.root, self.document)
+        conflict = self.commit(store=foreign_store, expected_document='stale-on-purpose')
+        self.assertEqual(conflict['status'], 'conflict', conflict)
+        self.assertEqual(conflict['error']['code'], 'document_conflict')
+        self.assertTrue(conflict['error']['retryable'])
+        self.assertEqual(self.commit(store=foreign_store)['status'], 'committed')
+        changed = copy.deepcopy(self.target)
+        changed['recovery']['summary'] += ' foreign namespace changed intent'
+        conflict = self.commit(store=foreign_store, target=changed)
+        self.assertEqual(conflict['error']['code'], 'operation_intent_mismatch', conflict)
+        self.assertEqual(len(self.prepares()), 1)
+
+    def test_real_no_owner_persists_receipt_not_current_revision_or_event(self):
+        source = 'synthetic-no-owner-Pi'
+        self.plan = self.prepare(OP, source)
+        self.authority, self.custody = authority(None), custody(source)
+        before = self.document.read_bytes(), self.document.stat().st_mtime_ns, self.store.current_snapshot()
+        first = self.commit()
+        self.assertEqual(first['status'], 'not_applicable', first)
+        self.assertTrue(first['no_owner_valid'])
+        self.assertFalse(first['current_binding_valid'])
+        self.assertIsNone(first['receipt']['owner_id'])
+        self.assertIsNone(first['receipt']['event_id'])
+        self.assertEqual((self.document.read_bytes(), self.document.stat().st_mtime_ns, self.store.current_snapshot()), before)
+        self.assertEqual(len(self.prepares()), 1)
+        self.assertIsNone(self.prepares()[0]['event'])
+        after = self.files()
+        self.assertEqual(self.get()['status'], 'not_applicable')
+        self.assertEqual(self.commit(expected_document='old-token')['status'], 'not_applicable')
+        self.assertEqual(self.files(), after)
+        self.manual(lambda s: s['owners']['child'].update(identity=identity(source)))
+        self.assertEqual(self.get()['status'], 'superseded')
+
+    def test_real_new_source_registration_conflicts_without_private_operation(self):
+        source = 'synthetic-no-owner-Pi'
+        self.plan = self.prepare(OP, source)
+        self.authority, self.custody = authority(None), custody(source)
+        self.manual(lambda s: s['owners']['child'].update(identity=identity(source)))
+        self.plan['document_token'] = self.store.current_snapshot()['document_token']
+        before = self.files()
+        result = self.commit()
+        self.assertEqual(result['error']['code'], 'source_registration_changed', result)
+        self.assertEqual(self.files(), before)
+
+    def test_real_later_carrier_manual_identity_and_clear_restore_supersede(self):
+        self.assertEqual(self.commit()['status'], 'committed')
+        original_digest = self.digest()
+        op2 = str(uuid.uuid4())
+        next_plan = self.prepare(op2, 'opaque-target-Pi')
+        result = self.commit(plan=next_plan, target=target(op2, 'opaque-third-Pi'),
+                             expected_document=next_plan['document_token'], custody=custody('opaque-target-Pi'))
+        self.assertEqual(result['status'], 'committed', result)
+        self.assertEqual(self.get(digest=original_digest)['status'], 'superseded')
+        self.assertEqual(self.commit()['status'], 'superseded')
+        self.assertEqual(len(self.prepares()), 2)
+        current_digest = api.build_intent_digest(next_plan, target(op2, 'opaque-third-Pi'), self.authority, custody('opaque-target-Pi'))
+        self.manual(lambda s: s['owners']['alpha']['identity'].update(intercom_id='new-manual-contact'))
+        self.assertEqual(self.get(op2, current_digest)['status'], 'superseded')
+        self.manual(lambda s: s['owners']['alpha'].update(identity=identity('opaque-third-Pi')))
+        self.assertEqual(self.get(op2, current_digest)['status'], 'already_committed')
+        clear = self.store.switch_document('clear', self.store.current_snapshot()['document_token'],
+                                           'user', 'Synthetic explicit clear.', 'Synthetic user authorization.')
+        self.assertEqual(self.get(op2, current_digest)['status'], 'superseded')
+        self.store.switch_document('restore', self.store.current_snapshot()['document_token'],
+                                   'user', 'Synthetic explicit restore.', 'Synthetic user authorization.', target='previous')
+        self.assertNotEqual(self.store.current_snapshot()['era'], next_plan['era'])
+        self.assertEqual(self.store.current_snapshot()['state']['owners']['alpha']['identity']['pi_session_id'], 'opaque-third-Pi')
+        self.assertEqual(self.get(op2, current_digest)['status'], 'superseded')
+
+    def test_real_same_source_same_op_concurrency_one_event(self):
+        barrier = threading.Barrier(2)
+        def attempt(_):
+            store = self.new_store()
+            original_status = store.operation_status
+            def synchronized_status(op, digest):
+                result = original_status(op, digest)
+                barrier.wait(timeout=10)
+                return result
+            store.operation_status = synchronized_status
+            return self.commit(store=store)
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(attempt, range(2)))
+        self.assertEqual(sorted(result['status'] for result in results), ['already_committed', 'committed'], results)
+        self.assertEqual(len(self.prepares()), 1)
+        self.assertEqual(self.store.current_snapshot()['state']['revision'], self.plan['observation_revision'] + 1)
+
+    def test_real_different_sources_concurrent_cas_then_same_intent_retry(self):
+        op2 = str(uuid.uuid4())
+        plan2 = self.prepare(op2, 'synthetic-child-Pi')
+        parameters = [dict(plan=self.plan, target=self.target, authority=self.authority, custody=self.custody),
+                      dict(plan=plan2, target=target(op2, 'synthetic-child-target-Pi'), authority=authority('child'), custody=custody('synthetic-child-Pi'))]
+        barrier = threading.Barrier(2)
+        def attempt(index):
+            barrier.wait(timeout=10)
+            return self.commit(**parameters[index], expected_document=parameters[index]['plan']['document_token'])
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(attempt, range(2)))
+        self.assertEqual(sorted(result['status'] for result in results), ['committed', 'conflict'], results)
+        loser = next(index for index, result in enumerate(results) if result['status'] == 'conflict')
+        self.assertEqual(results[loser]['error']['code'], 'document_conflict')
+        params = parameters[loser]
+        fresh = self.prepare(params['plan']['operation_id'], params['plan']['source_pi_session_id'])
+        self.assertEqual({k: fresh[k] for k in api._IMMUTABLE_PLAN}, {k: params['plan'][k] for k in api._IMMUTABLE_PLAN})
+        frozen_digest = api.build_intent_digest(**params)
+        params['plan'] = fresh
+        self.assertEqual(api.build_intent_digest(**params), frozen_digest)
+        result = self.commit(**params, expected_document=fresh['document_token'])
+        self.assertEqual(result['status'], 'committed', result)
+        current = self.store.current_snapshot()['state']
+        self.assertEqual(current['owners']['alpha']['identity']['pi_session_id'], 'opaque-target-Pi')
+        self.assertEqual(current['owners']['child']['identity']['pi_session_id'], 'synthetic-child-target-Pi')
+        self.assertEqual(len(self.prepares()), 2)
+
+    def test_real_same_source_other_op_cannot_steal_after_fresh_token(self):
+        competing_op = str(uuid.uuid4())
+        competing_plan = self.prepare(competing_op, 'opaque-source-Pi')
+        self.assertEqual(self.commit()['status'], 'committed')
+        result = self.commit(plan=competing_plan, target=target(competing_op, 'synthetic-competing-target'),
+                             expected_document=self.store.current_snapshot()['document_token'])
+        self.assertEqual(result['status'], 'conflict', result)
+        self.assertEqual(result['error']['code'], 'source_identity_conflict')
+        self.assertEqual(len(self.prepares()), 1)
+
+    def test_real_pending_get_does_not_repair_and_explicit_recovery_never_republishes(self):
+        def crash(phase):
+            if phase == 'current_replaced':
+                raise OSError('Synthetic fault after current publication.')
+        self.store.transaction_checkpoint = self.store.audit.checkpoint = crash
+        failed = self.commit(store=self.store)
+        self.assertEqual(failed['status'], 'needs_recovery', failed)
+        self.assertEqual(failed['error']['commit_state'], 'unknown')
+        after = self.files()
+        status = self.get()
+        self.assertEqual(status['status'], 'needs_recovery', status)
+        self.assertEqual(status['error']['code'], 'transaction_pending')
+        self.assertEqual(self.files(), after)
+        current_bytes = self.document.read_bytes()
+        self.new_store().recover_transaction('user', 'Synthetic explicit recovery.', 'Synthetic user authority.')
+        self.assertEqual(self.document.read_bytes(), current_bytes)
+        self.assertEqual(self.get()['status'], 'already_committed')
+        self.assertEqual(len(self.prepares()), 1)
+        self.assertEqual(self.commit()['status'], 'already_committed')
+
+    def test_real_unknown_after_manual_reversion_never_assumes_abort_or_replays(self):
+        original = self.document.read_bytes()
+        def crash(phase):
+            if phase == 'current_replaced':
+                raise OSError('Synthetic fault after current publication.')
+        self.store.transaction_checkpoint = self.store.audit.checkpoint = crash
+        self.assertEqual(self.commit(store=self.store)['status'], 'needs_recovery')
+        self.document.write_bytes(original)  # Valid manual current; history cannot prove rename never happened.
+        self.new_store().recover_transaction('user', 'Synthetic explicit recovery.', 'Synthetic user authority.')
+        current = self.files()
+        result = self.get()
+        self.assertEqual(result['status'], 'needs_recovery', result)
+        self.assertEqual(result['error']['commit_state'], 'unknown')
+        self.assertEqual(self.commit()['status'], 'needs_recovery')
+        self.assertEqual(self.files(), current)
+        self.assertEqual(self.document.read_bytes(), original)
+        self.assertEqual(len(self.prepares()), 1)
 
 
 if __name__ == '__main__':

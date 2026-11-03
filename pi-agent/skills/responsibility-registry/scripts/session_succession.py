@@ -97,6 +97,10 @@ def _fields(value, fields, code):
 
 def _text(value, code, label):
     _check(isinstance(value, str) and bool(value.strip()), code, label + ' must be nonempty text.')
+    try:
+        value.encode('utf-8')
+    except UnicodeError as exc:
+        raise SuccessionValidationError(code, label + ' must be UTF-8 text.') from exc
 
 
 def _uuid(value, code='invalid_operation_id'):
@@ -119,12 +123,12 @@ def _json(value, code):
                 validate(child)
         else:
             _check(item is None or type(item) in (str, int, float, bool), code, 'Strict JSON required.')
-    validate(value)
     try:
         encoded = json.dumps(value, sort_keys=True, separators=(',', ':'), ensure_ascii=False, allow_nan=False)
+        validate(value)
         encoded.encode('utf-8')
         return encoded
-    except (TypeError, ValueError, UnicodeError) as exc:
+    except (TypeError, ValueError, UnicodeError, RecursionError) as exc:
         raise SuccessionValidationError(code, 'Strict finite UTF-8 JSON required.') from exc
 
 
@@ -222,7 +226,7 @@ def _intent(plan, target, authority, custody):
                               target=target, authority=authority, custody=custody))
 
 
-def build_intent_digest(plan, target, authority, custody):
+def build_intent_digest(plan: dict, target: dict, authority: dict, custody: dict) -> str:
     """Hash validated frozen intent; invalid inputs raise SuccessionValidationError."""
     intent = _intent(plan, target, authority, custody)
     try:
@@ -320,7 +324,7 @@ def _policy(state, era, plan, target):
         raise _Fault('conflict', 'target_identity_occupied', 'Target Pi is currently claimed by another owner.')
 
 
-def prepare_owner_session_succession(operation_id, source_pi_session_id, *, store=None):
+def prepare_owner_session_succession(operation_id: str, source_pi_session_id: str, *, store=None) -> dict:
     """Read the complete current Store; never register, repair or hydrate history."""
     try:
         _uuid(operation_id)
@@ -443,7 +447,8 @@ def _present(record, operation_id, digest, *, new=False):
     return _envelope(operation_id, status, digest=digest, receipt=receipt, binding=not noop, no_owner=noop)
 
 
-def commit_owner_session_succession(plan, target, *, expected_document, authority, custody, store=None):
+def commit_owner_session_succession(plan: dict, target: dict, *, expected_document: str,
+                                    authority: dict, custody: dict, store=None) -> dict:
     """Commit one identity/recovery patch, with receipt lookup before source/CAS checks."""
     operation_id = plan.get('operation_id') if isinstance(plan, dict) else None
     digest = None
@@ -461,7 +466,11 @@ def commit_owner_session_succession(plan, target, *, expected_document, authorit
         if snapshot['format'] != _SPLIT_FORMAT:
             raise _Fault('unavailable', 'storage_not_migrated', 'Succession requires explicitly migrated current storage.')
 
+        callback_called = False
+
         def change(current, era):
+            nonlocal callback_called
+            callback_called = True
             _policy(current, era, intent['plan'], intent['target'])
             oid = intent['plan']['owner_id']
             if oid is None:
@@ -477,12 +486,14 @@ def commit_owner_session_succession(plan, target, *, expected_document, authorit
         record = store.transact_current(operation_id, digest, intent, expected_document, change,
                                         action='session-succession', actor=actor, reason=authority['reason'],
                                         authority=authority['evidence'], persist_noop=plan['owner_id'] is None)
-        return _present(record, operation_id, digest, new=True)
+        # Another caller may have committed the same op between our read-only
+        # status check and the locked transaction's own receipt lookup.
+        return _present(record, operation_id, digest, new=callback_called)
     except Exception as exc:
         return _error(operation_id if isinstance(operation_id, str) else None, exc, digest)
 
 
-def get_owner_session_succession(operation_id, intent_digest, *, store=None):
+def get_owner_session_succession(operation_id: str, intent_digest: str, *, store=None) -> dict:
     """Strictly read-only receipt lookup plus fresh current-binding qualification."""
     try:
         _uuid(operation_id)
