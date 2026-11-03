@@ -81,6 +81,24 @@ class PromptTests(unittest.TestCase):
             self.assertEqual(argv[argv.index("--manifest") + 1], str(self.directory / "manifest.json"))
             self.assertEqual(Path(argv[argv.index("--body-file") + 1]).parent, self.directory)
 
+    def test_new_succession_prompts_require_private_proof_and_narrow_gate(self):
+        self.manifest['succession'] = {'version': 1}
+        recovery = prompts.build_recovery_prompt(self.manifest, self.directory)
+        review = prompts.build_review_prompt(self.manifest, self.directory, 'a' * 64)
+        continuation = prompts.build_continuation_prompt(self.manifest, self.directory, 'b' * 64)
+        self.assertIn('Intercom self status', recovery)
+        self.assertIn('--kind identity', recovery)
+        self.assertIn('intercom_id', recovery)
+        self.assertIn('actual current-session', recovery)
+        self.assertIn('--kind custody', review)
+        self.assertIn('none_verified', review)
+        self.assertIn('unknown', review)
+        self.assertIn('不任意任命', continuation)
+        self.assertIn('check-owner', continuation)
+        self.assertIn('先取 canonical commit/get', continuation)
+        self.assertIn('不发额外 GO', continuation)
+        self.assertNotIn('不转移负责人权限', continuation)
+
     def test_installed_module_location_not_developer_path(self):
         with patch.object(prompts, "__file__", "/opt/installed/session-handoff/prompts.py"):
             prompt = prompts.build_recovery_prompt(self.manifest, self.directory)

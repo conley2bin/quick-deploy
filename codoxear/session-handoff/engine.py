@@ -13,6 +13,7 @@ import time
 from urllib.parse import quote
 from uuid import UUID, uuid4
 
+from . import succession
 from .context import ContextError, create_source_snapshot, prepare_artifacts, read_artifact
 from .prompts import build_recovery_prompt, build_review_prompt, build_continuation_prompt
 
@@ -163,8 +164,9 @@ def idle(row):
 
 class Engine:
     def __init__(self, upstream_json, *, state_root=None, timeouts=None,
-                 clock=time.monotonic, sleep=asyncio.sleep):
+                 clock=time.monotonic, sleep=asyncio.sleep, succession_service=None):
         self.upstream_json = upstream_json
+        self.succession = succession.Adapter(succession_service)
         self.root = Path(state_root or (Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state"))
                                        / "codoxear/session-handoff")).absolute()
         self.timeouts = {"native": 30.0, "launch": 120.0, "understanding": 900.0,
@@ -234,7 +236,7 @@ class Engine:
             resolution = self._artifact(op, "resolution")
         except (ContextError, HandoffError, OSError) as exc:
             self._set(op, op["status"], error_code=(
-                exc.code if isinstance(exc, HandoffError) else "invalid_artifact"))
+                getattr(exc, 'code', 'invalid_artifact')))
         else:
             if resolution is not None:
                 op["resolution_sha256"] = resolution["_sha256"]
@@ -311,6 +313,8 @@ class Engine:
                     "source_sha256": snapshot["sha256"], "note": note,
                     "paths": {"operation_dir": str(directory), "source_context": str(directory / "source-context.md"),
                               **{kind: str(directory / (kind + ".json")) for kind in ("understanding", "review", "resolution")}}}
+        manifest['succession'] = succession.prepare_source(directory, op['id'],
+            op['source_header']['pi_session_id'], self.succession)
         prepare_artifacts(directory, manifest)
         # Keep the bounded published manifest, not transient raw transcript entries.
         return read_private_json(directory / "manifest.json")
@@ -328,7 +332,7 @@ class Engine:
                 self._set(op, "interrupted", error_code="shutdown")
             raise
         except (ContextError, HandoffError) as exc:
-            self._set(op, "failed", error_code=exc.code if isinstance(exc, HandoffError) else "invalid_artifact")
+            self._set(op, "failed", error_code=getattr(exc, 'code', 'invalid_artifact'))
         except Exception:
             self._set(op, "failed", error_code="workflow_error")
 
@@ -367,6 +371,15 @@ class Engine:
         if header_identity(row) != op[who + "_header"]:
             raise HandoffError("identity_changed", "会话真实日志身份已改变，未继续发送")
         return row
+
+    async def _offloop(self, function, *args):
+        """Join owned file/service work even when the HTTP app shuts down."""
+        work = asyncio.create_task(asyncio.to_thread(function, *args))
+        try:
+            return await asyncio.shield(work)
+        except asyncio.CancelledError:
+            await asyncio.gather(work, return_exceptions=True)
+            raise
 
     async def _poll(self, seconds, check):
         deadline = self.clock() + seconds
@@ -449,6 +462,17 @@ class Engine:
                                source_sha256=op["source_sha256"],
                                understanding_sha256=op.get("understanding_sha256"),
                                review_sha256=op.get("review_sha256"))
+        manifest = self.manifests.get(op['id'])
+        if manifest is None:
+            manifest = read_private_json(self.root / op['id'] / 'manifest.json')
+        if 'succession' in manifest and result is not None:
+            directory = self.root / op['id']
+            if kind == 'understanding':
+                with succession.context._operation_dir(directory) as fd:
+                    succession.check_target(fd, manifest)
+            elif kind == 'resolution' and result['verdict'] == 'ready':
+                succession.validate_ready(directory, manifest, op.get('understanding_sha256'),
+                                           op.get('review_sha256'), self.succession)
         pinned = op.get(kind + "_sha256")
         if result is not None and pinned and result["_sha256"] != pinned:
             raise HandoffError("artifact_changed", "已提交的交接产物被替换")
@@ -468,7 +492,7 @@ class Engine:
                     return None  # Disappeared reviewer may return before the deadline.
                 self._verify(op, rows, "source")
             self._check_chain(op)
-            return self._artifact(op, kind)
+            return await self._offloop(self._artifact, op, kind)
         return await self._poll(self.timeouts[timeout], check)
 
     async def _run(self, op, cookie, row, note):
@@ -490,6 +514,10 @@ class Engine:
         created = await self._mutation(op, cookie, "create", "/api/sessions", launch)
         if created is None or not await self._bind_target(op, cookie, created):
             return
+        if 'succession' in manifest:
+            target_row = self._verify(op, await self.sessions(cookie), 'target')
+            await self._offloop(succession.bind_target, self.root / op['id'], manifest,
+                                    target_row, op['target_header'])
         if not await self._name_target(op, cookie):
             return
         self._set(op, "recovering")
@@ -563,6 +591,10 @@ class Engine:
         if target is None:
             self._set(op, "failed", error_code="target_idle_timeout")
             return
+        manifest = self.manifests.get(op['id']) or read_private_json(self.root / op['id'] / 'manifest.json')
+        if 'succession' in manifest:
+            await self._offloop(succession.freeze_intent, self.root / op['id'], manifest,
+                                    op['understanding_sha256'], op['review_sha256'], self.succession)
         sent = await self._mutation(op, cookie, "continuation", "/api/sessions/" + quote(target["session_id"], safe="") + "/send", {"text": text})
         if sent is None:
             return

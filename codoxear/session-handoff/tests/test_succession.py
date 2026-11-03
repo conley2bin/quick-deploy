@@ -2,6 +2,8 @@
 import concurrent.futures
 import importlib
 import json
+import io as stdio
+from contextlib import redirect_stdout, redirect_stderr
 from pathlib import Path
 import tempfile
 import unittest
@@ -196,6 +198,69 @@ class GateTests(unittest.TestCase):
         self.assertEqual(sum(item is not None for item in results), 1)
         self.assertEqual(self.service.events, 1)
         self.assertEqual(self.service.calls.count('commit'), 1)
+
+    def test_actual_cli_return_zero_precedes_toy_action(self):
+        stdout = stdio.StringIO()
+        argv = ['submit', '--manifest', str(self.directory / 'manifest.json'), '--kind', 'resolution',
+                '--body-file', str(self.body), '--verdict', 'ready']
+        with patch.object(s.Adapter, 'load', return_value=self.service), redirect_stdout(stdout):
+            code = io.main(argv)
+        self.assertEqual(code, 0)
+        self.assertEqual(self.service.events, 1)
+        self.assertTrue((self.directory / 'resolution.json').exists())
+        action = self.directory / 'toy-action.txt'
+        if code == 0:
+            action.write_text('Y')
+        self.assertEqual(action.read_text(), 'Y')
+        with patch.object(s.Adapter, 'load', return_value=self.service), redirect_stderr(stdio.StringIO()):
+            self.assertEqual(io.main(argv), 2)
+        self.assertEqual(self.service.events, 1)
+
+    def test_needs_recovery_never_allows_ready(self):
+        def pending(plan, target, *, expected_document, authority, custody, store=None):
+            digest = self.service.build_intent_digest(plan, target, authority, custody)
+            return self.service.envelope(self.op, 'needs_recovery', digest=digest,
+                error=dict(code='transaction_pending', message='pending', retryable=False, commit_state='unknown'))
+        self.service.commit_owner_session_succession = pending
+        with self.assertRaisesRegex(s.GateError, 'needs_recovery'):
+            self.submit('resolution', verdict='ready')
+        self.assertFalse((self.directory / 'resolution.json').exists())
+        self.assertEqual(self.service.events, 0)
+
+    def test_era_reset_prevents_commit(self):
+        prepare = self.service.prepare_owner_session_succession
+        def reset(*args, **kwargs):
+            value = prepare(*args, **kwargs)
+            value['plan']['era'] = 'reset-era'
+            return value
+        self.service.prepare_owner_session_succession = reset
+        with self.assertRaisesRegex(s.GateError, 'source_changed'):
+            self.submit('resolution', verdict='ready')
+        self.assertNotIn('commit', self.service.calls)
+
+    def test_contact_from_connected_status_and_wrong_nonce_rejected(self):
+        report = json.loads((self.directory / 'succession-identity.json').read_text())
+        report.update(intercom_id='actual-connected-contact', contact_source='target-intercom-status', unknown_reason='')
+        (self.directory / 'succession-identity.json').unlink()
+        self.identity_draft.write_text(json.dumps(report))
+        io.attest(self.directory / 'manifest.json', 'identity', self.identity_draft)
+        (self.directory / 'succession-intent.json').unlink()
+        intent = s.freeze_intent(self.directory, self.manifest, self.u['_sha256'], self.r['_sha256'], self.adapter)
+        self.assertEqual(intent['target']['identity']['intercom_id'], 'actual-connected-contact')
+        report['challenge'] = 'incorrect-private-nonce'
+        (self.directory / 'succession-identity.json').write_bytes(context._encode(report))
+        with self.assertRaises(s.GateError):
+            self.submit('resolution', verdict='ready')
+        self.assertNotIn('commit', self.service.calls)
+
+    def test_invalid_receipt_capsule_blocks_host_ready(self):
+        self.submit('resolution', verdict='ready')
+        path = self.directory / 'succession-receipt.json'
+        receipt = json.loads(path.read_text())
+        receipt['unexpected'] = 'invalid capsule'
+        path.write_bytes(context._encode(receipt))
+        with self.assertRaises(s.GateError):
+            s.validate_ready(self.directory, self.manifest, self.u['_sha256'], self.r['_sha256'], self.adapter)
 
     def test_strict_envelope_missing_api_and_no_raw_secret_in_receipt(self):
         with self.assertRaises(s.GateError):

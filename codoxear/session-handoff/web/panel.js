@@ -161,7 +161,7 @@
       details.after(button);
       const panel = el('section', '', { id: 'handoffPanel', 'aria-label': '会话接力' }); panel.hidden = true; bar.after(panel);
       const form = el('form'), source = el('p'); form.hidden = true;
-      const hint = el('p', '新 Pi 独立恢复 → 旧会话审阅 → 新会话核对一次后接续。仅支持 Pi，不迁移负责人。', { class: 'handoffHint' });
+      const hint = el('p', '新 Pi 独立恢复 → 旧会话审阅 → 新会话核对一次后接续。仅支持 Pi；既有负责人身份和关系自动由新会话继承，无负责人则不创建。', { class: 'handoffHint' });
       const label = el('label', '补充说明（可选，最多 1000 字）', { for: 'handoffNote' });
       const note = el('textarea', '', { id: 'handoffNote', rows: '2', maxlength: '1000' });
       const start = el('button', '确认接力', { type: 'submit' }), cancel = el('button', '取消', { type: 'button' });

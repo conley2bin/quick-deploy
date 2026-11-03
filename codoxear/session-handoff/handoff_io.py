@@ -30,6 +30,8 @@ def submit(manifest_path: Path, kind: str, body_file: Path, *, verdict=None,
     if unreviewed and kind != "resolution":
         raise context.ContextError("--unreviewed is only valid for resolution")
     body_file = Path(body_file).absolute()
+    if body_file.name.startswith("succession-"):
+        raise context.ContextError("protocol files cannot be body drafts")
     if (body_file.parent != operation_dir or body_file.name in
             {"manifest.json", "source-context.md", *(f"{k}.json" for k in context.KINDS)}):
         raise context.ContextError("body draft must be a separate file directly inside operation directory")
@@ -160,14 +162,27 @@ def main(argv=None):
     proof.add_argument('--manifest', required=True, type=Path)
     proof.add_argument('--kind', required=True, choices=('identity', 'custody'))
     proof.add_argument('--body-file', required=True, type=Path)
+    check = commands.add_parser('check-owner')
+    check.add_argument('--manifest', required=True, type=Path)
     args = parser.parse_args(argv)
     try:
+        if args.command == 'check-owner':
+            succession.require(args.manifest.is_absolute() and args.manifest.name == 'manifest.json')
+            directory = args.manifest.parent
+            with context._operation_dir(directory) as fd:
+                manifest = succession.read(fd, 'manifest.json')
+                intent = succession.read(fd, 'succession-intent.json')
+            result = succession.validate_ready(directory, manifest, intent['understanding_sha256'],
+                                               intent['review_sha256'], succession.Adapter())
+            succession.require(result['current_binding_valid'], 'succession_no_owner_authority')
+            print(context._encode({'current_binding_valid': True}).decode(), end='')
+            return 0
         if args.command == 'attest':
             artifact = attest(args.manifest, args.kind, args.body_file)
         else:
             artifact = submit(args.manifest, args.kind, args.body_file,
                               verdict=args.verdict, unreviewed=args.unreviewed)
-    except (context.ContextError, OSError) as exc:
+    except (context.ContextError, OSError, KeyError, TypeError, ValueError) as exc:
         print(context._encode({"error": "artifact_rejected", "message": str(exc) if isinstance(exc, succession.GateError) else '私有报告校验或发布失败'}).decode(),
               file=sys.stderr, end="")
         return 2

@@ -25,9 +25,10 @@ NAMESPACE = "__session_handoff__"
 MAX_BODY = 8192
 
 
-def install(app, host, *, state_root=None, timeouts=None):
+def install(app, host, *, state_root=None, timeouts=None, succession_service=None):
     """Only Python callers/tests can inject a root/deadline; HTTP cannot."""
-    engine = Engine(host.upstream_json, state_root=state_root, timeouts=timeouts)
+    engine = Engine(host.upstream_json, state_root=state_root, timeouts=timeouts,
+                    succession_service=succession_service)
     app[ENGINE_KEY] = engine
 
     async def lifecycle(_app):
@@ -80,7 +81,8 @@ def install(app, host, *, state_root=None, timeouts=None):
                 if set(data) != {"operation_id"}:
                     raise HandoffError("invalid_input", "请求仅接受操作标识", 400)
                 operation = (engine.continue_unreviewed(data["operation_id"], rows=rows, cookie=cookie)
-                             if action == "continue" else engine.status(data["operation_id"], rows=rows))
+                             if action == "continue" else await engine._offloop(
+                                 lambda: engine.status(data["operation_id"], rows=rows)))
             return host.json_response({"operation": operation})
         except HandoffError as exc:
             return host.json_response({"error": exc.code, "message": exc.message}, status=exc.status)

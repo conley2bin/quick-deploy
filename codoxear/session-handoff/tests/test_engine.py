@@ -9,6 +9,8 @@ import threading
 import types
 import unittest
 from uuid import uuid4
+from unittest.mock import patch
+from succession_mock import Service
 
 ROOT = Path(__file__).resolve().parents[1]
 PACKAGE = "_handoff_engine_tests"
@@ -47,6 +49,7 @@ class Clock:
 class Native:
     def __init__(self, root):
         self.root = root
+        self.service = Service()
         source_path = root / "source.jsonl"
         log(source_path, "source-header")
         self.source = {"session_id": "opaque/source", "thread_id": "filename-is-not-header",
@@ -82,6 +85,36 @@ class Native:
         path = directory / (kind + ".json")
         if path.exists():
             return
+        manifest_path = directory / 'manifest.json'
+        manifest = json.loads(manifest_path.read_text())
+        if 'succession' in manifest:
+            if kind == 'understanding':
+                proof_path = directory / 'succession-target.json'
+                if not proof_path.exists():
+                    return
+                proof = json.loads(proof_path.read_text())
+                source = json.loads((directory / 'succession-source.json').read_text())
+                report = dict(version=1, operation_id=op['id'], challenge=source['challenge'],
+                    pi_session_id=proof['pi_session_id'], session_file=proof['session_file'],
+                    intercom_id=None, contact_source='unavailable', unknown_reason='test has no Intercom runtime', source='current-session')
+                identity_path = directory / 'succession-identity.json'
+                if not identity_path.exists():
+                    identity_path.write_text(json.dumps(report))
+                    identity_path.chmod(0o600)
+            if kind == 'review':
+                custody_path = directory / 'succession-custody.json'
+                if not custody_path.exists():
+                    custody_path.write_text(json.dumps(dict(operation_id=op['id'],
+                        understanding_sha256=op['understanding_sha256'],
+                        custody=engine_module.succession.unknown_custody(op['source_header']['pi_session_id']))))
+                    custody_path.chmod(0o600)
+            if kind == 'resolution' and self.report_transform is None:
+                helper = __import__(PACKAGE + '.handoff_io', fromlist=['submit'])
+                body = directory / 'fake-body.md'
+                body.write_text('Verified current goal Y and next action.')
+                helper.submit(manifest_path, kind, body, verdict=self.resolution_verdict,
+                              unreviewed=op['review_sha256'] == 'unreviewed', service=self.service)
+                return
         data = {"version": 1, "operation_id": op["id"], "source_sha256": op["source_sha256"],
                 "body": "以当前目标 Y 为准；已核查文件，补回遗漏约束，不重复已否决方案。"}
         if kind in ("review", "resolution"):
@@ -154,7 +187,7 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
         self.root = Path(self.tmp.name)
         self.native = Native(self.root)
         self.clock = Clock()
-        self.engine = Engine(self.native, state_root=self.root / "state", clock=self.clock.now,
+        self.engine = Engine(self.native, succession_service=self.native.service, state_root=self.root / "state", clock=self.clock.now,
                              sleep=self.clock.sleep, timeouts={"poll": 1, "launch": 8, "understanding": 8,
                              "review": 8, "resolution": 8, "source_idle": 8}).open()
         self.native.engine = self.engine
@@ -260,7 +293,7 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.start(), first)
         self.assertEqual(len(self.native.mutations()), 1)
         await self.engine.close()
-        self.engine = Engine(self.native, state_root=self.engine.root).open()
+        self.engine = Engine(self.native, succession_service=self.native.service, state_root=self.engine.root).open()
         self.native.engine = self.engine
         self.assertEqual(self.engine.public(first)["status"], "creation_unknown")
         self.assertEqual(await self.start(), first)
@@ -321,7 +354,7 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
         first = await self.start()
         await self.finish()
         await self.engine.close()
-        self.engine = Engine(self.native, state_root=self.engine.root).open()
+        self.engine = Engine(self.native, succession_service=self.native.service, state_root=self.engine.root).open()
         self.native.engine = self.engine
         self.assertEqual(self.engine.public(first)["status"], "delivery_unknown")
         self.assertEqual(await self.start(), first)
@@ -339,7 +372,7 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
         self.native.op["status"] = "failed"
         self.engine._persist(self.native.op)
         await self.engine.close()
-        self.engine = Engine(self.native, state_root=self.engine.root).open()
+        self.engine = Engine(self.native, succession_service=self.native.service, state_root=self.engine.root).open()
         self.native.engine = self.engine
         self.assertEqual(self.engine.public(first)["status"], "delivery_unknown")
         self.assertEqual(await self.start(), first)
@@ -351,7 +384,7 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
         await self.finish()
         self.native.op["status"] = "revising"
         self.engine._persist(self.native.op)
-        second = Engine(self.native, state_root=self.engine.root).open()
+        second = Engine(self.native, succession_service=self.native.service, state_root=self.engine.root).open()
         try:
             self.assertEqual(second.public(first)["status"], "interrupted")
             self.native.artifact("resolution")
@@ -461,7 +494,7 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
                 newroot = self.root / str(uuid4())
                 newroot.mkdir()
                 self.native = Native(newroot)
-                self.engine = Engine(self.native, state_root=newroot / "state", clock=self.clock.now,
+                self.engine = Engine(self.native, succession_service=self.native.service, state_root=newroot / "state", clock=self.clock.now,
                                      sleep=self.clock.sleep, timeouts={"poll": 1}).open()
                 self.native.engine = self.engine
 
@@ -615,7 +648,7 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.start(requests[0]), ids[0])
         await self.finish()
         self.assertEqual(len(self.native.mutations()), 4)
-        second = Engine(self.native, state_root=self.engine.root).open()
+        second = Engine(self.native, succession_service=self.native.service, state_root=self.engine.root).open()
         self.assertEqual(second.requests[requests[-1]], ids[0])
         await second.close()
 
@@ -650,7 +683,7 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all(t.done() for t in tasks))
         self.assertEqual(self.engine.public(operation_id)["status"], "interrupted")
         count = len(self.native.mutations())
-        second = Engine(self.native, state_root=self.engine.root).open()
+        second = Engine(self.native, succession_service=self.native.service, state_root=self.engine.root).open()
         self.assertEqual(second.public(operation_id)["status"], "interrupted")
         self.assertFalse(second.tasks)
         self.assertEqual(count, len(self.native.mutations()))
@@ -662,7 +695,7 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
         op = self.native.op
         op["status"] = "reviewing"
         self.engine._persist(op)
-        second = Engine(self.native, state_root=self.engine.root).open()
+        second = Engine(self.native, succession_service=self.native.service, state_root=self.engine.root).open()
         self.assertEqual(second.public(operation_id)["status"], "interrupted")
         for path in self.engine.root.rglob("*"):
             mode = path.stat().st_mode & 0o777
@@ -683,9 +716,78 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(raised.exception.status, 422)
         self.assertEqual(self.native.mutations(), [])
 
+    async def test_missing_or_invalid_service_fails_before_native_create(self):
+        self.engine.succession = engine_module.succession.Adapter(object())
+        await self.start()
+        result = await self.finish()
+        self.assertEqual(result['status'], 'failed')
+        self.assertEqual(result['error_code'], 'succession_api_invalid')
+        self.assertEqual(self.native.mutations(), [])
+
+    async def test_absent_installed_api_blocks_before_create_without_reading_registry(self):
+        self.engine.succession = engine_module.succession.Adapter()
+        with patch.object(engine_module.succession.importlib.util, 'spec_from_file_location',
+                          side_effect=FileNotFoundError('installed API absent')):
+            await self.start()
+            result = await self.finish()
+        self.assertEqual(result['error_code'], 'succession_api_unavailable')
+        self.assertEqual(self.native.mutations(), [])
+
+    async def test_prepare_before_create_and_exact_intent_before_continuation(self):
+        previous = self.native.__call__
+        async def inspect(method, path, **kwargs):
+            if method == 'POST' and path == '/api/sessions':
+                self.assertEqual(self.native.service.calls, ['prepare'])
+                self.assertTrue((self.engine.root / self.native.op['id'] / 'succession-source.json').exists())
+            if method == 'POST' and path.endswith('opaque%2Ftarget/send'):
+                frozen = self.engine.root / self.native.op['id'] / 'succession-intent.json'
+                self.assertTrue(frozen.exists())
+                self.assertEqual(self.native.service.events, 0)
+            return await previous(method, path, **kwargs)
+        self.engine.upstream_json = inspect
+        await self.start()
+        self.assertEqual((await self.finish())['status'], 'ready')
+        self.assertEqual(self.native.service.events, 1)
+        self.assertEqual(self.native.service.calls, ['prepare', 'prepare', 'commit', 'get'])
+
+    async def test_forged_ready_file_without_registry_gate_never_ready(self):
+        self.native.report_transform = lambda kind, data: data
+        await self.start()
+        result = await self.finish()
+        self.assertEqual(result['status'], 'delivery_unknown')
+        self.assertNotEqual(result.get('error_code'), None)
+        self.assertEqual(self.native.service.events, 0)
+
+    async def test_no_owner_normal_engine_still_checks_absence(self):
+        self.native.service.owner = None
+        await self.start()
+        self.assertEqual((await self.finish())['status'], 'ready')
+        self.assertEqual(self.native.service.events, 0)
+        self.assertEqual(self.native.service.revision, 7)
+        self.assertEqual(self.native.service.calls, ['prepare', 'prepare', 'commit', 'get'])
+
+    async def test_old_manifest_remains_context_only_without_api(self):
+        prepare = self.engine._prepare
+        def legacy(*args):
+            manifest = prepare(*args)
+            manifest.pop('succession')
+            path = self.engine.root / manifest['operation_id'] / 'manifest.json'
+            path.write_text(json.dumps(manifest))
+            return manifest
+        self.engine._prepare = legacy
+        self.native.emit_resolution = False
+        first = await self.start()
+        await self.finish()
+        self.native.artifact('resolution')  # exact legacy envelope, no registry side effects
+        self.engine.succession = engine_module.succession.Adapter(object())
+        result = self.engine.status(first, rows=await self.engine.sessions('fresh'))
+        self.assertEqual(result['status'], 'ready')
+        self.assertEqual(self.native.service.calls, ['prepare'])
+        self.assertEqual(self.native.service.events, 0)
+
     async def test_nonfinite_deadline_rejected(self):
         with self.assertRaises(ValueError):
-            Engine(self.native, state_root=self.root / "other", timeouts={"review": float("inf")})
+            Engine(self.native, succession_service=self.native.service, state_root=self.root / "other", timeouts={"review": float("inf")})
 
 
 if __name__ == "__main__":

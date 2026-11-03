@@ -76,7 +76,7 @@ class NamingEngineTests(unittest.IsolatedAsyncioTestCase):
         for restart in (False, True):
             if restart:
                 await self.engine.close()
-                self.engine = Engine(self.native, state_root=self.engine.root).open()
+                self.engine = Engine(self.native, succession_service=self.native.service, state_root=self.engine.root).open()
                 self.native.engine = self.engine
             self.assertEqual(await self.start(), first)
             rows = await self.engine.sessions("fresh")
@@ -102,7 +102,7 @@ class NamingEngineTests(unittest.IsolatedAsyncioTestCase):
         await self.engine.close()
         self.assertEqual(self.native.op["status"], "interrupted")
         before = list(self.native.mutations())
-        self.engine = Engine(self.native, state_root=self.engine.root).open()
+        self.engine = Engine(self.native, succession_service=self.native.service, state_root=self.engine.root).open()
         self.native.engine = self.engine
         self.assertEqual(await self.start(), first)
         self.assertEqual(self.native.op["target_display_name"], "frozen_10")

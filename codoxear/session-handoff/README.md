@@ -1,15 +1,15 @@
 # Pi 会话接力
 
-此扩展由共享 `web-host` 显式加载，与 `owner-groups` 并列，不修改 Codoxear 上游、Pi 全局提示词或负责人登记。仅支持 Pi；Codex/其他后端返回明确的 422。
+此扩展由共享 `web-host` 显式加载，与 `owner-groups` 并列，不修改 Codoxear 上游或 Pi 全局提示词；负责人接续只调用固定 canonical service，不直接写登记文件。仅支持 Pi；Codex/其他后端返回明确的 422。
 
 ## 用户流程
 
 在当前原生会话页面选择接力后，新建一个 **新的 tmux Pi 会话**，继承源会话已明确的 cwd、model_provider、model 和 reasoning_effort。恢复提示作为原生创建请求的唯一 `args` 字符串传入；不克隆旧 argv，不 resume，不改变提供商。
 
-1. 记录源日志的真实 Pi header、完整 JSONL 截止边界及哈希。投影是 `latest_committed`，并不声称知道 Pi 尚未持久化的树游标。
+1. 创建前在应用拥有的线程内调用固定 installed succession API，冻结源实际 Pi 的只读 owner plan；服务缺失或无效则零原生变更失败。记录源日志的真实 Pi header、完整 JSONL 截止边界及哈希。投影是 `latest_committed`，并不声称知道 Pi 尚未持久化的树游标。
 2. 新会话独立阅读历史、当前文件及项目记忆，提交理解报告；在收到审阅输入前不推进任务。
 3. 原会话空闲且身份仍一致时，收到一次仅审阅消息；它提交针对该报告的审阅，之后仍只担任审阅者。
-4. 新会话收到一次意见，按当前证据核对/纠正。提交 `ready` 回执后正常继续；无法消除的目标分歧提交 `conflict` 并停下等待用户。不再发起第二轮互审。
+4. 新会话收到一次意见，按当前证据核对/纠正。`ready` helper 先确认登记 receipt 的当前绑定/无 owner 条件，再发布不可覆盖回执并返回成功，之后才正常继续；无法消除的目标分歧提交 `conflict` 并停下等待用户。不再发起第二轮互审。
 
 ### 新窗口名称
 
@@ -49,6 +49,43 @@
 日志快照和投影在应用拥有的线程任务中处理，避免大日志阻塞共享 HTTP 事件循环；关闭时也会等待该任务结束。状态和内存 manifest 均不保留原始 entries。
 
 默认有限等待：原生请求 30 秒、启动身份 120 秒、理解报告 900 秒、源/目标空闲 300 秒、审阅 600 秒、接续回执 900 秒。轮询间隔 0.5 秒只用于观察条件，不是固定启动 settle sleep。Python 测试可以注入状态目录、时钟、sleep、原生 transport 和 deadlines，HTTP 不能更改它们。
+
+
+## 自动负责人接续（未来新操作）
+
+源会话有唯一既有 owner 时，新 Pi 继承**同一稳定 owner UUID**，由 canonical service 条件更新 identity/recovery；保留提交时最新上级、下级、assignment、依赖，不制造 assignment handover。无 owner 时也必须通过 fresh absence check，返回 `not_applicable/no_owner_valid`，不任命、不增加登记 revision。历史 manifest 无 `succession` 字段仍按旧 context-only 协议运行，不追溯迁移。
+
+`succession.py` 只加载 `~/.pi/agent/skills/responsibility-registry/scripts/session_succession.py` 的四个 frozen v1 函数：`prepare_owner_session_succession`、`build_intent_digest`、`commit_owner_session_succession`、`get_owner_session_succession`。无 runtime path/Store/browser owner/authority 参数，无 stub、读缓存替代或静默降级。验证函数签名、精确 envelope/plan/receipt/error；摘要由 service 计算。Python 测试可显式注入 service double，HTTP 不能。
+
+### 私有协议和放行顺序
+
+所有文件位于本操作 0700 目录，0600、不可覆盖发布，除 `state.json` 外均不修改：
+
+| 文件 | 内容 / 生产者 |
+| --- | --- |
+| `succession-source.json` | host 在 native create 前冻结 source plan、随机 challenge、本次按钮同意及窄功能授权 attestation；不从 note/history 导入授权 |
+| manifest `succession` | version=1、source capsule SHA256、challenge SHA256；新增协议标记，不改变旧 manifest |
+| `succession-target.json` | host 精确绑定 route/launch/nonce 后记录实际 Pi header ID、首行 hash、file/device/inode/cwd；不按名字/文件名猜身份 |
+| `succession-identity.json` | target 用 `attest --kind identity` 提交实际 current-session Pi/file + challenge；实际 connected Intercom status 才能提供联系 ID，否则 null + 实际原因 |
+| `succession-custody.json` | old 用 `attest --kind custody` 报告实际子代理 custody，关联 operation/understanding hash；known_active/none_verified/unknown，不自动 reparent |
+| `succession-intent.json` | host 在 continuation 前冻结源 immutable plan + exact target/authority/custody、报告 hash、service digest；token/revision 不是 digest 输入 |
+| `succession-attempt.json` | helper 在首次可能有副作用的 commit 前持久化 operation/digest，后续任何不确定结果必须 get-first |
+| `succession-receipt.json` | canonical service 初次有效 envelope；不含原 challenge 或私有关系图；恢复与 host 核验仍 fresh get |
+| `succession.lock` | 本地 helper `flock`，把 resolution 存在检查、canonical gate 和原子 no-overwrite 发布串行化 |
+
+`attest` 输入只能是本操作内 `*-draft.json`，精确 JSON 字段见 `prompts.py` 与 `tests/test_succession.py`。这些是 cooperative provenance：host 的 header/transport 事实与 target 自报交叉核对，不是对恶意同 UID 文件控制者的密码学认证。无法调用实际 Intercom status 时只缺联系 ID，不阻断已证明的真实 Pi。旧会话审阅不能伪称子代理为空；显式未校对路线固定记录 unknown，后续不能执行依赖未解决 custody 转移的动作。
+
+ready helper 的执行顺序是：验证原报告链/host target/challenged identity/immutable intent → fresh prepare 且 immutable plan 完全相同 → canonical commit → `committed|already_committed + current_binding_valid` 或 `not_applicable + no_owner_valid` → 本地 ready 发布 → CLI 0 → 任务动作。`conflict` resolution 不 commit。`needs_recovery/superseded/not_found`、reset/rebind/occupied target、服务异常或无效 capsule 都不放行。
+
+只有明确 `document_conflict`、retryable=true、commit_state=not_committed 才允许同操作/同 digest 下再 prepare 一次并重试；不改 immutable plan/target。任何 unknown 都保留 attempt，下一次只 get 原 operation/digest，`not_found` 不是“没提交”的证明。登记 commit 与 ready 是两个资源：commit 后发布失败，目标仍须停止；同 intent fresh get 仍有效才能恢复本地发布，不产生第二登记事件。已经存在 resolution 时，重复 CLI 在服务副作用前拒绝，不算新许可。不承诺任意外部工作 exactly-once。
+
+Engine 看到 ready 文件还会核验私有 capsule 和 fresh canonical get；不能靠单个文件或事后迁移宣称 ready。旧会话只审阅/保管旧子代理并转送真实结果，登记绑定改变后不再是当前 owner。新会话以 owner 身份动作前须核对自己实际 Pi，并运行固定 helper `check-owner --manifest ...` 重新 get 当前有效绑定；旧 receipt 在后续接力/reset 后不会继续授予 owner 身份。此限制依赖合作代理遵守，不能拦截任意同 UID 脚本。
+
+### 验证证据边界
+
+`tests/succession_mock.py` 是精确 v1 API 的隔离 double，绝不加载真实 registry。helper 的 temporal tests 覆盖 commit→ready→真实 CLI main 返回码→toy action、并发一次许可、unknown/get-first、commit+publish 失败恢复、superseded/reset/occupied/needs_recovery、无 owner revision 不变、token 刷新 digest 不变、身份/contact/null/custody 和 capsule 破坏。Engine fake native 与 HTTP tests 显式注入 double；缺安装 API 在 native create 前失败。
+
+这些证明是 **handoff 调用契约与本地顺序**，不是实际 Store 迁移或真实 LLM/Pi 执行证据。安装服务由 registry peer 提供；还需在其精确 commit 上运行真实 temporary Store 集成（同 UUID、最新图保留、一次真实审计事件、current/audit 和 reader 共存）。不得使用真实 owner 做 fixture，不在此组件部署/安装/修改 registry。
 
 ## 验证边界
 

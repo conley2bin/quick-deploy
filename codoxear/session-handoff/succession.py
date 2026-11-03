@@ -14,6 +14,9 @@ import os
 from pathlib import Path
 import secrets
 import sys
+import threading
+
+_LOAD_LOCK = threading.RLock()
 
 if __package__:
     from . import context
@@ -97,12 +100,17 @@ class Adapter:
         self.service = service
 
     def load(self):
+        with _LOAD_LOCK:
+            return self._load()
+
+    def _load(self):
         if self.service is not None:
             return self.service
         path = Path.home() / '.pi/agent/skills/responsibility-registry/scripts/session_succession.py'
         try:
             spec = importlib.util.spec_from_file_location('_codoxear_registry_succession_v1', path)
             module = importlib.util.module_from_spec(spec)
+            sys.modules[spec.name] = module
             # The installed stdlib service may import its canonical sibling modules.
             sys.path.insert(0, str(path.parent))
             try:
@@ -127,6 +135,8 @@ class Adapter:
                 function = getattr(service, name)
                 require(callable(function), 'succession_api_invalid')
                 inspect.signature(function).bind(*args, **kwargs)
+                if name != 'build_intent_digest':
+                    inspect.signature(function).bind(*args, **kwargs, store=None)
         except (AttributeError, TypeError, ValueError):
             raise GateError('succession_api_invalid') from None
         return service
@@ -148,6 +158,9 @@ class Adapter:
             raise
         except Exception:
             raise GateError('succession_outcome_unknown') from None
+        return self.validate_response(name, op, value, digest=digest)
+
+    def validate_response(self, name, op, value, *, digest=None):
         keys(value, ENVELOPE)
         require(value['schema'] == SCHEMA and value['operation_id'] == op)
         status = value['status']
@@ -159,6 +172,8 @@ class Adapter:
         require((value['plan'] is not None) == (status == 'prepared'))
         if status == 'prepared':
             validate_plan(value['plan'], op)
+        require((value['receipt'] is not None) == (status in ('committed', 'already_committed', 'not_applicable', 'superseded')
+                    or (status == 'needs_recovery' and value['receipt'] is not None)))
         if value['receipt'] is not None:
             receipt = value['receipt']
             keys(receipt, RECEIPT)
@@ -247,6 +262,12 @@ def check_source(fd, manifest):
     keys(marker, ('version', 'source_sha256', 'challenge_sha256'))
     require(marker['version'] == 1)
     source = read(fd, 'succession-source.json')
+    keys(source, ('version', 'operation_id', 'plan', 'challenge', 'authority'))
+    keys(source['authority'], ('issuer', 'reason', 'evidence'))
+    require(source['version'] == 1 and source['authority']['issuer'] == 'user')
+    text(source['authority']['reason'])
+    text(source['authority']['evidence'])
+    text(source['challenge'])
     require(hashlib.sha256(context._encode(source)).hexdigest() == marker['source_sha256'])
     require(source['operation_id'] == manifest['operation_id'])
     require(hashlib.sha256(source['challenge'].encode()).hexdigest() == marker['challenge_sha256'])
@@ -288,6 +309,9 @@ def bind_target(directory, manifest, row, identity):
 def check_target(fd, manifest, *, report=None):
     source = check_source(fd, manifest)
     proof = read(fd, 'succession-target.json')
+    keys(proof, ('version', 'operation_id', 'pi_session_id', 'session_file', 'cwd', 'broker_session_id',
+                 'launch_binding', 'session_header_sha256', 'device', 'inode', 'challenge_sha256'))
+    require(type(proof['version']) is int and proof['version'] == 1)
     if report is None:
         report = read(fd, 'succession-identity.json')
     keys(report, ('version', 'operation_id', 'challenge', 'pi_session_id', 'session_file',
@@ -366,6 +390,13 @@ def validate_intent(fd, manifest, understanding_sha256, review_sha256, adapter):
         launch_binding=proof['launch_binding'], session_header_sha256=proof['session_header_sha256'],
         verification_source='codoxear-bound-target/header+challenged-report-v1', contact_source=report['contact_source']))
     validate_custody(intent['custody'], manifest['source']['pi_session_id'])
+    if review_sha256 == 'unreviewed':
+        require(intent['custody'] == unknown_custody(manifest['source']['pi_session_id']))
+    else:
+        custody = read(fd, 'succession-custody.json')
+        keys(custody, ('operation_id', 'understanding_sha256', 'custody'))
+        require(custody['operation_id'] == manifest['operation_id'] and custody['understanding_sha256'] == understanding_sha256)
+        require(intent['custody'] == custody['custody'])
     require(adapter.digest(intent['plan'], intent['target'], intent['authority'], intent['custody']) == intent['intent_digest'], 'succession_digest_changed')
     return intent
 
@@ -411,7 +442,11 @@ def gate(fd, manifest, understanding_sha256, review_sha256, adapter):
         permission(result, intent)
     # Store only the service envelope, never raw challenge or private graph.
     # Immutable initial receipt remains evidence; recovery always calls fresh get.
-    freeze(fd, 'succession-receipt.json', read(fd, 'succession-receipt.json', missing=True) or result)
+    stored = read(fd, 'succession-receipt.json', missing=True)
+    if stored is not None:
+        adapter.validate_response('commit_owner_session_succession', op, stored, digest=digest)
+        permission(stored, intent)
+    freeze(fd, 'succession-receipt.json', stored or result)
     return result
 
 
@@ -419,6 +454,7 @@ def validate_ready(directory, manifest, understanding_sha256, review_sha256, ada
     with context._operation_dir(directory) as fd:
         intent = validate_intent(fd, manifest, understanding_sha256, review_sha256, adapter)
         stored = read(fd, 'succession-receipt.json')
+        adapter.validate_response('commit_owner_session_succession', intent['operation_id'], stored, digest=intent['intent_digest'])
         permission(stored, intent)
         result = adapter.get(intent['operation_id'], intent['intent_digest'])
         permission(result, intent)

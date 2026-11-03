@@ -50,7 +50,7 @@ class FeatureTests(unittest.IsolatedAsyncioTestCase):
         # Frontend owns these files. Exercise the install contract without writing
         # placeholder sibling modules/assets into this lane's worktree.
         with patch.object(Path, "read_bytes", return_value=b"/* frozen frontend fixture */"):
-            self.engine = feature.install(self.app, self.host, state_root=self.root / "state",
+            self.engine = feature.install(self.app, self.host, state_root=self.root / "state", succession_service=self.native.service,
                                           timeouts={"poll": 1, "launch": 8, "understanding": 8,
                                                     "review": 8, "resolution": 8, "source_idle": 8})
         self.clock = Clock()

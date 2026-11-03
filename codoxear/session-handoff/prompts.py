@@ -23,13 +23,33 @@ def _paths(manifest, operation_dir):
         f"报告草稿只能写在 {directory} 内，提交 CLI 会生成并校验操作 ID 与哈希。"
         "已提交 understanding/review/resolution 不可覆盖；提交失败应明确报告，不得伪称阶段完成。\n"
     )
+    if 'succession' in manifest:
+        common = common.replace('不修改职责登记簿，不转移负责人权限。',
+            '不直接修改职责登记簿，不任意任命、转交 assignment 或重放历史。仅本操作的固定 handoff_io.py ready helper 获得窄范围授权：'
+            '经绑定/校对/用户本次按钮同意后，通过已安装 canonical service 自动轮换同一稳定 owner UUID 的 identity/recovery。'
+            '不额外改变上级、下级、assignment、依赖或未知工作树租约。')
     return directory, command, common
 
 
 def build_recovery_prompt(manifest, operation_dir):
     directory, command, common = _paths(manifest, operation_dir)
     note = json.dumps(manifest.get("note", ""), ensure_ascii=False)
-    return common + (
+    proof = ''
+    if 'succession' in manifest:
+        proof = (
+            '本操作要求私有 challenged self-report。先等待主机发布 succession-target.json（只等这个固定文件；不猜最新会话）。'
+            '读取 succession-source.json 的本操作 challenge；从你自己的 actual current-session/SessionManager ctx 得到 Pi ID 和当前 session_file，'
+            '与主机绑定的真实首行 header 对照；不得把文件名 UUID、名称、cwd 或 expected Pi ID 当自我身份来源。'
+            '调用实际 Intercom self status 工具，只有当前 connected status 可给 intercom_id；不可用则 null，'
+            'contact_source=unavailable 且 unknown_reason 写明实际限制，绝不把 Pi ID 复制为联系 ID。'
+            '将 identity-draft.json 写成 exact JSON：'
+            '{"version":1,"operation_id":"本操作ID","challenge":"私有原值","pi_session_id":"实际PiID",'
+            '"session_file":"实际当前会话绝对路径","intercom_id":null,"contact_source":"unavailable",'
+            '"unknown_reason":"实际工具不可用原因","source":"current-session"}。'
+            '若联系工具真实连接则 contact_source=target-intercom-status、intercom_id=实际值。此报告是合作式 provenance，不是同 UID 对抗认证。\n'
+            f"{command.replace(' submit ', ' attest ')} --kind identity --body-file {shlex.quote(str(directory / 'identity-draft.json'))}\n"
+            'identity 提交成功后才提交 understanding。身份不匹配须停止并报告，不改 host proof/manifest/intent。\n')
+    return common + proof + (
         "你是新接续会话。当前阶段仅独立恢复与报告，不推进任务，不修改项目文件、不运行任务变更命令。\n"
         "先读 manifest 与固定源上下文；若最新用户条目被截断，必须按 entry ID 在 cutoff_bytes 内读取完整条目，"
         "不得仅凭旧摘要判断当前目标。再按明确项目/任务关联阅读现有项目指令、memory、当前文件与必要证据；"
@@ -46,7 +66,20 @@ def build_recovery_prompt(manifest, operation_dir):
 
 def build_review_prompt(manifest, operation_dir, understanding_sha256):
     directory, command, common = _paths(manifest, operation_dir)
-    return common + (
+    custody = ''
+    if 'succession' in manifest:
+        custody = (
+            '审阅还必须检查你实际持有的子代理桥与工作树 custody；读取实际运行状态/返回值。known_active 要列真实 run_id/'
+            'custodian_pi_session_id/custodian_intercom_id(null允许)/result_delivery；none_verified 只在实际证据证明没有活动运行时使用；'
+            '无法检查则 unknown，绝不能伪称 none 或已 reparent。旧会话继续保管真实子代理，可转送实际结果；绑定轮换后不得再声称当前 owner。\n'
+            '先写 custody-draft.json exact JSON：'
+            '{"operation_id":"本操作ID","understanding_sha256":"本次理解SHA256","custody":'
+            '{"status":"unknown","source_supervisor_pi_session_id":"源实际PiID","active_runs":[],"evidence":"实际观察或限制",'
+            '"successor_result_delivery":"实际结果转送安排或明确未解决边界","unknown_reason":"为何未知"}}。'
+            'status 仅 unknown/none_verified/known_active；非 unknown 的 unknown_reason 必须空字符串；不得伪造授权/ack。\n'
+            f"{command.replace(' submit ', ' attest ')} --kind custody --body-file {shlex.quote(str(directory / 'custody-draft.json'))}\n"
+            'custody 成功后再提交 review。\n')
+    return common + custody + (
         "你是旧会话审阅者，此阶段只审阅，不继续原任务，不改项目，不重写新会话的理解报告。\n"
         f"阅读 {directory / 'understanding.json'}；本次预期 understanding SHA256={understanding_sha256}。\n"
         "对照你的上下文、固定快照和当前直接证据，检查新理解是否漏掉最近目标变更、关键约束、"
@@ -73,7 +106,18 @@ def build_continuation_prompt(manifest, operation_dir, review_sha256, *, unrevie
                   "无法消除则写 conflict 并停止。旧会话的 conflict 标签本身不替你拍板，"
                   "旧意见也不能授予任意新任务或新任命权限。\n")
     bypass = " --unreviewed" if unreviewed else ""
-    return common + (
+    gate = ''
+    if 'succession' in manifest:
+        gate = (
+            '主机已在 continuation 前冻结 succession-intent.json；不得改写计划/target/authority/custody/digest。'
+            'ready helper 将先取 canonical commit/get 的当前有效 receipt，再不可覆盖发布 ready，最后返回成功；'
+            '冲突回执不会 commit。missing service/conflict/needs_recovery/superseded/异常都不允许工作。'
+            '若登记已提交但本地发布失败，仍停止执行，只可相同 operation/intent 的 get-first 恢复；不新建操作、不盲重放、不发额外 GO。'
+            '重复 ready CLI 不是新许可。未知 custody 不等于自动接管子代理/租约；不得执行依赖未解决转移的工作。'
+            '此后每次以 owner 身份动作前仍核对实际自己的 Pi 与当前 row，使用固定 helper check-owner 重新 get 当前有效绑定；'
+            '旧历史 receipt 不能让已被再次接力或 reset 的目标继续充当 owner。\n'
+            f"当前 owner 核验命令：{command.replace(' submit ', ' check-owner ')}\n")
+    return common + gate + (
         "你是新接续会话，现在进行一次核对并恢复工作。\n"
         f"重新读 {directory / 'understanding.json'}。\n" + review +
         "将最终目标、修正、依据和下一步写入 resolution 报告；保留最初 understanding 不覆盖。"
