@@ -3,18 +3,20 @@
 Only explicit history/checkpoint operations walk the previous chain. Ordinary IO
 is direct-addressed and bounded by one pending and one latest terminal attempt.
 """
+from datetime import datetime
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 import stat
 import tempfile
 import uuid
 
 if __package__:
-    from .registry_document import RegistryError, parse_json, require
+    from .registry_document import RegistryError, parse_json, require, keys, text, validate_event, validate_time
 else:
-    from registry_document import RegistryError, parse_json, require
+    from registry_document import RegistryError, parse_json, require, keys, text, validate_event, validate_time
 
 
 class AuditDamaged(RegistryError):
@@ -147,6 +149,9 @@ class AuditStorage:
         return self.ops / (identifier(op) + '.outcome.json')
 
     def validate_prepare(self, value, op=None):
+        keys(value, ['schema', 'op_id', 'operation_id', 'intent_digest', 'intent', 'previous', 'at',
+                     'actor', 'authority', 'action', 'reason', 'disposition', 'base', 'after', 'event',
+                     'continuity', 'references', 'result'])
         require(value.get('schema') == 1, 'invalid prepare schema')
         identifier(value.get('op_id'))
         require(op is None or value['op_id'] == op, 'prepare operation mismatch')
@@ -154,13 +159,50 @@ class AuditStorage:
         require(isinstance(value.get('intent_digest'), str) and value['intent_digest'], 'missing intent digest')
         for field in ('base', 'after', 'continuity', 'references'):
             require(isinstance(value.get(field), dict), 'invalid prepare ' + field)
+        require(isinstance(value['intent'], dict), 'invalid frozen intent')
+        keys(value['continuity'], ['kind', 'previous_committed_sha256'])
+        require(value['continuity']['kind'] in ('managed_match', 'unmanaged_change_observed', 'unanchored'), 'invalid continuity classification')
+        previous_commit = value['continuity']['previous_committed_sha256']
+        require(previous_commit is None or (isinstance(previous_commit, str) and re.fullmatch('[0-9a-f]{64}', previous_commit)), 'invalid continuity hash')
+        for field in ('at', 'actor', 'action', 'reason'):
+            text(value[field], 'prepare.' + field)
+        require(value['authority'] is None or isinstance(value['authority'], str), 'invalid authority')
+        require(datetime.fromisoformat(value['at'].replace('Z', '+00:00')).utcoffset() is not None, 'prepare time requires timezone')
+        previous = value['previous']
+        if previous is not None:
+            keys(previous, ['op_id', 'prepare_sha256', 'outcome_sha256'])
+            identifier(previous['op_id'])
+            for field in ('prepare_sha256', 'outcome_sha256'):
+                require(isinstance(previous[field], str) and re.fullmatch('[0-9a-f]{64}', previous[field]), 'invalid previous evidence hash')
         for side in ('base', 'after'):
-            require(isinstance(value[side].get('document_sha256'), str) and len(value[side]['document_sha256']) == 64, 'invalid document hash')
+            point = value[side]
+            keys(point, ['era', 'revision', 'document_sha256', 'audit_head'] + (['document_token'] if side == 'base' else []))
+            text(point['era'], side + '.era')
+            require(type(point['revision']) is int and point['revision'] >= 0, 'invalid evidence revision')
+            require(isinstance(point['document_sha256'], str) and re.fullmatch('[0-9a-f]{64}', point['document_sha256']), 'invalid document hash')
+            if point['audit_head'] is not None:
+                identifier(point['audit_head'])
+        text(value['base']['document_token'], 'base document token')
+        if value['event'] is not None:
+            validate_event(value['event'], value['after']['revision'])
         require(value.get('disposition') in ('publication', 'noop'), 'invalid prepare disposition')
+        if value['disposition'] == 'noop':
+            require(value['event'] is None and value['after'] == {key: field for key, field in value['base'].items() if key != 'document_token'}, 'noop cannot change current')
+        else:
+            require(value['after']['audit_head'] == value['op_id'], 'publication must carry operation metadata')
         require(isinstance(value.get('result'), dict), 'invalid business result')
         return value
 
     def validate_outcome(self, value, prepare):
+        keys(value, ['schema', 'op_id', 'intent_digest', 'prepare_sha256', 'status', 'basis', 'recorded_at',
+                     'observed', 'document_token_after', 'commit'])
+        text(value['basis'], 'outcome basis')
+        require(datetime.fromisoformat(value['recorded_at'].replace('Z', '+00:00')).utcoffset() is not None, 'outcome time requires timezone')
+        keys(value['observed'], ['document_sha256', 'era', 'revision', 'current_valid'])
+        require(type(value['observed']['current_valid']) is bool, 'invalid current observation')
+        observed_hash = value['observed']['document_sha256']
+        require(observed_hash is None or (isinstance(observed_hash, str) and re.fullmatch('[0-9a-f]{64}', observed_hash)), 'invalid observed hash')
+        require(value['document_token_after'] is None or isinstance(value['document_token_after'], str), 'invalid observed token')
         require(value.get('schema') == 1 and value.get('op_id') == prepare['op_id'], 'outcome operation mismatch')
         require(value.get('intent_digest') == prepare['intent_digest'] and value.get('prepare_sha256') == sha(encoded(prepare)), 'outcome prepare hash mismatch')
         require(value.get('status') in ('COMMITTED', 'NOT_APPLICABLE', 'ABORTED', 'PUBLICATION_UNKNOWN'), 'invalid outcome status')
@@ -168,11 +210,13 @@ class AuditStorage:
             'era': prepare['after']['era'], 'revision': prepare['after']['revision'],
             'after_sha256': prepare['after']['document_sha256']}, 'invalid committed evidence')
         require(value.get('status') != 'NOT_APPLICABLE' or prepare['disposition'] == 'noop', 'invalid noop receipt')
+        require(value['status'] == 'COMMITTED' or value['commit'] is None, 'noncommit cannot carry committed authority')
         return value
 
     def pending(self):
         value = self.read(self.pending_path, optional=True)
         if value is not None:
+            keys(value, ['schema', 'op_id', 'prepare_sha256', 'prepare'])
             require(value.get('schema') == 1, 'invalid pending schema')
             self.validate_prepare(value.get('prepare', {}), value.get('op_id'))
             require(value.get('prepare_sha256') == sha(encoded(value['prepare'])), 'pending prepare hash mismatch')
@@ -192,11 +236,17 @@ class AuditStorage:
         head = self.read(self.head_path, optional=True)
         if head is None:
             return None
+        keys(head, ['schema', 'op_id', 'prepare_sha256', 'outcome_sha256', 'last_committed'])
         require(head.get('schema') == 1, 'invalid head schema')
         prepare, outcome = self.lookup(identifier(head.get('op_id')))
         require(prepare is not None and outcome is not None, 'head references incomplete attempt')
         require(head.get('prepare_sha256') == sha(encoded(prepare)) and head.get('outcome_sha256') == sha(encoded(outcome)), 'head object hash mismatch')
         last = head.get('last_committed')
+        if outcome['status'] == 'COMMITTED':
+            require(last == dict(op_id=head['op_id'], **outcome['commit']), 'head lost latest committed pointer')
+        else:
+            expected = prepare['continuity']['previous_committed_sha256']
+            require((last is None and expected is None) or (isinstance(last, dict) and last.get('after_sha256') == expected), 'head lost prior committed pointer')
         if last is not None:
             identifier(last.get('op_id'))
             require(set(last) == {'op_id', 'after_sha256', 'era', 'revision'}, 'invalid last committed pointer')

@@ -63,6 +63,58 @@ class SplitStoreTests(unittest.TestCase):
         self.assertEqual(self.store.current_snapshot(), snapshot)
         self.assertEqual(self.commit(change=lambda *_: self.fail('replayed noop'))['outcome']['status'], 'NOT_APPLICABLE')
 
+    def test_missing_root_or_lock_has_typed_read_only_unavailable_errors(self):
+        for condition in ('missing-root', 'missing-lock', 'root-permissions', 'symlink-lock'):
+            with self.subTest(condition=condition), tempfile.TemporaryDirectory() as directory:
+                base = Path(directory)
+                root, document = base / 'private', base / 'current.md'
+                document.write_text(codec.serialize_current_document(registry.current_fields(registry.empty()), codec.TEMPLATE_ERA))
+                if condition != 'missing-root':
+                    root.mkdir(mode=0o700)
+                if condition == 'root-permissions':
+                    root.chmod(0o755)
+                if condition == 'symlink-lock':
+                    target = base / 'sentinel'
+                    target.write_bytes(b'unchanged lock target')
+                    target.chmod(0o600)
+                    (root / 'registry.lock').symlink_to(target)
+                store = registry.Store(root, document)
+                calls = (
+                    ('snapshot', store.current_snapshot),
+                    ('status', lambda: store.operation_status('op', 'digest')),
+                    ('transact', lambda: store.transact_current('op', 'digest', {}, 'token', lambda *_: self.fail('callback before lock'),
+                        action='test', actor='user', reason='test', authority='test')))
+                raw = document.read_bytes()
+                for name, call in calls:
+                    with self.subTest(entry=name), self.assertRaises(registry.RegistryTransactionError) as failure:
+                        call()
+                    self.assertEqual(failure.exception.code, 'registry_unavailable')
+                    self.assertEqual(failure.exception.commit_state, 'unknown' if name == 'status' else 'not_committed')
+                    self.assertFalse(failure.exception.retryable)
+                    self.assertEqual(document.read_bytes(), raw)
+                if condition == 'missing-root':
+                    self.assertFalse(root.exists())
+                elif condition == 'symlink-lock':
+                    self.assertTrue((root / 'registry.lock').is_symlink())
+                    self.assertEqual(target.read_bytes(), b'unchanged lock target')
+                else:
+                    self.assertFalse((root / 'registry.lock').exists())
+
+    def test_concurrent_same_operation_executes_callback_once(self):
+        from concurrent.futures import ThreadPoolExecutor
+        from threading import Barrier
+        token = self.store.current_snapshot()['document_token']
+        barrier = Barrier(4)
+        def attempt(_):
+            barrier.wait(timeout=5)
+            return self.commit(token=token)
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            results = list(executor.map(attempt, range(4)))
+        self.assertEqual(self.calls, 1)
+        self.assertEqual({value['transaction_id'] for value in results}, {results[0]['transaction_id']})
+        self.assertTrue(all(value['outcome']['status'] == 'COMMITTED' for value in results))
+        self.assertEqual(self.store.current_snapshot()['state']['revision'], 1)
+
     def test_callback_cannot_tamper_revision(self):
         before = self.document.read_bytes()
         def bad(state, era):
@@ -120,6 +172,61 @@ class SplitStoreTests(unittest.TestCase):
                 self.assertEqual(store.document.read_bytes(), observed)
                 self.assertEqual(len(count), 1)
 
+    def test_real_fsync_errors_at_every_transaction_sync_do_not_replay(self):
+        import os
+        original_sync = os.fsync
+        sync_count = []
+        # Establish the exact real syscall count with directories already durable.
+        self.store.audit.directories(create=True)
+        def trace(fd):
+            sync_count.append(True)
+            return original_sync(fd)
+        with patch('os.fsync', side_effect=trace):
+            self.commit()
+        self.assertGreaterEqual(len(sync_count), 10)
+        for cut in range(1, len(sync_count) + 1):
+            with self.subTest(fsync_call=cut), tempfile.TemporaryDirectory() as directory:
+                store = registry.Store(directory, Path(directory) / 'current.md')
+                store.initialize()
+                store.audit.directories(create=True)
+                before = store.document.read_bytes()
+                counter = []
+                def failing_sync(fd):
+                    counter.append(True)
+                    if len(counter) == cut:
+                        raise OSError('synthetic real fsync error')
+                    return original_sync(fd)
+                with patch('os.fsync', side_effect=failing_sync):
+                    with self.assertRaises(registry.RegistryTransactionError):
+                        store.transact_current('op', 'digest', {}, store.current_snapshot()['document_token'], self.change,
+                            action='register', actor='alpha', reason='test', authority='test')
+                observed = store.document.read_bytes()
+                status = store.operation_status('op', 'digest')
+                if store.audit.pending() is not None:
+                    status = store.recover_transaction('user', 'recover', 'synthetic authority')
+                    self.assertEqual(status['outcome']['status'], 'PUBLICATION_UNKNOWN' if observed == before else 'COMMITTED')
+                self.assertEqual(store.document.read_bytes(), observed)
+                if observed != before:
+                    self.assertEqual(store.current_snapshot()['state']['revision'], 1)
+
+    def test_corrupt_immutable_prepare_or_outcome_preserves_current_and_evidence(self):
+        for side in ('prepare', 'outcome'):
+            with self.subTest(side=side), tempfile.TemporaryDirectory() as directory:
+                store = registry.Store(directory, Path(directory) / 'current.md')
+                store.initialize()
+                result = store.transact_current('op', 'digest', {}, store.current_snapshot()['document_token'], self.change,
+                    action='register', actor='alpha', reason='test', authority='test')
+                path = store.audit.prepare_path(result['transaction_id']) if side == 'prepare' else store.audit.outcome_path(result['transaction_id'])
+                path.write_bytes(b'partial-final-evidence')
+                raw = store.document.read_bytes()
+                self.assertIn('alpha', store.current_snapshot()['state']['owners'])
+                with self.assertRaises(registry.RegistryTransactionError) as failure:
+                    store.transact_current('new', 'new', {}, store.current_snapshot()['document_token'], lambda *_: {},
+                        action='test', actor='user', reason='test', authority='test', persist_noop=True)
+                self.assertEqual(failure.exception.code, 'audit_damaged')
+                self.assertEqual(path.read_bytes(), b'partial-final-evidence')
+                self.assertEqual(store.document.read_bytes(), raw)
+
     def test_manual_divergence_and_exact_before_restore_are_unknown_not_replayed(self):
         for manual in ('different', 'exact_before'):
             with self.subTest(manual=manual), tempfile.TemporaryDirectory() as directory:
@@ -169,6 +276,187 @@ class SplitStoreTests(unittest.TestCase):
             self.store.current_snapshot()
             self.commit(operation='fourth', digest='fourth', change=lambda *_: {}, persist_noop=True)
 
+    def test_split_clear_restore_previous_exact_backup_and_retained_receipts(self):
+        original = self.commit()
+        before = self.store.current_snapshot()
+        raw = self.document.read_bytes()
+        full = self.store.history_snapshot()
+        cleared = self.store.switch_document('clear', before['document_token'], 'user', 'explicit clear', 'synthetic user authority')
+        self.assertFalse(self.store.current_snapshot()['state']['owners'])
+        self.assertEqual(self.store.history_snapshot()['history'], [])
+        records = self.store.backup_candidates()
+        self.assertEqual(len(records), 1)
+        record = records[0]
+        self.assertEqual(self.store.snapshot_bytes(record)[0], raw)
+        self.assertEqual(record['storage_format'], codec.SPLIT_FORMAT)
+        checkpoint = self.store.audit.read(self.store.audit.checkpoints / (record['audit_checkpoint'] + '.json'))
+        self.assertEqual(checkpoint['history'], full['history'])
+        self.assertTrue(checkpoint['attempts'])
+        empty_raw = self.document.read_bytes()
+        restored = self.store.switch_document('restore', self.store.current_snapshot()['document_token'],
+                                              'user', 'explicit restore', 'synthetic user authority', 'previous')
+        self.assertEqual(self.store.history_snapshot(), full)
+        self.assertNotEqual(restored['era'], before['era'])
+        self.assertNotEqual(restored['era'], cleared['era'])
+        self.assertEqual(self.store.snapshot_bytes(self.store.backup_candidates()[-1])[0], empty_raw)
+        status = self.store.operation_status('synthetic-operation', 'synthetic-digest')
+        self.assertEqual(status['prepare'], original['prepare'])
+        self.assertNotEqual(status['current']['era'], status['prepare']['after']['era'])
+        # previous is selected before adding the new backup, so it toggles back.
+        self.store.switch_document('restore', restored['document_token'], 'user', 'toggle', 'synthetic user authority', 'previous')
+        self.assertFalse(self.store.current_snapshot()['state']['owners'])
+        self.assertEqual(len(self.store.audit.history()), 4)
+
+    def test_restore_old_v2_target_after_migration_does_not_rewrite_legacy_backups(self):
+        self.commit()
+        state = self.store.history_snapshot()
+        era = self.store.current_snapshot()['era']
+        self.document.write_text(codec.serialize_document(state, era))
+        self.store.switch_document('clear', self.store.current_snapshot()['document_token'], 'user', 'legacy clear', 'user evidence')
+        old_record = self.store.backup_candidates()[0]
+        old_raw = (self.document.parent / old_record['snapshot']).read_bytes()
+        old_record_exact = copy.deepcopy(old_record)
+        self.store.migrate_storage(self.store.current_snapshot()['document_token'], 'user', 'explicit migrate', 'user evidence')
+        self.store.switch_document('restore', self.store.current_snapshot()['document_token'], 'user', 'restore old target', 'user evidence', old_record['id'])
+        self.assertEqual(self.store.history_snapshot(), state)
+        self.assertEqual(self.store.backup_candidates()[0], old_record_exact)
+        self.assertEqual((self.document.parent / old_record['snapshot']).read_bytes(), old_raw)
+
+    def test_split_backup_index_failure_after_publication_recovers_same_journal(self):
+        self.commit()
+        original = self.store.write_backup_index
+        calls = []
+        def fail_completed(records):
+            calls.append(copy.deepcopy(records))
+            if any(record['status'] == 'completed' for record in records):
+                raise OSError('synthetic completed-index failure')
+            return original(records)
+        with patch.object(self.store, 'write_backup_index', side_effect=fail_completed):
+            with self.assertRaises(registry.RegistryTransactionError) as failure:
+                self.store.switch_document('clear', self.store.current_snapshot()['document_token'], 'user', 'clear', 'user evidence')
+        self.assertEqual(failure.exception.commit_state, 'committed')  # immutable OUTCOME is already durable
+        self.assertFalse(self.store.current_snapshot()['state']['owners'])
+        self.assertFalse(self.store.switch_journal.exists())
+        self.assertTrue(self.store.audit.pending())
+        current = self.document.read_bytes()
+        result = self.recover()
+        self.assertEqual(result['outcome']['status'], 'COMMITTED')
+        self.assertEqual(len(self.store.backup_candidates()), 1)
+        self.assertEqual(self.document.read_bytes(), current)
+        self.assertIsNone(self.store.audit.pending())
+
+    def test_manual_revision_jump_is_current_authority_without_padding_history(self):
+        self.commit()
+        state, era, metadata = codec.parse_store_document(self.document.read_text())
+        state['revision'] = 50
+        state['owners']['alpha']['role'] = 'Manually accepted role'
+        self.document.write_text(codec.serialize_current_document(state, era, metadata['audit_head']))
+        def update(state, era):
+            state['assignments']['release']['acceptance'] = 'New explicitly authorized acceptance'
+            return {}
+        result = self.commit(operation='after-manual', digest='after-manual', change=update)
+        self.assertEqual(result['current']['state']['revision'], 51)
+        self.assertEqual(result['current']['state']['owners']['alpha']['role'], 'Manually accepted role')
+        self.assertEqual(result['prepare']['continuity']['kind'], 'unmanaged_change_observed')
+        history = self.store.history_snapshot()['history']
+        self.assertEqual([event['revision'] for event in history], [1, 51])
+        self.assertEqual(result['prepare']['event']['before']['owners'], {})
+        self.assertEqual(list(result['prepare']['event']['before']['assignments']), ['release'])
+
+    def test_unknown_locator_does_not_turn_unknown_delta_into_committed_history(self):
+        self.commit()
+        def crash(phase):
+            if phase == 'current_replaced':
+                raise OSError('post-replace interruption')
+        self.store.audit.checkpoint = self.store.transaction_checkpoint = crash
+        def change(state, era):
+            state['owners']['alpha']['role'] = 'Unconfirmed publication'
+            return {}
+        with self.assertRaises(registry.RegistryTransactionError):
+            self.commit(operation='unknown', digest='unknown', change=change)
+        state, era, metadata = codec.parse_store_document(self.document.read_text())
+        state['owners']['alpha']['role'] = 'User accepted manual role'
+        self.document.write_text(codec.serialize_current_document(state, era, metadata['audit_head']))
+        self.store.audit.checkpoint = self.store.transaction_checkpoint = lambda _: None
+        self.assertEqual(self.recover()['outcome']['status'], 'PUBLICATION_UNKNOWN')
+        def next_change(state, era):
+            state['assignments']['release']['acceptance'] = 'New acceptance'
+            return {}
+        self.commit(operation='later', digest='later', change=next_change)
+        history = self.store.history_snapshot()['history']
+        self.assertEqual([event['revision'] for event in history], [1, 3])
+        self.assertEqual([attempt['outcome']['status'] for attempt in self.store.audit.history()],
+                         ['COMMITTED', 'PUBLICATION_UNKNOWN', 'COMMITTED'])
+
+    def test_missing_or_invalid_current_recovery_only_finalizes_metadata(self):
+        for observed in ('missing', 'invalid'):
+            with self.subTest(current=observed), tempfile.TemporaryDirectory() as directory:
+                store = registry.Store(directory, Path(directory) / 'current.md')
+                store.initialize()
+                def crash(phase):
+                    if phase == 'current_replaced':
+                        raise OSError('interruption')
+                store.audit.checkpoint = store.transaction_checkpoint = crash
+                with self.assertRaises(registry.RegistryTransactionError):
+                    store.transact_current('op', 'digest', {}, store.current_snapshot()['document_token'], self.change,
+                        action='register', actor='alpha', reason='test', authority='test')
+                if observed == 'missing':
+                    store.document.unlink()
+                else:
+                    store.document.write_bytes(b'corrupt current evidence')
+                store.audit.checkpoint = store.transaction_checkpoint = lambda _: None
+                result = store.recover_transaction('user', 'metadata recovery', 'synthetic authority')
+                self.assertEqual(result['outcome']['status'], 'PUBLICATION_UNKNOWN')
+                self.assertIsNone(result['current'])
+                if observed == 'missing':
+                    self.assertFalse(store.document.exists())
+                else:
+                    self.assertEqual(store.document.read_bytes(), b'corrupt current evidence')
+
+    def test_missing_current_switch_recovery_retains_unknown_backup_evidence(self):
+        self.commit()
+        def crash(phase):
+            if phase == 'current_replaced':
+                raise OSError('synthetic switch interruption')
+        self.store.audit.checkpoint = self.store.transaction_checkpoint = crash
+        with self.assertRaises(registry.RegistryTransactionError):
+            self.store.switch_document('clear', self.store.current_snapshot()['document_token'], 'user', 'clear', 'user evidence')
+        self.document.unlink()
+        self.store.audit.checkpoint = self.store.transaction_checkpoint = lambda _: None
+        result = self.recover()
+        self.assertEqual(result['outcome']['status'], 'PUBLICATION_UNKNOWN')
+        self.assertFalse(self.document.exists())
+        records = self.store.read_backup_index()
+        self.assertEqual(records[0]['status'], 'superseded-manual')
+        self.assertIsNone(records[0]['reconciliation']['observed_sha256'])
+        self.assertEqual(self.store.snapshot_bytes(records[0])[1]['revision'], 1)
+
+    def test_query_history_is_opt_in_and_report_cannot_overwrite_audit(self):
+        from contextlib import redirect_stdout, redirect_stderr
+        import io
+        self.commit()
+        def cli(*arguments):
+            out, err = io.StringIO(), io.StringIO()
+            with redirect_stdout(out), redirect_stderr(err):
+                code = registry.main(['--root', str(self.root), '--document', str(self.document), *arguments])
+            return code, out.getvalue(), err.getvalue()
+        for arguments in [('query',), ('query', '--active')]:
+            with patch.object(registry.AuditStorage, 'history', side_effect=AssertionError('implicit hydration')):
+                code, output, _ = cli(*arguments)
+            self.assertEqual(code, 0)
+            value = json.loads(output)
+            self.assertFalse(value['history_loaded'])
+            self.assertNotIn('history', value)
+        code, output, _ = cli('query', '--history')
+        self.assertEqual(code, 0)
+        self.assertTrue(json.loads(output)['history_loaded'])
+        self.assertEqual(len(json.loads(output)['history']), 1)
+        for destination in (self.store.audit.head_path, self.store.audit.pending_path,
+                            self.store.audit.ops / 'report.md', self.store.audit.path / 'receipts/report.md'):
+            code, _, error = cli('rebuild', '--output', str(destination))
+            self.assertEqual(code, 2)
+            self.assertIn('report output cannot replace', error)
+
     def test_corrupt_head_blocks_managed_write_but_current_query_works(self):
         self.commit()
         self.store.audit.head_path.write_bytes(b'corrupt')
@@ -177,6 +465,10 @@ class SplitStoreTests(unittest.TestCase):
             self.commit(operation='other', digest='other')
         self.assertEqual(failure.exception.code, 'audit_damaged')
         self.assertEqual(self.store.audit.head_path.read_bytes(), b'corrupt')
+        self.store.audit.head_path.unlink()  # missing is also damage when current points at retained evidence
+        with self.assertRaises(registry.RegistryTransactionError) as failure:
+            self.commit(operation='another', digest='another')
+        self.assertEqual(failure.exception.code, 'audit_damaged')
 
 
 if __name__ == '__main__':

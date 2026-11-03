@@ -43,6 +43,7 @@ class RegistryTransactionError(RegistryError):
         self.commit_state = commit_state
         self.retryable = retryable
         self.operation_id = operation_id
+        self.op_id = operation_id
 
 
 def current_fields(state):
@@ -115,7 +116,7 @@ def semantic_changes(before, state, action, args):
                     from_assignment=(old or {}).get('id'), to_assignment=(new or {}).get('id'),
                     from_parent=before['owners'].get(old_id, {}).get('parent'),
                     to_parent=state['owners'].get(new_id, {}).get('parent'), summary=summary)
-    if action == 'handover':
+    if action == 'handover' and args is not None:
         return [change(before['assignments'][args.assignment], state['assignments'][args.new_assignment],
                        'handover; pending work: ' + args.pending_work + '; reporting: ' +
                        (args.reporting_change or 'superior unchanged'))]
@@ -303,12 +304,18 @@ def fsync_directory(path):
 
 
 def exclusive_file(path, content):
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    with os.fdopen(fd, 'wb') as out:
-        out.write(content if isinstance(content, bytes) else content.encode('utf-8'))
-        out.flush()
-        os.fsync(out.fileno())
-    fsync_directory(path.parent)
+    # Immutable snapshots/archives must never expose a half-written final name.
+    fd, temp = tempfile.mkstemp(prefix='.' + path.name + '-', dir=path.parent)
+    try:
+        with os.fdopen(fd, 'wb') as out:
+            out.write(content if isinstance(content, bytes) else content.encode('utf-8'))
+            out.flush()
+            os.fsync(out.fileno())
+        os.link(temp, path, follow_symlinks=False)
+        fsync_directory(path.parent)
+    finally:
+        if os.path.exists(temp):
+            os.unlink(temp)
 
 
 class Store:
@@ -326,29 +333,41 @@ class Store:
         """Deterministic isolated interruption seam; no runtime fault switch."""
 
     def locked(self, action, create=False):
-        if create:
-            self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
-        require(not self.root.is_symlink() and self.root.is_dir(), 'private root cannot be symlink/non-directory')
-        require(self.root.stat().st_mode & 0o777 == 0o700, 'private root permissions must be 0700')
-        flags = os.O_RDWR | (os.O_CREAT if create else 0)
-        fd = os.open(self.root / 'registry.lock', flags | os.O_NOFOLLOW, 0o600)
-        with os.fdopen(fd, 'a') as lock:
-            info = os.fstat(lock.fileno())
+        # Normalize only acquisition failures. Domain/callback exceptions from
+        # action() retain their exact type and never get classified by message.
+        fd = None
+        try:
+            if create:
+                self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
+            require(not self.root.is_symlink() and self.root.is_dir(), 'private root cannot be symlink/non-directory')
+            require(self.root.stat().st_mode & 0o777 == 0o700, 'private root permissions must be 0700')
+            flags = os.O_RDWR | (os.O_CREAT if create else 0)
+            fd = os.open(self.root / 'registry.lock', flags | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
+            info = os.fstat(fd)
             require(stat_module.S_ISREG(info.st_mode) and info.st_mode & 0o777 == 0o600, 'registry lock must be a private regular file')
-            fcntl.flock(lock, fcntl.LOCK_EX)
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        except (OSError, RegistryError) as exc:
+            if fd is not None:
+                os.close(fd)
+            raise RegistryTransactionError('registry_unavailable', 'registry lock unavailable: ' + str(exc),
+                                           commit_state='not_committed', retryable=False) from exc
+        with os.fdopen(fd, 'a'):
             return action()
 
     def read_document(self):
         try:
             require(not self.document.is_symlink(), 'live document cannot be a symlink')
-            with self.document.open('rb') as source:
-                before = fingerprint(os.fstat(source.fileno()))
+            fd = os.open(self.document, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            with os.fdopen(fd, 'rb') as source:
+                info = os.fstat(source.fileno())
+                require(stat_module.S_ISREG(info.st_mode), 'live document must be regular')
+                before = fingerprint(info)
                 raw = source.read()
                 after = fingerprint(os.fstat(source.fileno()))
             require(before == after == fingerprint(self.document.stat()),
                     'document changed while reading; query again deliberately')
             content = raw.decode('utf-8')
-            if '\nFormat: responsibility-registry/v3\n' in content:
+            if re.search(r'^Format: responsibility-registry/v3\r?$', content, re.MULTILINE):
                 state, era, metadata = document_codec.parse_store_document(content)
             else:
                 state, era = parse_document(content)
@@ -414,7 +433,15 @@ class Store:
                 raise
             except (OSError, RegistryError, ValueError, TypeError, KeyError) as exc:
                 raise RegistryTransactionError('audit_damaged', str(exc), commit_state='unknown', operation_id=operation_id) from exc
-        return self.locked(operation)
+        try:
+            return self.locked(operation)
+        except RegistryTransactionError as exc:
+            if exc.operation_id is None:
+                exc.operation_id = exc.op_id = operation_id
+            if exc.code == 'registry_unavailable':
+                # Status cannot attest to an old operation without its lock/IO.
+                exc.commit_state = 'unknown'
+            raise
 
     def _transaction_ready(self):
         if self.switch_journal.exists():
@@ -425,7 +452,13 @@ class Store:
             self.audit.directories()
             if self.audit.pending() is not None:
                 raise RegistryTransactionError('transaction_pending', 'pending audit transaction; explicit recover-transaction required', commit_state='unknown')
-            return self.audit.head()
+            head = self.audit.head()
+            if head is None:
+                current = self._safe_snapshot()
+                if current and current['audit_head']:
+                    prepare, outcome = self.audit.lookup(current['audit_head'])
+                    require(prepare is None and outcome is None, 'missing audit head for retained managed evidence')
+            return head
         return None
 
     def _prepare_transaction(self, operation_id, intent_digest, intent, result, state, envelope, raw,
@@ -444,13 +477,19 @@ class Store:
             continuity=dict(kind=('managed_match' if sha(raw) == prior_sha else 'unmanaged_change_observed') if last else 'unanchored',
                             previous_committed_sha256=prior_sha), references=references or {}, result=copy.deepcopy(result))
 
-    def _outcome(self, prepare, status, basis, current):
-        observed_sha = None
+    def _observed_raw(self):
         try:
-            if not self.document.is_symlink():
-                observed_sha = sha(self.document.read_bytes())
+            fd = os.open(self.document, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            with os.fdopen(fd, 'rb') as source:
+                if not stat_module.S_ISREG(os.fstat(source.fileno()).st_mode):
+                    return None
+                return source.read()
         except OSError:
-            pass
+            return None
+
+    def _outcome(self, prepare, status, basis, current):
+        observed = self._observed_raw()
+        observed_sha = sha(observed) if observed is not None else None
         return dict(schema=1, op_id=prepare['op_id'], intent_digest=prepare['intent_digest'], prepare_sha256=sha(encoded(prepare)),
                     status=status, basis=basis, recorded_at=now(),
                     observed=dict(document_sha256=observed_sha, era=current['era'] if current else None,
@@ -462,6 +501,7 @@ class Store:
     def _publish_transaction(self, prepare, content, raw, stat, before_publication=None):
         """One current replace, never rollback or replay after any uncertain error."""
         entered_publication = False
+        outcome_durable = False
         try:
             self.audit.begin(prepare)
             if before_publication:
@@ -488,15 +528,17 @@ class Store:
             status = 'NOT_APPLICABLE' if prepare['disposition'] == 'noop' else 'COMMITTED'
             outcome = self._outcome(prepare, status, 'locked_no_change' if status == 'NOT_APPLICABLE' else 'live_replace_synced', current)
             self.audit.write(self.audit.outcome_path(prepare['op_id']), outcome, immutable=True, phase='outcome')
+            outcome_durable = True
             self._finalize_references(prepare, outcome)
             self.audit.finish(prepare, outcome)
             return self._status(prepare['operation_id'], prepare['intent_digest'])
         except Exception as exc:
             # Even a pre-publication failure may have left durable pending evidence.
             # Only explicit recovery terminalizes it; it never re-executes change().
-            raise RegistryTransactionError('commit_unknown' if entered_publication else 'transaction_pending',
-                'transaction requires explicit metadata recovery: ' + str(exc),
-                commit_state='unknown' if entered_publication else 'not_committed', retryable=False,
+            code = 'transaction_pending' if outcome_durable or not entered_publication else 'commit_unknown'
+            commit_state = ('committed' if entered_publication else 'not_committed') if outcome_durable else ('unknown' if entered_publication else 'not_committed')
+            raise RegistryTransactionError(code, 'transaction requires explicit metadata recovery: ' + str(exc),
+                commit_state=commit_state, retryable=False,
                 operation_id=prepare['operation_id']) from exc
 
     def transact_current(self, operation_id, intent_digest, intent, expected_document, change, *,
@@ -520,11 +562,11 @@ class Store:
                 state, envelope, raw, stat = self.read_document()
             except (RegistryError, OSError, UnicodeError) as exc:
                 raise RegistryTransactionError('registry_invalid' if self.document.exists() else 'registry_unavailable', str(exc), operation_id=operation_id) from exc
-            if envelope['storage_format'] != getattr(document_codec, 'SPLIT_FORMAT', 'responsibility-registry/v3'):
+            if envelope['storage_format'] != document_codec.SPLIT_FORMAT:
                 raise RegistryTransactionError('storage_not_migrated', 'explicit migrate-storage required before current transactions', operation_id=operation_id)
             if expected_document != envelope['document_token']:
                 raise RegistryTransactionError('document_conflict', 'stale expected document; query and decide deliberately', retryable=True, operation_id=operation_id)
-            before = copy.deepcopy(state)
+            before = state  # fresh owned read; callback receives only its independent copy
             changed = copy.deepcopy(state)
             result = change(changed, envelope['era'])
             require(isinstance(result, dict), 'transaction callback must return a JSON object')
@@ -541,7 +583,8 @@ class Store:
             event = None
             if not noop:
                 changed['revision'] += 1
-                event = changed_event(before, changed, action, actor, reason, authority, getattr(change, 'event_args', None))
+                event = changed_event(before, changed, action, actor, reason, authority,
+                                      getattr(change, 'event_args', None), stamp=getattr(change, 'event_stamp', None))
                 document_codec.validate_event(event, changed['revision'])
             op = self._transaction_id(operation_id)
             content = raw.decode('utf-8') if noop else document_codec.serialize_current_document(changed, era, op)
@@ -570,7 +613,8 @@ class Store:
                 # Journal-first payload preserves a missing final, never reconstructs current.
                 self.audit.write(self.audit.prepare_path(prepare['op_id']), prepare, immutable=True, phase='prepare')
                 if outcome is None:
-                    exact = current is not None and not self.document.is_symlink() and sha(self.document.read_bytes()) == prepare['after']['document_sha256']
+                    observed = self._observed_raw()
+                    exact = current is not None and observed is not None and sha(observed) == prepare['after']['document_sha256']
                     exact = exact and current['era'] == prepare['after']['era'] and current['state']['revision'] == prepare['after']['revision']
                     if prepare['disposition'] == 'noop' and exact:
                         status, basis = 'NOT_APPLICABLE', 'recovered_exact_noop_observation'
@@ -597,7 +641,7 @@ class Store:
         status = outcome['status']
         record['status'] = 'completed' if status == 'COMMITTED' else ('aborted' if status == 'ABORTED' else 'superseded-manual')
         if status not in ('COMMITTED', 'ABORTED'):
-            record['reconciliation'] = dict(observed_sha256=outcome['observed']['document_sha256'] or '0' * 64, journal_phase=status)
+            record['reconciliation'] = dict(observed_sha256=outcome['observed']['document_sha256'], journal_phase=status)
         records = self.read_backup_index()
         prior = next((value for value in records if value['id'] == record['id']), None)
         if prior is not None:
@@ -614,12 +658,17 @@ class Store:
             require(op not in seen, 'cyclic current audit ancestry')
             seen.add(op)
             prepare, outcome = self.audit.lookup(op)
-            require(prepare is not None and outcome is not None and outcome['status'] == 'COMMITTED', 'current history locator has no committed evidence')
+            require(prepare is not None and outcome is not None, 'current history locator has incomplete evidence')
+            if outcome['status'] != 'COMMITTED':
+                # A manual edit may retain an UNKNOWN locator. Preserve the
+                # attempt in explicit audit, never count its delta as committed.
+                op = prepare['base']['audit_head']
+                continue
             refs = prepare['references']
             if prepare['event'] is not None:
                 events.append(prepare['event'])
             if 'history_checkpoint' in refs:
-                checkpoint = self.audit.read(self.audit.checkpoints / (identifier(refs['history_checkpoint']) + '.json'))
+                checkpoint = self._read_checkpoint(refs['history_checkpoint'], refs['history_checkpoint_sha256'])
                 return checkpoint['history'] + list(reversed(events))
             if refs.get('history_reset'):
                 return list(reversed(events))
@@ -666,7 +715,8 @@ class Store:
                       if k not in ('root', 'document', 'input', 'expected_document', 'operation_id')}, payload=payload)
         digest = sha(encoded(intent))
         def change(state, era):
-            return mutate_records(state, args, payload)
+            change.event_stamp = now()
+            return mutate_records(state, args, payload, stamp=change.event_stamp)
         change.event_args = args
         reason = payload['appointment'] if args.command == 'register' else args.reason
         status = self.transact_current(operation_id, digest, intent, args.expected_document, change,
@@ -711,9 +761,10 @@ class Store:
 
     def control(self):
         path = self.root / 'document-control.json'
+        require(not path.is_symlink(), 'document control cannot be symlink')
         if not path.exists():
             return None
-        control = parse_json(path.read_text(encoding='utf-8'))
+        control = parse_json(read_private(path).decode('utf-8'))
         keys(control, ['kind', 'status', 'document'],
              ['migration_id', 'source_sha256', 'backup', 'staged', 'staged_sha256', 'era', 'dashboard_backup', 'dashboard_sha256'])
         require(control['kind'] in ['initialization', 'migration'] and control['status'] in ['pending', 'completed'],
@@ -737,7 +788,7 @@ class Store:
                 require(expected_document == envelope['document_token'],
                         'stale expected document; query current Markdown and decide again deliberately')
             if expected_document is not None and self.audit.exists():
-                require(self.audit.pending() is None, 'pending audit transaction; run recover-transaction')
+                self._transaction_ready()
             original = copy.deepcopy(state)
             result = fn(state)
             split = envelope['storage_format'] == 'responsibility-registry/v3'
@@ -765,7 +816,9 @@ class Store:
     def recheck(self, raw, stat):
         require(not self.document.is_symlink(), 'document replaced before commit; refuse stale operation')
         try:
-            with self.document.open('rb') as source:
+            fd = os.open(self.document, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            with os.fdopen(fd, 'rb') as source:
+                require(stat_module.S_ISREG(os.fstat(source.fileno()).st_mode), 'live document must be regular')
                 current = source.read()
                 identity = fingerprint(os.fstat(source.fileno()))
             require(raw == current and stat == identity == fingerprint(self.document.stat()),
@@ -955,7 +1008,9 @@ class Store:
             require(record['action'] in ['clear', 'restore'] and record['actor'] == 'user', 'invalid switch action/actor')
             if 'reconciliation' in record:
                 keys(record['reconciliation'], ['observed_sha256', 'journal_phase'])
-                require(re.fullmatch(r'[0-9a-f]{64}', record['reconciliation']['observed_sha256']), 'invalid observed digest')
+                observed = record['reconciliation']['observed_sha256']
+                require((observed is None and record.get('storage_format') == 'responsibility-registry/v3') or
+                        (isinstance(observed, str) and re.fullmatch(r'[0-9a-f]{64}', observed)), 'invalid observed digest')
                 text(record['reconciliation']['journal_phase'], 'reconciled journal phase')
             validate_time(dict(at=record['time'], precision='exact'))
             for field in ['id', 'reason', 'authority', 'snapshot', 'sha256', 'after_sha256', 'after_era']:
@@ -982,7 +1037,7 @@ class Store:
             if 'reconciliation' in record:
                 evidence = record['reconciliation']
                 lines.append('- Reconciled phase: ' + evidence['journal_phase'] +
-                             ' · observed current SHA-256: `' + evidence['observed_sha256'] + '`')
+                             ' · observed current SHA-256: `' + (evidence['observed_sha256'] or 'unavailable') + '`')
             lines.append('')
         lines += ['## Switch records (audit JSON)', '```json', json.dumps(records, ensure_ascii=False, indent=2, allow_nan=False), '```', '']
         require(not self.backup_index.is_symlink(), 'backup index cannot be a symlink')
@@ -1000,11 +1055,9 @@ class Store:
         require(hashlib.sha256(raw).hexdigest() == record['sha256'], 'snapshot hash mismatch; preserve current')
         if record.get('storage_format') == 'responsibility-registry/v3':
             state, era, _ = document_codec.parse_store_document(raw.decode('utf-8'))
-            checkpoint = self.audit.read(self.audit.checkpoints / (identifier(record['audit_checkpoint']) + '.json'))
-            require(sha(encoded(checkpoint)) == record['audit_checkpoint_sha256'] and checkpoint['current_sha256'] == sha(raw), 'backup audit checkpoint mismatch')
+            checkpoint = self._read_checkpoint(record['audit_checkpoint'], record['audit_checkpoint_sha256'])
+            require(checkpoint['current_sha256'] == sha(raw), 'backup audit checkpoint mismatch')
             require(checkpoint['era'] == era and checkpoint['revision'] == state['revision'], 'backup checkpoint current mismatch')
-            for event in checkpoint['history']:
-                document_codec.validate_event(event, event['revision'])
         else:
             state, era = parse_document(raw.decode('utf-8'))
         return raw, state, era
@@ -1048,6 +1101,21 @@ class Store:
         require(actor == 'user', 'global clear/restore/recovery requires actual direct user authority, not a role-bound peer')
         text(reason, 'user switch reason')
         text(authority, 'direct user authorization evidence')
+
+    def _read_checkpoint(self, checkpoint_id, expected_sha256):
+        checkpoint = self.audit.read(self.audit.checkpoints / (identifier(checkpoint_id) + '.json'))
+        require(checkpoint.get('schema') == 1 and checkpoint.get('checkpoint_id') == checkpoint_id and
+                sha(encoded(checkpoint)) == expected_sha256, 'immutable audit checkpoint hash/schema mismatch')
+        require(isinstance(checkpoint.get('history'), list) and isinstance(checkpoint.get('attempts'), list), 'invalid checkpoint evidence containers')
+        for event in checkpoint['history']:
+            document_codec.validate_event(event, event['revision'])
+        for attempt in checkpoint['attempts']:
+            self.audit.validate_prepare(attempt['prepare'])
+            self.audit.validate_outcome(attempt['outcome'], attempt['prepare'])
+        for archive, manifest in checkpoint['legacy_archives'].items():
+            archived = read_private(self.audit.legacy / (identifier(archive) + '.md'))
+            require(sha(archived) == manifest['sha256'] and len(archived) == manifest['bytes'], 'checkpoint raw legacy archive missing/corrupt')
+        return checkpoint
 
     def _write_checkpoint(self, checkpoint_id, raw, state, envelope, history=None):
         self.audit.directories(create=True)
@@ -1114,14 +1182,16 @@ class Store:
         if selected:
             if selected.get('storage_format') == 'responsibility-registry/v3':
                 references['history_checkpoint'] = selected['audit_checkpoint']
+                references['history_checkpoint_sha256'] = selected['audit_checkpoint_sha256']
             else:
                 # Legacy backup remains untouched; its complete history is preserved
                 # in a new immutable checkpoint for the newly published v3 era.
                 full, old_era = parse_document(selected_raw.decode('utf-8'))
                 target_checkpoint = str(uuid.uuid4())
-                self._write_checkpoint(target_checkpoint, selected_raw, full,
+                value = self._write_checkpoint(target_checkpoint, selected_raw, full,
                     dict(era=old_era, audit_head=None), history=full['history'])
                 references['history_checkpoint'] = target_checkpoint
+                references['history_checkpoint_sha256'] = sha(encoded(value))
             references['restore_target'] = selected['id']
         else:
             references['history_reset'] = True
@@ -1145,7 +1215,8 @@ class Store:
             state, envelope, raw, stat = self.read_document()
             if envelope['storage_format'] == 'responsibility-registry/v3':
                 return self._switch_split(action, expected_document, actor, reason, authority, target, state, envelope, raw, stat)
-            require(not self.audit.exists() or self.audit.pending() is None, 'pending audit transaction; run recover-transaction')
+            if self.audit.exists():
+                self._transaction_ready()
             require(expected_document == envelope['document_token'], 'stale expected document; reread current Markdown before switch')
             control = self.control()
             require(not control or control['status'] == 'completed', 'pending cutover; recover explicitly before switch')
@@ -1308,12 +1379,12 @@ def authorize(actor, oid, state=None):
     require(actor in permitted, f'actor must be responsible owner {oid}, authorized immediate superior (handover), or explicitly authorized user')
 
 
-def mutate_records(state, args, payload):
+def mutate_records(state, args, payload, *, stamp=None):
     """Shared business mutation. Does not own revision or history."""
     action, actor = args.command, args.actor
     text(actor, 'actor')
     state.setdefault('coordination', {})
-    stamp = now()
+    stamp = stamp or now()
     occurred = occurrence(args, stamp)
     if action == 'handover':
         prior = state['assignments'].get(args.assignment, {})
@@ -1423,8 +1494,8 @@ def mutate_records(state, args, payload):
     return {'action': action}
 
 
-def changed_event(before, state, action, actor, reason, authority, args=None):
-    stamp = now()
+def changed_event(before, state, action, actor, reason, authority, args=None, *, stamp=None):
+    stamp = stamp or now()
     snapshots = {side: {kind: {key: copy.deepcopy(records[key]) for key in records
                               if before[kind].get(key) != state[kind].get(key)}
                         for kind, records in ((kind, value[kind]) for kind in ('owners', 'assignments', 'coordination'))}
@@ -1439,14 +1510,15 @@ def changed_event(before, state, action, actor, reason, authority, args=None):
 def mutate(state, args, payload):
     """Legacy full-state API retains its complete input/history behavior."""
     before = {kind: copy.deepcopy(state.get(kind, {})) for kind in ('owners', 'assignments', 'coordination')}
-    result = mutate_records(state, args, payload)
+    stamp = now()
+    result = mutate_records(state, args, payload, stamp=stamp)
     if result.get('unchanged'):
         return result
     validate(state)
     state['revision'] += 1
     reason = payload['appointment'] if args.command == 'register' else args.reason
     state['history'].append(changed_event(before, state, args.command, args.actor, reason,
-                                           getattr(args, 'authority', None), args))
+                                           getattr(args, 'authority', None), args, stamp=stamp))
     return dict(result, revision=state['revision'])
 
 

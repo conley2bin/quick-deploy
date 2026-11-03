@@ -23,13 +23,17 @@ class AuditTests(unittest.TestCase):
         self.op = str(uuid.uuid4())
 
     def prepare(self):
-        return dict(schema=1, op_id=self.op, operation_id='external', intent_digest='digest', previous=None,
-                    base=dict(document_sha256='a' * 64), after=dict(document_sha256='b' * 64, era='era', revision=1),
-                    continuity={}, references={}, disposition='publication', result={})
+        return dict(schema=1, op_id=self.op, operation_id='external', intent_digest='digest', intent={}, previous=None,
+                    at='2026-01-01T00:00:00+00:00', actor='user', authority='synthetic', action='test', reason='test',
+                    base=dict(document_sha256='a' * 64, era='era', revision=0, document_token='observed-token', audit_head=None),
+                    after=dict(document_sha256='b' * 64, era='era', revision=1, audit_head=self.op), event=None,
+                    continuity=dict(kind='unanchored', previous_committed_sha256=None), references={}, disposition='publication', result={})
 
     def outcome(self, prepare):
         return dict(schema=1, op_id=self.op, intent_digest='digest', prepare_sha256=sha(encoded(prepare)),
-                    status='COMMITTED', commit=dict(era='era', revision=1, after_sha256='b' * 64))
+                    status='COMMITTED', basis='test', recorded_at='2026-01-01T00:00:00+00:00',
+                    observed=dict(document_sha256='b' * 64, era='era', revision=1, current_valid=True),
+                    document_token_after='observed-token', commit=dict(era='era', revision=1, after_sha256='b' * 64))
 
     def test_complete_immutable_finals_and_idempotent_finish(self):
         prepare = self.prepare()
