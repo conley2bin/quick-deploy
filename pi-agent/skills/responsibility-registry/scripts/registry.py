@@ -13,15 +13,40 @@ import sys
 import tempfile
 import hashlib
 import uuid
+import stat as stat_module
 
 DEFAULT_ROOT = Path.home() / '.pi/agent/.memory/local/responsibility-registry'
 DEFAULT_DOCUMENT = Path.home() / '.pi/agent/skills/responsibility-registry/RESPONSIBILITIES.md'
 
 
-from registry_document import (RegistryError, require, parse_json, text, keys, identity,
-    validate_time, goal_source, recovery_context, owner, scope, check_graph, validate,
-    validate_agreement, agreement_view, assignment_digest, terms_digest, parse_document, serialize_document,
-    FORMAT, TEMPLATE_ERA)
+if __package__:
+    from .registry_document import (RegistryError, require, parse_json, text, keys, identity,
+        validate_time, goal_source, recovery_context, owner, scope, check_graph, validate,
+        validate_agreement, agreement_view, assignment_digest, terms_digest, parse_document, serialize_document,
+        FORMAT, TEMPLATE_ERA, validate_current, parse_current_document)
+    from . import registry_document as document_codec
+    from .audit_storage import AuditStorage, AuditDamaged, encoded, sha, identifier, read_private, sync_directory
+else:
+    from registry_document import (RegistryError, require, parse_json, text, keys, identity,
+        validate_time, goal_source, recovery_context, owner, scope, check_graph, validate,
+        validate_agreement, agreement_view, assignment_digest, terms_digest, parse_document, serialize_document,
+        FORMAT, TEMPLATE_ERA, validate_current, parse_current_document)
+    import registry_document as document_codec
+    from audit_storage import AuditStorage, AuditDamaged, encoded, sha, identifier, read_private, sync_directory
+
+
+
+class RegistryTransactionError(RegistryError):
+    def __init__(self, code, message, *, commit_state='not_committed', retryable=False, operation_id=None):
+        super().__init__(message)
+        self.code = code
+        self.commit_state = commit_state
+        self.retryable = retryable
+        self.operation_id = operation_id
+
+
+def current_fields(state):
+    return {key: state[key] for key in ('version', 'revision', 'owners', 'assignments', 'coordination')}
 
 
 def coordinate(state, args, payload, stamp):
@@ -288,19 +313,28 @@ def exclusive_file(path, content):
 
 class Store:
     def __init__(self, root=DEFAULT_ROOT, document=None):
-        self.root = Path(root).expanduser().resolve()
+        self.root = Path(os.path.abspath(Path(root).expanduser()))
         require(document is not None or self.root == DEFAULT_ROOT.resolve(),
                 'alternate --root requires explicit --document (never infer runtime from source)')
         # Do not resolve away a replacement/symlink at the live filename.
         self.document = Path(os.path.abspath(Path(document or DEFAULT_DOCUMENT).expanduser()))
         self.envelope = None
+        self.store_id = sha(encoded([str(self.root), str(self.document)]))
+        self.audit = AuditStorage(self.root, self.transaction_checkpoint)
+
+    def transaction_checkpoint(self, phase):
+        """Deterministic isolated interruption seam; no runtime fault switch."""
 
     def locked(self, action, create=False):
         if create:
             self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        require(not self.root.is_symlink() and self.root.is_dir(), 'private root cannot be symlink/non-directory')
+        require(self.root.stat().st_mode & 0o777 == 0o700, 'private root permissions must be 0700')
         flags = os.O_RDWR | (os.O_CREAT if create else 0)
-        fd = os.open(self.root / 'registry.lock', flags, 0o600)
+        fd = os.open(self.root / 'registry.lock', flags | os.O_NOFOLLOW, 0o600)
         with os.fdopen(fd, 'a') as lock:
+            info = os.fstat(lock.fileno())
+            require(stat_module.S_ISREG(info.st_mode) and info.st_mode & 0o777 == 0o600, 'registry lock must be a private regular file')
             fcntl.flock(lock, fcntl.LOCK_EX)
             return action()
 
@@ -313,14 +347,367 @@ class Store:
                 after = fingerprint(os.fstat(source.fileno()))
             require(before == after == fingerprint(self.document.stat()),
                     'document changed while reading; query again deliberately')
-            state, era = parse_document(raw.decode('utf-8'))
+            content = raw.decode('utf-8')
+            if '\nFormat: responsibility-registry/v3\n' in content:
+                state, era, metadata = document_codec.parse_store_document(content)
+            else:
+                state, era = parse_document(content)
+                metadata = dict(format=FORMAT, audit_head=None)
         except FileNotFoundError as exc:
             raise RegistryError('missing live Markdown document; no legacy import or reconstruction') from exc
         except (ValueError, TypeError, KeyError, RegistryError) as exc:
             raise RegistryError('document invalid/changed; preserved unchanged: ' + str(exc)) from exc
         digest = hashlib.sha256(raw).hexdigest()
         token = hashlib.sha256(json.dumps([era, digest, after], separators=(',', ':')).encode()).hexdigest()
-        return state, dict(era=era, revision=state['revision'], document_token=token), raw, after
+        return state, dict(era=era, revision=state['revision'], document_token=token,
+                           storage_format=metadata['format'], audit_head=metadata['audit_head']), raw, after
+
+    def _snapshot(self):
+        state, envelope, _, _ = self.read_document()
+        self.envelope = envelope
+        return dict(state=current_fields(state), era=envelope['era'], document_token=envelope['document_token'],
+                    format=envelope['storage_format'], audit_head=envelope['audit_head'], store_id=self.store_id)
+
+    def _safe_snapshot(self):
+        try:
+            return self._snapshot()
+        except (OSError, RegistryError, UnicodeError):
+            return None
+
+    def current_snapshot(self):
+        """Fresh read-only authority observation. Never opens private audit."""
+        try:
+            return self.locked(self._snapshot)
+        except RegistryTransactionError:
+            raise
+        except (OSError, RegistryError, ValueError, TypeError, KeyError) as exc:
+            raise RegistryTransactionError('registry_invalid' if self.document.exists() else 'registry_unavailable', str(exc)) from exc
+
+    def _transaction_id(self, operation_id):
+        text(operation_id, 'operation ID')
+        return str(uuid.uuid5(uuid.NAMESPACE_URL, self.store_id + '\0' + operation_id))
+
+    def _status(self, operation_id, intent_digest):
+        op = self._transaction_id(operation_id)
+        prepare = outcome = pending = None
+        if self.audit.exists():
+            self.audit.directories()
+            pending = self.audit.pending()
+            prepare, outcome = self.audit.lookup(op)
+            if pending and pending['op_id'] == op:
+                if prepare is not None:
+                    require(prepare == pending['prepare'], 'pending/final prepare mismatch')
+                prepare = pending['prepare']
+            require(prepare is None or outcome is not None or (pending and pending['op_id'] == op),
+                    'orphan prepare without journal; preserve evidence')
+        if prepare and (prepare['intent_digest'] != intent_digest or prepare['operation_id'] != operation_id):
+            raise RegistryTransactionError('operation_intent_mismatch', 'operation already bound to another intent', operation_id=operation_id)
+        return dict(transaction_id=op, prepare=prepare, outcome=outcome,
+                    result=prepare['result'] if prepare else None, current=self._safe_snapshot(),
+                    pending=bool(pending and pending['op_id'] == op))
+
+    def operation_status(self, operation_id, intent_digest):
+        def operation():
+            try:
+                return self._status(operation_id, intent_digest)
+            except RegistryTransactionError:
+                raise
+            except (OSError, RegistryError, ValueError, TypeError, KeyError) as exc:
+                raise RegistryTransactionError('audit_damaged', str(exc), commit_state='unknown', operation_id=operation_id) from exc
+        return self.locked(operation)
+
+    def _transaction_ready(self):
+        if self.switch_journal.exists():
+            raise RegistryTransactionError('transaction_pending', 'pending legacy switch; run recover-switch', commit_state='unknown')
+        control = self.control()
+        require(not control or control['status'] == 'completed', 'pending initialization/cutover')
+        if self.audit.exists():
+            self.audit.directories()
+            if self.audit.pending() is not None:
+                raise RegistryTransactionError('transaction_pending', 'pending audit transaction; explicit recover-transaction required', commit_state='unknown')
+            return self.audit.head()
+        return None
+
+    def _prepare_transaction(self, operation_id, intent_digest, intent, result, state, envelope, raw,
+                             after_state, after_era, content, event, action, actor, reason, authority,
+                             *, noop=False, references=None, head=None):
+        op = self._transaction_id(operation_id)
+        last = head['last_committed'] if head else None
+        prior_sha = last['after_sha256'] if last else None
+        return dict(schema=1, op_id=op, operation_id=operation_id, intent_digest=intent_digest,
+            intent=copy.deepcopy(intent), previous={k: head[k] for k in ('op_id', 'prepare_sha256', 'outcome_sha256')} if head else None,
+            at=now(), actor=actor, authority=authority, action=action, reason=reason, disposition='noop' if noop else 'publication',
+            base=dict(era=envelope['era'], revision=state['revision'], document_token=envelope['document_token'],
+                      document_sha256=sha(raw), audit_head=envelope['audit_head']),
+            after=dict(era=after_era, revision=after_state['revision'], document_sha256=sha(content.encode('utf-8')),
+                       audit_head=envelope['audit_head'] if noop else op), event=event,
+            continuity=dict(kind=('managed_match' if sha(raw) == prior_sha else 'unmanaged_change_observed') if last else 'unanchored',
+                            previous_committed_sha256=prior_sha), references=references or {}, result=copy.deepcopy(result))
+
+    def _outcome(self, prepare, status, basis, current):
+        observed_sha = None
+        try:
+            if not self.document.is_symlink():
+                observed_sha = sha(self.document.read_bytes())
+        except OSError:
+            pass
+        return dict(schema=1, op_id=prepare['op_id'], intent_digest=prepare['intent_digest'], prepare_sha256=sha(encoded(prepare)),
+                    status=status, basis=basis, recorded_at=now(),
+                    observed=dict(document_sha256=observed_sha, era=current['era'] if current else None,
+                                  revision=current['state']['revision'] if current else None, current_valid=current is not None),
+                    document_token_after=current['document_token'] if current else None,
+                    commit=dict(era=prepare['after']['era'], revision=prepare['after']['revision'],
+                                after_sha256=prepare['after']['document_sha256']) if status == 'COMMITTED' else None)
+
+    def _publish_transaction(self, prepare, content, raw, stat, before_publication=None):
+        """One current replace, never rollback or replay after any uncertain error."""
+        entered_publication = False
+        try:
+            self.audit.begin(prepare)
+            if before_publication:
+                before_publication()
+            if prepare['disposition'] == 'publication':
+                fd, temp = tempfile.mkstemp(prefix='.' + self.document.name + '-', dir=self.document.parent)
+                try:
+                    with os.fdopen(fd, 'wb') as out:
+                        out.write(content.encode('utf-8'))
+                        out.flush()
+                        os.fsync(out.fileno())
+                    self.transaction_checkpoint('current_temp_synced')
+                    self.recheck(raw, stat)
+                    self.transaction_checkpoint('current_before_replace')
+                    entered_publication = True
+                    os.replace(temp, self.document)
+                    self.transaction_checkpoint('current_replaced')
+                    sync_directory(self.document.parent)
+                    self.transaction_checkpoint('current_synced')
+                finally:
+                    if os.path.exists(temp):
+                        os.unlink(temp)
+            current = self._safe_snapshot()
+            status = 'NOT_APPLICABLE' if prepare['disposition'] == 'noop' else 'COMMITTED'
+            outcome = self._outcome(prepare, status, 'locked_no_change' if status == 'NOT_APPLICABLE' else 'live_replace_synced', current)
+            self.audit.write(self.audit.outcome_path(prepare['op_id']), outcome, immutable=True, phase='outcome')
+            self._finalize_references(prepare, outcome)
+            self.audit.finish(prepare, outcome)
+            return self._status(prepare['operation_id'], prepare['intent_digest'])
+        except Exception as exc:
+            # Even a pre-publication failure may have left durable pending evidence.
+            # Only explicit recovery terminalizes it; it never re-executes change().
+            raise RegistryTransactionError('commit_unknown' if entered_publication else 'transaction_pending',
+                'transaction requires explicit metadata recovery: ' + str(exc),
+                commit_state='unknown' if entered_publication else 'not_committed', retryable=False,
+                operation_id=prepare['operation_id']) from exc
+
+    def transact_current(self, operation_id, intent_digest, intent, expected_document, change, *,
+                         action, actor, reason, authority, persist_noop=False):
+        text(intent_digest, 'intent digest')
+        encoded(intent)  # refuse non-JSON/NaN before any effect
+        for label, value in [('action', action), ('actor', actor), ('reason', reason)]:
+            text(value, label)
+        require(authority is None or isinstance(authority, str), 'authority must be string or null')
+        def operation():
+            try:
+                status = self._status(operation_id, intent_digest)
+                if status['prepare'] is not None:
+                    return status  # lookup precedes stale CAS and callback/domain conditions
+                head = self._transaction_ready()
+            except RegistryTransactionError:
+                raise
+            except (RegistryError, OSError, ValueError, KeyError, TypeError) as exc:
+                raise RegistryTransactionError('audit_damaged', str(exc), operation_id=operation_id) from exc
+            try:
+                state, envelope, raw, stat = self.read_document()
+            except (RegistryError, OSError, UnicodeError) as exc:
+                raise RegistryTransactionError('registry_invalid' if self.document.exists() else 'registry_unavailable', str(exc), operation_id=operation_id) from exc
+            if envelope['storage_format'] != getattr(document_codec, 'SPLIT_FORMAT', 'responsibility-registry/v3'):
+                raise RegistryTransactionError('storage_not_migrated', 'explicit migrate-storage required before current transactions', operation_id=operation_id)
+            if expected_document != envelope['document_token']:
+                raise RegistryTransactionError('document_conflict', 'stale expected document; query and decide deliberately', retryable=True, operation_id=operation_id)
+            before = copy.deepcopy(state)
+            changed = copy.deepcopy(state)
+            result = change(changed, envelope['era'])
+            require(isinstance(result, dict), 'transaction callback must return a JSON object')
+            encoded(result)
+            require(set(changed) == set(before) and changed['version'] == before['version'] and changed['revision'] == before['revision'],
+                    'callback cannot change version/revision/current envelope')
+            validate_current(changed)
+            noop = changed == before
+            if noop and not persist_noop:
+                return dict(transaction_id=self._transaction_id(operation_id), prepare=None, outcome=None,
+                            result=result, current=self._snapshot(), pending=False)
+            era = str(uuid.uuid4()) if envelope['era'] == TEMPLATE_ERA and not noop else envelope['era']
+            require(envelope['era'] != TEMPLATE_ERA or noop or action == 'register', 'blank template first mutation must be registration')
+            event = None
+            if not noop:
+                changed['revision'] += 1
+                event = changed_event(before, changed, action, actor, reason, authority, getattr(change, 'event_args', None))
+                document_codec.validate_event(event, changed['revision'])
+            op = self._transaction_id(operation_id)
+            content = raw.decode('utf-8') if noop else document_codec.serialize_current_document(changed, era, op)
+            if not noop:
+                require(document_codec.parse_store_document(content)[:2] == (changed, era), 'current serialization mismatch')
+            prepare = self._prepare_transaction(operation_id, intent_digest, intent, result, before, envelope, raw,
+                changed, era, content, event, action, actor, reason, authority, noop=noop, head=head)
+            return self._publish_transaction(prepare, content, raw, stat)
+        return self.locked(operation)
+
+    def recover_transaction(self, actor, reason, authority, expected_document=None):
+        """Metadata-only explicit reconciliation. Never publishes prepared current."""
+        self.switch_authority(actor, reason, authority)
+        def operation():
+            require(not self.switch_journal.exists(), 'legacy switch pending; recover-switch first')
+            try:
+                self.audit.directories()
+                pending = self.audit.pending()
+                require(pending is not None, 'no pending transaction')
+                prepare = pending['prepare']
+                current = self._safe_snapshot()
+                if expected_document is not None:
+                    require(current is not None and expected_document == current['document_token'], 'stale expected document before recovery')
+                existing, outcome = self.audit.lookup(prepare['op_id'])
+                require(existing is None or existing == prepare, 'journal/final prepare conflict')
+                # Journal-first payload preserves a missing final, never reconstructs current.
+                self.audit.write(self.audit.prepare_path(prepare['op_id']), prepare, immutable=True, phase='prepare')
+                if outcome is None:
+                    exact = current is not None and not self.document.is_symlink() and sha(self.document.read_bytes()) == prepare['after']['document_sha256']
+                    exact = exact and current['era'] == prepare['after']['era'] and current['state']['revision'] == prepare['after']['revision']
+                    if prepare['disposition'] == 'noop' and exact:
+                        status, basis = 'NOT_APPLICABLE', 'recovered_exact_noop_observation'
+                    elif exact and current['audit_head'] == prepare['op_id']:
+                        sync_directory(self.document.parent)
+                        status, basis = 'COMMITTED', 'recovered_exact_after'
+                    else:
+                        status, basis = 'PUBLICATION_UNKNOWN', 'recovery_current_not_exact_after'
+                    outcome = self._outcome(prepare, status, basis, current)
+                self._finalize_references(prepare, outcome)
+                self.audit.finish(prepare, outcome)
+                return self._status(prepare['operation_id'], prepare['intent_digest'])
+            except RegistryTransactionError:
+                raise
+            except (OSError, RegistryError, ValueError, TypeError, KeyError) as exc:
+                raise RegistryTransactionError('audit_damaged', str(exc), commit_state='unknown') from exc
+        return self.locked(operation)
+
+    def _finalize_references(self, prepare, outcome):
+        record = prepare['references'].get('backup_record')
+        if record is None:
+            return
+        record = copy.deepcopy(record)
+        status = outcome['status']
+        record['status'] = 'completed' if status == 'COMMITTED' else ('aborted' if status == 'ABORTED' else 'superseded-manual')
+        if status not in ('COMMITTED', 'ABORTED'):
+            record['reconciliation'] = dict(observed_sha256=outcome['observed']['document_sha256'] or '0' * 64, journal_phase=status)
+        records = self.read_backup_index()
+        prior = next((value for value in records if value['id'] == record['id']), None)
+        if prior is not None:
+            require(all(prior[key] == value for key, value in record.items() if key not in ('status', 'reconciliation')), 'backup index/transaction mismatch')
+            records[records.index(prior)] = record
+        else:
+            records.append(record)
+        self.write_backup_index(records)
+
+    def _history_at(self, op):
+        """Hydrate the explicitly requested logical history, never current authority."""
+        events, seen = [], set()
+        while op is not None:
+            require(op not in seen, 'cyclic current audit ancestry')
+            seen.add(op)
+            prepare, outcome = self.audit.lookup(op)
+            require(prepare is not None and outcome is not None and outcome['status'] == 'COMMITTED', 'current history locator has no committed evidence')
+            refs = prepare['references']
+            if prepare['event'] is not None:
+                events.append(prepare['event'])
+            if 'history_checkpoint' in refs:
+                checkpoint = self.audit.read(self.audit.checkpoints / (identifier(refs['history_checkpoint']) + '.json'))
+                return checkpoint['history'] + list(reversed(events))
+            if refs.get('history_reset'):
+                return list(reversed(events))
+            if 'legacy_archive' in refs:
+                archive = identifier(refs['legacy_archive'])
+                raw = read_private(self.audit.legacy / (archive + '.md'))
+                manifest = self.audit.read(self.audit.legacy / (archive + '.manifest.json'))
+                require(sha(raw) == manifest['sha256'] and len(raw) == manifest['bytes'], 'legacy archive digest mismatch')
+                legacy, _ = parse_document(raw.decode('utf-8'))
+                return legacy['history'] + list(reversed(events))
+            op = prepare['base']['audit_head']
+        return list(reversed(events))
+
+    def history_snapshot(self):
+        def operation():
+            state, envelope, _, _ = self.read_document()
+            self.envelope = envelope
+            if 'history' not in state:
+                state = dict(state, history=self._history_at(envelope['audit_head']))
+            return state
+        return self.locked(operation)
+
+    def query_current(self, args, include_history=False):
+        def operation():
+            state, envelope, _, _ = self.read_document()
+            self.envelope = envelope
+            if include_history:
+                if 'history' not in state:
+                    state = dict(state, history=self._history_at(envelope['audit_head']))
+            else:
+                state = current_fields(state)
+            result = dict(query(state, args), **envelope)
+            if include_history and self.audit.exists():
+                result['audit_attempts'] = self.audit.history()
+            return result
+        return self.locked(operation)
+
+    def mutate_cli(self, args, payload):
+        snapshot = self.current_snapshot()
+        if snapshot['format'] == FORMAT:
+            return self.run(lambda state: mutate(state, args, payload), expected_document=args.expected_document)
+        operation_id = getattr(args, 'operation_id', None) or str(uuid.uuid4())
+        intent = dict(command=args.command, arguments={k: v for k, v in vars(args).items()
+                      if k not in ('root', 'document', 'input', 'expected_document', 'operation_id')}, payload=payload)
+        digest = sha(encoded(intent))
+        def change(state, era):
+            return mutate_records(state, args, payload)
+        change.event_args = args
+        reason = payload['appointment'] if args.command == 'register' else args.reason
+        status = self.transact_current(operation_id, digest, intent, args.expected_document, change,
+            action=args.command, actor=args.actor, reason=reason, authority=args.authority)
+        if status['pending']:
+            raise RegistryTransactionError('transaction_pending', 'operation pending; explicit recover-transaction required', commit_state='unknown', operation_id=operation_id)
+        if status['outcome'] and status['outcome']['status'] not in ('COMMITTED', 'NOT_APPLICABLE'):
+            raise RegistryTransactionError('commit_unknown', 'operation did not obtain a committed outcome', commit_state='unknown', operation_id=operation_id)
+        result = dict(status['result'], operation_id=operation_id, transaction_id=status['transaction_id'])
+        current = status['current']
+        if current:
+            result.update(era=current['era'], revision=current['state']['revision'], document_token=current['document_token'],
+                          storage_format=current['format'], audit_head=current['audit_head'])
+        return result
+
+    def migrate_storage(self, expected_document, actor, reason, authority, operation_id=None):
+        self.switch_authority(actor, reason, authority)
+        operation_id = operation_id or str(uuid.uuid4())
+        intent = dict(action='migrate-storage', store_id=self.store_id, actor=actor, reason=reason, authority=authority)
+        digest = sha(encoded(intent))
+        def operation():
+            status = self._status(operation_id, digest)
+            if status['prepare'] is not None:
+                return status
+            head = self._transaction_ready()
+            state, envelope, raw, stat = self.read_document()
+            require(envelope['storage_format'] == FORMAT, 'migrate-storage requires legacy v2; no implicit remigration')
+            if expected_document != envelope['document_token']:
+                raise RegistryTransactionError('document_conflict', 'stale expected document before storage migration', retryable=True, operation_id=operation_id)
+            op = self._transaction_id(operation_id)
+            # Exact original bytes, not a reconstructed v2 serialization.
+            manifest = dict(schema=1, archive_id=op, sha256=sha(raw), bytes=len(raw), era=envelope['era'],
+                            revision=state['revision'], format=FORMAT, document=str(self.document))
+            self.audit.archive(op, raw, manifest)
+            desired = current_fields(state)
+            content = document_codec.serialize_current_document(desired, envelope['era'], op)
+            prepare = self._prepare_transaction(operation_id, digest, intent, dict(migrated=True, legacy_archive=op),
+                desired, envelope, raw, desired, envelope['era'], content, None, 'migrate-storage', actor, reason, authority,
+                references=dict(legacy_archive=op), head=head)
+            return self._publish_transaction(prepare, content, raw, stat)
+        return self.locked(operation)
 
     def control(self):
         path = self.root / 'document-control.json'
@@ -349,10 +736,14 @@ class Store:
                         'pending initialization/cutover; explicit recovery required before mutation')
                 require(expected_document == envelope['document_token'],
                         'stale expected document; query current Markdown and decide again deliberately')
+            if expected_document is not None and self.audit.exists():
+                require(self.audit.pending() is None, 'pending audit transaction; run recover-transaction')
             original = copy.deepcopy(state)
             result = fn(state)
-            validate(state)
+            split = envelope['storage_format'] == 'responsibility-registry/v3'
+            (validate_current if split else validate)(state)
             if state != original:
+                require(not split, 'v3 managed mutations require transact_current, not legacy full-state run')
                 require(expected_document is not None, 'every mutation requires --expected-document from current query')
                 era = str(uuid.uuid4()) if envelope['era'] == TEMPLATE_ERA else envelope['era']
                 require(envelope['era'] != TEMPLATE_ERA or
@@ -396,7 +787,7 @@ class Store:
             self.document.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
             control = dict(kind='initialization', status='pending', document=str(self.document))
             atomic_write(self.root / 'document-control.json', json.dumps(control) + '\n')
-            exclusive_file(self.document, serialize_document(empty(), TEMPLATE_ERA))
+            exclusive_file(self.document, document_codec.serialize_current_document(current_fields(empty()), TEMPLATE_ERA))
             control['status'] = 'completed'
             atomic_write(self.root / 'document-control.json', json.dumps(control) + '\n')
             return dict(initialized=True, era=TEMPLATE_ERA, revision=0)
@@ -408,9 +799,9 @@ class Store:
             require(control and control.get('kind') == 'initialization' and control.get('status') == 'pending',
                     'no pending initialization')
             require(control['document'] == str(self.document), 'initialization document mismatch')
-            content = serialize_document(empty(), TEMPLATE_ERA).encode()
+            content = document_codec.serialize_current_document(current_fields(empty()), TEMPLATE_ERA).encode()
             if self.document.exists():
-                require(self.document.read_bytes() == content, 'pending initialization diverged; preserve and reconcile explicitly')
+                require(self.document.read_bytes() in [content, serialize_document(empty(), TEMPLATE_ERA).encode()], 'pending initialization diverged; preserve and reconcile explicitly')
             else:
                 exclusive_file(self.document, content)
             control['status'] = 'completed'
@@ -556,7 +947,7 @@ class Store:
         for record in records:
             keys(record, ['id', 'sequence', 'time', 'action', 'actor', 'reason', 'authority', 'snapshot', 'sha256',
                           'status', 'summary', 'before_token', 'after_sha256', 'after_era', 'target_id', 'readiness_changes'],
-                 ['reconciliation'])
+                 ['reconciliation', 'storage_format', 'audit_checkpoint', 'audit_checkpoint_sha256'])
             require(record['id'] not in seen and type(record['sequence']) is int and record['sequence'] > 0,
                     'duplicate/invalid backup ID/sequence')
             seen.add(record['id'])
@@ -607,7 +998,15 @@ class Store:
         require(not directory.is_symlink() and not path.is_symlink() and path.is_file(), 'snapshot missing or symlink; preserve current')
         raw = path.read_bytes()
         require(hashlib.sha256(raw).hexdigest() == record['sha256'], 'snapshot hash mismatch; preserve current')
-        state, era = parse_document(raw.decode('utf-8'))
+        if record.get('storage_format') == 'responsibility-registry/v3':
+            state, era, _ = document_codec.parse_store_document(raw.decode('utf-8'))
+            checkpoint = self.audit.read(self.audit.checkpoints / (identifier(record['audit_checkpoint']) + '.json'))
+            require(sha(encoded(checkpoint)) == record['audit_checkpoint_sha256'] and checkpoint['current_sha256'] == sha(raw), 'backup audit checkpoint mismatch')
+            require(checkpoint['era'] == era and checkpoint['revision'] == state['revision'], 'backup checkpoint current mismatch')
+            for event in checkpoint['history']:
+                document_codec.validate_event(event, event['revision'])
+        else:
+            state, era = parse_document(raw.decode('utf-8'))
         return raw, state, era
 
     def backup_candidates(self):
@@ -650,12 +1049,103 @@ class Store:
         text(reason, 'user switch reason')
         text(authority, 'direct user authorization evidence')
 
+    def _write_checkpoint(self, checkpoint_id, raw, state, envelope, history=None):
+        self.audit.directories(create=True)
+        attempts = self.audit.history()
+        archives = {}
+        for attempt in attempts:
+            archive = attempt['prepare']['references'].get('legacy_archive')
+            if archive:
+                manifest = self.audit.read(self.audit.legacy / (identifier(archive) + '.manifest.json'))
+                archived = read_private(self.audit.legacy / (archive + '.md'))
+                require(sha(archived) == manifest['sha256'], 'checkpoint legacy archive hash mismatch')
+                archives[archive] = manifest
+        value = dict(schema=1, checkpoint_id=checkpoint_id, current_sha256=sha(raw), era=envelope['era'],
+                     revision=state['revision'], audit_head=envelope.get('audit_head'), head=self.audit.head(),
+                     history=self._history_at(envelope.get('audit_head')) if history is None else history,
+                     attempts=attempts, legacy_archives=archives)
+        self.audit.write(self.audit.checkpoints / (identifier(checkpoint_id) + '.json'), value,
+                         immutable=True, phase='backup_checkpoint')
+        return value
+
+    def _switch_split(self, action, expected_document, actor, reason, authority, target, state, envelope, raw, stat):
+        if expected_document != envelope['document_token']:
+            raise RegistryTransactionError('document_conflict', 'stale expected document before switch', retryable=True)
+        head = self._transaction_ready()
+        records = self.read_backup_index()
+        require(not any(r['status'] in ('pending', 'switched-index-incomplete') for r in records), 'pending backup index; recover explicitly')
+        selected = self.resolve_backup(text(target, 'restore target')) if action == 'restore' else None
+        selected_raw, desired, selected_era = self.snapshot_bytes(selected) if selected else (None, current_fields(empty()), None)
+        desired = copy.deepcopy(current_fields(desired))
+        new_era, operation_id = str(uuid.uuid4()), str(uuid.uuid4())
+        op = self._transaction_id(operation_id)
+        content = document_codec.serialize_current_document(desired, new_era, op)
+        timestamp = datetime.now(timezone.utc).isoformat(timespec='seconds')
+        sequence = max((record['sequence'] for record in records), default=0) + 1
+        backup_id = f'{timestamp}-{sequence:06d}-{uuid.uuid4()}'
+        checkpoint_id = str(uuid.uuid4())
+        checkpoint = self._write_checkpoint(checkpoint_id, raw, state, envelope)
+        owners = state['owners']
+        def parent_name(parent):
+            return 'user' if parent == 'user' else owners.get(parent[6:], {}).get('name', parent + ' (unresolved)')
+        summary = dict(era=envelope['era'], revision=state['revision'], owners=len(owners),
+            assignments=len(state['assignments']), coordination=len(state['coordination']), history=len(checkpoint['history']),
+            roots=[o['name'] + ' / ' + o['role'] + ' (' + oid + ')' for oid, o in owners.items() if o['parent'] == 'user'],
+            relations=[parent_name(o['parent']) + ' → ' + o['name'] + ' / ' + o['role'] + ' (' + oid + ')' for oid, o in owners.items()])
+        readiness_changes = {}
+        for cid, agreement in desired['coordination'].items():
+            legacy_ready = agreement_view(desired, agreement, legacy=True)['agreement_ready']
+            ready = agreement_view(desired, agreement)['agreement_ready']
+            if legacy_ready != ready:
+                readiness_changes[cid] = dict(legacy_ready=legacy_ready, restored_ready=ready,
+                                              reasons=agreement_view(desired, agreement)['not_ready_reasons'])
+        record = dict(id=backup_id, sequence=sequence, time=timestamp, action=action, actor=actor, reason=reason,
+            authority=authority, snapshot='backups/' + backup_id + '.md', sha256=sha(raw), status='pending', summary=summary,
+            before_token=envelope['document_token'], after_sha256=sha(content.encode()), after_era=new_era,
+            target_id=selected['id'] if selected else None, readiness_changes=readiness_changes,
+            storage_format='responsibility-registry/v3', audit_checkpoint=checkpoint_id, audit_checkpoint_sha256=sha(encoded(checkpoint)))
+        directory = self.document.parent / 'backups'
+        require(not directory.is_symlink(), 'backups directory cannot be symlink')
+        directory.mkdir(mode=0o700, exist_ok=True)
+        directory.chmod(0o700)
+        exclusive_file(self.document.parent / record['snapshot'], raw)
+        self.snapshot_bytes(record)
+        references = dict(backup_record=record, before_backup=backup_id)
+        if selected:
+            if selected.get('storage_format') == 'responsibility-registry/v3':
+                references['history_checkpoint'] = selected['audit_checkpoint']
+            else:
+                # Legacy backup remains untouched; its complete history is preserved
+                # in a new immutable checkpoint for the newly published v3 era.
+                full, old_era = parse_document(selected_raw.decode('utf-8'))
+                target_checkpoint = str(uuid.uuid4())
+                self._write_checkpoint(target_checkpoint, selected_raw, full,
+                    dict(era=old_era, audit_head=None), history=full['history'])
+                references['history_checkpoint'] = target_checkpoint
+            references['restore_target'] = selected['id']
+        else:
+            references['history_reset'] = True
+        intent = dict(action=action, actor=actor, reason=reason, authority=authority, restore_target=record['target_id'])
+        prepare = self._prepare_transaction(operation_id, sha(encoded(intent)), intent,
+            dict(action=action, backup=record['snapshot'], restored_from=record['target_id'], readiness_changes=readiness_changes),
+            state, envelope, raw, desired, new_era, content, None, action, actor, reason, authority, references=references, head=head)
+        status = self._publish_transaction(prepare, content, raw, stat,
+            before_publication=lambda: (self.write_backup_index(records + [record]), self.switch_checkpoint('prepared')))
+        current = status['current']
+        result = dict(status['result'], operation_id=operation_id, transaction_id=status['transaction_id'])
+        if current:
+            result.update(era=current['era'], revision=current['state']['revision'], document_token=current['document_token'])
+        return result
+
     def switch_document(self, action, expected_document, actor, reason, authority, target=None):
         """Explicit backed-up clear/restore. No history replay or execution restart."""
         self.switch_authority(actor, reason, authority)
         require(action in ['clear', 'restore'], 'invalid switch action')
         def operation():
             state, envelope, raw, stat = self.read_document()
+            if envelope['storage_format'] == 'responsibility-registry/v3':
+                return self._switch_split(action, expected_document, actor, reason, authority, target, state, envelope, raw, stat)
+            require(not self.audit.exists() or self.audit.pending() is None, 'pending audit transaction; run recover-transaction')
             require(expected_document == envelope['document_token'], 'stale expected document; reread current Markdown before switch')
             control = self.control()
             require(not control or control['status'] == 'completed', 'pending cutover; recover explicitly before switch')
@@ -761,6 +1251,7 @@ class Store:
         def operation():
             state, envelope, raw, stat = self.read_document()
             require(envelope['document_token'] == expected_document, 'stale expected document before recovery')
+            require(not self.audit.exists() or self.audit.pending() is None, 'audit transaction pending; run recover-transaction')
             require(self.switch_journal.exists(), 'no pending switch to recover')
             journal = parse_json(self.switch_journal.read_text(encoding='utf-8'))
             record = journal['record']
@@ -817,11 +1308,11 @@ def authorize(actor, oid, state=None):
     require(actor in permitted, f'actor must be responsible owner {oid}, authorized immediate superior (handover), or explicitly authorized user')
 
 
-def mutate(state, args, payload):
+def mutate_records(state, args, payload):
+    """Shared business mutation. Does not own revision or history."""
     action, actor = args.command, args.actor
     text(actor, 'actor')
     state.setdefault('coordination', {})
-    before = {kind: copy.deepcopy(state[kind]) for kind in ['owners', 'assignments', 'coordination']}
     stamp = now()
     occurred = occurrence(args, stamp)
     if action == 'handover':
@@ -928,20 +1419,35 @@ def mutate(state, args, payload):
                 state['assignments'][args.new_assignment] = new
                 a.update(status='handed-over', successor=args.new_assignment, end_reason=reason, updated_at=stamp,
                          end_time=occurred, handover_request=handover_request(args))
-    validate({**state, 'history': state['history'], 'revision': state['revision']})
+    validate_current(current_fields(state))
+    return {'action': action}
+
+
+def changed_event(before, state, action, actor, reason, authority, args=None):
+    stamp = now()
+    snapshots = {side: {kind: {key: copy.deepcopy(records[key]) for key in records
+                              if before[kind].get(key) != state[kind].get(key)}
+                        for kind, records in ((kind, value[kind]) for kind in ('owners', 'assignments', 'coordination'))}
+                 for side, value in [('before', before), ('after', state)]}
+    occurred = occurrence(args, stamp)
+    return dict(revision=state['revision'], id=f'event-{state["revision"]:08d}',
+                at=datetime.fromisoformat(stamp).isoformat(timespec='seconds'), occurred=occurred,
+                actor=actor, authority=authority, action=action, reason=reason,
+                changes=semantic_changes(before, state, action, args), **snapshots)
+
+
+def mutate(state, args, payload):
+    """Legacy full-state API retains its complete input/history behavior."""
+    before = {kind: copy.deepcopy(state.get(kind, {})) for kind in ('owners', 'assignments', 'coordination')}
+    result = mutate_records(state, args, payload)
+    if result.get('unchanged'):
+        return result
+    validate(state)
     state['revision'] += 1
-    after = {kind: state[kind] for kind in ['owners', 'assignments', 'coordination']}
-    # Store only changed records, with full before/after snapshots for meaningful audit.
-    changes = {side: {kind: {key: copy.deepcopy(records[key]) for key in records
-                            if before[kind].get(key) != after[kind].get(key)}
-                      for kind, records in snapshot.items()}
-               for side, snapshot in [('before', before), ('after', after)]}
-    state['history'].append(dict(revision=state['revision'], id=f'event-{state["revision"]:08d}',
-                                 at=datetime.fromisoformat(stamp).isoformat(timespec='seconds'), occurred=occurred,
-                                 actor=actor, authority=getattr(args, 'authority', None), action=action,
-                                 reason=reason, changes=semantic_changes(before, state, action, args),
-                                 before=changes['before'], after=changes['after']))
-    return {'revision': state['revision'], 'action': action}
+    reason = payload['appointment'] if args.command == 'register' else args.reason
+    state['history'].append(changed_event(before, state, args.command, args.actor, reason,
+                                           getattr(args, 'authority', None), args))
+    return dict(result, revision=state['revision'])
 
 
 def query(state, args):
@@ -963,17 +1469,21 @@ def query(state, args):
     current = {aid: dict(owner=owner_fact(state['owners'], a['owner']), project=a['project'], task=a['task'],
                          superior=state['owners'][a['owner']]['parent'], handover_obligations=a.get('handover_obligations'))
                for aid, a in selected.items() if a['status'] == 'active'}
-    history = [event for event in state['history'] if not any([args.owner, args.project, args.task, args.repo]) or
+    history = [event for event in state.get('history', []) if not any([args.owner, args.project, args.task, args.repo]) or
                any(d.get('from_assignment') in selected or d.get('to_assignment') in selected
                    or (args.owner and args.owner in [(d.get('old_owner') or {}).get('id'), (d.get('new_owner') or {}).get('id')])
                    for d in event.get('changes', []))]
-    return dict(revision=state['revision'], assignments=selected, current_owners=current, history=history, coordination=agreements,
+    result = dict(revision=state['revision'], assignments=selected, current_owners=current, coordination=agreements,
+                history_loaded='history' in state,
                 owners={oid: o for oid, o in state['owners'].items() if oid in ids},
                 hierarchy=[dict(owner=oid, parent=o['parent'],
                                 parent_resolved=o['parent'] == 'user' or o['parent'][6:] in state['owners'],
                                 children=[k for k, v in state['owners'].items() if v['parent'] == 'owner:' + oid])
                            for oid, o in state['owners'].items() if oid in ids],
                 relations=[dict(source=aid, status=a['status'], target=d) for aid, a in selected.items() for d in a['depends_on']])
+    if 'history' in state:
+        result['history'] = history
+    return result
 
 
 def main(argv=None):
@@ -986,9 +1496,11 @@ def main(argv=None):
     report = commands.add_parser('rebuild', help='non-authoritative report to stdout or explicit --output, never dashboard.md')
     report.add_argument('--output', type=Path)
     commands.add_parser('backup-list', help='historical completed snapshot candidates; never current authority')
-    for command in ['clear', 'restore', 'recover-switch']:
+    for command in ['clear', 'restore', 'recover-switch', 'migrate-storage', 'recover-transaction']:
         p = commands.add_parser(command)
-        p.add_argument('--expected-document', required=True)
+        p.add_argument('--expected-document', required=command != 'recover-transaction')
+        if command == 'migrate-storage':
+            p.add_argument('--operation-id')
         p.add_argument('--actor', required=True)
         p.add_argument('--reason', required=True)
         p.add_argument('--authority', required=True, help='actual direct user authorization evidence')
@@ -998,9 +1510,14 @@ def main(argv=None):
     for name in ['owner', 'project', 'task', 'repo']:
         q.add_argument('--' + name)
     q.add_argument('--active', action='store_true')
+    q.add_argument('--history', action='store_true', help='explicitly hydrate legacy and committed audit history')
+    audit = commands.add_parser('audit', help='explicit private audit evidence; never current authorization')
+    audit.add_argument('--operation-id')
+    audit.add_argument('--intent-digest')
     for name in ['register', 'update-owner', 'update', 'close', 'handover', 'coord-propose', 'coord-ack', 'coord-release']:
         p = commands.add_parser(name)
         p.add_argument('--expected-document', required=True, help='opaque token from a deliberate current query')
+        p.add_argument('--operation-id', help='stable retry ID for split-storage transaction')
         p.add_argument('--actor', required=True, help='owner ID or user; authorization attestation, not authentication')
         p.add_argument('--authority', help='known authorization/decision evidence; absent remains unknown')
         p.add_argument('--occurred-at', help='known ISO seconds+timezone, or approximate human description')
@@ -1035,6 +1552,16 @@ def main(argv=None):
             result = store.recover_initialization()
         elif args.command in ['migrate', 'resume-migration']:
             result = store.migrate(resume=args.command == 'resume-migration')
+        elif args.command == 'migrate-storage':
+            result = store.migrate_storage(args.expected_document, args.actor, args.reason, args.authority, args.operation_id)
+        elif args.command == 'recover-transaction':
+            result = store.recover_transaction(args.actor, args.reason, args.authority, args.expected_document)
+        elif args.command == 'audit':
+            if args.operation_id:
+                require(args.intent_digest is not None, 'operation audit requires --intent-digest')
+                result = store.operation_status(args.operation_id, args.intent_digest)
+            else:
+                result = store.locked(lambda: dict(attempts=store.audit.history() if store.audit.exists() else []))
         elif args.command == 'backup-list':
             result = store.locked(lambda: dict(backups=store.backup_candidates()))
         elif args.command in ['clear', 'restore']:
@@ -1042,7 +1569,8 @@ def main(argv=None):
         elif args.command == 'recover-switch':
             result = store.recover_switch(args.expected_document, args.actor, args.reason, args.authority)
         elif args.command == 'rebuild':
-            result = store.run(lambda s: dict(report=dashboard(s, store.envelope['era'])))
+            state = store.history_snapshot()
+            result = dict(report=dashboard(state, store.envelope['era']))
             if args.output is None:
                 print(result['report'])
                 return 0
@@ -1052,18 +1580,23 @@ def main(argv=None):
                                    (store.root / 'document-control.json').resolve(), (store.root / 'switch-pending.json').resolve(),
                                    (store.document.parent / 'BACKUPS.md').resolve()] and
                     (store.document.parent / 'backups').resolve() not in [output, *output.parents] and
+                    store.audit.path.resolve() not in [output, *output.parents] and
                     not (output.parent == store.root.resolve() and output.name.startswith('legacy-')),
                     'report output cannot replace authority, legacy tombstone or backups')
             atomic_write(output, result.pop('report'))
             result['output'] = str(output)
         elif args.command == 'query':
-            result = store.run(lambda s: query(s, args))
+            result = store.query_current(args, include_history=args.history)
         else:
-            result = store.run(lambda s: mutate(s, args, payload), expected_document=args.expected_document)
+            result = store.mutate_cli(args, payload)
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0
     except (RegistryError, OSError, ValueError, TypeError, KeyError) as exc:
-        print(f'ERROR: {exc}', file=sys.stderr)
+        if isinstance(exc, RegistryTransactionError):
+            print(json.dumps(dict(error=exc.code, message=str(exc), commit_state=exc.commit_state,
+                                  retryable=exc.retryable, operation_id=exc.operation_id)), file=sys.stderr)
+        else:
+            print(f'ERROR: {exc}', file=sys.stderr)
         return 2
 
 

@@ -68,7 +68,7 @@ class PredecessorTests(unittest.TestCase):
                         '--question-file', str(self.question), '--model', 'fixture/model-not-executed', '--output', str(self.output), ok=ok, env=env)
 
     def state(self):
-        return registry.parse_document(self.document.read_text())[0]
+        return registry.Store(self.root, self.document).history_snapshot()
 
     def test_reset_refuses_old_actor_assignment_and_prepared_plan_remains_historical(self):
         self.prepare()

@@ -56,7 +56,7 @@ class RegistryTests(unittest.TestCase):
         return self.cli('register', '--actor', actor or p['owner']['id'], payload=p, ok=ok)
 
     def state(self):
-        return registry.parse_document(self.document.read_text())[0]
+        return registry.Store(self.root, self.document).history_snapshot()
 
     def test_appointment_hierarchy_lookup_update_handover_close(self):
         p = appointment()
@@ -199,7 +199,8 @@ class RegistryTests(unittest.TestCase):
     def test_corrupt_canonical_preserved_no_silent_reset(self):
         self.register()
         good = self.document.read_text()
-        malformed = ['{bad', good.replace('Revision: 1', 'Revision: 9'), good.replace('Format: responsibility-registry/v2', 'Format: unknown')]
+        # v3 revisions are observed current labels, independent of audit length.
+        malformed = ['{bad', good.replace('Revision: 1', 'Revision: invalid'), good.replace('Format: responsibility-registry/v3', 'Format: unknown')]
         old_dashboard = (self.root / 'report.md').read_bytes()
         for broken in malformed:
             self.document.write_text(broken)

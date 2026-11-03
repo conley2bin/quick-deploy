@@ -37,12 +37,16 @@ class DocumentFixture(unittest.TestCase):
         self.document = self.base / 'skill/RESPONSIBILITIES.md'
         self.store = registry.Store(self.root, self.document)
         self.store.initialize()
+        # This suite preserves legacy v2/full-codec and old-switch coverage.
+        # Real fresh-init v3 publication/fault coverage lives in test_split_storage.
+        self.document.write_text(codec.serialize_document(registry.empty(), codec.TEMPLATE_ERA))
 
     def read(self):
-        return self.store.run(lambda state: copy.deepcopy(state))
+        state = self.store.history_snapshot()
+        return dict(state, **self.store.envelope)
 
     def domain(self):
-        return codec.parse_document(self.document.read_text())[0]
+        return self.store.history_snapshot()
 
     def token(self):
         self.read()
@@ -50,8 +54,8 @@ class DocumentFixture(unittest.TestCase):
 
     def register(self, payload=None, token=None):
         payload = payload or appointment()
-        return self.store.run(lambda s: registry.mutate(s, args(actor=payload['owner']['id']), payload),
-                              expected_document=token or self.token())
+        request = args(actor=payload['owner']['id'], expected_document=token or self.token())
+        return self.store.mutate_cli(request, payload)
 
     def project(self):
         return projection.read_registry(self.root, self.document, SCRIPT.parent / 'registry_document.py')
@@ -402,7 +406,7 @@ class MigrationTests(DocumentFixture):
             with self.subTest(phase=phase), tempfile.TemporaryDirectory() as temp:
                 base = Path(temp)
                 store = registry.Store(base / 'private', base / 'skill/RESPONSIBILITIES.md')
-                store.root.mkdir()
+                store.root.mkdir(mode=0o700)
                 (store.root / 'registry.json').write_text(json.dumps(state))
                 def crash(at):
                     if at == phase:
