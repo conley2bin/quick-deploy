@@ -93,7 +93,9 @@ python3 -m unittest discover -s codoxear/session-handoff/tests -p test_successio
 
 joint 用例直接观察：真实 session-succession event 和新 current binding 均先于 ready 发布/CLI 0/临时 toy 文件动作；保留最新完整非 carrier 图；commit 后仅 ready 发布失败则 CLI 2、无 toy 动作，登记已生效，重试只 get 原 operation/intent，仍为一个 event。另覆盖 no-owner current 字节/mtime/revision/图不变且 event 为零（允许 event:null 的私有 no-op metadata）、新注册/occupied/source swap/reset 阻断、两个并发 CLI 仅一次许可、另一源抢先提交后的同 immutable intent 有界 CAS 重试、A→B→C/reset 后历史 receipt/Engine/check-owner 拒绝，以及临时 HOME 安装布局、任意 cwd、被污染 generic module namespace 下的实际 loader。未启动真实 Pi、浏览器、HTTP 服务或安装器，未读取用户登记；此证据不覆盖模型理解、原生 transport、线上迁移、reader 展示或部署。
 
-首批 joint checkpoint 使用 canonical codec `da0f428`（已与 main `1d13a40` 同 blob，不重复导入）、`5bfb383`、`d1d0373`，core `c727286`，API `5c45d7e` / `3e6390ed` / `6f651dff`，handoff `0349336`。在该 API 版本，合法的同 Pi contact/recovery/graph 更新被误判为 superseded；对应 joint 测试保留为真实失败，未使用 skip/expectedFailure 或替代服务。需 registry peer 的 current-binding 修复原 SHA 后重跑，不能据其他绿例宣称全部闭环。不得使用真实 owner 做 fixture，不在此组件部署/安装/修改 registry。
+首批 joint checkpoint 使用 canonical codec `da0f428`（已与 main `1d13a40` 同 blob，不重复导入）、`5bfb383`、`d1d0373`，core `c727286`，API `5c45d7e` / `3e6390ed` / `6f651dff`，handoff `0349336`。该 API 将合法的同 Pi contact/recovery/graph 更新误判为 superseded，首批结果为 14 绿 / 1 真实失败，未使用 skip/expectedFailure 或替代服务。
+
+完整保留 joint tip `8b5331f` 后，仅消费 peer current-carrier 修复 `9d38f62`，同一命令的 **15 个实际 helper/Store 用例全部通过，无 skip**，不依赖后续 core checkpoint。合法更新后的 fresh API get、`validate_ready`、`Engine._artifact`、`check-owner` 四层均允许仍唯一的目标 Pi；仍只有一个 event，原 intent/receipt 字节与历史 token 不变，最新完整图保留。Pi→C、reset、重复 Pi claim、并发重复许可及 commit 后本地发布失败/get-first 恢复继续通过。canonical API 35 例（含 13 个实际 Store 例）、组件 Python 157 例（原 142 + joint 15，仅既有 native opt-in 例跳过）、JS 37 例亦通过。此结果仅覆盖临时 Store 与 helper，不覆盖真实 Pi attestation 或上线；不得使用真实 owner 做 fixture，不在此组件部署/安装/修改 registry。
 
 ## 验证边界
 
