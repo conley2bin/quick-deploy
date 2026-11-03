@@ -8,7 +8,7 @@
 current_state, era = codec.parse_current_document(lines)
 ```
 
-`lines: Iterable[str]` yields one Unicode text line at a time, either without a terminator or with LF/CRLF. A text stream is suitable. Passing a whole `str`, bytes, non-text items, or multiple lines in one item is rejected.
+`lines: Iterable[str]` yields one Unicode text line at a time, either without a terminator or with LF/CRLF. Passing a whole `str`, bytes, non-text items, or multiple lines in one item is rejected.
 
 The parser consumes the preamble, Owners, Assignments, Coordination, and the exact heading:
 
@@ -41,4 +41,13 @@ These functions return `None` on success and apply the same current-domain check
 
 `parse_document(content)`, `serialize_document(state, era)`, `validate(state)`, and `validate_envelope(state, era)` retain the full-history contract. They still check audit JSON, history/revision length, ordered revisions and event IDs, event fields, closing fence, and trailing structure. Existing Store and CLI operations continue using that contract. A returned current state cannot be serialized or validated as a full state without supplying a real, independently validated history.
 
-Incremental decoding, source accessibility, cooperative locking, read buffering, file-generation checks, and public projection limits belong to the caller. To avoid allocating the audit in the first place, pass a line iterator rather than reading the entire file and then splitting it. The codec's zero-next-line guarantee does not disable read-ahead inside a caller-provided stream or decoder.
+Incremental decoding, source accessibility, cooperative locking, read buffering, file-generation checks, and public projection limits belong to the caller. To avoid allocating the audit in the first place, pass a line iterator rather than reading the entire file and then splitting it.
+
+For a caller-owned binary stream, decode each binary line only when requested:
+
+```python
+lines = (line.decode('utf-8') for line in binary_stream)
+current_state, era = codec.parse_current_document(lines)
+```
+
+Do not use a `TextIOWrapper` when audit bytes must remain undecoded: it may read ahead and decode invalid UTF-8 in History before returning even the first current line. Per-binary-line decoding preserves the boundary: invalid UTF-8 after the History heading is never decoded, while invalid UTF-8 in the current prefix fails. Fixed-size binary buffering may prefetch bytes without logically consuming or decoding audit lines; the codec's zero-next-line guarantee does not control that buffering.

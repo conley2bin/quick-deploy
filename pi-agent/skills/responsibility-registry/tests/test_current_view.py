@@ -79,6 +79,28 @@ class CurrentViewTests(unittest.TestCase):
         self.assertEqual(codec.parse_current_document(enormous_document()), (current(self.state), ERA))
         self.assertEqual(audit_reads, [])
 
+    def test_binary_per_line_decoding_does_not_decode_invalid_utf8_audit(self):
+        raw = self.prefix.encode('utf-8') + b'```json\n[\xff]\n```\n'
+        binary = io.BytesIO(raw)
+        decoded = []
+        def decoded_lines(source):
+            for line in source:
+                decoded.append(line)
+                yield line.decode('utf-8')
+        self.assertEqual(codec.parse_current_document(decoded_lines(binary)), (current(self.state), ERA))
+        self.assertEqual(decoded[-1], (codec.HISTORY + '\n').encode('utf-8'))
+        self.assertEqual(binary.tell(), len(self.prefix.encode('utf-8')))
+        # The full text load still rejects invalid UTF-8 before invoking its codec.
+        with self.assertRaises(UnicodeDecodeError):
+            codec.parse_document(raw.decode('utf-8'))
+        # TextIOWrapper can decode the bad audit while returning its first line.
+        with io.TextIOWrapper(io.BytesIO(raw), encoding='utf-8') as text_stream:
+            with self.assertRaises(UnicodeDecodeError):
+                next(text_stream)
+        bad_prefix = raw.replace(b'| Example alpha |', b'| \xff |')
+        with self.assertRaises(UnicodeDecodeError):
+            codec.parse_current_document(decoded_lines(io.BytesIO(bad_prefix)))
+
     def test_normal_full_and_current_fields_match_for_line_sources(self):
         full, era = codec.parse_document(self.document)
         without_instructions = self.document
