@@ -479,6 +479,8 @@ def shell_segments(command):
 
     def emit(after):
         nonlocal text, declarations, before
+        if not text.strip() and after == '\n' and before in ('&&', '||', '|', '|&'):
+            return  # A blank/comment newline continues the preceding shell list.
         if text.strip():
             try:
                 words = shlex.split(text)
@@ -767,6 +769,32 @@ def python_goal_evidence(code):
     return asserted, printed
 
 
+def assertion_errexit_states(segments):
+    """Literal assertion-only shell normal form; None means unsupported, not success."""
+    forbidden = {'exit', 'exec', 'return', 'logout', 'break', 'continue', 'trap', 'eval', 'source', '.',
+                 'builtin', 'command', 'alias', 'shopt', 'hash', 'enable'}
+    independent = ('', ';', '\n')
+    states, errexit = [], False
+    for segment in segments:
+        if not segment.argv or segment.argv[0] in forbidden:
+            return None
+        states.append(errexit)
+        if segment.argv[0] != 'set':
+            continue
+        if segment.before not in independent or segment.after not in independent:
+            return None
+        words = iter(segment.argv[1:])
+        for word in words:
+            if not re.fullmatch(r'[-+][euxvo]+', word):
+                return None
+            option = next(words, None) if 'o' in word else None
+            if 'o' in word and option not in ('errexit', 'nounset', 'pipefail', 'xtrace'):
+                return None
+            if 'e' in word or option == 'errexit':
+                errexit = word[0] == '-'
+    return states
+
+
 def post_edit_verifications(rows, calls, results, edit_done_row):
     call_rows, result_rows = tool_positions(rows)
     verified = []
@@ -775,22 +803,16 @@ def post_edit_verifications(rows, calls, results, edit_done_row):
                 or call['id'] not in results or results[call['id']].get('isError')):
             continue
         segments = shell_segments(call.get('arguments', {}).get('command', ''))
-        errexit = False
+        errexit_states = assertion_errexit_states(segments)
         for index, segment in enumerate(segments):
-            if segment.argv and segment.argv[0] == 'set':
-                for position, word in enumerate(segment.argv[1:], 1):
-                    if word in ('-o', '+o') and segment.argv[position + 1:position + 2] == ['errexit']:
-                        errexit = word == '-o'
-                    elif word.startswith(('-', '+')) and 'e' in word[1:] and word not in ('-o', '+o'):
-                        errexit = word[0] == '-'
             invocation = python_invocation(segment)
             if (not invocation or invocation.code is None or 'B' not in invocation.flags or 'O' in invocation.flags or
                     'PYTHONOPTIMIZE' in segment.assigns):
                 continue
             asserted, printed = python_goal_evidence(invocation.code)
-            propagates = (segment.before not in ('|', '||', '|&', '&') and
+            propagates = (errexit_states is not None and segment.before not in ('|', '||', '|&', '&') and
                 (all(item.after in ('&&', '') for item in segments[index:]) or
-                 (errexit and segment.after in ('\n', ';', ''))))
+                 (errexit_states[index] and segment.before in ('', ';', '\n') and segment.after in ('', ';', '\n'))))
             lines = [line.rstrip('\r') for line in tool_text(results[call['id']]).split('\n')]
             if (asserted and propagates) or any(line in lines for line in printed):
                 verified.append(call)

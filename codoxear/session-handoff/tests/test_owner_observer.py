@@ -6,6 +6,8 @@ import inspect
 import json
 from pathlib import Path
 import shlex
+import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -34,7 +36,94 @@ def wait_predicate(trace, project, baseline):
     return asyncio.run(namespace['action_done']())
 
 
+def real_shell_trace(template, main_value):
+    """Fresh local Bash oracle; reached/asserted markers live outside task files."""
+    with tempfile.TemporaryDirectory(prefix='owner-observer-shell-') as temp:
+        project = Path(temp) / 'project'
+        project.mkdir()
+        main = project / 'main.py'
+        main.write_text('def result():\n    return "X"\n')
+        baseline = native.project_fingerprint(project)
+        main.write_text(f'def result():\n    return {main_value!r}\n')
+        code = ('from pathlib import Path; Path("../python-ran").touch(); import main; '
+                'assert main.result() == "Y"; Path("../asserted").touch()')
+        command = template.format(python=shlex.quote(sys.executable), code=shlex.quote(code), rawcode=code)
+        env = dict(HOME=temp, PATH='/usr/bin:/bin', GIT_CONFIG_NOSYSTEM='1', GIT_CONFIG_GLOBAL='/dev/null')
+        if 'git diff' in command:
+            subprocess.run(['git', '-c', 'init.defaultBranch=fixture', 'init', '-q'],
+                           cwd=project, env=env, check=True)
+        result = subprocess.run(['/bin/bash', '--noprofile', '--norc', '-c', command],
+                                cwd=project, env=env, capture_output=True, text=True)
+        if main_value == 'Y':
+            native.assert_turn_goal(project, baseline)
+        trace = target_trace(verify=False, ended=False)
+        trace.verify(command, result.stdout + result.stderr)
+        trace.results['verify']['isError'] = result.returncode != 0
+        trace.stop()
+        observation = dict(command=command, main=main_value, exit=result.returncode,
+                           python_ran=(Path(temp) / 'python-ran').exists(),
+                           asserted=(Path(temp) / 'asserted').exists(), output=result.stdout + result.stderr)
+    return trace, observation
+
+
 class ObserverContractsTests(unittest.TestCase):
+    def test_t16_real_bash_assertion_reachability_oracle(self):
+        py = '{python} -B -c {code}'
+        heredoc = "set -e\n{python} -B - <<'PY'\n{rawcode}\nPY\n"
+        # row, main, command, actual (rc, reached Python, completed assertion), accepted
+        cases = [
+            ('N1', 'Y', f"set -e; cd ./not-present && {py}; printf 'final diagnostic\\n'", (0, False, False), False),
+            ('N2', 'Y', f'set -e; false && {py}; true', (0, False, False), False),
+            ('N3', 'X', f'false && set -e; {py}; true', (0, True, False), False),
+            ('N4', 'Y', f'set -e; exit 0; {py}', (0, False, False), False),
+            ('N5', 'X', f"set -e; trap 'exit 0' ERR; {py}", (0, True, False), False),
+            ('N6', 'Y', f"set -e; cd ./not-present &&\n{py}; printf 'final diagnostic\\n'", (0, False, False), False),
+            ('N7', 'Y', f'true ||\n{py}', (0, False, False), False),
+            ('N8', 'X', f'set -e; true && set +e; {py}; true', (0, True, False), False),
+            ('N9', 'Y', f'set -n; {py}', (0, False, False), False),
+            ('N10', 'X', f'{py}; printf done', (0, True, False), False),
+            ('N11', 'Y', f'set -e\nif false; then\n{py}\nfi\ntrue', (0, False, False), False),
+            ('N12', 'Y', f"eval 'exit 0'; {py}", (0, False, False), False),
+            ('N13', 'Y', f'cd ./not-present && {py}', (1, False, False), False),
+            ('P1', 'Y', heredoc + "printf 'diff\\n'", (0, True, True), True),
+            ('P2', 'Y', f'cd . && {py}', (0, True, True), True),
+            ('P3', 'Y', f'set -euo pipefail; {py}; printf done', (0, True, True), True),
+            ('P4', 'Y', py, (0, True, True), True),
+            ('P1-git-diff', 'Y', heredoc + 'git diff', (0, True, True), True),
+        ]
+        for row, main_value, command, measured, expected in cases:
+            with self.subTest(row=row):
+                trace, observed = real_shell_trace(command, main_value)
+                self.assertEqual((observed['exit'], observed['python_ran'], observed['asserted']), measured)
+                self.assertEqual(native.target_turn_state(trace.rows)['state'], 'ended')
+                try:
+                    proofs = check(trace)
+                except AssertionError as exc:
+                    self.assertIn('no recognized successful post-edit', str(exc))
+                    proofs = []
+                accepted = bool(proofs)
+                print('T16 ' + json.dumps(dict(row=row, accepted=accepted, **observed), sort_keys=True))
+                if accepted:
+                    self.assertEqual(observed['exit'], 0)
+                    self.assertTrue(observed['asserted'], 'accepted implies Python reached and asserted Y')
+                self.assertEqual(accepted, expected)
+
+    def test_rev3_literal_normal_form_and_continuations(self):
+        for operator in ('&&', '||', '|', '|&'):
+            with self.subTest(operator=operator):
+                segments = native.shell_segments('echo guard ' + operator + '\n# comment\n\npython -B -c "pass"')
+                self.assertEqual(segments[-1].before, operator)
+        py = 'python -B -c \'import main; assert main.result() == "Y"\''
+        for prefix in ('set -n', 'set -f', 'set --', 'set positional', 'set -o unknown',
+                       'true && set -e', 'set -e && true', 'exit', 'exec', 'return', 'logout',
+                       'break', 'continue', 'trap', 'eval', 'source', '.', 'builtin', 'command',
+                       'alias', 'shopt', 'hash', 'enable'):
+            with self.subTest(prefix=prefix):
+                self.assertIsNone(native.assertion_errexit_states(native.shell_segments(prefix + '; ' + py)))
+        for command in ('set -e; set +o errexit; ' + py,
+                        'set -o errexit; set +e; ' + py):
+            self.assertEqual(native.assertion_errexit_states(native.shell_segments(command)), [False, True, False])
+
     def test_t3_inspection_echo_comment_and_heredoc_are_not_executions(self):
         mentions = [INSPECTION_COMMAND.replace('@HELPER@', shlex.quote(str(HELPER))),
                     'echo "python ' + str(HELPER) + ' check-owner"',
@@ -194,6 +283,7 @@ class ObserverContractsTests(unittest.TestCase):
             ('''python -B -c 'import main; actual = main.result(); print("meets current goal Y =", actual == "Y")' ''', 'meets current goal Y = True\n'),
             ('''python -B -c 'import main; print(f"{main.result()=}")' ''', "main.result()='Y'\n"),
             ('''python -B -c 'import main as m; print("result:", repr(m.result()), str(m.result()))' ''', "result: 'Y' Y\n"),
+            ('''command -v python3; python -B -c 'import main; print(main.result())' ''', 'Y\n'),
         ]
         for command, output in examples:
             with self.subTest(command=command):

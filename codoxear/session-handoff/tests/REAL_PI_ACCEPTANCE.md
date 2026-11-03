@@ -197,6 +197,18 @@ the observer is a bounded recognizer, not a general Bash/Python analyzer. Print
 rendering retains the cooperative-agent boundary: a contrived unrelated print of
 the same line can imitate that evidence.
 
+For assertion evidence, a successful whole Bash command must imply Python actually
+ran: either its final AND chain propagates success, or Python is independent under
+an executed independent errexit setting. All `set` words must use the literal
+`[-+][euxvo]+` whitelist, with `-o`/`+o` options limited to errexit, nounset, pipefail
+or xtrace. Conditional settings, noexec, terminating/hidden-execution/rebinding
+builtins (including `command -v`) put assertion evidence outside the supported
+normal form. Guarded Python followed by an independent successful suffix cannot
+prove execution. Blank/comment newlines preserve AND/OR/pipeline continuation.
+The print-evidence path is unchanged. T16 measures real fresh-temp Bash exit,
+Python-reached and assertion-completed markers: accepted assertion evidence must
+have exit 0 and the completed marker; no Pi or original captured command is run.
+
 `test_owner_observer.py` includes sanitized captured command structures and real
 `handoff_io.main()` serialization under unit mocks. Its captured target skeleton
 fails exactly at missing post-edit verification; adding genuine proof before the
