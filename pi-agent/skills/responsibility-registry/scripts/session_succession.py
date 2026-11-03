@@ -348,10 +348,11 @@ def _binding(snapshot, intent):
     if plan['owner_id'] is None:
         return not _claims(state, plan['source_pi_session_id']) and not _claims(state, target['identity']['pi_session_id'])
     owner = state['owners'].get(plan['owner_id'])
-    return (owner is not None and owner['identity'] == target['identity']
-            and owner.get('recovery') == target['recovery']
-            and _claims(state, target['identity']['pi_session_id']) == [plan['owner_id']]
-            and not _claims(state, plan['source_pi_session_id']))
+    target_pi = target['identity']['pi_session_id']
+    # Frozen metadata proves the original intent, not ongoing carrier identity.
+    return (owner is not None and owner['identity']['source'] == 'current-session'
+            and owner['identity']['pi_session_id'] == target_pi
+            and _claims(state, target_pi) == [plan['owner_id']])
 
 
 def _receipt(record, operation_id, digest):

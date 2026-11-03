@@ -104,11 +104,20 @@ The registry gate allows only:
 
 A durable no-owner disposition writes only private transaction metadata: no owner,
 assignment, current-document write, revision increment or event. A newly
-registered source invalidates that disposition. Fresh current qualification also
-checks era, configured Store, unique target binding and the frozen target
-identity/recovery. A later carrier, era reset or manual replacement identity
-makes an old successful receipt `superseded`, never a new permission. Ordinary
-latest graph/goal/coordination edits do not invalidate a matching carrier.
+registered source invalidates that disposition. For a committed owner receipt,
+`current_binding_valid` checks only the same configured Store and era, existence
+of the frozen stable owner, its identity source remaining `current-session`, its
+actual Pi ID equaling the frozen target Pi ID, and that Pi being claimed by only
+that owner across the current graph. A changed Pi, removed owner, duplicate Pi,
+lost current-session provenance or era reset/restore makes the receipt
+`superseded`.
+
+Legal parent, role, assignment, coordination, contact, unknown-reason and recovery
+updates preserve qualification while the same target Pi remains the unique current
+carrier. Later registration of the old source Pi elsewhere does not change that
+target binding. The complete target identity, recovery and evidence remain frozen
+in the original intent and audit; changing them on retry still conflicts.
+Metadata equality is not a continuation credential.
 
 `get` is strictly read-only. Pending journal evidence or unknown publication
 returns `needs_recovery`, with truthful commit_state; it never repairs journals,
@@ -119,7 +128,8 @@ blocks ready even when a historical commit is known.
 
 Receipt `document_token_after` is a genuine post-publication/recovery observation,
 or null if that observation is unavailable. It is never fabricated from a SHA
-or a stale source token, and it never replaces fresh current flags.
+or a stale source token, and it never replaces fresh current flags. A later
+qualifying current snapshot cannot fill a missing historical token.
 
 The handoff host must finish registry qualification **before** immutable ready
 publication/helper success. If registry commit is known but ready publication
@@ -145,8 +155,10 @@ ordering and read-only behavior; those tests alone do not attest to lock, fsync,
 crash recovery or transaction durability.
 
 A separate `ActualStoreSuccessionTests` group exercises the real Store against
-only temporary registry files: same-operation one-event behavior, latest graph
-preservation/CAS, private no-owner receipts, clear/restore-era supersession,
+only temporary registry files: same-operation one-event behavior, same-Pi contact
+and recovery updates with read-only lookup/retry and unchanged frozen audit,
+latest graph preservation/CAS, private no-owner receipts, missing-owner and
+duplicate-Pi/provenance rejection, clear/restore-era supersession,
 same-operation and different-source concurrent writers, cross-module injected
 Store errors, and publication failure followed by read-only status and explicit
 metadata-only recovery. Valid manual reversion after uncertain publication stays

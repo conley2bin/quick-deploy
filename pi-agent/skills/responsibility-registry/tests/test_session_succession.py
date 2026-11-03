@@ -403,6 +403,57 @@ class SuccessionPolicyTests(unittest.TestCase):
         self.assertEqual(result['error']['code'], 'operation_intent_mismatch')
         self.assertEqual(len(self.store.events), 1)
 
+    def test_current_carrier_survives_legal_metadata_and_old_source_registration(self):
+        changes = [
+            lambda s: s['owners']['alpha']['identity'].update(intercom_id=None, unknown_reason='Contact temporarily unavailable.'),
+            lambda s: s['owners']['alpha']['identity'].update(intercom_id='new-contact', unknown_reason=''),
+            lambda s: s['owners']['alpha']['recovery'].update(summary='New continuation summary.', pending_issues='Old child result received.',
+                                                             context_refs=['/synthetic/new-context']),
+            lambda s: s['owners']['alpha']['recovery'].update(worktree=None, unknown_reason='Worktree locator is no longer available.'),
+            lambda s: s['owners']['alpha'].update(parent='user', role='Updated authorized role'),
+            lambda s: s['assignments']['active'].update(objective='Updated authorized objective.'),
+            lambda s: s['assignments']['completed'].update(end_reason='Accepted later child result.'),
+            lambda s: s['coordination']['agreement'].update(sequencing='Updated authorized sequencing.'),
+            lambda s: s['owners']['child'].update(identity=identity('opaque-source-Pi')),
+        ]
+        for index, change in enumerate(changes):
+            with self.subTest(change=index):
+                self.store = ProtocolStore()
+                first = self.envelope(self.commit(), 'committed')
+                frozen_record = copy.deepcopy(self.store.records[OP])
+                self.store.edit(change)
+                result = self.envelope(api.get_owner_session_succession(OP, self.digest(), store=self.store), 'already_committed')
+                self.assertTrue(result['current_binding_valid'])
+                self.assertEqual(result['receipt'], first['receipt'])
+                self.assertEqual(self.store.records[OP], frozen_record)
+                self.assertTrue(self.envelope(self.commit(expected_document='stale-on-purpose'), 'already_committed')['current_binding_valid'])
+                self.assertEqual(len(self.store.events), 1)
+
+    def test_current_binding_requires_same_store_era_owner_and_unique_current_pi(self):
+        def remove_owner(s):
+            del s['owners']['alpha']
+            s['assignments'] = {aid: a for aid, a in s['assignments'].items() if a['owner'] != 'alpha'}
+            s['coordination'] = {}
+        cases = [
+            ('owner removed', remove_owner),
+            ('Pi changed', lambda s: s['owners']['alpha']['identity'].update(pi_session_id='another-Pi')),
+            ('duplicate Pi', lambda s: s['owners']['child'].update(identity=identity('opaque-target-Pi'))),
+            ('source no longer current-session', lambda s: s['owners']['alpha']['identity'].update(
+                pi_session_id=None, source='intercom-status', unknown_reason='Only contact is now verified.')),
+        ]
+        for label, change in cases:
+            with self.subTest(change=label):
+                self.store = ProtocolStore()
+                self.envelope(self.commit(), 'committed')
+                self.store.edit(change)
+                self.envelope(api.get_owner_session_succession(OP, self.digest(), store=self.store), 'superseded')
+        for field in ('store_id', 'era'):
+            with self.subTest(change=field):
+                self.store = ProtocolStore()
+                self.envelope(self.commit(), 'committed')
+                setattr(self.store, field, str(uuid.uuid4()))
+                self.envelope(api.get_owner_session_succession(OP, self.digest(), store=self.store), 'superseded')
+
     def test_old_receipt_superseded_after_successive_carrier_and_reset_or_manual_identity(self):
         self.envelope(self.commit(), 'committed')
         old_digest = self.digest()
@@ -417,7 +468,7 @@ class SuccessionPolicyTests(unittest.TestCase):
         self.assertEqual(len(self.store.events), 2)
         self.store = ProtocolStore()
         self.envelope(self.commit(), 'committed')
-        self.store.edit(lambda s: s['owners']['alpha']['identity'].update(intercom_id='manual-new-contact'))
+        self.store.edit(lambda s: s['owners']['alpha']['identity'].update(pi_session_id='manual-new-Pi'))
         self.envelope(api.get_owner_session_succession(OP, old_digest, store=self.store), 'superseded')
         self.store.state['owners']['alpha']['identity'] = copy.deepcopy(self.target['identity'])
         self.store.era = str(uuid.uuid4())
@@ -628,6 +679,70 @@ class ActualStoreSuccessionTests(unittest.TestCase):
         self.assertEqual(conflict['error']['code'], 'operation_intent_mismatch')
         self.assertEqual(self.files(), after)
 
+    def test_real_same_pi_contact_and_recovery_edits_keep_receipt_current_without_writes(self):
+        first = self.commit()
+        self.assertEqual(first['status'], 'committed', first)
+        frozen_prepares = self.prepares()
+        def continuation_update(s):
+            owner = s['owners']['alpha']
+            owner['identity'].update(intercom_id='new-target-contact', unknown_reason='Contact reconnected.')
+            owner['recovery'].update(summary='Target completed the first continuation step.',
+                                     pending_issues='Old supervisor delivered the child result.',
+                                     context_refs=['/synthetic/continuation/PROMPT.md', '/synthetic/child-result'])
+        self.manual(continuation_update)
+        current = self.store.current_snapshot()
+        self.assertNotEqual(current['document_token'], first['receipt']['document_token_after'])
+        observed_files = self.files()
+        result = self.get()
+        self.assertEqual(result['status'], 'already_committed', result)
+        self.assertTrue(result['current_binding_valid'])
+        self.assertEqual(result['receipt'], first['receipt'])
+        self.assertEqual(self.files(), observed_files)
+        retry = self.commit(expected_document='intentionally-stale')
+        self.assertEqual(retry['status'], 'already_committed', retry)
+        self.assertTrue(retry['current_binding_valid'])
+        self.assertEqual(retry['receipt'], first['receipt'])
+        self.assertEqual(self.files(), observed_files)
+        self.assertEqual(self.store.current_snapshot(), current)
+        self.assertEqual(self.prepares(), frozen_prepares)
+        self.assertEqual(len(frozen_prepares), 1)
+        self.assertEqual(frozen_prepares[0]['intent']['target'], self.target)
+        self.assertEqual(frozen_prepares[0]['event']['after']['owners']['alpha']['recovery'], self.target['recovery'])
+        changed = copy.deepcopy(self.target)
+        changed['identity'] = current['state']['owners']['alpha']['identity']
+        changed['recovery'] = current['state']['owners']['alpha']['recovery']
+        conflict = self.commit(target=changed)
+        self.assertEqual(conflict['status'], 'conflict', conflict)
+        self.assertEqual(conflict['error']['code'], 'operation_intent_mismatch')
+        self.assertEqual(self.files(), observed_files)
+
+    def test_real_removed_owner_duplicate_pi_or_lost_source_supersede_read_only(self):
+        first = self.commit()
+        self.assertEqual(first['status'], 'committed', first)
+        committed_document = self.document.read_bytes()
+        def remove_owner(s):
+            del s['owners']['alpha']
+            s['assignments'] = {aid: a for aid, a in s['assignments'].items() if a['owner'] != 'alpha'}
+            s['coordination'] = {}
+        cases = [
+            ('owner removed', remove_owner),
+            ('duplicate Pi', lambda s: s['owners']['child'].update(identity=identity('opaque-target-Pi'))),
+            ('source no longer current-session', lambda s: s['owners']['alpha']['identity'].update(
+                pi_session_id=None, source='intercom-status', unknown_reason='Only contact is now verified.')),
+        ]
+        for label, change in cases:
+            with self.subTest(change=label):
+                self.document.write_bytes(committed_document)
+                self.manual(change)
+                observed_files = self.files()
+                result = self.get()
+                self.assertEqual(result['status'], 'superseded', result)
+                self.assertFalse(result['current_binding_valid'])
+                self.assertFalse(result['no_owner_valid'])
+                self.assertEqual(result['receipt'], first['receipt'])
+                self.assertEqual(self.files(), observed_files)
+                self.assertEqual(len(self.prepares()), 1)
+
     def test_real_latest_graph_cas_and_all_noncarrier_fields_preserved(self):
         digest = self.digest()
         def changes(s):
@@ -725,7 +840,7 @@ class ActualStoreSuccessionTests(unittest.TestCase):
         self.assertEqual(self.commit()['status'], 'superseded')
         self.assertEqual(len(self.prepares()), 2)
         current_digest = api.build_intent_digest(next_plan, target(op2, 'opaque-third-Pi'), self.authority, custody('opaque-target-Pi'))
-        self.manual(lambda s: s['owners']['alpha']['identity'].update(intercom_id='new-manual-contact'))
+        self.manual(lambda s: s['owners']['alpha']['identity'].update(pi_session_id='new-manual-Pi'))
         self.assertEqual(self.get(op2, current_digest)['status'], 'superseded')
         self.manual(lambda s: s['owners']['alpha'].update(identity=identity('opaque-third-Pi')))
         self.assertEqual(self.get(op2, current_digest)['status'], 'already_committed')
