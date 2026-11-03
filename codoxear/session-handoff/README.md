@@ -85,7 +85,15 @@ Engine 看到 ready 文件还会核验私有 capsule 和 fresh canonical get；�
 
 `tests/succession_mock.py` 是精确 v1 API 的隔离 double，绝不加载真实 registry。helper 的 temporal tests 覆盖 commit→ready→真实 CLI main 返回码→toy action、并发一次许可、unknown/get-first、commit+publish 失败恢复、superseded/reset/occupied/needs_recovery、无 owner revision 不变、token 刷新 digest 不变、身份/contact/null/custody 和 capsule 破坏。Engine fake native 与 HTTP tests 显式注入 double；缺安装 API 在 native create 前失败。
 
-这些证明是 **handoff 调用契约与本地顺序**，不是实际 Store 迁移或真实 LLM/Pi 执行证据。安装服务由 registry peer 提供；还需在其精确 commit 上运行真实 temporary Store 集成（同 UUID、最新图保留、一次真实审计事件、current/audit 和 reader 共存）。不得使用真实 owner 做 fixture，不在此组件部署/安装/修改 registry。
+上述 double 测试证明 **handoff 调用契约与本地顺序**。独立的 `tests/test_succession_store.py` 则通过同一个实际 helper/CLI/Engine ready gate 调用 canonical API，所有 prepare/commit/get 均显式绑定 `Store(temp/private, temp/current.md)`；初始化真实 v3 current/audit，使用 registry peer `state()` 提供的 codec-valid 合成 owner/assignment/coordination 图，缺真实依赖会失败而非 skip。运行：
+
+```sh
+python3 -m unittest discover -s codoxear/session-handoff/tests -p test_succession_store.py -v
+```
+
+joint 用例直接观察：真实 session-succession event 和新 current binding 均先于 ready 发布/CLI 0/临时 toy 文件动作；保留最新完整非 carrier 图；commit 后仅 ready 发布失败则 CLI 2、无 toy 动作，登记已生效，重试只 get 原 operation/intent，仍为一个 event。另覆盖 no-owner current 字节/mtime/revision/图不变且 event 为零（允许 event:null 的私有 no-op metadata）、新注册/occupied/source swap/reset 阻断、两个并发 CLI 仅一次许可、另一源抢先提交后的同 immutable intent 有界 CAS 重试、A→B→C/reset 后历史 receipt/Engine/check-owner 拒绝，以及临时 HOME 安装布局、任意 cwd、被污染 generic module namespace 下的实际 loader。未启动真实 Pi、浏览器、HTTP 服务或安装器，未读取用户登记；此证据不覆盖模型理解、原生 transport、线上迁移、reader 展示或部署。
+
+首批 joint checkpoint 使用 canonical codec `da0f428`（已与 main `1d13a40` 同 blob，不重复导入）、`5bfb383`、`d1d0373`，core `c727286`，API `5c45d7e` / `3e6390ed` / `6f651dff`，handoff `0349336`。在该 API 版本，合法的同 Pi contact/recovery/graph 更新被误判为 superseded；对应 joint 测试保留为真实失败，未使用 skip/expectedFailure 或替代服务。需 registry peer 的 current-binding 修复原 SHA 后重跑，不能据其他绿例宣称全部闭环。不得使用真实 owner 做 fixture，不在此组件部署/安装/修改 registry。
 
 ## 验证边界
 
