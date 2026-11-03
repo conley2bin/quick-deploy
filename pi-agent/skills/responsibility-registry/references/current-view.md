@@ -51,3 +51,11 @@ current_state, era = codec.parse_current_document(lines)
 ```
 
 Do not use a `TextIOWrapper` when audit bytes must remain undecoded: it may read ahead and decode invalid UTF-8 in History before returning even the first current line. Per-binary-line decoding preserves the boundary: invalid UTF-8 after the History heading is never decoded, while invalid UTF-8 in the current prefix fails. Fixed-size binary buffering may prefetch bytes without logically consuming or decoding audit lines; the codec's zero-next-line guarantee does not control that buffering.
+
+## Codoxear consumer
+
+The owner-groups adapter uses this API under its existing shared registry lock. `project_current(state, codec)` calls `codec.validate_current(state)` on the exact five-field state before applying the same public whitelist and 500-owner/64-depth bounds as full-state `project(state)`. The latter retains its complete-input history-container/revision contract; no empty history is invented to convert a current state into a full state.
+
+The web reader has no whole-document 8/64 MiB gate and never falls back to `parse_document` if the installed current API is missing. Install the compatible codec through the canonical selected-skill, runtime-preserving workflow before activating the adapter. Current success attests only to current fields, including coordination structure; it does not attest to audit validity or coordination readiness.
+
+Each app/worker process owns one generation reader, caching only the minimal public projection. It checks current MD and codec readability plus `(dev, ino, size, mtime_ns, ctime_ns)` on each call, singleflights cold loads with its worker mutex and the existing shared flock, and verifies descriptor/path generations before publishing. Same-generation hot calls perform no MD content read or parse. History-only edits invalidate once but reread only the current prefix; unavailable/invalid input never reuses old success. Fresh source compilation avoids timestamp `.pyc` reuse. Authentication and native session/log linkage remain per-request and are never cached with the public projection. Source changes are request-observed; existing browser polling still determines when a visible page refreshes. See the [consumer documentation](../../../../codoxear/owner-groups/README.md) for the full cache, identity, and failure boundaries.

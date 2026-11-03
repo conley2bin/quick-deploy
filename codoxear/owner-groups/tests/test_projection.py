@@ -1,4 +1,3 @@
-from contextlib import contextmanager
 import copy
 import json
 from pathlib import Path
@@ -79,14 +78,13 @@ class ProjectionTests(unittest.TestCase):
 
     def test_invalid_snapshots_fail_closed(self):
         variants = []
-        for field, value in [('version', 2), ('owners', []), ('revision', 999), ('assignments', [])]:
+        for field, value in [('version', 2), ('owners', []), ('revision', -1), ('assignments', [])]:
             state = copy.deepcopy(self.state); state[field] = value; variants.append(state)
         state = copy.deepcopy(self.state); state['owners']['ops']['parent'] = 'owner:qa'; variants.append(state)
         state = copy.deepcopy(self.state); state['owners']['office']['id'] = 'another'; variants.append(state)
         state = copy.deepcopy(self.state); state['owners']['office']['identity']['source'] = 'intercom-status'; variants.append(state)
         state = copy.deepcopy(self.state); state['owners']['office']['parent'] = 'owner: ops'; variants.append(state)
         state = copy.deepcopy(self.state); state['assignments']['office-scope']['owner'] = 'no-such-owner'; variants.append(state)
-        state = copy.deepcopy(self.state); state['history'][0]['revision'] = 99; variants.append(state)
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp); (root / 'registry.lock').touch()
             for state in variants:
@@ -131,37 +129,16 @@ class ProjectionTests(unittest.TestCase):
         for forbidden in ('PRIVATE', 'HISTORY-ONLY-ID', 'history', 'recovery'):
             self.assertNotIn(forbidden, json.dumps(result))
 
-    def test_document_byte_boundary_is_bounded_before_codec_parse(self):
-        self.assertEqual(p.MAX_DOCUMENT_BYTES, 64 * 1024 * 1024)
-        raw = (self.root / 'RESPONSIBILITIES.md').read_bytes()
-        self.assertGreater(len(raw), len(raw.decode('utf-8')))
+    def test_reader_calls_current_api_without_full_parse(self):
         codec = fixture.registry_document
-        real_parse = codec.parse_document
-        reads = []
-        original_open = p.open_source
-        class BoundedRead:
-            def __init__(self, source): self.source = source
-            def fileno(self): return self.source.fileno()
-            def read(self, size):
-                reads.append(size)
-                return self.source.read(size)
-        @contextmanager
-        def opened(path):
-            with original_open(path) as source:
-                yield BoundedRead(source) if path.name == 'RESPONSIBILITIES.md' else source
-        with patch.object(p, 'load_codec', return_value=codec), patch.object(p, 'open_source', opened):
-            for limit in (len(raw) + 1, len(raw)):
-                with self.subTest(limit=limit), patch.object(p, 'MAX_DOCUMENT_BYTES', limit), \
-                        patch.object(codec, 'parse_document', wraps=real_parse) as parse:
-                    self.assertTrue(p.read_registry(self.root, self.root / 'RESPONSIBILITIES.md', fixture.CODEC)['ok'])
-                    parse.assert_called_once_with(raw.decode('utf-8'))
-                    self.assertEqual(reads[-1], limit + 1)
-            limit = len(raw) - 1
-            with patch.object(p, 'MAX_DOCUMENT_BYTES', limit), patch.object(codec, 'parse_document') as parse:
-                result = p.read_registry(self.root, self.root / 'RESPONSIBILITIES.md', fixture.CODEC)
-                self.assertEqual(result, p.failure('document-too-large'))
-                parse.assert_not_called()
-                self.assertEqual(reads[-1], limit + 1)
+        with patch.object(p, 'load_codec', return_value=codec), \
+                patch.object(codec, 'parse_current_document', wraps=codec.parse_current_document) as current, \
+                patch.object(codec, 'parse_document', side_effect=AssertionError('full audit parse')):
+            result = p.read_registry(self.root, self.root / 'RESPONSIBILITIES.md', fixture.CODEC)
+        self.assertTrue(result['ok'])
+        self.assertEqual(result['owners'], p.project(self.state)['owners'])
+        current.assert_called_once()
+        self.assertNotIsInstance(current.call_args.args[0], (str, bytes))
 
     def test_owner_count_boundary_is_independent_of_document_size(self):
         state = copy.deepcopy(self.state)
@@ -173,7 +150,6 @@ class ProjectionTests(unittest.TestCase):
                                    for i in range(count)}
                 state['assignments'] = {}
                 raw = fixture.registry_document.serialize_document(state, '00000000-0000-0000-0000-000000000001').encode('utf-8')
-                self.assertLess(len(raw), p.MAX_DOCUMENT_BYTES)
                 document.write_bytes(raw)
                 result = p.read_registry(root, document, fixture.CODEC)
                 with self.subTest(count=count):
@@ -192,7 +168,6 @@ class ProjectionTests(unittest.TestCase):
                     'parent': 'user' if i == 0 else f'owner:owner-{i - 1}'} for i in range(depth)}
                 state['assignments'] = {}
                 raw = fixture.registry_document.serialize_document(state, '00000000-0000-0000-0000-000000000001').encode('utf-8')
-                self.assertLess(len(raw), p.MAX_DOCUMENT_BYTES)
                 document.write_bytes(raw)
                 result = p.read_registry(root, document, fixture.CODEC)
                 with self.subTest(depth=depth):

@@ -140,9 +140,9 @@ class DocumentTests(DocumentFixture):
         self.register()
         good = self.document.read_text()
         details = codec.encode_cell(json.dumps({'id': 'shadow'}, separators=(',', ':')))
-        variants = [good.replace('Revision: 1', 'Revision: 9'), good.replace('Format: responsibility-registry/v2', 'Format: v99'),
+        variants = [good.replace('Format: responsibility-registry/v2', 'Format: v99'),
                     good.replace('Era: ' + self.store.envelope['era'], 'Era: template'),
-                    good + 'ignored table\n| stale | ghost |\n', good.replace('## Owners', '## Owners\n## Owners')]
+                    good.replace('## Owners', '## Owners\n## Owners')]
         line = next(line for line in good.splitlines() if line.startswith('| alpha |'))
         variants += [good.replace(line, line + '\n' + line), good.replace(line, '| alpha | n | r | user | ' + details + ' |'),
                      good.replace('identity&quot;:', 'identity&quot;:null,&quot;identity&quot;:'),
@@ -168,6 +168,24 @@ class DocumentTests(DocumentFixture):
             self.read()
         self.assertNotIn(line, self.document.read_text())
         self.assertTrue(original['history'])
+
+    def test_audit_only_errors_preserve_store_strictness_and_allow_current_web_view(self):
+        self.register()
+        good = self.document.read_text()
+        expected_owners = self.project()['owners']
+        for broken in (good.replace('Revision: 1', 'Revision: 9'),
+                       good + 'ignored table\n| stale | ghost |\n'):
+            with self.subTest(broken=broken[-100:]):
+                self.document.write_text(broken)
+                with self.assertRaises(registry.RegistryError):
+                    self.read()
+                with self.assertRaises(codec.RegistryError):
+                    codec.parse_document(broken)
+                self.assertEqual(self.document.read_text(), broken)
+                current = self.project()
+                self.assertTrue(current['ok'])
+                self.assertEqual(current['owners'], expected_owners)
+                self.assertEqual(current['revision'], 9 if 'Revision: 9' in broken else 1)
 
     def test_manual_scope_edit_invalidates_ack_without_updated_timestamp_change(self):
         self.register()

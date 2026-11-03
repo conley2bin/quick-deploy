@@ -43,9 +43,13 @@
 
 ## 身份和数据边界
 
-固定唯一当前来源：`~/.pi/agent/skills/responsibility-registry/RESPONSIBILITIES.md`。受控加载同安装目录的纯 `scripts/registry_document.py`（要求 responsibility-registry/v2），只读打开私有目录已存在的 `registry.lock` 并取共享锁，再严格解析 Markdown；无 Store/CLI 调用、JSON fallback 或路径发现，HTTP 调用者不能指定路径。codec 不存在/不兼容、MD 缺失/损坏只报不可用并恢复原生列表，不显示最后成功图。首次部署须同时部署已安装 codec 与适配器；一次显式迁移和适配器激活后，后续 MD 修改/模板复制无需服务刷新。见 [迁移及不复活旧数据的回退](../../pi-agent/skills/responsibility-registry/references/migration.md)。
+固定唯一当前来源：`~/.pi/agent/skills/responsibility-registry/RESPONSIBILITIES.md`。受控加载同安装目录的纯 `scripts/registry_document.py`（要求 responsibility-registry/v2 及 `parse_current_document` / `validate_current` 新 API），只读打开私有目录已存在的 `registry.lock` 并取共享锁，再严格解析当前前缀；无 Store/CLI 调用、JSON fallback 或路径发现，HTTP 调用者不能指定路径。codec 缺失/不兼容（包括缺少新 API）、当前前缀缺失/无效时明确失败并恢复原生列表，不回退旧的完整解析或最后成功图。首次部署须通过 canonical 选定 skill 的保留式安装流程同时更新 codec，再获准激活适配器；后续 MD 修改/模板复制无需服务刷新。见 [current-view API](../../pi-agent/skills/responsibility-registry/references/current-view.md) 及 [迁移及不复活旧数据的回退](../../pi-agent/skills/responsibility-registry/references/migration.md)。
 
-只导出当前文档 era/revision 与 owner 的 id/name/role/parent、登记插入序号 registration_order（canonical CLI 保存对象插入顺序，无活动时间/历史）、**source=current-session 已核验 Pi ID**、身份缺失说明、简短 project/task/status。历史、recovery、联系别名、任命证据、目标/验收正文、目录路径、transcript 均不导出。包含完整审计历史的原始 Markdown 文档预算为 **64 MiB**（最多读取上限加 1 字节判定超限），与最小公开投影的 **500 owner / 64 层**限制独立；历史增长不增加公开字段，但仍须完整通过严格 codec 校验。原始字节超限与文档无效/owner 或层数超限分别报告不含私密数据的错误，均整树拒绝，不截断历史或祖先。64 MiB 为历史增长提供余量，并非无界读取；未来超过上限仍会停用分组。重复 Pi 身份不绑定、不挑一个；对应原生行保持在框外。
+只导出当前文档 era/revision 与 owner 的 id/name/role/parent、登记插入序号 registration_order（canonical CLI 保存对象插入顺序，无活动时间/历史）、**source=current-session 已核验 Pi ID**、身份缺失说明、简短 project/task/status。历史、recovery、联系别名、任命证据、目标/验收正文、目录路径、transcript 均不导出。最小公开投影仍有 **500 owner / 64 层**限制，超限整树拒绝，不截断祖先；重复 Pi 身份不绑定、不挑一个，对应原生行保持在框外。
+
+网页 reader 按二进制行读取，仅在 codec 请求该行时严格 UTF-8 解码，消费到精确 `## History (audit only; never restores current rows)` 标题便停止；不使用会提前解码 audit 的 `TextIOWrapper`，不读取整份 Markdown。当前字段/图/身份/职责生命周期/协调及 era/template 仍严格校验，返回的五字段 current state **没有 history**，不能作为完整 Store mutation envelope。History 正文无论巨大、截断、格式错误或含非法 UTF-8，都不参与网页 current-view 的有效性；标题之前的非法 UTF-8、错误表格或缺少精确标题仍失败。网页路径已移除旧的整份文件 8/64 MiB gate；底层固定大小二进制/OS 预读允许，但不逻辑消费、解码、解析或保留 History。当前前缀仍需完整读取，成本受当前内容而非审计总长驱动。CLI、Store 及 `parse_document` 保留完整 History 校验，current 成功不证明 audit 有效，也不修复/删除源历史。
+
+每个 app/进程只有一个 `RegistryReader`，只缓存一代最小公有投影，返回隔离副本；不保存 Markdown、codec module、完整 state、History、cookie 或原生会话映射。每次请求在 worker mutex 和已有共享 flock 内重新检查 MD 与 codec 的可读 regular/nonlink 状态及 `(dev, ino, size, mtime_ns, ctime_ns)`；同代并发只冷解析一次，热命中 **0 MD 正文读取 / 0 解析**，仍有只读 open/stat/flock。编辑、原子替换、重置、改 parent/身份及 codec 更新均失效；History-only 变更也触发一次相同 current 前缀读取。新 codec 从核验过的 source bytes compile/exec，避免同秒同长度修改命中旧 `.pyc`。加载前后 fd/path generation 不一致、missing、不可读或锁失败都丢弃旧成功；稳定无效代只可缓存脱敏错误。无 TTL、watcher 或跨进程 singleflight；合作 writer 须沿用稳定 `registry.lock` inode，非合作编辑可能使一个在途请求返回刚核验过的旧代，下一请求会检测变化。兼容 `proxy.create_app` 默认保留同一 app-local reader，仅显式 fixture projector 覆盖；直接 `read_registry(...)` 仍是每次冷加载的 stateless 入口。
 
 数据路由为前缀下 **`POST __owner_groups__/snapshot`，空 body、无 query 参数、只读**。GET 返回 405。选择 POST 是必要的兼容措施：当前上游 service worker 会手动缓存 no-store GET、可能用旧 GET 会话记录兜底；它不拦截 POST。适配器用调用浏览器的 cookie 对固定 loopback 上游 **重新 GET `/api/sessions`**，禁止重定向和缓存、要求 200 JSON 及预期结构，再读取目录，返回最小会话关联：
 
@@ -58,7 +62,7 @@ has_bound_log (仅对可信上游返回的非空绝对 log_path 做只读 regula
 
 上游公开列表会删除内部 `log_exists` 字段，适配器不依赖该字段；stat 在线程中执行，避免阻塞 aiohttp。缺失/相对/目录/不可访问路径均视为未绑定，错误不含路径。浏览器不能提交 stat 目标。
 
-无 cookie/认证失败 401；上游/API/目录不可用 503。无 CORS，拒绝跨 Origin / Sec-Fetch-Site:cross-site，不接受外部 URL、文件路径、owner 过滤或浏览器指定身份。服务不保存 cookie，不输出密码/token/访问 URL 日志。此路由的权限与当前 Codoxear 登录相同，已经登录的用户可读取以上最小目录；不另建账号体系。保留现有 HTTPS/VPN 边界；本功能不把现有明文 HTTP 变成 TLS。
+无 cookie/认证失败 401；上游/API/目录不可用 503。公有投影 cache 不缓存 HTTP 响应：即使热命中，每位调用者仍用本次 cookie 重新鉴权，并重新取得原生会话、thread/backend 和日志存在性映射；无 MD 变更的 broker rebind 也会反映。无 CORS，拒绝跨 Origin / Sec-Fetch-Site:cross-site，不接受外部 URL、文件路径、owner 过滤或浏览器指定身份。服务不保存 cookie，不输出密码/token/访问 URL 日志。此路由的权限与当前 Codoxear 登录相同，已经登录的用户可读取以上最小目录；不另建账号体系。保留现有 HTTPS/VPN 边界；本功能不把现有明文 HTTP 变成 TLS。
 
 绑定要求：当前 owner 的已核验 Pi ID **精确相等**于唯一 pi-backend 会话的 `thread_id`，该 ID 也只被一个 owner 使用，且有已存在的绑定日志。不使用 intercom ID、别名、文件名、目录、最近时间。全新 POST 快照用于计算分组，每 10 秒在可见页面刷新，失败则恢复完整原生列表并显示简短提示，不用旧绑定兜底。**不拦截或重放点击**：会话行、Edit/Delete/Duplicate、触摸滑动和键盘控件仍是原始节点及原生回调，直接操作该行原始 opaque broker key。分组快照不是事务性身份选择；两次快照之间的 broker 再绑定可能短暂留下旧归组，下一次成功快照会移出错误绑定。上游没有原子条件选择接口。
 
@@ -91,7 +95,7 @@ CODOXEAR_TEST_PYTHON="$PWD/.runtime/venv/bin/python" \
 node --test owner-groups/tests/core.test.cjs
 ```
 
-可选真实上游认证集成测试使用**现有 runtime 解释器只读导入**，临时 HOME/cwd、随机且不打印的测试密码、loopback 随机端口；从不启动真实 agent。未设置 `CODOXEAR_TEST_PYTHON` 则跳过该项。其他 HTTP 测试验证认证失败/重定向拒绝、无跨请求 cookie 缓存、固定请求、SSE 首事件未等上游完成即到达、上传/压缩/重定向和 cookie 保留。
+可选真实上游认证集成测试使用**现有 runtime 解释器只读导入**，临时 HOME/cwd、随机且不打印的测试密码、loopback 随机端口；从不启动真实 agent。未设置 `CODOXEAR_TEST_PYTHON` 则跳过该项。其他 HTTP 测试验证认证失败/重定向拒绝、无跨请求 cookie 缓存、固定请求、SSE 首事件未等上游完成即到达、上传/压缩/重定向和 cookie 保留。`test_current_reader.py` 使用真实二进制临时文件和真实 current API，比较短 audit 与 >64 MiB sparse audit 的底层 bounded readinto 字节及逻辑前缀读取，验证坏 UTF-8 的边界、热请求零正文读取和 host/feature/facade 的两 client 鉴权/映射；`test_registry_cache.py` 覆盖并发、代失效、旧 `.pyc` 和返回值隔离。这些是 registry 工作量证据，不据此宣称整个 HTTP 请求按相同比例加速。
 
 可视化演示使用实际安装的上游 frontend + service worker **原样只读**，由独立合成 API 和 CLI 在临时目录建立的合成登记簿供数：
 

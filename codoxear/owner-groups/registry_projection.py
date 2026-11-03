@@ -19,8 +19,6 @@ DOCUMENT = Path.home() / '.pi/agent/skills/responsibility-registry/RESPONSIBILIT
 CODEC = DOCUMENT.parent / 'scripts/registry_document.py'
 FORMAT = 'responsibility-registry/v2'
 SCHEMA = 'codoxear-owner-groups/v1'
-# Raw Markdown includes audit history; projected owner/depth limits are separate.
-MAX_DOCUMENT_BYTES = 64 * 1024 * 1024
 MAX_OWNERS = 500
 MAX_DEPTH = 64
 
@@ -43,7 +41,7 @@ def failure(code):
     messages = {
         'unavailable': 'Owner registry unavailable or not initialized.',
         'invalid': 'Owner registry is invalid or exceeds supported owner/depth limits; no partial tree shown.',
-        'document-too-large': 'Owner registry document exceeds the supported byte limit; no partial tree shown.',
+        'incompatible-codec': 'Owner registry codec lacks the current-view API; install a compatible registry codec.',
     }
     return {'schema': SCHEMA, 'ok': False, 'error': messages[code], 'owners': []}
 
@@ -53,6 +51,17 @@ def project(state):
     owners, assignments, history = (state.get(k) for k in ('owners', 'assignments', 'history'))
     require(isinstance(owners, dict) and isinstance(assignments, dict) and isinstance(history, list))
     require(type(state.get('revision')) is int and state['revision'] == len(history))
+    return _project_current_rows(state)
+
+
+def project_current(state, codec):
+    """Validate the five current fields, then project; no fabricated audit state."""
+    codec.validate_current(state)
+    return _project_current_rows(state)
+
+
+def _project_current_rows(state):
+    owners, assignments = state['owners'], state['assignments']
     require(len(owners) <= MAX_OWNERS)
     for oid, owner in owners.items():
         require(text(oid) and oid != 'user' and not oid.startswith('owner:'))
@@ -146,17 +155,19 @@ def open_source(path):
 
 
 def _load_projection(source, codec_source, codec_path):
-    """Cold-load seam: keep full codec/byte budget until current-view integration."""
+    """Read only the current prefix; audit bytes are never decoded or parsed."""
     try:
         codec = load_codec(codec_path, codec_source)
-        raw = source.read(MAX_DOCUMENT_BYTES + 1)
-        if len(raw) > MAX_DOCUMENT_BYTES:
-            return failure('document-too-large')
+        if not all(callable(getattr(codec, name, None))
+                   for name in ('parse_current_document', 'validate_current')):
+            return failure('incompatible-codec')
         try:
-            state, era = codec.parse_document(raw.decode('utf-8'))
+            # TextIOWrapper may decode a prefetched invalid audit byte too early.
+            # Binary buffering is bounded; decode only lines requested by the codec.
+            state, era = codec.parse_current_document(line.decode('utf-8') for line in source)
+            return dict(project_current(state, codec), era=era)
         except codec.RegistryError as exc:
-            raise ValueError('invalid document') from exc
-        return dict(project(state), era=era)
+            raise ValueError('invalid current document') from exc
     except (ImportError, SyntaxError):
         return failure('unavailable')
     except (ValueError, TypeError, KeyError, AttributeError, RecursionError):

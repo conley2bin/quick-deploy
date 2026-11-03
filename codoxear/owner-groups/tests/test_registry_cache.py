@@ -53,7 +53,11 @@ class SyntheticRegistry:
 
 @contextmanager
 def counted_loads():
-    """Instrument actual codec parse and document read, not cache implementation methods."""
+    """Count parsed generations and MD descriptors that actually consume content.
+
+    Iteration/read/readline all count; physical readinto bytes are measured
+    separately by test_current_reader, including bounded binary prefetch.
+    """
     counts = {'parse': 0, 'read': 0, 'load': 0}
     real_load = p.load_codec
     original_open = Path.open
@@ -62,15 +66,28 @@ def counted_loads():
     class CountedSource:
         def __init__(self, source):
             self.source = source
+            self.consumed = False
         def __enter__(self):
             return self
         def __exit__(self, *args):
             return self.source.__exit__(*args)
         def __getattr__(self, name):
             return getattr(self.source, name)
+        def consume(self):
+            if not self.consumed:
+                counts['read'] += 1
+                self.consumed = True
+        def __iter__(self):
+            return self
+        def __next__(self):
+            self.consume()
+            return next(self.source)
         def read(self, *args):
-            counts['read'] += 1
+            self.consume()
             return self.source.read(*args)
+        def readline(self, *args):
+            self.consume()
+            return self.source.readline(*args)
 
     def opened(path, *args, **kwargs):
         source = original_open(path, *args, **kwargs)
@@ -84,11 +101,11 @@ def counted_loads():
     def loaded(*args, **kwargs):
         counts['load'] += 1
         codec = real_load(*args, **kwargs)
-        real_parse = codec.parse_document
+        real_parse = codec.parse_current_document
         def parsed(*args, **kwargs):
             counts['parse'] += 1
             return real_parse(*args, **kwargs)
-        codec.parse_document = parsed
+        codec.parse_current_document = parsed
         return codec
 
     with patch.object(p, 'load_codec', loaded), patch.object(Path, 'open', opened), patch.object(os, 'fdopen', fdopened):
@@ -156,7 +173,7 @@ class RegistryCacheTests(unittest.TestCase):
         calls = []
         def loaded(*args, **kwargs):
             codec = real_load(*args, **kwargs)
-            real_parse = codec.parse_document
+            real_parse = codec.parse_current_document
             def parse(raw):
                 calls.append(True)
                 if len(calls) == 1:
@@ -164,7 +181,7 @@ class RegistryCacheTests(unittest.TestCase):
                     if not release.wait(timeout=5):
                         raise AssertionError('test did not release cold parse')
                 return real_parse(raw)
-            codec.parse_document = parse
+            codec.parse_current_document = parse
             return codec
         def waiter():
             waiting.set()
@@ -329,7 +346,7 @@ class RegistryCacheTests(unittest.TestCase):
                 real_load = p.load_codec
                 def changing_load(*args, **kwargs):
                     codec = real_load(*args, **kwargs)
-                    real_parse = codec.parse_document
+                    real_parse = codec.parse_current_document
                     def parse(raw):
                         state = real_parse(raw)
                         path = getattr(self.files, name)
@@ -341,7 +358,7 @@ class RegistryCacheTests(unittest.TestCase):
                             with path.open('ab') as source:
                                 source.write(b'\n')
                         return state
-                    codec.parse_document = parse
+                    codec.parse_current_document = parse
                     return codec
                 with patch.object(p, 'load_codec', changing_load):
                     result = reader()
