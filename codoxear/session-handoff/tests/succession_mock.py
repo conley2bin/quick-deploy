@@ -13,6 +13,7 @@ class Service:
         self.commit_error = None
         self.events = 0
         self.revision = 7
+        self.null_document_token_after = False
 
     def envelope(self, op, status, *, digest=None, plan=None, receipt=None, error=None):
         return dict(schema='responsibility-session-succession/v1', status=status,
@@ -52,7 +53,7 @@ class Service:
             target_pi_session_id=target['identity']['pi_session_id'],
             outcome='committed' if plan['owner_id'] else 'not_applicable', revision_before=before,
             revision_after=self.revision, transaction_id='tx-one', event_id='event-one' if plan['owner_id'] else None,
-            document_token_after='doc-' + str(self.revision))
+            document_token_after=None if self.null_document_token_after else 'doc-' + str(self.revision))
         self.receipts[op] = receipt
         return self.envelope(op, receipt['outcome'], digest=digest, receipt=copy.deepcopy(receipt))
 

@@ -184,8 +184,10 @@ class Adapter:
             keys(receipt, RECEIPT)
             require(type(receipt['version']) is int and receipt['version'] == 1)
             require(receipt['operation_id'] == op and receipt['intent_digest'] == digest)
-            for k in ('store_id', 'era', 'source_pi_session_id', 'target_pi_session_id', 'transaction_id', 'document_token_after'):
+            for k in ('store_id', 'era', 'source_pi_session_id', 'target_pi_session_id', 'transaction_id'):
                 text(receipt[k])
+            if receipt['document_token_after'] is not None:
+                text(receipt['document_token_after'])
             require(receipt['outcome'] in ('committed', 'not_applicable'))
             for k in ('revision_before', 'revision_after'):
                 require(type(receipt[k]) is int and receipt[k] >= 0)

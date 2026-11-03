@@ -1,5 +1,6 @@
 """Permission ordering against the frozen API double, not real Store evidence."""
 import concurrent.futures
+import copy
 import importlib
 import json
 import io as stdio
@@ -80,6 +81,112 @@ class GateTests(unittest.TestCase):
         self.assertEqual(calls, self.service.calls)
         self.assertEqual(self.service.events, 1)
 
+    def test_null_token_committed_receipt_allows_ready_without_second_permission(self):
+        self.service.null_document_token_after = True
+        self.submit('resolution', verdict='ready')
+        receipt = json.loads((self.directory / 'succession-receipt.json').read_text())
+        self.assertEqual(receipt['status'], 'committed')
+        self.assertTrue(receipt['current_binding_valid'])
+        self.assertIsNone(receipt['receipt']['document_token_after'])
+        self.assertTrue((self.directory / 'resolution.json').exists())
+        self.assertEqual(self.service.calls, ['prepare', 'prepare', 'commit'])
+        self.assertEqual(self.service.events, 1)
+        s.validate_ready(self.directory, self.manifest, self.u['_sha256'], self.r['_sha256'], self.adapter)
+        calls = list(self.service.calls)
+        with self.assertRaises(context.ContextError):
+            self.submit('resolution', verdict='ready')
+        self.assertEqual(self.service.calls, calls)
+        self.assertEqual(self.service.events, 1)
+
+    def test_null_token_publish_failure_get_first_recovers_one_event(self):
+        self.service.null_document_token_after = True
+        original = context._publish_at
+        def fail(fd, name, raw):
+            if name == 'resolution.json':
+                raise OSError('publication failure')
+            return original(fd, name, raw)
+        with patch.object(context, '_publish_at', fail), self.assertRaises(context.ContextError):
+            self.submit('resolution', verdict='ready')
+        receipt = json.loads((self.directory / 'succession-receipt.json').read_text())
+        self.assertEqual(receipt['status'], 'committed')
+        self.assertIsNone(receipt['receipt']['document_token_after'])
+        self.assertEqual(self.service.events, 1)
+        self.assertFalse((self.directory / 'resolution.json').exists())
+        self.submit('resolution', verdict='ready')
+        self.assertEqual(json.loads((self.directory / 'succession-receipt.json').read_text()), receipt)
+        self.assertEqual(self.service.calls, ['prepare', 'prepare', 'commit', 'get'])
+        self.assertEqual(self.service.events, 1)
+        self.assertTrue((self.directory / 'resolution.json').exists())
+        self.assertEqual(json.loads((self.directory / 'succession-intent.json').read_text()), self.intent)
+        fresh = s.validate_ready(self.directory, self.manifest, self.u['_sha256'], self.r['_sha256'], self.adapter)
+        self.assertEqual(fresh['status'], 'already_committed')
+        self.assertTrue(fresh['current_binding_valid'])
+        self.assertIsNone(fresh['receipt']['document_token_after'])
+
+    def test_null_token_lost_response_get_first_recovers_original_intent(self):
+        self.service.null_document_token_after = True
+        original = self.service.commit_owner_session_succession
+        def lost(*args, **kwargs):
+            original(*args, **kwargs)
+            self.service.owner = None  # A fresh prepare must not replace the original owner plan.
+            raise OSError('response lost after durable transaction')
+        self.service.commit_owner_session_succession = lost
+        with self.assertRaisesRegex(s.GateError, 'outcome_unknown'):
+            self.submit('resolution', verdict='ready')
+        self.assertEqual(self.service.events, 1)
+        self.assertFalse((self.directory / 'resolution.json').exists())
+        self.submit('resolution', verdict='ready')
+        receipt = json.loads((self.directory / 'succession-receipt.json').read_text())
+        self.assertEqual(receipt['status'], 'already_committed')
+        self.assertIsNone(receipt['receipt']['document_token_after'])
+        self.assertEqual(self.service.calls, ['prepare', 'prepare', 'commit', 'get'])
+        self.assertEqual(self.service.events, 1)
+        self.assertTrue((self.directory / 'resolution.json').exists())
+        self.assertEqual(json.loads((self.directory / 'succession-intent.json').read_text()), self.intent)
+
+    def test_nullable_token_does_not_relax_flags_correlation_or_other_receipt_fields(self):
+        self.service.null_document_token_after = True
+        intent = self.intent
+        value = self.service.commit_owner_session_succession(intent['plan'], intent['target'],
+            expected_document=intent['plan']['document_token'], authority=intent['authority'], custody=intent['custody'])
+        self.adapter.validate_response('commit_owner_session_succession', self.op, value,
+                                       digest=intent['intent_digest'])
+        for field, invalid in (
+            ('document_token_after', ['', ' ', 0, 1, False, True, {}, []]),
+            ('store_id', [None, '', False]),
+            ('operation_id', [str(uuid4())]),
+            ('intent_digest', ['0' * 64]),
+            ('outcome', ['unknown']),
+        ):
+            for item in invalid:
+                with self.subTest(receipt_field=field, value=item):
+                    broken = copy.deepcopy(value)
+                    broken['receipt'][field] = item
+                    with self.assertRaises(s.GateError):
+                        self.adapter.validate_response('commit_owner_session_succession', self.op, broken,
+                                                       digest=intent['intent_digest'])
+        for field, invalid in (
+            ('current_binding_valid', [False, None, 1, 'true']),
+            ('no_owner_valid', [True, None, 0]),
+            ('operation_id', [str(uuid4())]),
+            ('intent_digest', ['0' * 64]),
+            ('status', ['unknown']),
+        ):
+            for item in invalid:
+                with self.subTest(envelope_field=field, value=item):
+                    broken = copy.deepcopy(value)
+                    broken[field] = item
+                    with self.assertRaises(s.GateError):
+                        self.adapter.validate_response('commit_owner_session_succession', self.op, broken,
+                                                       digest=intent['intent_digest'])
+        broken = copy.deepcopy(value)
+        broken['receipt']['extra'] = 'not allowed'
+        with self.assertRaises(s.GateError):
+            self.adapter.validate_response('commit_owner_session_succession', self.op, broken,
+                                           digest=intent['intent_digest'])
+        self.assertEqual(self.service.events, 1)
+        self.assertFalse((self.directory / 'resolution.json').exists())
+
     def test_conflict_never_calls_commit(self):
         self.submit('resolution', verdict='conflict')
         self.assertEqual(self.service.calls, ['prepare'])
@@ -129,7 +236,8 @@ class GateTests(unittest.TestCase):
         self.assertEqual(self.service.calls, ['prepare', 'prepare', 'commit', 'get'])
         self.assertTrue((self.directory / 'resolution.json').exists())
 
-    def test_superseded_receipt_blocks_recovery_and_host_validation(self):
+    def test_superseded_null_token_blocks_recovery_and_host_validation(self):
+        self.service.null_document_token_after = True
         original = context._publish_at
         def fail(fd, name, raw):
             if name == 'resolution.json':
@@ -138,15 +246,22 @@ class GateTests(unittest.TestCase):
         with patch.object(context, '_publish_at', fail), self.assertRaises(context.ContextError):
             self.submit('resolution', verdict='ready')
         self.service.valid = False
+        receipt = self.adapter.get(self.op, self.intent['intent_digest'])
+        self.assertEqual(receipt['status'], 'superseded')
+        self.assertFalse(receipt['current_binding_valid'])
+        self.assertFalse(receipt['no_owner_valid'])
+        self.assertIsNone(receipt['receipt']['document_token_after'])
         with self.assertRaisesRegex(s.GateError, 'superseded'):
             self.submit('resolution', verdict='ready')
         with self.assertRaisesRegex(s.GateError, 'superseded'):
             s.validate_ready(self.directory, self.manifest, self.u['_sha256'], self.r['_sha256'], self.adapter)
         self.assertFalse((self.directory / 'resolution.json').exists())
+        self.assertEqual(self.service.events, 1)
 
-    def test_no_owner_no_event_or_revision_and_fresh_absence_check(self):
+    def test_no_owner_null_token_no_event_or_revision_and_fresh_absence_check(self):
         # Independent fixture starts no-owner, rather than mutating a frozen owner plan.
         self.service.owner = None
+        self.service.null_document_token_after = True
         for filename in ('succession-source.json', 'succession-intent.json'):
             (self.directory / filename).unlink()
         marker = s.prepare_source(self.directory, self.op, 'actual-source', self.adapter)
@@ -163,7 +278,13 @@ class GateTests(unittest.TestCase):
         self.submit('resolution', verdict='ready')
         self.assertEqual(self.service.events, 0)
         self.assertEqual(self.service.revision, 7)
-        self.assertEqual(json.loads((self.directory / 'succession-receipt.json').read_text())['status'], 'not_applicable')
+        receipt = json.loads((self.directory / 'succession-receipt.json').read_text())
+        self.assertEqual(receipt['status'], 'not_applicable')
+        self.assertTrue(receipt['no_owner_valid'])
+        self.assertFalse(receipt['current_binding_valid'])
+        self.assertIsNone(receipt['receipt']['document_token_after'])
+        self.assertTrue((self.directory / 'resolution.json').exists())
+        s.validate_ready(self.directory, self.manifest, self.u['_sha256'], self.r['_sha256'], self.adapter)
 
     def test_refresh_preserves_digest_latest_revision_and_bounded_conflict_retry(self):
         digest = self.intent['intent_digest']
