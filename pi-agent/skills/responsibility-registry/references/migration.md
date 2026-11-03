@@ -1,6 +1,42 @@
 # Markdown cutover / recovery runbook
 
-This is an **explicit operator action**. Installing source does not authorize migration, resets, service refreshes, or appointments. Obtain the owner's approval for the exact cutover and coordinate current registry CLI writers first. Preserve the existing `registry.lock` inode. Real documents, JSON, backups and migration markers stay private and out of Git.
+This is an **explicit operator action**. Installing source does not authorize migration, resets, service refreshes, or appointments. Obtain the owner's approval for the exact cutover and coordinate current registry CLI writers first. Preserve the existing `registry.lock` inode. Bootstrap init/legacy JSON migration may create the first lock only without audit/control runtime evidence; missing lock with such evidence is an error, never an automatic new inode. Retained audit also prevents empty initialization when both current and control were deleted. Real documents, JSON, backups and migration markers stay private and out of Git.
+
+## v2 Markdown → v3 split storage
+
+This is a separate explicit maintenance operation from the older JSON → Markdown migration below. Deploy the compatible codec, writer, and current reader before changing data. The full-v2 parser deliberately rejects v3, so an already-loaded old full writer cannot rewrite split current as inline v2. Keep this format fence on code rollback.
+
+1. Coordinate registry writers and obtain actual direct user authorization. Query the exact current document and accept its fresh token; do not use a cached web projection as a mutation envelope.
+2. `migrate-storage` locks the existing stable lock, fully validates v2 once, and preserves **the exact complete original raw Markdown bytes** in private `audit/legacy/<transaction UUID>.md` with a canonical immutable manifest (actual byte hash/length, format, era, revision). It never substitutes a reserialized export for raw evidence.
+3. The transaction publishes v3 current with the same owners, parents, identity/recovery, assignments, lifecycle/goals/dependencies/coordination, era, and revision. This format-only publication has event=null and a legacy archive reference. An empty v2 template retains template era/revision0 and current Audit-Head none, as required by the codec; its administrative migration receipt remains in private audit. That narrow exception binds the complete empty five-field graph in PREPARE. Exact-after recovery checks the prepared head (normally the operation UUID), never relaxes ordinary publication proof, and never replays current. It does not appoint, transfer, reset, or create a padding event.
+4. Query current and explicit history separately. Compare all five current fields and era to the accepted v2 source, the complete legacy history to its archive, archive raw bytes/hash, and current web projection. Do not use counts as preservation evidence.
+
+```bash
+RR="$HOME/.pi/agent/skills/responsibility-registry/scripts/registry.py"
+# Read/check current rows and actual user authorization before accepting TOKEN.
+python3 "$RR" query
+python3 "$RR" migrate-storage --actor user --expected-document "$TOKEN" \
+  --operation-id "$OPERATION_ID" --reason 'Approved physical current/audit separation' \
+  --authority 'Actual direct user message authorizing this migration'
+python3 "$RR" query
+python3 "$RR" query --history
+```
+
+The operation ID binds retries to one intent; preserve it and the returned transaction ID. Same-op receipt lookup precedes the now-stale v2 token. A pending/uncertain result is not proof that no change occurred. Explicit `recover-transaction --actor user --reason ... --authority ... [--expected-document TOKEN]` finalizes metadata only. It never publishes prepared current, even when current equals before. With no definitive receipt, exact-after bytes plus this op's metadata can confirm COMMITTED; all other current observations become PUBLICATION_UNKNOWN and remain untouched. An immutable receipt/head corruption is retained and stops managed writes; current-only queries do not depend on it. See [CLI recovery](cli.md#split-storage-operations-and-recovery).
+
+Private layout is under the configured private ROOT, outside the installed skill payload: `audit/pending.json`, bounded `audit/head.json`, immutable `audit/ops/<UUID>.prepare.json` / `.outcome.json`, raw legacy archives/manifests, and immutable `audit/checkpoints/<UUID>.json`. Directories are0700 and files0600; nonregular/symlink private destinations are rejected. Immutable final names are linked from complete fsynced temporary files without replacement. Normal v3 mutations read a bounded latest head/last-committed pair and their own operation, never historical chains or archives. Fresh explicit initialization or validated v2 migration provisions directories and a durable empty head with schema1 and null op/hash/last-committed fields. That exact marker alone denotes no prior attempt; missing files never do. Current transactions, archive/checkpoint writes, and transaction recovery only verify already-provisioned storage. Incomplete fresh initialization requires explicit `recover-initialization`; existing v3 missing audit must be reconciled without automatic reinitialization. A v2 migration interrupted during provisioning before a valid head exists leaves current untouched and requires explicit operator reconciliation rather than guessing freshness from directory contents. Query/status have no automatic recovery side effects. Only explicit history/audit/backup operations traverse history.
+
+### v3 clear/restore and backups
+
+The existing direct-user authority, target-before-backup selection, timestamp ambiguity rules, and new-era behavior still apply. A v3 snapshot stores exact raw current **and** a hash-bound immutable private audit checkpoint containing logical history, terminal attempt evidence, the fixed head, and legacy archive references. Those referenced raw archives remain immutable. Raw v3 Markdown alone is not a complete historical backup; retaining/moving a backup requires its checkpoint and referenced private archive/evidence objects. The local CLI does not claim a standalone portable bundle exporter.
+
+A restore selects and verifies the target first, saves current raw bytes/checkpoint, then publishes the target graph/revision/history context under a new UUID era. Legacy v2 snapshots/index records remain untouched and readable as targets. Old operation receipts remain historical and never acquire permission in the new era. The clear/restore itself is an append-only audited attempt. Index completion uses the same audit pending journal; `recover-transaction`, not a second current publisher, finalizes it. Missing/invalid current can be recorded UNKNOWN without reconstruction. Existing pre-split `switch-pending.json` still uses `recover-switch`; either pending form blocks the other publisher.
+
+Manual rm+template-copy immediately changes current authority to empty. It does not remove private lifetime audit, revive old appointments, or automatically capture unobserved manual edits. Prefer clear for an exact current snapshot/checkpoint. Same-UID actor claims and private hashes do not authenticate the caller or stop an old process; non-cooperating edits retain the final-check→rename race. Registry receipt and handoff-ready are separate resources, with fresh current qualification required by the succession service.
+
+## Legacy JSON → v2 Markdown cutover
+
+The remainder documents the retained older JSON migration path. Its full-v2 history and switch behavior apply to v2 sources, not to v3's external audit protocol above.
 
 ## Before cutover
 
@@ -86,4 +122,4 @@ Direct user cancel-all/rebuild requests use token-guarded `clear --actor user --
 
 A snapshot/pre-index failure leaves live bytes/inode untouched. Post-switch audit failure returns nonzero `switched; index incomplete`; private switch journal retains exact before/after hashes. User-authorized `recover-switch` reconciles hashes and completes/aborts the index without replaying graph data; a later valid manual MD is preserved byte/inode-exact and finalized as non-automatic superseded-manual with observed hash/journal phase, then the journal is cleared. Known unpublished failures best-effort finalize aborted immediately; post-rename fsync/readback failure is not mislabeled aborted. Invalid/missing live MD stays diagnostic: report and obtain the user repair/replacement decision, preserving extant corrupt bytes in a private dated raw copy before any manual replacement. query/projector never consult backups/index for authority. Installer excludes live/index/snapshots/staging categorically.
 
-Manual OS deletion cannot be intercepted and destroys that file's full era history, including events after migration; it does not guarantee backup of unobserved edits. Prefer agent clear when complete backup matters, otherwise make a private dated copy first. Literal rm+cp remains supported; optional same-lock flock form is documented in CLI.
+For an unmigrated v2 source, manual OS deletion cannot be intercepted and destroys that file's inline era history; it does not guarantee backup of unobserved edits. For v3, private history persists independently as described above. Prefer agent clear when complete backup matters, otherwise make a private dated copy first. Literal rm+cp remains supported; optional same-lock flock form is documented in CLI.

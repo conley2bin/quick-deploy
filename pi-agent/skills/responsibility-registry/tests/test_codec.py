@@ -11,12 +11,42 @@ spec.loader.exec_module(codec)
 
 
 class CodecTests(unittest.TestCase):
-    def test_blank_template_is_exact_valid_empty_document(self):
+    def test_v2_blank_is_exact_valid_legacy_document(self):
+        # Frozen legacy fixture, independent of the default v3 source template.
+        legacy = '''# Responsibility registry
+
+Format: responsibility-registry/v2
+Era: template
+Revision: 0
+
+Edit the visible rows. Details are additional fields, never duplicate columns.
+To start over: delete this live file, then copy RESPONSIBILITIES.template.md here.
+Reset changes registered authority; it does not stop running agents.
+Parent values: user or owner:ID (bare stable ID). Use the CLI to appoint after a template reset.
+Manual deletion loses this file and its history. Prefer agent-managed clear when a complete backup matters.
+
+## Owners
+| ID | Name | Role | Parent | Details (JSON) |
+| --- | --- | --- | --- | --- |
+
+## Assignments
+| ID | Owner | Status | Project ID | Task | Objective | Acceptance | Details (JSON) |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+
+## Coordination
+| ID | Status | Integration owner | Details (JSON) |
+| --- | --- | --- | --- |
+
+## History (audit only; never restores current rows)
+```json
+[]
+```
+'''
         state = dict(version=1, revision=0, owners={}, assignments={}, coordination={}, history=[])
         document = codec.serialize_document(state, 'template')
-        self.assertEqual(codec.parse_document(document), (state, 'template'))
+        self.assertEqual(document, legacy)
+        self.assertEqual(codec.parse_document(legacy), (state, 'template'))
         self.assertEqual(codec.parse_document(document.replace('\n', '\n\n')), (state, 'template'))
-        self.assertEqual((SCRIPT.parents[1] / 'RESPONSIBILITIES.template.md').read_text(), document)
         for bad in [document + 'extra structure', document.replace('Revision: 0', 'Revision: 1'),
                     document.replace('Format: responsibility-registry/v2', 'Format: unsupported')]:
             with self.assertRaises(codec.RegistryError):

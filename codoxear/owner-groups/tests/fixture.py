@@ -16,7 +16,9 @@ projection = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(projection)
 
 
-def build(root):
+def build(root, *, storage_format):
+    if storage_format not in (registry_document.FORMAT, registry_document.SPLIT_FORMAT):
+        raise ValueError('fixture format must be explicit v2 or v3')
     def cli(*args, payload=None):
         if args[0] not in ['init', 'query', 'rebuild']:
             args = (*args, '--expected-document', cli('query')['document_token'])
@@ -28,6 +30,12 @@ def build(root):
         return json.loads(result.stdout)
 
     cli('init')
+    if storage_format == registry_document.FORMAT:
+        # The legacy full-projection lane must create real inline audit events,
+        # independently of the current default init/template format.
+        empty = dict(version=1, revision=0, owners={}, assignments={}, coordination={}, history=[])
+        (root / 'RESPONSIBILITIES.md').write_text(
+            registry_document.serialize_document(empty, registry_document.TEMPLATE_ERA), encoding='utf-8')
     def owner(oid, name, role, parent='owner:ops', pi=None, source='current-session', task=None, project='示例评测项目'):
         identity = {'pi_session_id': pi, 'intercom_id': 'synthetic-contact-' + oid if source != 'unavailable' else None,
                     'source': source, 'unknown_reason': '合成：尚未核验 Pi 会话身份' if pi is None else ''}
@@ -53,7 +61,10 @@ def build(root):
     owner('collision-b', '冲突乙', '冲突演示', pi='pi-synthetic-duplicate')
     owner('other', '另一顶层负责人', '独立项目', parent='user', pi='pi-synthetic-other', task='同库另一方向')
     owner('orphan', '待确认上级方向', '未登记上级演示', parent='owner:not-registered', pi='pi-synthetic-orphan', task='同库独立方向')
-    return registry_document.parse_document((root / 'RESPONSIBILITIES.md').read_text())[0]
+    raw = (root / 'RESPONSIBILITIES.md').read_text(encoding='utf-8')
+    if storage_format == registry_document.FORMAT:
+        return registry_document.parse_document(raw)[0]
+    return registry_document.parse_store_document(raw)[0]
 
 
 def sessions():
@@ -70,8 +81,9 @@ def sessions():
 
 def demo():
     with tempfile.TemporaryDirectory(prefix='owner-groups-demo-') as temp:
-        state = build(Path(temp))
-        return {'owners': dict(projection.project(state), era='00000000-0000-0000-0000-000000000001'), 'sessions': sessions()}
+        state = build(Path(temp), storage_format=registry_document.SPLIT_FORMAT)
+        return {'owners': dict(projection.project_current(state, registry_document),
+                               era='00000000-0000-0000-0000-000000000001'), 'sessions': sessions()}
 
 
 if __name__ == '__main__':
