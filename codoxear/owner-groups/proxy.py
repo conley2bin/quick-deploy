@@ -46,9 +46,10 @@ def inject(body, headers, prefix):
     return _host.inject(body, headers, prefix, {NAMESPACE: asset()})
 
 
-def create_app(upstream, prefix='', projector=read_registry):
+def create_app(upstream, prefix='', projector=None):
     app = _host.create_app(upstream, prefix, features=(_owner,))
-    app[_owner.STATE]['projector'] = projector
+    if projector is not None:
+        app[_owner.STATE]['projector'] = projector
     app[_owner.STATE]['demo'] = lambda: app[CONFIG].get('demo', False)
     return app
 

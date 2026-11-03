@@ -381,7 +381,7 @@ class FeatureCacheTests(unittest.IsolatedAsyncioTestCase):
         self.owner = proxy._owner
         self.reader = self.files.reader()
         with patch.object(self.owner, 'RegistryReader', return_value=self.reader) as constructor:
-            self.app = proxy._host.create_app(str(self.upstream.make_url('')).rstrip('/'), features=(self.owner,))
+            self.app = proxy.create_app(str(self.upstream.make_url('')).rstrip('/'))
             constructor.assert_called_once_with()
         self.front = TestServer(self.app)
         await self.front.start_server()
@@ -394,11 +394,13 @@ class FeatureCacheTests(unittest.IsolatedAsyncioTestCase):
         self.files.close()
 
     async def request(self, cookie, client=None):
+        # Fail before HTTP if facade wiring regresses; never read a real HOME registry.
+        self.assertIs(self.app[self.owner.STATE]['projector'], self.reader)
         headers = {'Cookie': cookie} if cookie is not None else {}
         async with (client or self.client).post(self.front.make_url('/__owner_groups__/snapshot'), headers=headers) as response:
             return response.status, await response.json()
 
-    async def test_shared_projection_keeps_each_cookie_auth_and_native_mapping_fresh(self):
+    async def test_facade_default_shares_projection_with_fresh_auth_and_mapping(self):
         log = self.files.home / 'native.jsonl'
         log.write_text('PRIVATE transcript never read')
         with counted_loads() as counts:
@@ -436,12 +438,32 @@ class FeatureCacheTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(payload['owners'], expected)
             self.assertCountEqual(self.cookies, ['caller=one', 'caller=two'] * 4)
 
-    async def test_install_uses_separate_reader_for_each_app(self):
-        app = proxy._host.create_app('http://127.0.0.1:1', features=(self.owner,))
+    async def test_facade_invalid_and_missing_current_source_never_returns_old_owners(self):
+        status, initial = await self.request('caller=one')
+        self.assertEqual(status, 200)
+        self.assertTrue(initial['owners']['owners'])
+        self.files.document.write_text('PRIVATE invalid document')
+        status, invalid = await self.request('caller=one')
+        self.assertEqual(status, 503)
+        self.assertNotIn('owners', invalid)
+        self.assertNotIn('PRIVATE', json.dumps(invalid))
+        self.files.write()
+        self.assertEqual((await self.request('caller=one'))[0], 200)
+        self.files.document.unlink()
+        status, missing = await self.request('caller=two')
+        self.assertEqual(status, 503)
+        self.assertNotIn('owners', missing)
+        self.assertIsNone(self.reader._projection)
+
+    async def test_facade_separates_app_readers_and_preserves_explicit_projector(self):
+        app = proxy.create_app('http://127.0.0.1:1')
         other_reader = app[self.owner.STATE]['projector']
         self.assertIsNot(other_reader, self.reader)
         self.assertEqual(other_reader.__class__.__name__, 'RegistryReader')
         self.assertIs(self.app[self.owner.STATE]['projector'], self.reader)
+        explicit = lambda: {'ok': False}
+        overridden = proxy.create_app('http://127.0.0.1:1', projector=explicit)
+        self.assertIs(overridden[self.owner.STATE]['projector'], explicit)
 
 
 if __name__ == '__main__':
