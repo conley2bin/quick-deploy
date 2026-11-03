@@ -670,6 +670,37 @@ class Store:
             records.append(record)
         self.write_backup_index(records)
 
+    def _read_legacy_archive(self, prepare, manifest=None):
+        """Read exact v2 evidence bound to its known migration source anchor.
+
+        Checkpoints supply their embedded manifest; it has the same source
+        constraint as the standalone manifest, never a newly minted authority.
+        """
+        try:
+            self.audit.validate_prepare(prepare)
+            archive = identifier(prepare['references']['legacy_archive'])
+            require(prepare['action'] == 'migrate-storage' and prepare['disposition'] == 'publication' and
+                    archive == prepare['op_id'], 'legacy archive source is not its migration PREPARE')
+            if manifest is None:
+                manifest = self.audit.read(self.audit.legacy / (archive + '.manifest.json'))
+            keys(manifest, ['schema', 'archive_id', 'sha256', 'bytes', 'era', 'revision', 'format', 'document'])
+            base, after = prepare['base'], prepare['after']
+            require(manifest['schema'] == 1 and manifest['archive_id'] == archive and manifest['format'] == FORMAT and
+                    manifest['era'] == base['era'] == after['era'] and
+                    type(manifest['revision']) is int and manifest['revision'] == base['revision'] == after['revision'],
+                    'legacy manifest metadata contradicts migration source')
+            raw = read_private(self.audit.legacy / (archive + '.md'))
+            require(sha(raw) == manifest['sha256'] == base['document_sha256'] and
+                    type(manifest['bytes']) is int and len(raw) == manifest['bytes'],
+                    'legacy archive digest/bytes contradict migration source')
+            legacy, era = parse_document(raw.decode('utf-8'))
+            require(era == base['era'] and legacy['revision'] == base['revision'],
+                    'legacy document metadata contradicts migration source')
+            return legacy, manifest
+        except (OSError, RegistryError, ValueError, TypeError, KeyError) as exc:
+            raise RegistryTransactionError('audit_damaged', 'legacy archive source evidence damaged: ' + str(exc),
+                                           commit_state='unknown') from exc
+
     def _history_at(self, op):
         """Hydrate the explicitly requested logical history, never current authority."""
         self.audit.directories()
@@ -694,14 +725,54 @@ class Store:
             if refs.get('history_reset'):
                 return list(reversed(events))
             if 'legacy_archive' in refs:
-                archive = identifier(refs['legacy_archive'])
-                raw = read_private(self.audit.legacy / (archive + '.md'))
-                manifest = self.audit.read(self.audit.legacy / (archive + '.manifest.json'))
-                require(sha(raw) == manifest['sha256'] and len(raw) == manifest['bytes'], 'legacy archive digest mismatch')
-                legacy, _ = parse_document(raw.decode('utf-8'))
+                legacy, _ = self._read_legacy_archive(prepare)
                 return legacy['history'] + list(reversed(events))
             op = prepare['base']['audit_head']
         return list(reversed(events))
+
+    def audit_history_at(self, transaction_uuid, *, include_history=True):
+        """Select private historical evidence without opening or repairing current.
+
+        Only a terminal COMMITTED publication identifies logical history. Other
+        attempts can be inspected with include_history=False, never as authority.
+        """
+        try:
+            identifier(transaction_uuid)
+        except (RegistryError, ValueError, TypeError) as exc:
+            raise RegistryTransactionError('invalid_transaction', 'transaction selector requires a canonical UUID') from exc
+        def operation():
+            try:
+                self.audit.directories()
+                self.audit.head()
+                pending = self.audit.pending()
+                prepare, outcome = self.audit.lookup(transaction_uuid)
+                own_pending = pending is not None and pending['op_id'] == transaction_uuid
+                if own_pending:
+                    require(prepare is None or prepare == pending['prepare'], 'pending/final prepare mismatch')
+                    prepare = pending['prepare']
+                if prepare is None:
+                    raise RegistryTransactionError('transaction_not_found', 'no evidence for selected transaction UUID')
+                require(outcome is not None or own_pending, 'orphan selected prepare without journal; preserve evidence')
+                committed = outcome is not None and outcome['status'] == 'COMMITTED' and prepare['disposition'] == 'publication'
+                if include_history and not committed:
+                    raise RegistryTransactionError('history_unavailable',
+                        'selected transaction is not a terminal COMMITTED publication; inspect without --history',
+                        commit_state='unknown', operation_id=prepare['operation_id'])
+                result = dict(selected=dict(transaction_id=transaction_uuid, operation_id=prepare['operation_id'],
+                                            status=outcome['status'] if outcome else None, disposition=prepare['disposition']),
+                              source_era=prepare['after']['era'] if committed else None,
+                              revision=prepare['after']['revision'] if committed else None,
+                              history_loaded=include_history, current_authority=False,
+                              prepare=prepare, outcome=outcome, pending=own_pending)
+                if include_history:
+                    result['history'] = self._history_at(transaction_uuid)
+                return result
+            except RegistryTransactionError:
+                raise
+            except (OSError, RegistryError, ValueError, TypeError, KeyError) as exc:
+                raise RegistryTransactionError('audit_damaged', 'selected transaction evidence damaged: ' + str(exc),
+                                               commit_state='unknown') from exc
+        return self.locked(operation)
 
     def history_snapshot(self):
         def operation():
@@ -1148,9 +1219,14 @@ class Store:
         for attempt in checkpoint['attempts']:
             self.audit.validate_prepare(attempt['prepare'])
             self.audit.validate_outcome(attempt['outcome'], attempt['prepare'])
-        for archive, manifest in checkpoint['legacy_archives'].items():
-            archived = read_private(self.audit.legacy / (identifier(archive) + '.md'))
-            require(sha(archived) == manifest['sha256'] and len(archived) == manifest['bytes'], 'checkpoint raw legacy archive missing/corrupt')
+        archives = checkpoint['legacy_archives']
+        require(isinstance(archives, dict), 'invalid checkpoint legacy source manifests')
+        sources = [attempt['prepare'] for attempt in checkpoint['attempts']
+                   if 'legacy_archive' in attempt['prepare']['references']]
+        require(set(archives) == {source['references']['legacy_archive'] for source in sources},
+                'checkpoint legacy source anchor coverage mismatch')
+        for source in sources:
+            self._read_legacy_archive(source, archives[source['references']['legacy_archive']])
         return checkpoint
 
     def _write_checkpoint(self, checkpoint_id, raw, state, envelope, history=None):
@@ -1160,9 +1236,7 @@ class Store:
         for attempt in attempts:
             archive = attempt['prepare']['references'].get('legacy_archive')
             if archive:
-                manifest = self.audit.read(self.audit.legacy / (identifier(archive) + '.manifest.json'))
-                archived = read_private(self.audit.legacy / (archive + '.md'))
-                require(sha(archived) == manifest['sha256'], 'checkpoint legacy archive hash mismatch')
+                _, manifest = self._read_legacy_archive(attempt['prepare'])
                 archives[archive] = manifest
         value = dict(schema=1, checkpoint_id=checkpoint_id, current_sha256=sha(raw), era=envelope['era'],
                      revision=state['revision'], audit_head=envelope.get('audit_head'), head=self.audit.head(),
@@ -1620,8 +1694,11 @@ def main(argv=None):
     q.add_argument('--active', action='store_true')
     q.add_argument('--history', action='store_true', help='explicitly hydrate legacy and committed audit history')
     audit = commands.add_parser('audit', help='explicit private audit evidence; never current authorization')
-    audit.add_argument('--operation-id')
+    selectors = audit.add_mutually_exclusive_group()
+    selectors.add_argument('--operation-id')
+    selectors.add_argument('--transaction', help='canonical transaction UUID from retained private audit evidence')
     audit.add_argument('--intent-digest')
+    audit.add_argument('--history', action='store_true', help='load logical history at --transaction, never current authority')
     for name in ['register', 'update-owner', 'update', 'close', 'handover', 'coord-propose', 'coord-ack', 'coord-release']:
         p = commands.add_parser(name)
         p.add_argument('--expected-document', required=True, help='opaque token from a deliberate current query')
@@ -1665,7 +1742,12 @@ def main(argv=None):
         elif args.command == 'recover-transaction':
             result = store.recover_transaction(args.actor, args.reason, args.authority, args.expected_document)
         elif args.command == 'audit':
-            if args.operation_id:
+            require(args.intent_digest is None or args.operation_id is not None,
+                    '--intent-digest requires --operation-id and cannot accompany --transaction')
+            require(not args.history or args.transaction is not None, 'audit --history requires --transaction')
+            if args.transaction is not None:
+                result = store.audit_history_at(args.transaction, include_history=args.history)
+            elif args.operation_id is not None:
                 require(args.intent_digest is not None, 'operation audit requires --intent-digest')
                 result = store.operation_status(args.operation_id, args.intent_digest)
             else:
