@@ -7,10 +7,11 @@ import json
 import os
 from pathlib import Path
 import shutil
+import socket
 import tempfile
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 import uuid
 
 import owner_succession_native as native
@@ -562,6 +563,122 @@ class DexGemOfflineTests(unittest.TestCase):
             with redirect_stdout(io.StringIO()), patch('sys.stderr', io.StringIO()), self.assertRaises(SystemExit):
                 native.main(['--prepare', '--provider', 'dexgem-responses', '--pi-bin', '/synthetic/pi',
                     '--native-python', '/synthetic/python', '--auth-source', '/synthetic/auth'])
+
+
+class ProfileAndSocketTests(unittest.TestCase):
+    """Offline profile dispatch and real temporary Unix socket inodes only."""
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp(prefix='codoxear-owner-succession-', dir='/tmp'))
+        self.addCleanup(shutil.rmtree, self.root)
+        (self.root / 'evidence').mkdir()
+        (self.root / 'home/.pi/agent').mkdir(parents=True)
+        # A PID/start mismatch is not an owned live process, even if the PID exists.
+        self.stopped = dict(pid=os.getpid(), start_ticks='not-this-process-start')
+
+    def stale_socket(self):
+        path = self.root / 'tmux.sock'
+        with socket.socket(socket.AF_UNIX) as endpoint:
+            endpoint.bind(str(path))
+        self.assertTrue(path.is_socket())
+        return path
+
+    def test_dexgem_profile_omits_all_engine_timeout_overrides(self):
+        total, options = native.test_profile('dexgem-responses')
+        self.assertEqual(total, 3600)
+        self.assertEqual(options, {})
+        self.assertNotIn('timeouts', options)
+
+    def test_openai_original_budget_overrides_and_oauth_ttl_are_unchanged(self):
+        total, options = native.test_profile('openai')
+        self.assertEqual(total, 900)
+        self.assertEqual(options, dict(timeouts=dict(
+            launch=120, understanding=240, source_idle=90, review=240, resolution=240)))
+        auth = dict(type='oauth', access='SYNTHETIC_ACCESS', expires=2200 * 1000)
+        native.oauth_access_only(auth, now=1000)
+        with self.assertRaisesRegex(ValueError, 'require 1200s'):
+            native.oauth_access_only(auth, now=1000.001)
+
+    def test_run_wrapper_selects_profile_deadline_and_engine_options_without_launch(self):
+        import asyncio
+        for provider, expected in [('openai', 900), ('dexgem-responses', 3600)]:
+            with self.subTest(provider=provider):
+                config = dict(provider=provider)
+                native.private_json(self.root / 'config.json', config)
+                with patch.object(native, 'check_isolation', return_value=self.root), \
+                        patch.object(native, '_run', new_callable=AsyncMock) as run, \
+                        patch.object(native.asyncio, 'timeout', wraps=asyncio.timeout) as deadline:
+                    asyncio.run(native.run(self.root))
+                deadline.assert_called_once_with(expected)
+                run.assert_awaited_once_with(self.root, config, expected, native.test_profile(provider)[1])
+
+    def test_unknown_profile_erases_private_credentials_before_any_run(self):
+        import asyncio
+        native.private_json(self.root / 'config.json', dict(provider='unregistered'))
+        native.private_json(self.root / 'home/.pi/agent/auth.json', dict(synthetic='NOT_A_REAL_KEY'))
+        native.private_json(self.root / 'environment.json', dict(synthetic='NOT_A_REAL_PASSWORD'))
+        with patch.object(native, 'check_isolation', return_value=self.root), \
+                patch.object(native, '_run', new_callable=AsyncMock) as run, \
+                patch.object(native.subprocess, 'run') as launch:
+            with self.assertRaisesRegex(ValueError, 'unsupported test profile; no fallback'):
+                asyncio.run(native.run(self.root))
+        run.assert_not_awaited()
+        launch.assert_not_called()
+        self.assertFalse((self.root / 'home/.pi/agent/auth.json').exists())
+        self.assertFalse((self.root / 'environment.json').exists())
+        report = json.loads((self.root / 'evidence/result.json').read_text())
+        self.assertEqual(report['status'], 'preflight-failed')
+        self.assertEqual(report['error_type'], 'ValueError')
+
+    def test_stale_socket_removed_only_after_all_owned_processes_have_exited(self):
+        path = self.stale_socket()
+        live = native.proc_identity(os.getpid())
+        for tmux, descendants, server in [(live, [], None),
+                (self.stopped, [live], None), (self.stopped, [], live)]:
+            with self.subTest(tmux=tmux, descendants=descendants, server=server):
+                with self.assertRaisesRegex(RuntimeError, 'still running'):
+                    native.remove_stale_tmux_socket(self.root, tmux, descendants, server)
+                self.assertTrue(path.is_socket())
+        self.assertEqual(native.remove_stale_tmux_socket(
+            self.root, self.stopped, [self.stopped], self.stopped),
+            'verified-stale-private-tmux-socket-removed')
+        self.assertFalse(os.path.lexists(path))
+        self.assertEqual(native.remove_stale_tmux_socket(self.root, self.stopped),
+                         'private-tmux-socket-absent')
+
+    def test_active_bound_or_listening_socket_is_never_unlinked(self):
+        path = self.root / 'tmux.sock'
+        with socket.socket(socket.AF_UNIX) as endpoint:
+            endpoint.bind(str(path))
+            for listening in (False, True):
+                with self.subTest(listening=listening):
+                    if listening:
+                        endpoint.listen(1)
+                    with self.assertRaisesRegex(RuntimeError, 'active kernel entry'):
+                        native.remove_stale_tmux_socket(self.root, self.stopped)
+                    self.assertTrue(path.is_socket())
+        native.remove_stale_tmux_socket(self.root, self.stopped)
+        self.assertFalse(os.path.lexists(path))
+
+    def test_symlink_or_regular_file_is_never_unlinked(self):
+        path = self.root / 'tmux.sock'
+        target = self.root / 'unrelated'
+        target.write_text('preserve')
+        path.symlink_to(target)
+        with self.assertRaisesRegex(RuntimeError, 'owned ordinary socket'):
+            native.remove_stale_tmux_socket(self.root, self.stopped)
+        self.assertTrue(path.is_symlink())
+        self.assertEqual(target.read_text(), 'preserve')
+        path.unlink()
+        path.write_text('preserve regular file')
+        with self.assertRaisesRegex(RuntimeError, 'owned ordinary socket'):
+            native.remove_stale_tmux_socket(self.root, self.stopped)
+        self.assertEqual(path.read_text(), 'preserve regular file')
+
+    def test_stale_socket_requires_verified_tmux_identity(self):
+        path = self.stale_socket()
+        with self.assertRaisesRegex(RuntimeError, 'identity is unverified'):
+            native.remove_stale_tmux_socket(self.root, None)
+        self.assertTrue(path.is_socket())
 
 
 if __name__ == '__main__':

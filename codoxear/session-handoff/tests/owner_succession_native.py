@@ -536,6 +536,16 @@ def transcript_calls(path):
     return rows, calls, results
 
 
+def test_profile(provider):
+    """Only the two authorized harness profiles; production owns stage defaults."""
+    if provider == 'openai':
+        return BUDGET, dict(timeouts=dict(
+            launch=120, understanding=240, source_idle=90, review=240, resolution=240))
+    if provider == 'dexgem-responses':
+        return 3600, {}  # Omit timeouts entirely: use unmodified Engine defaults.
+    raise ValueError('unsupported test profile; no fallback')
+
+
 def model_request(provider):
     if provider not in PROVIDERS:
         raise ValueError('unsupported provider; no fallback')
@@ -560,16 +570,58 @@ async def run(root):
     evidence = within(root / 'evidence', root)
     try:
         check_isolation(root)
+        config = json.loads(within(root / 'config.json', root).read_text())
+        total, engine_options = test_profile(config['provider'])
     except BaseException as exc:
         private_json(evidence / 'result.json', dict(status='preflight-failed', error_type=type(exc).__name__, error=str(exc)))
         remove_private_credentials(root)
         raise
-    config = json.loads((root / 'config.json').read_text())
+    async with asyncio.timeout(total):
+        await _run(root, config, total, engine_options)
+
+
+def remove_stale_tmux_socket(root, tmux_identity, descendants=(), native_identity=None):
+    """Unlink only this private socket, after process and kernel absence proofs."""
+    root = private_root(root)
+    fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        if os.fstat(fd).st_uid != os.getuid():
+            raise RuntimeError('private socket root is not owned')
+        try:
+            info = os.stat('tmux.sock', dir_fd=fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return 'private-tmux-socket-absent'
+        if not stat.S_ISSOCK(info.st_mode) or info.st_uid != os.getuid():
+            raise RuntimeError('private tmux socket is not an owned ordinary socket')
+        if tmux_identity is None:
+            raise RuntimeError('private tmux server identity is unverified')
+        records = [tmux_identity, native_identity, *descendants]
+        if any(same_process(record) for record in records if record is not None):
+            raise RuntimeError('private server or descendants are still running')
+        # Reject every live kernel entry, including bound sockets not yet listening.
+        path = str(root / 'tmux.sock')
+        for row in Path('/proc/net/unix').read_text().splitlines()[1:]:
+            fields = row.split(maxsplit=7)
+            if len(fields) == 8 and fields[7] == path:
+                raise RuntimeError('private tmux socket still has an active kernel entry')
+        current = os.stat('tmux.sock', dir_fd=fd, follow_symlinks=False)
+        if (current.st_dev, current.st_ino, current.st_mode, current.st_uid) != (
+                info.st_dev, info.st_ino, info.st_mode, info.st_uid):
+            raise RuntimeError('private tmux socket changed during verification')
+        os.unlink('tmux.sock', dir_fd=fd)
+        return 'verified-stale-private-tmux-socket-removed'
+    finally:
+        os.close(fd)
+
+
+async def _run(root, config, total, engine_options):
+    evidence = root / 'evidence'
     provider = config['provider']
     project, seed = Path(config['project']), Path(config['seed'])
     baseline = project_fingerprint(project)
     watcher = FileEvents(root)
     native_identity = tmux_identity = None
+    descendants = []
     client = front = None
     engine = None
     report = dict(status='running', model=provider + '/' + MODEL + ':xhigh', candidate=config['candidate'])
@@ -623,11 +675,14 @@ async def run(root):
             nonlocal engine
             transport = ctx.upstream_json
             async def observe(method, path, **kwargs):
+                nonlocal descendants
                 if method == 'POST':
                     body = kwargs.get('body')
                     mutations.append(dict(path=path, body=body, time_ns=time.monotonic_ns()))
                     private_json(evidence / 'native-mutations.json', mutations)
-                    private_json(evidence / 'processes-before-native-mutation.json', owned_descendants(tmux_identity))
+                    descendants = list({(p['pid'], p['start_ticks']): p for p in
+                        [*descendants, *owned_descendants(tmux_identity)]}.values())
+                    private_json(evidence / 'processes-before-native-mutation.json', descendants)
                     if path == '/api/sessions':
                         assert_model_request(body, provider)
                         assert body['create_in_tmux'] is True and len(body['args']) == 1
@@ -640,8 +695,7 @@ async def run(root):
                         mark('before-stage-send', path=path, fingerprint=project_fingerprint(project))
                 return await transport(method, path, **kwargs)
             ctx.upstream_json = observe
-            engine = handoff.install(app, ctx, state_root=root / 'run-state', timeouts=dict(
-                launch=120, understanding=240, source_idle=90, review=240, resolution=240))
+            engine = handoff.install(app, ctx, state_root=root / 'run-state', **engine_options)
         front = TestServer(host.create_app(f'http://127.0.0.1:{port}', features=(owner_feature, SimpleNamespace(install=install))))
         await front.start_server()
         client = aiohttp.ClientSession(cookie_jar=aiohttp.DummyCookieJar())
@@ -673,7 +727,7 @@ async def run(root):
                 raise RuntimeError('source initial prompt model error; original response remains in private transcript')
             return row if any(block.get('text', '').strip() == 'READY' for entry in entries
                 if entry.get('message', {}).get('role') == 'assistant' for block in entry['message'].get('content', [])) else False
-        source = await watcher.until(source_ready, 180)
+        source = await watcher.until(source_ready, 180 if provider == 'openai' else total)
         assert_model_request(source, provider)
         source_file = within(source['log_path'], root)
         source_id = json.loads(source_file.read_text().splitlines()[0])['id']
@@ -692,7 +746,7 @@ async def run(root):
         started, _ = await request('POST', '/__session_handoff__/start', dict(source_session_id=source['session_id'], request_id=str(uuid.uuid4())), cookie)
         operation_id = started['operation']['id']
         report['operation_id'] = operation_id
-        await asyncio.wait_for(asyncio.shield(engine.tasks[operation_id]), 780)
+        await asyncio.wait_for(asyncio.shield(engine.tasks[operation_id]), 780 if provider == 'openai' else total)
         operation = engine.operations[operation_id]
         report['operation'] = engine.public(operation_id)
         if operation['status'] != 'ready':
@@ -711,7 +765,7 @@ async def run(root):
                 return successful
             except AssertionError:
                 return False
-        python_checks = await watcher.until(action_done, 120)
+        python_checks = await watcher.until(action_done, 120 if provider == 'openai' else total)
         after = store.current_snapshot()['state']
         target_id = operation['target_header']['pi_session_id']
         assert_graph(before, after, ids['alpha'], source_id, target_id)
@@ -760,7 +814,7 @@ async def run(root):
         private_json(evidence / 'result.json', report)
         private_json(evidence / 'file-events.json', watcher.observations)
         watcher.close()
-        cleanup, cleanup_errors, descendants = [], [], []
+        cleanup, cleanup_errors = [], []
         try:
             if client:
                 await client.close()
@@ -771,7 +825,8 @@ async def run(root):
                 cleanup.append('verified-native-web-SIGTERM')
             if tmux_identity and same_process(tmux_identity):
                 # Exclusive socket created above, with its exact server PID/start.
-                descendants = owned_descendants(tmux_identity)
+                descendants = list({(p['pid'], p['start_ticks']): p for p in
+                    [*descendants, *owned_descendants(tmux_identity)]}.values())
                 private_json(evidence / 'owned-processes.json', descendants)
                 inventory = subprocess.check_output(['tmux', 'list-panes', '-a', '-F', '#{pane_id} #{pane_pid} #{window_id}'], text=True)
                 (evidence / 'owned-panes.txt').write_text(inventory)
@@ -784,15 +839,21 @@ async def run(root):
                             os.kill(process['pid'], signal.SIGTERM)
                         except ProcessLookupError:
                             pass
-                await wait_owned_exits([*descendants, tmux_identity, native_identity])
-                cleanup.append('verified-exclusive-private-tmux-and-descendants-stopped')
+            await wait_owned_exits([*descendants, tmux_identity, native_identity])
+            records = [*descendants, tmux_identity, native_identity]
+            if any(same_process(p) for p in records if p is not None):
+                raise RuntimeError('owned processes remain after cleanup')
+            cleanup.append('verified-exclusive-private-tmux-and-descendants-stopped')
+            cleanup.append(remove_stale_tmux_socket(root, tmux_identity, descendants, native_identity))
         except BaseException as exc:
             cleanup_errors.append(type(exc).__name__ + ': ' + str(exc)[:200])
         finally:
             remove_private_credentials(root)
-            remaining = [process for process in descendants if same_process(process)]
+            remaining = [process for process in [*descendants, tmux_identity, native_identity]
+                         if process is not None and same_process(process)]
             private_json(evidence / 'cleanup.json', dict(actions=cleanup, errors=cleanup_errors,
-                remaining_owned=remaining, auth_removed=True, password_file_removed=True))
+                remaining_owned=remaining, socket_removed=not os.path.lexists(root / 'tmux.sock'),
+                auth_removed=True, password_file_removed=True))
             print(json.dumps(dict(status=report['status'], evidence=str(evidence))))
 
 
@@ -824,10 +885,7 @@ def main(argv=None):
         within(root / 'environment.json', root)
         env = json.loads((root / 'environment.json').read_text())
         os.execve(sys.executable, [sys.executable, str(Path(__file__).resolve()), '--run', str(root), '--clean-child'], env)
-    async def bounded():
-        async with asyncio.timeout(BUDGET):
-            await run(args.run)
-    asyncio.run(bounded())
+    asyncio.run(run(args.run))
 
 
 if __name__ == '__main__':

@@ -151,10 +151,14 @@ DexGem 准备使用已核验原 HOME 下的注册文件，不读取 OAuth：
   --native-python "$NATIVE_PYTHON"
 ```
 
-该分支验证原注册的精确公开 route/capabilities；只接受 `!cat` 的单个绝对路径或字面 `~/` operand，后者只按显式已核验的 `ORIGINAL_HOME` 展开。直接读取该单一常规文件一次，不执行 shell；临时 0600 `auth.json` 只存该 provider 的字面 `api_key`，公开 `models.json` 不保留 credential expression/path。API key 的 expiry 未知，不宣称通过 OAuth 1200 秒 TTL；原 OAuth 门槛保持不变。DexGem 失败输出隐藏 key 和源路径，不切换 provider。此入口仅准备隔离环境；新 route 的实际 actor→registry event→ready→check-owner→toy 闭环仍待单独授权阶段验证。
+该分支验证原注册的精确公开 route/capabilities；只接受 `!cat` 的单个绝对路径或字面 `~/` operand，后者只按显式已核验的 `ORIGINAL_HOME` 展开。直接读取该单一常规文件一次，不执行 shell；临时 0600 `auth.json` 只存该 provider 的字面 `api_key`，公开 `models.json` 不保留 credential expression/path。API key 的 expiry 未知，不宣称通过 OAuth 1200 秒 TTL；原 OAuth 门槛保持不变。DexGem 失败输出隐藏 key 和源路径，不切换 provider。准备成功不证明实际 actor→registry event→ready→check-owner→toy 闭环。
+
+离线 profile checkpoint 保留 OpenAI 原总预算 900 秒、理解/审阅/接续各 240 秒的旧测试覆盖值及原 OAuth TTL 1200 秒门槛。DexGem profile 的总预算为 3600 秒，安装 Engine 时完全省略 `timeouts` 参数，使用生产默认理解 900 秒、审阅 600 秒、接续 900 秒；不修改生产配置。总 deadline 覆盖 source READY、handoff 和 toy 验证，超时仍进入清理。未知 profile 在启动前失败并移除临时 auth/environment 文件。
+
+首轮实际 DexGem 实验在旧的 240 秒理解门槛停止：source 已 READY，target 两轮正常模型响应分别约 117、109 秒，但尚无 receipt 或 registry event，`main.py` 仍为 X。这是未完成闭环的负面证据；生产默认 900/600/900 在该轮没有被测试。新 3600 秒 profile 仅修正测试条件，本离线 checkpoint 没有再次启动 actor，不宣称真实闭环通过。
 
 运行进程以精确 allowlist 重新 exec；私有 tmux shim 固定 `-S ROOT/tmux.sock -f /dev/null`，服务 cwd 固定为临时根以免读取仓库 `.env`。broker 原 argv 保留，仅增加资源隔离 flags；显式加载的 installed native active-session bridge 保留。Pi 会设置 `process.title` 并覆盖 Linux `/proc/PID/cmdline`，因此临时 Pi shim 在 exec 前以同一 PID 保存 0600、NUL 分隔的真实 argv；观察器以真实 marker/header、PID/start、broker 父进程和原始 exec argv 共同核验 bridge，不把运行后的进程标题误当启动参数。源只确认 fixture 后审阅；target 必须自行读取其真实 SessionManager marker/header、提交 challenged identity，Intercom 不可用须真实 null+原因。source 自行提交 custody 与 review；harness 不代填任何模型产物。
 
-产物检查区分完整非 carrier 图、唯一 session-succession event、新 current binding、不可覆盖 ready、实际 helper 成功结果、后续 `check-owner` 与独立 main.py edit。保存私有文件事件/单调时钟、真实工具调用/结果和 fingerprint；最终须人工阅读三份报告、身份来源与 custody 证据。只有 main.py 可变且须实际以 Python `-B` 验证 Y；vendor/memory/AGENTS 不变。清理仅作用于本次独占 socket 的精确 PID/start descendants，并删除 access/password 文件；`cleanup.json` 中残留或错误必须显式处理。该实验不证明恶意同 UID 隔离或真实 owner 迁移。
+产物检查区分完整非 carrier 图、唯一 session-succession event、新 current binding、不可覆盖 ready、实际 helper 成功结果、后续 `check-owner` 与独立 main.py edit。保存私有文件事件/单调时钟、真实工具调用/结果和 fingerprint；最终须人工阅读三份报告、身份来源与 custody 证据。只有 main.py 可变且须实际以 Python `-B` 验证 Y；vendor/memory/AGENTS 不变。清理仅作用于本次独占 socket 的精确 PID/start descendants，并删除 access/password 文件。仅当已核验 tmux server、native server 和所记录 descendants 均已退出，且 `/proc/net/unix` 不再包含该私有路径时，才删除同一 owned 普通 socket inode；仍绑定但未 listen 的 socket、活动 listener、symlink 和普通文件均不删除。`cleanup.json` 记录 socket 是否移除以及残留进程/错误，不能只以已发出 kill 命令视为清理完成；残留或错误必须显式处理。该实验不证明恶意同 UID 隔离或真实 owner 迁移。
 
 2026-11-03 本轮实际 **preflight 被阻断**：原 access 剩余 1078 秒，小于 1200 秒门槛。未复制 access/refresh，未启动 Pi/tmux/Web，未请求模型或修改真实 registry。14 个准备/证据 helper 测试通过，其中包括临时默认 installed Store 的实测；这不构成新 identity/custody/ready/toy 的真实 Pi 验收。真实 actor 证据仍待具备足够 TTL 的另一次明确执行。
