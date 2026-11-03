@@ -672,9 +672,9 @@ for i in "${!skill_dirs[@]}"; do
   else
     mkdir -p "$dest"
     if [[ "$name" == responsibility-registry ]]; then
-      # Never remove/recreate this directory or copy the live authority file,
-      # including one accidentally present in a source checkout.
-      tar -C "$skill_dir" --exclude='./RESPONSIBILITIES.md' --exclude='./BACKUPS.md' --exclude='./backups' --exclude='./.responsibilities-*' --exclude='./.RESPONSIBILITIES.md-*' --exclude='./.BACKUPS.md-*' --exclude='__pycache__' -cf - . |
+      # Never remove/recreate this directory or copy live authority/private audit,
+      # including runtime evidence accidentally present in a source checkout.
+      tar -C "$skill_dir" --exclude='./RESPONSIBILITIES.md' --exclude='./BACKUPS.md' --exclude='./backups' --exclude='./.registry-private' --exclude='./audit' --exclude='./.responsibilities-*' --exclude='./.RESPONSIBILITIES.md-*' --exclude='./.BACKUPS.md-*' --exclude='__pycache__' -cf - . |
         tar -C "$dest" -xf -
       registry_root="$(python3 - "$dest" <<'PYROOT'
 from pathlib import Path
@@ -685,7 +685,9 @@ print(Path.home() / '.pi/agent/.memory/local/responsibility-registry'
       if installed == default.resolve() else installed / '.registry-private')
 PYROOT
 )"
-      if [[ -e "$registry_root/registry.json" || -e "$registry_root/dashboard.md" || -e "$registry_root/document-control.json" ]]; then
+      # Even an empty/damaged audit path is prior runtime evidence, not a fresh
+      # install. Preserve it and missing Markdown/control; never repair implicitly.
+      if [[ -e "$registry_root/registry.json" || -e "$registry_root/dashboard.md" || -e "$registry_root/document-control.json" || -e "$registry_root/audit" || -L "$registry_root/audit" ]]; then
         echo "responsibility-registry: preserving runtime state; explicit migration/recovery if Markdown is absent"
       else
         python3 "$dest/scripts/registry.py" --root "$registry_root" --document "$dest/RESPONSIBILITIES.md" init
