@@ -7,7 +7,7 @@ import stat
 import aiohttp
 from aiohttp import web
 
-from .registry_projection import read_registry
+from .registry_projection import RegistryReader, read_registry
 
 HERE = Path(__file__).resolve().parent
 NAMESPACE = '__owner_groups__'
@@ -87,6 +87,6 @@ async def feature(request):
 
 
 def install(app, host):
-    app[STATE] = {'host': host, 'projector': read_registry, 'demo': lambda: False}
+    app[STATE] = {'host': host, 'projector': RegistryReader(), 'demo': lambda: False}
     host.add_script(NAMESPACE, asset()[0])
     app.router.add_route('*', host.prefix + '/' + NAMESPACE + '/{name}', feature)

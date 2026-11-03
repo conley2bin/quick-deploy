@@ -1,13 +1,18 @@
 #!/usr/bin/env python3
 """Read-only owner sidebar projection. Shared pure installed codec; no Store, discovery or mutations.
 
-Transport entry points must call read_registry() with its fixed default path.
-project()/read_registry(root) are also usable by isolated tests.
+Transport entry points own one RegistryReader with fixed default paths per app.
+project()/stateless read_registry(root) are also usable by isolated tests.
 """
+from contextlib import contextmanager
+from copy import deepcopy
 import fcntl
 import importlib.util
+import os
 from pathlib import Path
 import re
+import stat
+import threading
 
 ROOT = Path.home() / '.pi/agent/.memory/local/responsibility-registry'
 DOCUMENT = Path.home() / '.pi/agent/skills/responsibility-registry/RESPONSIBILITIES.md'
@@ -107,32 +112,102 @@ def project(state):
     return {'schema': SCHEMA, 'ok': True, 'revision': state['revision'], 'owners': result}
 
 
-def load_codec(path):
+def load_codec(path, source=None):
     spec = importlib.util.spec_from_file_location('owner_registry_document', path)
     require(spec is not None and spec.loader is not None)
     module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    if source is None:
+        with open_source(path) as source:
+            content = source.read()
+    else:
+        content = source.read()
+    # A same-size edit with restored mtime must not reuse importlib's stale .pyc.
+    exec(compile(content, str(path), 'exec'), module.__dict__)
     require(module.FORMAT == FORMAT)
     return module
 
 
-def read_registry(root=ROOT, document=DOCUMENT, codec_path=CODEC):
-    """Transport calls only fixed defaults; parameters are for isolated internal tests."""
+def source_version(info):
+    if not stat.S_ISREG(info.st_mode) or not info.st_mode & 0o444:
+        raise OSError('registry source must be a readable regular file')
+    return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+
+
+@contextmanager
+def open_source(path):
+    """Open existing readable regular files without following a final symlink."""
+    before = source_version(path.lstat())
+    # NONBLOCK also prevents a raced-in FIFO from blocking a worker before fstat.
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(fd, 'rb') as source:
+        if source_version(os.fstat(source.fileno())) != before:
+            raise OSError('registry source changed while opening')
+        yield source
+
+
+def _load_projection(source, codec_source, codec_path):
+    """Cold-load seam: keep full codec/byte budget until current-view integration."""
     try:
-        codec = load_codec(codec_path)
-        with (root / 'registry.lock').open('rb') as lock:
-            fcntl.flock(lock, fcntl.LOCK_SH)
-            require(not document.is_symlink())
-            with document.open('rb') as source:
-                raw = source.read(MAX_DOCUMENT_BYTES + 1)
-            if len(raw) > MAX_DOCUMENT_BYTES:
-                return failure('document-too-large')
-            try:
-                state, era = codec.parse_document(raw.decode('utf-8'))
-            except codec.RegistryError as exc:
-                raise ValueError('invalid document') from exc
-            return dict(project(state), era=era)
-    except (OSError, PermissionError, ImportError, SyntaxError):
+        codec = load_codec(codec_path, codec_source)
+        raw = source.read(MAX_DOCUMENT_BYTES + 1)
+        if len(raw) > MAX_DOCUMENT_BYTES:
+            return failure('document-too-large')
+        try:
+            state, era = codec.parse_document(raw.decode('utf-8'))
+        except codec.RegistryError as exc:
+            raise ValueError('invalid document') from exc
+        return dict(project(state), era=era)
+    except (ImportError, SyntaxError):
         return failure('unavailable')
     except (ValueError, TypeError, KeyError, AttributeError, RecursionError):
         return failure('invalid')
+
+
+class RegistryReader:
+    """One generation of public projection, singleflight within this app's workers.
+
+    No raw document, codec module, audit state or per-request identity is retained.
+    Shared registry.lock still serializes against cooperating registry writers.
+    """
+    def __init__(self, root=ROOT, document=DOCUMENT, codec_path=CODEC):
+        self.root = Path(root)
+        self.document = Path(document)
+        self.codec_path = Path(codec_path)
+        self._mutex = threading.Lock()
+        self._generation = None
+        self._projection = None
+
+    def __call__(self):
+        # Called through asyncio.to_thread: neither mutex nor flock blocks the loop.
+        with self._mutex:
+            try:
+                with open_source(self.root / 'registry.lock') as lock:
+                    fcntl.flock(lock, fcntl.LOCK_SH)
+                    with open_source(self.document) as source, open_source(self.codec_path) as codec_source:
+                        generation = (source_version(os.fstat(source.fileno())),
+                                      source_version(os.fstat(codec_source.fileno())))
+                        if generation != self._generation:
+                            # Discard success before attempting a new or invalid generation.
+                            self._generation = self._projection = None
+                            result = _load_projection(source, codec_source, self.codec_path)
+                        else:
+                            result = self._projection
+                        after = (source_version(os.fstat(source.fileno())),
+                                 source_version(os.fstat(codec_source.fileno())))
+                        paths = (source_version(self.document.lstat()),
+                                 source_version(self.codec_path.lstat()))
+                        if generation != after or generation != paths:
+                            raise OSError('registry source changed while reading')
+                        self._generation, self._projection = generation, result
+                        return deepcopy(result)
+            except (OSError, ImportError, SyntaxError):
+                code = 'unavailable'
+            except (ValueError, TypeError, KeyError, AttributeError, RecursionError):
+                code = 'invalid'
+            self._generation = self._projection = None
+            return failure(code)
+
+
+def read_registry(root=ROOT, document=DOCUMENT, codec_path=CODEC):
+    """Stateless compatibility entrypoint; transports install their own reader."""
+    return RegistryReader(root, document, codec_path)()

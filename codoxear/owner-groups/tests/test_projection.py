@@ -1,3 +1,4 @@
+from contextlib import contextmanager
 import copy
 import json
 from pathlib import Path
@@ -60,19 +61,21 @@ class ProjectionTests(unittest.TestCase):
         self.assertEqual(snapshot(), before)
 
     def test_lock_precedes_snapshot_read(self):
-        original = Path.open
-        locked = []
+        original = p.os.open
+        locked, documents = [], []
         def opened(path, *args, **kwargs):
             if path.name == 'RESPONSIBILITIES.md':
                 self.assertEqual(locked, [True])
+                documents.append(path)
             return original(path, *args, **kwargs)
         real_lock = p.fcntl.flock
         def lock(fd, operation):
             self.assertEqual(operation, p.fcntl.LOCK_SH)
             locked.append(True)
             return real_lock(fd, operation)
-        with patch.object(Path, 'open', opened), patch.object(p.fcntl, 'flock', lock):
+        with patch.object(p.os, 'open', opened), patch.object(p.fcntl, 'flock', lock):
             self.assertTrue(p.read_registry(self.root, self.root / 'RESPONSIBILITIES.md', fixture.CODEC)['ok'])
+        self.assertEqual(documents, [self.root / 'RESPONSIBILITIES.md'])
 
     def test_invalid_snapshots_fail_closed(self):
         variants = []
@@ -135,18 +138,18 @@ class ProjectionTests(unittest.TestCase):
         codec = fixture.registry_document
         real_parse = codec.parse_document
         reads = []
-        original_open = Path.open
+        original_open = p.open_source
         class BoundedRead:
             def __init__(self, source): self.source = source
-            def __enter__(self): return self
-            def __exit__(self, *args): self.source.close()
+            def fileno(self): return self.source.fileno()
             def read(self, size):
                 reads.append(size)
                 return self.source.read(size)
-        def opened(path, *args, **kwargs):
-            source = original_open(path, *args, **kwargs)
-            return BoundedRead(source) if path.name == 'RESPONSIBILITIES.md' and args == ('rb',) else source
-        with patch.object(p, 'load_codec', return_value=codec), patch.object(Path, 'open', opened):
+        @contextmanager
+        def opened(path):
+            with original_open(path) as source:
+                yield BoundedRead(source) if path.name == 'RESPONSIBILITIES.md' else source
+        with patch.object(p, 'load_codec', return_value=codec), patch.object(p, 'open_source', opened):
             for limit in (len(raw) + 1, len(raw)):
                 with self.subTest(limit=limit), patch.object(p, 'MAX_DOCUMENT_BYTES', limit), \
                         patch.object(codec, 'parse_document', wraps=real_parse) as parse:
