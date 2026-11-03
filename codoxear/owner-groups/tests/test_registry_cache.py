@@ -31,7 +31,7 @@ class SyntheticRegistry:
         self.env = patch.dict(os.environ, HOME=str(self.home))
         self.env.start()
         self.root = self.home / 'registry'
-        self.root.mkdir()
+        self.root.mkdir(mode=0o700)
         self.document = self.root / 'RESPONSIBILITIES.md'
         self.codec_path = self.home / 'scripts/registry_document.py'
         self.codec_path.parent.mkdir()
