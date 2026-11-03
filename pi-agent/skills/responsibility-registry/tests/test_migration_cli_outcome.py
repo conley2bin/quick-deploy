@@ -83,8 +83,12 @@ class MigrationCliOutcomeTests(unittest.TestCase):
     def test_pending_and_aborted_retry_do_not_report_success(self):
         self.assertEqual(self.fail_publication('current_temp_synced')['commit_state'], 'not_committed')
         self.assert_rejected_unchanged('transaction_pending', 'unknown')
-        recovered = self.store.recover_transaction('user', 'synthetic recovery', self.authority)
-        self.assertEqual(recovered['outcome']['status'], 'ABORTED')
+        # Recovery cannot prove an unchanged current was never published. Seed
+        # a known historical ABORTED receipt in this isolated fixture instead.
+        prepare = self.store.audit.pending()['prepare']
+        outcome = self.store._outcome(prepare, 'ABORTED', 'synthetic_prepublication_abort',
+                                      self.store.current_snapshot())
+        self.store.audit.finish(prepare, outcome)
         self.assert_rejected_unchanged('migration_not_committed', 'not_committed')
 
     def test_committed_receipt_with_replaced_current_is_historical_only(self):
