@@ -257,6 +257,7 @@ def _error(operation_id, exc, digest=None):
             'commit_unknown': 'needs_recovery', 'audit_unavailable': 'unavailable',
             'audit_damaged': 'unavailable', 'registry_unavailable': 'unavailable',
             'registry_invalid': 'unavailable', 'storage_not_migrated': 'unavailable',
+            'codec_incompatible': 'unavailable',
         }.get(code)
         if (status is None or getattr(exc, 'commit_state', None) not in ('not_committed', 'committed', 'unknown')
                 or type(getattr(exc, 'retryable', None)) is not bool):
@@ -359,16 +360,9 @@ def _receipt(record, operation_id, digest):
     plan = intent['plan']
     event = prepare['event']
     kind = 'committed' if outcome['status'] == 'COMMITTED' else 'not_applicable'
+    # Only Store's publication/recovery observation belongs in this historical
+    # receipt. A later current read qualifies the flags, not an invented old token.
     token = outcome.get('document_token_after')
-    # Older protocol implementations may only expose a genuine fresh post-read.
-    # It qualifies as a post-publication token only for this exact managed result.
-    current = record['current']
-    if (token is None and current is not None
-            and (current['audit_head'] == record['transaction_id'] or
-                 (kind == 'not_applicable' and current['document_token'] == prepare['base']['document_token']))
-            and current['era'] == plan['era'] and current['state']['revision'] == prepare['after']['revision']
-            and _binding(current, intent)):
-        token = current['document_token']
     return dict(version=1, operation_id=operation_id, intent_digest=digest, store_id=plan['store_id'],
                 era=plan['era'], owner_id=plan['owner_id'], source_pi_session_id=plan['source_pi_session_id'],
                 target_pi_session_id=intent['target']['identity']['pi_session_id'], outcome=kind,

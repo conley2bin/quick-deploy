@@ -454,7 +454,8 @@ class SuccessionPolicyTests(unittest.TestCase):
         for code, status, effect in [('document_conflict', 'conflict', 'not_committed'),
                                      ('audit_unavailable', 'unavailable', 'unknown'),
                                      ('commit_unknown', 'needs_recovery', 'unknown'),
-                                     ('registry_invalid', 'unavailable', 'committed')]:
+                                     ('registry_invalid', 'unavailable', 'committed'),
+                                     ('codec_incompatible', 'unavailable', 'not_committed')]:
             fails(code, effect)
             result = self.envelope(api.get_owner_session_succession(OP, self.digest(), store=self.store), status)
             self.assertEqual(result['error']['commit_state'], effect)
@@ -481,6 +482,11 @@ class SuccessionPolicyTests(unittest.TestCase):
         self.envelope(self.commit(), 'committed')
         record = self.store.records[OP]
         record['outcome'].pop('document_token_after')
+        # Even an unchanged matching current cannot supply a missing historical
+        # publication/recovery observation; it qualifies only the current flags.
+        result = self.envelope(api.get_owner_session_succession(OP, self.digest(), store=self.store), 'already_committed')
+        self.assertIsNone(result['receipt']['document_token_after'])
+        self.assertTrue(result['current_binding_valid'])
         record['prepare']['after']['document_sha256'] = 'd' * 64
         self.store.edit(lambda s: s['assignments']['active'].update(objective='New valid manual current.'))
         self.store.state['revision'] += 1
