@@ -119,3 +119,29 @@ HANDOFF_NATIVE_PYTHON=codoxear/.runtime/venv/bin/python \
 该测试创建临时 HOME、appstate、Pi 日志和私有 `tmux -S` socket，通过原生 API 创建/命名、由真实 mirror 收敛，并按固定 nonce 读取真实 `window_name`；它还核验原窗口不变及 `_99` 零创建。Pi 替身仅写有效 header 后等待，不生成理解报告，所以预期接力停在 `understanding_timeout`，不代表语义闭环验收。所有测试窗口和 Web 子进程在结束时清理。
 
 上述普通单元命令默认跳过此 opt-in 测试：使用临时 Pi JSONL、假原生创建/命名/发送响应、真实 Context 产物验证和应用内 aiohttp HTTP 服务；不会启动真实 Pi/tmux、访问用户数据或切换线上服务。它们验证身份、哈希、截止边界、状态和一次性副作用机制，不能证明模型真实理解了目标。需显式启用的专用隔离真实 Pi fixture 及已记录结果见 [真实 Pi 验收](tests/REAL_PI_ACCEPTANCE.md)，其语义证据来自实际理解报告、审阅、核对回执和任务文件结果。原生 UI 配合合成 API 的浏览器验证只覆盖界面交互与共享宿主、分组功能共存，不替代真实 Pi 的语义证据。
+
+### 新版 owner gate 的真实 Pi 验收入口
+
+`tests/owner_succession_native.py` 是单独 opt-in 的 `openai/gpt-6.1-sol:xhigh` 实验，不由 unittest 启动。它创建私有 `/tmp/codoxear-owner-succession-*`，只复制候选 registry scripts 与该模型的公开注册信息；固定 installed-service 默认路径解析到临时 HOME 的真实 v3 Store。合成 UUID owner 图包含上级、下级、两个 active/一个 ended 的源 assignment、依赖与 coordination，均为测试数据。
+
+准备阶段必须显式指定已安装 Pi、native Python 和原 OAuth 文件；只有原 access/account metadata/真实 expiry 可进入 0600 临时文件，refresh 固定为不可用 sentinel。剩余 TTL 不足 1200 秒即在复制凭据/启动任何进程前失败；运行前再次核验。不会刷新、延长到期、选择其他模型或访问生产 Web。
+
+```sh
+# 指向现有安装的绝对路径；不得为本实验新装/更新全局 runtime。
+NATIVE_PYTHON="${HANDOFF_NATIVE_PYTHON:?set existing installed native Python absolute path}"
+# 在已批准的 exact joint tree 中，先运行不启动 actor 的 helper tests。
+"$NATIVE_PYTHON" -m unittest discover -s codoxear/session-handoff/tests -p test_owner_succession_native.py -v
+HARNESS="$PWD/codoxear/session-handoff/tests/owner_succession_native.py"
+"$NATIVE_PYTHON" "$HARNESS" --prepare --pi-bin "$(command -v pi)" \
+  --native-python "$NATIVE_PYTHON" --auth-source "$HOME/.pi/agent/auth.json"
+# 从上一步 JSON 取本次 ROOT；不要 source/eval 其输出。失败时不得继续。
+# 通过 job 提交一次，按 job 技能为同一 run ID 注册完成通知。
+job run owner-succession-native --mem 2G --high 1G --swap 0G \
+  --cwd "$PWD" --input "$HARNESS" -- "$NATIVE_PYTHON" "$HARNESS" --run "$ROOT"
+```
+
+运行进程以精确 allowlist 重新 exec；私有 tmux shim 固定 `-S ROOT/tmux.sock -f /dev/null`，服务 cwd 固定为临时根以免读取仓库 `.env`。broker 原 argv 保留，仅增加资源隔离 flags；显式加载的 installed native active-session bridge 保留。Pi 会设置 `process.title` 并覆盖 Linux `/proc/PID/cmdline`，因此临时 Pi shim 在 exec 前以同一 PID 保存 0600、NUL 分隔的真实 argv；观察器以真实 marker/header、PID/start、broker 父进程和原始 exec argv 共同核验 bridge，不把运行后的进程标题误当启动参数。源只确认 fixture 后审阅；target 必须自行读取其真实 SessionManager marker/header、提交 challenged identity，Intercom 不可用须真实 null+原因。source 自行提交 custody 与 review；harness 不代填任何模型产物。
+
+产物检查区分完整非 carrier 图、唯一 session-succession event、新 current binding、不可覆盖 ready、实际 helper 成功结果、后续 `check-owner` 与独立 main.py edit。保存私有文件事件/单调时钟、真实工具调用/结果和 fingerprint；最终须人工阅读三份报告、身份来源与 custody 证据。只有 main.py 可变且须实际以 Python `-B` 验证 Y；vendor/memory/AGENTS 不变。清理仅作用于本次独占 socket 的精确 PID/start descendants，并删除 access/password 文件；`cleanup.json` 中残留或错误必须显式处理。该实验不证明恶意同 UID 隔离或真实 owner 迁移。
+
+2026-11-03 本轮实际 **preflight 被阻断**：原 access 剩余 1078 秒，小于 1200 秒门槛。未复制 access/refresh，未启动 Pi/tmux/Web，未请求模型或修改真实 registry。14 个准备/证据 helper 测试通过，其中包括临时默认 installed Store 的实测；这不构成新 identity/custody/ready/toy 的真实 Pi 验收。真实 actor 证据仍待具备足够 TTL 的另一次明确执行。
