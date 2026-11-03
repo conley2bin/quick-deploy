@@ -758,6 +758,20 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotEqual(result.get('error_code'), None)
         self.assertEqual(self.native.service.events, 0)
 
+    async def test_superseded_after_helper_ready_blocks_host_ready(self):
+        previous = self.native.__call__
+        async def supersede(method, path, **kwargs):
+            result = await previous(method, path, **kwargs)
+            if method == 'POST' and path.endswith('opaque%2Ftarget/send'):
+                self.native.service.valid = False  # a later binding/reset after the accepted helper commit
+            return result
+        self.engine.upstream_json = supersede
+        await self.start()
+        result = await self.finish()
+        self.assertEqual(result['status'], 'delivery_unknown')
+        self.assertEqual(result['error_code'], 'succession_superseded')
+        self.assertEqual(self.native.service.events, 1)
+
     async def test_no_owner_normal_engine_still_checks_absence(self):
         self.native.service.owner = None
         await self.start()

@@ -32,6 +32,11 @@ RECEIPT = {'version', 'operation_id', 'intent_digest', 'store_id', 'era', 'owner
            'source_pi_session_id', 'target_pi_session_id', 'outcome', 'revision_before',
            'revision_after', 'transaction_id', 'event_id', 'document_token_after'}
 ERROR = {'code', 'message', 'retryable', 'commit_state'}
+ERROR_CODES = {'document_conflict', 'era_changed', 'source_owner_missing', 'source_owner_changed',
+               'source_identity_conflict', 'source_registration_changed', 'target_identity_occupied',
+               'operation_intent_mismatch', 'store_mismatch', 'transaction_pending', 'commit_unknown',
+               'registry_unavailable', 'registry_invalid', 'codec_incompatible', 'audit_unavailable',
+               'invalid_plan', 'invalid_target', 'invalid_authority', 'invalid_custody', 'invalid_operation_id', 'invalid_digest'}
 STATUSES = {'prepared', 'committed', 'already_committed', 'not_applicable', 'superseded',
             'not_found', 'conflict', 'needs_recovery', 'unavailable', 'invalid_request'}
 
@@ -209,7 +214,8 @@ class Adapter:
 
     def prepare(self, op, source):
         result = self.call('prepare_owner_session_succession', op, op, source)
-        require(result['status'] == 'prepared', 'succession_prepare_blocked')
+        if result['status'] != 'prepared':
+            blocked(result)
         require(result['plan']['source_pi_session_id'] == source)
         return result['plan']
 
@@ -299,7 +305,8 @@ def bind_target(directory, manifest, row, identity):
     require(bool(launch['launch_id']) or type(launch['broker_pid']) is int)
     proof = dict(version=1, operation_id=manifest['operation_id'], pi_session_id=pi,
                  session_file=identity['log_path'], cwd=row['cwd'], broker_session_id=row['session_id'],
-                 launch_binding=context._encode(launch).decode().strip(), session_header_sha256=sha,
+                 launch_binding='native-launch-sha256:' + hashlib.sha256(context._encode(launch)).hexdigest(),
+                 session_header_sha256=sha,
                  device=dev, inode=ino, challenge_sha256=manifest['succession']['challenge_sha256'])
     with context._operation_dir(directory) as fd:
         check_source(fd, manifest)
@@ -401,13 +408,20 @@ def validate_intent(fd, manifest, understanding_sha256, review_sha256, adapter):
     return intent
 
 
+def blocked(result):
+    # Never forward infrastructure text, unbounded module codes or private paths.
+    code = result.get('error', {}).get('code') if result.get('error') else None
+    suffix = '_' + code if code in ERROR_CODES else ''
+    raise GateError('succession_' + result['status'] + suffix)
+
+
 def permission(result, intent):
     if result['status'] in ('committed', 'already_committed'):
         require(result['current_binding_valid'])
     elif result['status'] == 'not_applicable':
         require(result['no_owner_valid'])
     else:
-        raise GateError('succession_' + result['status'])
+        blocked(result)
     receipt = result['receipt']
     for k in ('operation_id', 'store_id', 'era', 'owner_id', 'source_pi_session_id'):
         require(receipt[k] == intent['plan'][k])

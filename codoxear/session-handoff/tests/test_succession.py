@@ -114,6 +114,21 @@ class GateTests(unittest.TestCase):
         self.assertEqual(self.service.calls[-1], 'get')
         self.assertFalse((self.directory / 'resolution.json').exists())
 
+    def test_lost_commit_response_recovers_exact_receipt_without_reprepare(self):
+        original = self.service.commit_owner_session_succession
+        def lost(*args, **kwargs):
+            original(*args, **kwargs)
+            raise OSError('response lost after durable transaction')
+        self.service.commit_owner_session_succession = lost
+        with self.assertRaisesRegex(s.GateError, 'outcome_unknown'):
+            self.submit('resolution', verdict='ready')
+        self.assertFalse((self.directory / 'resolution.json').exists())
+        self.assertFalse((self.directory / 'succession-receipt.json').exists())
+        self.submit('resolution', verdict='ready')
+        self.assertEqual(self.service.events, 1)
+        self.assertEqual(self.service.calls, ['prepare', 'prepare', 'commit', 'get'])
+        self.assertTrue((self.directory / 'resolution.json').exists())
+
     def test_superseded_receipt_blocks_recovery_and_host_validation(self):
         original = context._publish_at
         def fail(fd, name, raw):
