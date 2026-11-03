@@ -14,7 +14,7 @@ class ProjectionTests(unittest.TestCase):
     def setUpClass(cls):
         cls.temp = tempfile.TemporaryDirectory(prefix='owner-groups-test-')
         cls.root = Path(cls.temp.name)
-        cls.state = fixture.build(cls.root)
+        cls.state = fixture.build(cls.root, storage_format=fixture.registry_document.FORMAT)
 
     @classmethod
     def tearDownClass(cls):

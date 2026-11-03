@@ -36,7 +36,7 @@ class SyntheticRegistry:
         self.codec_path = self.home / 'scripts/registry_document.py'
         self.codec_path.parent.mkdir()
         self.codec_path.write_bytes(fixture.CODEC.read_bytes())
-        self.state = fixture.build(self.root)
+        self.state = fixture.build(self.root, storage_format=fixture.registry_document.FORMAT)
         self.era = '00000000-0000-0000-0000-000000000001'
         self.write()
 

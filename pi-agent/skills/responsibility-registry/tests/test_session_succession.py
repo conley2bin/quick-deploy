@@ -753,11 +753,14 @@ class ActualStoreSuccessionTests(unittest.TestCase):
             s['coordination']['agreement']['sequencing'] = 'Newest confirmed sequencing.'
         self.manual(changes)
         before_bytes = self.document.read_bytes()
+        before_files = self.files()
+        self.assertIsNone(self.store.audit.head())  # Fresh init provisions an empty marker.
         stale = self.commit()
         self.assertEqual(stale['status'], 'conflict', stale)
         self.assertEqual(stale['error']['code'], 'document_conflict')
         self.assertEqual(self.document.read_bytes(), before_bytes)
-        self.assertFalse(self.store.audit.exists())
+        self.assertEqual(self.files(), before_files)
+        self.assertEqual(self.store.audit.history(), [])
         self.plan = self.prepare(OP, 'opaque-source-Pi')
         self.assertEqual(self.digest(), digest)
         before = self.store.current_snapshot()['state']
