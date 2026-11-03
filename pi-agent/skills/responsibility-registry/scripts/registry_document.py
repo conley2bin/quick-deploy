@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Pure fixed-format Markdown codec and domain validation; no I/O or discovery."""
+from collections.abc import Iterable
 from datetime import datetime
 import hashlib
 import json
@@ -152,13 +153,11 @@ def check_graph(owners):
             here = parent[6:] if parent.startswith('owner:') else None
 
 
-def validate(state):
-    keys(state, ['version', 'revision', 'owners', 'assignments', 'history'], ['coordination'])
+def _validate_current_fields(state):
     require(isinstance(state.get('coordination', {}), dict), 'invalid coordination container')
     require(type(state['version']) is int and state['version'] == 1, 'unsupported canonical version')
     require(type(state['revision']) is int and state['revision'] >= 0, 'invalid revision')
-    require(isinstance(state['owners'], dict) and isinstance(state['assignments'], dict)
-            and isinstance(state['history'], list), 'invalid canonical containers')
+    require(isinstance(state['owners'], dict) and isinstance(state['assignments'], dict), 'invalid canonical containers')
     for oid, record in state['owners'].items():
         keys(record, ['id', 'name', 'role', 'parent', 'identity', 'created_at', 'updated_at'], ['appointment_source', 'recovery'])
         owner({k: v for k, v in record.items() if k not in ['created_at', 'updated_at', 'appointment_source']})
@@ -204,6 +203,18 @@ def validate(state):
     for cid, agreement in state.get('coordination', {}).items():
         validate_agreement(state, agreement)
         require(cid == agreement['id'], 'coordination key/id mismatch')
+
+
+def validate_current(state):
+    """Validate exactly the current fields, without asserting audit validity."""
+    keys(state, ['version', 'revision', 'owners', 'assignments', 'coordination'])
+    _validate_current_fields(state)
+
+
+def validate(state):
+    keys(state, ['version', 'revision', 'owners', 'assignments', 'history'], ['coordination'])
+    _validate_current_fields(state)
+    require(isinstance(state['history'], list), 'invalid canonical containers')
     require(len(state['history']) == state['revision'], 'history/revision mismatch')
     for index, event in enumerate(state['history'], 1):
         keys(event, ['revision', 'at', 'actor', 'action', 'reason', 'before', 'after'], ['id', 'occurred', 'authority', 'changes'])
@@ -365,16 +376,26 @@ def strict_json(value):
         raise RegistryError('invalid strict JSON: ' + str(exc)) from exc
 
 
-def validate_envelope(state, era):
-    validate(state)
+def _validate_era(state, era):
     if era == TEMPLATE_ERA:
-        require(state['revision'] == 0 and not any(state[k] for k in ('owners', 'assignments', 'coordination', 'history')),
+        require(state['revision'] == 0 and not any(state[k] for k in ('owners', 'assignments', 'coordination')),
                 'template era must be wholly blank at Revision 0')
     else:
         try:
             require(str(uuid.UUID(era)) == era, 'era must be canonical UUID or template')
         except (ValueError, AttributeError) as exc:
             raise RegistryError('era must be canonical UUID or template') from exc
+
+
+def validate_current_envelope(state, era):
+    """Validate current fields and era/template rules; never validate an audit."""
+    validate_current(state)
+    _validate_era(state, era)
+
+
+def validate_envelope(state, era):
+    validate(state)
+    _validate_era(state, era)
 
 
 def serialize_document(state, era):
@@ -399,58 +420,88 @@ def serialize_document(state, era):
     return '\n'.join(lines)
 
 
-def parse_document(content):
-    require(isinstance(content, str), 'UTF-8 document text required')
-    # Accept editor CRLF structural lines; literal data CR remains entity encoded.
-    lines = content.replace('\r\n', '\n').split('\n')
-    pos = 0
-    section = 'preamble'
-    def take(expected=None):
-        nonlocal pos
-        while pos < len(lines) and lines[pos] == '':
-            pos += 1
-        require(pos < len(lines), f'{section} line {pos + 1}: unexpected end')
-        value = lines[pos]
-        pos += 1
-        require(expected is None or value == expected,
-                f'{section} line {pos}: expected {expected!r}; got {value!r}')
+class _DocumentLines:
+    """One-line lookahead, never advancing beyond the requested line."""
+    def __init__(self, lines):
+        require(not isinstance(lines, (str, bytes, bytearray)), 'iterable of Unicode text lines required, not whole text')
+        try:
+            self.lines = iter(lines)
+        except TypeError as exc:
+            raise RegistryError('iterable of Unicode text lines required') from exc
+        self.pos = 0
+        self.section = 'preamble'
+        self.buffer = None
+        self.finished = False
+
+    def peek(self):
+        if self.buffer is None and not self.finished:
+            try:
+                value = next(self.lines)
+            except StopIteration:
+                self.finished = True
+                return None
+            require(isinstance(value, str), f'{self.section} line {self.pos + 1}: Unicode text line required')
+            # Accept line iterators with LF/CRLF endings or already split lines.
+            if value.endswith('\n'):
+                value = value[:-2] if value.endswith('\r\n') else value[:-1]
+            require('\n' not in value, f'{self.section} line {self.pos + 1}: expected one text line')
+            self.buffer = value
+        return self.buffer
+
+    def pop(self):
+        value = self.peek()
+        require(value is not None, f'{self.section} line {self.pos + 1}: unexpected end')
+        self.buffer = None
+        self.pos += 1
         return value
+
+    def skip_blanks(self):
+        while self.peek() == '':
+            self.pop()
+
+    def take(self, expected=None):
+        self.skip_blanks()
+        value = self.pop()
+        require(expected is None or value == expected,
+                f'{self.section} line {self.pos}: expected {expected!r}; got {value!r}')
+        return value
+
+
+def _parse_current_prefix(lines):
     def table_cells(line):
         line = line.rstrip(' \t')
-        require(line.startswith('|') and line.endswith('|'), f'{section} line {pos}: required outer delimiters')
+        require(line.startswith('|') and line.endswith('|'), f'{lines.section} line {lines.pos}: required outer delimiters')
         return [cell.strip(' ') for cell in line[1:-1].split('|')]
+
     def metadata(label):
-        value = take()
-        require(value.startswith(label + ': '), f'{section} line {pos}: expected unique {label}')
+        value = lines.take()
+        require(value.startswith(label + ': '), f'{lines.section} line {lines.pos}: expected unique {label}')
         return value[len(label) + 2:]
-    take(TITLE)
+
+    lines.take(TITLE)
     require(metadata('Format') == FORMAT, 'unsupported document format')
     era = metadata('Era')
     revision = metadata('Revision')
-    require(re.fullmatch(r'0|[1-9][0-9]*', revision), f'line {pos}: invalid revision')
+    require(re.fullmatch(r'0|[1-9][0-9]*', revision), f'line {lines.pos}: invalid revision')
     # Instructions may be omitted, but no unrecognized prose is silently ignored.
     for instruction in INSTRUCTIONS:
-        while pos < len(lines) and lines[pos] == '':
-            pos += 1
-        if pos < len(lines) and lines[pos] == instruction:
-            pos += 1
-    state = dict(version=1, revision=int(revision), owners={}, assignments={}, coordination={}, history=[])
+        lines.skip_blanks()
+        if lines.peek() == instruction:
+            lines.pop()
+    state = dict(version=1, revision=int(revision), owners={}, assignments={}, coordination={})
     for heading, kind, headers, fields in SECTIONS:
-        section = heading
-        take('## ' + heading)
-        require(table_cells(take()) == list((*headers, 'Details (JSON)')), f'{section} line {pos}: wrong column headers')
-        separators = table_cells(take())
+        lines.section = heading
+        lines.take('## ' + heading)
+        require(table_cells(lines.take()) == list((*headers, 'Details (JSON)')), f'{heading} line {lines.pos}: wrong column headers')
+        separators = table_cells(lines.take())
         require(len(separators) == len(headers) + 1 and all(re.fullmatch(r':?-{3,}:?', cell) for cell in separators),
-                f'{section} line {pos}: invalid table separator')
-        while pos < len(lines):
-            if lines[pos] == '':
-                pos += 1
-                continue
-            if not lines[pos].startswith('|'):
+                f'{heading} line {lines.pos}: invalid table separator')
+        while True:
+            lines.skip_blanks()
+            if lines.peek() is None or not lines.peek().startswith('|'):
                 break
-            line_no = pos + 1
-            line = lines[pos].rstrip(' \t')
-            pos += 1
+            line_no = lines.pos + 1
+            line = lines.pop().rstrip(' \t')
             try:
                 require(line.endswith('|'), 'required outer table delimiters')
                 raw_cells = line[1:-1].split('|')
@@ -469,16 +520,39 @@ def parse_document(content):
                 require(record['id'] not in state[kind], 'duplicate row ID ' + record['id'])
                 state[kind][record['id']] = record
             except (RegistryError, ValueError, TypeError, KeyError) as exc:
-                raise RegistryError(f'{section} line {line_no}: {exc}') from exc
-    section = 'History'
-    take(HISTORY)
-    take('```json')
-    start = pos
-    while pos < len(lines) and lines[pos] != '```':
-        pos += 1
-    require(pos < len(lines), f'History line {start + 1}: missing closing fence')
-    state['history'] = strict_json('\n'.join(lines[start:pos]))
-    pos += 1
-    require(all(line == '' for line in lines[pos:]), f'History line {pos + 1}: unexpected nonblank structure')
+                raise RegistryError(f'{heading} line {line_no}: {exc}') from exc
+    lines.section = 'History'
+    lines.take(HISTORY)
+    return state, era
+
+
+def parse_current_document(lines: Iterable[str]) -> tuple[dict, str]:
+    """Validate the current prefix and consume its exact History heading only.
+
+    No audit-body line is requested, buffered, parsed or validated. The returned
+    state has exactly version/revision/owners/assignments/coordination; it cannot
+    be used as a validated full document or as a Store mutation envelope.
+    """
+    state, era = _parse_current_prefix(_DocumentLines(lines))
+    validate_current_envelope(state, era)
+    return state, era
+
+
+def parse_document(content):
+    require(isinstance(content, str), 'UTF-8 document text required')
+    # Full parsing intentionally materializes and validates the complete audit.
+    lines = _DocumentLines(content.replace('\r\n', '\n').split('\n'))
+    state, era = _parse_current_prefix(lines)
+    lines.take('```json')
+    start = lines.pos
+    history = []
+    while lines.peek() is not None and lines.peek() != '```':
+        history.append(lines.pop())
+    require(lines.peek() is not None, f'History line {start + 1}: missing closing fence')
+    state['history'] = strict_json('\n'.join(history))
+    lines.pop()
+    trailing_start = lines.pos + 1
+    while lines.peek() is not None:
+        require(lines.pop() == '', f'History line {trailing_start}: unexpected nonblank structure')
     validate_envelope(state, era)
     return state, era
