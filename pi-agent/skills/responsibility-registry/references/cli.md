@@ -69,6 +69,9 @@ v3 publishes current Markdown once, after durable private pending/PREPARE eviden
 ## Split-storage operations and recovery
 
 See [migration.md](migration.md) for explicit v2-to-v3 migration and raw-byte preservation. Normal v3 reads/writes open current plus a fixed number of directly addressed transaction metadata files; they do not enumerate old operations, read legacy archives, or hydrate history. A callback sees exactly five current fields, with no fake `history:[]`.
+`migrate-storage` exits nonzero for pending or non-COMMITTED outcomes; typed errors preserve `operation_id` and truthful `commit_state` (ABORTED is `not_committed`, unresolved publication is `unknown`).
+A COMMITTED receipt qualifies as `already-committed-current-era` only when freshly observed current is valid v3 in the migration era; later managed revisions are allowed, and `current.document_token` is fresh while the outcome token remains historical. Otherwise `migration_historical` exits nonzero with `commit_state:committed`, without replaying mutation; audit/status remain read-only historical inspection.
+Migration acceptance still independently compares the complete current graph, era/revision, full history and exact raw archive; CLI success alone does not prove preservation.
 
 ```bash
 # Explicit historical lookup for a known operation and its frozen digest:

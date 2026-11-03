@@ -1739,6 +1739,25 @@ def main(argv=None):
             result = store.migrate(resume=args.command == 'resume-migration')
         elif args.command == 'migrate-storage':
             result = store.migrate_storage(args.expected_document, args.actor, args.reason, args.authority, args.operation_id)
+            operation_id = result['prepare']['operation_id']
+            outcome = result['outcome']['status'] if result['outcome'] else None
+            commit_state = ('committed' if outcome == 'COMMITTED' else
+                            'not_committed' if outcome in ('ABORTED', 'NOT_APPLICABLE') else 'unknown')
+            if result['pending']:
+                raise RegistryTransactionError('transaction_pending', 'migration pending; explicit recover-transaction required',
+                    commit_state=commit_state, operation_id=operation_id)
+            if outcome != 'COMMITTED':
+                raise RegistryTransactionError('migration_not_committed' if commit_state == 'not_committed' else 'commit_unknown',
+                    'migration has no committed outcome: ' + str(outcome), commit_state=commit_state, operation_id=operation_id)
+            # _status observes current afresh under the migration lock, including
+            # on receipt lookup. The outcome token remains historical evidence.
+            current = result['current']
+            if (current is None or current['format'] != document_codec.SPLIT_FORMAT or
+                    current['era'] != result['prepare']['after']['era']):
+                raise RegistryTransactionError('migration_historical',
+                    'migration committed historically; current is not valid v3 in that era; no mutation replayed',
+                    commit_state='committed', operation_id=operation_id)
+            result['qualification'] = 'already-committed-current-era'
         elif args.command == 'recover-transaction':
             result = store.recover_transaction(args.actor, args.reason, args.authority, args.expected_document)
         elif args.command == 'audit':
