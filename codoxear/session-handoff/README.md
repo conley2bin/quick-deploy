@@ -122,9 +122,9 @@ HANDOFF_NATIVE_PYTHON=codoxear/.runtime/venv/bin/python \
 
 ### 新版 owner gate 的真实 Pi 验收入口
 
-`tests/owner_succession_native.py` 是单独 opt-in 的 `openai/gpt-6.1-sol:xhigh` 实验，不由 unittest 启动。它创建私有 `/tmp/codoxear-owner-succession-*`，只复制候选 registry scripts 与该模型的公开注册信息；固定 installed-service 默认路径解析到临时 HOME 的真实 v3 Store。合成 UUID owner 图包含上级、下级、两个 active/一个 ended 的源 assignment、依赖与 coordination，均为测试数据。
+`tests/owner_succession_native.py` 是单独 opt-in 的实验，显式选择 `openai/gpt-6.1-sol:xhigh` 或 `dexgem-responses/gpt-6.1-sol:xhigh`，无自动 fallback，不由 unittest 启动。它创建私有 `/tmp/codoxear-owner-succession-*`，只复制候选 registry scripts 与该模型的公开注册信息；固定 installed-service 默认路径解析到临时 HOME 的真实 v3 Store。合成 UUID owner 图包含上级、下级、两个 active/一个 ended 的源 assignment、依赖与 coordination，均为测试数据。
 
-准备阶段必须显式指定已安装 Pi、native Python 和原 OAuth 文件；只有原 access/account metadata/真实 expiry 可进入 0600 临时文件，refresh 固定为不可用 sentinel。剩余 TTL 不足 1200 秒即在复制凭据/启动任何进程前失败；运行前再次核验。不会刷新、延长到期、选择其他模型或访问生产 Web。
+OpenAI 准备阶段必须显式指定已安装 Pi、native Python 和原 OAuth 文件；只有原 access/account metadata/真实 expiry 可进入 0600 临时文件，refresh 固定为不可用 sentinel。剩余 TTL 不足 1200 秒即在复制凭据/启动任何进程前失败；运行前再次核验。不会刷新、延长到期、选择其他模型或访问生产 Web。
 
 ```sh
 # 指向现有安装的绝对路径；不得为本实验新装/更新全局 runtime。
@@ -139,6 +139,19 @@ HARNESS="$PWD/codoxear/session-handoff/tests/owner_succession_native.py"
 job run owner-succession-native --mem 2G --high 1G --swap 0G \
   --cwd "$PWD" --input "$HARNESS" -- "$NATIVE_PYTHON" "$HARNESS" --run "$ROOT"
 ```
+
+DexGem 准备使用已核验原 HOME 下的注册文件，不读取 OAuth：
+
+```sh
+# ORIGINAL_HOME 是已核验原 models.json 所属 HOME 的绝对路径，不是 actor HOME。
+: "${ORIGINAL_HOME:?set verified original registration HOME}"
+"$NATIVE_PYTHON" "$HARNESS" --prepare --provider dexgem-responses \
+  --models-source "$ORIGINAL_HOME/.pi/agent/models.json" \
+  --registration-home "$ORIGINAL_HOME" --pi-bin "$(command -v pi)" \
+  --native-python "$NATIVE_PYTHON"
+```
+
+该分支验证原注册的精确公开 route/capabilities；只接受 `!cat` 的单个绝对路径或字面 `~/` operand，后者只按显式已核验的 `ORIGINAL_HOME` 展开。直接读取该单一常规文件一次，不执行 shell；临时 0600 `auth.json` 只存该 provider 的字面 `api_key`，公开 `models.json` 不保留 credential expression/path。API key 的 expiry 未知，不宣称通过 OAuth 1200 秒 TTL；原 OAuth 门槛保持不变。DexGem 失败输出隐藏 key 和源路径，不切换 provider。此入口仅准备隔离环境；新 route 的实际 actor→registry event→ready→check-owner→toy 闭环仍待单独授权阶段验证。
 
 运行进程以精确 allowlist 重新 exec；私有 tmux shim 固定 `-S ROOT/tmux.sock -f /dev/null`，服务 cwd 固定为临时根以免读取仓库 `.env`。broker 原 argv 保留，仅增加资源隔离 flags；显式加载的 installed native active-session bridge 保留。Pi 会设置 `process.title` 并覆盖 Linux `/proc/PID/cmdline`，因此临时 Pi shim 在 exec 前以同一 PID 保存 0600、NUL 分隔的真实 argv；观察器以真实 marker/header、PID/start、broker 父进程和原始 exec argv 共同核验 bridge，不把运行后的进程标题误当启动参数。源只确认 fixture 后审阅；target 必须自行读取其真实 SessionManager marker/header、提交 challenged identity，Intercom 不可用须真实 null+原因。source 自行提交 custody 与 review；harness 不代填任何模型产物。
 

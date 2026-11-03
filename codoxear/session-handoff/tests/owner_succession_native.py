@@ -1,6 +1,6 @@
 """Opt-in, one-shot native Sol Pi + synthetic-owner acceptance.
 
-Preparation reads only the explicitly selected OAuth entry, never refreshes it.
+Preparation uses an explicit OpenAI OAuth or DexGem API-key branch; no fallback.
 Run preparation separately; submit --run ROOT through the bounded job service.
 The normal unittest suite never starts Pi, tmux, a server, or a model request.
 Raw evidence stays in the private temporary root. No production URL is accepted.
@@ -20,6 +20,7 @@ import secrets
 import shlex
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -35,6 +36,8 @@ from integration_fixture import (prepare_fixture, project_fingerprint, assert_un
 from native_acceptance import FileEvents, private_json, load_host, assert_handoff_mutations
 
 MODEL = 'gpt-6.1-sol'
+PROVIDERS = ('openai', 'dexgem-responses')
+DEXGEM_URL = 'https://litellm-direct.dex-gem.ai/v1'
 BUDGET = 900
 MARGIN = 300
 REPO = Path(__file__).resolve().parents[3]
@@ -60,6 +63,99 @@ def oauth_access_only(entry, now=None):
     result = {key: entry[key] for key in ('type', 'access', 'expires', 'clientId', 'scopes', 'accountId') if key in entry}
     result['refresh'] = 'TEST_ONLY_REFRESH_DISABLED'
     return result
+
+
+def dexgem_public_registration(registry, *, isolated=False):
+    """Keep the registered public route, never its credential expression."""
+    providers = registry['providers']
+    route = providers['dexgem-responses']
+    selected = [row for row in route['models'] if row.get('id') == MODEL]
+    if len(selected) != 1:
+        raise ValueError('exact DexGem Sol registration required')
+    model = selected[0]
+    provider_fields = {'name', 'baseUrl', 'api', 'compat', 'authHeader', 'models', 'apiKey'}
+    model_fields = {'id', 'name', 'provider', 'api', 'baseUrl', 'reasoning', 'thinkingLevelMap',
+                    'input', 'contextWindow', 'maxTokens', 'cost', 'compat', 'inputLimits',
+                    'promptCache', 'samplingParams', 'samplingParamsByThinkingLevel'}
+    if (set(route) - provider_fields or set(model) - model_fields
+            or route.get('baseUrl') != DEXGEM_URL or route.get('api') != 'openai-responses'
+            or model.get('api', route['api']) != route['api']
+            or model.get('baseUrl', route['baseUrl']) != route['baseUrl']
+            or model.get('provider', 'dexgem-responses') != 'dexgem-responses'
+            or model.get('reasoning') is not True or model.get('input') != ['text', 'image']
+            or model.get('contextWindow') != 690000 or model.get('maxTokens') != 128000
+            or model.get('thinkingLevelMap', {}).get('xhigh') != 'xhigh'):
+        raise ValueError('exact DexGem route/capabilities required')
+    public = {key: value for key, value in route.items() if key not in ('apiKey', 'models')}
+    public['models'] = [model]
+    # Metadata is data, not executable configuration or an external file reference.
+    def check(value):
+        if isinstance(value, dict):
+            for key, item in value.items():
+                if key in ('apiKey', 'headers', 'env', 'oauth'):
+                    raise ValueError('credential-bearing public metadata')
+                check(key)
+                check(item)
+        elif isinstance(value, list):
+            for item in value:
+                check(item)
+        elif isinstance(value, str) and value != DEXGEM_URL:
+            if any(char in value for char in '!$~/\\\n\r`'):
+                raise ValueError('non-public model metadata')
+    check(public)
+    result = {'providers': {'dexgem-responses': public}}
+    if isolated and registry != result:
+        raise ValueError('isolated DexGem registration must contain only the selected public model')
+    return result
+
+
+def dexgem_credentials(models_source, registration_home):
+    """Directly read ONE registered regular file; never evaluate a command.
+
+    registration_home is an explicitly verified original same-host HOME, pinned
+    by its canonical models.json location, not inferred from the actor/caller env.
+    All source-side exceptions are replaced before reaching public evidence.
+    """
+    stage = 'registration'
+    try:
+        home, source = Path(registration_home), Path(models_source)
+        if (not home.is_absolute() or '..' in home.parts or home.resolve() != home
+                or not home.is_dir() or source != home / '.pi/agent/models.json'
+                or source.is_symlink() or not source.is_file()):
+            raise ValueError()
+        registry = json.loads(source.read_text())
+        public = dexgem_public_registration(registry)
+        stage = 'credential source'
+        expression = registry['providers']['dexgem-responses']['apiKey']
+        if (not isinstance(expression, str) or not expression.startswith('!')
+                or any(char in expression for char in '$`\\\n\r;|&<>()*?[]{}')):
+            raise ValueError()
+        words = shlex.split(expression[1:])
+        if len(words) != 2 or words[0] not in ('cat', '/bin/cat', '/usr/bin/cat'):
+            raise ValueError()
+        operand = words[1]
+        if operand.startswith('~/'):
+            key_path = home / operand[2:]
+            if not key_path.resolve().is_relative_to(home):
+                raise ValueError()
+        elif operand.startswith('/'):
+            key_path = Path(operand)
+        else:
+            raise ValueError()
+        if '..' in key_path.parts or '~' in str(key_path):
+            raise ValueError()
+        # O_NOFOLLOW plus fstat rejects symlinks/directories without reading them.
+        fd = os.open(key_path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(fd) as stream:
+            if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+                raise ValueError()
+            key = stream.read().strip()  # Exactly one content read, no shell.
+        stage = 'API key'
+        if not key or any(char.isspace() or char in '!$`' for char in key):
+            raise ValueError()
+        return public, {'type': 'api_key', 'key': key}
+    except Exception:
+        raise ValueError('DexGem ' + stage + ' rejected; source details withheld; no fallback') from None
 
 
 def clean_environment(root, pi_bin):
@@ -121,14 +217,24 @@ def synthetic_graph(factory, source_pi, source_file, project):
     return state, ids
 
 
-def prepare(pi_bin, native_python, auth_source):
+def prepare(pi_bin, native_python, auth_source=None, *, provider='openai',
+            models_source=None, registration_home=None):
     root = Path(tempfile.mkdtemp(prefix='codoxear-owner-succession-', dir='/tmp')).resolve()
     root.chmod(0o700)
     evidence = root / 'evidence'
     evidence.mkdir(mode=0o700)
     # Fail before copying any access token, starting a server, or creating actors.
     try:
-        auth = oauth_access_only(json.loads(Path(auth_source).read_text())['openai'])
+        if provider == 'openai':
+            if models_source is not None or registration_home is not None:
+                raise ValueError('OpenAI preparation requires only its OAuth auth-source')
+            auth = oauth_access_only(json.loads(Path(auth_source).read_text())['openai'])
+        elif provider == 'dexgem-responses':
+            if auth_source is not None:
+                raise ValueError('DexGem preparation does not read OAuth auth-source')
+            public_models, auth = dexgem_credentials(models_source, registration_home)
+        else:
+            raise ValueError('unsupported provider; no fallback')
         pi_bin = Path(pi_bin).absolute()
         if not pi_bin.is_file():
             raise ValueError('installed Pi executable is missing')
@@ -163,22 +269,26 @@ def prepare(pi_bin, native_python, auth_source):
         env = clean_environment(root, pi_bin)
         for key in ('XDG_CONFIG_HOME', 'XDG_CACHE_HOME', 'XDG_STATE_HOME', 'XDG_DATA_HOME'):
             Path(env[key]).mkdir(parents=True, exist_ok=True, mode=0o700)
-        settings = dict(defaultProvider='openai', defaultModel=MODEL, defaultThinkingLevel='xhigh',
-            enabledModels=['openai/' + MODEL], defaultProjectTrust='never',
+        settings = dict(defaultProvider=provider, defaultModel=MODEL, defaultThinkingLevel='xhigh',
+            enabledModels=[provider + '/' + MODEL], defaultProjectTrust='never',
             retry=dict(enabled=False, maxRetries=0, provider=dict(maxRetries=0, timeoutMs=120000)),
             packages=[], extensions=[], skills=[], prompts=[], themes=[], enableInstallTelemetry=False,
             enableAnalytics=False, cacheWarming='off')
         private_json(root / 'home/.pi/agent/settings.json', settings)
         # Copy only this exact public model registration, not daily configuration.
-        registry = json.loads((Path(auth_source).parent / 'models-store.json').read_text())
-        selected = [row for row in registry['openai']['models'] if row.get('id') == MODEL and row.get('provider') == 'openai']
-        if len(selected) != 1 or selected[0].get('api') != 'openai-responses' or 'xhigh' not in selected[0].get('thinkingLevelMap', {}):
-            raise ValueError('exact registered Sol route/capabilities unavailable; no fallback')
-        if any(key in selected[0] for key in ('apiKey', 'headers')):
-            raise ValueError('model registration contains credential-bearing fields')
-        private_json(root / 'home/.pi/agent/models-store.json', {'openai': {**{key: value for key, value in registry['openai'].items() if key != 'models'}, 'models': selected}})
-        private_json(evidence / 'selected-model.json', selected[0])
-        private_json(root / 'home/.pi/agent/auth.json', {'openai': auth})
+        if provider == 'openai':
+            registry = json.loads((Path(auth_source).parent / 'models-store.json').read_text())
+            selected = [row for row in registry['openai']['models'] if row.get('id') == MODEL and row.get('provider') == 'openai']
+            if len(selected) != 1 or selected[0].get('api') != 'openai-responses' or 'xhigh' not in selected[0].get('thinkingLevelMap', {}):
+                raise ValueError('exact registered Sol route/capabilities unavailable; no fallback')
+            if any(key in selected[0] for key in ('apiKey', 'headers')):
+                raise ValueError('model registration contains credential-bearing fields')
+            private_json(root / 'home/.pi/agent/models-store.json', {'openai': {**{key: value for key, value in registry['openai'].items() if key != 'models'}, 'models': selected}})
+            private_json(evidence / 'selected-model.json', selected[0])
+        else:
+            private_json(root / 'home/.pi/agent/models.json', public_models)
+            private_json(evidence / 'selected-model.json', public_models)
+        private_json(root / 'home/.pi/agent/auth.json', {provider: auth})
         flags = ['--no-extensions', '--no-skills', '--no-prompt-templates', '--no-themes', '--no-mcp', '--no-approve', '--offline']
         # Explicit broker -e bridge argv remains intact despite disabled discovery.
         # Pi sets process.title, which overwrites Linux /proc/PID/cmdline.
@@ -191,24 +301,43 @@ def prepare(pi_bin, native_python, auth_source):
             (root / 'bin' / name).chmod(0o700)
         private_json(root / 'environment.json', env)
         private_json(root / 'config.json', dict(native_python=str(native_python), pi_bin=str(pi_bin),
-            project=str(project), seed=str(seed), candidate=subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=REPO, text=True).strip()))
-        private_json(evidence / 'preparation.json', dict(status='prepared', model='openai/' + MODEL + ':xhigh',
-            auth_ttl_seconds=int(auth['expires'] / 1000 - time.time()), refresh_disabled=True))
+            project=str(project), seed=str(seed), provider=provider,
+            candidate=subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=REPO, text=True).strip()))
+        auth_info = (dict(auth_type='oauth', auth_ttl_seconds=int(auth['expires'] / 1000 - time.time()),
+                          refresh_disabled=True) if provider == 'openai' else
+                     dict(auth_type='api_key', auth_ttl_seconds=None, expiry='unknown', refresh_disabled=True))
+        private_json(evidence / 'preparation.json', dict(status='prepared', model=provider + '/' + MODEL + ':xhigh', **auth_info))
     except BaseException as exc:
         (root / 'home/.pi/agent/auth.json').unlink(missing_ok=True)
-        private_json(evidence / 'result.json', dict(status='preflight-failed', error_type=type(exc).__name__, error=str(exc)))
-        print(json.dumps({'status': 'preflight-failed', 'root': str(root), 'error': str(exc)}))
+        (root / 'environment.json').unlink(missing_ok=True)
+        error = str(exc) if provider != 'dexgem-responses' else 'DexGem preparation failed; source details withheld; no fallback'
+        private_json(evidence / 'result.json', dict(status='preflight-failed', error_type=type(exc).__name__, error=error))
+        print(json.dumps({'status': 'preflight-failed', 'root': str(root), 'error': error}))
+        if provider == 'dexgem-responses':
+            raise ValueError(error) from None
         raise
     print(json.dumps({'status': 'prepared', 'root': str(root)}))
     return root
 
 
-def check_isolation(root):
-    root = Path(root).resolve()
+def private_root(root):
+    root = Path(root).absolute()
+    if root.is_symlink() or root.resolve() != root:
+        raise ValueError('temporary root must not be a symlink')
     if root.parent != Path('/tmp') or not root.name.startswith('codoxear-owner-succession-'):
         raise ValueError('not a fresh owner-succession temporary root')
     if root.stat().st_mode & 0o777 != 0o700:
         raise ValueError('temporary root must be private')
+    return root
+
+
+def remove_private_credentials(root):
+    for relative in ('home/.pi/agent/auth.json', 'environment.json'):
+        within(Path(root) / relative, root).unlink(missing_ok=True)
+
+
+def check_isolation(root):
+    root = private_root(root)
     expected = json.loads((root / 'environment.json').read_text())
     allowed = set(clean_environment(root, '/usr/bin/pi'))
     if set(expected) != allowed or dict(os.environ) != expected:
@@ -223,9 +352,30 @@ def check_isolation(root):
     if auth_path.stat().st_mode & 0o777 != 0o600:
         raise ValueError('auth must be private')
     auth = json.loads(auth_path.read_text())
-    if set(auth) != {'openai'} or auth['openai'].get('refresh') != 'TEST_ONLY_REFRESH_DISABLED':
+    provider = json.loads(within(root / 'config.json', root).read_text())['provider']
+    if provider not in PROVIDERS or set(auth) != {provider}:
         raise ValueError('auth contains unauthorized credentials')
-    oauth_access_only(auth['openai'])
+    agent = root / 'home/.pi/agent'
+    settings = json.loads(within(agent / 'settings.json', root).read_text())
+    if (settings['defaultProvider'] != provider or settings['defaultModel'] != MODEL
+            or settings['defaultThinkingLevel'] != 'xhigh' or settings['enabledModels'] != [provider + '/' + MODEL]):
+        raise ValueError('isolated settings do not select the exact provider/model')
+    if provider == 'openai':
+        if auth[provider].get('refresh') != 'TEST_ONLY_REFRESH_DISABLED':
+            raise ValueError('auth contains unauthorized credentials')
+        oauth_access_only(auth[provider])
+    else:
+        entry = auth[provider]
+        if (set(entry) != {'type', 'key'} or entry['type'] != 'api_key'
+                or not isinstance(entry['key'], str) or not entry['key']
+                or any(char.isspace() or char in '!$`' for char in entry['key'])):
+            raise ValueError('auth must contain only a literal DexGem API key')
+        if (agent / 'models-store.json').exists():
+            raise ValueError('DexGem must not use models-store')
+        try:
+            dexgem_public_registration(json.loads(within(agent / 'models.json', root).read_text()), isolated=True)
+        except Exception:
+            raise ValueError('isolated DexGem public registration rejected; no fallback') from None
     return root
 
 
@@ -386,24 +536,43 @@ def transcript_calls(path):
     return rows, calls, results
 
 
+def model_request(provider):
+    if provider not in PROVIDERS:
+        raise ValueError('unsupported provider; no fallback')
+    return dict(model_provider=provider, model=MODEL, reasoning_effort='xhigh')
+
+
+def assert_model_request(body, provider):
+    for key, value in model_request(provider).items():
+        assert body.get(key) == value, 'native request changed the selected provider/model/effort'
+
+
+def source_request(project, seed, provider):
+    return dict(cwd=str(project), agent_backend='pi', **model_request(provider),
+        create_in_tmux=True, args=['--session', str(seed),
+        'This instruction applies only to this predecessor session. Acknowledge this authorized temporary fixture '
+        'with exactly READY, without an answer-key summary or task edits. Then wait to review the successor. '
+        'The successor may implement the latest user goal after the normal review/resolution protocol.'])
+
+
 async def run(root):
-    root = Path(root).resolve()
+    root = private_root(root)
     evidence = within(root / 'evidence', root)
     try:
         check_isolation(root)
     except BaseException as exc:
         private_json(evidence / 'result.json', dict(status='preflight-failed', error_type=type(exc).__name__, error=str(exc)))
-        (root / 'home/.pi/agent/auth.json').unlink(missing_ok=True)
-        (root / 'environment.json').unlink(missing_ok=True)
+        remove_private_credentials(root)
         raise
     config = json.loads((root / 'config.json').read_text())
+    provider = config['provider']
     project, seed = Path(config['project']), Path(config['seed'])
     baseline = project_fingerprint(project)
     watcher = FileEvents(root)
     native_identity = tmux_identity = None
     client = front = None
     engine = None
-    report = dict(status='running', model='openai/' + MODEL + ':xhigh', candidate=config['candidate'])
+    report = dict(status='running', model=provider + '/' + MODEL + ':xhigh', candidate=config['candidate'])
     mutations, milestones = [], []
     def mark(stage, **details):
         milestones.append(dict(stage=stage, time_ns=time.monotonic_ns(), **details))
@@ -412,8 +581,8 @@ async def run(root):
         # Catalog inspection is local only; no Pi actor or provider call.
         catalog = subprocess.run([str(root / 'bin/pi'), '--list-models', MODEL], capture_output=True, text=True, check=True)
         (evidence / 'model-catalog.txt').write_text(catalog.stdout)
-        if 'openai' not in catalog.stdout or MODEL not in catalog.stdout:
-            raise ValueError('exact registered openai Sol model is absent; no fallback')
+        if not any(provider in line.split() and MODEL in line.split() for line in catalog.stdout.splitlines()):
+            raise ValueError('exact registered ' + provider + ' Sol model is absent; no fallback')
         subprocess.run(['tmux', 'new-session', '-d', '-c', str(root), '-s', 'acceptance', '-n', 'anchor', '/bin/bash --noprofile --norc'], check=True)
         tmux_pid = int(subprocess.check_output(['tmux', 'display-message', '-p', '#{pid}'], text=True))
         tmux_identity = proc_identity(tmux_pid)
@@ -460,8 +629,7 @@ async def run(root):
                     private_json(evidence / 'native-mutations.json', mutations)
                     private_json(evidence / 'processes-before-native-mutation.json', owned_descendants(tmux_identity))
                     if path == '/api/sessions':
-                        assert body['model_provider'] == 'openai' and body['model'] == MODEL
-                        assert body['reasoning_effort'] == 'xhigh'
+                        assert_model_request(body, provider)
                         assert body['create_in_tmux'] is True and len(body['args']) == 1
                         assert not body['args'][0].startswith(('-', '@')) and 'resume_session_id' not in body
                     elif path.endswith('/send'):
@@ -486,11 +654,10 @@ async def run(root):
                 return value, response.cookies
         _, cookies = await request('POST', '/api/login', dict(password=os.environ['CODEX_WEB_PASSWORD']))
         cookie = '; '.join(f'{key}={value.value}' for key, value in cookies.items())
-        created, _ = await request('POST', '/api/sessions', dict(cwd=str(project), agent_backend='pi', model_provider='openai',
-            model=MODEL, reasoning_effort='xhigh', create_in_tmux=True, args=['--session', str(seed),
-            'This instruction applies only to this predecessor session. Acknowledge this authorized temporary fixture '
-            'with exactly READY, without an answer-key summary or task edits. Then wait to review the successor. '
-            'The successor may implement the latest user goal after the normal review/resolution protocol.']), cookie)
+        source_body = source_request(project, seed, provider)
+        assert_model_request(source_body, provider)
+        private_json(evidence / 'source-create-request.json', source_body)
+        created, _ = await request('POST', '/api/sessions', source_body, cookie)
         private_json(evidence / 'source-create.json', created)
         async def source_ready():
             rows, _ = await request('GET', '/api/sessions', cookie=cookie)
@@ -507,6 +674,7 @@ async def run(root):
             return row if any(block.get('text', '').strip() == 'READY' for entry in entries
                 if entry.get('message', {}).get('role') == 'assistant' for block in entry['message'].get('content', [])) else False
         source = await watcher.until(source_ready, 180)
+        assert_model_request(source, provider)
         source_file = within(source['log_path'], root)
         source_id = json.loads(source_file.read_text().splitlines()[0])['id']
         private_json(evidence / 'source-runtime-bridge.json', runtime_bridge(root, source, source_id, source_file))
@@ -556,6 +724,7 @@ async def run(root):
         current_rows, _ = await request('GET', '/api/sessions', cookie=cookie)
         target_rows = [row for row in current_rows['sessions'] if row['session_id'] == operation['target_session_id']]
         assert len(target_rows) == 1
+        assert_model_request(target_rows[0], provider)
         private_json(evidence / 'target-runtime-bridge.json', runtime_bridge(root, target_rows[0], target_id, identity['session_file']))
         custody = json.loads((directory / 'succession-custody.json').read_text())
         assert identity['pi_session_id'] == target_id and identity['intercom_id'] is None
@@ -620,8 +789,7 @@ async def run(root):
         except BaseException as exc:
             cleanup_errors.append(type(exc).__name__ + ': ' + str(exc)[:200])
         finally:
-            (root / 'home/.pi/agent/auth.json').unlink(missing_ok=True)
-            (root / 'environment.json').unlink(missing_ok=True)
+            remove_private_credentials(root)
             remaining = [process for process in descendants if same_process(process)]
             private_json(evidence / 'cleanup.json', dict(actions=cleanup, errors=cleanup_errors,
                 remaining_owned=remaining, auth_removed=True, password_file_removed=True))
@@ -635,16 +803,24 @@ def main(argv=None):
     mode.add_argument('--run', type=Path)
     parser.add_argument('--pi-bin', type=Path)
     parser.add_argument('--native-python', type=Path)
-    parser.add_argument('--auth-source', type=Path)
+    parser.add_argument('--provider', choices=PROVIDERS, default='openai', help='explicit auth/model branch; no fallback')
+    parser.add_argument('--auth-source', type=Path, help='OpenAI OAuth source only')
+    parser.add_argument('--models-source', type=Path, help='DexGem registered models.json only')
+    parser.add_argument('--registration-home', type=Path, help='explicitly verified original same-host HOME for models.json and literal ~/')
     parser.add_argument('--clean-child', action='store_true', help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
     if args.prepare:
-        if not all((args.pi_bin, args.native_python, args.auth_source)):
-            parser.error('preparation requires explicit installed Pi, native Python and auth-source paths')
-        prepare(args.pi_bin, args.native_python, args.auth_source)
+        if not all((args.pi_bin, args.native_python)):
+            parser.error('preparation requires explicit installed Pi and native Python paths')
+        if args.provider == 'openai' and (not args.auth_source or args.models_source or args.registration_home):
+            parser.error('OpenAI preparation requires only its explicit OAuth auth-source')
+        if args.provider == 'dexgem-responses' and (args.auth_source or not args.models_source or not args.registration_home):
+            parser.error('DexGem preparation requires models-source and verified registration-home, not auth-source')
+        prepare(args.pi_bin, args.native_python, args.auth_source, provider=args.provider,
+                models_source=args.models_source, registration_home=args.registration_home)
         return
     if not args.clean_child:
-        root = args.run.resolve()
+        root = private_root(args.run)
         within(root / 'environment.json', root)
         env = json.loads((root / 'environment.json').read_text())
         os.execve(sys.executable, [sys.executable, str(Path(__file__).resolve()), '--run', str(root), '--clean-child'], env)

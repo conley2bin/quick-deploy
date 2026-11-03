@@ -274,5 +274,295 @@ class OwnerSuccessionNativeTests(unittest.TestCase):
             native.assert_actor_tools([], calls, results, target=False)
 
 
+class DexGemOfflineTests(unittest.TestCase):
+    """Only synthetic config/key files and /usr/bin/true; never real Pi/auth."""
+    KEY = 'SYNTHETIC_DEXGEM_UNIT_KEY'
+
+    def files(self, expression=None):
+        parent = Path(tempfile.mkdtemp(prefix='dexgem-owner-unit-'))
+        self.addCleanup(shutil.rmtree, parent)
+        home = parent / 'original-home'
+        source = home / '.pi/agent/models.json'
+        source.parent.mkdir(parents=True)
+        key = home / 'synthetic-key.private'
+        key.write_text(self.KEY + '\n')
+        model = dict(id=native.MODEL, name='Sol (synthetic registration)', reasoning=True,
+            input=['text', 'image'], contextWindow=690000, maxTokens=128000,
+            thinkingLevelMap={'high': 'high', 'xhigh': 'xhigh'},
+            compat={'supportsStrictMode': True})
+        route = dict(baseUrl=native.DEXGEM_URL, api='openai-responses',
+            compat={'supportsDeveloperRole': True, 'supportsLongCacheRetention': False},
+            apiKey=expression or '!cat ~/synthetic-key.private',
+            models=[model, {'id': 'UNSELECTED_MODEL', 'apiKey': 'MUST_NOT_COPY'}])
+        registry = {'providers': {'dexgem-responses': route, 'unselected': {'apiKey': 'MUST_NOT_COPY'}}}
+        source.write_text(json.dumps(registry))
+        return home, source, key, registry
+
+    def prepared(self, files=None):
+        home, source, key, registry = files or self.files()
+        before = {path: (path.read_bytes(), path.stat().st_mtime_ns) for path in (source, key)}
+        with redirect_stdout(io.StringIO()):
+            root = native.prepare('/usr/bin/true', '/usr/bin/python3', provider='dexgem-responses',
+                                  models_source=source, registration_home=home)
+        self.addCleanup(shutil.rmtree, root)
+        self.assertEqual(before, {path: (path.read_bytes(), path.stat().st_mtime_ns) for path in before})
+        return root
+
+    def test_literal_tilde_uses_pinned_registration_home_not_inherited_or_actor_home(self):
+        files = self.files()
+        home, source, key, registry = files
+        other = home.parent / 'wrong-actor-home'
+        other.mkdir()
+        (other / key.name).write_text('WRONG_HOME_KEY')
+        with patch.dict(os.environ, {'HOME': str(other), 'DEXGEM_API_KEY': 'INHERITED_BAD_KEY'}, clear=True):
+            root = self.prepared(files)
+        auth = json.loads((root / 'home/.pi/agent/auth.json').read_text())
+        self.assertEqual(auth, {'dexgem-responses': {'type': 'api_key', 'key': self.KEY}})
+        self.assertNotEqual(root / 'home', home)
+        env = json.loads((root / 'environment.json').read_text())
+        self.assertEqual(env['HOME'], str(root / 'home'))
+        self.assertNotIn('DEXGEM_API_KEY', env)
+        with patch.dict(os.environ, env, clear=True):
+            self.assertEqual(native.check_isolation(root), root)
+
+    def test_all_exact_cat_executables_and_absolute_operand_read_once_without_execution(self):
+        home, source, key, registry = self.files()
+        for executable in ('cat', '/bin/cat', '/usr/bin/cat'):
+            with self.subTest(executable=executable):
+                registry['providers']['dexgem-responses']['apiKey'] = '!' + executable + ' ' + str(key)
+                source.write_text(json.dumps(registry))
+                with patch.object(native.os, 'open', wraps=native.os.open) as opened, \
+                        patch.object(native.subprocess, 'run') as execute:
+                    public, auth = native.dexgem_credentials(source, home)
+                self.assertEqual(auth['key'], self.KEY)
+                self.assertEqual(opened.call_count, 1)
+                self.assertEqual(opened.call_args.args[0], key)
+                execute.assert_not_called()
+                self.assertNotIn('apiKey', public['providers']['dexgem-responses'])
+
+    def test_only_selected_public_model_and_private_literal_auth_survive(self):
+        files = self.files()
+        home, source, key, registry = files
+        root = self.prepared(files)
+        agent = root / 'home/.pi/agent'
+        auth_path = agent / 'auth.json'
+        self.assertEqual(auth_path.stat().st_mode & 0o777, 0o600)
+        public = json.loads((agent / 'models.json').read_text())
+        selected = public['providers']['dexgem-responses']
+        route = registry['providers']['dexgem-responses']
+        self.assertEqual(selected, {**{k: v for k, v in route.items() if k not in ('models', 'apiKey')},
+                                    'models': [route['models'][0]]})
+        self.assertFalse((agent / 'models-store.json').exists())
+        settings = json.loads((agent / 'settings.json').read_text())
+        self.assertEqual(settings['defaultProvider'], 'dexgem-responses')
+        self.assertEqual(settings['enabledModels'], ['dexgem-responses/' + native.MODEL])
+        report = json.loads((root / 'evidence/preparation.json').read_text())
+        self.assertEqual(report['model'], 'dexgem-responses/' + native.MODEL + ':xhigh')
+        self.assertEqual(report['auth_type'], 'api_key')
+        self.assertEqual(report['expiry'], 'unknown')
+        self.assertIsNone(report['auth_ttl_seconds'])
+        # Fake executable captures the actual exec argv, without starting Pi.
+        process = native.subprocess.Popen([str(root / 'bin/pi'), '--model', 'dexgem-responses/' + native.MODEL])
+        self.assertEqual(process.wait(timeout=5), 0)
+        self.assertTrue(list((root / 'evidence').glob('pi-launch-*.argv')))
+        for path in root.rglob('*'):
+            if path.is_file() and path != auth_path:
+                value = path.read_bytes()
+                for forbidden in (self.KEY, str(key), str(home), route['apiKey'], 'UNSELECTED_MODEL', 'INHERITED_BAD_KEY'):
+                    self.assertNotIn(forbidden.encode(), value, str(path.relative_to(root)))
+        native.remove_private_credentials(root)
+        self.assertFalse(auth_path.exists())
+        self.assertFalse((root / 'environment.json').exists())
+
+    def test_rejects_tilde_users_env_escapes_extra_args_and_commands_before_key_read(self):
+        home, source, key, registry = self.files()
+        invalid = ['!cat ~other/key', '!cat $HOME/key', '!cat ${HOME}/key', '!cat ../key',
+            '!cat ~/../key', '!cat ' + str(home / '../key'), '!cat ~/synthetic-key.private extra',
+            '!cat -- ~/synthetic-key.private', '!cat -n', '!echo ' + str(key), '!sh -c cat',
+            '!cat ~/synthetic-key.private; true', '!cat ~/synthetic-key.private | cat',
+            '!cat `pwd`', '!cat "$(pwd)"', '!cat ~/synthetic-key.private\ntrue',
+            '!cat ~/synthetic*', '!cat > ' + str(key), 'literal-key', '!env cat ' + str(key)]
+        for expression in invalid:
+            with self.subTest(expression=expression):
+                registry['providers']['dexgem-responses']['apiKey'] = expression
+                source.write_text(json.dumps(registry))
+                with patch.object(native.os, 'open') as opened, self.assertRaises(ValueError) as error:
+                    native.dexgem_credentials(source, home)
+                opened.assert_not_called()
+                self.assertNotIn(str(home), str(error.exception))
+                self.assertNotIn(expression, str(error.exception))
+
+    def test_original_home_must_match_fixed_registered_location(self):
+        home, source, key, registry = self.files()
+        for other_home, other_source in ((home.parent, source), (home, key), (Path('relative'), source),
+                                         (home / '..' / home.name, source)):
+            with self.subTest(home=other_home), patch.object(native.os, 'open') as opened:
+                with self.assertRaisesRegex(ValueError, 'registration rejected'):
+                    native.dexgem_credentials(other_source, other_home)
+                opened.assert_not_called()
+
+    def test_wrong_route_api_capabilities_headers_and_metadata_fail_before_key_read(self):
+        home, source, key, original = self.files()
+        mutations = [('provider', 'baseUrl', 'https://wrong.invalid/v1'),
+            ('provider', 'api', 'openai-completions'), ('provider', 'headers', {}),
+            ('model', 'headers', {}), ('model', 'api', 'openai-completions'),
+            ('model', 'baseUrl', 'https://wrong.invalid/v1'), ('model', 'id', 'gpt-6-astra'),
+            ('model', 'reasoning', False), ('model', 'thinkingLevelMap', {'xhigh': None}),
+            ('model', 'thinkingLevelMap', {'xhigh': 'high'}), ('model', 'input', ['text']),
+            ('model', 'contextWindow', 272000), ('model', 'maxTokens', 120000),
+            ('model', 'name', '!cat /synthetic/private'), ('model', 'compat', {'headers': {}})]
+        for level, field, value in mutations:
+            with self.subTest(level=level, field=field):
+                registry = copy.deepcopy(original)
+                route = registry['providers']['dexgem-responses']
+                (route if level == 'provider' else route['models'][0])[field] = value
+                source.write_text(json.dumps(registry))
+                with patch.object(native.os, 'open') as opened, self.assertRaises(ValueError):
+                    native.dexgem_credentials(source, home)
+                opened.assert_not_called()
+
+    def test_missing_empty_commandlike_and_nonregular_key_errors_are_redacted(self):
+        import traceback
+        home, source, key, registry = self.files()
+        def rejected():
+            with self.assertRaises(ValueError) as error:
+                native.dexgem_credentials(source, home)
+            text = ''.join(traceback.format_exception(error.exception))
+            for forbidden in (str(home), str(key), self.KEY, registry['providers']['dexgem-responses']['apiKey']):
+                self.assertNotIn(forbidden, text)
+        for value in ('', '  \n', '!cat /do-not-execute', '$ENV', 'two\nkeys'):
+            key.write_text(value)
+            rejected()
+        key.unlink()
+        rejected()
+        key.mkdir()
+        rejected()
+        key.rmdir()
+        other = home / 'other-private'
+        other.write_text(self.KEY)
+        key.symlink_to(other)
+        rejected()
+        key.unlink()
+        (home / 'escape').symlink_to(home.parent, target_is_directory=True)
+        registry['providers']['dexgem-responses']['apiKey'] = '!cat ~/escape/outside'
+        source.write_text(json.dumps(registry))
+        rejected()
+
+    def test_preparation_failure_after_auth_write_erases_auth_env_and_redacts_every_output(self):
+        home, source, key, registry = self.files()
+        root = Path(tempfile.mkdtemp(prefix='codoxear-owner-succession-'))
+        self.addCleanup(shutil.rmtree, root)
+        original = native.private_json
+        def fault(path, value):
+            if Path(path).name == 'config.json':
+                raise OSError(str(key) + ' ' + self.KEY)
+            original(path, value)
+        output = io.StringIO()
+        with patch.object(native.tempfile, 'mkdtemp', return_value=str(root)), \
+                patch.object(native, 'private_json', side_effect=fault), redirect_stdout(output):
+            with self.assertRaises(ValueError) as error:
+                native.prepare('/usr/bin/true', '/usr/bin/python3', provider='dexgem-responses',
+                               models_source=source, registration_home=home)
+        self.assertFalse((root / 'home/.pi/agent/auth.json').exists())
+        self.assertFalse((root / 'environment.json').exists())
+        public = output.getvalue() + str(error.exception) + (root / 'evidence/result.json').read_text()
+        self.assertNotIn(str(key), public)
+        self.assertNotIn(self.KEY, public)
+        self.assertNotIn(registry['providers']['dexgem-responses']['apiKey'], public)
+
+    def test_isolation_rejects_extra_auth_unsafe_modes_roots_env_and_public_registration(self):
+        root = self.prepared()
+        agent = root / 'home/.pi/agent'
+        auth_path = agent / 'auth.json'
+        auth = json.loads(auth_path.read_text())
+        public = json.loads((agent / 'models.json').read_text())
+        env = json.loads((root / 'environment.json').read_text())
+        variants = [{**auth, 'openai': {'type': 'api_key', 'key': 'OTHER'}},
+            {'dexgem-responses': {**auth['dexgem-responses'], 'env': {'HOME': '/untrusted'}}},
+            {'dexgem-responses': {'type': 'oauth', 'key': self.KEY}},
+            {'dexgem-responses': {'type': 'api_key', 'key': '!cat /untrusted'}}]
+        with patch.dict(os.environ, env, clear=True):
+            for variant in variants:
+                native.private_json(auth_path, variant)
+                with self.assertRaises(ValueError):
+                    native.check_isolation(root)
+            native.private_json(auth_path, auth)
+            auth_path.chmod(0o644)
+            with self.assertRaisesRegex(ValueError, 'auth must be private'):
+                native.check_isolation(root)
+            auth_path.chmod(0o600)
+            root.chmod(0o755)
+            with self.assertRaisesRegex(ValueError, 'root must be private'):
+                native.check_isolation(root)
+            root.chmod(0o700)
+            alias = root.parent / (root.name + '-alias')
+            alias.symlink_to(root, target_is_directory=True)
+            try:
+                with self.assertRaisesRegex(ValueError, 'symlink'):
+                    native.check_isolation(alias)
+            finally:
+                alias.unlink()
+            tampered = copy.deepcopy(public)
+            tampered['providers']['dexgem-responses']['apiKey'] = '!cat /untrusted'
+            native.private_json(agent / 'models.json', tampered)
+            with self.assertRaisesRegex(ValueError, 'registration rejected'):
+                native.check_isolation(root)
+            native.private_json(agent / 'models.json', public)
+            native.private_json(agent / 'models-store.json', {})
+            with self.assertRaisesRegex(ValueError, 'models-store'):
+                native.check_isolation(root)
+            (agent / 'models-store.json').unlink()
+            os.environ['DEXGEM_API_KEY'] = 'INHERITED'
+            with self.assertRaisesRegex(ValueError, 'allowlist'):
+                native.check_isolation(root)
+
+    def test_runtime_preflight_and_post_preflight_faults_cleanup_without_launches(self):
+        import asyncio
+        for stage in ('isolation', 'catalog'):
+            with self.subTest(stage=stage):
+                root = self.prepared()
+                env = json.loads((root / 'environment.json').read_text())
+                if stage == 'isolation':
+                    native.private_json(root / 'home/.pi/agent/auth.json', {'unexpected': {}})
+                with patch.dict(os.environ, env, clear=True), \
+                        patch.object(native.subprocess, 'run', side_effect=RuntimeError('synthetic catalog failure')) as launch, \
+                        patch.object(native, 'FileEvents') as watcher, redirect_stdout(io.StringIO()):
+                    watcher.return_value.observations = []
+                    with self.assertRaises((ValueError, RuntimeError)):
+                        asyncio.run(native.run(root))
+                self.assertEqual(launch.call_count, 0 if stage == 'isolation' else 1)
+                self.assertFalse((root / 'home/.pi/agent/auth.json').exists())
+                self.assertFalse((root / 'environment.json').exists())
+                if stage == 'catalog':
+                    cleanup = json.loads((root / 'evidence/cleanup.json').read_text())
+                    self.assertEqual(cleanup['remaining_owned'], [])
+                    self.assertEqual(cleanup['errors'], [])
+
+    def test_explicit_model_request_and_source_payload_contract(self):
+        # Shared model-request and source-payload contract only; observe checks actual successor requests.
+        for provider in native.PROVIDERS:
+            with self.subTest(provider=provider):
+                source = native.source_request('/synthetic/project', '/synthetic/seed.jsonl', provider)
+                native.assert_model_request(source, provider)
+                self.assertEqual(source['args'][:2], ['--session', '/synthetic/seed.jsonl'])
+                with self.assertRaises(AssertionError):
+                    native.assert_model_request({**source, 'model_provider': 'fallback'}, provider)
+                self.assertEqual(native.model_request(provider), dict(model_provider=provider,
+                    model=native.MODEL, reasoning_effort='xhigh'))
+        with self.assertRaisesRegex(ValueError, 'no fallback'):
+            native.model_request('unregistered')
+
+    def test_cli_requires_explicit_dexgem_paths_and_rejects_mixed_auth_branches(self):
+        with patch.object(native, 'prepare') as prepared:
+            native.main(['--prepare', '--provider', 'dexgem-responses', '--pi-bin', '/synthetic/pi',
+                '--native-python', '/synthetic/python', '--models-source', '/synthetic/home/.pi/agent/models.json',
+                '--registration-home', '/synthetic/home'])
+            self.assertEqual(prepared.call_args.kwargs['provider'], 'dexgem-responses')
+            self.assertEqual(prepared.call_args.kwargs['registration_home'], Path('/synthetic/home'))
+            with redirect_stdout(io.StringIO()), patch('sys.stderr', io.StringIO()), self.assertRaises(SystemExit):
+                native.main(['--prepare', '--provider', 'dexgem-responses', '--pi-bin', '/synthetic/pi',
+                    '--native-python', '/synthetic/python', '--auth-source', '/synthetic/auth'])
+
+
 if __name__ == '__main__':
     unittest.main()
