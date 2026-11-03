@@ -217,24 +217,33 @@ def validate(state):
     require(isinstance(state['history'], list), 'invalid canonical containers')
     require(len(state['history']) == state['revision'], 'history/revision mismatch')
     for index, event in enumerate(state['history'], 1):
-        keys(event, ['revision', 'at', 'actor', 'action', 'reason', 'before', 'after'], ['id', 'occurred', 'authority', 'changes'])
-        if 'id' in event:
-            require(event['id'] == f'event-{index:08d}', 'invalid stable event ID/order')
-            validate_time(event['occurred'])
-            validate_time({'at': event['at'], 'precision': 'exact'})
-            require(event['authority'] is None or isinstance(event['authority'], str), 'invalid authority evidence')
-            require(isinstance(event['changes'], list), 'invalid semantic changes')
-            for change in event['changes']:
-                keys(change, ['project', 'task', 'old_owner', 'new_owner', 'from_assignment', 'to_assignment', 'from_parent', 'to_parent', 'summary'])
-                text(change['summary'], 'semantic change summary')
-                for field in ['old_owner', 'new_owner']:
-                    if change[field] is not None:
-                        keys(change[field], ['id', 'name', 'role'])
-                        text(change[field]['id'], 'historical owner ID')
-        require(event['revision'] == index, 'invalid history revision')
-        for field in ['at', 'actor', 'action', 'reason']:
-            text(event[field], 'history.' + field)
-        require(isinstance(event['before'], dict) and isinstance(event['after'], dict), 'invalid history snapshots')
+        validate_event(event, index)
+
+
+def validate_event(event: dict, revision: int) -> None:
+    """Validate one existing event shape at its current managed revision.
+
+    Legacy events without an ID retain their original optional-field behavior.
+    This does not validate audit continuity or replay snapshots against current.
+    """
+    keys(event, ['revision', 'at', 'actor', 'action', 'reason', 'before', 'after'], ['id', 'occurred', 'authority', 'changes'])
+    if 'id' in event:
+        require(event['id'] == f'event-{revision:08d}', 'invalid stable event ID/order')
+        validate_time(event['occurred'])
+        validate_time({'at': event['at'], 'precision': 'exact'})
+        require(event['authority'] is None or isinstance(event['authority'], str), 'invalid authority evidence')
+        require(isinstance(event['changes'], list), 'invalid semantic changes')
+        for change in event['changes']:
+            keys(change, ['project', 'task', 'old_owner', 'new_owner', 'from_assignment', 'to_assignment', 'from_parent', 'to_parent', 'summary'])
+            text(change['summary'], 'semantic change summary')
+            for field in ['old_owner', 'new_owner']:
+                if change[field] is not None:
+                    keys(change[field], ['id', 'name', 'role'])
+                    text(change[field]['id'], 'historical owner ID')
+    require(event['revision'] == revision, 'invalid history revision')
+    for field in ['at', 'actor', 'action', 'reason']:
+        text(event[field], 'history.' + field)
+    require(isinstance(event['before'], dict) and isinstance(event['after'], dict), 'invalid history snapshots')
 
 
 def validate_agreement(state, value):
@@ -303,6 +312,7 @@ def agreement_view(state, value, legacy=False):
 
 
 FORMAT = 'responsibility-registry/v2'
+SPLIT_FORMAT = 'responsibility-registry/v3'
 TEMPLATE_ERA = 'template'
 TITLE = '# Responsibility registry'
 INSTRUCTIONS = (
@@ -312,6 +322,10 @@ INSTRUCTIONS = (
     'Parent values: user or owner:ID (bare stable ID). Use the CLI to appoint after a template reset.',
     'Manual deletion loses this file and its history. Prefer agent-managed clear when a complete backup matters.',
 )
+SPLIT_INSTRUCTIONS = INSTRUCTIONS[:-1] + (
+    'Manual deletion loses current rows. Private audit does not restore current authority; prefer agent-managed clear for a complete backup.',
+)
+EXTERNAL_HISTORY_NOTICE = 'Audit history is stored separately in the private responsibility-registry store.'
 SECTIONS = (
     ('Owners', 'owners', ('ID', 'Name', 'Role', 'Parent'), ('id', 'name', 'role', 'parent')),
     ('Assignments', 'assignments', ('ID', 'Owner', 'Status', 'Project ID', 'Task', 'Objective', 'Acceptance'),
@@ -398,9 +412,8 @@ def validate_envelope(state, era):
     _validate_era(state, era)
 
 
-def serialize_document(state, era):
-    validate_envelope(state, era)
-    lines = [TITLE, '', 'Format: ' + FORMAT, 'Era: ' + era, 'Revision: ' + str(state['revision']), '', *INSTRUCTIONS, '']
+def _serialize_tables(state):
+    lines = []
     for heading, kind, headers, fields in SECTIONS:
         lines += ['## ' + heading, '| ' + ' | '.join((*headers, 'Details (JSON)')) + ' |',
                   '| ' + ' | '.join(['---'] * (len(headers) + 1)) + ' |']
@@ -416,7 +429,39 @@ def serialize_document(state, era):
             cells.append(json.dumps(details, ensure_ascii=False, separators=(',', ':'), allow_nan=False))
             lines.append('| ' + ' | '.join(encode_cell(c) for c in cells) + ' |')
         lines.append('')
+    return lines
+
+
+def serialize_document(state, era):
+    validate_envelope(state, era)
+    lines = [TITLE, '', 'Format: ' + FORMAT, 'Era: ' + era, 'Revision: ' + str(state['revision']), '', *INSTRUCTIONS, '']
+    lines += _serialize_tables(state)
     lines += [HISTORY, '```json', json.dumps(state['history'], ensure_ascii=False, indent=2, allow_nan=False), '```', '']
+    return '\n'.join(lines)
+
+
+def _validate_audit_head(audit_head):
+    if audit_head is not None:
+        try:
+            require(isinstance(audit_head, str) and str(uuid.UUID(audit_head)) == audit_head,
+                    'Audit-Head must be canonical UUID or none')
+        except (ValueError, AttributeError) as exc:
+            raise RegistryError('Audit-Head must be canonical UUID or none') from exc
+
+
+def _validate_split_envelope(state, era, audit_head):
+    validate_current_envelope(state, era)
+    _validate_audit_head(audit_head)
+    require(era != TEMPLATE_ERA or audit_head is None, 'template era must have no Audit-Head')
+
+
+def serialize_current_document(state: dict, era: str, audit_head: str | None = None) -> str:
+    """Serialize a v3 Store document, never inline or load an audit."""
+    _validate_split_envelope(state, era, audit_head)
+    lines = [TITLE, '', 'Format: ' + SPLIT_FORMAT, 'Era: ' + era, 'Revision: ' + str(state['revision']),
+             'Audit-Head: ' + (audit_head if audit_head is not None else 'none'), '', *SPLIT_INSTRUCTIONS, '']
+    lines += _serialize_tables(state)
+    lines += [HISTORY, EXTERNAL_HISTORY_NOTICE, '']
     return '\n'.join(lines)
 
 
@@ -467,7 +512,7 @@ class _DocumentLines:
         return value
 
 
-def _parse_current_prefix(lines):
+def _parse_current_prefix(lines, formats):
     def table_cells(line):
         line = line.rstrip(' \t')
         require(line.startswith('|') and line.endswith('|'), f'{lines.section} line {lines.pos}: required outer delimiters')
@@ -479,12 +524,22 @@ def _parse_current_prefix(lines):
         return value[len(label) + 2:]
 
     lines.take(TITLE)
-    require(metadata('Format') == FORMAT, 'unsupported document format')
+    document_format = metadata('Format')
+    require(document_format in formats, 'unsupported document format')
     era = metadata('Era')
     revision = metadata('Revision')
     require(re.fullmatch(r'0|[1-9][0-9]*', revision), f'line {lines.pos}: invalid revision')
+    audit_head = None
+    if document_format == SPLIT_FORMAT:
+        lines.skip_blanks()
+        if lines.peek() is not None and lines.peek().startswith('Audit-Head: '):
+            value = metadata('Audit-Head')
+            audit_head = None if value == 'none' else value
+            _validate_audit_head(audit_head)
+        require(era != TEMPLATE_ERA or audit_head is None, 'template era must have no Audit-Head')
     # Instructions may be omitted, but no unrecognized prose is silently ignored.
-    for instruction in INSTRUCTIONS:
+    instructions = SPLIT_INSTRUCTIONS if document_format == SPLIT_FORMAT else INSTRUCTIONS
+    for instruction in instructions:
         lines.skip_blanks()
         if lines.peek() == instruction:
             lines.pop()
@@ -523,7 +578,7 @@ def _parse_current_prefix(lines):
                 raise RegistryError(f'{heading} line {line_no}: {exc}') from exc
     lines.section = 'History'
     lines.take(HISTORY)
-    return state, era
+    return state, era, {'format': document_format, 'audit_head': audit_head}
 
 
 def parse_current_document(lines: Iterable[str]) -> tuple[dict, str]:
@@ -533,7 +588,7 @@ def parse_current_document(lines: Iterable[str]) -> tuple[dict, str]:
     state has exactly version/revision/owners/assignments/coordination; it cannot
     be used as a validated full document or as a Store mutation envelope.
     """
-    state, era = _parse_current_prefix(_DocumentLines(lines))
+    state, era, _ = _parse_current_prefix(_DocumentLines(lines), (FORMAT, SPLIT_FORMAT))
     validate_current_envelope(state, era)
     return state, era
 
@@ -542,7 +597,7 @@ def parse_document(content):
     require(isinstance(content, str), 'UTF-8 document text required')
     # Full parsing intentionally materializes and validates the complete audit.
     lines = _DocumentLines(content.replace('\r\n', '\n').split('\n'))
-    state, era = _parse_current_prefix(lines)
+    state, era, _ = _parse_current_prefix(lines, (FORMAT,))
     lines.take('```json')
     start = lines.pos
     history = []
@@ -556,3 +611,16 @@ def parse_document(content):
         require(lines.pop() == '', f'History line {trailing_start}: unexpected nonblank structure')
     validate_envelope(state, era)
     return state, era
+
+
+def parse_store_document(content: str) -> tuple[dict, str, dict]:
+    """Validate v3 current/metadata and its fixed external-audit notice only."""
+    require(isinstance(content, str), 'UTF-8 document text required')
+    lines = _DocumentLines(content.replace('\r\n', '\n').split('\n'))
+    state, era, metadata = _parse_current_prefix(lines, (SPLIT_FORMAT,))
+    lines.take(EXTERNAL_HISTORY_NOTICE)
+    trailing_start = lines.pos + 1
+    while lines.peek() is not None:
+        require(lines.pop() == '', f'History line {trailing_start}: unexpected nonblank structure')
+    _validate_split_envelope(state, era, metadata['audit_head'])
+    return state, era, metadata
