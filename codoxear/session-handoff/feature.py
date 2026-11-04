@@ -40,7 +40,7 @@ def install(app, host, *, state_root=None, timeouts=None, succession_service=Non
 
     app.cleanup_ctx.append(lifecycle)
     scripts = b"\n;\n".join((DIRECTORY / "web" / name).read_bytes()
-                            for name in ("core.js", "panel.js", "bootstrap.js"))
+                            for name in ("core.js", "target-model.js", "panel.js", "bootstrap.js"))
     host.add_script(NAMESPACE, scripts)
 
     async def handle(request):

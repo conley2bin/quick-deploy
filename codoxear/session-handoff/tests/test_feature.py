@@ -47,12 +47,13 @@ class FeatureTests(unittest.IsolatedAsyncioTestCase):
         self.native = Native(self.root)
         self.host = Host(self.native)
         self.app = web.Application()
-        # Frontend owns these files. Exercise the install contract without writing
-        # placeholder sibling modules/assets into this lane's worktree.
-        with patch.object(Path, "read_bytes", return_value=b"/* frozen frontend fixture */"):
+        # Record the concatenation contract without replacing sibling assets.
+        with patch.object(Path, "read_bytes", autospec=True,
+                          side_effect=lambda path: path.name.encode()) as script_reads:
             self.engine = feature.install(self.app, self.host, state_root=self.root / "state", succession_service=self.native.service,
                                           timeouts={"poll": 1, "launch": 8, "understanding": 8,
                                                     "review": 8, "resolution": 8, "source_idle": 8})
+        self.script_names = [call.args[0].name for call in script_reads.call_args_list]
         self.clock = Clock()
         self.engine.clock, self.engine.sleep = self.clock.now, self.clock.sleep
         self.native.engine = self.engine
@@ -93,6 +94,9 @@ class FeatureTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(data["operation"]["status"], "ready")
         self.assertNotIn(str(self.root), json.dumps(data))
         self.assertIn("__session_handoff__", self.host.scripts)
+        self.assertEqual(self.script_names, ["core.js", "target-model.js", "panel.js", "bootstrap.js"])
+        self.assertEqual(self.host.scripts["__session_handoff__"],
+                         b"core.js\n;\ntarget-model.js\n;\npanel.js\n;\nbootstrap.js")
 
     async def test_fresh_auth_on_all_state_requests_and_no_error_leak(self):
         _, data = await self.post("start", self.start_body())
