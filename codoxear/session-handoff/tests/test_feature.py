@@ -85,7 +85,7 @@ class FeatureTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(set(data), {"operation"})
         op = data["operation"]
         self.assertEqual(set(op), {"id", "request_id", "source_session_id", "target_session_id", "status",
-                                   "message", "reviewed", "can_continue_unreviewed", "updated_at"})
+                                   "message", "reviewed", "can_continue_unreviewed", "updated_at", "target_settings"})
         self.assertIn("no-store", response.headers["Cache-Control"])
         self.assertNotIn("Access-Control-Allow-Origin", response.headers)
         await self.finish()
@@ -216,6 +216,58 @@ class FeatureTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(data["error"], "sequence_limit")
         self.assertEqual(self.native.mutations(), [])
         self.assertEqual(self.engine.operations, {})
+
+    async def test_target_legacy_and_explicit_each_use_one_fresh_listing(self):
+        for explicit in (False, True):
+            body = self.start_body()
+            if explicit:
+                body["target"] = {"model_provider": "p1", "model": "shared", "reasoning_effort": "high"}
+            before = len(self.native.calls)
+            response, data = await self.post("start", body)
+            self.assertEqual(response.status, 200)
+            self.assertEqual(self.native.calls[before:], [("GET", "/api/sessions", None)])
+            self.assertEqual(data["operation"]["target_settings"]["origin"], "explicit" if explicit else "inherited")
+            await self.finish()
+            create = self.native.mutations()[-4][2]
+            self.assertEqual(set(create), {"cwd", "model_provider", "model", "reasoning_effort",
+                                          "agent_backend", "create_in_tmux", "args"})
+            expected = body.get("target", {k: self.native.source[k] for k in
+                                           ("model_provider", "model", "reasoning_effort")})
+            self.assertEqual({k: create[k] for k in expected}, expected)
+
+    async def test_target_shape_matrix_rejected_before_engine_start_no_effects(self):
+        good = {"model_provider": "p1", "model": "shared", "reasoning_effort": "high"}
+        targets = [None, [], "p1/shared", 3, {}, {"model": "shared"}, {**good, "cwd": "/bad"}]
+        for key in good:
+            for value in (None, False, 1, [], {}, "", " padded", "padded ", "a\x00b", "a\x7fb",
+                          "a\x85b", "x" * 257):
+                targets.append({**good, key: value})
+        targets.append({**good, "reasoning_effort": "HIGH"})
+        with patch.object(self.engine, "start", wraps=self.engine.start) as start:
+            for target in targets:
+                with self.subTest(target=target):
+                    response, data = await self.post("start", {**self.start_body(), "target": target})
+                    self.assertEqual((response.status, data.get("error")), (400, "invalid_input"))
+            start.assert_not_called()
+        self.assertEqual(self.engine.operations, {})
+        self.assertEqual(self.engine.requests, {})
+        self.assertEqual(list(self.engine.root.iterdir()), [])
+        self.assertEqual(self.native.mutations(), [])
+
+    async def test_target_missing_or_malformed_defaults_leave_auth_and_legacy_working(self):
+        for defaults in (None, [], "bad"):
+            self.native.defaults = defaults
+            body = self.start_body()
+            response, data = await self.post("start", {**body, "target": {
+                "model_provider": "p1", "model": "shared", "reasoning_effort": "high"}})
+            self.assertEqual((response.status, data["error"]), (422, "target_unverifiable"))
+            response, data = await self.post("start", body)
+            self.assertEqual(response.status, 200)
+            operation_id = data["operation"]["id"]
+            await self.finish()
+            response, data = await self.post("status", {"operation_id": operation_id})
+            self.assertEqual((response.status, data["operation"]["status"]), (200, "ready"))
+        self.assertEqual(len(self.native.mutations()), 12)
 
     async def test_non_pi_returns_clear_4xx(self):
         self.native.source["agent_backend"] = "codex"
