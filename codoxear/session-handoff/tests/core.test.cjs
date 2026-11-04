@@ -1,6 +1,9 @@
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const Core = require('../web/core.js');
+const OldCore = require('./core-9d.fixture.cjs');
+const { createHash } = require('node:crypto');
+const { readFileSync } = require('node:fs');
 const rid = '12345678-1234-4123-8123-123456789012', oid = '87654321-1234-4123-8123-123456789012';
 const ridB = '22345678-1234-4123-8123-123456789012', oidB = '97654321-1234-4123-8123-123456789012';
 const op = (status = 'recovering', extra = {}) => ({ id: oid, request_id: rid, source_session_id: 'source', target_session_id: 'target', status, message: '合成状态', reviewed: false, can_continue_unreviewed: false, ...extra });
@@ -245,10 +248,190 @@ test('fresh unknown delivery status retains explicit Continue uncertainty', asyn
 });
 
 const chosenTarget = () => ({ model_provider: 'provider-b', model: 'shared', reasoning_effort: 'xhigh' });
+const pendingV2 = (source = 'source', request_id = rid, target = chosenTarget()) => ({
+  version: 2, pending_start: { request_id, source_session_id: source, target },
+});
+// Both shipped 9d and current Core use this exact key and one instrumented memory store.
+const compatKey = 'codoxear:session-handoff:/demo/__session_handoff__/';
+const compatSourceKey = source => compatKey + ':source:' + encodeURIComponent(source);
+function compatStore() {
+  const values = new Map(), writes = []; let reads = 0;
+  const storage = { getItem(k) { reads++; return values.get(k); },
+    setItem(k, v) { writes.push(['set', k, v]); values.set(k, v); },
+    removeItem(k) { writes.push(['remove', k]); values.delete(k); },
+    get length() { reads++; return values.size; }, key(i) { reads++; return [...values.keys()][i]; } };
+  function tab(core, post = () => { throw Error('never arrived'); }, uuid = () => rid) {
+    const calls = [];
+    const c = core.createController({ storage, key: compatKey, uuid,
+      post: async (route, body) => { calls.push({ route, body }); return post(route, body); } });
+    c.select('source'); return { c, calls };
+  }
+  return { values, writes, tab, get reads() { return reads; } };
+}
+test('v2 never-arrived: immutable actual 9d cannot downgrade explicit intent; fresh Core recovers exact request', async () => {
+  assert.equal(createHash('sha256').update(readFileSync(require.resolve('./core-9d.fixture.cjs'))).digest('hex'),
+    'b0721a8e7cfe8ace9e5d83f9663d8f2abb63aeaa25605d9f3e9e19dd812a10ca');
+  const s = compatStore(), writer = s.tab(Core);
+  await writer.c.start('source', 'not persisted', chosenTarget());
+  const raw = s.values.get(compatSourceKey('source')), old = s.tab(OldCore), writes = s.writes.length;
+  old.c.select('source'); await old.c.start('source'); await old.c.recover(); await old.c.poll();
+  await old.c.continueUnreviewed(); old.c.forget();
+  const legacy = JSON.stringify({ request_id: rid, source_session_id: 'source' });
+  s.values.set(compatKey, legacy); await old.c.migrateLegacy();
+  const reads = s.reads; old.c.stop(false); assert.equal(s.reads, reads, 'pagehide does no storage I/O');
+  assert.deepEqual(old.calls, [], 'actual 9d must never POST, especially targetless start');
+  assert.equal(s.writes.length, writes); assert.equal(s.values.get(compatKey), legacy);
+  assert.equal(s.values.get(compatSourceKey('source')), raw); assert.deepEqual(JSON.parse(raw), pendingV2());
+  assert.equal(OldCore.retained(raw), null);
+  const fresh = s.tab(Core, () => ({ operation: op() }));
+  assert.deepEqual(fresh.calls, []); await fresh.c.recover();
+  assert.deepEqual(fresh.calls, [{ route: 'start', body: { request_id: rid, source_session_id: 'source', target: chosenTarget() } }]);
+});
+test('v2 accepted-unknown: new recovery deduplicates one create; ACK restores old status-only observation', async () => {
+  const s = compatStore(), accepted = new Map(); let creates = 0, loseReply = true;
+  const server = (route, body) => {
+    if (route === 'start') {
+      assert.deepEqual(body, { source_session_id: 'source', request_id: rid, target: chosenTarget() });
+      if (!accepted.has(body.request_id)) { accepted.set(body.request_id, body); creates++; }
+      assert.deepEqual(body, accepted.get(body.request_id));
+      if (loseReply) { loseReply = false; throw Error('accepted, response lost'); }
+    } else { assert.equal(route, 'status'); assert.deepEqual(body, { operation_id: oid }); }
+    return { operation: op('recovering', { target_settings: { ...chosenTarget(), origin: 'explicit' } }) };
+  };
+  const writer = s.tab(Core, server); await writer.c.start('source', '', chosenTarget());
+  const raw = s.values.get(compatSourceKey('source')), old = s.tab(OldCore, server);
+  await old.c.recover(); assert.deepEqual(old.calls, []); assert.equal(s.values.get(compatSourceKey('source')), raw);
+  const fresh = s.tab(Core, server); await fresh.c.recover(); assert.equal(creates, 1);
+  assert.deepEqual(JSON.parse(s.values.get(compatSourceKey('source'))), { operation_id: oid, source_session_id: 'source' });
+  assert.equal(old.c.select('source'), true); await old.c.recover(); await old.c.start('source');
+  assert.deepEqual(old.calls, [{ route: 'status', body: { operation_id: oid } }]); assert.equal(creates, 1);
+});
+test('v2 legacy compatibility: actual 9d inherit/operation/continue records read without migration writes', async () => {
+  for (const shape of ['inherit', 'operation', 'continue']) {
+    const s = compatStore(), old = s.tab(OldCore, route => {
+      if (shape === 'inherit' || route === 'continue') throw Error('lost response');
+      return { operation: op('unreviewed', { can_continue_unreviewed: true }) };
+    });
+    await old.c.start('source'); if (shape === 'continue') await old.c.continueUnreviewed();
+    const raw = s.values.get(compatSourceKey('source')), writes = s.writes.length;
+    const fresh = s.tab(Core), oldReload = s.tab(OldCore);
+    assert.deepEqual(fresh.c.view().reference, oldReload.c.view().reference);
+    assert.equal(s.writes.length, writes); assert.equal(s.values.get(compatSourceKey('source')), raw);
+    if (shape === 'inherit') {
+      const other = compatStore(), newWriter = other.tab(Core); await newWriter.c.start('source');
+      assert.equal(other.values.get(compatSourceKey('source')), raw, 'inherit bytes are unchanged');
+      await fresh.c.recover(); await oldReload.c.recover();
+      assert.deepEqual(fresh.calls, oldReload.calls);
+      assert.deepEqual(fresh.calls, [{ route: 'start', body: { request_id: rid, source_session_id: 'source' } }]);
+    } else {
+      await fresh.c.recover(); assert.deepEqual(fresh.calls, [{ route: 'status', body: { operation_id: oid } }]);
+      if (shape === 'continue') { await fresh.c.continueUnreviewed(); assert(fresh.c.view().uncertainContinue); }
+    }
+  }
+});
+test('v2 malformed/unknown wrappers fail closed; unshipped plain-target b2 is rejected only by new Core', async () => {
+  const valid = pendingV2(), pending = valid.pending_start;
+  const malformed = [
+    { ...valid, version: 3 }, { ...valid, version: '2' }, { pending_start: pending }, { version: 2 },
+    { ...valid, extra: true }, { ...valid, pending_start: { ...pending, extra: true } },
+    { ...valid, pending_start: { operation_id: oid, source_session_id: 'source', target: chosenTarget() } },
+    { ...valid, pending_start: { ...pending, request_id: 'not-a-uuid' } },
+    { ...valid, pending_start: { ...pending, request_id: [rid] } },
+    { ...valid, pending_start: { ...pending, source_session_id: 'other' } },
+    { ...valid, pending_start: { ...pending, source_session_id: 'x'.repeat(513) } },
+    { ...valid, pending_start: { ...pending, source_session_id: 'bad\u0000source' } },
+    ...[null, {}, { ...chosenTarget(), extra: true }, { ...chosenTarget(), reasoning_effort: 'HIGH' },
+      { ...chosenTarget(), model: 'default' }, { ...chosenTarget(), model: ' leading' },
+      { ...chosenTarget(), model_provider: 'x\u007f' }].map(target => ({ ...valid, pending_start: { ...pending, target } })),
+  ];
+  for (const value of malformed) for (const core of [Core, OldCore]) {
+    const raw = JSON.stringify(value), s = compatStore(); s.values.set(compatSourceKey('source'), raw);
+    const t = s.tab(core); assert.equal(t.c.select('source'), false);
+    await t.c.start('source'); await t.c.recover(); await t.c.poll(); await t.c.continueUnreviewed(); t.c.forget();
+    assert.deepEqual(t.calls, []); assert.deepEqual(s.writes, []);
+    assert.equal(s.values.get(compatSourceKey('source')), raw); assert.match(t.c.view().error, /恢复/);
+  }
+  // A corrupted envelope with old-readable IDs is rejected by new Core, but cannot be protected from 9d.
+  const hybrid = JSON.stringify({ ...valid, request_id: rid, source_session_id: 'source' });
+  assert.equal(Core.retained(hybrid), null); assert.notEqual(OldCore.retained(hybrid), null);
+  const b2 = JSON.stringify(pending), s = compatStore(); s.values.set(compatSourceKey('source'), b2);
+  const fresh = s.tab(Core); await fresh.c.start('source'); await fresh.c.recover();
+  assert.deepEqual(fresh.calls, []); assert.equal(Core.retained(b2), null); assert.deepEqual(s.writes, []);
+  assert.equal(s.values.get(compatSourceKey('source')), b2);
+  assert.deepEqual(OldCore.retained(b2), { request_id: rid, source_session_id: 'source' }, 'known unsafe negative baseline');
+  const old = s.tab(OldCore); await old.c.recover();
+  assert.deepEqual(old.calls, [{ route: 'start', body: { request_id: rid, source_session_id: 'source' } }]);
+});
+test('v2 source isolation: A explicit stays byte-identical while old and new B recover inheritance', async () => {
+  const s = compatStore(), a = s.tab(Core), b = s.tab(Core, undefined, () => ridB);
+  await a.c.start('source', '', chosenTarget()); const rawA = s.values.get(compatSourceKey('source'));
+  b.c.select('other'); await b.c.start('other');
+  const old = s.tab(OldCore); assert.equal(old.c.select('source'), false); await old.c.recover();
+  assert.deepEqual(old.calls, []); assert.equal(old.c.select('other'), true); await old.c.recover();
+  assert.deepEqual(old.calls, [{ route: 'start', body: { request_id: ridB, source_session_id: 'other' } }]);
+  old.c.forget(); assert.equal(s.values.get(compatSourceKey('source')), rawA);
+  const fresh = s.tab(Core); await fresh.c.recover(); fresh.c.select('other'); await fresh.c.recover();
+  assert.deepEqual(fresh.calls, [
+    { route: 'start', body: { request_id: rid, source_session_id: 'source', target: chosenTarget() } },
+    { route: 'start', body: { request_id: ridB, source_session_id: 'other' } },
+  ]);
+  assert.equal(s.values.get(compatSourceKey('source')), rawA);
+});
+test('v2 old stale/null cache cannot poll/start/continue/forget/migrate; explicit logout still clears', async () => {
+  for (const status of [null, 'ready', 'unreviewed']) {
+    const s = compatStore();
+    if (status) s.values.set(compatSourceKey('source'), JSON.stringify({ operation_id: oid, source_session_id: 'source' }));
+    const old = s.tab(OldCore, () => ({ operation: op(status, { can_continue_unreviewed: true }) }));
+    if (status) await old.c.poll();
+    s.values.delete(compatSourceKey('source')); // Previously completed/retired record, still cached in old tab.
+    const writer = s.tab(Core); await writer.c.start('source', '', chosenTarget());
+    const raw = s.values.get(compatSourceKey('source')), writes = s.writes.length, posts = old.calls.length;
+    await old.c.poll(); await old.c.recover(); await old.c.start('source');
+    await old.c.continueUnreviewed(); old.c.forget(); assert.equal(old.c.select('source'), false);
+    s.values.set(compatKey, JSON.stringify({ request_id: rid, source_session_id: 'source' }));
+    await old.c.migrateLegacy(); const reads = s.reads; old.c.stop(false);
+    assert.equal(s.reads, reads); assert.equal(old.calls.length, posts); assert.equal(s.writes.length, writes);
+    assert.equal(s.values.get(compatSourceKey('source')), raw); assert.match(old.c.view().legacyError, /旧接力/);
+    s.values.set(compatSourceKey('unloaded'), JSON.stringify(pendingV2('unloaded')));
+    s.values.set('unrelated', 'kept'); old.c.stop(true);
+    assert.deepEqual([...s.values], [['unrelated', 'kept']], 'intentional old logout clears all feature refs');
+  }
+});
+test('v2 definite 400/422 clear only explicit pending; 503/network/abort keep exact original bytes', async () => {
+  for (const outcome of [400, 422, 503, 'network', 'abort']) {
+    const s = compatStore(); let raw;
+    const t = s.tab(Core, () => {
+      raw = s.values.get(compatSourceKey('source')); assert.deepEqual(JSON.parse(raw), pendingV2());
+      throw outcome === 'abort' ? new DOMException('aborted', 'AbortError')
+        : Object.assign(Error(String(outcome)), typeof outcome === 'number' ? { status: outcome, definitive: outcome < 500 } : {});
+    });
+    await t.c.start('source', '', chosenTarget());
+    if (outcome === 400 || outcome === 422) {
+      assert.equal(s.values.has(compatSourceKey('source')), false); assert.equal(t.c.view().reference, null);
+    } else {
+      assert.equal(s.values.get(compatSourceKey('source')), raw); assert.equal(s.writes.length, 1);
+      await t.c.recover(); assert.equal(s.values.get(compatSourceKey('source')), raw); assert.equal(s.writes.length, 1);
+    }
+  }
+});
+test('v2 explicit pending cannot be overwritten by matching legacy base pending or operation', async () => {
+  for (const legacy of [{ request_id: rid, source_session_id: 'source' },
+    { operation_id: oid, source_session_id: 'source' }, { operation_id: oid }]) {
+    const s = compatStore(), t = s.tab(Core, () => ({ operation: op() }));
+    // First start never arrives; status-only migration of an unsourced legacy op may still observe its source.
+    const writer = s.tab(Core); await writer.c.start('source', '', chosenTarget());
+    const raw = s.values.get(compatSourceKey('source')), base = JSON.stringify(legacy), writes = s.writes.length;
+    s.values.set(compatKey, base); await t.c.migrateLegacy();
+    assert.equal(s.values.get(compatSourceKey('source')), raw); assert.equal(s.values.get(compatKey), base);
+    assert.equal(s.writes.length, writes); assert.match(t.c.view().legacyError, /来源已有另一条恢复记录/);
+    assert(t.calls.every(call => call.route === 'status'), 'migration never creates');
+  }
+});
+
 test('explicit target is frozen and persisted before POST, then recovered unchanged after reload', async () => {
   const target = chosenTarget(); let release;
   const r = rig((route, body) => {
-    assert.deepEqual(JSON.parse(r.values.get(sourceKey('source'))), { source_session_id: 'source', request_id: rid, target: chosenTarget() });
+    assert.deepEqual(JSON.parse(r.values.get(sourceKey('source'))), pendingV2());
     return new Promise(resolve => release = resolve);
   });
   const pending = r.c.start('source', 'private', target);
@@ -281,7 +464,7 @@ test('target-only cross-tab replacement cannot accept old response under same re
   let release; const r = rig(() => new Promise(resolve => release = resolve));
   const pending = r.c.start('source', '', chosenTarget());
   const replacement = { source_session_id: 'source', request_id: rid, target: { ...chosenTarget(), model: 'replacement' } };
-  r.values.set(sourceKey('source'), JSON.stringify(replacement)); release({ operation: op() }); await pending;
+  r.values.set(sourceKey('source'), JSON.stringify(pendingV2('source', rid, replacement.target))); release({ operation: op() }); await pending;
   assert.equal(r.c.view().op, null); assert.deepEqual(r.c.view().reference, replacement);
 });
 test('optional frozen settings and asymmetric target checks validate strictly without runtime claims', () => {

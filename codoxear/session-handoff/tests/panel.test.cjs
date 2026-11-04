@@ -119,7 +119,7 @@ function pick(r, provider, model) {
 test('panel actual-native choice freezes before POST and same-source lock prevents retargeting', async t => {
   const held = deferred(), target = { model_provider: 'provider-b', model: 'shared', reasoning_effort: 'high' };
   const r = await fixture(t, 'recovering', false, { native: true, postReply: (route, body, storage) => {
-    assert.deepEqual(JSON.parse(storage.getItem(key + 'A')).target, target); return held.promise;
+    assert.deepEqual(JSON.parse(storage.getItem(key + 'A')).pending_start.target, target); return held.promise;
   } });
   await openPicker(r); assert.equal(r.catalogCalls.length, 1);
   const { url, opts } = r.catalogCalls[0]; assert.equal(url.pathname, '/api/sessions');
@@ -128,11 +128,11 @@ test('panel actual-native choice freezes before POST and same-source lock preven
   const staleRow = node(r, 'handoffModelMenu').children.find(n => n.title === 'restricted · provider-b');
   form(r).fire('submit'); assert.equal(r.calls.length, 1); assert.deepEqual(r.calls[0].body.target, target);
   staleRow.click(); node(r, 'handoffInheritModel').click(); form(r).fire('submit'); assert.equal(r.calls.length, 1);
-  assert.deepEqual(JSON.parse(r.values.get(key + 'A')).target, target);
+  assert.deepEqual(JSON.parse(r.values.get(key + 'A')).pending_start.target, target);
   assert.equal(node(r, 'handoffModelMenu').hidden, true);
   assert.equal(r.writes.filter(([k]) => !k.startsWith('codoxear:session-handoff:')).length, 0);
   held.resolve({ ok: false, status: 500, json: async () => ({ message: 'offline' }) }); await settle();
-  assert.deepEqual(JSON.parse(r.values.get(key + 'A')).target, target);
+  assert.deepEqual(JSON.parse(r.values.get(key + 'A')).pending_start.target, target);
 });
 test('A choice stays A; stale menu/submit repaints B and deliberate B submit inherits', async t => {
   const r = await fixture(t, 'recovering', false, { native: true }); await openPicker(r); pick(r, 'provider-b', 'shared');

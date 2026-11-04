@@ -66,15 +66,28 @@
     } catch (_) { throw Error('接力状态格式不兼容'); }
     return { ...value, message: typeof value.message === 'string' ? value.message.slice(0, 1000) : '' };
   }
+  function encode(ref) {
+    // Same key guards old tabs; only explicit pre-ACK intent needs an unreadable envelope.
+    return JSON.stringify(ref.request_id && ref.target && !ref.operation_id
+      ? { version: 2, pending_start: { request_id: ref.request_id, source_session_id: ref.source_session_id, target: ref.target } } : ref);
+  }
   function retained(raw) {
     try {
       const r = JSON.parse(raw);
+      if (r && (Object.hasOwn(r, 'version') || Object.hasOwn(r, 'pending_start'))) {
+        const p = r.pending_start;
+        if (!exactKeys(r, ['version', 'pending_start']) || r.version !== 2
+          || !exactKeys(p, ['request_id', 'source_session_id', 'target'])
+          || typeof p.request_id !== 'string' || !UUID.test(p.request_id) || !bounded(p.source_session_id, 512)) return null;
+        return { request_id: p.request_id, source_session_id: p.source_session_id, target: requestedTarget(p.target) };
+      }
+      // The unshipped plain-target pending shape is unsafe in old tabs; never downgrade it.
+      if (r && Object.hasOwn(r, 'target')) return null;
       if (r && UUID.test(r.operation_id)) return { operation_id: r.operation_id,
         ...(bounded(r.source_session_id, 512) ? { source_session_id: r.source_session_id } : {}),
         ...(r.pending_action === 'continue' ? { pending_action: 'continue', ...(UUID.test(r.pending_id) ? { pending_id: r.pending_id } : {}) } : {}) };
       if (r && UUID.test(r.request_id) && bounded(r.source_session_id, 512))
-        return { request_id: r.request_id, source_session_id: r.source_session_id,
-          ...(Object.hasOwn(r, 'target') ? { target: requestedTarget(r.target) } : {}) };
+        return { request_id: r.request_id, source_session_id: r.source_session_id };
     } catch (_) { /* Invalid local reference is not a request. */ }
     return null;
   }
@@ -102,7 +115,7 @@
     const notify = s => { if (!stopped && (!s || s.source === current)) changed(view()); };
     function persist(s, next) {
       // Persist only one source key: tabs operating on other sources cannot erase it.
-      if (next) storage.setItem(sourceKey(s.source), JSON.stringify(next)); else storage.removeItem(sourceKey(s.source));
+      if (next) storage.setItem(sourceKey(s.source), encode(next)); else storage.removeItem(sourceKey(s.source));
       s.reference = next;
     }
     const sameOwner = (a, b) => ['operation_id', 'request_id', 'source_session_id'].every(k => a?.[k] === b?.[k])
@@ -133,7 +146,7 @@
           next = { ...old, source_session_id: recovered.source_session_id };
         }
         const s = state(next.source_session_id), existing = read(s.source);
-        if (s.busy || (existing && !(existing.operation_id === next.operation_id && next.operation_id)
+        if (s.busy || (existing?.target && !next.target) || (existing && !(existing.operation_id === next.operation_id && next.operation_id)
           && !(existing.request_id && existing.request_id === (recovered?.request_id || next.request_id)))) throw Error('来源已有另一条恢复记录，保留旧记录待核对');
         // A pending continuation is never weakened by a migrated older reference.
         if (existing?.pending_action === 'continue') next = { ...next, pending_action: 'continue', ...(existing.pending_id ? { pending_id: existing.pending_id } : {}) };
