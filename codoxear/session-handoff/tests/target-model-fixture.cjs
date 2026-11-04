@@ -45,9 +45,10 @@ function fakeDOM() {
     removeAttribute(k) { delete this[k]; }
     append(...ns) { this.children.push(...ns); for (const n of ns) { n.parentNode = this; n.parentElement = this; } }
     appendChild(n) { this.append(n); return n; }
+    prepend(...ns) { this.append(...ns); this.children = [...ns, ...this.children.filter(n => !ns.includes(n))]; }
     replaceChildren(...ns) { for (const n of this.children) n.remove(); this.children = []; this.append(...ns); }
     after(n) { this.parentNode?.append(n); }
-    remove() { this.isConnected = false; if (this.parentNode) this.parentNode.children = this.parentNode.children.filter(n => n !== this); }
+    remove() { this.isConnected = false; for (const n of [...this.children]) n.remove(); if (this.parentNode) this.parentNode.children = this.parentNode.children.filter(n => n !== this); }
     focus() {} setSelectionRange() {} scrollIntoView() {}
     contains(n) { return n === this || this.children.some(c => c.contains(n)); }
     addEventListener(k, f, options) {
