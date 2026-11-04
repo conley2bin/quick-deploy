@@ -119,7 +119,8 @@ class FeatureTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.native.calls, [])
 
     async def test_strict_post_unknown_routes_and_override_rejection(self):
-        for field in ("path", "cwd", "model", "url", "callback_url", "provider", "operation_id"):
+        for field in ("path", "cwd", "model", "url", "callback_url", "provider", "operation_id",
+                      "agent_backend", "args", "create_in_tmux", "reasoning_effort"):
             response, data = await self.post("start", {**self.start_body(), field: "/arbitrary"})
             self.assertEqual(response.status, 400)
         response = await self.client.get(self.base + "status", headers=self.headers)
@@ -215,11 +216,13 @@ class FeatureTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_sequence_limit_is_4xx_before_any_creation(self):
         self.native.source["display_name"] = "接力_99"
-        response, data = await self.post("start", self.start_body())
-        self.assertEqual(response.status, 409)
-        self.assertEqual(data["error"], "sequence_limit")
+        for extra in ({}, {"target": {"model_provider": "p1", "model": "shared", "reasoning_effort": "high"}}):
+            response, data = await self.post("start", {**self.start_body(), **extra})
+            self.assertEqual(response.status, 409)
+            self.assertEqual(data["error"], "sequence_limit")
         self.assertEqual(self.native.mutations(), [])
         self.assertEqual(self.engine.operations, {})
+        self.assertEqual(list(self.engine.root.iterdir()), [])
 
     async def test_target_legacy_and_explicit_each_use_one_fresh_listing(self):
         for explicit in (False, True):
@@ -272,6 +275,28 @@ class FeatureTests(unittest.IsolatedAsyncioTestCase):
             response, data = await self.post("status", {"operation_id": operation_id})
             self.assertEqual((response.status, data["operation"]["status"]), (200, "ready"))
         self.assertEqual(len(self.native.mutations()), 12)
+
+    async def test_target_absent_defaults_do_not_break_auth_status_or_unreviewed_continue(self):
+        previous = self.native.__call__
+        async def no_defaults(method, path, **kwargs):
+            status, data = await previous(method, path, **kwargs)
+            if method == "GET":
+                data.pop("new_session_defaults", None)
+            return status, data
+        self.engine.upstream_json = no_defaults
+        self.native.emit_review = False
+        response, data = await self.post("start", self.start_body())
+        self.assertEqual(response.status, 200)
+        operation_id = data["operation"]["id"]
+        await self.finish()
+        response, data = await self.post("status", {"operation_id": operation_id})
+        self.assertEqual((response.status, data["operation"]["status"]), (200, "unreviewed"))
+        response, _ = await self.post("continue", {"operation_id": operation_id})
+        self.assertEqual(response.status, 200)
+        await self.finish()
+        response, data = await self.post("status", {"operation_id": operation_id})
+        self.assertEqual((response.status, data["operation"]["status"]), (200, "ready"))
+        self.assertEqual(len(self.native.mutations()), 4)
 
     async def test_non_pi_returns_clear_4xx(self):
         self.native.source["agent_backend"] = "codex"
