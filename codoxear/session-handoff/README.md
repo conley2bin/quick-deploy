@@ -4,7 +4,7 @@
 
 ## 用户流程
 
-在当前原生会话页面选择接力后，新建一个 **新的 tmux Pi 会话**，继承源会话已明确的 cwd、model_provider、model 和 reasoning_effort。恢复提示作为原生创建请求的唯一 `args` 字符串传入；不克隆旧 argv，不 resume，不改变提供商。
+在当前原生会话页面选择接力后，新建一个 **新的 tmux Pi 会话**，保留源会话的 cwd。默认沿用原会话列表设置（model_provider、model、reasoning_effort），也可明确选择新会话的完整模型三元组；选择仅用于新会话创建，不修改原会话或全局偏好。恢复提示作为原生创建请求的唯一 `args` 字符串传入；不克隆旧 argv，不 resume。
 
 1. 创建前在应用拥有的线程内调用固定 installed succession API，冻结源实际 Pi 的只读 owner plan；服务缺失或无效则零原生变更失败。记录源日志的真实 Pi header、完整 JSONL 截止边界及哈希。投影是 `latest_committed`，并不声称知道 Pi 尚未持久化的树游标。
 2. 新会话独立阅读历史、当前文件及项目记忆，提交理解报告；在收到审阅输入前不推进任务。
@@ -38,11 +38,21 @@
 
 全部状态接口都要求同源 POST、JSON，以及每次重新通过原生会话列表验证的现有认证：
 
-- `POST <prefix>/__session_handoff__/start`：`{source_session_id, request_id: UUID, note?}`。
+- `POST <prefix>/__session_handoff__/start`：`{source_session_id, request_id: UUID, note?, target?: {model_provider, model, reasoning_effort}}`。
 - `POST .../status`：`{operation_id: UUID}`。
 - `POST .../continue`：`{operation_id: UUID}`，只对未校对操作有效。
 
-响应为 `{operation: {...}}`，仅含操作标识、源/目标原生路由、阶段、中文消息、校对标记和更新时间；错误为 `{error, message}`。禁止 HTTP 调用者覆盖文件路径、cwd、模型或 URL。没有 CORS。相同 request UUID 返回同一操作，同时接力同一活动源也会合并；同一操作最多登记 256 个重复 request UUID。
+响应为 `{operation: {...}}`，包含操作标识、源/目标原生路由、阶段、中文消息、校对标记和更新时间；新操作还返回 `target_settings: {model_provider, model, reasoning_effort, origin}`，`origin` 为 `inherited` 或 `explicit`。错误为 `{error, message}`。禁止 HTTP 调用者覆盖文件路径、cwd、args、后端或 URL。没有 CORS。同一 request UUID 绑定源与完整请求选择（包括未传 target）；不同源或选择返回 `409 request_conflict`。同源未释放操作只有请求选择相同才合并，不同选择返回 `409 target_conflict`，不新增别名或绕过未知结果租约；同一操作最多登记 256 个重复 request UUID。
+
+### 新会话模型参数
+
+`target` 缺省才表示继承；显式值必须恰好包含三个非空字符串，不接受 null、缺项、额外字段、首尾空白、控制字符或超过 256 字符的值，推理级别必须小写。形状错误返回 `400 invalid_input`。新显式操作仅根据同一次认证 GET `/api/sessions` 的 `new_session_defaults.backends.pi` 验证精确 provider/model 成员及 `provider/model` 推理能力（无此列表时采用后端能力，不采用 bare-model key）；`model: "default"` 的任意大小写均不允许。非成员返回 `422 target_invalid`；缺少目录/能力或 `warnings.pi` 说明原生读取回退时返回 `422 target_unverifiable`。这些拒绝不产生操作目录、租约或原生变更。已有操作的 UUID/同源合并先于目录验证，因此目录变更不会阻断已接受操作的观察恢复。
+
+接受时，服务先将 `requested_target` 和 `target_settings` 原子持久化到 `state.json`，再安排工作或调用原生创建。继承只冻结该源列表行的三元组，不取全局默认值、不另读日志推断当前模型；显式选择只要求源 cwd 与原身份有效，不要求源行的旧模型字段齐全。manifest 保持 v1 不变。历史操作可省略新字段；重启不重放创建或投递，也不把损坏的新目标字段当作缺省继承。
+
+`target_settings` 是冻结的**创建参数**，不证明运行时有效值。原生列表在单独切换推理级别后可能暂时保留旧值；同 ID 的第二提供商模型可能未出现在原生目录；原生可选推理级别也可能与 Pi 实际采用值不同。此扩展保留原生边界，不建立第二目录、不自动 fallback、不锁定用户之后的原生模型切换。
+
+可选的 `target_check: {result, stage, observed: {model_provider, model, reasoning_effort}}` 仅来自已有、身份核实后的目标读取，阶段为 `launch` / `named` / `continuation`。`result` 按 `model_differs > effort_differs > not_contradicted` 保留首次最高级别观察，不降级或覆盖同级观察；差异只表示“接力期间列表曾报告 X，与创建选择 Y 不同”，不推断调整原因。相等可能只是原生回显创建字段，不能宣称“已生效”。诊断不改变状态、租约、命名、审阅或重试行为；status 不采集新诊断，历史操作没有冻结参数时跳过。
 
 运行状态位于 `${XDG_STATE_HOME:-~/.local/state}/codoxear/session-handoff`，目录 0700、文件 0600。状态以小型原子替换和 fsync 保存，**先保存副作用意图，再调用原生接口**。Cookie 只在应用任务内存中存在，不写状态、manifest 或产物；公开错误不返回上游正文或本地异常细节。不要将此目录提交到 Git。
 
@@ -104,7 +114,13 @@ joint 用例直接观察：真实 session-succession event 和新 current bindin
 ```sh
 codoxear/web-host/.venv/bin/python -m unittest discover -s codoxear/session-handoff/tests -p 'test_engine.py' -v
 codoxear/web-host/.venv/bin/python -m unittest discover -s codoxear/session-handoff/tests -p 'test_feature.py' -v
+# 可选：现有只读 native checkout + 合成 defaults / 依赖，纯解析和 launch-plan join，不启动进程。
+HANDOFF_NATIVE_SOURCE=codoxear/.runtime/upstream \
+  codoxear/web-host/.venv/bin/python -B -m unittest discover \
+  -s codoxear/session-handoff/tests -p test_engine.py -k test_target_native_pure -v
 ```
+
+纯 join 将实际捕获的接力创建体传入原生 `parse_new_session_launch_request` / `prepare_launch_plan`，核验精确 provider/model/thinking argv、`CODEX_WEB_*` 环境字段和唯一恢复提示；它证明参数传递，不证明 Pi 运行时采用值。未设置 `HANDOFF_NATIVE_SOURCE` 时仅这一可选用例跳过，不读取默认安装或用户配置。
 
 原生 `/rename` 和 `/send` 没有 expected-header/nonce 条件参数：扩展会在发送前重新查验身份，但无法把“列表核验”和“原生接受输入”合并成原子事务。不要在这段时间手动重绑同一路由；真实原生联调需核验其路由生命周期。
 

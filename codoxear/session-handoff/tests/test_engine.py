@@ -2,6 +2,7 @@
 import asyncio
 import importlib.util
 import json
+import os
 from pathlib import Path
 import sys
 import tempfile
@@ -842,6 +843,8 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(check_disk()["intents"], {})  # Scheduling has not run yet.
         requested["model"] = "mutated-client-object"
         self.assertEqual(accepted["target_settings"], {**self.choice(), "origin": "explicit"})
+        accepted["target_settings"]["model"] = "mutated-public-copy"
+        self.assertEqual(self.engine.public(accepted["id"])["target_settings"]["model"], "shared")
         self.assertEqual((await self.finish())["status"], "ready")
         self.assertEqual(len(self.native.mutations()), 4)
         self.assertEqual(self.native.source["model"], "test-model")
@@ -852,34 +855,41 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_target_inherit_freezes_source_row_not_defaults_before_worker(self):
         frozen = {k: self.native.source[k] for k in self.choice()}
-        accepted = await self.target_start()
+        source_row = dict(self.native.source)
+        accepted = await self.target_start(rows=[source_row])
+        source_row.update(model_provider="changed-row-provider", model="changed-row-model", reasoning_effort="off",
+                          cwd="/must-not-be-used")
         self.native.source.update(model_provider="changed-provider", model="changed-model", reasoning_effort="off")
         self.native.defaults = None
         self.assertEqual((await self.finish())["status"], "ready")
         self.assertEqual(accepted["target_settings"], {**frozen, "origin": "inherited"})
         body = self.native.mutations()[0][2]
+        self.assertEqual(body["cwd"], str(self.root))
         self.assertEqual({k: body[k] for k in frozen}, frozen)
         self.assertEqual(set(body), {"cwd", *frozen, "agent_backend", "create_in_tmux", "args"})
 
     async def test_target_invalid_exact_native_pair_and_effort_no_effects(self):
-        for target in (self.choice(model_provider="unknown"), self.choice(model="other"),
+        for target in (self.choice(model_provider="unknown"), self.choice(model_provider="P1"),
+                       self.choice(model="Shared"), self.choice(model="other"),
                        self.choice(model_provider="p2"), self.choice(model="default"),
                        self.choice(model="DEFAULT"), self.choice(reasoning_effort="xhigh"),
                        self.choice(model_provider="p2", model="other", reasoning_effort="minimal")):
-            with self.subTest(target=target), self.assertRaises(HandoffError) as raised:
-                await self.target_start(target)
-            self.assertEqual((raised.exception.status, raised.exception.code), (422, "target_invalid"))
-            self.assert_no_operation_effects()
+            with self.subTest(target=target):
+                with self.assertRaises(HandoffError) as raised:
+                    await self.target_start(target)
+                self.assertEqual((raised.exception.status, raised.exception.code), (422, "target_invalid"))
+                self.assert_no_operation_effects()
 
     async def test_target_unverifiable_no_effects_but_inherit_still_works(self):
         for catalog in ({}, {"backends": {"pi": []}},
                         {**self.native.defaults, "warnings": {"pi": None}},
                         {"backends": {"pi": {**self.native.defaults["backends"]["pi"],
                                              "reasoning_efforts": None, "reasoning_efforts_by_model": {}}}}):
-            with self.subTest(catalog=catalog), self.assertRaises(HandoffError) as raised:
-                await self.target_start(self.choice(), catalog=catalog)
-            self.assertEqual((raised.exception.status, raised.exception.code), (422, "target_unverifiable"))
-            self.assert_no_operation_effects()
+            with self.subTest(catalog=catalog):
+                with self.assertRaises(HandoffError) as raised:
+                    await self.target_start(self.choice(), catalog=catalog)
+                self.assertEqual((raised.exception.status, raised.exception.code), (422, "target_unverifiable"))
+                self.assert_no_operation_effects()
         self.native.defaults = None
         with self.assertRaises(HandoffError) as raised:
             await self.target_start(self.choice())
@@ -932,6 +942,12 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
             await self.target_start()
         self.assertEqual(raised.exception.code, "settings_missing")
         self.assert_no_operation_effects()
+        self.native.source.update(cwd="", display_name="valid-source-name")
+        with self.assertRaises(HandoffError) as raised:
+            await self.target_start(self.choice())
+        self.assertEqual(raised.exception.code, "settings_missing")
+        self.assert_no_operation_effects()
+        self.native.source["cwd"] = str(self.root)
         await self.target_start(self.choice())
         self.assertEqual((await self.finish())["status"], "ready")
 
@@ -945,7 +961,7 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
         self.native.engine = self.engine
         frozen = {**self.choice(), "origin": "explicit"}
         self.assertEqual(self.engine.public(accepted["id"])["target_settings"], frozen)
-        self.assertEqual(self.engine.status(accepted["id"], rows=[]) ["status"], "creation_unknown")
+        self.assertEqual(self.engine.status(accepted["id"], rows=[])["status"], "creation_unknown")
         self.native.defaults = None
         self.assertEqual((await self.target_start(self.choice()))["id"], accepted["id"])
         with self.assertRaises(HandoffError) as raised:
@@ -967,6 +983,172 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(raised.exception.code, "request_conflict")
         self.assertFalse(self.engine.tasks)
         self.assertEqual(len(self.native.mutations()), 1)
+
+    async def test_target_checks_only_bound_reads_sticky_and_no_workflow_effect(self):
+        observations = []
+        persist = self.engine._persist
+        def record(op):
+            if op.get("target_check") and (not observations or observations[-1] != op["target_check"]):
+                observations.append(json.loads(json.dumps(op["target_check"])))
+            persist(op)
+        self.engine._persist = record
+        def change_reported_tuple():
+            if not self.native.target:
+                return
+            intents = self.native.op["intents"]
+            if "review" in intents:
+                self.native.target.update(model_provider="p2", model="other", reasoning_effort="xhigh")
+            elif "rename" in intents:
+                self.native.target["reasoning_effort"] = "off"
+        self.native.on_list = change_reported_tuple
+        accepted = await self.target_start(self.choice())
+        result = await self.finish()
+        self.assertEqual(result["status"], "ready")
+        self.assertTrue(result["reviewed"])
+        self.assertEqual([(c["result"], c["stage"]) for c in observations],
+                         [("not_contradicted", "launch"), ("effort_differs", "named"),
+                          ("model_differs", "continuation")])
+        self.assertEqual(result["target_check"], {"result": "model_differs", "stage": "continuation",
+            "observed": self.choice(model_provider="p2", model="other", reasoning_effort="xhigh")})
+        self.assertEqual([call[1] for call in self.native.mutations()], ["/api/sessions",
+            "/api/sessions/opaque%2Ftarget/rename", "/api/sessions/opaque%2Fsource/send",
+            "/api/sessions/opaque%2Ftarget/send"])
+        self.assertEqual(self.native.service.calls, ["prepare", "prepare", "commit", "get"])
+        self.assertEqual(self.native.service.events, 1)
+        self.native.target.update(self.choice())
+        frozen = json.loads(json.dumps(result["target_check"]))
+        with patch.object(self.engine, "_persist", wraps=self.engine._persist) as persist:
+            for stage, fields in (("launch", self.choice()), ("named", self.choice(model="another")),
+                                   ("continuation", self.choice(reasoning_effort="off"))):
+                self.engine._observe_target(self.native.op, {**self.native.target, **fields}, stage)
+            persist.assert_not_called()  # Equal/lower severity, including later model differences.
+        with patch.object(self.engine, "_observe_target", side_effect=AssertionError("status must not observe")):
+            self.assertEqual(self.engine.status(accepted["id"], rows=[self.native.target])["target_check"], frozen)
+        self.assertEqual(len(self.native.mutations()), 4)
+
+    async def test_target_check_missing_raw_fields_and_legacy_skip_without_persist(self):
+        await self.target_start(self.choice())
+        await self.finish()
+        op = self.native.op
+        op.pop("target_check", None)
+        with patch.object(self.engine, "_persist", wraps=self.engine._persist) as persist:
+            for row in ({}, {**self.choice(), "model_provider": None, "provider_choice": "p1"},
+                        {**self.choice(), "model": 1}, {**self.choice(), "reasoning_effort": ""}):
+                self.engine._observe_target(op, row, "named")
+            self.assertNotIn("target_check", op)
+            op.pop("target_settings")
+            op.pop("requested_target")
+            self.engine._observe_target(op, self.choice(model="different"), "continuation")
+            persist.assert_not_called()
+
+    async def test_target_check_rebound_identity_never_observed_as_model_change(self):
+        def rebound(path, body):
+            if "source" in path:
+                self.native.target.update(broker_pid=999, model="unbound-other-model")
+        self.native.on_send = rebound
+        await self.target_start(self.choice())
+        result = await self.finish()
+        self.assertEqual((result["status"], result["error_code"]), ("delivery_unknown", "identity_changed"))
+        self.assertEqual(result["target_check"], {"result": "not_contradicted", "stage": "launch",
+                                                 "observed": self.choice()})
+        self.assertEqual(len(self.native.mutations()), 3)
+
+    async def test_target_malformed_persisted_fields_never_become_legacy_inherit(self):
+        await self.target_start(self.choice())
+        await self.finish()
+        op = self.native.op
+        original = json.loads(json.dumps(op))
+        cases = [{"target_settings": None}, {"target_settings": {}},
+                 {"target_settings": {**self.choice(), "origin": "inherited"}},
+                 {"requested_target": []}, {"requested_target": {"model": "shared"}},
+                 {"target_check": None}, {"target_check": {"result": "verified"}}]
+        for change in cases:
+            self.engine._persist({**original, **change})
+            with self.subTest(change=change):
+                with self.assertRaises(HandoffError) as raised:
+                    Engine(self.native, state_root=self.engine.root).open()
+                self.assertEqual((raised.exception.code, raised.exception.status), ("unsafe_state", 500))
+        missing = {**original}
+        missing.pop("target_settings")
+        self.engine._persist(missing)
+        with self.assertRaises(HandoffError):
+            Engine(self.native, state_root=self.engine.root).open()
+        self.engine._persist(original)
+        self.assertEqual(len(self.native.mutations()), 4)
+
+    async def test_target_alias_limit_and_independent_source_freezes(self):
+        # Inspect acceptance concurrently without running a broker or its protocol workers.
+        second_path = self.root / "source-b.jsonl"
+        log(second_path, "source-b-header")
+        second_row = {**self.native.source, "session_id": "source-b", "log_path": str(second_path),
+                      "launch_id": "launch-b", "spawn_nonce": "nonce-b", "broker_pid": 101}
+        with patch.object(self.engine, "_schedule") as schedule:
+            a = await self.target_start(self.choice())
+            b = await self.target_start(self.choice(model_provider="p2", model="other", reasoning_effort="xhigh"),
+                                        source="source-b", rows=[second_row])
+            self.assertNotEqual(a["id"], b["id"])
+            self.assertNotEqual(a["target_settings"], b["target_settings"])
+            self.assertEqual(schedule.call_count, 2)
+            for _ in range(255):
+                await self.target_start(self.choice())
+            before = json.loads((self.engine.root / a["id"] / "state.json").read_text())
+            with self.assertRaises(HandoffError) as raised:
+                await self.target_start(self.choice())
+            self.assertEqual(raised.exception.code, "request_limit")
+            self.assertEqual(json.loads((self.engine.root / a["id"] / "state.json").read_text()), before)
+            self.assertEqual(len(self.engine.operations[a["id"]]["request_ids"]), 256)
+            self.assertEqual((await self.target_start(self.choice(), request_id=a["request_id"]))["id"], a["id"])
+            self.assertEqual(self.native.mutations(), [])
+
+    async def test_target_explicit_native_400_retains_existing_rejection_lease_rules(self):
+        previous = self.native.__call__
+        async def rejected(method, path, **kwargs):
+            if method == "POST" and path == "/api/sessions":
+                self.native.calls.append((method, path, kwargs["body"]))
+                return 400, {"error": "catalog changed before native accepted create"}
+            return await previous(method, path, **kwargs)
+        self.engine.upstream_json = rejected
+        first = await self.target_start(self.choice())
+        self.assertEqual((await self.finish())["error_code"], "native_create_rejected")
+        self.assertTrue(engine_module.releases_source(self.native.op))
+        second = await self.target_start(self.choice(reasoning_effort="off"))
+        self.assertNotEqual(first["id"], second["id"])
+        await self.finish()
+        self.assertEqual(len(self.native.mutations()), 2)
+        self.assertEqual(self.native.op["intents"]["create"]["result"], "rejected")
+
+    async def test_target_native_pure_parser_launch_plan_exact_argv_env_one_prompt(self):
+        native_root = os.environ.get("HANDOFF_NATIVE_SOURCE")
+        if not native_root:
+            self.skipTest("set HANDOFF_NATIVE_SOURCE to an existing read-only native checkout for the pure join")
+        with patch.object(sys, "path", [str(Path(native_root).resolve()), *sys.path]):
+            from codoxear.launch_config import parse_new_session_launch_request
+            from codoxear.session_launch_plan import LaunchPlanDeps, LaunchPlanRequest, prepare_launch_plan
+        await self.target_start(self.choice(model_provider="p2", model="other", reasoning_effort="xhigh"))
+        self.assertEqual((await self.finish())["status"], "ready")
+        body = self.native.mutations()[0][2]
+        def forbidden(*args, **kwargs):
+            raise AssertionError("pure plan must not discover, read configuration or launch actors")
+        parsed = parse_new_session_launch_request(body, default_agent_backend="pi",
+            codex_launch_defaults_provider=forbidden,
+            pi_launch_defaults_provider=lambda: self.native.defaults["backends"]["pi"])
+        request = LaunchPlanRequest(**vars(parsed))
+        plan = prepare_launch_plan(request, deps=LaunchPlanDeps(
+            resolve_dir_target=lambda cwd, **kwargs: Path(cwd), create_git_worktree=forbidden,
+            codex_trust_override_for_path=lambda path: "", list_resume_candidates_for_cwd=forbidden,
+            resume_candidate_from_log=forbidden, live_session_for_resume_target=forbidden,
+            load_env_file=forbidden, environ={"CODEX_WEB_MODEL": "must-be-replaced"},
+            dotenv_path=self.root / "absent-env", homes={"pi": self.root / "synthetic-pi-home"},
+            python_executable="synthetic-python"))
+        self.assertEqual(plan.argv, ["synthetic-python", "-m", "codoxear.broker", "--cwd", str(self.root), "--",
+                                     "--provider", "p2", "--model", "other", "--thinking", "xhigh", body["args"][0]])
+        self.assertEqual(len(body["args"]), 1)
+        self.assertEqual(plan.argv.count(body["args"][0]), 1)
+        self.assertEqual({k: plan.env[k] for k in ("CODEX_WEB_MODEL_PROVIDER", "CODEX_WEB_MODEL", "CODEX_WEB_REASONING_EFFORT")},
+                         {"CODEX_WEB_MODEL_PROVIDER": "p2", "CODEX_WEB_MODEL": "other", "CODEX_WEB_REASONING_EFFORT": "xhigh"})
+        self.assertTrue(plan.create_in_tmux)
+        self.assertEqual(self.native.source["model"], "test-model")
+        self.assertFalse((self.root / "synthetic-pi-home").exists())
 
     async def test_nonfinite_deadline_rejected(self):
         with self.assertRaises(ValueError):

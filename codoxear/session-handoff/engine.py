@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+from copy import deepcopy
 import json
 import math
 import os
@@ -51,6 +52,7 @@ class HandoffError(Exception):
 
 
 TARGET_KEYS = ("model_provider", "model", "reasoning_effort")
+CHECK_SEVERITY = {"not_contradicted": 0, "effort_differs": 1, "model_differs": 2}
 
 
 def requested_target(value):
@@ -93,7 +95,7 @@ def validate_target(catalog, target):
 
 def validate_frozen_target(op):
     """Old operations omit both fields; malformed new state is never inheritance."""
-    if "requested_target" not in op and "target_settings" not in op:
+    if not any(key in op for key in ("requested_target", "target_settings", "target_check")):
         return
     try:
         requested = op["requested_target"]
@@ -105,6 +107,14 @@ def validate_frozen_target(op):
                 or settings["origin"] != ("inherited" if requested is None else "explicit")
                 or requested is not None and any(settings[k] != requested[k] for k in TARGET_KEYS)):
             raise ValueError("invalid frozen target")
+        if "target_check" in op:
+            check = op["target_check"]
+            if (not isinstance(check, dict) or set(check) != {"result", "stage", "observed"}
+                    or check["result"] not in CHECK_SEVERITY
+                    or check["stage"] not in ("launch", "named", "continuation")
+                    or not isinstance(check["observed"], dict) or set(check["observed"]) != set(TARGET_KEYS)
+                    or any(not isinstance(v, str) or not v for v in check["observed"].values())):
+                raise ValueError("invalid target check")
     except (KeyError, ValueError, TypeError, HandoffError):
         raise HandoffError("unsafe_state", "接力目标设置损坏，不能自动恢复", 500) from None
 
@@ -282,7 +292,7 @@ class Engine:
         op = self.operations.get(uuid_text(operation_id))
         if op is None:
             raise HandoffError("not_found", "未找到接力操作", 404)
-        return {key: op[key] for key in PUBLIC if key in op}
+        return deepcopy({key: op[key] for key in PUBLIC if key in op})
 
     def status(self, operation_id, *, rows):
         """Reconcile a late receipt using fresh authenticated rows; never send."""
@@ -351,7 +361,7 @@ class Engine:
                 self.requests[request_id] = op["id"]
                 self._persist(op)
                 return self.public(op["id"])
-        row = self._row(rows, source_session_id)
+        row = dict(self._row(rows, source_session_id))
         if row.get("agent_backend") != "pi":
             raise HandoffError("unsupported_backend", "当前仅支持 Pi 会话接力", 422)
         source_name, target_name = handoff_names(row)
@@ -373,7 +383,7 @@ class Engine:
               "requested_target": requested, "target_settings": settings}
         self._set(op, "creating")
         self.operations[operation_id], self.requests[request_id] = op, operation_id
-        self._schedule(op, lambda: self._run(op, cookie, dict(row), note))
+        self._schedule(op, lambda: self._run(op, cookie, row, note))
         return self.public(operation_id)
 
     def _prepare(self, op, row, note):
@@ -447,6 +457,23 @@ class Engine:
             raise HandoffError("identity_changed", "会话真实日志身份已改变，未继续发送")
         return row
 
+    def _observe_target(self, op, row, stage):
+        """Diagnostic on an already identity-bound row, never an effective-settings claim."""
+        if "target_settings" not in op:
+            return  # Legacy operations have no frozen creation tuple to compare.
+        observed = {key: row.get(key) for key in TARGET_KEYS}
+        if any(not isinstance(v, str) or not v for v in observed.values()):
+            return
+        settings = op["target_settings"]
+        result = ("model_differs" if any(observed[k] != settings[k] for k in TARGET_KEYS[:2])
+                  else "effort_differs" if observed["reasoning_effort"] != settings["reasoning_effort"]
+                  else "not_contradicted")
+        previous = op.get("target_check")
+        if previous is not None and CHECK_SEVERITY[previous["result"]] >= CHECK_SEVERITY[result]:
+            return
+        op["target_check"] = {"result": result, "stage": stage, "observed": observed}
+        self._persist(op)
+
     async def _offloop(self, function, *args):
         """Join owned file/service work even when the HTTP app shuts down."""
         work = asyncio.create_task(asyncio.to_thread(function, *args))
@@ -506,6 +533,7 @@ class Engine:
             if op["target_header"]["pi_session_id"] == op["source_header"]["pi_session_id"]:
                 raise HandoffError("identity_changed", "新会话复用了原 Pi 日志身份")
             self._persist(op)
+            self._observe_target(op, row, "launch")
             return row
 
         result = await self._poll(self.timeouts["launch"], check)
@@ -526,6 +554,7 @@ class Engine:
         # Listing also triggers native's asynchronous nonce-bound tmux mirror;
         # this proves durable display state, not completion of that mirror.
         observed = self._verify(op, await self.sessions(cookie), "target")
+        self._observe_target(op, observed, "named")
         if observed.get("alias") != expected or observed.get("display_name") != expected:
             raise HandoffError("name_mismatch", "无法核实新会话的准确名称，未继续接力")
         op["intents"]["rename"]["verified"] = True
@@ -662,6 +691,7 @@ class Engine:
         async def target_idle():
             rows = await self.sessions(cookie)
             target = self._verify(op, rows, "target")
+            self._observe_target(op, target, "continuation")
             self._check_chain(op)
             return target if idle(target) else None
         target = await self._poll(self.timeouts["source_idle"], target_idle)
