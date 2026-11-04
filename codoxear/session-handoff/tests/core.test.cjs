@@ -243,3 +243,54 @@ test('fresh unknown delivery status retains explicit Continue uncertainty', asyn
     assert(r.c.view().uncertainContinue); assert.equal(JSON.parse(shared.get(sourceKey('source'))).pending_action, 'continue');
   }
 });
+
+const chosenTarget = () => ({ model_provider: 'provider-b', model: 'shared', reasoning_effort: 'xhigh' });
+test('explicit target is frozen and persisted before POST, then recovered unchanged after reload', async () => {
+  const target = chosenTarget(); let release;
+  const r = rig((route, body) => {
+    assert.deepEqual(JSON.parse(r.values.get(sourceKey('source'))), { source_session_id: 'source', request_id: rid, target: chosenTarget() });
+    return new Promise(resolve => release = resolve);
+  });
+  const pending = r.c.start('source', 'private', target);
+  target.model = 'changed-after-click';
+  assert.deepEqual(r.calls[0].body.target, chosenTarget());
+  release(Promise.reject(Error('offline'))); await pending;
+  const next = rig(() => ({ operation: op() }), null, r.values);
+  assert.equal(next.calls.length, 0); await next.c.start('source', '', { ...chosenTarget(), model: 'another' });
+  assert.equal(next.calls.length, 0); await next.c.recover();
+  assert.deepEqual(next.calls[0].body, { source_session_id: 'source', request_id: rid, target: chosenTarget() });
+});
+test('malformed pending target keeps recovery lock and raw record without POST or inheritance', async () => {
+  for (const target of [null, {}, { ...chosenTarget(), extra: true }, { ...chosenTarget(), reasoning_effort: 'HIGH' }, { ...chosenTarget(), model: ' leading' }]) {
+    const raw = JSON.stringify({ source_session_id: 'source', request_id: rid, target });
+    const r = rig(() => ({ operation: op() }), null, new Map([[sourceKey('source'), raw]]));
+    await r.c.start('source'); await r.c.recover();
+    assert.equal(r.calls.length, 0); assert.equal(r.values.get(sourceKey('source')), raw);
+    assert.equal(r.c.view().invalidReference, true); assert.match(r.c.view().error, /恢复/);
+  }
+});
+test('invalid explicit start values never persist or POST; legacy start has no target key', async () => {
+  for (const target of [null, {}, { ...chosenTarget(), model: 'DEFAULT' }, { ...chosenTarget(), reasoning_effort: 'High' }, { ...chosenTarget(), model: 'x\u007f' }]) {
+    const r = rig(() => ({ operation: op() })); await r.c.start('source', '', target);
+    assert.equal(r.calls.length, 0); assert.equal(r.values.size, 0); assert.match(r.c.view().error, /模型/);
+  }
+  const legacy = rig(() => ({ operation: op() })); await legacy.c.start('source');
+  assert.equal(Object.hasOwn(legacy.calls[0].body, 'target'), false);
+});
+test('target-only cross-tab replacement cannot accept old response under same request UUID', async () => {
+  let release; const r = rig(() => new Promise(resolve => release = resolve));
+  const pending = r.c.start('source', '', chosenTarget());
+  const replacement = { source_session_id: 'source', request_id: rid, target: { ...chosenTarget(), model: 'replacement' } };
+  r.values.set(sourceKey('source'), JSON.stringify(replacement)); release({ operation: op() }); await pending;
+  assert.equal(r.c.view().op, null); assert.deepEqual(r.c.view().reference, replacement);
+});
+test('optional frozen settings and asymmetric target checks validate strictly without runtime claims', () => {
+  const target_settings = { ...chosenTarget(), origin: 'explicit' };
+  const target_check = { result: 'effort_differs', stage: 'launch', observed: { ...chosenTarget(), reasoning_effort: 'high' } };
+  assert.deepEqual(Core.operation(op('ready', { target_settings, target_check })).target_check, target_check);
+  assert.equal(Core.operation(op()).target_settings, undefined);
+  for (const value of [null, { ...target_settings, origin: 'current' }, { ...target_settings, model: '' }, { ...target_settings, extra: 1 }])
+    assert.throws(() => Core.operation(op('ready', { target_settings: value })), /格式/);
+  for (const value of [null, { ...target_check, stage: 'status' }, { ...target_check, result: 'verified' }, { ...target_check, observed: {} }, { ...target_check, extra: 1 }])
+    assert.throws(() => Core.operation(op('ready', { target_check: value })), /格式/);
+});

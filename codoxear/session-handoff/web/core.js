@@ -32,11 +32,38 @@
     const u = new URL(href), hash = new URLSearchParams(u.hash.slice(1));
     hash.set('session', id); u.hash = hash.toString(); return u.href;
   }
+  const targetKeys = ['model_provider', 'model', 'reasoning_effort'];
+  const exactKeys = (value, keys) => value && typeof value === 'object' && !Array.isArray(value)
+    && Object.keys(value).length === keys.length && keys.every(k => Object.hasOwn(value, k));
+  function targetSettings(value, extra = []) {
+    if (!exactKeys(value, [...targetKeys, ...extra]) || !targetKeys.every(k => bounded(value[k], 256)
+      && value[k] === value[k].trim() && !/[\u007f-\u009f]/.test(value[k]))
+      || value.reasoning_effort !== value.reasoning_effort.toLowerCase()) throw Error('目标模型设置格式不兼容');
+    return Object.freeze(Object.fromEntries(targetKeys.map(k => [k, value[k]])));
+  }
+  function requestedTarget(value) {
+    const target = targetSettings(value);
+    if (target.model.toLowerCase() === 'default') throw Error('目标模型必须从原生可用列表选择');
+    return target;
+  }
   function operation(value) {
     if (!value || !UUID.test(value.id) || !UUID.test(value.request_id) || !bounded(value.source_session_id, 512)
       || !Object.hasOwn(labels, value.status) || typeof value.reviewed !== 'boolean'
       || typeof value.can_continue_unreviewed !== 'boolean'
       || (value.target_session_id !== null && (!bounded(value.target_session_id, 512) || value.target_session_id === value.source_session_id))) throw Error('接力状态格式不兼容');
+    try {
+      if (Object.hasOwn(value, 'target_settings')) {
+        targetSettings(value.target_settings, ['origin']);
+        if (!['inherited', 'explicit'].includes(value.target_settings.origin)) throw Error();
+      }
+      if (Object.hasOwn(value, 'target_check')) {
+        const check = value.target_check;
+        if (!exactKeys(check, ['result', 'stage', 'observed'])
+          || !['not_contradicted', 'effort_differs', 'model_differs'].includes(check.result)
+          || !['launch', 'named', 'continuation'].includes(check.stage)) throw Error();
+        targetSettings(check.observed);
+      }
+    } catch (_) { throw Error('接力状态格式不兼容'); }
     return { ...value, message: typeof value.message === 'string' ? value.message.slice(0, 1000) : '' };
   }
   function retained(raw) {
@@ -46,7 +73,8 @@
         ...(bounded(r.source_session_id, 512) ? { source_session_id: r.source_session_id } : {}),
         ...(r.pending_action === 'continue' ? { pending_action: 'continue', ...(UUID.test(r.pending_id) ? { pending_id: r.pending_id } : {}) } : {}) };
       if (r && UUID.test(r.request_id) && bounded(r.source_session_id, 512))
-        return { request_id: r.request_id, source_session_id: r.source_session_id };
+        return { request_id: r.request_id, source_session_id: r.source_session_id,
+          ...(Object.hasOwn(r, 'target') ? { target: requestedTarget(r.target) } : {}) };
     } catch (_) { /* Invalid local reference is not a request. */ }
     return null;
   }
@@ -63,9 +91,9 @@
     }
     function state(source) {
       if (!states.has(source)) {
-        const s = { source, reference: null, pendingBody: null, op: null, busy: false, error: '', uncertainContinue: false };
+        const s = { source, reference: null, pendingBody: null, op: null, busy: false, error: '', uncertainContinue: false, invalidReference: false };
         try { s.reference = read(source); s.uncertainContinue = s.reference?.pending_action === 'continue'; }
-        catch (e) { s.error = String(e.message || '无法读取接力恢复记录'); }
+        catch (e) { s.invalidReference = true; s.error = String(e.message || '无法读取接力恢复记录'); }
         states.set(source, s);
       }
       return states.get(source);
@@ -77,13 +105,17 @@
       if (next) storage.setItem(sourceKey(s.source), JSON.stringify(next)); else storage.removeItem(sourceKey(s.source));
       s.reference = next;
     }
-    const sameOwner = (a, b) => ['operation_id', 'request_id', 'source_session_id'].every(k => a?.[k] === b?.[k]);
+    const sameOwner = (a, b) => ['operation_id', 'request_id', 'source_session_id'].every(k => a?.[k] === b?.[k])
+      && JSON.stringify(a?.target) === JSON.stringify(b?.target);
     function sync(s) {
-      const next = read(s.source);
-      if (['operation_id', 'request_id', 'source_session_id', 'pending_action', 'pending_id'].some(k => next?.[k] !== s.reference?.[k])) {
+      let next;
+      try { next = read(s.source); } catch (e) { s.invalidReference = true; throw e; }
+      if (s.invalidReference || !sameOwner(next, s.reference)
+        || ['pending_action', 'pending_id'].some(k => next?.[k] !== s.reference?.[k])) {
         s.reference = next; s.op = null; s.pendingBody = null;
         s.uncertainContinue = next?.pending_action === 'continue'; s.error = '';
       }
+      s.invalidReference = false;
     }
     async function migrateLegacy() {
       if (stopped || migrating) return;
@@ -159,7 +191,7 @@
             const saved = read(s.source);
             if (saved?.pending_action !== observed?.pending_action || saved?.pending_id !== observed?.pending_id) { sync(s); return; }
           }
-        } catch (_) { s.error = '无法核对当前恢复记录，请刷新查询'; return; }
+        } catch (_) { s.invalidReference = true; s.error = '无法核对当前恢复记录，请刷新查询'; return; }
         s.error = String(e.message || '网络异常').slice(0, 1000);
         if (e.status === 401 || e.status === 403) { authLost(); return; }
         if (kind === 'start' && e.definitive) {
@@ -183,7 +215,7 @@
         }
         notify(); return true;
       },
-      async start(source, note = '') {
+      async start(source, note = '', target) {
         if (stopped || !bounded(source, 512)) return;
         const s = state(source);
         if (s.busy) return;
@@ -195,18 +227,27 @@
         } catch (_) { s.error = '无法读取恢复标识，未发送接力请求'; notify(s); return; }
         if (s.reference || stopped) return;
         if (typeof note !== 'string' || note.length > 1000) { s.error = '补充说明最多 1000 字'; notify(s); return; }
+        let frozenTarget;
+        try {
+          if (target !== undefined) {
+            frozenTarget = requestedTarget(target);
+          }
+        } catch (e) { s.error = e.message; notify(s); return; }
+        const selection = frozenTarget ? { target: frozenTarget } : {};
         let request_id;
         try { request_id = uuid(); } catch (_) { /* No identity means no mutation. */ }
         if (!UUID.test(request_id)) { s.error = '浏览器无法生成请求标识'; notify(s); return; }
-        try { persist(s, { source_session_id: source, request_id }); }
+        try { persist(s, { source_session_id: source, request_id, ...selection }); }
         catch (_) { s.error = '无法保存恢复标识，未发送接力请求'; notify(s); return; }
-        s.pendingBody = { source_session_id: source, request_id, ...(note ? { note } : {}) };
+        s.pendingBody = { source_session_id: source, request_id, ...(note ? { note } : {}), ...selection };
         await request(s, 'start', s.pendingBody);
       },
       async recover() {
         if (!current || stopped) return;
         const s = state(current);
-        if (s.busy || !s.reference) return;
+        if (s.busy) return;
+        try { sync(s); } catch (_) { s.error = '无法读取接力恢复记录，未发送请求'; notify(s); return; }
+        if (!s.reference) return;
         if (s.reference.operation_id) return request(s, 'status', { operation_id: s.reference.operation_id });
         // Explicit same-UUID reconciliation only; never replay on mount.
         return request(s, 'start', s.pendingBody || s.reference);
@@ -251,7 +292,7 @@
     };
   }
 
-  const api = { requestUUID, selected, namespace, targetURL, retained, operation, labels, active, createController };
+  const api = { requestUUID, selected, namespace, targetURL, targetSettings, retained, operation, labels, active, createController };
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   else global.CodoxearHandoffCore = api;
 })(typeof window !== 'undefined' ? window : globalThis);
