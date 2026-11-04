@@ -3,6 +3,10 @@ const http = require('node:http');
 const fs = require('node:fs');
 const path = require('node:path');
 const { randomUUID } = require('node:crypto');
+const modelFixture = process.env.HANDOFF_MODEL_FIXTURE === '1';
+const modelCatalog = require('./target-model-fixture.cjs').catalog();
+const heldCatalog = []; let catalogFault = '';
+const requestLog = [];
 const staticDir = fs.realpathSync(process.env.CODOXEAR_STATIC_DIR || (() => { throw Error('Set CODOXEAR_STATIC_DIR to read-only upstream/installed static assets'); })());
 const base = '/demo', owners = path.resolve(__dirname, '../../owner-groups/web');
 const assets = path.resolve(__dirname, '../web');
@@ -17,17 +21,20 @@ const body = async req => { let s = ''; for await (const chunk of req) { s += ch
 const server = http.createServer(async (req, res) => {
   try {
     const u = new URL(req.url, 'http://localhost'), p = u.pathname.slice(base.length);
+    requestLog.push({ method: req.method, path: u.pathname });
     if (!u.pathname.startsWith(base + '/')) return json(res, { error: 'demo_only' }, 404);
     if (p === '/__fixture__/state') {
       if (req.method === 'POST') {
         const b = await body(req);
+        if ('catalogFault' in b) catalogFault = b.catalogFault;
+        if (b.releaseCatalog) for (const reply of heldCatalog.splice(0)) reply();
         if (b.release) { for (const item of held.filter(item => item.source === b.release)) { json(item.res, { operation: item.operation }); held.splice(held.indexOf(item), 1); } }
         if (b.reset) { for (const item of held.splice(0)) item.res.destroy(); operations.clear(); settings.clear(); actions = []; operation = null; fault = ''; status = 'recovering'; allow = false; auth = true; message = 'DEMO 合成状态，不会创建真实 Pi'; rows.splice(3); }
         if (b.source) settings.set(b.source, { ...settings.get(b.source), ...Object.fromEntries(['status', 'message', 'allow', 'fault'].filter(k => k in b).map(k => [k, b[k]])) });
         else { if (b.status) status = b.status; if ('message' in b) message = b.message; if ('allow' in b) allow = b.allow; if ('fault' in b) fault = b.fault; }
         if ('auth' in b) auth = b.auth;
       }
-      return json(res, { actions, operation, operations: [...operations.values()], held: held.map(({ source, kind }) => ({ source, kind })), fault, status, auth });
+      return json(res, { actions, operation, operations: [...operations.values()], held: held.map(({ source, kind }) => ({ source, kind })), fault, status, auth, requestLog, heldCatalog: heldCatalog.length });
     }
     if (p.startsWith('/__session_handoff__/') && !p.endsWith('.js')) {
       if (req.method !== 'POST') return json(res, { error: 'post_required' }, 405);
@@ -40,6 +47,7 @@ const server = http.createServer(async (req, res) => {
         if (config.fault === 'unsupported') return json(res, { error: 'unsupported_backend', message: '仅支持 Pi；DEMO Codex 不受支持' }, 422);
         if (!operation) operation = { id: randomUUID(), request_id: b.request_id, source_session_id: source,
           target_session_id: 'target', status: config.status, message: config.message, reviewed: false, can_continue_unreviewed: config.allow, updated_at: new Date().toISOString() };
+        if (modelFixture) operation.target_settings = { ...(b.target || { model_provider: 'provider-a', model: 'shared', reasoning_effort: 'high' }), origin: b.target ? 'explicit' : 'inherited' };
         operations.set(source, operation);
         if (config.fault === 'drop-start') { req.socket.destroy(); return; }
       } else if (kind === 'continue') {
@@ -64,11 +72,19 @@ const server = http.createServer(async (req, res) => {
       if (p === '/api/logout') { res.setHeader('Set-Cookie', 'fixture=; Max-Age=0; Path=/demo/'); return json(res, { ok: true }); }
       if (p === '/api/me') return json(res, { ok: true });
       if (req.method === 'POST') actions.push({ kind: 'native', path: p, body: await body(req) });
+      if (modelFixture && p === '/api/sessions' && req.method === 'POST') return json(res, { error: 'native_create_forbidden_in_model_fixture' }, 403);
       if (p === '/api/sessions' && req.method === 'POST') {
         if (rows.length === 3) rows.push({ ...rows[0], session_id: 'copy', thread_id: 'pi-demo-copy', alias: 'DEMO 原生复制', broker_pid: 424242 });
         return json(res, { broker_pid: 424242 });
       }
-      if (p === '/api/sessions') return json(res, { sessions: rows, recent_cwds: [], new_session_defaults: {}, tmux_available: false });
+      if (p === '/api/sessions') {
+        const data = { sessions: rows.map((r, i) => modelFixture ? { ...r, model_provider: i === 1 ? 'provider-b' : 'provider-a', model: i === 1 ? 'restricted' : 'shared', reasoning_effort: 'high' } : r), recent_cwds: [], new_session_defaults: modelFixture ? structuredClone(modelCatalog.new_session_defaults) : {}, tmux_available: false };
+        if (catalogFault === 'warning') data.new_session_defaults.warnings = { pi: 'Synthetic reader failure' };
+        if (catalogFault === 'empty') data.new_session_defaults.backends.pi.provider_models = {};
+        if (catalogFault === 'no-efforts') data.new_session_defaults.backends.pi.reasoning_efforts_by_model['provider-b/restricted'] = [];
+        if (catalogFault === 'hold') { heldCatalog.push(() => json(res, data)); return; }
+        return json(res, data);
+      }
       if (p.endsWith('/live')) { res.writeHead(200, { 'Content-Type': 'text/event-stream' }); return res.end(': DEMO\n\n'); }
       if (p.includes('/messages/')) return json(res, { events: [], transcript_state: 'bound', thread_id: 'pi-demo-' + p.split('/')[3], log_path: '/DEMO/never-read', live_cursor: null, history_cursor: null, has_older: false, busy: false, queue_len: 0 });
       return json(res, { ok: true, items: [], models: [], queue: [] });
@@ -79,7 +95,7 @@ const server = http.createServer(async (req, res) => {
       res.writeHead(200, { 'Content-Type': 'text/html', 'Cache-Control': 'no-store' }); return res.end(html);
     }
     if (p === '/__owner_groups__/fixture.js') { res.writeHead(200, { 'Content-Type': 'application/javascript' }); return res.end(['core.js', 'panel.js', 'bootstrap.js'].map(n => fs.readFileSync(path.join(owners, n), 'utf8')).join('\n')); }
-    if (p === '/__session_handoff__/handoff.js') { res.writeHead(200, { 'Content-Type': 'application/javascript' }); return res.end(['core.js', 'panel.js', 'bootstrap.js'].map(n => fs.readFileSync(path.join(assets, n), 'utf8')).join('\n')); }
+    if (p === '/__session_handoff__/handoff.js') { res.writeHead(200, { 'Content-Type': 'application/javascript' }); return res.end(['core.js', 'target-model.js', 'panel.js', 'bootstrap.js'].map(n => fs.readFileSync(path.join(assets, n), 'utf8')).join('\n')); }
     const relative = p.replace(/^\/static\//, '').replace(/^\//, ''), file = path.resolve(staticDir, relative);
     if (!file.startsWith(staticDir + path.sep) || !fs.existsSync(file) || !fs.statSync(file).isFile()) return json(res, { error: 'missing_asset' }, 404);
     const type = ({ '.js': 'application/javascript', '.css': 'text/css', '.json': 'application/json', '.svg': 'image/svg+xml', '.png': 'image/png', '.webmanifest': 'application/manifest+json', '.woff2': 'font/woff2' })[path.extname(file)] || 'application/octet-stream';
