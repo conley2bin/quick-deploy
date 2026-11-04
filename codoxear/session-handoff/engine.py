@@ -10,6 +10,7 @@ import re
 import stat
 import tempfile
 import time
+import unicodedata
 from urllib.parse import quote
 from uuid import UUID, uuid4
 
@@ -18,7 +19,8 @@ from .context import ContextError, create_source_snapshot, prepare_artifacts, re
 from .prompts import build_recovery_prompt, build_review_prompt, build_continuation_prompt
 
 PUBLIC = ("id", "request_id", "source_session_id", "target_session_id", "status",
-          "message", "reviewed", "can_continue_unreviewed", "updated_at", "error_code")
+          "message", "reviewed", "can_continue_unreviewed", "updated_at", "error_code",
+          "target_settings", "target_check")
 MESSAGES = {
     "creating": "正在保存交接边界", "launching": "正在创建新的 Pi 会话",
     "recovering": "新会话正在独立恢复并整理理解报告", "waiting_source": "等待原会话空闲后审阅",
@@ -46,6 +48,65 @@ class HandoffError(Exception):
     def __init__(self, code: str, message: str, status: int = 409):
         super().__init__(code)
         self.code, self.message, self.status = code, message, status
+
+
+TARGET_KEYS = ("model_provider", "model", "reasoning_effort")
+
+
+def requested_target(value):
+    """Strict explicit-choice shape; absence is handled by the caller, never here."""
+    if (not isinstance(value, dict) or set(value) != set(TARGET_KEYS)
+            or any(not isinstance(v, str) or not v or v != v.strip() or len(v) > 256
+                   or any(unicodedata.category(ch) == "Cc" for ch in v) for v in value.values())
+            or value["reasoning_effort"] != value["reasoning_effort"].lower()):
+        raise HandoffError("invalid_input", "目标模型需要完整、准确的提供商、模型和小写推理级别", 400)
+    return {key: value[key] for key in TARGET_KEYS}
+
+
+def validate_target(catalog, target):
+    """Validate only the existing native catalog; never discover or infer models."""
+    unverifiable = HandoffError("target_unverifiable", "原生模型列表暂不能验证此选择，请重新打开选择器", 422)
+    invalid = HandoffError("target_invalid", "目标提供商、模型或推理级别不在原生可选范围内", 422)
+    if (not isinstance(catalog, dict)
+            or isinstance(catalog.get("warnings"), dict) and "pi" in catalog["warnings"]):
+        raise unverifiable
+    backends = catalog.get("backends")
+    pi = backends.get("pi") if isinstance(backends, dict) else None
+    if not isinstance(pi, dict):
+        raise unverifiable
+    def choices(values):
+        return [v.strip() for v in values if isinstance(v, str)] if isinstance(values, list) else []
+    provider, model, effort = (target[key] for key in TARGET_KEYS)
+    models = pi.get("provider_models")
+    if (provider not in choices(pi.get("provider_choices")) or model.lower() == "default"
+            or not isinstance(models, dict) or model not in choices(models.get(provider))):
+        raise invalid
+    by_model = pi.get("reasoning_efforts_by_model")
+    caps = by_model.get(provider + "/" + model) if isinstance(by_model, dict) else None
+    if not isinstance(caps, list):
+        caps = pi.get("reasoning_efforts")
+    if not isinstance(caps, list):
+        raise unverifiable
+    if effort not in [v.lower() for v in choices(caps)]:
+        raise invalid
+
+
+def validate_frozen_target(op):
+    """Old operations omit both fields; malformed new state is never inheritance."""
+    if "requested_target" not in op and "target_settings" not in op:
+        return
+    try:
+        requested = op["requested_target"]
+        if requested is not None:
+            requested_target(requested)
+        settings = op["target_settings"]
+        if (not isinstance(settings, dict) or set(settings) != {*TARGET_KEYS, "origin"}
+                or any(not isinstance(settings[k], str) or not settings[k] for k in TARGET_KEYS)
+                or settings["origin"] != ("inherited" if requested is None else "explicit")
+                or requested is not None and any(settings[k] != requested[k] for k in TARGET_KEYS)):
+            raise ValueError("invalid frozen target")
+    except (KeyError, ValueError, TypeError, HandoffError):
+        raise HandoffError("unsafe_state", "接力目标设置损坏，不能自动恢复", 500) from None
 
 
 def handoff_names(row):
@@ -194,6 +255,7 @@ class Engine:
             op = read_private_json(state_path)
             if op.get("id") != directory.name or op.get("status") not in MESSAGES:
                 raise HandoffError("unsafe_state", "接力状态损坏，不能自动恢复", 500)
+            validate_frozen_target(op)
             self.operations[op["id"]] = op
             for request_id in op["request_ids"]:
                 self.requests[request_id] = op["id"]
@@ -244,6 +306,9 @@ class Engine:
         return self.public(op["id"])
 
     async def sessions(self, cookie):
+        return (await self.listing(cookie))[0]
+
+    async def listing(self, cookie):
         try:
             status, data = await asyncio.wait_for(self.upstream_json(
                 "GET", "/api/sessions", cookie=cookie, timeout=self.timeouts["native"]), self.timeouts["native"])
@@ -255,7 +320,8 @@ class Engine:
             raise HandoffError("native_unavailable", "无法验证原生会话列表", 503)
         if any(not isinstance(row, dict) for row in data["sessions"]):
             raise HandoffError("native_unavailable", "无法验证原生会话列表", 503)
-        return data["sessions"]
+        defaults = data.get("new_session_defaults")
+        return data["sessions"], defaults if isinstance(defaults, dict) else None
 
     @staticmethod
     def _row(rows, route):
@@ -264,18 +330,21 @@ class Engine:
             raise HandoffError("identity_changed", "会话不存在或原生路由绑定已改变")
         return matches[0]
 
-    def start(self, source_session_id, request_id, note, *, rows, cookie):
+    def start(self, source_session_id, request_id, note, target=None, *, rows, catalog=None, cookie):
         """No await between deduplication, intent storage, and task ownership."""
         if self.closed:
             raise HandoffError("shutting_down", "服务正在关闭", 503)
         request_id = uuid_text(request_id)
+        requested = requested_target(target) if target is not None else None
         if request_id in self.requests:
             op = self.operations[self.requests[request_id]]
-            if op["source_session_id"] != source_session_id:
-                raise HandoffError("request_conflict", "同一请求标识不能用于不同会话")
+            if op["source_session_id"] != source_session_id or op.get("requested_target") != requested:
+                raise HandoffError("request_conflict", "同一请求标识不能用于不同会话或目标选择")
             return self.public(op["id"])
         for op in self.operations.values():
             if op["source_session_id"] == source_session_id and not releases_source(op):
+                if op.get("requested_target") != requested:
+                    raise HandoffError("target_conflict", "原会话已有不同目标选择的接力操作，请查看原操作")
                 if len(op["request_ids"]) >= 256:
                     raise HandoffError("request_limit", "此操作的重复请求过多，请使用原操作标识")
                 op["request_ids"].append(request_id)
@@ -287,15 +356,21 @@ class Engine:
             raise HandoffError("unsupported_backend", "当前仅支持 Pi 会话接力", 422)
         source_name, target_name = handoff_names(row)
         source_header = header_identity(row)
-        if not all(isinstance(row.get(k), str) and row[k] for k in ("cwd", "model_provider", "model", "reasoning_effort")):
-            raise HandoffError("settings_missing", "源会话的模型、提供商或推理设置尚未明确")
+        required = ("cwd", *TARGET_KEYS) if requested is None else ("cwd",)
+        if not all(isinstance(row.get(k), str) and row[k] for k in required):
+            raise HandoffError("settings_missing", "源会话的目录、模型、提供商或推理设置尚未明确")
+        if requested is not None:
+            validate_target(catalog, requested)
+        settings = {key: (row if requested is None else requested)[key] for key in TARGET_KEYS}
+        settings["origin"] = "inherited" if requested is None else "explicit"
         operation_id = str(uuid4())
         directory = self.root / operation_id
         private_dir(directory)
         op = {"id": operation_id, "request_id": request_id, "request_ids": [request_id],
               "source_session_id": source_session_id, "target_session_id": None, "reviewed": False,
               "source_binding": binding(row), "source_header": source_header, "intents": {},
-              "source_display_name": source_name, "target_display_name": target_name}
+              "source_display_name": source_name, "target_display_name": target_name,
+              "requested_target": requested, "target_settings": settings}
         self._set(op, "creating")
         self.operations[operation_id], self.requests[request_id] = op, operation_id
         self._schedule(op, lambda: self._run(op, cookie, dict(row), note))
@@ -506,7 +581,9 @@ class Engine:
             raise
         self.manifests[op["id"]] = manifest
         op["source_sha256"] = manifest["source_sha256"]
-        launch = {key: row[key] for key in ("cwd", "model_provider", "model", "reasoning_effort")}
+        # Only genuinely old operations lack the durable tuple. Never replay on open().
+        settings = op["target_settings"] if "target_settings" in op else row
+        launch = {"cwd": row["cwd"], **{key: settings[key] for key in TARGET_KEYS}}
         launch.update(agent_backend="pi", create_in_tmux=True,
                       args=[build_recovery_prompt(manifest, self.root / op["id"])])
         self._set(op, "launching")

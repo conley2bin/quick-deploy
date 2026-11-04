@@ -50,7 +50,11 @@ def install(app, host, *, state_root=None, timeouts=None, succession_service=Non
             # Auth is freshly checked on every state-bearing request, including
             # status, malformed input and deduplicated start. Cookie is never saved.
             cookie = request.headers.get("Cookie", "")
-            rows = await engine.sessions(cookie)
+            action = request.match_info["action"]
+            if action == "start":
+                rows, catalog = await engine.listing(cookie)
+            else:
+                rows = await engine.sessions(cookie)
             if request.content_type != "application/json":
                 raise HandoffError("invalid_input", "请求必须使用 JSON", 400)
             if request.content_length is not None and request.content_length > MAX_BODY:
@@ -66,9 +70,8 @@ def install(app, host, *, state_root=None, timeouts=None, succession_service=Non
                 raise HandoffError("invalid_input", "请求不是有效 JSON", 400) from None
             if not isinstance(data, dict):
                 raise HandoffError("invalid_input", "请求必须是 JSON 对象", 400)
-            action = request.match_info["action"]
             if action == "start":
-                if set(data) - {"source_session_id", "request_id", "note"} or not {"source_session_id", "request_id"} <= data.keys():
+                if set(data) - {"source_session_id", "request_id", "note", "target"} or not {"source_session_id", "request_id"} <= data.keys():
                     raise HandoffError("invalid_input", "接力请求包含未支持的字段", 400)
                 source = data["source_session_id"]
                 note = data.get("note", "")
@@ -76,7 +79,9 @@ def install(app, host, *, state_root=None, timeouts=None, succession_service=Non
                         or any(ord(char) < 32 for char in source)
                         or not isinstance(note, str) or len(note) > 2000):
                     raise HandoffError("invalid_input", "会话标识或附注无效", 400)
-                operation = engine.start(source, data["request_id"], note, rows=rows, cookie=cookie)
+                target = engine_module.requested_target(data["target"]) if "target" in data else None
+                operation = engine.start(source, data["request_id"], note, target,
+                                         rows=rows, catalog=catalog, cookie=cookie)
             else:
                 if set(data) != {"operation_id"}:
                     raise HandoffError("invalid_input", "请求仅接受操作标识", 400)

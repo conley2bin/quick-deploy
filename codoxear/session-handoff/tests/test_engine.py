@@ -57,6 +57,13 @@ class Native:
                        "log_path": str(source_path), "cwd": str(root), "busy": False,
                        "model_provider": "test-provider", "model": "test-model", "reasoning_effort": "high"}
         self.target = None
+        self.defaults = {"backends": {"pi": {
+            "provider_choices": ["p1", "p2"], "models": ["shared", "other"],
+            # Native omits p2/shared even when a capability entry exists.
+            "provider_models": {"p1": ["shared"], "p2": ["other"]},
+            "reasoning_efforts": ["off", "high", "xhigh"],
+            "reasoning_efforts_by_model": {"p1/shared": ["off", "high"],
+                                            "p2/shared": ["xhigh"], "shared": ["xhigh"]}}}}
         self.include_source = True
         self.calls = []
         self.engine = None
@@ -77,7 +84,7 @@ class Native:
 
     @property
     def op(self):
-        return next(iter(self.engine.operations.values()))
+        return next(reversed(self.engine.operations.values()))
 
     def artifact(self, kind):
         op = self.op
@@ -148,11 +155,13 @@ class Native:
                 self.source["busy"] = False
             if self.on_list:
                 self.on_list()
-            return 200, {"sessions": ([dict(self.source)] if self.include_source else []) + ([dict(self.target)] if self.target else [])}
+            return 200, {"sessions": ([dict(self.source)] if self.include_source else []) + ([dict(self.target)] if self.target else []),
+                         "new_session_defaults": self.defaults}
         if path == "/api/sessions":
             if self.create_gate:
                 await self.create_gate.wait()
-            self.target = {**self.source, "session_id": "opaque/target", "broker_pid": 200,
+            self.target = {**self.source, **{k: body[k] for k in ("model_provider", "model", "reasoning_effort")},
+                           "session_id": "opaque/target", "broker_pid": 200,
                            "thread_id": None, "launch_id": "launch-pending-string", "spawn_nonce": "target-nonce",
                            "log_path": None, "busy": False}
             if self.lost == "create":
@@ -798,6 +807,166 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result['status'], 'ready')
         self.assertEqual(self.native.service.calls, ['prepare'])
         self.assertEqual(self.native.service.events, 0)
+
+    async def target_start(self, target=None, *, request_id=None, catalog=None, source="opaque/source", rows=None):
+        return self.engine.start(source, request_id or str(uuid4()), "保留原目标", target,
+                                 rows=rows if rows is not None else [dict(self.native.source)],
+                                 catalog=self.native.defaults if catalog is None else catalog, cookie="private-cookie")
+
+    def choice(self, **fields):
+        return {"model_provider": "p1", "model": "shared", "reasoning_effort": "high", **fields}
+
+    def assert_no_operation_effects(self):
+        self.assertEqual(self.engine.operations, {})
+        self.assertEqual(self.engine.requests, {})
+        self.assertEqual(list(self.engine.root.iterdir()), [])
+        self.assertEqual(self.native.mutations(), [])
+        self.assertEqual(self.native.service.calls, [])
+
+    async def test_target_explicit_durable_before_schedule_and_first_native_byte(self):
+        requested = self.choice()
+        previous = self.native.__call__
+        def check_disk():
+            disk = json.loads((self.engine.root / self.native.op["id"] / "state.json").read_text())
+            self.assertEqual(disk["requested_target"], self.choice())
+            self.assertEqual(disk["target_settings"], {**self.choice(), "origin": "explicit"})
+            return disk
+        async def inspect(method, path, **kwargs):
+            if method == "POST" and path == "/api/sessions":
+                self.assertEqual(check_disk()["intents"]["create"]["result"], "unknown")
+                self.assertEqual(kwargs["body"], {"cwd": str(self.root), **self.choice(),
+                    "agent_backend": "pi", "create_in_tmux": True, "args": kwargs["body"]["args"]})
+            return await previous(method, path, **kwargs)
+        self.engine.upstream_json = inspect
+        accepted = await self.target_start(requested)
+        self.assertEqual(check_disk()["intents"], {})  # Scheduling has not run yet.
+        requested["model"] = "mutated-client-object"
+        self.assertEqual(accepted["target_settings"], {**self.choice(), "origin": "explicit"})
+        self.assertEqual((await self.finish())["status"], "ready")
+        self.assertEqual(len(self.native.mutations()), 4)
+        self.assertEqual(self.native.source["model"], "test-model")
+        manifest = json.loads((self.engine.root / accepted["id"] / "manifest.json").read_text())
+        self.assertEqual(manifest["version"], 1)
+        self.assertNotIn("target_settings", manifest)
+        self.assertNotIn("requested_target", manifest)
+
+    async def test_target_inherit_freezes_source_row_not_defaults_before_worker(self):
+        frozen = {k: self.native.source[k] for k in self.choice()}
+        accepted = await self.target_start()
+        self.native.source.update(model_provider="changed-provider", model="changed-model", reasoning_effort="off")
+        self.native.defaults = None
+        self.assertEqual((await self.finish())["status"], "ready")
+        self.assertEqual(accepted["target_settings"], {**frozen, "origin": "inherited"})
+        body = self.native.mutations()[0][2]
+        self.assertEqual({k: body[k] for k in frozen}, frozen)
+        self.assertEqual(set(body), {"cwd", *frozen, "agent_backend", "create_in_tmux", "args"})
+
+    async def test_target_invalid_exact_native_pair_and_effort_no_effects(self):
+        for target in (self.choice(model_provider="unknown"), self.choice(model="other"),
+                       self.choice(model_provider="p2"), self.choice(model="default"),
+                       self.choice(model="DEFAULT"), self.choice(reasoning_effort="xhigh"),
+                       self.choice(model_provider="p2", model="other", reasoning_effort="minimal")):
+            with self.subTest(target=target), self.assertRaises(HandoffError) as raised:
+                await self.target_start(target)
+            self.assertEqual((raised.exception.status, raised.exception.code), (422, "target_invalid"))
+            self.assert_no_operation_effects()
+
+    async def test_target_unverifiable_no_effects_but_inherit_still_works(self):
+        for catalog in ({}, {"backends": {"pi": []}},
+                        {**self.native.defaults, "warnings": {"pi": None}},
+                        {"backends": {"pi": {**self.native.defaults["backends"]["pi"],
+                                             "reasoning_efforts": None, "reasoning_efforts_by_model": {}}}}):
+            with self.subTest(catalog=catalog), self.assertRaises(HandoffError) as raised:
+                await self.target_start(self.choice(), catalog=catalog)
+            self.assertEqual((raised.exception.status, raised.exception.code), (422, "target_unverifiable"))
+            self.assert_no_operation_effects()
+        self.native.defaults = None
+        with self.assertRaises(HandoffError) as raised:
+            await self.target_start(self.choice())
+        self.assertEqual(raised.exception.code, "target_unverifiable")
+        self.assert_no_operation_effects()
+        await self.target_start()
+        self.assertEqual((await self.finish())["status"], "ready")
+
+    async def test_target_backend_caps_trimmed_and_no_bare_model_fallback(self):
+        pi = self.native.defaults["backends"]["pi"]
+        pi["provider_choices"] = [" p2 "]
+        pi["provider_models"]["p2"] = [" other "]
+        pi["reasoning_efforts"] = [" XHIGH "]
+        pi["reasoning_efforts_by_model"]["other"] = ["off"]
+        await self.target_start(self.choice(model_provider="p2", model="other", reasoning_effort="xhigh"))
+        self.assertEqual((await self.finish())["status"], "ready")
+        self.assertEqual(self.native.mutations()[0][2]["reasoning_effort"], "xhigh")
+
+    async def test_target_dedup_and_source_lease_precede_catalog_drift(self):
+        request_id = str(uuid4())
+        accepted = await self.target_start(self.choice(), request_id=request_id)
+        state_path = self.engine.root / accepted["id"] / "state.json"
+        before = state_path.read_bytes()
+        self.native.defaults = None
+        same = await self.target_start(self.choice(), request_id=request_id, rows=[])
+        self.assertEqual(same, accepted)
+        self.assertEqual(state_path.read_bytes(), before)
+        for target in (None, self.choice(reasoning_effort="off")):
+            with self.assertRaises(HandoffError) as raised:
+                await self.target_start(target, request_id=request_id)
+            self.assertEqual(raised.exception.code, "request_conflict")
+            self.assertEqual(state_path.read_bytes(), before)
+            with self.assertRaises(HandoffError) as raised:
+                await self.target_start(target)
+            self.assertEqual(raised.exception.code, "target_conflict")
+            self.assertEqual(state_path.read_bytes(), before)
+        with self.assertRaises(HandoffError) as raised:
+            await self.target_start(self.choice(), request_id=request_id, source="different-source")
+        self.assertEqual(raised.exception.code, "request_conflict")
+        alias = str(uuid4())
+        self.assertEqual((await self.target_start(self.choice(), request_id=alias, rows=[]))["id"], accepted["id"])
+        self.assertEqual(self.engine.requests[alias], accepted["id"])
+        await self.finish()
+        self.assertEqual(len(self.native.mutations()), 4)
+
+    async def test_target_explicit_needs_only_source_cwd_inherit_needs_all_four(self):
+        for key in self.choice():
+            self.native.source.pop(key)
+        with self.assertRaises(HandoffError) as raised:
+            await self.target_start()
+        self.assertEqual(raised.exception.code, "settings_missing")
+        self.assert_no_operation_effects()
+        await self.target_start(self.choice())
+        self.assertEqual((await self.finish())["status"], "ready")
+
+    async def test_target_unknown_create_restart_and_legacy_operation_no_replay(self):
+        self.native.lost = "create"
+        request_id = str(uuid4())
+        accepted = await self.target_start(self.choice(), request_id=request_id)
+        self.assertEqual((await self.finish())["status"], "creation_unknown")
+        await self.engine.close()
+        self.engine = Engine(self.native, state_root=self.engine.root).open()
+        self.native.engine = self.engine
+        frozen = {**self.choice(), "origin": "explicit"}
+        self.assertEqual(self.engine.public(accepted["id"])["target_settings"], frozen)
+        self.assertEqual(self.engine.status(accepted["id"], rows=[]) ["status"], "creation_unknown")
+        self.native.defaults = None
+        self.assertEqual((await self.target_start(self.choice()))["id"], accepted["id"])
+        with self.assertRaises(HandoffError) as raised:
+            await self.target_start()
+        self.assertEqual(raised.exception.code, "target_conflict")
+        self.assertFalse(self.engine.tasks)
+        self.assertEqual(len(self.native.mutations()), 1)
+        op = self.native.op
+        op.pop("target_settings")
+        op.pop("requested_target")
+        self.engine._persist(op)
+        await self.engine.close()
+        self.engine = Engine(self.native, state_root=self.engine.root).open()
+        self.native.engine = self.engine
+        self.assertNotIn("target_settings", self.engine.public(accepted["id"]))
+        self.assertEqual((await self.target_start(request_id=request_id))["id"], accepted["id"])
+        with self.assertRaises(HandoffError) as raised:
+            await self.target_start(self.choice(), request_id=request_id)
+        self.assertEqual(raised.exception.code, "request_conflict")
+        self.assertFalse(self.engine.tasks)
+        self.assertEqual(len(self.native.mutations()), 1)
 
     async def test_nonfinite_deadline_rejected(self):
         with self.assertRaises(ValueError):
