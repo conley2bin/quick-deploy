@@ -179,7 +179,9 @@
     on(modelInput, 'input', () => {
       const value = modelInput.value, captured = context;
       if (!guard(captured) || unavailable) { restoreInput(); return; }
-      d().query = value; browsing = false; menu = 'model'; focus = -1; renderModels(); paint(); onChange();
+      // The source guard may synchronously repaint/bind the committed input.
+      // Restore this event's captured query before asking native to filter it.
+      d().query = value; modelInput.value = value; browsing = false; menu = 'model'; focus = -1; renderModels(); paint(); onChange();
     });
     on(modelInput, 'keydown', e => {
       if (e.key === 'Escape' && menu) { e.preventDefault(); e.stopPropagation(); close(); return; }

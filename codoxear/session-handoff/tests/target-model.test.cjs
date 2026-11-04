@@ -6,13 +6,13 @@ async function rig(t) {
   const dom = fakeDOM(), writes = [];
   const native = await actualNative(t, { getItem: () => null, setItem: (...v) => writes.push(v), removeItem: (...v) => writes.push(v) });
   const menuHost = dom.doc.createElement('div'); dom.doc.body.append(menuHost);
-  const d = { choice: null }, data = catalog(); let current = true, changes = 0;
-  const field = Target.createTargetModelField({ ...dom, native, menuHost, actionCurrent: () => current, onChange: () => changes++ });
+  const d = { choice: null }, data = catalog(); let current = true, changes = 0, action = () => current;
+  const field = Target.createTargetModelField({ ...dom, native, menuHost, actionCurrent: () => action(), onChange: () => changes++ });
   t.after(() => field.dispose()); field.bind({ draft: d, data, source: 'A', seq: 1, visible: true });
   const find = id => dom.doc.getElementById(id);
   const rows = () => find('handoffModelMenu').children.filter(n => n.role === 'option');
   const choose = (provider, model) => { find('handoffModelInput').click(); rows().find(n => n.title === `${model} · ${provider}`).click(); };
-  return { ...dom, native, d, data, field, find, rows, choose, writes, stale: () => current = false, changes: () => changes };
+  return { ...dom, native, d, data, field, find, rows, choose, writes, stale: () => current = false, guard: fn => action = fn, changes: () => changes };
 }
 test('actual native exported controller owns grouping/search/display/parsing, not a cloned algorithm', async t => {
   const r = await rig(t), input = r.find('handoffModelInput'); input.click();
@@ -108,5 +108,17 @@ for (const priorExplicit of [false, true]) test(`empty native effort choices blo
   await confirm(); assert.deepEqual(calls[0].target, { model_provider: 'provider-b', model: 'shared', reasoning_effort: 'high' });
   r.choose('provider-b', 'restricted'); assert.notEqual(r.field.blockReason(), '');
   r.find('handoffInheritModel').click(); assert.equal(r.field.blockReason(), ''); assert.equal(r.field.target(), undefined);
+  assert.deepEqual(r.writes, []);
+});
+test('a source guard repaint cannot erase the query before native filtering', async t => {
+  const r = await rig(t), input = r.find('handoffModelInput');
+  r.guard(() => {
+    r.field.bind({ draft: r.d, data: r.data, source: 'A', seq: 1, visible: true });
+    return true;
+  });
+  input.value = 'shared'; input.fire('input');
+  assert.equal(input.value, 'shared');
+  assert.deepEqual(r.rows().map(n => n.title), r.native.controllers[0].filteredNewSessionModelOptions().map(n => n.displayText));
+  assert.equal(r.rows().length, 2);
   assert.deepEqual(r.writes, []);
 });
