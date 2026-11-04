@@ -90,3 +90,23 @@ test('loader resolves native same-origin prefixed modules and rejects incompatib
   assert.deepEqual(seen, ['https://fixture/prefix/static/app_new_session.js?v=test%20version', 'https://fixture/prefix/static/app_display.js', 'https://fixture/prefix/static/app_dialog_menu.js']);
   await assert.rejects(Target.loadNative('https://fixture/', {}, async () => ({})), /不兼容/);
 });
+for (const priorExplicit of [false, true]) test(`empty native effort choices block a new visible pick (${priorExplicit ? 'prior explicit' : 'initial inherit'}) until deliberate recovery`, async t => {
+  const r = await rig(t), calls = [];
+  if (priorExplicit) r.choose('provider-a', 'shared');
+  r.data.new_session_defaults.backends.pi.reasoning_efforts_by_model['provider-b/restricted'] = [];
+  r.choose('provider-b', 'restricted');
+  assert.match(r.find('handoffModelInput').value, /restricted/);
+  assert.notEqual(r.field.blockReason(), '', 'a failed visible selection must block confirmation');
+  const Core = require('../web/core.js');
+  const saved = new Map();
+  const c = Core.createController({ key: 'test', storage: { getItem: k => saved.get(k), setItem: (k, v) => saved.set(k, v) },
+    uuid: () => '12345678-1234-4123-8123-123456789012', post: async (route, body) => { calls.push(body); throw Error('synthetic loss'); } });
+  const confirm = async () => { if (!r.field.blockReason()) await c.start('A', '', r.field.target()); };
+  await confirm(); assert.equal(calls.length, 0);
+  r.find('handoffModelInput').value = ''; r.find('handoffModelInput').fire('input');
+  r.choose('provider-b', 'shared'); assert.equal(r.field.blockReason(), '');
+  await confirm(); assert.deepEqual(calls[0].target, { model_provider: 'provider-b', model: 'shared', reasoning_effort: 'high' });
+  r.choose('provider-b', 'restricted'); assert.notEqual(r.field.blockReason(), '');
+  r.find('handoffInheritModel').click(); assert.equal(r.field.blockReason(), ''); assert.equal(r.field.target(), undefined);
+  assert.deepEqual(r.writes, []);
+});

@@ -106,7 +106,13 @@
       provider = item.providerChoice; modelInput.value = ctl.newSessionProviderModelDisplay(item.model, provider);
       ctl.setNewSessionReasoningEffort(requested);
       const choice = Core.targetSettings({ model_provider: provider, model: item.model, reasoning_effort: effort });
-      if (!ctl.currentReasoningChoices().includes(effort)) return; // Native's empty-capability fallback is not an available effort.
+      if (!ctl.currentReasoningChoices().includes(effort)) {
+        // Native's empty-capability fallback is not selectable. Preserve the
+        // attempted label as an invalid query so no prior target can submit.
+        Object.assign(d(), { query: modelInput.value, choiceStale: true,
+          effortNote: '该模型没有原生可选推理强度，请选择其他模型或明确沿用原会话设置' });
+        close(); paint(); onChange(); return;
+      }
       Object.assign(d(), { choice, query: null, choiceStale: false,
         effortNote: requested && requested !== effort ? `推理强度 ${requested} 不在该模型的原生可选范围，已按原生规则改为 ${effort}` : '' });
       close(); paint(); onChange();
