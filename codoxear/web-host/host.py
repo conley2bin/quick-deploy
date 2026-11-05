@@ -48,7 +48,7 @@ def load_feature(directory):
 
 def default_features():
     # Explicit composition, never discovery or silent omission of a missing feature.
-    return (load_feature('owner-groups'), load_feature('session-handoff'))
+    return (load_feature('session-handoff'),)
 
 
 class HostContext:
@@ -96,8 +96,6 @@ class HostContext:
 
     def compatibility_headers(self, headers):
         headers['X-Codoxear-Extensions'] = self.html_status
-        if '__owner_groups__' in self.scripts:
-            headers['X-Owner-Groups'] = self.html_status
 
     async def upstream_json(self, method, path, *, cookie, body=None, timeout=30.0, limit=8*1024*1024):
         # A feature supplies API paths, never a browser-selected URL or redirect target.

@@ -131,9 +131,9 @@ else:
         return ['validate', 'sync:fixture-default', 'install:fixture-revision',
                 'native:describe fixture-revision']
 
-    def test_default_and_legacy_flag_launch_managed_proxy_after_update_and_describe(self):
+    def test_default_launches_managed_proxy_after_update_and_describe(self):
         self.install_adapter()
-        for args in ((), ('--owner-groups',)):
+        for args in ((),):
             with self.subTest(args=args):
                 self.clear_calls()
                 result = self.run_script('run_server.sh', *args)
@@ -143,7 +143,7 @@ else:
 
     def test_native_rollback_has_no_adapter_dependency_or_probe(self):
         for installed in (False, True):
-            for flag in ('--no-owner-groups', '--no-extensions'):
+            for flag in ('--no-extensions',):
                 with self.subTest(adapter_installed=installed, flag=flag):
                     if installed:
                         self.install_adapter()
@@ -153,7 +153,7 @@ else:
                     self.assertEqual(self.calls(), [*self.update_calls(), 'native:server'])
 
     def test_missing_adapter_fails_before_any_updater_effect(self):
-        for args in ((), ('--owner-groups',)):
+        for args in ((),):
             with self.subTest(args=args):
                 result = self.run_script('run_server.sh', *args)
                 self.assertEqual(result.returncode, 1)
@@ -163,7 +163,7 @@ else:
 
     def test_broken_adapter_import_fails_explicitly_before_updater(self):
         self.install_adapter()
-        for args in ((), ('--owner-groups',)):
+        for args in ((),):
             with self.subTest(args=args):
                 self.clear_calls()
                 result = self.run_script('run_server.sh', *args, FIXTURE_IMPORT_STATUS='9')
@@ -183,7 +183,7 @@ else:
     def test_missing_env_fails_without_updater_in_both_modes(self):
         self.install_adapter()
         (self.root / '.env').unlink()
-        for args in ((), ('--no-owner-groups',)):
+        for args in ((), ('--no-extensions',)):
             with self.subTest(args=args):
                 self.clear_calls()
                 result = self.run_script('run_server.sh', *args)
@@ -198,7 +198,7 @@ else:
             ('FIXTURE_SYNC_STATUS', ['validate', 'sync:fixture-default']),
             ('FIXTURE_INSTALL_STATUS', ['validate', 'sync:fixture-default', 'install:fixture-revision']),
         ):
-            for args in ((), ('--no-owner-groups',)):
+            for args in ((), ('--no-extensions',)):
                 with self.subTest(variable=variable, args=args):
                     self.clear_calls()
                     result = self.run_script('run_server.sh', *args, **{variable: '7'})
@@ -210,12 +210,9 @@ else:
             result = self.run_script('run_server.sh', flag)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn('默认启用', result.stdout)
-            self.assertIn('--no-owner-groups', result.stdout)
             self.assertIn('--no-extensions', result.stdout)
             self.assertEqual(self.calls(), [])
-        for args in (('--unknown',), ('--owner-groups', '--no-owner-groups'),
-                     ('--no-owner-groups', '--owner-groups'), ('--owner-groups', 'extra'),
-                     ('--help', 'extra'), ('--no-extensions', '--owner-groups'), ('',)):
+        for args in (('--unknown',), ('--help', 'extra'), ('--no-extensions', 'extra'), ('',)):
             with self.subTest(args=args):
                 result = self.run_script('run_server.sh', *args)
                 self.assertEqual(result.returncode, 2)

@@ -6,15 +6,13 @@ source "${SCRIPT_DIR}/.internal/common.sh"
 
 usage() {
   cat <<'EOF'
-usage: ./run_server.sh [--owner-groups | --no-owner-groups | --no-extensions]
+usage: ./run_server.sh [--no-extensions]
 
-默认启用共享 Web 宿主及负责人分组、会话接力两个独立扩展，保留现有前端地址，上游运行在私有 loopback。
+默认启用共享 Web 宿主及会话接力扩展，保留现有前端地址，上游运行在私有 loopback。
 每次启动前都 fetch 远程 origin/main，切换到最新提交，必要时重新安装。
 无法确认远程最新版本、共享宿主依赖缺失或启动失败时直接报错，不自动回退。
 先运行 ./setup.sh 安装全部依赖；已有在线服务需安排重启才切换。
---owner-groups:    兼容旧命令，与无参数默认行为相同。
---no-owner-groups: 显式回退到原生 codoxear-server，不依赖任何扩展。
---no-extensions:   与 --no-owner-groups 相同，关闭全部扩展。
+--no-extensions:   显式回退到原生 codoxear-server，不依赖任何扩展。
 EOF
 }
 
@@ -26,8 +24,7 @@ main() {
     fi
     case "$1" in
       -h|--help) usage; return 0 ;;
-      --owner-groups) ;;
-      --no-owner-groups|--no-extensions) extensions=0 ;;
+      --no-extensions) extensions=0 ;;
       *) echo "error: 未知参数: $1" >&2; usage >&2; return 2 ;;
     esac
   fi

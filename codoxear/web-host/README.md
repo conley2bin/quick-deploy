@@ -2,8 +2,7 @@
 
 `host.py` owns the single front HTTP listener, the private loopback native server,
 streaming proxy and extension assets. The upstream checkout/package is unchanged.
-Production explicitly installs `owner-groups/feature.py` and
-`session-handoff/feature.py`; a missing module or asset is a startup error, never a
+Production explicitly installs `session-handoff/feature.py`; a missing module or asset is a startup error, never a
 silently disabled feature. There is no plugin discovery or nested proxy.
 
 ## Feature contract
@@ -45,11 +44,7 @@ downloads and SSE stream. Duplicate Set-Cookie, opaque encoded routes, native pr
 IPv6 dual-stack front behavior are preserved. WebSocket upgrades fail explicitly
 with 501 because this host only supports the observed HTTP/SSE native protocol.
 
-`owner-groups/proxy.py` keeps legacy imports and owner-only `create_app` /
-`managed_app` fixtures. Its CLI delegates to the shared host and enables both
-production features. Owner namespace, snapshot projection, status schema and
-`X-Owner-Groups` response header remain compatible. Shared HTML status also uses
-`X-Codoxear-Extensions`.
+Shared HTML status uses the `X-Codoxear-Extensions` response header.
 
 ## Isolated tests
 
@@ -57,16 +52,11 @@ From `codoxear/`, after provisioning the shared venv with `./setup.sh`:
 
 ```bash
 web-host/.venv/bin/python -m unittest discover -s web-host/tests -v
-web-host/.venv/bin/python -m unittest discover -s owner-groups/tests -p 'test_*.py'
 python3 -m unittest discover -s tests -v
-node --test owner-groups/tests/core.test.cjs
-# Optional installed upstream: read-only package, temporary HOME and private port.
-CODOXEAR_TEST_PYTHON="$PWD/.runtime/venv/bin/python" \
-  web-host/.venv/bin/python -m unittest discover -s owner-groups/tests -p test_real_upstream.py
 ```
 
 Host tests inject explicit synthetic features; they require no session-handoff
-module, live registry, user cookies or agents. Production defaults never install
+module, user cookies or agents. Production defaults never install
 those fakes. The optional native test starts only a temporary Web child, never a
 broker/agent. Full handoff/browser integration belongs to the integrated feature
 tests, not this isolated transport suite.

@@ -9,4 +9,4 @@ else
   python3 -m venv "${HERE}/.venv"
   "${HERE}/.venv/bin/python" -m pip install -r "${HERE}/requirements.txt"
 fi
-printf '\nReady. Owner groups and session handoff are enabled by default at the next approved Web restart:\n  %s/../run_server.sh\nExplicit native rollback (no adapter dependencies):\n  %s/../run_server.sh --no-extensions\nNo service was started or restarted; existing online processes are unchanged.\n' "${HERE}" "${HERE}"
+printf '\nReady. Session handoff is enabled by default at the next approved Web restart:\n  %s/../run_server.sh\nExplicit native rollback (no adapter dependencies):\n  %s/../run_server.sh --no-extensions\nNo service was started or restarted; existing online processes are unchanged.\n' "${HERE}" "${HERE}"

@@ -112,7 +112,6 @@ class HostTests(unittest.IsolatedAsyncioTestCase):
         async with self.client.get(self.front.make_url('/phone/')) as response:
             text = await response.text()
             self.assertEqual(response.headers['X-Codoxear-Extensions'], 'injected')
-            self.assertNotIn('X-Owner-Groups', response.headers)
             self.assertNotIn('ETag', response.headers)
         self.assertEqual(text.count('<script defer src='), 2)
         for feature, body in zip(self.features, original):
@@ -216,8 +215,8 @@ class ConstructionTests(unittest.TestCase):
         fake = SimpleNamespace(install=lambda app, context: None)
         with patch.object(host, 'load_feature', return_value=fake) as load:
             host.create_app('http://127.0.0.1:1234')
-            self.assertEqual([call.args for call in load.call_args_list], [('owner-groups',), ('session-handoff',)])
-        with patch.object(host, 'load_feature', side_effect=[fake, FileNotFoundError('missing handoff')]):
+            self.assertEqual([call.args for call in load.call_args_list], [('session-handoff',)])
+        with patch.object(host, 'load_feature', side_effect=FileNotFoundError('missing handoff')):
             with self.assertRaises(FileNotFoundError):
                 host.create_app('http://127.0.0.1:1234')
 
