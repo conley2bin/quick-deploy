@@ -60,8 +60,6 @@ pi                                 # 新会话直接使用 fullscreen；无需�
 | `extensions/pi-inline-images/{patches,vendor}/` | 与本功能桥接协议共同演进的 pi-tmux-images 补丁与 vendored 代码 | 手动 guarded replay（见功能 README） |
 | `skills/` | 自有技能 `skills/<name>/`；vendored `skills/<来源>/<name>/` + `UPSTREAM.txt` | `install.sh --skills-only` 调用现有 `skills/install-skills.sh`，交互式选中后复制到 `~/.pi/agent/skills/` |
 
-`skills/responsibility-registry/` 是全局责任登记技能的源码；安装时在 `--skills-only` 菜单只选 `responsibility-registry`。`~/.pi/agent/skills/responsibility-registry/` 是安装副本，不在该目录开发。运行态登记簿位于 `~/.pi/agent/.memory/local/responsibility-registry/`，不随源码或安装复制；已有 Pi 会话 `/reload` 后加载更新。
-
 `pi-copy-links` 提供代码块右下角复制按钮和 Ctrl+左键打开网页及 Pi 服务器文件；需使用 Pi 的 `fullscreen` 模式。扩展运行时及其单独的叶安装器不修改全局设置；全局 fullscreen 默认策略由本目录的一键安装器负责。版本号仅作诊断：TUI 启动时在自有隔离对象上检查实际接口与关键行为，契约成立即启用，无需用户逐版验证或编辑版本名单。具体接口/行为不兼容时只停用增强并提示原因，原生 Markdown/Pi 保持可用；`/copy-links` 查看实际状态。更新源码后须在 Pi 空闲时手动 `/reload` 或重启才会生效，详见 [使用说明](extensions/pi-copy-links/README.md)。
 
 一键安装器的隔离测试用 `node --test pi-agent/test/installer.test.mjs`（从仓库根目录，需已安装 Pi 的锁依赖）；测试执行临时源码副本中的主入口，覆盖所有真实叶安装器的普通非 Git home 安装/重跑、顶层功能安装入口约定、含嵌套组件的实际 Pi 入口解析边界，以及受控失败；`npm` 和 `systemctl` 使用只记录调用的替身，不启动 Pi、不下载依赖或操作真实用户服务。扩展测试在各自 `test/` 下，例如 `extensions/pi-suspend-guard/test/run.sh`、`extensions/pi-tmux-window-status/test/installer.sh`；`pi-copy-links` 使用 `npm run check`。其[本地诊断命令](extensions/pi-copy-links/README.md#开发者诊断与本地复现)用于开发/排查，不是用户逐版升级的验证任务。

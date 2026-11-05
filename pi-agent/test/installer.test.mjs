@@ -371,7 +371,7 @@ test("child failure means no setting creation/change and no later leaf", t => {
   }
 });
 
-test("skills-only copies only the selected real skill and preserves configs and unrelated skills", async t => {
+test("skills-only copies only the selected skill and preserves configs and unrelated skills", async t => {
   const f = fixture(t);
   f.seed('{"tuiMode":"regular","owned":42}\n');
   const before = snapshot(f.settings);
@@ -383,25 +383,26 @@ test("skills-only copies only the selected real skill and preserves configs and 
   writeFileSync(unrelated, 'unrelated installed skill\n');
   const unrelatedBefore = snapshot(unrelated);
   copyFileSync(join(source, 'skills/install-skills.sh'), join(f.checkout, 'skills/install-skills.sh'));
-  cpSync(join(source, 'skills/responsibility-registry'), join(f.checkout, 'skills/responsibility-registry'), {
-    recursive: true, filter: path => basename(path) !== '__pycache__' && !path.endsWith('.pyc'),
-  });
+  const sample = join(f.checkout, 'skills/example-skill');
+  mkdirSync(join(sample, 'references'), { recursive: true });
+  writeFileSync(join(sample, 'SKILL.md'), '---\nname: example-skill\ndescription: Example fixture\n---\n\nFixture body.\n');
+  writeFileSync(join(sample, 'references/example.md'), 'Fixture reference.\n');
   // Prove the main skill-only route does not need or execute any leaf installer.
   rmSync(join(f.checkout, 'extensions'), { recursive: true });
   const result = spawnSync('bash', [join(f.checkout, 'install.sh'), '--skills-only'], { ...f.options(), input: '1\n' });
   passed(result);
-  assert.match(result.stdout, /installed responsibility-registry/);
+  assert.match(result.stdout, /installed example-skill/);
   assert.equal(existsSync(f.trace), false);
   unchanged(f.settings, before); unchanged(shellConfig, shellBefore); unchanged(unrelated, unrelatedBefore);
-  assert.deepEqual(readdirSync(join(f.agent, 'skills')).sort(), ['responsibility-registry', 'unrelated']);
-  const target = join(f.agent, 'skills/responsibility-registry');
-  for (const path of ['SKILL.md', 'scripts/registry.py', 'references/cli.md', 'tests/test_registry.py']) {
-    assert.deepEqual(readFileSync(join(target, path)), readFileSync(join(source, 'skills/responsibility-registry', path)));
+  assert.deepEqual(readdirSync(join(f.agent, 'skills')).sort(), ['example-skill', 'unrelated']);
+  const target = join(f.agent, 'skills/example-skill');
+  for (const path of ['SKILL.md', 'references/example.md']) {
+    assert.deepEqual(readFileSync(join(target, path)), readFileSync(join(sample, path)));
   }
   const { loadSkillsFromDir } = await import(pathToFileURL(join(packageDir, 'dist/core/skills.js')).href);
   const loaded = loadSkillsFromDir({ dir: target, source: 'user' });
   assert.deepEqual(loaded.diagnostics, []);
-  assert.equal(loaded.skills[0].name, 'responsibility-registry');
+  assert.equal(loaded.skills[0].name, 'example-skill');
   assert.equal(loaded.skills[0].disableModelInvocation, false);
 });
 
