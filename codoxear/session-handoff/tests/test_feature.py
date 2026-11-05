@@ -50,7 +50,7 @@ class FeatureTests(unittest.IsolatedAsyncioTestCase):
         # Record the concatenation contract without replacing sibling assets.
         with patch.object(Path, "read_bytes", autospec=True,
                           side_effect=lambda path: path.name.encode()) as script_reads:
-            self.engine = feature.install(self.app, self.host, state_root=self.root / "state", succession_service=self.native.service,
+            self.engine = feature.install(self.app, self.host, state_root=self.root / "state",
                                           timeouts={"poll": 1, "launch": 8, "understanding": 8,
                                                     "review": 8, "resolution": 8, "source_idle": 8})
         self.script_names = [call.args[0].name for call in script_reads.call_args_list]

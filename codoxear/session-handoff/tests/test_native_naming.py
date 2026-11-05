@@ -135,8 +135,7 @@ class NativeNamingTests(unittest.IsolatedAsyncioTestCase):
                     await request("GET", "/api/sessions")
                     return next((w for w in windows() if w[1] == source["spawn_nonce"] and w[2] == name), None)
                 original_window = await until(source_mirrored)
-                from succession_mock import Service
-                engine = Engine(request, succession_service=Service(), state_root=root / "handoff", timeouts={
+                engine = Engine(request, state_root=root / "handoff", timeouts={
                     "poll":.1, "launch":30, "understanding":.2}).open()
                 rows = await engine.sessions("")
                 mutations.clear()
@@ -162,7 +161,7 @@ class NativeNamingTests(unittest.IsolatedAsyncioTestCase):
                 code, _ = await request("POST", "/api/sessions/" + quote(source["session_id"], safe="") + "/rename",
                                         body={"name":"private_99"})
                 self.assertEqual(code, 200)
-                limit = Engine(request, succession_service=Service(), state_root=root / "limit").open()
+                limit = Engine(request, state_root=root / "limit").open()
                 try:
                     limit_rows = await limit.sessions("")
                     self.assertEqual(limit._row(limit_rows, source["session_id"])["display_name"], "private_99")

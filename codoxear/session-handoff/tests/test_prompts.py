@@ -61,7 +61,7 @@ class PromptTests(unittest.TestCase):
         self.assertIn("尚不授权执行任务", prompt)
         self.assertIn("只有最新明确用户指令或当前直接证据", prompt)
         self.assertIn("无法消除则写 conflict 并停止", prompt)
-        self.assertIn("旧意见也不能授予任意新任务或新任命权限", prompt)
+        self.assertIn("旧意见也不能授予任意新任务权限", prompt)
 
     def test_shared_evidence_authority_and_safe_argv(self):
         values = [prompts.build_recovery_prompt(self.manifest, self.directory),
@@ -69,7 +69,7 @@ class PromptTests(unittest.TestCase):
                   prompts.build_continuation_prompt(self.manifest, self.directory, "b" * 64)]
         for prompt in values:
             self.assertNotIn(prompt[0], "-@")
-            self.assertIn("不转移负责人权限", prompt)
+            self.assertIn("遵守当前项目指令、用户授权", prompt)
             self.assertIn("不得批量重放历史命令", prompt)
             self.assertIn("当前文件/测试等直接证据优先", prompt)
             self.assertIn("latest_committed", prompt)
@@ -80,24 +80,6 @@ class PromptTests(unittest.TestCase):
             self.assertEqual(argv[1], str(ROOT / "handoff_io.py"))
             self.assertEqual(argv[argv.index("--manifest") + 1], str(self.directory / "manifest.json"))
             self.assertEqual(Path(argv[argv.index("--body-file") + 1]).parent, self.directory)
-
-    def test_new_succession_prompts_require_private_proof_and_narrow_gate(self):
-        self.manifest['succession'] = {'version': 1}
-        recovery = prompts.build_recovery_prompt(self.manifest, self.directory)
-        review = prompts.build_review_prompt(self.manifest, self.directory, 'a' * 64)
-        continuation = prompts.build_continuation_prompt(self.manifest, self.directory, 'b' * 64)
-        self.assertIn('Intercom self status', recovery)
-        self.assertIn('--kind identity', recovery)
-        self.assertIn('intercom_id', recovery)
-        self.assertIn('actual current-session', recovery)
-        self.assertIn('--kind custody', review)
-        self.assertIn('none_verified', review)
-        self.assertIn('unknown', review)
-        self.assertIn('不任意任命', continuation)
-        self.assertIn('check-owner', continuation)
-        self.assertIn('先取 canonical commit/get', continuation)
-        self.assertIn('不发额外 GO', continuation)
-        self.assertNotIn('不转移负责人权限', continuation)
 
     def test_installed_module_location_not_developer_path(self):
         with patch.object(prompts, "__file__", "/opt/installed/session-handoff/prompts.py"):

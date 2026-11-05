@@ -55,7 +55,7 @@ config/alias edits. A test-only PI_BIN shim may append resource-isolation flags
 (`--no-extensions`, `--no-skills`, `--no-prompt-templates`, `--no-themes`,
 `--no-mcp`, `--no-approve`, `--offline`) while retaining the broker-supplied
 argv exactly. Keep the native active-session bridge if broker passes it
-explicitly; its role is session identity, not owner registration. Fixture
+explicitly; its role is session identity. Fixture
 AGENTS.md remains visible. No custom system prompt supplies the expected answer.
 
 ### Why a private tmux route is required
@@ -86,9 +86,7 @@ tmux server/session or signal production brokers/agents.
    Only `main.py` may change. Keep the seed log inside the private native Pi
    sessions namespace; never weaken native resume validation.
 2. Start installed native Web under the clean home and private tmux route,
-   plus the integrated shared host with a test state root. Use both actual
-   features, without reading a real owner registry. Empty/missing test registry
-   is acceptable for this semantic run; grouping is a separate browser fixture.
+   plus the integrated shared host with a test state root and actual handoff feature.
 3. Create the predecessor via native API with the synthetic history as its
    explicitly selected session and a fixture-only instruction to answer READY
    and remain idle without changing task files. Scope that instruction to this
@@ -159,63 +157,6 @@ Sanitize published summaries; do not commit raw transcripts or auth state.
 Report separately: fixture/helper tests, deterministic workflow actors, native
 Pi startup and report chain, actual toy action, browser coexistence, and live
 rollout. None implies another. This plan authorizes no production deployment.
-
-## Owner-gate observer contracts (offline)
-
-Run these from the repository root with the existing component Python environment:
-
-```sh
-codoxear/web-host/.venv/bin/python -B -m unittest discover \
-  -s codoxear/session-handoff/tests -p 'test_*.py' -v
-```
-
-Keep the native naming opt-in (`HANDOFF_NATIVE_PYTHON`) unset for the offline suite.
-The preparation and Store unit cases use synthetic credentials, `/usr/bin/true`,
-and private temporary paths; they do not authorize real preparation or actors.
-
-The owner acceptance harness waits for the last user turn's normal assistant
-`stop` before checking the goal. A stopped turn without the intended file action
-fails immediately. An `error`, `length`, or `aborted` row stays unresolved until a
-later matching retry `context_edit`, a normal turn end, or the existing deadline;
-`result.json` retains `target_turn` on failure. An error row alone cannot distinguish
-a terminal error from Pi's pending retry and must not trigger early cleanup.
-
-Helper evidence requires an executed Python script at the exact path named in the
-engine's user prompt, followed by canonical CLI JSON records. Diagnostic prefixes
-are allowed; malformed, missing, duplicate/ambiguous, or rejected records fail.
-Fresh check-owner calls after ready must all succeed, and at least one must finish
-before the first main.py edit call. Source helper help output is not attestation.
-
-A successful edit tool result must precede both the verification call and its
-result. Recognized verification is top-level Python `-B` code (no optimization):
-a propagated `assert result() == 'Y'`, or an observed full print line whose bounded
-AST rendering proves Y. Imports/aliases must refer to main, not vendor. Quoted
-mentions, heredoc data, pre-edit checks, parallel/delayed calls, masked assertion
-exits, shell control/function blocks, relative helper paths, and unsupported code
-forms cannot supply success. Unsupported legitimate forms require manual review;
-the observer is a bounded recognizer, not a general Bash/Python analyzer. Print
-rendering retains the cooperative-agent boundary: a contrived unrelated print of
-the same line can imitate that evidence.
-
-For assertion evidence, a successful whole Bash command must imply Python actually
-ran: either its final AND chain propagates success, or Python is independent under
-an executed independent errexit setting. All `set` words must use the literal
-`[-+][euxvo]+` whitelist, with `-o`/`+o` options limited to errexit, nounset, pipefail
-or xtrace. Conditional settings, noexec, terminating/hidden-execution/rebinding
-builtins (including `command -v`) put assertion evidence outside the supported
-normal form. Guarded Python followed by an independent successful suffix cannot
-prove execution. Blank/comment newlines preserve AND/OR/pipeline continuation.
-The print-evidence path is unchanged. T16 measures real fresh-temp Bash exit,
-Python-reached and assertion-completed markers: accepted assertion evidence must
-have exit 0 and the completed marker; no Pi or original captured command is run.
-
-`test_owner_observer.py` includes sanitized captured command structures and real
-`handoff_io.main()` serialization under unit mocks. Its captured target skeleton
-fails exactly at missing post-edit verification; adding genuine proof before the
-final stop passes. These are observer contracts, not a new native acceptance run.
-The original failed owner run remains failed; no post-edit evidence is invented.
-The existing JSONL U+2028 `splitlines` limitation and `source_ready` error handling
-remain outside this observer change.
 
 ## Recorded isolated execution — 2026-11-02
 

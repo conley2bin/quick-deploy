@@ -25,10 +25,9 @@ NAMESPACE = "__session_handoff__"
 MAX_BODY = 8192
 
 
-def install(app, host, *, state_root=None, timeouts=None, succession_service=None):
+def install(app, host, *, state_root=None, timeouts=None):
     """Only Python callers/tests can inject a root/deadline; HTTP cannot."""
-    engine = Engine(host.upstream_json, state_root=state_root, timeouts=timeouts,
-                    succession_service=succession_service)
+    engine = Engine(host.upstream_json, state_root=state_root, timeouts=timeouts)
     app[ENGINE_KEY] = engine
 
     async def lifecycle(_app):

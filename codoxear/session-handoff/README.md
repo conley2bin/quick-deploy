@@ -1,15 +1,15 @@
 # Pi 会话接力
 
-此扩展由共享 `web-host` 显式加载，与 `owner-groups` 并列，不修改 Codoxear 上游或 Pi 全局提示词；负责人接续只调用固定 canonical service，不直接写登记文件。仅支持 Pi；Codex/其他后端返回明确的 422。
+此扩展由共享 `web-host` 显式加载，不修改 Codoxear 上游或 Pi 全局提示词。仅支持 Pi；Codex/其他后端返回明确的 422。
 
 ## 用户流程
 
 在当前原生会话页面选择接力后，新建一个 **新的 tmux Pi 会话**，保留源会话的 cwd。默认沿用原会话列表设置（model_provider、model、reasoning_effort），也可明确选择新会话的完整模型三元组；选择仅用于新会话创建，不修改原会话或全局偏好。恢复提示作为原生创建请求的唯一 `args` 字符串传入；不克隆旧 argv，不 resume。
 
-1. 创建前在应用拥有的线程内调用固定 installed succession API，冻结源实际 Pi 的只读 owner plan；服务缺失或无效则零原生变更失败。记录源日志的真实 Pi header、完整 JSONL 截止边界及哈希。投影是 `latest_committed`，并不声称知道 Pi 尚未持久化的树游标。
+1. 创建前在应用拥有的线程内记录源日志的真实 Pi header、完整 JSONL 截止边界及哈希。投影是 `latest_committed`，并不声称知道 Pi 尚未持久化的树游标。
 2. 新会话独立阅读历史、当前文件及项目记忆，提交理解报告；在收到审阅输入前不推进任务。
 3. 原会话空闲且身份仍一致时，收到一次仅审阅消息；它提交针对该报告的审阅，之后仍只担任审阅者。
-4. 新会话收到一次意见，按当前证据核对/纠正。`ready` helper 先确认登记 receipt 的当前绑定/无 owner 条件，再发布不可覆盖回执并返回成功，之后才正常继续；无法消除的目标分歧提交 `conflict` 并停下等待用户。不再发起第二轮互审。
+4. 新会话收到一次意见，按当前证据核对/纠正。`ready` helper 发布不可覆盖回执并返回成功，之后才正常继续；无法消除的目标分歧提交 `conflict` 并停下等待用户。不再发起第二轮互审。
 
 ### 新窗口名称
 
@@ -61,59 +61,12 @@
 默认有限等待：原生请求 30 秒、启动身份 120 秒、理解报告 900 秒、源/目标空闲 300 秒、审阅 600 秒、接续回执 900 秒。轮询间隔 0.5 秒只用于观察条件，不是固定启动 settle sleep。Python 测试可以注入状态目录、时钟、sleep、原生 transport 和 deadlines，HTTP 不能更改它们。
 
 
-## 自动负责人接续（未来新操作）
-
-源会话有唯一既有 owner 时，新 Pi 继承**同一稳定 owner UUID**，由 canonical service 条件更新 identity/recovery；保留提交时最新上级、下级、assignment、依赖，不制造 assignment handover。无 owner 时也必须通过 fresh absence check，返回 `not_applicable/no_owner_valid`，不任命、不增加登记 revision。历史 manifest 无 `succession` 字段仍按旧 context-only 协议运行，不追溯迁移。
-
-`succession.py` 只加载 `~/.pi/agent/skills/responsibility-registry/scripts/session_succession.py` 的四个 frozen v1 函数：`prepare_owner_session_succession`、`build_intent_digest`、`commit_owner_session_succession`、`get_owner_session_succession`。无 runtime path/Store/browser owner/authority 参数，无 stub、读缓存替代或静默降级。验证函数签名、精确 envelope/plan/receipt/error；摘要由 service 计算。Python 测试可显式注入 service double，HTTP 不能。
-
-### 私有协议和放行顺序
-
-所有文件位于本操作 0700 目录，0600、不可覆盖发布，除 `state.json` 外均不修改：
-
-| 文件 | 内容 / 生产者 |
-| --- | --- |
-| `succession-source.json` | host 在 native create 前冻结 source plan、随机 challenge、本次按钮同意及窄功能授权 attestation；不从 note/history 导入授权 |
-| manifest `succession` | version=1、source capsule SHA256、challenge SHA256；新增协议标记，不改变旧 manifest |
-| `succession-target.json` | host 精确绑定 route/launch/nonce 后记录实际 Pi header ID、首行 hash、file/device/inode/cwd；不按名字/文件名猜身份 |
-| `succession-identity.json` | target 用 `attest --kind identity` 提交实际 current-session Pi/file + challenge；实际 connected Intercom status 才能提供联系 ID，否则 null + 实际原因 |
-| `succession-custody.json` | old 用 `attest --kind custody` 报告实际子代理 custody，关联 operation/understanding hash；known_active/none_verified/unknown，不自动 reparent |
-| `succession-intent.json` | host 在 continuation 前冻结源 immutable plan + exact target/authority/custody、报告 hash、service digest；token/revision 不是 digest 输入 |
-| `succession-attempt.json` | helper 在首次可能有副作用的 commit 前持久化 operation/digest，后续任何不确定结果必须 get-first |
-| `succession-receipt.json` | canonical service 初次有效 envelope；不含原 challenge 或私有关系图；恢复与 host 核验仍 fresh get |
-| `succession.lock` | 本地 helper `flock`，把 resolution 存在检查、canonical gate 和原子 no-overwrite 发布串行化 |
-
-`attest` 输入只能是本操作内 `*-draft.json`，精确 JSON 字段见 `prompts.py` 与 `tests/test_succession.py`。这些是 cooperative provenance：host 的 header/transport 事实与 target 自报交叉核对，不是对恶意同 UID 文件控制者的密码学认证。无法调用实际 Intercom status 时只缺联系 ID，不阻断已证明的真实 Pi。旧会话审阅不能伪称子代理为空；显式未校对路线固定记录 unknown，后续不能执行依赖未解决 custody 转移的动作。
-
-ready helper 的执行顺序是：验证原报告链/host target/challenged identity/immutable intent → fresh prepare 且 immutable plan 完全相同 → canonical commit → `committed|already_committed + current_binding_valid` 或 `not_applicable + no_owner_valid` → 本地 ready 发布 → CLI 0 → 任务动作。`conflict` resolution 不 commit。`needs_recovery/superseded/not_found`、reset/rebind/occupied target、服务异常或无效 capsule 都不放行。
-
-只有明确 `document_conflict`、retryable=true、commit_state=not_committed 才允许同操作/同 digest 下再 prepare 一次并重试；不改 immutable plan/target。任何 unknown 都保留 attempt，下一次只 get 原 operation/digest，`not_found` 不是“没提交”的证明。登记 commit 与 ready 是两个资源：commit 后发布失败，目标仍须停止；同 intent fresh get 仍有效才能恢复本地发布，不产生第二登记事件。已经存在 resolution 时，重复 CLI 在服务副作用前拒绝，不算新许可。不承诺任意外部工作 exactly-once。
-
-Engine 看到 ready 文件还会核验私有 capsule 和 fresh canonical get；不能靠单个文件或事后迁移宣称 ready。旧会话只审阅/保管旧子代理并转送真实结果，登记绑定改变后不再是当前 owner。新会话以 owner 身份动作前须核对自己实际 Pi，并运行固定 helper `check-owner --manifest ...` 重新 get 当前有效绑定；旧 receipt 在后续接力/reset 后不会继续授予 owner 身份。此限制依赖合作代理遵守，不能拦截任意同 UID 脚本。
-
-### 验证证据边界
-
-`tests/succession_mock.py` 是精确 v1 API 的隔离 double，绝不加载真实 registry。helper 的 temporal tests 覆盖 commit→ready→真实 CLI main 返回码→toy action、并发一次许可、unknown/get-first、commit+publish 失败恢复、superseded/reset/occupied/needs_recovery、无 owner revision 不变、token 刷新 digest 不变、身份/contact/null/custody 和 capsule 破坏。Engine fake native 与 HTTP tests 显式注入 double；缺安装 API 在 native create 前失败。
-
-上述 double 测试证明 **handoff 调用契约与本地顺序**。独立的 `tests/test_succession_store.py` 则通过同一个实际 helper/CLI/Engine ready gate 调用 canonical API，所有 prepare/commit/get 均显式绑定 `Store(temp/private, temp/current.md)`；初始化真实 v3 current/audit，使用 registry peer `state()` 提供的 codec-valid 合成 owner/assignment/coordination 图，缺真实依赖会失败而非 skip。运行：
-
-```sh
-python3 -m unittest discover -s codoxear/session-handoff/tests -p test_succession_store.py -v
-```
-
-joint 用例直接观察：真实 session-succession event 和新 current binding 均先于 ready 发布/CLI 0/临时 toy 文件动作；保留最新完整非 carrier 图；commit 后仅 ready 发布失败则 CLI 2、无 toy 动作，登记已生效，重试只 get 原 operation/intent，仍为一个 event。另覆盖 no-owner current 字节/mtime/revision/图不变且 event 为零（允许 event:null 的私有 no-op metadata）、新注册/occupied/source swap/reset 阻断、两个并发 CLI 仅一次许可、另一源抢先提交后的同 immutable intent 有界 CAS 重试、A→B→C/reset 后历史 receipt/Engine/check-owner 拒绝，以及临时 HOME 安装布局、任意 cwd、被污染 generic module namespace 下的实际 loader。未启动真实 Pi、浏览器、HTTP 服务或安装器，未读取用户登记；此证据不覆盖模型理解、原生 transport、线上迁移、reader 展示或部署。
-
-首批 joint checkpoint 使用 canonical codec `da0f428`（已与 main `1d13a40` 同 blob，不重复导入）、`5bfb383`、`d1d0373`，core `c727286`，API `5c45d7e` / `3e6390ed` / `6f651dff`，handoff `0349336`。该 API 将合法的同 Pi contact/recovery/graph 更新误判为 superseded，首批结果为 14 绿 / 1 真实失败，未使用 skip/expectedFailure 或替代服务。
-
-完整保留 joint tip `8b5331f` 后，仅消费 peer current-carrier 修复 `9d38f62`，同一命令的 **15 个实际 helper/Store 用例全部通过，无 skip**，不依赖后续 core checkpoint。合法更新后的 fresh API get、`validate_ready`、`Engine._artifact`、`check-owner` 四层均允许仍唯一的目标 Pi；仍只有一个 event，原 intent/receipt 字节与历史 token 不变，最新完整图保留。Pi→C、reset、重复 Pi claim、并发重复许可及 commit 后本地发布失败/get-first 恢复继续通过。canonical API 35 例（含 13 个实际 Store 例）、组件 Python 157 例（原 142 + joint 15，仅既有 native opt-in 例跳过）、JS 37 例亦通过。此结果仅覆盖临时 Store 与 helper，不覆盖真实 Pi attestation 或上线；不得使用真实 owner 做 fixture，不在此组件部署/安装/修改 registry。
-
 ## 验证边界
 
 从仓库根目录使用共享虚拟环境运行：
 
 ```sh
-codoxear/web-host/.venv/bin/python -m unittest discover -s codoxear/session-handoff/tests -p 'test_engine.py' -v
-codoxear/web-host/.venv/bin/python -m unittest discover -s codoxear/session-handoff/tests -p 'test_feature.py' -v
+codoxear/web-host/.venv/bin/python -m unittest discover -s codoxear/session-handoff/tests -v
 # 可选：现有只读 native checkout + 合成 defaults / 依赖，纯解析和 launch-plan join，不启动进程。
 HANDOFF_NATIVE_SOURCE=codoxear/.runtime/upstream \
   codoxear/web-host/.venv/bin/python -B -m unittest discover \
@@ -134,47 +87,4 @@ HANDOFF_NATIVE_PYTHON=codoxear/.runtime/venv/bin/python \
 
 该测试创建临时 HOME、appstate、Pi 日志和私有 `tmux -S` socket，通过原生 API 创建/命名、由真实 mirror 收敛，并按固定 nonce 读取真实 `window_name`；它还核验原窗口不变及 `_99` 零创建。Pi 替身仅写有效 header 后等待，不生成理解报告，所以预期接力停在 `understanding_timeout`，不代表语义闭环验收。所有测试窗口和 Web 子进程在结束时清理。
 
-上述普通单元命令默认跳过此 opt-in 测试：使用临时 Pi JSONL、假原生创建/命名/发送响应、真实 Context 产物验证和应用内 aiohttp HTTP 服务；不会启动真实 Pi/tmux、访问用户数据或切换线上服务。它们验证身份、哈希、截止边界、状态和一次性副作用机制，不能证明模型真实理解了目标。需显式启用的专用隔离真实 Pi fixture 及已记录结果见 [真实 Pi 验收](tests/REAL_PI_ACCEPTANCE.md)，其语义证据来自实际理解报告、审阅、核对回执和任务文件结果。原生 UI 配合合成 API 的浏览器验证只覆盖界面交互与共享宿主、分组功能共存，不替代真实 Pi 的语义证据。
-
-### 新版 owner gate 的真实 Pi 验收入口
-
-`tests/owner_succession_native.py` 是单独 opt-in 的实验，显式选择 `openai/gpt-6.1-sol:xhigh` 或 `dexgem-responses/gpt-6.1-sol:xhigh`，无自动 fallback，不由 unittest 启动。它创建私有 `/tmp/codoxear-owner-succession-*`，只复制候选 registry scripts 与该模型的公开注册信息；固定 installed-service 默认路径解析到临时 HOME 的真实 v3 Store。合成 UUID owner 图包含上级、下级、两个 active/一个 ended 的源 assignment、依赖与 coordination，均为测试数据。
-
-OpenAI 准备阶段必须显式指定已安装 Pi、native Python 和原 OAuth 文件；只有原 access/account metadata/真实 expiry 可进入 0600 临时文件，refresh 固定为不可用 sentinel。剩余 TTL 不足 1200 秒即在复制凭据/启动任何进程前失败；运行前再次核验。不会刷新、延长到期、选择其他模型或访问生产 Web。
-
-```sh
-# 指向现有安装的绝对路径；不得为本实验新装/更新全局 runtime。
-NATIVE_PYTHON="${HANDOFF_NATIVE_PYTHON:?set existing installed native Python absolute path}"
-# 在已批准的 exact joint tree 中，先运行不启动 actor 的 helper tests。
-"$NATIVE_PYTHON" -m unittest discover -s codoxear/session-handoff/tests -p test_owner_succession_native.py -v
-HARNESS="$PWD/codoxear/session-handoff/tests/owner_succession_native.py"
-"$NATIVE_PYTHON" "$HARNESS" --prepare --pi-bin "$(command -v pi)" \
-  --native-python "$NATIVE_PYTHON" --auth-source "$HOME/.pi/agent/auth.json"
-# 从上一步 JSON 取本次 ROOT；不要 source/eval 其输出。失败时不得继续。
-# 通过 job 提交一次，按 job 技能为同一 run ID 注册完成通知。
-job run owner-succession-native --mem 2G --high 1G --swap 0G \
-  --cwd "$PWD" --input "$HARNESS" -- "$NATIVE_PYTHON" "$HARNESS" --run "$ROOT"
-```
-
-DexGem 准备使用已核验原 HOME 下的注册文件，不读取 OAuth：
-
-```sh
-# ORIGINAL_HOME 是已核验原 models.json 所属 HOME 的绝对路径，不是 actor HOME。
-: "${ORIGINAL_HOME:?set verified original registration HOME}"
-"$NATIVE_PYTHON" "$HARNESS" --prepare --provider dexgem-responses \
-  --models-source "$ORIGINAL_HOME/.pi/agent/models.json" \
-  --registration-home "$ORIGINAL_HOME" --pi-bin "$(command -v pi)" \
-  --native-python "$NATIVE_PYTHON"
-```
-
-该分支验证原注册的精确公开 route/capabilities；只接受 `!cat` 的单个绝对路径或字面 `~/` operand，后者只按显式已核验的 `ORIGINAL_HOME` 展开。直接读取该单一常规文件一次，不执行 shell；临时 0600 `auth.json` 只存该 provider 的字面 `api_key`，公开 `models.json` 不保留 credential expression/path。API key 的 expiry 未知，不宣称通过 OAuth 1200 秒 TTL；原 OAuth 门槛保持不变。DexGem 失败输出隐藏 key 和源路径，不切换 provider。准备成功不证明实际 actor→registry event→ready→check-owner→toy 闭环。
-
-离线 profile checkpoint 保留 OpenAI 原总预算 900 秒、理解/审阅/接续各 240 秒的旧测试覆盖值及原 OAuth TTL 1200 秒门槛。DexGem profile 的总预算为 3600 秒，安装 Engine 时完全省略 `timeouts` 参数，使用生产默认理解 900 秒、审阅 600 秒、接续 900 秒；不修改生产配置。总 deadline 覆盖 source READY、handoff 和 toy 验证，超时仍进入清理。未知 profile 在启动前失败并移除临时 auth/environment 文件。
-
-首轮实际 DexGem 实验在旧的 240 秒理解门槛停止：source 已 READY，target 两轮正常模型响应分别约 117、109 秒，但尚无 receipt 或 registry event，`main.py` 仍为 X。这是未完成闭环的负面证据；生产默认 900/600/900 在该轮没有被测试。新 3600 秒 profile 仅修正测试条件，本离线 checkpoint 没有再次启动 actor，不宣称真实闭环通过。
-
-运行进程以精确 allowlist 重新 exec；私有 tmux shim 固定 `-S ROOT/tmux.sock -f /dev/null`，服务 cwd 固定为临时根以免读取仓库 `.env`。broker 原 argv 保留，仅增加资源隔离 flags；显式加载的 installed native active-session bridge 保留。Pi 会设置 `process.title` 并覆盖 Linux `/proc/PID/cmdline`，因此临时 Pi shim 在 exec 前以同一 PID 保存 0600、NUL 分隔的真实 argv；观察器以真实 marker/header、PID/start、broker 父进程和原始 exec argv 共同核验 bridge，不把运行后的进程标题误当启动参数。源只确认 fixture 后审阅；target 必须自行读取其真实 SessionManager marker/header、提交 challenged identity，Intercom 不可用须真实 null+原因。source 自行提交 custody 与 review；harness 不代填任何模型产物。
-
-产物检查区分完整非 carrier 图、唯一 session-succession event、新 current binding、不可覆盖 ready、实际 helper 成功结果、后续 `check-owner` 与独立 main.py edit。保存私有文件事件/单调时钟、真实工具调用/结果和 fingerprint；最终须人工阅读三份报告、身份来源与 custody 证据。只有 main.py 可变且须实际以 Python `-B` 验证 Y；vendor/memory/AGENTS 不变。清理仅作用于本次独占 socket 的精确 PID/start descendants，并删除 access/password 文件。仅当已核验 tmux server、native server 和所记录 descendants 均已退出，且 `/proc/net/unix` 不再包含该私有路径时，才删除同一 owned 普通 socket inode；仍绑定但未 listen 的 socket、活动 listener、symlink 和普通文件均不删除。`cleanup.json` 记录 socket 是否移除以及残留进程/错误，不能只以已发出 kill 命令视为清理完成；残留或错误必须显式处理。该实验不证明恶意同 UID 隔离或真实 owner 迁移。
-
-2026-11-03 本轮实际 **preflight 被阻断**：原 access 剩余 1078 秒，小于 1200 秒门槛。未复制 access/refresh，未启动 Pi/tmux/Web，未请求模型或修改真实 registry。14 个准备/证据 helper 测试通过，其中包括临时默认 installed Store 的实测；这不构成新 identity/custody/ready/toy 的真实 Pi 验收。真实 actor 证据仍待具备足够 TTL 的另一次明确执行。
+上述普通单元命令默认跳过此 opt-in 测试：使用临时 Pi JSONL、假原生创建/命名/发送响应、真实 Context 产物验证和应用内 aiohttp HTTP 服务；不会启动真实 Pi/tmux、访问用户数据或切换线上服务。它们验证身份、哈希、截止边界、状态和一次性副作用机制，不能证明模型真实理解了目标。需显式启用的专用隔离真实 Pi fixture 及已记录结果见 [真实 Pi 验收](tests/REAL_PI_ACCEPTANCE.md)，其语义证据来自实际理解报告、审阅、核对回执和任务文件结果。原生 UI 配合合成 API 的浏览器验证只覆盖界面交互与共享宿主集成，不替代真实 Pi 的语义证据。

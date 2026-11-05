@@ -1,4 +1,4 @@
-/* Real native frontend + owner extension, synthetic API only. Named ephemeral Chrome. */
+/* Real native frontend + handoff extension, synthetic API only. Named ephemeral Chrome. */
 const assert = require('node:assert/strict');
 const { execFileSync } = require('node:child_process');
 const { mkdirSync, mkdtempSync, writeFileSync, chmodSync, rmSync } = require('node:fs');
@@ -207,7 +207,6 @@ try {
   assert(evaluate('matchMedia("(hover:hover) and (pointer:fine)").matches'));
   assert.equal(evaluate('document.querySelector("#diagBtn").nextElementSibling.id'), 'handoffButton');
   assert.equal(evaluate('document.querySelectorAll("#handoffButton").length'), 1);
-  assert.equal(evaluate('document.querySelectorAll(".owner-root-star").length'), 1);
   assertIcon(20); assertToolbar(1440); keyboardCancel(); screenshot('desktop-icon-focus');
   concurrentSources('desktop'); crossTabAndStorage(); staleDisplayedContinue('desktop');
   // One external icon child mutation must not cause a remount or observer feedback loop.

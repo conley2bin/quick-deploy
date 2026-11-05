@@ -8,7 +8,7 @@ const modelCatalog = require('./target-model-fixture.cjs').catalog();
 const heldCatalog = []; let catalogFault = '';
 const requestLog = [];
 const staticDir = fs.realpathSync(process.env.CODOXEAR_STATIC_DIR || (() => { throw Error('Set CODOXEAR_STATIC_DIR to read-only upstream/installed static assets'); })());
-const base = '/demo', owners = path.resolve(__dirname, '../../owner-groups/web');
+const base = '/demo';
 const assets = path.resolve(__dirname, '../web');
 const operations = new Map(), settings = new Map(), held = [];
 let actions = [], operation = null, fault = '', status = 'recovering', allow = false, auth = true, message = 'DEMO 合成状态，不会创建真实 Pi';
@@ -63,9 +63,6 @@ const server = http.createServer(async (req, res) => {
       if (config.fault === 'hold-' + kind) { held.push({ source, kind, res, operation }); return; }
       return json(res, { operation });
     }
-    if (p === '/__owner_groups__/snapshot') return json(res, { demo: true,
-      owners: { schema: 'codoxear-owner-groups/v1', ok: true, era: 'demo', owners: [{ id: 'demo', name: 'DEMO 合成负责人', role: 'DEMO', parent: 'user', identity_source: 'current-session', pi_session_id: 'pi-demo-source', state: 'active', scopes: [] }] },
-      sessions: { sessions: rows.map(r => ({ ...r, has_bound_log: true })) } });
     if (p === '/api/login') { res.setHeader('Set-Cookie', 'fixture=demo; HttpOnly; SameSite=Strict; Path=/demo/'); return json(res, { ok: true }); }
     if (p.startsWith('/api/')) {
       if (!auth || !req.headers.cookie?.includes('fixture=demo')) return json(res, { error: 'DEMO login required' }, 401);
@@ -91,10 +88,9 @@ const server = http.createServer(async (req, res) => {
     }
     if (['/', '/index.html', '/static/index.html'].includes(p)) {
       let html = fs.readFileSync(path.join(staticDir, 'index.html'), 'utf8').replaceAll('__CODOXEAR_ASSET_VERSION__', 'handoff-demo').replaceAll('__CODOXEAR_ATTACH_MAX_BYTES__', '10485760');
-      html = html.replace('<title>Codoxear</title>', '<title>Codoxear · DEMO 合成接力</title>').replace('</head>', '<script defer src="/demo/__owner_groups__/fixture.js"></script><script defer src="/demo/__session_handoff__/handoff.js"></script></head>');
+      html = html.replace('<title>Codoxear</title>', '<title>Codoxear · DEMO 合成接力</title>').replace('</head>', '<script defer src="/demo/__session_handoff__/handoff.js"></script></head>');
       res.writeHead(200, { 'Content-Type': 'text/html', 'Cache-Control': 'no-store' }); return res.end(html);
     }
-    if (p === '/__owner_groups__/fixture.js') { res.writeHead(200, { 'Content-Type': 'application/javascript' }); return res.end(['core.js', 'panel.js', 'bootstrap.js'].map(n => fs.readFileSync(path.join(owners, n), 'utf8')).join('\n')); }
     if (p === '/__session_handoff__/handoff.js') { res.writeHead(200, { 'Content-Type': 'application/javascript' }); return res.end(['core.js', 'target-model.js', 'panel.js', 'bootstrap.js'].map(n => fs.readFileSync(path.join(assets, n), 'utf8')).join('\n')); }
     const relative = p.replace(/^\/static\//, '').replace(/^\//, ''), file = path.resolve(staticDir, relative);
     if (!file.startsWith(staticDir + path.sep) || !fs.existsSync(file) || !fs.statSync(file).isFile()) return json(res, { error: 'missing_asset' }, 404);

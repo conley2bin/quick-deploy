@@ -46,7 +46,7 @@ test('late A success cannot clear B unknown-start error or recovery UUID', async
 test('prefix is from own namespace script and rejects cross origin', () => {
   assert.equal(Core.namespace('https://x/nested/__session_handoff__/a.hash.js', 'https://x'), 'https://x/nested/__session_handoff__/');
   assert.throws(() => Core.namespace('https://evil/__session_handoff__/asset.js', 'https://x'));
-  assert.throws(() => Core.namespace('https://x/__owner_groups__/asset.js', 'https://x'));
+  assert.throws(() => Core.namespace('https://x/__other_feature__/asset.js', 'https://x'));
 });
 test('hash selection and navigation preserve opaque identifiers and other hash params', () => {
   assert.equal(Core.selected('#session=a%2Fb%20%26%E4%B8%AD'), 'a/b &中');

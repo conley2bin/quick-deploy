@@ -148,7 +148,7 @@ async def run(args):
     seed = seed_paths[0]
     watcher = FileEvents(root)
     host = load_host()
-    owner, handoff = host.default_features()  # actual committed assets; no fake script
+    (handoff,) = host.default_features()  # actual committed assets; no fake script
     native = front = client = None
     native_identity = None
     engine = None
@@ -214,7 +214,7 @@ httpd.serve_forever()
             engine = handoff.install(app, ctx, state_root=root / "run-state", timeouts={
                 "launch": 120, "understanding": 240, "source_idle": 90,
                 "review": 240, "resolution": 240})
-        front = TestServer(host.create_app(f"http://127.0.0.1:{port}", features=(owner, SimpleNamespace(install=install))))
+        front = TestServer(host.create_app(f"http://127.0.0.1:{port}", features=(SimpleNamespace(install=install),)))
         await front.start_server()
         client = aiohttp.ClientSession(cookie_jar=aiohttp.DummyCookieJar())
         async def request(method, path, body=None, cookie=""):
