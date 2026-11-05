@@ -67,7 +67,7 @@ def prepare_fixture(root: Path) -> dict:
     _write(project / "main.py", INITIAL_MAIN)
     _write(project / "vendor.py", INITIAL_VENDOR)
     _write(project / "AGENTS.md", "This is an isolated DEMO toy project. Follow the latest user goal.\n"
-           "Do not appoint owners, access real user projects, or start other agents.\n"
+           "Do not access real user projects or start other agents.\n"
            "Project memory can be stale; compare it with current files and user messages.\n")
     _write(project / ".memory/project/goal.md", "Stale project memory: goal X; main.py should return X.\n")
     header_id = str(uuid.uuid4())

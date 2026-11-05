@@ -30,7 +30,7 @@ Use an environment **allowlist**, not `{**os.environ, ...}`: explicit PATH,
 HOME, USER, LANG, TERM, SHELL, PI_HOME, PI_CODING_AGENT_DIR,
 XDG_CONFIG_HOME/XDG_CACHE_HOME/XDG_STATE_HOME, PYTHONDONTWRITEBYTECODE,
 PI_OFFLINE, and test-only CODEX_WEB configuration. No inherited intercom,
-subagent, registry, SSH agent, cloud credentials, TMUX, or production Web env.
+subagent, SSH agent, cloud credentials, TMUX, or production Web env.
 Use a new random local Web password and a loopback ephemeral port; retain its
 cookie only in the test client memory. Never output env/auth/header dumps.
 
@@ -46,7 +46,7 @@ SDK refresh margin before spawning. If insufficient, only the parent's
 separately approved native ModelRuntime.getAuth coordinated refresh may update
 canonical auth; a failed refresh stops this attempt. The test copy must never
 rotate account credentials. Do not copy settings, prompts, extensions,
-packages, skills, registry, MCP configuration, or other providers. Bound provider
+packages, skills, MCP configuration, or other providers. Bound provider
 retries and total runtime in the private settings.
 
 Use installed Pi and installed native Python read-only, never `run_server.sh`

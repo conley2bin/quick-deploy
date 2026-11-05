@@ -1,4 +1,4 @@
-/* Loopback-only DEMO. Read-only actual native assets; synthetic APIs, no agents/auth/registry. */
+/* Loopback-only DEMO. Read-only actual native assets; synthetic APIs, no agents/auth. */
 const http = require('node:http');
 const fs = require('node:fs');
 const path = require('node:path');
