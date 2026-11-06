@@ -1,56 +1,20 @@
-# Native session handoff UI
+# 会话接力界面
 
-The frontend model-picker integration requires `core.js`, `target-model.js`, `panel.js`, `bootstrap.js`, in that order, in **one separate same-origin namespace script**. The backend feature's concat and `target` route allowlist must be joined with this frontend before deployment; this frontend checkpoint alone does not wire that Python boundary. Bootstrap captures `document.currentScript.src` to locate `__session_handoff__`, including a configured URL prefix.
+宿主按 `core.js → target-model.js → panel.js → bootstrap.js` 拼为独立同源脚本；URL 前缀来自该脚本地址。
 
-- Core validates public operations and serializes actions **per opaque source session ID**. Different sources can start concurrently; busy/error/unknown-result locks and late replies stay with their source. Only the currently selected source renders or receives timed status polls. Start reads native `#session` when opening confirmation and again on submit; changed sources require another confirmation and never inherit another source's note. Target links use `location.replace` so native hashchange owns navigation.
-- Native selection also uses `history.replaceState`, which emits no event. Passive click/keyboard/hash/popstate listeners re-read the URL after native handlers; a visible-only 250ms URL comparison covers asynchronous native transcript/deeplink changes. Every contextual action captures its displayed source/reference/operation before URL and storage synchronization: if identity changed, the first click only repaints or reconfirms, and another deliberate click is required. It pauses while hidden and is removed on unload/logout. No native history patch, card-name/DOM identity inference, or transcript observer is used.
-- Panel attaches one icon button immediately after `.topActions > #diagBtn`. The static Opus SVG depicts context flowing from an old node into a fresh node; `title` and `aria-label` retain “会话接力” without a visible text label. It inherits native `.icon-btn` dimensions, hit area, colors, hover, disabled and keyboard-focus styles; only the SVG shrinks from 20px to 18px at widths up to 420px. Native handlers stay untouched. Observers watch direct shell/main replacements and only the small topbar subtree; never the transcript or whole document tree.
-- Bootstrap handles native login/logout without requiring a page reload. Logout disposes session requests, timers, listeners and observers. A fresh root-only login sentinel (no operation data or network requests) waits for the next authenticated shell; pagehide removes that sentinel too.
+- Details 后的原生样式图标打开确认面板；只提供可选目标模型/提供商/推理强度，没有附注或“未经校对继续”。
+- `target-model.js` 复用原生 `createNewSessionController` 的目录、分组、搜索和推理选择规则，只维护接力自己的草稿，不调用原生 Start 或偏好写入方法。无法读取目录时只可明确沿用源设置；未提交的搜索或失效选择阻止确认。
+- 状态只有 `waiting_source`（等待源会话写交接）、`creating`（创建新会话）、`completed`（完成）、`failed`（失败及原因）。完成时显示新会话链接。
+- 每个源的草稿、请求和状态相互独立。所有操作先核对当前 URL 和显示身份，切换源后不会把旧源操作或模型带给新源。
+- 本地只保存每源请求 UUID/目标选择或操作 UUID。显式目标在 POST 前冻结保存；待确认请求不自动重放，用户可用同一 UUID 查询原请求。服务器失败不自动重试。
+- 页面可见时才轮询所选源的活动操作；终态停止轮询。登出/卸载清理请求、定时器、监听器和局部观察器。旧服务操作查询 404 后释放本地引用，不触发新接力。
+- 原生模型/创建设置仅影响新会话。交接文件内容核实由新会话完成；界面不展示任何审阅、哈希或回执协议。
 
-## Request recovery
-
-Each source has its own local storage key, `codoxear:session-handoff:<namespace path>:source:<encodeURIComponent(source ID)>`. Separate keys avoid whole-map lost updates between tabs operating on different sources. Only minimal source-associated identities are stored:
-
-- confirmed operation: `{operation_id,source_session_id}`;
-- inherit pending start: `{request_id,source_session_id}`, unchanged from legacy records;
-- explicit pending start, before acknowledgement only: `{version:2,pending_start:{request_id,source_session_id,target:{model_provider,model,reasoning_effort}}}`; the exact-key envelope retains the frozen tuple at the **same** source key so old 9d tabs fail closed instead of recovering it as inheritance;
-- uncertain explicit continue: `{operation_id,source_session_id,pending_action:"continue",pending_id}`; the UUID `pending_id` distinguishes successive explicit intents, while older records without it remain readable.
-
-The former namespace-wide base key is migrated only after the new source key is written. A legacy pending start already identifies its source. A legacy operation without a source is queried read-only and assigned using the **returned** source, never the selected session. Failed lookups/writes or conflicting references preserve the original record, show a recovery warning, and do not lock unrelated sessions. Mount never replays pending starts or continuations. Status responses must match both source ID and operation ID.
-
-An explicit tuple is validated, copied and saved **before** the first POST. New Core unwraps v2 to its existing internal reference and unchanged HTTP request; same-UUID recovery after reload carries exactly that tuple. Unknown versions, malformed envelopes and the unshipped plain-target b2 pending shape retain an error/lock and the original bytes, with no fallback POST. Actual 9d accepts that b2 shape and drops its target: the old-reader guarantee covers generated v2 envelopes without recognizable top-level request/operation IDs, not arbitrary corrupted legacy-shaped records. Cross-tab ownership includes the target, not only the UUID. A targetless legacy base-key record cannot overwrite an explicit pending envelope.
-
-Old 9d select/start/recover/poll/continue/forget paths cannot POST or rewrite the v2 source record, including with a stale cached operation. Legacy migration cannot overwrite it; an unsourced legacy operation may still need a read-only status POST to identify its source. After a correlated operation acknowledgement, Core writes the plain legacy-readable operation reference: the server has frozen the creation tuple. Network errors, aborts and 5xx keep the pending envelope byte-identical; definitive 400/422 rejections clear it. Existing inherit, operation and continue references remain readable in place without storage writes. `stop(false)` (pagehide) performs no storage I/O. `stop(true)` (logout/auth loss) intentionally clears all feature references in old and new Core; login does not promise to retain a never-accepted choice.
-
-Notes, status payloads, transcripts and credentials are never persisted. A pending start is not replayed on reload. The user can reconcile it with the same UUID; a note lost on refresh is explicitly disclosed. A pending continue is queried but never resent while unreviewed or explicitly unknown. Only its correlated response or a status observation begun with the same persisted intent can resolve the lock upon state advancement. Request completions, including rejections, compare current stored source-reference ownership before writing; replaced/deleted references discard old results and synchronize the view. These checks cover stale observations, not atomic cross-tab compare-and-swap. Storage failure before mutation prevents the request.
-
-Chrome can repeat a POST internally when a keepalive connection resets, even without JavaScript retry code. Therefore backend start idempotency and continue's durable side-effect guard are required independently of UI single-click protection. A successful HTTP response alone never produces `ready`; the panel displays the server's public state.
-
-Status POSTs run only while the document is visible. Terminal states stop timed polling; explicit status refresh remains available. Unknown mutation states cannot be dismissed into an accidental new request. Authentication loss clears local feature references and shows an explicit login/permission message.
-
-## Native target-model reuse
-
-`target-model.js` lazily imports the served native `createNewSessionController`, `iconSvg`, and `createDialogMenuController`. The existing authenticated same-origin `GET api/sessions` is the sole catalog source (`cache:no-store`, bypassing native service-worker stale fallback). Native controller methods own grouping, Recent, ranked search, provider/model display/parsing, and reasoning capabilities/resolution. The handoff owns only a minimal DOM shell and source-local immutable draft choices. It never instantiates the native New-session dialog, invokes native Start/create, reconstructs missing provider/model pairs, or calls native preference-writing methods (`setNewSessionProvider`, `selectNewSessionModel`, `syncNewSessionProviderFromModelInput`, `applyNewSessionLaunchPreset`). No native `codoxear.*` storage is written.
-
-Initial inheritance is labelled `沿用原会话设置`, without claiming the native row is runtime-current. Explicit selection requires a committed real native pair, never a synthetic or case-insensitive `default` model. A missing/incompatible module, unavailable/empty catalog, or **any** `warnings.pi` key disables explicit selection; inheritance remains available. Dirty queries or a no-longer-available selected pair/effort block confirmation rather than silently changing the choice. Native effort adjustments are shown in the confirmation. Native may omit duplicate IDs under a second provider or Pi may clamp advertised effort: this bridge follows native authority, not a second catalog.
-
-Optional server `target_settings` is frozen creation configuration, not runtime proof. Inherited echoes say `沿用原会话列表设置`. Optional `target_check` reports asymmetric observations: model mismatch is an alert, effort mismatch a visible note, and equality is only `not_contradicted`, never a verification claim. Observations do not retarget operations, change locks or trigger retries.
-
-## Isolated verification
+从仓库根运行：
 
 ```sh
-CODOXEAR_STATIC_DIR=/absolute/read-only/codoxear/static \
-  node --test codoxear/session-handoff/tests/{core,panel,target-model}.test.cjs
-# Run this persistent fixture in a task-owned tmux pane:
-CODOXEAR_STATIC_DIR=/absolute/read-only/codoxear/static \
-  node codoxear/session-handoff/tests/frontend-fixture.cjs
-# Run the Chrome suite as a resource-bounded job on the test machine:
-AGENT_BROWSER_BIN=/absolute/path/to/agent-browser \
-  node codoxear/session-handoff/tests/browser.test.cjs
+CODOXEAR_STATIC_DIR="$PWD/codoxear/.runtime/venv/lib/python3.12/site-packages/codoxear/static" \
+  node --test codoxear/session-handoff/tests/*.test.cjs
 ```
 
-The fixture binds only loopback (`PORT`, default 8896), serves actual upstream assets read-only, injects the handoff script and provides synthetic APIs. UI and data are marked **DEMO**. It never starts agents, writes production data, or contacts production APIs. The browser test accepts only a loopback `/demo/` URL, uses named ephemeral Chrome sessions and closes its own sessions. `HANDOFF_SCREENSHOTS` selects the output directory. Desktop includes native edit/cancel, delete/cancel and synthetic duplicate; mobile checks 390px layout and target navigation. Both viewport tests assert the exact SVG, accessible name, keyboard open/Escape cancellation, visible focus, native-sized unoccluded toolbar hit areas and no overflow. Remount and icon-child mutation checks guard against duplicate buttons and observer feedback.
-
-The concurrency regression holds A's start response open, selects B through the real native sidebar, starts B before A completes, then releases late A and checks both source views and refresh recovery. Both desktop and mobile cover unsourced legacy migration while B is selected and selected-only terminal forgetting. Separate tabs exercise independent source writes; storage refusal, auth loss, hidden polling, and unload cleanup are also checked. Controlled promises cover old recovering/ready responses versus new Continue intents and replacement/deleted references. Controlled panel timers and real desktop/mobile single-task `replaceState`→click probes exercise the pre-monitor gap: a displayed A action cannot act on B, and a deliberate second B click works. Browser condition waits are bounded to avoid hanging on unrelated native fixture failures. A `GAP mobile native Duplicate/drawer fixture` line explicitly reports incomplete coverage of that existing native action (the drawer can close after Delete cancellation); desktop Duplicate and all handoff assertions remain mandatory.
-
-These tests establish frontend behavior against the supplied native asset version. Actual Pi reconstruction, review and continuation require the separate integrated workflow acceptance test.
+测试用可控 DOM/HTTP 和只读原生模型模块，覆盖状态、源隔离、重复点击、身份切换、模型选择、失败和生命周期，不访问生产 API。

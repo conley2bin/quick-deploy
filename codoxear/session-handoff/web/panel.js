@@ -12,7 +12,7 @@
     const appBase = new URL('../', base).href;
     const drafts = new Map();
     const draft = () => {
-      if (!drafts.has(currentSource)) drafts.set(currentSource, { open: false, note: '', confirmedSource: null, reconfirm: false,
+      if (!drafts.has(currentSource)) drafts.set(currentSource, { open: false, confirmedSource: null, reconfirm: false,
         choice: null, query: null, choiceStale: false, effortNote: '', catalog: null });
       return drafts.get(currentSource);
     };
@@ -42,7 +42,6 @@
 #handoffPanel{flex:none;font:inherit;background:var(--panel);color:var(--text);border-bottom:1px solid var(--border);padding:8px 12px;overflow-wrap:anywhere}
 #handoffPanel[hidden]{display:none} #handoffPanel .handoffRow{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
 #handoffPanel button,#handoffPanel a{font:inherit;min-height:36px} #handoffPanel a{color:var(--accent)}
-#handoffPanel textarea{display:block;box-sizing:border-box;width:100%;max-width:560px;font:inherit;color:inherit;background:var(--bg);border:1px solid var(--border);border-radius:6px;margin:6px 0;padding:6px}
 #handoffPanel p{margin:4px 0} #handoffPanel .handoffHint{font-size:12px;color:var(--muted)}
 #handoffMenuHost{position:fixed;inset:0;pointer-events:none;z-index:60}#handoffMenuHost>*{pointer-events:auto}
 #handoffMenuHost [hidden]{display:none}#handoffMenuHost .fileMenuItem{min-height:44px;font:inherit}
@@ -69,7 +68,7 @@
       timer = win.setTimeout(() => { syncSelection(); if (!doc.hidden) controller.poll(); }, 1800);
     }
     const identity = s => JSON.stringify([s.source, s.reference?.operation_id, s.reference?.request_id,
-      s.reference?.pending_action, s.reference?.pending_id, s.reference?.target, s.invalidReference, s.op?.id, s.op?.target_session_id]);
+      s.reference?.target, s.invalidReference, s.op?.id, s.op?.target_session_id]);
     function actionCurrent() {
       // Own the action by what was painted before synchronizing native URL or
       // cross-tab storage. A stale A button may repaint B, never act on B.
@@ -86,30 +85,22 @@
       const locked = s.busy || Boolean(s.reference) || s.invalidReference;
       ui.form.hidden = !d.open || Boolean(s.reference) || s.invalidReference;
       renderModel(d, locked);
-      ui.note.value = d.note;
       ui.source.textContent = d.reconfirm ? '来源已切换，请再次确认：' + (currentSource || '未选择会话')
         : currentSource ? '来源会话：' + currentSource : '请先在原生页面选择一个会话。';
-      const has = Boolean(s.reference || s.error || s.legacyError);
+      const has = Boolean(s.reference || s.error);
       ui.panel.hidden = !has && ui.form.hidden;
       ui.status.textContent = s.op ? `${labels[s.op.status]} · 来源：${s.op.source_session_id}${s.op.message ? ' · ' + s.op.message : ''}`
-        : s.reference ? (s.busy ? '正在核对接力请求…' : '请求结果未确认。请核对原请求；刷新后补充说明不会保留。') : '';
+        : s.reference ? (s.busy ? '正在核对接力请求…' : '请求结果未确认，请查询原请求。') : '';
       const tuple = t => `${t.model} · ${t.model_provider} · ${t.reasoning_effort}`;
       if (s.op?.target_settings) ui.status.textContent += ` · 创建设置（${s.op.target_settings.origin === 'inherited' ? '沿用原会话列表设置' : '显式选择'}）：${tuple(s.op.target_settings)}`;
-      const check = s.op?.target_check;
-      ui.targetCheck.textContent = check && check.result !== 'not_contradicted'
-        ? `接力期间列表曾报告 ${tuple(check.observed)}，与创建选择 ${s.op.target_settings ? tuple(s.op.target_settings) : '（未记录）'} 不同（${check.stage}）。`
-        : '';
-      ui.targetCheck.setAttribute('role', check?.result === 'model_differs' ? 'alert' : 'status');
-      ui.error.textContent = [s.error || (s.uncertainContinue ? '继续请求结果尚未确认；仅查询状态，不会重发。' : ''), s.legacyError].filter(Boolean).join('；');
+      ui.error.textContent = s.error;
       ui.start.disabled = !currentSource || locked || Boolean(modelBlock(d));
       ui.button.disabled = s.busy;
       ui.retry.hidden = !s.reference || s.busy || (!s.error && s.op && active.has(s.op.status));
-      ui.retry.textContent = s.reference?.operation_id ? '刷新接力状态' : '核对原请求';
-      ui.bypass.hidden = !(s.op?.status === 'unreviewed' && s.op.can_continue_unreviewed && s.op.target_session_id && !s.uncertainContinue);
-      ui.bypass.disabled = s.busy;
-      ui.link.hidden = !s.op?.target_session_id;
+      ui.retry.textContent = s.reference?.operation_id ? '刷新接力状态' : '查询原请求';
+      ui.link.hidden = !(s.op?.status === 'completed' && s.op.target_session_id);
       if (s.op?.target_session_id) ui.link.href = targetURL(win.location.href, s.op.target_session_id);
-      ui.done.hidden = !s.op || !['ready', 'failed', 'conflict'].includes(s.op.status) || s.uncertainContinue || s.busy;
+      ui.done.hidden = !s.op || !['completed', 'failed'].includes(s.op.status) || s.busy;
       ui.button.setAttribute('aria-expanded', String(!ui.panel.hidden));
       if (s.reference) ui.form.hidden = true;
       schedule();
@@ -238,21 +229,19 @@
       details.after(button);
       const panel = el('section', '', { id: 'handoffPanel', 'aria-label': '会话接力' }); panel.hidden = true; bar.after(panel);
       const form = el('form'), source = el('p'); form.hidden = true;
-      const hint = el('p', '新 Pi 独立恢复 → 旧会话审阅 → 新会话核对一次后接续。仅支持 Pi。', { class: 'handoffHint' });
-      const label = el('label', '补充说明（可选，最多 1000 字）', { for: 'handoffNote' });
-      const note = el('textarea', '', { id: 'handoffNote', rows: '2', maxlength: '1000' });
+      const hint = el('p', '源会话写交接 → 创建新 Pi 会话继续。旧会话保留；源会话忙时请稍后再试。', { class: 'handoffHint' });
       const modelBox = el('div'), modelFallback = el('p', '', { class: 'handoffHint' });
       const resetModel = el('button', '沿用原会话设置', { type: 'button' }); modelBox.append(modelFallback, resetModel);
       const menuHost = el('div', '', { id: 'handoffMenuHost' }); doc.body.append(menuHost);
       const start = el('button', '确认接力', { type: 'submit' }), cancel = el('button', '取消', { type: 'button' });
       const buttons = el('div', '', { class: 'handoffRow' }); buttons.append(start, cancel);
-      form.append(source, hint, modelBox, label, note, buttons);
+      form.append(source, hint, modelBox, buttons);
       const status = el('p', '', { role: 'status', 'aria-live': 'polite' }), error = el('p', '', { role: 'alert' });
-      const retry = el('button', '核对原请求', { type: 'button' }), bypass = el('button', '未校对，仍继续', { type: 'button' });
+      const retry = el('button', '查询原请求', { type: 'button' });
       const link = el('a', '打开新会话'), done = el('button', '收起记录', { type: 'button' });
-      const row = el('div', '', { class: 'handoffRow' }); row.append(retry, bypass, link, done);
-      const targetCheck = el('p', '', { id: 'handoffTargetCheck', role: 'status' }); panel.append(form, status, targetCheck, error, row);
-      ui = { button, panel, form, source, note, start, status, error, retry, bypass, link, done, targetCheck, modelBox, modelFallback, resetModel, menuHost, field: null };
+      const row = el('div', '', { class: 'handoffRow' }); row.append(retry, link, done);
+      panel.append(form, status, error, row);
+      ui = { button, panel, form, source, start, status, error, retry, link, done, modelBox, modelFallback, resetModel, menuHost, field: null };
       onUI(panel, 'scroll', () => ui?.field?.position());
       onUI(resetModel, 'click', () => {
         if (!actionCurrent() || controller.view().reference || controller.view().busy || controller.view().invalidReference) return;
@@ -266,11 +255,7 @@
           if (opening && currentSource) readCatalog(currentSource, d);
         }
         render(s);
-        if (!s.reference) note.focus();
-      });
-      onUI(note, 'input', () => {
-        const value = note.value;
-        if (actionCurrent()) { draft().note = value; note.value = value; }
+        if (!s.reference) start.focus();
       });
       onUI(form, 'submit', e => {
         e.preventDefault();
@@ -284,17 +269,16 @@
         }
         if (modelBlock(d) || controller.view().invalidReference) { render(controller.view()); return; }
         ui.field?.close();
-        controller.start(now, d.note, d.choice || undefined);
+        controller.start(now, d.choice || undefined);
       });
       onUI(cancel, 'click', () => {
         if (!actionCurrent()) return;
         const d = draft(); cancelCatalog(); ui.field?.close();
-        Object.assign(d, { open: false, note: '', choice: null, query: null, choiceStale: false, effortNote: '', catalog: null });
+        Object.assign(d, { open: false, choice: null, query: null, choiceStale: false, effortNote: '', catalog: null });
         render(controller.view()); button.focus();
       });
       onUI(form, 'keydown', e => { if (e.key === 'Escape') { e.preventDefault(); cancel.click(); } });
       onUI(retry, 'click', () => { if (actionCurrent()) controller.recover(); });
-      onUI(bypass, 'click', () => { if (actionCurrent()) controller.continueUnreviewed(); });
       onUI(link, 'click', e => {
         e.preventDefault(); if (!actionCurrent()) return;
         const id = controller.view().op?.target_session_id; if (id) win.location.replace(targetURL(win.location.href, id));
@@ -303,7 +287,7 @@
         if (!actionCurrent()) return;
         controller.forget();
         if (!controller.view().reference) {
-          cancelCatalog(); Object.assign(draft(), { note: '', open: false, choice: null, query: null, choiceStale: false, effortNote: '', catalog: null });
+          cancelCatalog(); Object.assign(draft(), { open: false, choice: null, query: null, choiceStale: false, effortNote: '', catalog: null });
         }
         render(controller.view()); button.focus();
       });
@@ -324,13 +308,12 @@
     for (const type of ['click', 'keyup', 'pointerup']) on(doc, type, selectionEvent);
     for (const type of ['hashchange', 'popstate', 'focus']) on(win, type, selectionEvent);
     on(win, 'storage', e => {
-      if (e.key === key || e.key === null) controller.migrateLegacy();
       if (e.key === null || e.key === key + ':source:' + encodeURIComponent(currentSource)) {
         controller.select(currentSource);
         if (!doc.hidden && controller.view().reference?.operation_id && !controller.view().op) controller.poll();
       }
     });
-    syncSelection(); install(); monitorSelection(); controller.migrateLegacy();
+    syncSelection(); install(); monitorSelection();
     return { controller, dispose };
   }
   const api = { mount };

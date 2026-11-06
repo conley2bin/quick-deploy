@@ -1,4 +1,4 @@
-"""HTTP seam tests with an in-process fake native transport and temporary artifacts."""
+"""HTTP seam tests with an in-process fake native transport and temporary handover files."""
 import asyncio
 import importlib.util
 import json
@@ -51,11 +51,11 @@ class FeatureTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(Path, "read_bytes", autospec=True,
                           side_effect=lambda path: path.name.encode()) as script_reads:
             self.engine = feature.install(self.app, self.host, state_root=self.root / "state",
-                                          timeouts={"poll": 1, "launch": 8, "understanding": 8,
-                                                    "review": 8, "resolution": 8, "source_idle": 8})
+                                          timeouts={"native": .1, "poll": 1, "launch": 8, "handover": 8})
         self.script_names = [call.args[0].name for call in script_reads.call_args_list]
         self.clock = Clock()
         self.engine.clock, self.engine.sleep = self.clock.now, self.clock.sleep
+        self.engine.wall_ns = lambda: 1_000_000_000_000_000_000
         self.native.engine = self.engine
         self.server = TestServer(self.app, handler_cancellation=True)
         self.client = TestClient(self.server)
@@ -68,7 +68,7 @@ class FeatureTests(unittest.IsolatedAsyncioTestCase):
         self.tmp.cleanup()
 
     def start_body(self):
-        return {"source_session_id": "opaque/source", "request_id": str(uuid4()), "note": "保留目标 Y"}
+        return {"source_session_id": "opaque/source", "request_id": str(uuid4())}
 
     async def post(self, action, body, headers=None):
         response = await self.client.post(self.base + action, json=body,
@@ -86,12 +86,12 @@ class FeatureTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(set(data), {"operation"})
         op = data["operation"]
         self.assertEqual(set(op), {"id", "request_id", "source_session_id", "target_session_id", "status",
-                                   "message", "reviewed", "can_continue_unreviewed", "updated_at", "target_settings"})
+                                   "message", "updated_at", "target_settings"})
         self.assertIn("no-store", response.headers["Cache-Control"])
         self.assertNotIn("Access-Control-Allow-Origin", response.headers)
         await self.finish()
         response, data = await self.post("status", {"operation_id": op["id"]})
-        self.assertEqual(data["operation"]["status"], "ready")
+        self.assertEqual(data["operation"]["status"], "completed")
         self.assertNotIn(str(self.root), json.dumps(data))
         self.assertIn("__session_handoff__", self.host.scripts)
         self.assertEqual(self.script_names, ["core.js", "target-model.js", "panel.js", "bootstrap.js"])
@@ -103,8 +103,7 @@ class FeatureTests(unittest.IsolatedAsyncioTestCase):
         await self.finish()
         op = data["operation"]["id"]
         self.native.auth = False
-        for action, body in (("start", self.start_body()), ("status", {"operation_id": op}),
-                             ("continue", {"operation_id": op})):
+        for action, body in (("start", self.start_body()), ("status", {"operation_id": op})):
             response, data = await self.post(action, body)
             self.assertEqual(response.status, 401)
             self.assertEqual(data["error"], "authentication_required")
@@ -119,19 +118,20 @@ class FeatureTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.native.calls, [])
 
     async def test_strict_post_unknown_routes_and_override_rejection(self):
-        for field in ("path", "cwd", "model", "url", "callback_url", "provider", "operation_id",
+        for field in ("path", "cwd", "model", "url", "callback_url", "provider", "operation_id", "note",
                       "agent_backend", "args", "create_in_tmux", "reasoning_effort"):
             response, data = await self.post("start", {**self.start_body(), field: "/arbitrary"})
             self.assertEqual(response.status, 400)
         response = await self.client.get(self.base + "status", headers=self.headers)
         self.assertEqual(response.status, 405)
+        response = await self.client.post(self.base + "continue", json={}, headers=self.headers)
+        self.assertEqual(response.status, 404)
         response = await self.client.post(self.base + "unknown", json={}, headers=self.headers)
         self.assertEqual(response.status, 404)
         self.assertEqual(self.native.mutations(), [])
 
     async def test_malformed_bounded_and_nonobject_inputs(self):
         for body in ([], None, {"source_session_id": "x", "request_id": "bad"},
-                     {**self.start_body(), "note": "x" * 2001}, {**self.start_body(), "note": 1},
                      {**self.start_body(), "source_session_id": "\x00"},
                      {**self.start_body(), "request_id": 3}):
             response, _ = await self.post("start", body)
@@ -148,7 +148,7 @@ class FeatureTests(unittest.IsolatedAsyncioTestCase):
         ids = {data["operation"]["id"] for _, data in results}
         self.assertEqual(len(ids), 1)
         await self.finish()
-        self.assertEqual(len(self.native.mutations()), 4)
+        self.assertEqual(len(self.native.mutations()), 3)
         _, retry = await self.post("start", bodies[-1])
         self.assertIn(retry["operation"]["id"], ids)
 
@@ -163,7 +163,7 @@ class FeatureTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.engine.tasks[operation_id].done())
         self.native.create_gate.set()
         await self.finish()
-        self.assertEqual(self.engine.public(operation_id)["status"], "ready")
+        self.assertEqual(self.engine.public(operation_id)["status"], "completed")
 
     async def test_cleanup_cancels_and_awaits_background_work(self):
         self.native.create_gate = asyncio.Event()
@@ -173,46 +173,8 @@ class FeatureTests(unittest.IsolatedAsyncioTestCase):
         await self.client.close()
         self.assertTrue(all(task.done() for task in tasks))
         self.assertFalse(self.engine.tasks)
-        self.assertEqual(self.engine.public(operation_id)["status"], "interrupted")
+        self.assertEqual(self.engine.public(operation_id)["status"], "failed")
 
-    async def test_authenticated_explicit_continue_only_after_timeout(self):
-        self.native.emit_review = False
-        _, data = await self.post("start", self.start_body())
-        operation_id = data["operation"]["id"]
-        await self.finish()
-        response, data = await self.post("status", {"operation_id": operation_id})
-        self.assertEqual(data["operation"]["status"], "unreviewed")
-        self.assertEqual(len(self.native.mutations()), 3)
-        response, _ = await self.post("continue", {"operation_id": operation_id, "unreviewed": True})
-        self.assertEqual(response.status, 400)
-        response, _ = await self.post("continue", {"operation_id": operation_id})
-        self.assertEqual(response.status, 200)
-        await self.finish()
-        self.assertFalse(self.engine.public(operation_id)["reviewed"])
-        self.assertEqual(self.engine.public(operation_id)["status"], "ready")
-        response, _ = await self.post("continue", {"operation_id": operation_id})
-        self.assertEqual(response.status, 409)
-
-    async def test_status_reconciles_late_receipt_only_after_fresh_auth(self):
-        self.native.emit_resolution = False
-        _, data = await self.post("start", self.start_body())
-        operation_id = data["operation"]["id"]
-        await self.finish()
-        _, data = await self.post("status", {"operation_id": operation_id})
-        self.assertEqual(data["operation"]["status"], "delivery_unknown")
-        _, duplicate = await self.post("start", self.start_body())
-        self.assertEqual(duplicate["operation"]["id"], operation_id)
-        self.native.artifact("resolution")
-        self.native.auth = False
-        response, _ = await self.post("status", {"operation_id": operation_id})
-        self.assertEqual(response.status, 401)
-        self.assertEqual(self.engine.public(operation_id)["status"], "delivery_unknown")
-        self.native.auth = True
-        response, data = await self.post("status", {"operation_id": operation_id})
-        self.assertEqual(response.status, 200)
-        self.assertEqual(data["operation"]["status"], "ready")
-        self.assertEqual(len(self.native.mutations()), 4)
-        self.assertFalse(self.engine.tasks)
 
     async def test_sequence_limit_is_4xx_before_any_creation(self):
         self.native.source["display_name"] = "接力_99"
@@ -224,7 +186,7 @@ class FeatureTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.engine.operations, {})
         self.assertEqual(list(self.engine.root.iterdir()), [])
 
-    async def test_target_legacy_and_explicit_each_use_one_fresh_listing(self):
+    async def test_inherited_and_explicit_use_authenticated_listing(self):
         for explicit in (False, True):
             body = self.start_body()
             if explicit:
@@ -232,10 +194,11 @@ class FeatureTests(unittest.IsolatedAsyncioTestCase):
             before = len(self.native.calls)
             response, data = await self.post("start", body)
             self.assertEqual(response.status, 200)
-            self.assertEqual(self.native.calls[before:], [("GET", "/api/sessions", None)])
+            self.assertEqual(self.native.calls[before], ("GET", "/api/sessions", None))
+            # The app-owned worker also freshly checks idle immediately before send.
             self.assertEqual(data["operation"]["target_settings"]["origin"], "explicit" if explicit else "inherited")
             await self.finish()
-            create = self.native.mutations()[-4][2]
+            create = self.native.mutations()[-2][2]
             self.assertEqual(set(create), {"cwd", "model_provider", "model", "reasoning_effort",
                                           "agent_backend", "create_in_tmux", "args"})
             expected = body.get("target", {k: self.native.source[k] for k in
@@ -261,7 +224,7 @@ class FeatureTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(list(self.engine.root.iterdir()), [])
         self.assertEqual(self.native.mutations(), [])
 
-    async def test_target_missing_or_malformed_defaults_leave_auth_and_legacy_working(self):
+    async def test_missing_catalog_still_allows_authenticated_inheritance(self):
         for defaults in (None, [], "bad"):
             self.native.defaults = defaults
             body = self.start_body()
@@ -273,30 +236,15 @@ class FeatureTests(unittest.IsolatedAsyncioTestCase):
             operation_id = data["operation"]["id"]
             await self.finish()
             response, data = await self.post("status", {"operation_id": operation_id})
-            self.assertEqual((response.status, data["operation"]["status"]), (200, "ready"))
-        self.assertEqual(len(self.native.mutations()), 12)
+            self.assertEqual((response.status, data["operation"]["status"]), (200, "completed"))
+        self.assertEqual(len(self.native.mutations()), 9)
 
-    async def test_target_absent_defaults_do_not_break_auth_status_or_unreviewed_continue(self):
-        previous = self.native.__call__
-        async def no_defaults(method, path, **kwargs):
-            status, data = await previous(method, path, **kwargs)
-            if method == "GET":
-                data.pop("new_session_defaults", None)
-            return status, data
-        self.engine.upstream_json = no_defaults
-        self.native.emit_review = False
+    async def test_busy_source_is_visible_without_operation_or_mutation(self):
+        self.native.source["busy"] = True
         response, data = await self.post("start", self.start_body())
-        self.assertEqual(response.status, 200)
-        operation_id = data["operation"]["id"]
-        await self.finish()
-        response, data = await self.post("status", {"operation_id": operation_id})
-        self.assertEqual((response.status, data["operation"]["status"]), (200, "unreviewed"))
-        response, _ = await self.post("continue", {"operation_id": operation_id})
-        self.assertEqual(response.status, 200)
-        await self.finish()
-        response, data = await self.post("status", {"operation_id": operation_id})
-        self.assertEqual((response.status, data["operation"]["status"]), (200, "ready"))
-        self.assertEqual(len(self.native.mutations()), 4)
+        self.assertEqual((response.status, data["message"]), (409, "源会话忙，稍后再试"))
+        self.assertFalse(self.engine.operations)
+        self.assertFalse(self.native.mutations())
 
     async def test_non_pi_returns_clear_4xx(self):
         self.native.source["agent_backend"] = "codex"

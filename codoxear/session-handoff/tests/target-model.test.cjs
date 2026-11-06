@@ -101,7 +101,7 @@ for (const priorExplicit of [false, true]) test(`empty native effort choices blo
   const saved = new Map();
   const c = Core.createController({ key: 'test', storage: { getItem: k => saved.get(k), setItem: (k, v) => saved.set(k, v) },
     uuid: () => '12345678-1234-4123-8123-123456789012', post: async (route, body) => { calls.push(body); throw Error('synthetic loss'); } });
-  const confirm = async () => { if (!r.field.blockReason()) await c.start('A', '', r.field.target()); };
+  const confirm = async () => { if (!r.field.blockReason()) await c.start('A', r.field.target()); };
   await confirm(); assert.equal(calls.length, 0);
   r.find('handoffModelInput').value = ''; r.find('handoffModelInput').fire('input');
   r.choose('provider-b', 'shared'); assert.equal(r.field.blockReason(), '');

@@ -7,7 +7,7 @@ const rid = '12345678-1234-4123-8123-123456789012';
 const ids = { A: '87654321-1234-4123-8123-123456789012', B: '97654321-1234-4123-8123-123456789012' };
 const key = 'codoxear:session-handoff:/__session_handoff__/:source:';
 const settle = () => new Promise(resolve => setImmediate(resolve));
-async function fixture(t, status = 'unreviewed', references = true, options = {}) {
+async function fixture(t, status = 'completed', references = true, options = {}) {
   const observers = [];
   global.MutationObserver = class { constructor(fn) { this.fn = fn; observers.push(this); } observe() {} disconnect() {} };
   const { nodes, Node } = fakeDOM();
@@ -29,8 +29,8 @@ async function fixture(t, status = 'unreviewed', references = true, options = {}
       if (options.postReply) return options.postReply(route, body, storage);
       const source = body.source_session_id || Object.keys(ids).find(s => ids[s] === body.operation_id);
       return { ok: true, json: async () => ({ operation: { id: ids[source], request_id: rid, source_session_id: source, target_session_id: 'T' + source,
-        status, reviewed: status === 'ready', can_continue_unreviewed: status === 'unreviewed', ...options.operationFields } }) }; } });
-  const instance = mount(win, 'http://fixture/__session_handoff__/app.js', () => {}, options.nativeLoader || (native ? async () => native : async () => { throw Error('native unavailable in legacy fixture'); })); t.after(() => instance.dispose()); await settle();
+        status, ...options.operationFields } }) }; } });
+  const instance = mount(win, 'http://fixture/__session_handoff__/app.js', () => {}, options.nativeLoader || (native ? async () => native : async () => { throw Error('native unavailable in inherit-only fixture'); })); t.after(() => instance.dispose()); await settle();
   const button = text => nodes.find(n => n.tag === 'button' && n.textContent === text);
   const choose = async source => { win.location.hash = '#session=' + source;
     const [id, timer] = [...timers].find(([, v]) => v.ms === 250); timers.delete(id); timer.fn(); await settle(); };
@@ -38,9 +38,9 @@ async function fixture(t, status = 'unreviewed', references = true, options = {}
   await choose('B'); await choose('A');
   return { instance, nodes, doc, win, values, calls, catalogCalls, native, writes, observers, navigations, button, choose, status: nodes.find(n => n.role === 'status') };
 }
-for (const action of ['未校对，仍继续', '刷新接力状态', '收起记录', '打开新会话']) {
+for (const action of ['刷新接力状态', '收起记录', '打开新会话']) {
   test('visible A ' + action + ' cannot act on URL B before selection monitor', async t => {
-    const r = await fixture(t, action === '收起记录' ? 'ready' : 'unreviewed');
+    const r = await fixture(t, 'completed');
     assert.match(r.status.textContent, /来源：A/);
     const node = action === '打开新会话' ? r.nodes.find(n => n.tag === 'a') : r.button(action);
     assert.equal(node.hidden, false); const before = r.calls.length;
@@ -48,61 +48,50 @@ for (const action of ['未校对，仍继续', '刷新接力状态', '收起记�
     assert.equal(r.calls.length, before); assert.equal(r.navigations.length, 0);
     assert(r.values.has(key + 'A')); assert(r.values.has(key + 'B')); assert.match(r.status.textContent, /来源：B/);
     node.click(); await settle();
-    if (action === '未校对，仍继续') assert.deepEqual(r.calls.slice(before), [{ route: 'continue', body: { operation_id: ids.B } }]);
     if (action === '刷新接力状态') assert.deepEqual(r.calls.slice(before), [{ route: 'status', body: { operation_id: ids.B } }]);
     if (action === '收起记录') { assert(!r.values.has(key + 'B')); assert(r.values.has(key + 'A')); }
     if (action === '打开新会话') { assert.equal(r.navigations.length, 1); assert.match(r.navigations[0], /session=TB/); }
   });
 }
 test('same-source replaced reference makes displayed Forget repaint rather than delete replacement', async t => {
-  const r = await fixture(t, 'ready'); const done = r.button('收起记录');
+  const r = await fixture(t, 'completed'); const done = r.button('收起记录');
   r.values.set(key + 'A', JSON.stringify({ operation_id: ids.B, source_session_id: 'A' }));
   done.click(); await settle();
   assert.equal(JSON.parse(r.values.get(key + 'A')).operation_id, ids.B);
   assert.equal(r.instance.controller.view().op, null); assert.match(r.status.textContent, /请求结果未确认/);
 });
-test('stale A form reconfirms B with no A note; stale cancel cannot close B draft', async t => {
-  const r = await fixture(t, 'recovering', false), form = r.nodes.find(n => n.tag === 'form'), note = r.nodes.find(n => n.tag === 'textarea');
-  const open = r.nodes.find(n => n.id === 'handoffButton');
-  open.click(); note.value = 'B draft'; note.fire('input'); // Initially A; explicitly fill B below.
-  await r.choose('B'); open.click(); note.value = 'B only'; note.fire('input');
-  await r.choose('A'); note.value = 'A only'; note.fire('input');
-  r.win.location.hash = '#session=B'; r.button('取消').click();
-  assert.equal(form.hidden, false); assert.equal(note.value, 'B only');
-  await r.choose('A'); r.win.location.hash = '#session=B'; form.fire('submit'); await settle();
-  assert.equal(r.calls.length, 0); assert.equal(note.value, 'B only');
-  assert(r.nodes.some(n => n.textContent === '来源已切换，请再次确认：B'));
+test('stale A form reconfirms B before deliberate submit', async t => {
+  const r = await fixture(t, 'waiting_source', false), form = r.nodes.find(n => n.tag === 'form');
+  r.doc.getElementById('handoffButton').click();
+  r.win.location.hash = '#session=B'; form.fire('submit'); await settle();
+  assert.equal(r.calls.length, 0); assert(r.nodes.some(n => n.textContent === '来源已切换，请再次确认：B'));
   form.fire('submit'); await settle(); assert.equal(r.calls.length, 1);
-  assert.equal(r.calls[0].body.source_session_id, 'B'); assert.equal(r.calls[0].body.note, 'B only');
+  assert.equal(r.calls[0].body.source_session_id, 'B'); assert.equal(Object.hasOwn(r.calls[0].body, 'note'), false);
 });
 test('target link checks current reference even while an old status request is busy', async t => {
-  const r = await fixture(t, 'ready'), link = r.nodes.find(n => n.tag === 'a');
+  const r = await fixture(t, 'completed'), link = r.nodes.find(n => n.tag === 'a');
   let release;
   r.win.fetch = () => new Promise(resolve => release = resolve);
   const held = r.instance.controller.poll();
   r.values.set(key + 'A', JSON.stringify({ operation_id: ids.B, source_session_id: 'A' }));
   link.click(); assert.equal(r.navigations.length, 0); assert.equal(link.hidden, true);
   release({ ok: true, json: async () => ({ operation: { id: ids.A, request_id: rid, source_session_id: 'A', target_session_id: 'TA',
-    status: 'ready', reviewed: true, can_continue_unreviewed: false } }) });
+    status: 'completed' } }) });
   await held; assert.equal(r.instance.controller.view().op, null);
   assert.equal(JSON.parse(r.values.get(key + 'A')).operation_id, ids.B);
 });
-test('stale topbar and note input repaint without opening or contaminating B draft', async t => {
-  const r = await fixture(t, 'recovering', false), open = r.nodes.find(n => n.id === 'handoffButton');
-  const form = r.nodes.find(n => n.tag === 'form'), note = r.nodes.find(n => n.tag === 'textarea');
+test('stale topbar repaints B without opening another source form', async t => {
+  const r = await fixture(t, 'waiting_source', false), open = r.doc.getElementById('handoffButton');
+  const form = r.nodes.find(n => n.tag === 'form');
   r.win.location.hash = '#session=B'; open.click(); assert.equal(form.hidden, true);
   open.click(); assert.equal(form.hidden, false);
-  await r.choose('A'); open.click();
-  r.win.location.hash = '#session=B'; note.value = 'A private input'; note.fire('input');
-  assert.equal(note.value, ''); form.fire('submit'); await settle();
-  assert.equal(r.calls.length, 1); assert.equal(r.calls[0].body.source_session_id, 'B'); assert.equal(r.calls[0].body.note, undefined);
 });
 test('visible A retry cannot replay B pending start; explicit repainted B retry keeps its UUID', async t => {
   const r = await fixture(t), retry = r.button('刷新接力状态');
   r.values.set(key + 'B', JSON.stringify({ request_id: rid, source_session_id: 'B' }));
   await r.choose('B'); await r.choose('A'); const before = r.calls.length;
   r.win.location.hash = '#session=B'; retry.click(); await settle();
-  assert.equal(r.calls.length, before); assert.equal(retry.textContent, '核对原请求');
+  assert.equal(r.calls.length, before); assert.equal(retry.textContent, '查询原请求');
   retry.click(); await settle();
   assert.deepEqual(r.calls.slice(before), [{ route: 'start', body: { request_id: rid, source_session_id: 'B' } }]);
   assert(![...r.values.values()].join('').includes('note'));
@@ -118,7 +107,7 @@ function pick(r, provider, model) {
 }
 test('panel actual-native choice freezes before POST and same-source lock prevents retargeting', async t => {
   const held = deferred(), target = { model_provider: 'provider-b', model: 'shared', reasoning_effort: 'high' };
-  const r = await fixture(t, 'recovering', false, { native: true, postReply: (route, body, storage) => {
+  const r = await fixture(t, 'waiting_source', false, { native: true, postReply: (route, body, storage) => {
     assert.deepEqual(JSON.parse(storage.getItem(key + 'A')).pending_start.target, target); return held.promise;
   } });
   await openPicker(r); assert.equal(r.catalogCalls.length, 1);
@@ -135,7 +124,7 @@ test('panel actual-native choice freezes before POST and same-source lock preven
   assert.deepEqual(JSON.parse(r.values.get(key + 'A')).pending_start.target, target);
 });
 test('A choice stays A; stale menu/submit repaints B and deliberate B submit inherits', async t => {
-  const r = await fixture(t, 'recovering', false, { native: true }); await openPicker(r); pick(r, 'provider-b', 'shared');
+  const r = await fixture(t, 'waiting_source', false, { native: true }); await openPicker(r); pick(r, 'provider-b', 'shared');
   node(r, 'handoffModelInput').click(); const staleRow = node(r, 'handoffModelMenu').children.find(n => n.title === 'restricted · provider-b');
   r.win.location.hash = '#session=B'; staleRow.click(); await settle();
   assert.equal(r.calls.length, 0); await openPicker(r); assert.match(node(r, 'handoffModelSummary').textContent, /沿用原会话设置/);
@@ -145,7 +134,7 @@ test('A choice stays A; stale menu/submit repaints B and deliberate B submit inh
   assert.equal(r.calls[0].body.source_session_id, 'B'); assert.equal(Object.hasOwn(r.calls[0].body, 'target'), false);
 });
 test('dirty query blocks submit; cancellation resets choice and every reopen refreshes native catalog', async t => {
-  const r = await fixture(t, 'recovering', false, { native: true }); await openPicker(r); pick(r, 'provider-b', 'shared');
+  const r = await fixture(t, 'waiting_source', false, { native: true }); await openPicker(r); pick(r, 'provider-b', 'shared');
   const input = node(r, 'handoffModelInput'); input.value = 'typed not selected'; input.fire('input');
   assert.equal(r.button('确认接力').disabled, true); form(r).fire('submit'); await settle(); assert.equal(r.calls.length, 0);
   r.button('取消').click(); await openPicker(r); assert.equal(r.catalogCalls.length, 2);
@@ -154,7 +143,7 @@ test('dirty query blocks submit; cancellation resets choice and every reopen ref
 });
 test('held A catalog and async import cannot paint B, resurrect cancelled forms or survive disposal', async t => {
   const a = deferred(), b = deferred(), module = deferred();
-  const r = await fixture(t, 'recovering', false, { native: true, nativeLoader: () => module.promise,
+  const r = await fixture(t, 'waiting_source', false, { native: true, nativeLoader: () => module.promise,
     catalogReply: () => (r.catalogCalls.length === 1 ? a.promise : b.promise) });
   await openPicker(r); await r.choose('B'); await openPicker(r);
   assert.equal(r.catalogCalls[0].opts.signal.aborted, true);
@@ -166,7 +155,7 @@ test('held A catalog and async import cannot paint B, resurrect cancelled forms 
   assert.equal(r.calls.length, 0);
 });
 test('catalog/import failure is honest inherit-only; warning key never offers explicit fallback', async t => {
-  const r = await fixture(t, 'recovering', false, { native: true, catalogReply: async () => {
+  const r = await fixture(t, 'waiting_source', false, { native: true, catalogReply: async () => {
     const data = catalog(); data.new_session_defaults.warnings = { pi: '' }; return { ok: true, json: async () => data };
   } });
   await openPicker(r); assert.equal(node(r, 'handoffModelInput').disabled, true);
@@ -174,14 +163,14 @@ test('catalog/import failure is honest inherit-only; warning key never offers ex
   form(r).fire('submit'); await settle(); assert.equal(Object.hasOwn(r.calls[0].body, 'target'), false);
 });
 test('catalog auth loss disposes menus, aborts pending requests and prevents subsequent POST', async t => {
-  const held = deferred(); const r = await fixture(t, 'recovering', false, { native: true, catalogReply: () => held.promise });
+  const held = deferred(); const r = await fixture(t, 'waiting_source', false, { native: true, catalogReply: () => held.promise });
   await openPicker(r); held.resolve({ ok: false, status: 401, json: async () => ({}) }); await settle();
   assert.equal(r.instance.controller.view().stopped, true); assert.equal(node(r, 'handoffMenuHost'), null);
   assert.equal(r.catalogCalls[0].opts.signal.aborted, true); assert.equal(r.calls.length, 0);
   assert.match(node(r, 'handoffCompatibility').textContent, /登录已失效/);
 });
 test('remount keeps only one menu host and restores the same-source draft, not old menu callbacks', async t => {
-  const r = await fixture(t, 'recovering', false, { native: true }); await openPicker(r); pick(r, 'provider-b', 'shared');
+  const r = await fixture(t, 'waiting_source', false, { native: true }); await openPicker(r); pick(r, 'provider-b', 'shared');
   node(r, 'handoffModelInput').click(); const staleRow = node(r, 'handoffModelMenu').children.find(n => n.title === 'restricted · provider-b');
   node(r, 'handoffButton').isConnected = false; r.observers[0].fn(); await settle();
   assert.equal(r.nodes.filter(n => n.id === 'handoffMenuHost' && n.isConnected).length, 1);
@@ -189,22 +178,19 @@ test('remount keeps only one menu host and restores the same-source draft, not o
   form(r).fire('submit'); await settle(); assert.equal(r.calls[0].body.target.model, 'shared');
 });
 test('malformed saved target leaves form locked and cannot POST or quietly use inheritance', async t => {
-  const r = await fixture(t, 'recovering', false, { native: true });
+  const r = await fixture(t, 'waiting_source', false, { native: true });
   const raw = JSON.stringify({ request_id: rid, source_session_id: 'A', target: { model: 'partial' } }); r.values.set(key + 'A', raw);
   node(r, 'handoffButton').click(); await settle(); form(r).fire('submit'); await r.instance.controller.recover();
   assert.equal(form(r).hidden, true); assert.equal(r.button('确认接力').disabled, true);
   assert.equal(r.calls.length, 0); assert.equal(r.values.get(key + 'A'), raw);
 });
-test('server frozen settings and sticky differences are labelled as observations without effective-settings claims', async t => {
-  const expected = { model_provider: 'provider-b', model: 'shared', reasoning_effort: 'xhigh' };
-  for (const result of ['model_differs', 'effort_differs', 'not_contradicted']) {
-    const r = await fixture(t, 'ready', true, { operationFields: {
-      target_settings: { ...expected, origin: 'inherited' }, target_check: { result, stage: 'named', observed: { ...expected, model: result === 'model_differs' ? 'other' : expected.model, reasoning_effort: 'high' } },
-    } });
-    assert.match(r.status.textContent, /沿用原会话列表设置.*shared · provider-b · xhigh/);
-    const check = node(r, 'handoffTargetCheck');
-    if (result !== 'not_contradicted') { assert.match(check.textContent, /接力期间列表曾报告.*high.*与创建选择.*xhigh.*不同/); }
-    assert.equal(check.role, result === 'model_differs' ? 'alert' : 'status');
-    assert.doesNotMatch(r.status.textContent + check.textContent, /已生效|verified|被.*调整/);
+test('panel shows simple states, failure reason and completed-only link', async t => {
+  for (const status of ['waiting_source', 'creating', 'completed', 'failed']) {
+    const r = await fixture(t, status, true, { operationFields: { message: status === 'failed' ? '服务重启，未完成' : '' } });
+    const link = r.nodes.find(n => n.tag === 'a');
+    assert.equal(link.hidden, status !== 'completed');
+    assert.equal(r.nodes.some(n => n.tag === 'button' && /未校对|仍继续/.test(n.textContent)), false);
+    if (status === 'failed') assert.match(r.status.textContent, /服务重启，未完成/);
+    assert.equal(r.nodes.some(n => n.tag === 'textarea'), false);
   }
 });

@@ -70,34 +70,28 @@ def install(app, host, *, state_root=None, timeouts=None):
             if not isinstance(data, dict):
                 raise HandoffError("invalid_input", "请求必须是 JSON 对象", 400)
             if action == "start":
-                if set(data) - {"source_session_id", "request_id", "note", "target"} or not {"source_session_id", "request_id"} <= data.keys():
+                if set(data) - {"source_session_id", "request_id", "target"} or not {"source_session_id", "request_id"} <= data.keys():
                     raise HandoffError("invalid_input", "接力请求包含未支持的字段", 400)
                 source = data["source_session_id"]
-                note = data.get("note", "")
                 if (not isinstance(source, str) or not source.strip() or len(source) > 512
-                        or any(ord(char) < 32 for char in source)
-                        or not isinstance(note, str) or len(note) > 2000):
-                    raise HandoffError("invalid_input", "会话标识或附注无效", 400)
+                        or any(ord(char) < 32 for char in source)):
+                    raise HandoffError("invalid_input", "会话标识无效", 400)
                 target = engine_module.requested_target(data["target"]) if "target" in data else None
-                operation = engine.start(source, data["request_id"], note, target,
+                operation = engine.start(source, data["request_id"], target,
                                          rows=rows, catalog=catalog, cookie=cookie)
             else:
                 if set(data) != {"operation_id"}:
                     raise HandoffError("invalid_input", "请求仅接受操作标识", 400)
-                operation = (engine.continue_unreviewed(data["operation_id"], rows=rows, cookie=cookie)
-                             if action == "continue" else await engine._offloop(
-                                 lambda: engine.status(data["operation_id"], rows=rows)))
+                operation = engine.status(data["operation_id"])
             return host.json_response({"operation": operation})
         except HandoffError as exc:
             return host.json_response({"error": exc.code, "message": exc.message}, status=exc.status)
-        except engine_module.ContextError:
-            return host.json_response({"error": "invalid_source", "message": "源日志无法形成可信交接边界"}, status=422)
         except Exception:
             # Neither native bodies nor local filesystem/exception details leave this seam.
             return host.json_response({"error": "handoff_unavailable", "message": "接力服务暂不可用"}, status=503)
 
     prefix = host.prefix.rstrip("/") + "/" + NAMESPACE
-    route = prefix + "/{action:start|status|continue}"
+    route = prefix + "/{action:start|status}"
     app.router.add_post(route, handle)
 
     async def wrong_method(_request):
